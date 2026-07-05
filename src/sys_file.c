@@ -7,6 +7,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/file.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1004,6 +1006,14 @@ SYSDEF(utimensat) {
 SYSDEF(fsync) { return fsync((int)a0) < 0 ? host_err() : 0; }
 SYSDEF(fdatasync) { return fdatasync((int)a0) < 0 ? host_err() : 0; }
 
+SYSDEF(sync_file_range) {
+    /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic.
+     * glibc's wrapper maps to the host's sync_file_range/sync_file_range2 ABI. */
+    (void)a4; (void)a5;
+    return sync_file_range((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (unsigned)a3) < 0
+           ? host_err() : 0;
+}
+
 SYSDEF(sendfile) {
     off_t off, *offp = NULL;
     if (a2) {
@@ -1184,4 +1194,62 @@ SYSDEF(fadvise64) {
     (void)a4; (void)a5;
     int e = posix_fadvise((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (int)a3);
     return e ? (u64)(s64)-e : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Event fds: eventfd2, epoll. Guest fd == host fd, so the objects themselves
+ * pass through; only epoll_event needs marshalling (guest 16B vs packed-x86
+ * host 12B, see GEpollEvent). The EFD_ and EPOLL_ flags equal the shared
+ * O_CLOEXEC / O_NONBLOCK values, so they need no translation.
+ * ------------------------------------------------------------------------- */
+
+SYSDEF(eventfd2) {
+    int r = eventfd((unsigned)a0, (int)a1);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(epoll_create1) {
+    int r = epoll_create1((int)a0);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(epoll_ctl) {
+    /* (epfd, op, fd, event); event may be NULL for EPOLL_CTL_DEL. */
+    struct epoll_event ev, *evp = NULL;
+    if (a3) {
+        GEpollEvent g;
+        if (copy_from_guest(c, &g, a3, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        ev.events = g.events;
+        ev.data.u64 = g.data;
+        evp = &ev;
+    }
+    return epoll_ctl((int)a0, (int)a1, (int)a2, evp) < 0 ? host_err() : 0;
+}
+
+SYSDEF(epoll_pwait) {
+    /* (epfd, events, maxevents, timeout, sigmask, sigsetsize). */
+    int maxevents = (int)a2;
+    if (maxevents <= 0 || maxevents > 4096) return (u64)(s64)-EINVAL;
+    sigset_t ss, *ssp = NULL;
+    if (a4) {
+        u64 gmask;
+        if (copy_from_guest(c, &gmask, a4, 8) < 0) return (u64)(s64)-EFAULT;
+        sigemptyset(&ss);
+        for (int i = 1; i <= 64; i++)
+            if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
+        ssp = &ss;
+    }
+    struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
+    if (!evs) return (u64)(s64)-ENOMEM;
+    int r = epoll_pwait((int)a0, evs, maxevents, (int)a3, ssp);
+    if (r < 0) { free(evs); return host_err(); }
+    for (int i = 0; i < r; i++) {
+        GEpollEvent g = { .events = evs[i].events, .__pad = 0, .data = evs[i].data.u64 };
+        if (copy_to_guest(c, a1 + (u64)i * sizeof g, &g, sizeof g) < 0) {
+            free(evs);
+            return (u64)(s64)-EFAULT;
+        }
+    }
+    free(evs);
+    return (u64)r;
 }

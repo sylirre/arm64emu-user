@@ -23,6 +23,8 @@ SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
 SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
+SYSDEF(sync_file_range); SYSDEF(eventfd2);
+SYSDEF(epoll_create1); SYSDEF(epoll_ctl); SYSDEF(epoll_pwait);
 
 /* sys_mm.c */
 SYSDEF(brk); SYSDEF(mmap); SYSDEF(munmap); SYSDEF(mprotect);
@@ -120,6 +122,11 @@ static const struct {
     { G_NR_utimensat, sys_utimensat, "utimensat" },
     { G_NR_statx, sys_statx, "statx" },
     { 32 /* flock */, sys_flock, "flock" },
+    { G_NR_sync_file_range, sys_sync_file_range, "sync_file_range" },
+    { G_NR_eventfd2, sys_eventfd2, "eventfd2" },
+    { G_NR_epoll_create1, sys_epoll_create1, "epoll_create1" },
+    { G_NR_epoll_ctl, sys_epoll_ctl, "epoll_ctl" },
+    { G_NR_epoll_pwait, sys_epoll_pwait, "epoll_pwait" },
 
     { G_NR_brk, sys_brk, "brk" },
     { G_NR_mmap, sys_mmap, "mmap" },

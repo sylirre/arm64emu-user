@@ -352,6 +352,13 @@ typedef struct {
 } GStat;
 
 typedef struct { u64 iov_base; u64 iov_len; } GIovec;
+
+/* struct epoll_event. On arm64 (and every arch except x86) it is unpacked, so
+ * the u64 data is 8-aligned: events@0, 4 bytes padding, data@8, size 16. The
+ * host struct is packed only on x86 (data@4, size 12), hence the marshalling in
+ * the epoll handlers rather than a raw copy. */
+typedef struct { u32 events; u32 __pad; u64 data; } GEpollEvent;
+
 typedef struct { s64 tv_sec; s64 tv_nsec; } GTimespec;
 typedef struct { s64 tv_sec; s64 tv_usec; } GTimeval;
 typedef struct { u64 rlim_cur; u64 rlim_max; } GRlimit;
