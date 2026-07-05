@@ -249,6 +249,42 @@ static int l2s_target(const char *host, char *data, unsigned long *count) {
     return 0;
 }
 
+/* Materialize the contents of `src` into a new regular file `dst` by copying.
+ * Used when `src` is not a named regular file that can be symlinked -- notably
+ * "/proc/self/fd/N" naming an O_TMPFILE (as apk does to publish its downloaded
+ * index): the anonymous inode has nothing to point a symlink at, so a copy is
+ * the only faithful emulation. Returns 0 or -errno. */
+static int l2s_materialize(struct Machine *m, const char *src, const char *dst) {
+#define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
+    int in = open(src, O_RDONLY | O_CLOEXEC);            /* follows /proc/self/fd/N */
+    if (in < 0) { L2SLOG("materialize open('%s'): %s\n", src, strerror(errno)); return -errno; }
+    struct stat sst;
+    if (fstat(in, &sst) < 0) { int e = errno; close(in); return -e; }
+    if (!S_ISREG(sst.st_mode)) { close(in); return -EPERM; }   /* only regular content */
+
+    int out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, sst.st_mode & 0777);
+    if (out < 0) { int e = errno; close(in); L2SLOG("materialize creat('%s'): %s\n", dst, strerror(e)); return -e; }
+
+    char buf[65536];
+    ssize_t n;
+    int rc = 0;
+    while ((n = read(in, buf, sizeof buf)) > 0) {
+        for (ssize_t off = 0; off < n; ) {
+            ssize_t w = write(out, buf + off, (size_t)(n - off));
+            if (w < 0) { rc = -errno; break; }
+            off += w;
+        }
+        if (rc) break;
+    }
+    if (n < 0 && rc == 0) rc = -errno;
+    if (rc == 0) fchmod(out, sst.st_mode & 0777);    /* best-effort metadata */
+    close(in);
+    if (close(out) < 0 && rc == 0) rc = -errno;
+    if (rc != 0) { unlink(dst); L2SLOG("materialize copy '%s'->'%s': %s\n", src, dst, strerror(-rc)); }
+    return rc;
+#undef L2SLOG
+}
+
 /* Emulate link(src, dst) via the symlink scheme (both are host paths). With
  * -strace, log the exact failing host op so Android EPERM/EXDEV causes show up. */
 static int l2s_link(struct Machine *m, const char *src, const char *dst) {
@@ -291,8 +327,10 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
         struct stat sst;
         if (lstat(src, &sst) < 0) { L2SLOG("lstat('%s'): %s\n", src, strerror(errno)); return -errno; }
         if (!S_ISREG(sst.st_mode)) {
-            L2SLOG("src '%s' is not a regular file (mode 0%o)\n", src, sst.st_mode);
-            return -EPERM;
+            /* Not a named regular file (e.g. /proc/self/fd/N naming an O_TMPFILE):
+             * the symlink scheme can't apply, so copy the contents into dst. */
+            L2SLOG("materialize non-regular src '%s' (mode 0%o)\n", src, sst.st_mode);
+            return l2s_materialize(m, src, dst);
         }
         ino = (unsigned long long)sst.st_ino;
         l2s_dirname(src, dir);
@@ -865,7 +903,11 @@ SYSDEF(linkat) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (link(h1, h2) == 0) return 0;
+    /* Use host linkat with AT_SYMLINK_FOLLOW so the guest's flag is honored --
+     * notably it lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) be
+     * materialized, which plain link() cannot do. */
+    int hflags = (gf & G_AT_SYMLINK_FOLLOW) ? AT_SYMLINK_FOLLOW : 0;
+    if (linkat(AT_FDCWD, h1, AT_FDCWD, h2, hflags) == 0) return 0;
 #ifdef L2S_ENABLED
     if (c->m->link2symlink && (errno == EXDEV || errno == EPERM))
         return (u64)(s64)l2s_link(c->m, h1, h2);
