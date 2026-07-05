@@ -22,6 +22,7 @@ arm64chroot [options] <rootfs> <program> [args...]
 
   -strace          log guest syscalls to stderr
   -d               per-instruction trace (very verbose)
+  -nopd            disable the decoded-instruction cache (diagnostic; slower)
   -E VAR=VAL       set an environment variable for the guest (repeatable)
   -0 ARG0          override argv[0] for the guest program
   -fake-id [ID]    present a fake identity (fakeroot-style); ID = uid | uid:gid,

@@ -9,6 +9,7 @@
 #include "machine.h"
 #include "esr.h"
 #include "guest_abi.h"
+#include "predecode.h"
 
 /* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c weak hook):
  * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
@@ -49,10 +50,14 @@ int emu_loop(CPU *c) {
             /* Full step: keeps every per-instruction debug facility
              * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */
             cpu_step(c);
+        } else if (LIKELY(g_predecode)) {
+            /* Threaded fast path: executes instructions back-to-back through
+             * the decode cache, returning when this loop must intervene. */
+            pd_run(c);
         } else {
-            /* User-mode fast step: cpu_step minus the IRQ/FIQ-line and halted
-             * checks — nothing drives the interrupt lines in linux-user, and
-             * halted is cleared below before the next step could see it. */
+            /* -nopd: single-step fast path — cpu_step minus the IRQ/FIQ-line
+             * and halted checks (nothing drives the interrupt lines in
+             * linux-user; halted is cleared below before the next step). */
             c->cur_insn_pc = c->pc;
             u32 insn;
             if (LIKELY(mem_ifetch(c, c->pc, &insn))) {

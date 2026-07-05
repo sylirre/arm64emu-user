@@ -21,13 +21,15 @@
 #include "machine.h"
 #include "thread.h"
 
+extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
+
 struct Machine g_machine;
 
 extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: arm64chroot [-strace] [-d] [-E VAR=VAL]... [-0 argv0] "
+            "usage: arm64chroot [-strace] [-d] [-nopd] [-E VAR=VAL]... [-0 argv0] "
             "[-fake-id [uid[:gid]]] <rootfs> <program> [args...]\n");
     exit(2);
 }
@@ -68,6 +70,7 @@ int main(int argc, char **argv) {
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (!strcmp(argv[i], "-strace")) m->strace = 1;
         else if (!strcmp(argv[i], "-d")) { g_trace = 1; g_debug_hooks = 1; }
+        else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
         else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
             extra_env = realloc(extra_env, sizeof(char *) * (size_t)(n_extra + 1));

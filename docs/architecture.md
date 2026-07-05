@@ -90,27 +90,36 @@ something completely different.
 
 ## Control flow
 
-### One instruction (inlined fast step in `emu_loop`, `src/loop.c`)
+### One instruction (threaded fast path, `pd_run` in `src/predecode.c`)
 
 1. `cur_insn_pc = pc`.
 2. `mem_ifetch(pc, &insn)` — fast path reads through a per-thread single-page
    host-pointer cache; a miss or fault takes `mem_ifetch_slow`.
-3. `pc += 4`.
-4. `exec_a64(insn)` — 4-bit top-level switch → group decoder → execute, touching
-   registers directly and memory through the seam.
-5. `icount++`.
+3. Decode-cache lookup: a per-thread, per-PC cache of the *decoded* form
+   (dense opcode id + pre-extracted operands, 16 B/entry). The entry is a pure
+   function of the instruction word, so comparing it against the live fetched
+   word fully validates a hit — self-modifying/remapped code needs no flushes.
+   A mismatch runs the classifier (`pd_fill`) once.
+4. `pc += 4`; dispatch the opcode id by computed goto. ~200 hot forms execute
+   inline (transcribed from decode.c); everything else is `PD_GENERIC` →
+   `exec_a64(insn)` — 4-bit top-level switch → group decoder → execute.
+5. `icount++`; each handler then fetches and dispatches the *next* instruction
+   itself (direct threading), so instructions run back-to-back until something
+   rare — a recorded exception, pending signal, stop/halt, fetch fault —
+   returns control to `emu_loop`.
 
 When any per-instruction debug facility is active (`g_debug_hooks`) the loop
 instead calls the full `cpu_step` (`src/core/cpu.c`), which adds the debug
 hooks and the system emulator's IRQ/FIQ-line checks (never taken in
-linux-user).
+linux-user). `-nopd` selects a plain fetch → `exec_a64` step (diagnostic mode
+for bisecting decode-cache suspicions).
 
 ### One syscall (the run loop, `src/loop.c`)
 
 ```
 emu_loop:
   if c->stop: return
-  step one instruction (fast step above, or cpu_step under debug)
+  run instructions (pd_run burst; cpu_step under debug; plain step under -nopd)
   if g_tls.pend_exc.valid:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
@@ -137,6 +146,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/mmu.h`, `src/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/exception.c` | Pending-exception recorder (the exception seam). |
 | `src/loop.c` | Run loop + exception dispatch + signal delivery point. |
+| `src/predecode.h`, `src/predecode.c` | Decoded-instruction cache: classifier + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
 | `src/elf.c` | ELF64 loader, `PT_INTERP`, initial stack/auxv/HWCAP, sigreturn trampoline page. |
 | `src/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |
 | `src/syscall.c` + `src/sys_*.c` | Syscall dispatcher and per-area handlers. |
