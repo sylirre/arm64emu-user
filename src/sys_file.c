@@ -19,6 +19,7 @@
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/xattr.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -663,6 +664,149 @@ SYSDEF(getdents64) {
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     return (u64)n;
+}
+
+/* ---- extended attributes (xattr) ----
+ * value/list payloads are opaque bytes and names are C strings, so every variant
+ * is a straight bounce to the host.  Path variants resolve through the rootfs;
+ * the *l* variants keep the final symlink (resolve NOFOLLOW + host l*xattr) while
+ * the plain variants follow it.  fd variants use the guest==host fd directly. */
+#define XATTR_BUF_MAX (1u << 20)     /* Linux caps a value/list at 64 KiB; be generous */
+#define XATTR_NAME_BUF 256           /* XATTR_NAME_MAX (255) + NUL */
+
+/* Sized read shared by {get,lget,fget}xattr and {list,llist,flist}xattr.
+ * Exactly one target is live: `host` (path) or `fd`; `name` is NULL for the list
+ * variants.  size == 0 is the "how big?" probe (no buffer written). */
+static u64 xattr_read(CPU *c, const char *host, int fd, int follow,
+                      const char *name, u64 val_va, u64 size) {
+    size_t n = size > XATTR_BUF_MAX ? XATTR_BUF_MAX : (size_t)size;
+    void *buf = NULL;
+    if (n && !(buf = malloc(n))) return (u64)(s64)-ENOMEM;
+    ssize_t r;
+    if (host)
+        r = name ? (follow ? getxattr(host, name, buf, n)
+                           : lgetxattr(host, name, buf, n))
+                 : (follow ? listxattr(host, buf, n)
+                           : llistxattr(host, buf, n));
+    else
+        r = name ? fgetxattr(fd, name, buf, n) : flistxattr(fd, buf, n);
+    if (r < 0) { u64 e = host_err(); free(buf); return e; }
+    if (n && r > 0 && copy_to_guest(c, val_va, buf, (size_t)r) < 0) {
+        free(buf); return (u64)(s64)-EFAULT;
+    }
+    free(buf);
+    return (u64)r;
+}
+
+/* Sized write shared by {set,lset,fset}xattr. */
+static u64 xattr_write(CPU *c, const char *host, int fd, int follow,
+                       const char *name, u64 val_va, u64 size, int flags) {
+    size_t n = (size_t)size;
+    if (n > XATTR_BUF_MAX) return (u64)(s64)-E2BIG;
+    void *buf = NULL;
+    if (n) {
+        if (!(buf = malloc(n))) return (u64)(s64)-ENOMEM;
+        if (copy_from_guest(c, buf, val_va, n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    }
+    int r;
+    if (host)
+        r = follow ? setxattr(host, name, buf, n, flags)
+                   : lsetxattr(host, name, buf, n, flags);
+    else
+        r = fsetxattr(fd, name, buf, n, flags);
+    if (r < 0) { u64 e = host_err(); free(buf); return e; }
+    free(buf);
+    return 0;
+}
+
+/* Copy a guest xattr name; -errno on fault or overflow. */
+static long xattr_name(CPU *c, char *dst, u64 va) {
+    return copy_str_from_guest(c, dst, va, XATTR_NAME_BUF);
+}
+
+SYSDEF(getxattr) {   /* (path, name, value, size) — follow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_read(c, host, -1, 1, name, a2, a3);
+}
+SYSDEF(lgetxattr) {  /* (path, name, value, size) — nofollow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_read(c, host, -1, 0, name, a2, a3);
+}
+SYSDEF(fgetxattr) {  /* (fd, name, value, size) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_read(c, NULL, (int)a0, 1, name, a2, a3);
+}
+SYSDEF(listxattr) {  /* (path, list, size) — follow */
+    char host[PATH_MAX];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    return xattr_read(c, host, -1, 1, NULL, a1, a2);
+}
+SYSDEF(llistxattr) { /* (path, list, size) — nofollow */
+    char host[PATH_MAX];
+    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    return xattr_read(c, host, -1, 0, NULL, a1, a2);
+}
+SYSDEF(flistxattr) { /* (fd, list, size) */
+    return xattr_read(c, NULL, (int)a0, 1, NULL, a1, a2);
+}
+SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_write(c, host, -1, 1, name, a2, a3, (int)a4);
+}
+SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_write(c, host, -1, 0, name, a2, a3, (int)a4);
+}
+SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_write(c, NULL, (int)a0, 1, name, a2, a3, (int)a4);
+}
+SYSDEF(removexattr) {  /* (path, name) — follow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    if (removexattr(host, name) < 0) return host_err();
+    return 0;
+}
+SYSDEF(lremovexattr) { /* (path, name) — nofollow */
+    char host[PATH_MAX], name[XATTR_NAME_BUF];
+    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    if (lremovexattr(host, name) < 0) return host_err();
+    return 0;
+}
+SYSDEF(fremovexattr) { /* (fd, name) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    if (fremovexattr((int)a0, name) < 0) return host_err();
+    return 0;
 }
 
 /* ioctl whitelist: cmd values below are asm-generic and shared by arm64, arm

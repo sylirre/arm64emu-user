@@ -25,6 +25,10 @@ SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
 SYSDEF(sync_file_range); SYSDEF(eventfd2);
 SYSDEF(epoll_create1); SYSDEF(epoll_ctl); SYSDEF(epoll_pwait);
+SYSDEF(setxattr); SYSDEF(lsetxattr); SYSDEF(fsetxattr);
+SYSDEF(getxattr); SYSDEF(lgetxattr); SYSDEF(fgetxattr);
+SYSDEF(listxattr); SYSDEF(llistxattr); SYSDEF(flistxattr);
+SYSDEF(removexattr); SYSDEF(lremovexattr); SYSDEF(fremovexattr);
 
 /* sys_mm.c */
 SYSDEF(brk); SYSDEF(mmap); SYSDEF(munmap); SYSDEF(mprotect);
@@ -127,6 +131,18 @@ static const struct {
     { G_NR_epoll_create1, sys_epoll_create1, "epoll_create1" },
     { G_NR_epoll_ctl, sys_epoll_ctl, "epoll_ctl" },
     { G_NR_epoll_pwait, sys_epoll_pwait, "epoll_pwait" },
+    { G_NR_setxattr, sys_setxattr, "setxattr" },
+    { G_NR_lsetxattr, sys_lsetxattr, "lsetxattr" },
+    { G_NR_fsetxattr, sys_fsetxattr, "fsetxattr" },
+    { G_NR_getxattr, sys_getxattr, "getxattr" },
+    { G_NR_lgetxattr, sys_lgetxattr, "lgetxattr" },
+    { G_NR_fgetxattr, sys_fgetxattr, "fgetxattr" },
+    { G_NR_listxattr, sys_listxattr, "listxattr" },
+    { G_NR_llistxattr, sys_llistxattr, "llistxattr" },
+    { G_NR_flistxattr, sys_flistxattr, "flistxattr" },
+    { G_NR_removexattr, sys_removexattr, "removexattr" },
+    { G_NR_lremovexattr, sys_lremovexattr, "lremovexattr" },
+    { G_NR_fremovexattr, sys_fremovexattr, "fremovexattr" },
 
     { G_NR_brk, sys_brk, "brk" },
     { G_NR_mmap, sys_mmap, "mmap" },

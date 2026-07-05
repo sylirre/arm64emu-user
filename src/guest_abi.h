@@ -10,6 +10,18 @@
 #include "types.h"
 
 /* ---- syscall numbers (arch/arm64 uses asm-generic/unistd.h) ---- */
+#define G_NR_setxattr          5
+#define G_NR_lsetxattr         6
+#define G_NR_fsetxattr         7
+#define G_NR_getxattr          8
+#define G_NR_lgetxattr         9
+#define G_NR_fgetxattr         10
+#define G_NR_listxattr         11
+#define G_NR_llistxattr        12
+#define G_NR_flistxattr        13
+#define G_NR_removexattr       14
+#define G_NR_lremovexattr      15
+#define G_NR_fremovexattr      16
 #define G_NR_getcwd            17
 #define G_NR_eventfd2          19
 #define G_NR_epoll_create1     20
