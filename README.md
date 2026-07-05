@@ -103,6 +103,11 @@ host needs it for wide atomics — added automatically).
 
 ## Design
 
+Deeper architecture notes live under [`docs/`](docs/README.md): the copied-core
+seams, the guest memory model and host-ordering discipline, the syscall layer and
+`-fake-id`, signal/job-control and the process model, and a catalog of
+host-portability pitfalls.
+
 ```
 src/
   core/         COPIED from ARM64EMU_System (kept diffable):
