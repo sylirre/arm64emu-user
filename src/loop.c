@@ -42,13 +42,30 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
 }
 
 int emu_loop(CPU *c) {
-    struct Machine *m = c->m;
     for (;;) {
-        cpu_step(c);
-        /* WFE/WFI at EL0: treat as yield. */
-        if (c->halted) c->halted = false;
+        if (UNLIKELY(c->stop)) return 0;
 
-        if (g_tls.pend_exc.valid) {
+        if (UNLIKELY(g_debug_hooks)) {
+            /* Full step: keeps every per-instruction debug facility
+             * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */
+            cpu_step(c);
+        } else {
+            /* User-mode fast step: cpu_step minus the IRQ/FIQ-line and halted
+             * checks — nothing drives the interrupt lines in linux-user, and
+             * halted is cleared below before the next step could see it. */
+            c->cur_insn_pc = c->pc;
+            u32 insn;
+            if (LIKELY(mem_ifetch(c, c->pc, &insn))) {
+                c->pc += 4;
+                exec_a64(c, insn);
+                c->icount++;
+            }
+        }
+
+        /* WFE/WFI at EL0: treat as yield. */
+        if (UNLIKELY(c->halted)) c->halted = false;
+
+        if (UNLIKELY(g_tls.pend_exc.valid)) {
             g_tls.pend_exc.valid = false;
             u64 esr = g_tls.pend_exc.esr;
             u64 far = g_tls.pend_exc.far;
@@ -84,8 +101,6 @@ int emu_loop(CPU *c) {
         }
 
         /* Deliver any host-caught guest signal at this safe boundary. */
-        if (g_sig_npend) sig_deliver_pending(c);
-
-        if (c->stop) return 0;
+        if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
     }
 }

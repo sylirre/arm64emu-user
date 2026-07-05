@@ -10,7 +10,7 @@
 /* FP/SIMD group hook (M4). Weak so M1 links standalone. */
 void exec_fpsimd(CPU *c, u32 insn) __attribute__((weak));
 
-static void undefined(CPU *c, u32 insn) {
+static void __attribute__((cold)) undefined(CPU *c, u32 insn) {
     /* Architecturally an UNDEFINED instruction takes a synchronous exception
      * with EC_UNKNOWN. During bring-up we also log it. */
     if (g_trace)

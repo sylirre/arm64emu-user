@@ -8,6 +8,10 @@
 
 #include "cpu.h"
 
+/* Branch-prediction hints for the interpreter hot paths (run loop, mem seam). */
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 typedef enum { ACC_READ, ACC_WRITE, ACC_EXEC } AccType;
 
 /* Typed accesses. Return false if a fault was raised (caller must abort the
@@ -45,8 +49,10 @@ static inline bool mem_ifetch(CPU *c, u64 va, u32 *insn_out) {
 bool mem_read128(CPU *c, u64 va, V128 *out);
 bool mem_write128(CPU *c, u64 va, const V128 *val);
 
-/* Invalidate cached translations (fetch cache). Kept under the system
- * emulator's name so the copied core compiles unchanged. */
+/* Invalidate this thread's cached translations (fetch cache + data TLB). Kept
+ * under the system emulator's name so the copied core compiles unchanged.
+ * Cross-thread invalidation happens via the address-space generation counter
+ * in mem.c, bumped by every PTE mutation. */
 void tlb_flush_all(void);
 
 /* ---- Guest address space (linux-user), defined in mem.c ---- */

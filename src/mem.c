@@ -22,7 +22,27 @@
 /* Per-thread: each guest thread fetches from its own PC. */
 __thread FetchCache g_fcache;
 
-void tlb_flush_all(void) { g_fcache.host = NULL; }
+/* Data-side TLB: direct-mapped VA-page -> PTE cache in front of the 2-level
+ * walk in translate(). Per-thread like g_fcache. Coherence across threads
+ * (the page table is shared): g_as_gen is bumped, under the AS lock, by every
+ * PTE mutation; a lookup that sees a generation other than the one its TLB
+ * reflects empties the TLB first, so one thread's munmap/mprotect invalidates
+ * every thread's cached translations at their next access. */
+#define DTLB_BITS 8                        /* 256 entries x 16 B = 4 KB/thread */
+#define DTLB_SIZE (1u << DTLB_BITS)
+typedef struct { u64 page; uintptr_t pte; } DTlbEntry;
+static __thread DTlbEntry g_dtlb[DTLB_SIZE];
+static __thread unsigned long g_dtlb_gen;  /* generation g_dtlb reflects; 0 = flushed */
+static unsigned long g_as_gen = 1;         /* never 0; word-sized: lock-free on ILP32 */
+
+static void as_gen_bump(void) {
+    __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
+}
+
+void tlb_flush_all(void) {
+    g_fcache.host = NULL;
+    g_dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
+}
 
 /* 128-bit CAS fallback lock for hosts without lock-free __int128 (32-bit ARM
  * without LSE support in libatomic). One interpreter thread holds it at a time;
@@ -76,6 +96,7 @@ static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) 
         }
         (*slot)[L2_IDX(va)] = host ? ((uintptr_t)(host + off) | prot) : 0;
     }
+    as_gen_bump();
     tlb_flush_all();
 }
 
@@ -86,6 +107,7 @@ static void pte_prot_range(AddrSpace *as, u64 addr, u64 len, u32 prot) {
         if (l2 && l2[L2_IDX(va)])
             l2[L2_IDX(va)] = (l2[L2_IDX(va)] & ~(uintptr_t)PTE_FLAGS) | prot;
     }
+    as_gen_bump();
     tlb_flush_all();
 }
 
@@ -287,6 +309,7 @@ void as_destroy(AddrSpace *as) {
     for (size_t i = 0; i < L1_SIZE; i++) free(as->l1[i]);
     free(as->l1);
     memset(as, 0, sizeof *as);
+    as_gen_bump();
     tlb_flush_all();
 }
 
@@ -297,16 +320,31 @@ static AddrSpace *cpu_as(CPU *c) { return &c->m->as; }
 /* Raise the guest-visible abort for a failed data access. The DFSC encodes
  * unmapped (translation fault -> SEGV_MAPERR) vs permission (-> SEGV_ACCERR)
  * for precise siginfo later. */
-static void raise_dabort(CPU *c, u64 va, bool write, bool perm) {
+static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool perm) {
     unsigned fsc = perm ? FSC_PERM_L3 : FSC_TRANS_L3;
     cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, fsc)), va);
 }
 
 static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
-    if (va >= GUEST_TASK_SIZE) { *perm_fault = false; return NULL; }
-    uintptr_t pte = pte_get(cpu_as(c), va);
-    if (!pte) { *perm_fault = false; return NULL; }
-    if ((pte & need) != need) { *perm_fault = true; return NULL; }
+    *perm_fault = false;
+    if (UNLIKELY(va >= GUEST_TASK_SIZE)) return NULL;
+    unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
+    if (UNLIKELY(gen != g_dtlb_gen)) {
+        memset(g_dtlb, 0, sizeof g_dtlb);
+        g_dtlb_gen = gen;
+    }
+    u64 page = va >> 12;
+    DTlbEntry *e = &g_dtlb[page & (DTLB_SIZE - 1)];
+    uintptr_t pte;
+    if (LIKELY(e->pte && e->page == page)) {
+        pte = e->pte;
+    } else {
+        pte = pte_get(cpu_as(c), va);
+        if (!pte) return NULL;                 /* never cache misses */
+        e->page = page;
+        e->pte = pte;
+    }
+    if (UNLIKELY((pte & need) != need)) { *perm_fault = true; return NULL; }
     return (u8 *)(pte & ~(uintptr_t)PTE_FLAGS) + (va & GUEST_PAGE_MASK);
 }
 

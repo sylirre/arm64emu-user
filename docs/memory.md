@@ -36,6 +36,16 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
 raises the appropriate data/instruction abort ESR via `cpu_raise_sync`, so later
 `SIGSEGV` `si_code` is precise.
 
+In front of the walk sits a **data-side TLB** (`g_dtlb`, `__thread`): a
+256-entry direct-mapped VA-page → PTE cache, so a hit is one tag compare
+instead of the two dependent table loads. The permission check still runs per
+access (one entry serves R/W/X), and negative results are never cached.
+Cross-thread coherence — the page table is shared — comes from a global
+generation counter bumped under the AS lock by every PTE mutation; each lookup
+compares it (acquire load) against the generation its TLB reflects and empties
+the TLB on mismatch, so another thread's `munmap`/`mprotect` is honored at the
+next access. `tlb_flush_all` also forces a re-sync for the calling thread.
+
 - `mem_read` / `mem_write` / `mem_read128` / `mem_write128`: bounds-check, walk,
   permission-check, `memcpy`. An access that straddles a page boundary is split
   recursively (unaligned in-page access is a plain `memcpy` — EL0 Linux semantics

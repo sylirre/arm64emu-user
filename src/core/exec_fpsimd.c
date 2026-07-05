@@ -9,7 +9,7 @@
 #define BIT(i)      ((insn >> (i)) & 1u)
 #define BITS(hi,lo) ((insn >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1))
 
-static void fpsimd_undef(CPU *c, u32 insn) {
+static void __attribute__((cold)) fpsimd_undef(CPU *c, u32 insn) {
     /* Always log: drives the on-demand FP/SIMD implementation loop. */
     fprintf(stderr, "[fpsimd] UNIMPL 0x%08x at pc=0x%llx\n",
             insn, (unsigned long long)c->cur_insn_pc);

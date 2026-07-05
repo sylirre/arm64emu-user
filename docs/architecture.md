@@ -90,7 +90,7 @@ something completely different.
 
 ## Control flow
 
-### One instruction (`cpu_step`, `src/core/cpu.c`)
+### One instruction (inlined fast step in `emu_loop`, `src/loop.c`)
 
 1. `cur_insn_pc = pc`.
 2. `mem_ifetch(pc, &insn)` — fast path reads through a per-thread single-page
@@ -100,11 +100,17 @@ something completely different.
    registers directly and memory through the seam.
 5. `icount++`.
 
+When any per-instruction debug facility is active (`g_debug_hooks`) the loop
+instead calls the full `cpu_step` (`src/core/cpu.c`), which adds the debug
+hooks and the system emulator's IRQ/FIQ-line checks (never taken in
+linux-user).
+
 ### One syscall (the run loop, `src/loop.c`)
 
 ```
 emu_loop:
-  cpu_step(c)
+  if c->stop: return
+  step one instruction (fast step above, or cpu_step under debug)
   if g_tls.pend_exc.valid:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
@@ -113,7 +119,6 @@ emu_loop:
         EC_BRK64            -> sig_deliver_fault(SIGTRAP)
         EC_UNKNOWN/default   -> sig_deliver_fault(SIGILL)
   if g_sig_npend:  sig_deliver_pending(c)   // host-caught guest signals, at a safe point
-  if c->stop: return
 ```
 
 `syscall_dispatch` (`src/syscall.c`) indexes a table of ~150 handlers grouped

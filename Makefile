@@ -2,9 +2,14 @@
 # C11 + libc only; builds on x86_64/i386/arm/aarch64 Linux with GCC or Clang.
 CC      ?= cc
 CFLAGS  ?= -O2
+# LTO (opt-in: `make LTO=-flto`). It measured ~28% faster before the data-TLB
+# and merged run loop landed, but those capture the same cross-TU seam in
+# source; on top of them LTO measures slightly slower (docs/todo-performance.md),
+# so it is off by default.
+LTO     ?=
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
-           -Isrc -Isrc/core
+           -Isrc -Isrc/core $(LTO)
 LDFLAGS ?=
 LDFLAGS += -lm -lpthread
 # 8/16-byte atomics on 32-bit hosts may need libatomic; harmless if unused.
