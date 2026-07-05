@@ -311,11 +311,21 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
         }
     }
 
+    /* A "hardlink" symlink must use a bare same-directory basename target
+     * (".l2s.<ino>"): that resolves correctly whether the guest or the emulator
+     * follows it. An absolute target can't -- a host path would be re-rooted by
+     * the guest, and a guest path would be wrong for the emulator. So a guest
+     * hardlink whose two names are in different directories can't share the
+     * backing via a symlink; copy instead (independent inode, correct data). */
+    char ddir[PATH_MAX];
+    l2s_dirname(dst, ddir);
+
     if (isl == 1) {
-        /* Existing group: bump the marker count. */
+        /* Existing group. */
         l2s_parse_data(l2s_basename(data), &ino);
         l2s_dirname(data, dir);
-        char newm[PATH_MAX], oldm[PATH_MAX];
+        if (strcmp(dir, ddir) != 0) return l2s_materialize(m, data, dst);   /* cross-dir */
+        char newm[PATH_MAX], oldm[PATH_MAX];                                /* bump count */
         unsigned long nc = (count ? count : 1) + 1;
         if (l2s_marker_name(newm, dir, ino, nc) < 0) return -ENAMETOOLONG;
         if (count && l2s_marker_name(oldm, dir, ino, count) == 0)
@@ -332,16 +342,18 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
             L2SLOG("materialize non-regular src '%s' (mode 0%o)\n", src, sst.st_mode);
             return l2s_materialize(m, src, dst);
         }
-        ino = (unsigned long long)sst.st_ino;
         l2s_dirname(src, dir);
+        if (strcmp(dir, ddir) != 0)              /* cross-dir: copy, leave src intact */
+            return l2s_materialize(m, src, dst);
+        ino = (unsigned long long)sst.st_ino;
         if (l2s_data_name(data, dir, ino) < 0) return -ENAMETOOLONG;
         if (rename(src, data) < 0) {                          /* move the contents */
             L2SLOG("rename('%s' -> '%s'): %s\n", src, data, strerror(errno));
             return -errno;
         }
-        if (symlink(data, src) < 0) {                         /* src -> data (absolute) */
+        if (symlink(l2s_basename(data), src) < 0) {           /* src -> data (same dir) */
             int e = errno;
-            L2SLOG("symlink('%s' -> '%s'): %s\n", data, src, strerror(e));
+            L2SLOG("symlink('%s' -> '%s'): %s\n", l2s_basename(data), src, strerror(e));
             rename(data, src);                                /* best-effort rollback */
             return -e;
         }
@@ -349,11 +361,9 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
         if (l2s_marker_name(newm, dir, ino, 2) == 0) l2s_touch(newm);
     }
 
-    /* Point dst at the data file. Absolute target so an individual name can be
-     * renamed to any directory and still resolve (only moving the directory
-     * that holds the backing file breaks a group). */
-    if (symlink(data, dst) < 0) {
-        L2SLOG("symlink('%s' -> '%s'): %s\n", data, dst, strerror(errno));
+    /* Point dst at the data file with a same-directory (relative) target. */
+    if (symlink(l2s_basename(data), dst) < 0) {
+        L2SLOG("symlink('%s' -> '%s'): %s\n", l2s_basename(data), dst, strerror(errno));
         return -errno;
     }
     return 0;
@@ -907,6 +917,10 @@ SYSDEF(linkat) {
      * notably it lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) be
      * materialized, which plain link() cannot do. */
     int hflags = (gf & G_AT_SYMLINK_FOLLOW) ? AT_SYMLINK_FOLLOW : 0;
+#if defined(L2S_ENABLED) && defined(A64_L2S_FORCE)
+    /* Test hook: exercise the l2s path even where the host allows hardlinks. */
+    if (c->m->link2symlink) return (u64)(s64)l2s_link(c->m, h1, h2);
+#endif
     if (linkat(AT_FDCWD, h1, AT_FDCWD, h2, hflags) == 0) return 0;
 #ifdef L2S_ENABLED
     /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path
