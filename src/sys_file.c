@@ -249,8 +249,11 @@ static int l2s_target(const char *host, char *data, unsigned long *count) {
     return 0;
 }
 
-/* Emulate link(src, dst) via the symlink scheme (both are host paths). */
-static int l2s_link(const char *src, const char *dst) {
+/* Emulate link(src, dst) via the symlink scheme (both are host paths). With
+ * -strace, log the exact failing host op so Android EPERM/EXDEV causes show up. */
+static int l2s_link(struct Machine *m, const char *src, const char *dst) {
+#define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
+    L2SLOG("linkat fallback: '%s' -> '%s'\n", src, dst);
     struct stat dsst;
     if (lstat(dst, &dsst) == 0) return -EEXIST;   /* link(2): dst must not exist */
 
@@ -258,7 +261,7 @@ static int l2s_link(const char *src, const char *dst) {
     unsigned long count;
     unsigned long long ino;
     int isl = l2s_resolve(src, data, &count);
-    if (isl < 0) return isl;
+    if (isl < 0) { L2SLOG("resolve('%s'): %s\n", src, strerror(-isl)); return isl; }
 
     /* AT_SYMLINK_FOLLOW may have resolved src directly onto the data file. */
     if (isl == 0) {
@@ -286,14 +289,21 @@ static int l2s_link(const char *src, const char *dst) {
     } else {
         /* First hardlink for a real file: it must be a regular file. */
         struct stat sst;
-        if (lstat(src, &sst) < 0) return -errno;
-        if (!S_ISREG(sst.st_mode)) return -EPERM;
+        if (lstat(src, &sst) < 0) { L2SLOG("lstat('%s'): %s\n", src, strerror(errno)); return -errno; }
+        if (!S_ISREG(sst.st_mode)) {
+            L2SLOG("src '%s' is not a regular file (mode 0%o)\n", src, sst.st_mode);
+            return -EPERM;
+        }
         ino = (unsigned long long)sst.st_ino;
         l2s_dirname(src, dir);
         if (l2s_data_name(data, dir, ino) < 0) return -ENAMETOOLONG;
-        if (rename(src, data) < 0) return -errno;             /* move the contents */
+        if (rename(src, data) < 0) {                          /* move the contents */
+            L2SLOG("rename('%s' -> '%s'): %s\n", src, data, strerror(errno));
+            return -errno;
+        }
         if (symlink(data, src) < 0) {                         /* src -> data (absolute) */
             int e = errno;
+            L2SLOG("symlink('%s' -> '%s'): %s\n", data, src, strerror(e));
             rename(data, src);                                /* best-effort rollback */
             return -e;
         }
@@ -304,8 +314,12 @@ static int l2s_link(const char *src, const char *dst) {
     /* Point dst at the data file. Absolute target so an individual name can be
      * renamed to any directory and still resolve (only moving the directory
      * that holds the backing file breaks a group). */
-    if (symlink(data, dst) < 0) return -errno;
+    if (symlink(data, dst) < 0) {
+        L2SLOG("symlink('%s' -> '%s'): %s\n", data, dst, strerror(errno));
+        return -errno;
+    }
     return 0;
+#undef L2SLOG
 }
 
 /* One name in a group was removed: `data`/`count` come from l2s_resolve run
@@ -854,7 +868,7 @@ SYSDEF(linkat) {
     if (link(h1, h2) == 0) return 0;
 #ifdef L2S_ENABLED
     if (c->m->link2symlink && (errno == EXDEV || errno == EPERM))
-        return (u64)(s64)l2s_link(h1, h2);
+        return (u64)(s64)l2s_link(c->m, h1, h2);
 #endif
     return host_err();
 }
