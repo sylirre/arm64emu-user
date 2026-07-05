@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/random.h>
+#include <sys/syscall.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -184,7 +184,7 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
 
     /* Strings at the top of the stack. */
     u8 rnd[16];
-    if (getrandom(rnd, sizeof rnd, 0) != sizeof rnd)
+    if (syscall(SYS_getrandom, rnd, sizeof rnd, 0) != (long)sizeof rnd)
         for (int i = 0; i < 16; i++) rnd[i] = (u8)(i * 41 + 7);
     u64 rnd_va = stack_push(m, &sp, rnd, sizeof rnd);
     u64 plat_va = stack_push(m, &sp, "aarch64", 8);

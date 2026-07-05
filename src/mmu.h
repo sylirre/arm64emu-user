@@ -74,6 +74,9 @@ typedef struct Region {
     u64  start, end;          /* guest range [start, end), page aligned */
     u32  prot;                /* PTE_R/W/X */
     u32  shared;              /* MAP_SHARED file mapping (host prot mirrors) */
+    u32  map_pad;             /* host bytes before `host` in the real mmap: nonzero
+                               * only for a MAP_SHARED mapping whose 4 KB-aligned file
+                               * offset isn't host-page aligned (host page > 4 KB) */
     u8  *host;                /* host address backing `start` */
     char *path;               /* strdup'd guest path for /proc/self/maps, or NULL */
     u64  file_off;            /* file offset at `start` (file-backed only) */

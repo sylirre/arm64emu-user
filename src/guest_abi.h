@@ -318,6 +318,15 @@
 
 /* ---- guest struct layouts (arm64 LP64) ---- */
 
+/* Bionic <sys/stat.h> defines st_{a,m,c}time_nsec as macros (-> st_Xtim.tv_nsec),
+ * and sys.h includes <sys/stat.h> before this header, so those macros would
+ * corrupt the guest field names below. Host stat is only ever read via its raw
+ * st_Xtim members (see sys_file.c), never these macros, so drop them. glibc does
+ * not define them, so this is a no-op there. */
+#undef st_atime_nsec
+#undef st_mtime_nsec
+#undef st_ctime_nsec
+
 /* asm-generic struct stat for arm64 (128 bytes). */
 typedef struct {
     u64 st_dev;

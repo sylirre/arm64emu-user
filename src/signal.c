@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -139,7 +140,9 @@ void sig_reset_for_exec(struct Machine *m) {
 #define MC_PC         (MCTX_OFF + 264)
 #define MC_PSTATE     (MCTX_OFF + 272)
 #define MC_RESERVED   (MCTX_OFF + 288)   /* fpsimd_context + terminator */
+#ifndef FPSIMD_MAGIC  /* Bionic <asm/sigcontext.h> already defines it (same value) */
 #define FPSIMD_MAGIC  0x46508001u
+#endif
 #define FRAME_SIZE    ((MC_RESERVED + 544 + 15) & ~15)
 
 static void wr64(CPU *c, u64 base, u64 off, u64 v) { copy_to_guest(c, base + off, &v, 8); }

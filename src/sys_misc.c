@@ -3,7 +3,6 @@
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
 #include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -15,7 +14,7 @@ SYSDEF(getrandom) {
     size_t len = (size_t)a1;
     if (len > 65536) len = 65536;
     u8 buf[65536];
-    ssize_t n = getrandom(buf, len, (unsigned)a2);
+    ssize_t n = syscall(SYS_getrandom, buf, len, (unsigned)a2);
     if (n < 0) return host_err();
     if (copy_to_guest(c, a0, buf, (size_t)n) < 0) return (u64)(s64)-EFAULT;
     return (u64)n;

@@ -164,13 +164,19 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
         u64 cut_lo = addr > r->start ? addr : r->start;
         u64 cut_hi = end < r->end ? end : r->end;
         int whole_region = (cut_lo == r->start && cut_hi == r->end);
-        if (whole_region || g_host_pagesz == (long)GUEST_PAGE_SIZE)
+        if (whole_region)
+            munmap(r->host - r->map_pad, (cut_hi - cut_lo) + r->map_pad);
+        else if (g_host_pagesz == (long)GUEST_PAGE_SIZE)
             munmap(r->host + (cut_lo - r->start), cut_hi - cut_lo);
         if (whole_region) {
             region_delete(as, i);
             i--;
             continue;
         }
+        /* Surviving fragment: its map_pad no longer spans a whole mmap, so drop it.
+         * The underlying host mapping is then retained until whole-region teardown
+         * (same policy as sub-region munmap on >4 KB hosts). */
+        r->map_pad = 0;
         if (cut_lo == r->start) {              /* trim head */
             r->host += cut_hi - r->start;
             r->file_off += cut_hi - r->start;
@@ -215,14 +221,27 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     if ((addr | len | off) & GUEST_PAGE_MASK || addr + len > GUEST_TASK_SIZE || !len)
         return -EINVAL;
     u8 *host;
+    u64 pad = 0;
     if (shared) {
         /* MAP_SHARED must be a real host mapping so stores reach the file.
          * Host prot mirrors guest write permission (host write to a read-only
          * mapping of an O_RDONLY fd is refused by the kernel). */
         int hprot = PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0);
         void *p = mmap(NULL, len, hprot, MAP_SHARED, host_fd, (off_t)off);
-        if (p == MAP_FAILED) return -errno;
-        host = p;
+        if (p == MAP_FAILED) {
+            /* Host page > 4 KB (e.g. Android 16 KB kernels): mmap requires the file
+             * offset to be host-page aligned, but guest offsets are only 4 KB
+             * aligned. Map from the host-page-aligned offset below and expose a
+             * padded view, so MAP_SHARED write-back still reaches the file. */
+            if (errno != EINVAL || g_host_pagesz <= (long)GUEST_PAGE_SIZE ||
+                !(off & (u64)(g_host_pagesz - 1)))
+                return -errno;
+            u64 aligned = off & ~(u64)(g_host_pagesz - 1);
+            pad = off - aligned;
+            p = mmap(NULL, len + pad, hprot, MAP_SHARED, host_fd, (off_t)aligned);
+            if (p == MAP_FAILED) return -errno;
+            host = (u8 *)p + pad;
+        } else host = p;
     } else {
         /* MAP_PRIVATE file mapping: private copy-on-write host mapping, RW so
          * software-protected guest pages stay reachable by the emulator. */
@@ -239,7 +258,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     }
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = (u32)shared, .host = host,
+                 .shared = (u32)shared, .host = host, .map_pad = (u32)pad,
                  .path = path ? strdup(path) : NULL, .file_off = off };
     region_insert(as, r);
     pte_set_range(as, addr, len, host, prot);
@@ -265,8 +284,22 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
             /* Mirror the write bit onto the host mapping for the overlap. */
             u64 lo = addr > r->start ? addr : r->start;
             u64 hi = (addr + len) < r->end ? (addr + len) : r->end;
-            mprotect(r->host + (lo - r->start), hi - lo,
-                     PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0));
+            if (g_host_pagesz == (long)GUEST_PAGE_SIZE) {
+                mprotect(r->host + (lo - r->start), hi - lo,
+                         PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0));
+            } else if (prot & PTE_W) {
+                /* >4 KB host: up to four 4 KB guest pages share one host page, so the
+                 * host mapping can't track them independently. Only ever widen write
+                 * access (align to whole host pages), never revoke it — a shared host
+                 * page may still back a writable guest page, and guest RO stays
+                 * enforced by the software PTEs, so an over-permissive host mapping is
+                 * harmless (the emulator never writes a non-PTE_W page). */
+                uintptr_t hpsz = (uintptr_t)g_host_pagesz;
+                uintptr_t a = (uintptr_t)(r->host + (lo - r->start)) & ~(hpsz - 1);
+                uintptr_t b = ((uintptr_t)(r->host + (hi - r->start)) + hpsz - 1)
+                              & ~(hpsz - 1);
+                mprotect((void *)a, (size_t)(b - a), PROT_READ | PROT_WRITE);
+            }
         }
         if (addr <= r->start && addr + len >= r->end) {
             r->prot = prot;   /* fully covered: update bookkeeping */
@@ -304,7 +337,8 @@ u64 as_find_free_impl(AddrSpace *as, u64 len) {
 
 void as_destroy(AddrSpace *as) {
     for (int i = 0; i < as->nregions; i++) {
-        munmap(as->regions[i].host, as->regions[i].end - as->regions[i].start);
+        munmap(as->regions[i].host - as->regions[i].map_pad,
+               (as->regions[i].end - as->regions[i].start) + as->regions[i].map_pad);
         free(as->regions[i].path);
     }
     free(as->regions);
