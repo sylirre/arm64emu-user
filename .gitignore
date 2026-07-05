@@ -1,0 +1,10 @@
+# build outputs
+/arm64chroot
+/arm64chroot32
+/arm64chroot_armhf
+/arm64chroot_arm64
+*.o
+
+# test binaries (built on demand by tests/run_tests.sh)
+tests/asm/*.bin
+tests/c/*.bin
