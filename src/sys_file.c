@@ -44,14 +44,14 @@ int oflags_h2g(int h) {
     return g;
 }
 
-void gstat_from_host(GStat *g, const struct stat *st) {
+void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
     memset(g, 0, sizeof *g);
     g->st_dev = st->st_dev;
     g->st_ino = st->st_ino;
     g->st_mode = st->st_mode;
     g->st_nlink = (u32)st->st_nlink;
-    g->st_uid = st->st_uid;
-    g->st_gid = st->st_gid;
+    g->st_uid = remap_uid(m, st->st_uid);   /* fake-id ownership remap */
+    g->st_gid = remap_gid(m, st->st_gid);
     g->st_rdev = st->st_rdev;
     g->st_size = st->st_size;
     g->st_blksize = (s32)st->st_blksize;
@@ -63,6 +63,9 @@ void gstat_from_host(GStat *g, const struct stat *st) {
     g->st_ctime_sec = st->st_ctim.tv_sec;
     g->st_ctime_nsec = st->st_ctim.tv_nsec;
 }
+
+/* True when -fake-id is active and the guest's effective uid is root. */
+static int fake_root(struct Machine *m) { return m->fake_id && m->cred.euid == 0; }
 
 /* Bounded guest-iovec import. Returns iov count or -errno. */
 static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
@@ -193,7 +196,7 @@ SYSDEF(fstat) {
     struct stat st;
     if (fstat((int)a0, &st) < 0) return host_err();
     GStat g;
-    gstat_from_host(&g, &st);
+    gstat_from_host(c->m, &g, &st);
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
@@ -221,15 +224,28 @@ SYSDEF(newfstatat) {
     }
 out:;
     GStat g;
-    gstat_from_host(&g, &st);
+    gstat_from_host(c->m, &g, &st);
     return copy_to_guest(c, a2, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+/* Root's DAC bypass: existence and R/W are always granted; X requires at least
+ * one execute bit. Applied only when fake-root, and only as a fallback after the
+ * host check (so a genuinely-accessible file still succeeds normally). */
+static u64 access_fake_root(struct Machine *m, const char *host, int mode) {
+    if (!fake_root(m)) return host_err();
+    struct stat st;
+    if (stat(host, &st) < 0) return host_err();     /* keep ENOENT etc. */
+    if ((mode & X_OK) && !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+        return (u64)(s64)-EACCES;
+    return 0;
 }
 
 SYSDEF(faccessat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, 0, host, NULL);
     if (r < 0) return (u64)(s64)r;
-    return faccessat(AT_FDCWD, host, (int)a2, 0) < 0 ? host_err() : 0;
+    if (faccessat(AT_FDCWD, host, (int)a2, 0) == 0) return 0;
+    return access_fake_root(c->m, host, (int)a2);
 }
 
 SYSDEF(faccessat2) {
@@ -238,7 +254,8 @@ SYSDEF(faccessat2) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
     if (r < 0) return (u64)(s64)r;
-    return faccessat(AT_FDCWD, host, (int)a2, (int)(gf & ~0x100u)) < 0 ? host_err() : 0;
+    if (faccessat(AT_FDCWD, host, (int)a2, (int)(gf & ~0x100u)) == 0) return 0;
+    return access_fake_root(c->m, host, (int)a2);
 }
 
 SYSDEF(readlinkat) {
@@ -496,13 +513,22 @@ SYSDEF(truncate) {
     return truncate(host, (off_t)(s64)a1) < 0 ? host_err() : 0;
 }
 
-SYSDEF(fchmod) { return fchmod((int)a0, (mode_t)a1) < 0 ? host_err() : 0; }
+/* Fake-root (fake_id && euid==0) turns an EPERM/EINVAL failure on an ownership/
+ * mode change into success — the host can't perform it unprivileged, but the
+ * guest believes it is root. Real errors (ENOENT, etc.) still propagate. */
+static u64 chattr_result(struct Machine *m, int rr) {
+    if (rr == 0) return 0;
+    if (fake_root(m) && (errno == EPERM || errno == EINVAL || errno == EACCES)) return 0;
+    return host_err();
+}
+
+SYSDEF(fchmod) { return chattr_result(c->m, fchmod((int)a0, (mode_t)a1)); }
 
 SYSDEF(fchmodat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, 0, host, NULL);
     if (r < 0) return (u64)(s64)r;
-    return chmod(host, (mode_t)a2) < 0 ? host_err() : 0;
+    return chattr_result(c->m, chmod(host, (mode_t)a2));
 }
 
 SYSDEF(fchownat) {
@@ -513,11 +539,11 @@ SYSDEF(fchownat) {
     if (r < 0) return (u64)(s64)r;
     int rr = (gf & G_AT_SYMLINK_NOFOLLOW) ? lchown(host, (uid_t)a2, (gid_t)a3)
                                           : chown(host, (uid_t)a2, (gid_t)a3);
-    return rr < 0 ? host_err() : 0;
+    return chattr_result(c->m, rr);
 }
 
 SYSDEF(fchown) {
-    return fchown((int)a0, (uid_t)a1, (gid_t)a2) < 0 ? host_err() : 0;
+    return chattr_result(c->m, fchown((int)a0, (uid_t)a1, (gid_t)a2));
 }
 
 SYSDEF(utimensat) {
@@ -621,6 +647,12 @@ SYSDEF(statx) {
                     (unsigned)a3, buf);
     }
     if (r < 0) return host_err();
+    if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) */
+        u32 u, g;
+        memcpy(&u, buf + 20, 4); memcpy(&g, buf + 24, 4);
+        u = remap_uid(c->m, u); g = remap_gid(c->m, g);
+        memcpy(buf + 20, &u, 4); memcpy(buf + 24, &g, 4);
+    }
     return copy_to_guest(c, a4, buf, 256) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 

@@ -33,11 +33,25 @@ SYSDEF(exit_group) {
 
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
 SYSDEF(getppid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getppid(); }
-SYSDEF(getuid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getuid(); }
-SYSDEF(geteuid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)geteuid(); }
-SYSDEF(getgid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getgid(); }
-SYSDEF(getegid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getegid(); }
 SYSDEF(gettid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)g_tls.tid; }
+
+/* ---- credential policy (-fake-id). "Privileged" == fake euid is root. ---- */
+#define ID_KEEP ((u32)-1)          /* the -1 "leave unchanged" sentinel */
+
+static int cred_priv(struct Machine *m) { return m->cred.euid == 0; }
+
+/* Is `v` one of the current real/effective/saved ids? (unprivileged constraint) */
+static int in_uset(struct Machine *m, u32 v) {
+    return v == m->cred.ruid || v == m->cred.euid || v == m->cred.suid;
+}
+static int in_gset(struct Machine *m, u32 v) {
+    return v == m->cred.rgid || v == m->cred.egid || v == m->cred.sgid;
+}
+
+SYSDEF(getuid)  { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.ruid : (u64)getuid(); }
+SYSDEF(geteuid) { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.euid : (u64)geteuid(); }
+SYSDEF(getgid)  { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.rgid : (u64)getgid(); }
+SYSDEF(getegid) { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.egid : (u64)getegid(); }
 
 SYSDEF(set_tid_address) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -276,6 +290,21 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     char **envp_copy = dup_strvec(envp);
     if (!envp_copy) { free_strvec(argv); return (u64)(s64)-ENOMEM; }
 
+    /* setuid/setgid bit on the final ELF (`host` holds its resolved path).
+     * "Disregard actual filesystem ownership": the file's guest-visible owner
+     * is the remapped owner, so a rootfs binary owned by the host user confers
+     * the fake identity. euid/fsuid (and saved id) take the file owner; the
+     * real uid is unchanged. AT_SECURE then follows from euid != ruid. */
+    if (m->fake_id) {
+        struct stat est;
+        if (stat(host, &est) == 0) {
+            if (est.st_mode & S_ISUID)
+                m->cred.euid = m->cred.suid = m->cred.fsuid = remap_uid(m, est.st_uid);
+            if (est.st_mode & S_ISGID)
+                m->cred.egid = m->cred.sgid = m->cred.fsgid = remap_gid(m, est.st_gid);
+        }
+    }
+
     /* Point of no return: tear down and reload. */
     as_destroy(&m->as);
     as_init(&m->as);
@@ -412,37 +441,156 @@ SYSDEF(prctl) {
 }
 
 SYSDEF(getgroups) {
-    int n = getgroups(0, NULL);
-    if (n < 0) return host_err();
+    struct Machine *m = c->m;
+    u32 gg[256];
+    int n;
+    if (m->fake_id) {
+        n = m->cred.ngroups;
+        for (int i = 0; i < n; i++) gg[i] = m->cred.groups[i];
+    } else {
+        n = getgroups(0, NULL);
+        if (n < 0) return host_err();
+        if (n > 256) n = 256;
+        gid_t g[256];
+        if (a0 != 0) { n = getgroups(n, g); if (n < 0) return host_err(); }
+        for (int i = 0; i < n; i++) gg[i] = g[i];
+    }
     if (a0 == 0) return (u64)n;
     if ((int)a0 < n) return (u64)(s64)-EINVAL;
-    gid_t g[256];
-    if (n > 256) n = 256;
-    n = getgroups(n, g);
-    if (n < 0) return host_err();
-    u32 gg[256];
-    for (int i = 0; i < n; i++) gg[i] = g[i];
     if (copy_to_guest(c, a1, gg, sizeof(u32) * (size_t)n) < 0) return (u64)(s64)-EFAULT;
     return (u64)n;
 }
 
 SYSDEF(setgroups) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    struct Machine *m = c->m;
+    if (m->fake_id) {
+        if (!cred_priv(m)) return (u64)(s64)-EPERM;
+        int n = (int)(s32)a0;
+        if (n < 0 || n > 64) return (u64)(s64)-EINVAL;
+        u32 g[64];
+        if (n && copy_from_guest(c, g, a1, sizeof(u32) * (size_t)n) < 0)
+            return (u64)(s64)-EFAULT;
+        for (int i = 0; i < n; i++) m->cred.groups[i] = g[i];
+        m->cred.ngroups = n;
+        return 0;
+    }
+    (void)a2; (void)a3; (void)a4; (void)a5;
     return (u64)(s64)(geteuid() == 0 ? -EINVAL : -EPERM);
 }
 
 SYSDEF(umask) { (void)c;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)umask((mode_t)a0); }
 
-SYSDEF(setuid) { return setuid((uid_t)a0) < 0 ? host_err() : 0; }
-SYSDEF(setgid) { return setgid((gid_t)a0) < 0 ? host_err() : 0; }
-SYSDEF(setresuid) { return setresuid((uid_t)a0, (uid_t)a1, (uid_t)a2) < 0 ? host_err() : 0; }
-SYSDEF(setresgid) { return setresgid((gid_t)a0, (gid_t)a1, (gid_t)a2) < 0 ? host_err() : 0; }
-SYSDEF(setreuid) { return setreuid((uid_t)a0, (uid_t)a1) < 0 ? host_err() : 0; }
-SYSDEF(setregid) { return setregid((gid_t)a0, (gid_t)a1) < 0 ? host_err() : 0; }
+SYSDEF(setuid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setuid((uid_t)a0) < 0 ? host_err() : 0;
+    u32 u = (u32)a0;
+    if (cred_priv(m)) { m->cred.ruid = m->cred.euid = m->cred.suid = m->cred.fsuid = u; return 0; }
+    if (u == m->cred.ruid || u == m->cred.suid) { m->cred.euid = m->cred.fsuid = u; return 0; }
+    return (u64)(s64)-EPERM;
+}
+SYSDEF(setgid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setgid((gid_t)a0) < 0 ? host_err() : 0;
+    u32 g = (u32)a0;
+    if (cred_priv(m)) { m->cred.rgid = m->cred.egid = m->cred.sgid = m->cred.fsgid = g; return 0; }
+    if (g == m->cred.rgid || g == m->cred.sgid) { m->cred.egid = m->cred.fsgid = g; return 0; }
+    return (u64)(s64)-EPERM;
+}
+
+SYSDEF(setreuid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setreuid((uid_t)a0, (uid_t)a1) < 0 ? host_err() : 0;
+    u32 r = (u32)a0, e = (u32)a1;
+    Cred nc = m->cred;
+    if (r != ID_KEEP) {
+        if (!cred_priv(m) && r != m->cred.ruid && r != m->cred.euid) return (u64)(s64)-EPERM;
+        nc.ruid = r;
+    }
+    if (e != ID_KEEP) {
+        if (!cred_priv(m) && e != m->cred.ruid && e != m->cred.euid && e != m->cred.suid) return (u64)(s64)-EPERM;
+        nc.euid = e;
+    }
+    if ((r != ID_KEEP) || (e != ID_KEEP && e != m->cred.ruid)) nc.suid = nc.euid;
+    nc.fsuid = nc.euid;
+    m->cred = nc;
+    return 0;
+}
+SYSDEF(setregid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setregid((gid_t)a0, (gid_t)a1) < 0 ? host_err() : 0;
+    u32 r = (u32)a0, e = (u32)a1;
+    Cred nc = m->cred;
+    if (r != ID_KEEP) {
+        if (!cred_priv(m) && r != m->cred.rgid && r != m->cred.egid) return (u64)(s64)-EPERM;
+        nc.rgid = r;
+    }
+    if (e != ID_KEEP) {
+        if (!cred_priv(m) && e != m->cred.rgid && e != m->cred.egid && e != m->cred.sgid) return (u64)(s64)-EPERM;
+        nc.egid = e;
+    }
+    if ((r != ID_KEEP) || (e != ID_KEEP && e != m->cred.rgid)) nc.sgid = nc.egid;
+    nc.fsgid = nc.egid;
+    m->cred = nc;
+    return 0;
+}
+
+SYSDEF(setresuid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setresuid((uid_t)a0, (uid_t)a1, (uid_t)a2) < 0 ? host_err() : 0;
+    u32 r = (u32)a0, e = (u32)a1, s = (u32)a2;
+    if (!cred_priv(m)) {
+        if (r != ID_KEEP && !in_uset(m, r)) return (u64)(s64)-EPERM;
+        if (e != ID_KEEP && !in_uset(m, e)) return (u64)(s64)-EPERM;
+        if (s != ID_KEEP && !in_uset(m, s)) return (u64)(s64)-EPERM;
+    }
+    if (r != ID_KEEP) m->cred.ruid = r;
+    if (e != ID_KEEP) m->cred.euid = e;
+    if (s != ID_KEEP) m->cred.suid = s;
+    m->cred.fsuid = m->cred.euid;
+    return 0;
+}
+SYSDEF(setresgid) {
+    struct Machine *m = c->m;
+    if (!m->fake_id) return setresgid((gid_t)a0, (gid_t)a1, (gid_t)a2) < 0 ? host_err() : 0;
+    u32 r = (u32)a0, e = (u32)a1, s = (u32)a2;
+    if (!cred_priv(m)) {
+        if (r != ID_KEEP && !in_gset(m, r)) return (u64)(s64)-EPERM;
+        if (e != ID_KEEP && !in_gset(m, e)) return (u64)(s64)-EPERM;
+        if (s != ID_KEEP && !in_gset(m, s)) return (u64)(s64)-EPERM;
+    }
+    if (r != ID_KEEP) m->cred.rgid = r;
+    if (e != ID_KEEP) m->cred.egid = e;
+    if (s != ID_KEEP) m->cred.sgid = s;
+    m->cred.fsgid = m->cred.egid;
+    return 0;
+}
+
+/* setfsuid/setfsgid: return the previous fs id; never fail. */
+SYSDEF(setfsuid) {
+    struct Machine *m = c->m;
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!m->fake_id) return (u64)(uid_t)syscall(SYS_setfsuid, (uid_t)a0);
+    u32 old = m->cred.fsuid, u = (u32)a0;
+    if (u != ID_KEEP && (cred_priv(m) || u == m->cred.ruid || u == m->cred.euid ||
+                         u == m->cred.suid || u == m->cred.fsuid))
+        m->cred.fsuid = u;
+    return old;
+}
+SYSDEF(setfsgid) {
+    struct Machine *m = c->m;
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!m->fake_id) return (u64)(gid_t)syscall(SYS_setfsgid, (gid_t)a0);
+    u32 old = m->cred.fsgid, g = (u32)a0;
+    if (g != ID_KEEP && (cred_priv(m) || g == m->cred.rgid || g == m->cred.egid ||
+                         g == m->cred.sgid || g == m->cred.fsgid))
+        m->cred.fsgid = g;
+    return old;
+}
 
 SYSDEF(getresuid) {
     uid_t r, e, s;
-    getresuid(&r, &e, &s);
+    if (c->m->fake_id) { r = c->m->cred.ruid; e = c->m->cred.euid; s = c->m->cred.suid; }
+    else getresuid(&r, &e, &s);
     u32 v;
     v = r; if (copy_to_guest(c, a0, &v, 4) < 0) return (u64)(s64)-EFAULT;
     v = e; if (copy_to_guest(c, a1, &v, 4) < 0) return (u64)(s64)-EFAULT;
@@ -452,7 +600,8 @@ SYSDEF(getresuid) {
 
 SYSDEF(getresgid) {
     gid_t r, e, s;
-    getresgid(&r, &e, &s);
+    if (c->m->fake_id) { r = c->m->cred.rgid; e = c->m->cred.egid; s = c->m->cred.sgid; }
+    else getresgid(&r, &e, &s);
     u32 v;
     v = r; if (copy_to_guest(c, a0, &v, 4) < 0) return (u64)(s64)-EFAULT;
     v = e; if (copy_to_guest(c, a1, &v, 4) < 0) return (u64)(s64)-EFAULT;

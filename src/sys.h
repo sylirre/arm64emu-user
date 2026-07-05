@@ -34,7 +34,7 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
 int oflags_g2h(int g);
 int oflags_h2g(int h);
 
-void gstat_from_host(GStat *g, const struct stat *st);
+void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
 /* Fill in x0 (return value) after a handler runs. */
 void syscall_return(CPU *c, u64 ret);

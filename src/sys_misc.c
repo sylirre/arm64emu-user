@@ -136,15 +136,24 @@ SYSDEF(personality) {
 }
 
 SYSDEF(capget) {
-    /* header {version, pid}; report no capabilities */
+    /* header {version, pid}. Report the full capability set for fake-root,
+     * otherwise none. */
     struct { u32 version; s32 pid; } hdr;
     if (copy_from_guest(c, &hdr, a0, sizeof hdr) < 0) return (u64)(s64)-EFAULT;
     if (a1) {
         struct { u32 eff, perm, inh; } d[2];
-        memset(d, 0, sizeof d);
+        u32 all = (c->m->fake_id && c->m->cred.euid == 0) ? 0xffffffffu : 0;
+        for (int i = 0; i < 2; i++) { d[i].eff = all; d[i].perm = all; d[i].inh = 0; }
         int n = (hdr.version == 0x19980330) ? 1 : 2;
         if (copy_to_guest(c, a1, d, sizeof(d[0]) * (size_t)n) < 0)
             return (u64)(s64)-EFAULT;
     }
     return 0;
+}
+
+SYSDEF(capset) {
+    /* Accept capability changes under fake-root; otherwise deny like the host. */
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (c->m->fake_id && c->m->cred.euid == 0) return 0;
+    return (u64)(s64)-EPERM;
 }

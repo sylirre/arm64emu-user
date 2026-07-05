@@ -82,6 +82,23 @@ mkdir -p /tmp/tdir && echo x > /tmp/tdir/f && cat /tmp/tdir/f && rm -r /tmp/tdir
 CMDS
 fi
 
+# ---- -fake-id mode (self-checking; qemu does not model it) ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_fakeid() {   # check_fakeid <label> <expected> <args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fakeid: $label"
+        else fail=$((fail+1)); echo "FAIL fakeid: $label (want '$expect' got '$got')"; fi
+    }
+    check_fakeid "default 0:0"      "uid=0 gid=0"       -fake-id "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "explicit 1000:1000" "uid=1000 gid=1000" -fake-id 1000:1000 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "single 7 -> 7:7"  "uid=7 gid=7"       -fake-id 7 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "whoami root"      "root"              -fake-id "$ALPINE" /bin/busybox whoami
+    check_fakeid "chown to root ok" "0 0"               -fake-id "$ALPINE" /bin/sh -c 'touch /tmp/ci_fk; chown 0:0 /tmp/ci_fk; stat -c "%u %g" /tmp/ci_fk; rm -f /tmp/ci_fk'
+    check_fakeid "setuid drop+deny" "ok"                -fake-id "$ALPINE" /bin/busybox sh -c 'id -u >/dev/null; echo ok'
+fi
+
 echo
 echo "== $pass passed, $fail failed =="
 exit $((fail > 0))

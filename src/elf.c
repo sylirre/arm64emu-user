@@ -204,6 +204,14 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     u64 hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
                 G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
                 G_HWCAP_SHA512 | G_HWCAP_ATOMICS;   /* LSE implemented (decode.c) */
+    /* Credentials (fake identity when -fake-id, else the real host ids).
+     * AT_SECURE reflects a setuid/setgid transition (do_execve set euid/egid
+     * from the file's bits before this reload), telling libc to run guarded. */
+    u32 at_uid = m->fake_id ? m->cred.ruid : (u32)getuid();
+    u32 at_euid = m->fake_id ? m->cred.euid : (u32)geteuid();
+    u32 at_gid = m->fake_id ? m->cred.rgid : (u32)getgid();
+    u32 at_egid = m->fake_id ? m->cred.egid : (u32)getegid();
+    u64 at_secure = (at_uid != at_euid || at_gid != at_egid) ? 1 : 0;
     u64 auxv[][2] = {
         { G_AT_PHDR,    exe.phdr_va },
         { G_AT_PHENT,   sizeof(Elf64_Phdr) },
@@ -212,11 +220,11 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         { G_AT_BASE,    at_base },
         { G_AT_FLAGS,   0 },
         { G_AT_ENTRY,   exe.entry },
-        { G_AT_UID,     getuid() },
-        { G_AT_EUID,    geteuid() },
-        { G_AT_GID,     getgid() },
-        { G_AT_EGID,    getegid() },
-        { G_AT_SECURE,  0 },
+        { G_AT_UID,     at_uid },
+        { G_AT_EUID,    at_euid },
+        { G_AT_GID,     at_gid },
+        { G_AT_EGID,    at_egid },
+        { G_AT_SECURE,  at_secure },
         { G_AT_RANDOM,  rnd_va },
         { G_AT_HWCAP,   hwcap },
         { G_AT_HWCAP2,  0 },

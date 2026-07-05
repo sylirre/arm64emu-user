@@ -20,10 +20,12 @@ translation, and signal delivery — is new for user mode.
 ```
 arm64chroot [options] <rootfs> <program> [args...]
 
-  -strace       log guest syscalls to stderr
-  -d            per-instruction trace (very verbose)
-  -E VAR=VAL    set an environment variable for the guest (repeatable)
-  -0 ARG0       override argv[0] for the guest program
+  -strace          log guest syscalls to stderr
+  -d               per-instruction trace (very verbose)
+  -E VAR=VAL       set an environment variable for the guest (repeatable)
+  -0 ARG0          override argv[0] for the guest program
+  -fake-id [ID]    present a fake identity (fakeroot-style); ID = uid | uid:gid,
+                   default 0:0 (root)
 ```
 
 `<rootfs>` is a directory tree containing an AArch64 userland (e.g. an Alpine or
@@ -33,6 +35,30 @@ followed against the guest root and `..` cannot escape it — so no privilege or
 `chroot(2)` is required. `/proc` and a `/dev` whitelist (null, zero, random,
 urandom, tty, ptmx, pts, shm, fd) pass through to the host; `/proc/self/exe` and
 `/proc/self/maps` are synthesized for the guest.
+
+### Fake identity (`-fake-id`)
+
+`-fake-id` makes the guest believe it runs as a chosen user — by default **root
+`0:0`** — like `proot -0` or `fakeroot`, so package managers, `make install`,
+`chown`/`chmod`, and `id -u == 0` checks work without real privilege:
+
+```sh
+arm64chroot -fake-id            ./rootfs /bin/sh   # guest is root 0:0
+arm64chroot -fake-id 1000:1000  ./rootfs /bin/sh   # guest is 1000:1000
+arm64chroot -fake-id 1000       ./rootfs /bin/sh   # uid=gid=1000
+```
+
+The whole `get`/`set` credential family (`setuid`/`setgid`/`setre*`/`setres*`/
+`setfsuid`/`setfsgid`/`setgroups`) works with real Linux privilege rules — a fake
+euid of 0 is privileged, a dropped identity cannot regain it. setuid/setgid-bit
+executables take on the file owner's (remapped) identity on exec, `AT_SECURE` is
+set on such transitions, `capget` reports full capabilities for fake-root, and
+`stat`/`chown` present a consistent view: a file the host reports as owned by the
+real invoking user appears owned by the fake identity, and `chown`/`chmod` that
+the host would reject succeed. The illusion is confined to what the emulator
+reports — it does **not** bypass host DAC, so fake-root still cannot read a file
+the host user genuinely cannot, and there is no persistent per-file ownership
+database (a `chown` to an arbitrary third uid is accepted but not remembered).
 
 ## What works
 

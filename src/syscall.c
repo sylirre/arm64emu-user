@@ -36,6 +36,7 @@ SYSDEF(setpgid); SYSDEF(getpgid); SYSDEF(setsid); SYSDEF(getsid);
 SYSDEF(prctl); SYSDEF(getgroups); SYSDEF(setgroups); SYSDEF(umask);
 SYSDEF(setuid); SYSDEF(setgid); SYSDEF(setresuid); SYSDEF(setresgid);
 SYSDEF(getresuid); SYSDEF(getresgid); SYSDEF(setreuid); SYSDEF(setregid);
+SYSDEF(setfsuid); SYSDEF(setfsgid);
 SYSDEF(getpriority); SYSDEF(setpriority); SYSDEF(sched_yield);
 SYSDEF(sched_getaffinity); SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
 
@@ -52,6 +53,7 @@ SYSDEF(gettimeofday); SYSDEF(nanosleep); SYSDEF(setitimer); SYSDEF(getitimer);
 SYSDEF(getrandom); SYSDEF(getrlimit); SYSDEF(setrlimit); SYSDEF(prlimit64);
 SYSDEF(sysinfo); SYSDEF(futex); SYSDEF(membarrier); SYSDEF(getcpu);
 SYSDEF(sethostname); SYSDEF(syslog); SYSDEF(personality); SYSDEF(capget);
+SYSDEF(capset);
 
 /* sys_net.c */
 SYSDEF(socket); SYSDEF(socketpair); SYSDEF(bind); SYSDEF(connect);
@@ -158,6 +160,8 @@ static const struct {
     { G_NR_getresgid, sys_getresgid, "getresgid" },
     { G_NR_setreuid, sys_setreuid, "setreuid" },
     { G_NR_setregid, sys_setregid, "setregid" },
+    { G_NR_setfsuid, sys_setfsuid, "setfsuid" },
+    { G_NR_setfsgid, sys_setfsgid, "setfsgid" },
     { G_NR_getpriority, sys_getpriority, "getpriority" },
     { G_NR_setpriority, sys_setpriority, "setpriority" },
     { G_NR_sched_yield, sys_sched_yield, "sched_yield" },
@@ -213,6 +217,7 @@ static const struct {
     { G_NR_syslog, sys_syslog, "syslog" },
     { G_NR_personality, sys_personality, "personality" },
     { G_NR_capget, sys_capget, "capget" },
+    { G_NR_capset, sys_capset, "capset" },
 };
 
 static sysfn table[G_NR_MAX];

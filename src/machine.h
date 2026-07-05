@@ -22,6 +22,14 @@ typedef struct {
     u64 mask;                 /* guest sigset (64 bits) */
 } GSigAction;
 
+/* Fake process credential set (-fake-id mode). Process-wide per POSIX. */
+typedef struct {
+    u32 ruid, euid, suid, fsuid;
+    u32 rgid, egid, sgid, fsgid;
+    u32 groups[64];
+    int ngroups;
+} Cred;
+
 struct Machine {
     CPU cpu;
 
@@ -50,12 +58,28 @@ struct Machine {
     /* Thread bookkeeping (CLONE_VM). */
     int next_tid;             /* monotonic tid allocator */
 
+    /* Fake identity (-fake-id): proot-style fake uid/gid + credential set. */
+    int fake_id;              /* mode enabled */
+    u32 fake_uid, fake_gid;   /* configured identity = stat remap target (fixed) */
+    u32 host_uid, host_gid;   /* real invoking IDs, captured at startup */
+    Cred cred;                /* mutable process credential set */
+
     /* Flags */
     int strace;               /* -strace */
 };
 
 /* The singleton task of this process (fork copies it naturally). */
 extern struct Machine g_machine;
+
+/* Ownership remap for -fake-id: a file the host reports as owned by the real
+ * invoking user is presented to the guest as owned by the fake identity;
+ * everything else passes through unchanged. */
+static inline u32 remap_uid(const struct Machine *m, u32 host) {
+    return (m->fake_id && host == m->host_uid) ? m->fake_uid : host;
+}
+static inline u32 remap_gid(const struct Machine *m, u32 host) {
+    return (m->fake_id && host == m->host_gid) ? m->fake_gid : host;
+}
 
 /* loop.c */
 int  emu_loop(CPU *c);
