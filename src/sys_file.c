@@ -1032,10 +1032,18 @@ SYSDEF(fdatasync) { return fdatasync((int)a0) < 0 ? host_err() : 0; }
 
 SYSDEF(sync_file_range) {
     /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic.
-     * glibc's wrapper maps to the host's sync_file_range/sync_file_range2 ABI. */
+     * glibc's wrapper maps to the host's sync_file_range/sync_file_range2 ABI,
+     * including 64-bit arg marshalling on ILP32.  Bionic (Termux) doesn't
+     * declare the wrapper, so issue the raw syscall there; Android hosts are
+     * LP64, so the 64-bit offset/nbytes pass in single registers. */
     (void)a4; (void)a5;
-    return sync_file_range((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (unsigned)a3) < 0
-           ? host_err() : 0;
+    long r;
+#if defined(__BIONIC__) && defined(SYS_sync_file_range)
+    r = syscall(SYS_sync_file_range, (int)a0, (s64)a1, (s64)a2, (unsigned)a3);
+#else
+    r = sync_file_range((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (unsigned)a3);
+#endif
+    return r < 0 ? host_err() : 0;
 }
 
 SYSDEF(sendfile) {
