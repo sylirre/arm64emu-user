@@ -909,7 +909,13 @@ SYSDEF(linkat) {
     int hflags = (gf & G_AT_SYMLINK_FOLLOW) ? AT_SYMLINK_FOLLOW : 0;
     if (linkat(AT_FDCWD, h1, AT_FDCWD, h2, hflags) == 0) return 0;
 #ifdef L2S_ENABLED
-    if (c->m->link2symlink && (errno == EXDEV || errno == EPERM))
+    /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path
+     * (an O_TMPFILE publish via linkat(AT_SYMLINK_FOLLOW) yields EACCES), and a
+     * filesystem that lacks links reports EOPNOTSUPP; fall back for all. A
+     * genuine permission error still surfaces, since the copy/symlink then
+     * fails the same way. */
+    if (c->m->link2symlink && (errno == EXDEV || errno == EPERM
+                               || errno == EACCES || errno == EOPNOTSUPP))
         return (u64)(s64)l2s_link(c->m, h1, h2);
 #endif
     return host_err();
