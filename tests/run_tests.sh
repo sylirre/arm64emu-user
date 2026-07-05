@@ -97,6 +97,37 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     check_fakeid "whoami root"      "root"              -fake-id "$ALPINE" /bin/busybox whoami
     check_fakeid "chown to root ok" "0 0"               -fake-id "$ALPINE" /bin/sh -c 'touch /tmp/ci_fk; chown 0:0 /tmp/ci_fk; stat -c "%u %g" /tmp/ci_fk; rm -f /tmp/ci_fk'
     check_fakeid "setuid drop+deny" "ok"                -fake-id "$ALPINE" /bin/busybox sh -c 'id -u >/dev/null; echo ok'
+    # vfork+exec+wait must reap the child (regression: vfork treated as a thread
+    # broke wait4 with ECHILD and corrupted the shared image).
+    "$AGCC" -O1 -static -o "$ALPINE/tmp/ci_vfork" tests/fixtures/vfork.c 2>/dev/null &&
+        check_fakeid "vfork+exec+wait" "child-echo
+vfork child=1 waited=1 exited=1 status=0
+fork done rc=0" "$ALPINE" /tmp/ci_vfork
+    rm -f "$ALPINE/tmp/ci_vfork"
+    # adduser exercises vfork+exec of helpers under fake-root.
+    check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
+        -fake-id "$ALPINE" /bin/sh -c \
+        'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
+fi
+
+# ---- interactive job control (needs a PTY): an external command under bash must
+# run, not get Stopped by a stray SIGTTOU during tcsetpgrp setup. ----
+if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then
+    jc=$(expect -c "
+        set timeout 15
+        spawn $EMU $ALPINE /bin/bash
+        expect -re {[#\$] $}
+        send \"id -u; echo JC''DONE\r\"
+        expect {
+            -re {Stopped} { puts STOPPED }
+            -re {\nJCDONE} { puts RAN }
+            timeout { puts TIMEOUT }
+        }
+        expect -re {[#\$] $}
+        send \"exit\r\"; expect eof
+    " 2>/dev/null | grep -aoE "STOPPED|RAN|TIMEOUT" | head -1)
+    if [ "$jc" = "RAN" ]; then pass=$((pass+1)); echo "PASS jobctl: external cmd under bash not stopped"
+    else fail=$((fail+1)); echo "FAIL jobctl: external cmd under bash ($jc)"; fi
 fi
 
 echo

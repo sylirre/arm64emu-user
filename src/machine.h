@@ -106,6 +106,8 @@ void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 void sig_return(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */
 void sig_reset_for_exec(struct Machine *m);
+/* Mirror the guest block-state of terminal job-control signals to the host. */
+void sig_sync_host_mask(struct Machine *m);
 
 /* elf.c: load `guest_path` (canonical guest path) into the address space and
  * prepare the initial stack. Returns 0 or -errno. */

@@ -84,6 +84,7 @@ SYSDEF(uname) {
 /* clone flags (subset) */
 #define G_CLONE_VM      0x00000100
 #define G_CLONE_VFORK   0x00004000
+#define G_CLONE_THREAD  0x00010000
 #define G_CLONE_SETTLS  0x00080000
 #define G_CLONE_PARENT_SETTID  0x00100000
 #define G_CLONE_CHILD_CLEARTID 0x00200000
@@ -129,7 +130,13 @@ SYSDEF(clone) {
     u64 flags = a0, child_stack = a1, ptid = a2, ctid = a4, tls = a3;
     struct Machine *m = c->m;
 
-    if (flags & G_CLONE_VM) {
+    /* Spawn a host thread only for a real thread clone (CLONE_THREAD). A bare
+     * CLONE_VM without CLONE_THREAD is vfork(): the child shares the address
+     * space but is a distinct process that immediately execve()s or _exit()s —
+     * running it as a thread would tear down the shared address space under the
+     * parent and make wait4() fail with ECHILD. Treat vfork as a fork (the
+     * child's copy is discarded at its imminent exec). */
+    if ((flags & G_CLONE_VM) && (flags & G_CLONE_THREAD)) {
         /* Real thread: one host thread per guest thread, shared address space. */
         GThread *t = calloc(1, sizeof *t);
         if (!t) return (u64)(s64)-ENOMEM;

@@ -368,23 +368,46 @@ SYSDEF(fcntl) {
             int r = fcntl(fd, F_SETFL, oflags_g2h((int)a2));
             return r < 0 ? host_err() : (u64)r;
         }
-        case F_SETLK:
-        case F_SETLKW:
-        case F_GETLK: {
-            /* guest struct flock (LP64): i16 l_type, i16 l_whence, i64 l_start,
-             * i64 l_len, i32 l_pid — matches host struct flock on LP64; convert
-             * explicitly for ILP32 hosts. */
-            struct { s16 l_type, l_whence; s64 l_start, l_len; s32 l_pid; } gfl;
-            if (copy_from_guest(c, &gfl, a2, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
-            struct flock fl = { .l_type = gfl.l_type, .l_whence = gfl.l_whence,
-                                .l_start = (off_t)gfl.l_start, .l_len = (off_t)gfl.l_len,
-                                .l_pid = gfl.l_pid };
-            int r = fcntl(fd, cmd, &fl);
+        /* Record-lock commands. Match the GUEST's asm-generic values literally
+         * (F_GETLK=5, F_SETLK=6, F_SETLKW=7; OFD 36/37/38): with
+         * -D_FILE_OFFSET_BITS=64 the host F_SETLK *macro* becomes F_SETLK64 (13)
+         * on ILP32 hosts, so using it in the case label would miss the guest's
+         * 6 and fall through, passing a guest pointer to the host (EFAULT). */
+        case 5: case 6: case 7:
+        case 36: case 37: case 38: {
+            /* guest struct flock (arm64 LP64, 32 bytes): l_type i16 @0,
+             * l_whence i16 @2, l_start i64 @8, l_len i64 @16, l_pid i32 @24.
+             * Read at explicit offsets (host struct alignment differs on ILP32). */
+            u8 gfl[32];
+            if (copy_from_guest(c, gfl, a2, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
+            s16 l_type, l_whence; s64 l_start, l_len; s32 l_pid;
+            memcpy(&l_type, gfl + 0, 2);  memcpy(&l_whence, gfl + 2, 2);
+            memcpy(&l_start, gfl + 8, 8); memcpy(&l_len, gfl + 16, 8);
+            memcpy(&l_pid, gfl + 24, 4);
+            struct flock fl = { .l_type = l_type, .l_whence = l_whence,
+                                .l_start = (off_t)l_start, .l_len = (off_t)l_len,
+                                .l_pid = l_pid };
+            int hcmd;
+            switch (cmd) {
+                case 5: hcmd = F_GETLK;  break;
+                case 6: hcmd = F_SETLK;  break;
+                case 7: hcmd = F_SETLKW; break;
+#ifdef F_OFD_GETLK
+                case 36: hcmd = F_OFD_GETLK;  break;
+                case 37: hcmd = F_OFD_SETLK;  break;
+                case 38: hcmd = F_OFD_SETLKW; break;
+#endif
+                default: return (u64)(s64)-EINVAL;
+            }
+            int r = fcntl(fd, hcmd, &fl);
             if (r < 0) return host_err();
-            if (cmd == F_GETLK) {
-                gfl.l_type = fl.l_type; gfl.l_whence = fl.l_whence;
-                gfl.l_start = fl.l_start; gfl.l_len = fl.l_len; gfl.l_pid = fl.l_pid;
-                if (copy_to_guest(c, a2, &gfl, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
+            if (cmd == 5 || cmd == 36) {   /* GETLK: copy the result back */
+                l_type = fl.l_type; l_whence = fl.l_whence;
+                l_start = fl.l_start; l_len = fl.l_len; l_pid = fl.l_pid;
+                memcpy(gfl + 0, &l_type, 2);  memcpy(gfl + 2, &l_whence, 2);
+                memcpy(gfl + 8, &l_start, 8); memcpy(gfl + 16, &l_len, 8);
+                memcpy(gfl + 24, &l_pid, 4);
+                if (copy_to_guest(c, a2, gfl, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
             }
             return (u64)r;
         }

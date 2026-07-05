@@ -69,6 +69,26 @@ static int is_sync_sig(int sig) {
            sig == SIGTRAP;
 }
 
+/* Mirror the guest block-state of the terminal job-control signals to the host
+ * process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
+ * kernel* (tcsetpgrp, background terminal I/O) and would stop our process
+ * before the run loop can mediate; SIGTSTP travels with them in bash's
+ * give_terminal_to() critical section. When the guest blocks one of these
+ * (as bash does around tcsetpgrp), we must block it on the host too — POSIX
+ * then suppresses the signal entirely instead of stopping us. */
+void sig_sync_host_mask(struct Machine *m) {
+    static const int sigs[] = { SIGTTOU, SIGTTIN, SIGTSTP };
+    sigset_t block, unblock;
+    sigemptyset(&block);
+    sigemptyset(&unblock);
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        if (m->sigmask & (1ULL << (sigs[i] - 1))) sigaddset(&block, sigs[i]);
+        else sigaddset(&unblock, sigs[i]);
+    }
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+}
+
 void sig_host_update(struct Machine *m, int sig) {
     if (sig < 1 || sig > 64 || sig == SIGKILL || sig == SIGSTOP) return;
     if (sig == 32 || sig == 33) return;          /* host-libc internal rt sigs */
@@ -245,6 +265,7 @@ void sig_return(CPU *c) {
     c->nzcv = (u32)v & (PS_N | PS_Z | PS_C | PS_V);
     if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) < 0) goto bad;
     m->sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sig_sync_host_mask(m);
     /* fpsimd */
     u32 magic = 0;
     copy_from_guest(c, &magic, frame + MC_RESERVED, 4);

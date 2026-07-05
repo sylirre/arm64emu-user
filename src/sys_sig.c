@@ -52,6 +52,7 @@ SYSDEF(rt_sigprocmask) {
         }
         /* SIGKILL/SIGSTOP cannot be blocked */
         m->sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        sig_sync_host_mask(m);   /* propagate job-control-signal block state */
     }
     if (a2 && copy_to_guest(c, a2, &old, 8) < 0) return (u64)(s64)-EFAULT;
     return 0;
@@ -80,17 +81,14 @@ SYSDEF(rt_sigsuspend) {
      * arrives. The run loop then delivers it to the guest handler. */
     m->saved_sigmask = m->sigmask;
     m->have_saved_sigmask = 1;
-    u64 old = m->sigmask;
     m->sigmask = set;
-    sigset_t hs;
-    sigemptyset(&hs);
-    for (int i = 1; i <= 31; i++)
-        if (!(set & (1ULL << (i - 1)))) { /* unblocked signals wake us */ }
-    (void)hs; (void)old;
+    sig_sync_host_mask(m);
     /* Wait for any signal; the host catcher queues it, then we return EINTR
      * and the loop delivers to the guest (which restores saved_sigmask via
      * the sigframe ucontext on sigreturn). */
     pause();
+    m->sigmask = m->saved_sigmask;
+    sig_sync_host_mask(m);
     return (u64)(s64)-EINTR;
 }
 
