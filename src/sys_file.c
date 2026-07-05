@@ -691,10 +691,34 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x5429 /*TIOCGSID*/,   4, 1 },
     { 0x80045430 /*TIOCGPTN*/, 4, 1 },
     { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
+    { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
 };
 
 SYSDEF(ioctl) {
     u32 cmd = (u32)a1;
+    if (cmd == 0xc020660b /*FS_IOC_FIEMAP*/) {
+        /* struct fiemap = 32-byte header + fm_extent_count * 56-byte extents.
+         * All fields are __u64/__u32 (no pointers), so the layout is identical
+         * across arm64/arm/x86 and a raw byte bounce is sufficient; the payload
+         * is variable-length, so it can't ride the fixed-size ioctl_tab path. */
+        u32 count;                                 /* fm_extent_count @ offset 24 */
+        if (copy_from_guest(c, &count, a2 + 24, sizeof count) < 0)
+            return (u64)(s64)-EFAULT;
+        if (count > (1u << 20))                    /* bound host alloc; guard 32-bit
+                                                      size_t overflow before it happens */
+            return (u64)(s64)-EINVAL;
+        size_t total = 32 + (size_t)count * 56;
+        u8 *buf = malloc(total);
+        if (!buf) return (u64)(s64)-ENOMEM;
+        /* copy the whole buffer in so extent slots the kernel doesn't fill
+         * round-trip back to the guest unchanged (matches native behavior). */
+        if (copy_from_guest(c, buf, a2, total) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+        int r = ioctl((int)a0, cmd, buf);
+        if (r < 0) { u64 err = host_err(); free(buf); return err; }
+        if (copy_to_guest(c, a2, buf, total) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+        free(buf);
+        return (u64)r;
+    }
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)
         if (ioctl_tab[i].cmd == cmd) { e = &ioctl_tab[i]; break; }
