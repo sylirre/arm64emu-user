@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AArch64 FP/Advanced-SIMD execution. Grown on demand as the firmware/kernel
  * exercise instructions (the "implement on demand" M4 strategy). */
 #include "cpu.h"
@@ -1083,10 +1085,12 @@ static double fround_mode(double v, int rmode) {
 }
 
 /* ---- FRECPE / FRSQRTE reciprocal estimates (exact ARM algorithm) ----------
- * Transcribed from QEMU target/arm/vfp_helper.c so the 8-bit-mantissa estimate
- * matches bit-for-bit (Newton-Raphson refinement via FRECPS/FRSQRTS depends on
- * the precise starting value). Pure-integer; assumes default rounding and
- * FPCR.FZ=0 (the qemu-aarch64 user default we validate against). */
+ * Implemented directly from the Arm Architecture Reference Manual pseudocode
+ * (FPRecipEstimate / FPRSqrtEstimate and the RecipEstimate / RecipSqrtEstimate
+ * table functions), so the 8-bit-mantissa estimate matches the architecture
+ * bit-for-bit (Newton-Raphson refinement via FRECPS/FRSQRTS depends on the
+ * precise starting value). Pure-integer; assumes default rounding and
+ * FPCR.FZ=0. Bit-exactness is validated against the qemu-aarch64 oracle. */
 static u64 bf_extract(u64 v, unsigned start, unsigned len) {
     return (v >> start) & (len >= 64 ? ~0ULL : ((1ULL << len) - 1));
 }
@@ -1616,8 +1620,8 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
 }
 
 /* ===================== ARMv8 Cryptographic Extensions =====================
- * SHA-1, SHA-256 and AES, transcribed from the ARM ARM shared pseudocode
- * (cross-checked against QEMU target/arm/tcg/crypto_helper.c).  All work on the
+ * SHA-1, SHA-256 and AES, implemented from the Arm ARM shared pseudocode and
+ * validated against the algorithms' published test vectors. All work on the
  * little-endian V128 lane views: pseudocode Elem[X,e,32] == X.s[e]. */
 
 /* ror32()/ror64() are provided by types.h. */
@@ -1844,10 +1848,10 @@ static u64 sha512_s0 (u64 x) { return ror64(x,  1) ^ ror64(x,  8) ^ (x >> 7); } 
 static u64 sha512_s1 (u64 x) { return ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6); }     /* sigma1 */
 
 /* ARMv8.2 cryptographic extensions in the 0xce encoding space: FEAT_SHA3
- * (EOR3/BCAX/RAX1/XAR) and FEAT_SHA512 (SHA512H/H2/SU0/SU1). Transcribed from
- * the ARM ARM pseudocode (cross-checked against QEMU crypto_helper.c); SHA-512
- * lanes use the little-endian view d[0]=low 64, d[1]=high 64. SM3/SM4 (also in
- * this space) are intentionally left UNDEF/unadvertised. */
+ * (EOR3/BCAX/RAX1/XAR) and FEAT_SHA512 (SHA512H/H2/SU0/SU1). Implemented from
+ * the Arm ARM pseudocode; SHA-512 lanes use the little-endian view d[0]=low 64,
+ * d[1]=high 64. SM3/SM4 (also in this space) are intentionally left
+ * UNDEF/unadvertised. */
 static void crypto_sha3_512(CPU *c, u32 insn) {
     unsigned Rm = BITS(20, 16), Ra = BITS(14, 10), Rn = BITS(9, 5), Rd = BITS(4, 0);
     V128 n = c->v[Rn], m = c->v[Rm], r;

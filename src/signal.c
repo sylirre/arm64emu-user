@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest signal delivery.
  *
  * Host side: one SA_SIGINFO catcher (no SA_RESTART, everything masked while it

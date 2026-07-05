@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Operand pre-decode: a per-PC, per-thread cache of the decoded form of an
  * instruction — a dense opcode id plus pre-extracted operand fields — that
  * lets the run loop skip exec_a64's classification tree and field extraction

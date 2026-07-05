@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AArch64 CPU state and core interpreter interface. */
 #ifndef A64_CPU_H
 #define A64_CPU_H

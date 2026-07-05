@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Signal syscalls. Until M5 (full guest delivery), dispositions are stored in
  * the task and mirrored onto the host coarsely: SIG_IGN/SIG_DFL pass through
  * so process-fatal semantics (pipelines, Ctrl-C on the group) behave; guest

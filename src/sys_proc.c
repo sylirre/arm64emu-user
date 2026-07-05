@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Process syscalls. Guest pid == host pid: fork-shaped clone maps to host
  * fork() (the interpreter state is inherited by copy), execve reloads the
  * guest image in-process, wait/kill/pgid pass through. Threads (CLONE_VM)

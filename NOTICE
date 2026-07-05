@@ -1,0 +1,22 @@
+arm64chroot
+Copyright 2026 Sylirre
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file for the full text).
+
+arm64chroot is an original implementation (C11, libc/POSIX only). The AArch64
+instruction interpreter, the guest address space and memory model, the ELF
+loader, the rootfs path-containment resolver, the syscall layer, and the
+signal/job-control delivery are written from scratch. The instruction-set,
+FP/Advanced-SIMD, reciprocal-estimate, and cryptographic-extension (AES,
+SHA-1/2/3/512, PMULL) implementations follow the pseudocode published in the
+Arm Architecture Reference Manual; no third-party source code is included or
+distributed with this project.
+
+The instruction decode/execute core in src/core/ is shared, near-verbatim, with
+the sibling ARM64EMU_System full-system emulator; both are authored by the same
+copyright holder and licensed identically.
+
+qemu-aarch64 is used only as a differential-testing oracle (see tests/) and as
+the reference for a handful of AArch64 ID-register values chosen for guest
+compatibility; it is neither included nor linked.

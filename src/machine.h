@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Linux-user task state. cpu.h forward-declares `struct Machine`; here it is
  * the per-process emulation state (the system emulator's machine/devices are
  * replaced by an address space, a syscall layer and rootfs path translation). */

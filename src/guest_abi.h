@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* AArch64 Linux guest ABI: syscall numbers (asm-generic), auxv tags, and the
  * guest-side struct layouts the syscall layer marshals to/from. Guest structs
  * are spelled out with fixed-width types (LP64 arm64 layout) so the same

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
 #include <stdlib.h>
 #include <string.h>

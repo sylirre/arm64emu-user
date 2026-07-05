@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Rootfs path containment: resolve guest paths to host paths under the rootfs
  * prefix, component by component, so absolute symlinks inside the rootfs
  * resolve against the *guest* root and `..` never escapes it (proot's

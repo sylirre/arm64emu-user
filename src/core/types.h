@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Common fixed-width types and small helpers. */
 #ifndef A64_TYPES_H
 #define A64_TYPES_H

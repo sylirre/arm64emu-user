@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Internal helpers shared by the syscall handler files (sys_*.c). */
 #ifndef A64_SYS_H
 #define A64_SYS_H

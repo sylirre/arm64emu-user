@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Syscall dispatch: arm64 ABI (x8 = nr, x0..x5 = args, result -> x0).
  * Handlers live in sys_*.c grouped by area; unimplemented syscalls return
  * -ENOSYS with a one-shot warning naming the syscall (except the designed

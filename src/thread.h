@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Per-thread emulation state. With CLONE_VM guest threads, each guest thread
  * runs on its own host thread with its own CPU and the fields below; the
  * Machine (address space, fd table, signal dispositions) is shared. These live

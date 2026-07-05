@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest address space: 2-level software page table (guest 4 KB page -> host
  * pointer | prot flags), region bookkeeping, and the mem_* access seam the
  * copied core uses. Guest VAs never become host pointers except through the

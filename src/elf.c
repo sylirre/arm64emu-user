@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* ELF64/AArch64 loader: PT_LOAD segments, PT_INTERP (dynamic linker from the
  * rootfs), initial stack with argv/envp/auxv. Segment content is pread into
  * anonymous guest backing (equivalent to MAP_PRIVATE file pages for an

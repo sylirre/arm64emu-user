@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Memory-management syscalls over the guest address space (mem.c). */
 #include <stdio.h>
 #include <sys/mman.h>

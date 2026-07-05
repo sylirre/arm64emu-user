@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* ESR_ELx exception syndrome construction. */
 #ifndef A64_ESR_H
 #define A64_ESR_H

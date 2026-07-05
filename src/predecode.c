@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Pre-decode classifier: turn one instruction word into a PDEnt (dense
  * opcode id + pre-extracted operands). Runs only on a decode-cache miss.
  *

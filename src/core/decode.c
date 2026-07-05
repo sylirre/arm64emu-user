@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* A64 instruction decoder/executor — integer/branch/load-store (M1).
  * FP/SIMD lives in exec_fpsimd.c (M4). System regs in sysreg.c (M2). */
 #include "cpu.h"

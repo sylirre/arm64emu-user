@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* File and fd syscalls. Guest fd == host fd (the kernel does the numbering);
  * every path argument goes through resolve_at() for rootfs containment.
  * Structs are marshalled through explicit guest layouts (guest_abi.h) so the

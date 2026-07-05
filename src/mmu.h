@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Guest (user-space) memory access. Replaces the system emulator's MMU with a
  * software page table mapping guest 4 KB pages to host pointers. Guest VAs are
  * decoupled from host VAs, so a 39-bit guest address space works on 32-bit

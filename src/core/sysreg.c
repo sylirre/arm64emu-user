@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System registers: MSR/MRS/SYS/MSR-immediate, ID registers, generic-timer
  * register plumbing. */
 #include "sysreg.h"

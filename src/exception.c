@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Linux-user exception seam. The copied core calls exception_take() /
  * cpu_raise_sync() exactly as in the system emulator, but here nothing ever
  * vectors to EL1: the exception is recorded and the run loop (loop.c)

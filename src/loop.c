@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* The interpreter run loop: step the CPU, dispatch pending exceptions
  * (recorded by exception.c) to the syscall layer or to signal delivery. */
 #include <signal.h>

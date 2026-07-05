@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Time syscalls: clockid values and semantics are shared; only the struct
  * widths need marshalling (guest timespec/timeval are 2 x s64). */
 #include <sys/time.h>

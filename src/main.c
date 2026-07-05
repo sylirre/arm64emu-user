@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* arm64chroot: run an AArch64 Linux program from a rootfs directory under a
  * pure-interpreter user-space emulator.
  *

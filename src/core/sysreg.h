@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* System register / SMCCC hooks. Implemented in M2 (sysreg.c) and M3 (psci.c).
  * Declared weak so M1 links standalone. */
 #ifndef A64_SYSREG_H

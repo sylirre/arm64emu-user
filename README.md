@@ -152,3 +152,14 @@ is exercised continuously, not just on real 32-bit hardware.
   denormal flushing are not bit-exact (normal values match).
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
 - Big-endian hosts are not supported (the SIMD register union is little-endian).
+
+## License
+
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+arm64chroot is original, clean-room C11 code (libc/POSIX only). The instruction
+set, FP/Advanced-SIMD, reciprocal estimates, and cryptographic extensions are
+implemented from the *Arm Architecture Reference Manual* pseudocode;
+`qemu-aarch64` is used only as a differential-testing oracle and is neither
+included nor linked. The `src/core/` interpreter is shared, near-verbatim, with
+the sibling **ARM64EMU_System** emulator under the same license.

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
 /* Socket syscalls. sockaddr layouts (sockaddr_in/in6/un) are identical across
  * arm64/arm/x86; msghdr and cmsghdr differ only in pointer/size_t width and are
  * converted explicitly, so the code is correct on ILP32 hosts too. */
