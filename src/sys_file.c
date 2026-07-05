@@ -4,6 +4,7 @@
  * every path argument goes through resolve_at() for rootfs containment.
  * Structs are marshalled through explicit guest layouts (guest_abi.h) so the
  * same code is correct on ILP32 hosts. */
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/file.h>
@@ -93,6 +94,267 @@ static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
     *bounce_out = bounce;
     return (int)cnt;
 }
+
+/* ---------------------------------------------------------------------------
+ * -link2symlink: emulate hardlinks with tracked symlinks.
+ *
+ * Where the host refuses link(2) -- Android/SELinux returns EXDEV (some configs
+ * EPERM) -- a guest hardlink A->B is faked by moving A's data to a hidden
+ * backing file ".l2s.<ino>.<count>" and pointing a symlink at it from every
+ * name. The link count lives in the backing filename, so stat() reports it as
+ * st_nlink and the backing file is reclaimed only when the last name is
+ * removed. This keeps shared-inode semantics (one inode, matching st_ino,
+ * shared contents), unlike a plain copy. All paths handled here are already
+ * rootfs-resolved host paths. Compiled only where the host needs it (Android,
+ * where __ANDROID__ is auto-defined) or with -DA64_LINK2SYMLINK for testing;
+ * gated at run time by m->link2symlink (the -link2symlink option).
+ * ------------------------------------------------------------------------- */
+#if defined(__ANDROID__) || defined(A64_LINK2SYMLINK)
+#define L2S_ENABLED 1
+
+#define L2S_PREFIX     ".l2s."
+#define L2S_PREFIX_LEN 5
+
+/* A link group has two hidden files, both in the directory of the file that was
+ * first linked:
+ *   data   ".l2s.<ino>"          the real file contents; every "hardlink" name
+ *                                is a symlink to it. Its name is STABLE, so the
+ *                                symlinks never dangle (open/exec/... just work).
+ *   marker ".l2s.<ino>.<count>"  an empty file whose name encodes the current
+ *                                link count. Nothing points to it, so renaming
+ *                                it on a count change breaks nothing. */
+
+/* Parse a data basename ".l2s.<ino>" (single numeric field): 1 or 0. */
+static int l2s_parse_data(const char *name, unsigned long long *ino) {
+    if (strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN) != 0) return 0;
+    const char *p = name + L2S_PREFIX_LEN;
+    char *end;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p || *end != '\0') return 0;   /* exactly digits, no suffix */
+    if (ino) *ino = v;
+    return 1;
+}
+
+/* Parse a marker basename ".l2s.<ino>.<count>": 1 (+ optional fields) or 0. */
+static int l2s_parse_marker(const char *name, unsigned long long *ino, unsigned long *count) {
+    if (strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN) != 0) return 0;
+    const char *p = name + L2S_PREFIX_LEN;
+    char *end;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p || *end != '.') return 0;
+    const char *q = end + 1;
+    unsigned long c = strtoul(q, &end, 10);
+    if (end == q || *end != '\0') return 0;
+    if (ino) *ino = v;
+    if (count) *count = c;
+    return 1;
+}
+
+/* True for any hidden l2s file (data or marker) — used to hide them from the guest. */
+static int l2s_hidden(const char *name) {
+    return l2s_parse_data(name, NULL) || l2s_parse_marker(name, NULL, NULL);
+}
+
+/* Directory portion of an absolute host path -> `dir` ("/" for a root child). */
+static void l2s_dirname(const char *path, char *dir) {
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) { strcpy(dir, "/"); return; }
+    size_t dl = (size_t)(slash - path);
+    if (dl >= PATH_MAX) dl = PATH_MAX - 1;
+    memcpy(dir, path, dl);
+    dir[dl] = '\0';
+}
+
+static const char *l2s_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Format "<dir>/.l2s.<ino>" (data) into `out` (>= PATH_MAX). 0 or -errno. */
+static int l2s_data_name(char *out, const char *dir, unsigned long long ino) {
+    const char *sep = (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/";
+    int r = snprintf(out, PATH_MAX, "%s%s" L2S_PREFIX "%llu", dir, sep, ino);
+    return (r < 0 || r >= PATH_MAX) ? -ENAMETOOLONG : 0;
+}
+
+/* Format "<dir>/.l2s.<ino>.<count>" (marker) into `out`. 0 or -errno. */
+static int l2s_marker_name(char *out, const char *dir,
+                           unsigned long long ino, unsigned long count) {
+    const char *sep = (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/";
+    int r = snprintf(out, PATH_MAX, "%s%s" L2S_PREFIX "%llu.%04lu",
+                     dir, sep, ino, count);
+    return (r < 0 || r >= PATH_MAX) ? -ENAMETOOLONG : 0;
+}
+
+static void l2s_touch(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0) close(fd);
+}
+
+/* Live link count for inode `ino`: scan `dir` for its ".l2s.<ino>.<count>"
+ * marker. 0 (found, fills *count) or -1 (no marker). */
+static int l2s_find_marker(const char *dir, unsigned long long ino, unsigned long *count) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *de;
+    int found = -1;
+    while ((de = readdir(d)) != NULL) {
+        unsigned long long dino; unsigned long dc;
+        if (l2s_parse_marker(de->d_name, &dino, &dc) && dino == ino) {
+            *count = dc; found = 0; break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* If `host` is one of our l2s symlinks, fill `data` (the backing file path) and
+ * *count (from the marker, 0 if the group is broken). Returns 1 (ours), 0 (not
+ * ours), or -errno. */
+static int l2s_resolve(const char *host, char *data, unsigned long *count) {
+    struct stat lst;
+    if (lstat(host, &lst) < 0) return -errno;
+    if (!S_ISLNK(lst.st_mode)) return 0;
+
+    char tgt[PATH_MAX];
+    ssize_t n = readlink(host, tgt, sizeof tgt - 1);
+    if (n < 0) return -errno;
+    tgt[n] = '\0';
+
+    unsigned long long ino;
+    if (!l2s_parse_data(l2s_basename(tgt), &ino)) return 0;   /* a real symlink */
+
+    char dir[PATH_MAX];
+    if (tgt[0] == '/') l2s_dirname(tgt, dir);    /* data beside the target */
+    else               l2s_dirname(host, dir);   /* relative: beside the link */
+    (void)l2s_data_name(data, dir, ino);
+    if (l2s_find_marker(dir, ino, count) != 0) *count = 0;
+    return 1;
+}
+
+/* Map a resolved host path to its backing file + count. `host` may be one of our
+ * symlinks (NOFOLLOW resolution) or already the data file itself (a FOLLOW
+ * resolution followed the symlink). Returns 1 (fills `data`+*count), 0, -errno. */
+static int l2s_target(const char *host, char *data, unsigned long *count) {
+    int isl = l2s_resolve(host, data, count);
+    if (isl != 0) return isl;                     /* 1 (ours) or -errno */
+    unsigned long long ino;
+    if (l2s_parse_data(l2s_basename(host), &ino)) {   /* host itself is the data file */
+        char dir[PATH_MAX];
+        l2s_dirname(host, dir);
+        (void)l2s_data_name(data, dir, ino);
+        if (l2s_find_marker(dir, ino, count) != 0) *count = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Emulate link(src, dst) via the symlink scheme (both are host paths). */
+static int l2s_link(const char *src, const char *dst) {
+    struct stat dsst;
+    if (lstat(dst, &dsst) == 0) return -EEXIST;   /* link(2): dst must not exist */
+
+    char data[PATH_MAX], dir[PATH_MAX];
+    unsigned long count;
+    unsigned long long ino;
+    int isl = l2s_resolve(src, data, &count);
+    if (isl < 0) return isl;
+
+    /* AT_SYMLINK_FOLLOW may have resolved src directly onto the data file. */
+    if (isl == 0) {
+        struct stat sst;
+        if (lstat(src, &sst) == 0 && S_ISREG(sst.st_mode)
+            && l2s_parse_data(l2s_basename(src), &ino)) {
+            strcpy(data, src);
+            l2s_dirname(src, dir);
+            if (l2s_find_marker(dir, ino, &count) != 0) count = 0;
+            isl = 1;
+        }
+    }
+
+    if (isl == 1) {
+        /* Existing group: bump the marker count. */
+        l2s_parse_data(l2s_basename(data), &ino);
+        l2s_dirname(data, dir);
+        char newm[PATH_MAX], oldm[PATH_MAX];
+        unsigned long nc = (count ? count : 1) + 1;
+        if (l2s_marker_name(newm, dir, ino, nc) < 0) return -ENAMETOOLONG;
+        if (count && l2s_marker_name(oldm, dir, ino, count) == 0)
+            rename(oldm, newm);
+        else
+            l2s_touch(newm);           /* marker was lost: recreate */
+    } else {
+        /* First hardlink for a real file: it must be a regular file. */
+        struct stat sst;
+        if (lstat(src, &sst) < 0) return -errno;
+        if (!S_ISREG(sst.st_mode)) return -EPERM;
+        ino = (unsigned long long)sst.st_ino;
+        l2s_dirname(src, dir);
+        if (l2s_data_name(data, dir, ino) < 0) return -ENAMETOOLONG;
+        if (rename(src, data) < 0) return -errno;             /* move the contents */
+        if (symlink(data, src) < 0) {                         /* src -> data (absolute) */
+            int e = errno;
+            rename(data, src);                                /* best-effort rollback */
+            return -e;
+        }
+        char newm[PATH_MAX];
+        if (l2s_marker_name(newm, dir, ino, 2) == 0) l2s_touch(newm);
+    }
+
+    /* Point dst at the data file. Absolute target so an individual name can be
+     * renamed to any directory and still resolve (only moving the directory
+     * that holds the backing file breaks a group). */
+    if (symlink(data, dst) < 0) return -errno;
+    return 0;
+}
+
+/* One name in a group was removed: `data`/`count` come from l2s_resolve run
+ * *before* the removal. Drop the marker count; delete the data + marker on the
+ * last reference. */
+static void l2s_decref(const char *data, unsigned long count) {
+    unsigned long long ino;
+    if (!l2s_parse_data(l2s_basename(data), &ino)) return;
+    char dir[PATH_MAX], m[PATH_MAX];
+    l2s_dirname(data, dir);
+    if (count <= 1) {                                 /* last reference */
+        unlink(data);
+        if (l2s_marker_name(m, dir, ino, count ? count : 1) == 0) unlink(m);
+        return;
+    }
+    char newm[PATH_MAX];
+    if (l2s_marker_name(m, dir, ino, count) == 0
+        && l2s_marker_name(newm, dir, ino, count - 1) == 0)
+        rename(m, newm);
+}
+
+/* If `host` resolves to one of our backing files, stat it (a regular file) into
+ * *out with st_nlink = live count. Returns 1 (filled), 0 (not ours), -errno. */
+static int l2s_stat(const char *host, struct stat *out) {
+    char data[PATH_MAX];
+    unsigned long count;
+    int r = l2s_target(host, data, &count);
+    if (r != 1) return r;
+    if (stat(data, out) < 0) return -errno;
+    out->st_nlink = count ? count : 1;
+    return 1;
+}
+
+/* fstat-by-fd: if the fd names a data backing file, correct st_nlink in place. */
+static void l2s_fix_fd(int fd, struct stat *st) {
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n < 0) return;
+    path[n] = '\0';
+    unsigned long long ino;
+    if (l2s_parse_data(l2s_basename(path), &ino)) {
+        char dir[PATH_MAX]; unsigned long count;
+        l2s_dirname(path, dir);
+        if (l2s_find_marker(dir, ino, &count) == 0)
+            st->st_nlink = count ? count : 1;
+    }
+}
+#endif /* L2S_ENABLED */
 
 SYSDEF(openat) {
     char host[PATH_MAX];
@@ -197,6 +459,9 @@ SYSDEF(lseek) {
 SYSDEF(fstat) {
     struct stat st;
     if (fstat((int)a0, &st) < 0) return host_err();
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) l2s_fix_fd((int)a0, &st);
+#endif
     GStat g;
     gstat_from_host(c->m, &g, &st);
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
@@ -212,6 +477,9 @@ SYSDEF(newfstatat) {
         if (n == 0 || a1 == 0) {   /* fstat by fd */
             r = fstat((int)(s32)a0, &st);
             if (r < 0) return host_err();
+#ifdef L2S_ENABLED
+            if (c->m->link2symlink) l2s_fix_fd((int)(s32)a0, &st);
+#endif
             goto out;
         }
         if (n < 0) return (u64)(s64)n;
@@ -221,6 +489,13 @@ SYSDEF(newfstatat) {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
         int rr = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
         if (rr < 0) return (u64)(s64)rr;
+#ifdef L2S_ENABLED
+        if (c->m->link2symlink) {
+            int h = l2s_stat(host, &st);   /* present an l2s symlink as backing */
+            if (h == 1) goto out;
+            if (h < 0) return (u64)(s64)h;
+        }
+#endif
         r = (gf & G_AT_SYMLINK_NOFOLLOW) ? lstat(host, &st) : stat(host, &st);
         if (r < 0) return host_err();
     }
@@ -274,6 +549,13 @@ SYSDEF(readlinkat) {
     char host[PATH_MAX];
     int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return (u64)(s64)r;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) {
+        char backing[PATH_MAX]; unsigned long count;
+        if (l2s_resolve(host, backing, &count) == 1)
+            return (u64)(s64)-EINVAL;   /* guest sees a regular file, not a link */
+    }
+#endif
     char buf[PATH_MAX];
     ssize_t rn = readlink(host, buf, sizeof buf);
     if (rn < 0) return host_err();
@@ -289,7 +571,30 @@ SYSDEF(getdents64) {
     if (len > (1u << 20)) len = 1u << 20;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
-    long n = syscall(SYS_getdents64, (int)a0, buf, len);
+    long n;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) {
+        /* Hide ".l2s.*" backing files so the guest never sees or removes them.
+         * Re-read if a whole batch was filtered away (0 would look like EOF). */
+        for (;;) {
+            n = syscall(SYS_getdents64, (int)a0, buf, len);
+            if (n <= 0) break;
+            size_t w = 0, o = 0;
+            while (o + 19 <= (size_t)n) {
+                u16 reclen;
+                memcpy(&reclen, buf + o + 16, 2);
+                if (reclen == 0 || o + reclen > (size_t)n) break;
+                if (!l2s_hidden((const char *)(buf + o + 19))) {
+                    if (w != o) memmove(buf + w, buf + o, reclen);
+                    w += reclen;
+                }
+                o += reclen;
+            }
+            if (w > 0) { n = (long)w; break; }
+        }
+    } else
+#endif
+        n = syscall(SYS_getdents64, (int)a0, buf, len);
     if (n < 0) { free(buf); return host_err(); }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
@@ -483,7 +788,18 @@ SYSDEF(unlinkat) {
     int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return (u64)(s64)r;
     int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
-    return unlinkat(AT_FDCWD, host, flags) < 0 ? host_err() : 0;
+#ifdef L2S_ENABLED
+    char backing[PATH_MAX]; unsigned long count; int isl = 0;
+    if (c->m->link2symlink && !flags) {
+        isl = l2s_resolve(host, backing, &count);
+        if (isl < 0) isl = 0;   /* probe error: fall through to a plain unlink */
+    }
+#endif
+    if (unlinkat(AT_FDCWD, host, flags) < 0) return host_err();
+#ifdef L2S_ENABLED
+    if (isl == 1) l2s_decref(backing, count);
+#endif
+    return 0;
 }
 
 SYSDEF(renameat) {
@@ -492,7 +808,18 @@ SYSDEF(renameat) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
-    return rename(h1, h2) < 0 ? host_err() : 0;
+#ifdef L2S_ENABLED
+    char backing[PATH_MAX]; unsigned long count; int isl = 0;
+    if (c->m->link2symlink && strcmp(h1, h2) != 0) {
+        isl = l2s_resolve(h2, backing, &count);   /* dest replaced by the rename */
+        if (isl < 0) isl = 0;
+    }
+#endif
+    if (rename(h1, h2) < 0) return host_err();
+#ifdef L2S_ENABLED
+    if (isl == 1) l2s_decref(backing, count);
+#endif
+    return 0;
 }
 
 SYSDEF(renameat2) {
@@ -524,7 +851,12 @@ SYSDEF(linkat) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
-    return link(h1, h2) < 0 ? host_err() : 0;
+    if (link(h1, h2) == 0) return 0;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && (errno == EXDEV || errno == EPERM))
+        return (u64)(s64)l2s_link(h1, h2);
+#endif
+    return host_err();
 }
 
 SYSDEF(ftruncate) {
@@ -667,6 +999,14 @@ SYSDEF(statx) {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
         int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, NULL);
         if (rr < 0) return (u64)(s64)rr;
+#ifdef L2S_ENABLED
+        char l2sb[PATH_MAX]; unsigned long l2sc;
+        if (c->m->link2symlink && l2s_target(host, l2sb, &l2sc) == 1) {
+            /* Present the backing file (regular) with the group's link count. */
+            r = syscall(SYS_statx, AT_FDCWD, l2sb, 0, (unsigned)a3, buf);
+            if (r == 0) { u32 nl = l2sc ? (u32)l2sc : 1; memcpy(buf + 16, &nl, 4); }
+        } else
+#endif
         r = syscall(SYS_statx, AT_FDCWD, host,
                     (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0,
                     (unsigned)a3, buf);

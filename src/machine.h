@@ -68,6 +68,8 @@ struct Machine {
 
     /* Flags */
     int strace;               /* -strace */
+    int link2symlink;         /* -link2symlink: emulate hardlinks with tracked
+                               * symlinks where the host forbids link() (Android) */
 };
 
 /* The singleton task of this process (fork copies it naturally). */

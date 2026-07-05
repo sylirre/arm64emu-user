@@ -12,6 +12,8 @@
  *   -0 ARG0          set argv[0] for the guest program
  *   -fake-id [ID]    fake identity (fakeroot-style); ID = uid | uid:gid,
  *                    default 0:0 (root)
+ *   -link2symlink    emulate hardlinks with tracked symlinks where the host
+ *                    forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
  */
 #include <ctype.h>
 #include <limits.h>
@@ -32,7 +34,7 @@ extern char **environ;
 static void usage(void) {
     fprintf(stderr,
             "usage: arm64chroot [-strace] [-d] [-nopd] [-E VAR=VAL]... [-0 argv0] "
-            "[-fake-id [uid[:gid]]] <rootfs> <program> [args...]\n");
+            "[-fake-id [uid[:gid]]] [-link2symlink] <rootfs> <program> [args...]\n");
     exit(2);
 }
 
@@ -73,6 +75,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-strace")) m->strace = 1;
         else if (!strcmp(argv[i], "-d")) { g_trace = 1; g_debug_hooks = 1; }
         else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
+        else if (!strcmp(argv[i], "-link2symlink")) m->link2symlink = 1;
         else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
             extra_env = realloc(extra_env, sizeof(char *) * (size_t)(n_extra + 1));
