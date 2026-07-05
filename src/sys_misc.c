@@ -1,4 +1,5 @@
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
+#include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -156,4 +157,90 @@ SYSDEF(capset) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (c->m->fake_id && c->m->cred.euid == 0) return 0;
     return (u64)(s64)-EPERM;
+}
+
+/* ---- kernel key management. Passes through to the host keyring (the guest
+ * process is a host process, so its session keyring works); pointer arguments
+ * are bounced through host buffers per operation. Used by PAM (pam_keyinit)
+ * for `su -l` and by keyutils. ---- */
+
+#define G_KEYCTL_JOIN_SESSION_KEYRING 1
+#define G_KEYCTL_UPDATE               2
+#define G_KEYCTL_DESCRIBE             6
+#define G_KEYCTL_READ                 11
+#define G_KEYCTL_INSTANTIATE          12
+#define G_KEYCTL_GET_SECURITY         17
+#define G_KEYCTL_CAPABILITIES         30
+
+SYSDEF(keyctl) {
+    long op = (long)a0;
+    switch (op) {
+        case G_KEYCTL_JOIN_SESSION_KEYRING: {   /* (name-or-NULL) */
+            if (!a1) { long r = syscall(SYS_keyctl, op, (char *)NULL); return r < 0 ? host_err() : (u64)r; }
+            char name[256];
+            if (copy_str_from_guest(c, name, a1, sizeof name) < 0) return (u64)(s64)-EFAULT;
+            long r = syscall(SYS_keyctl, op, name);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case G_KEYCTL_DESCRIBE:      /* (key, char *buf, size_t buflen) */
+        case G_KEYCTL_READ:
+        case G_KEYCTL_GET_SECURITY: {
+            u64 bufva = a2, buflen = a3;
+            if (buflen > (1u << 20)) buflen = 1u << 20;
+            u8 *buf = malloc(buflen ? (size_t)buflen : 1);
+            if (!buf) return (u64)(s64)-ENOMEM;
+            long r = syscall(SYS_keyctl, op, (long)a1, buf, (size_t)buflen);
+            if (r < 0) { free(buf); return host_err(); }
+            size_t out = (size_t)r < buflen ? (size_t)r : (size_t)buflen;
+            if (bufva && out && copy_to_guest(c, bufva, buf, out) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+            free(buf);
+            return (u64)r;
+        }
+        case G_KEYCTL_CAPABILITIES: {   /* (char *buf, size_t buflen) */
+            u64 buflen = a2;
+            if (buflen > 256) buflen = 256;
+            u8 buf[256] = {0};
+            long r = syscall(SYS_keyctl, op, buf, (size_t)buflen);
+            if (r < 0) return host_err();
+            size_t out = (size_t)r < buflen ? (size_t)r : (size_t)buflen;
+            if (a1 && out && copy_to_guest(c, a1, buf, out) < 0) return (u64)(s64)-EFAULT;
+            return (u64)r;
+        }
+        default: {   /* integer-only operations (GET_KEYRING_ID/REVOKE/LINK/...) */
+            long r = syscall(SYS_keyctl, op, (long)a1, (long)a2, (long)a3, (long)a4);
+            return r < 0 ? host_err() : (u64)r;
+        }
+    }
+}
+
+SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
+    char type[64], desc[256];
+    if (copy_str_from_guest(c, type, a0, sizeof type) < 0) return (u64)(s64)-EFAULT;
+    if (copy_str_from_guest(c, desc, a1, sizeof desc) < 0) return (u64)(s64)-EFAULT;
+    size_t plen = (size_t)a3;
+    if (plen > (1u << 20)) return (u64)(s64)-EINVAL;
+    u8 *pl = NULL;
+    if (a2 && plen) {
+        pl = malloc(plen);
+        if (!pl) return (u64)(s64)-ENOMEM;
+        if (copy_from_guest(c, pl, a2, plen) < 0) { free(pl); return (u64)(s64)-EFAULT; }
+    }
+    (void)a5;
+    long r = syscall(SYS_add_key, type, desc, pl, plen, (int)a4);
+    free(pl);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(request_key) {   /* (type, desc, callout-or-NULL, keyring) */
+    char type[64], desc[256], callout[256];
+    if (copy_str_from_guest(c, type, a0, sizeof type) < 0) return (u64)(s64)-EFAULT;
+    if (copy_str_from_guest(c, desc, a1, sizeof desc) < 0) return (u64)(s64)-EFAULT;
+    char *cp = NULL;
+    if (a2) {
+        if (copy_str_from_guest(c, callout, a2, sizeof callout) < 0) return (u64)(s64)-EFAULT;
+        cp = callout;
+    }
+    (void)a4; (void)a5;
+    long r = syscall(SYS_request_key, type, desc, cp, (int)a3);
+    return r < 0 ? host_err() : (u64)r;
 }

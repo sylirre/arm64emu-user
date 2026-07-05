@@ -231,6 +231,32 @@ SYSDEF(sendmsg) {
     return n < 0 ? host_err() : (u64)n;
 }
 
+/* Scatter a received message back into the guest: iov data, source address,
+ * control, and the updated header at `hdr_va`. `n` is the recvmsg result. */
+static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
+                              struct iovec *iov, u8 *bounce,
+                              struct sockaddr_storage *ss, u8 *ctrl, ssize_t n) {
+    int cnt = (int)h->msg_iovlen;
+    GIovec gi[1024];
+    copy_from_guest(c, gi, g->msg_iov, sizeof(GIovec) * (unsigned)cnt);
+    ssize_t left = n;
+    size_t off = 0;
+    for (int i = 0; i < cnt && left > 0; i++) {
+        size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
+        if (chunk) copy_to_guest(c, gi[i].iov_base, bounce + off, chunk);
+        off += iov[i].iov_len;
+        left -= (ssize_t)chunk;
+    }
+    if (g->msg_name && h->msg_namelen)
+        copy_to_guest(c, g->msg_name, ss, h->msg_namelen);
+    if (g->msg_control && h->msg_controllen)
+        copy_to_guest(c, g->msg_control, ctrl, h->msg_controllen);
+    g->msg_namelen = h->msg_namelen;
+    g->msg_controllen = h->msg_controllen;
+    g->msg_flags = h->msg_flags;
+    copy_to_guest(c, hdr_va, g, sizeof *g);
+}
+
 SYSDEF(recvmsg) {
     GMsghdr g;
     struct msghdr h;
@@ -242,26 +268,62 @@ SYSDEF(recvmsg) {
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
     if (n < 0) { free(iov); free(bounce); return host_err(); }
-    /* scatter received data back into guest iov */
-    GIovec gi[1024];
-    copy_from_guest(c, gi, g.msg_iov, sizeof(GIovec) * (unsigned)cnt);
-    ssize_t left = n;
-    size_t off = 0;
-    for (int i = 0; i < cnt && left > 0; i++) {
-        size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
-        if (chunk) copy_to_guest(c, gi[i].iov_base, bounce + off, chunk);
-        off += iov[i].iov_len;
-        left -= (ssize_t)chunk;
-    }
-    if (g.msg_name && h.msg_namelen)
-        copy_to_guest(c, g.msg_name, &ss, h.msg_namelen);
-    if (g.msg_control && h.msg_controllen)
-        copy_to_guest(c, g.msg_control, ctrl, h.msg_controllen);
-    /* update namelen/controllen/flags */
-    g.msg_namelen = h.msg_namelen;
-    g.msg_controllen = h.msg_controllen;
-    g.msg_flags = h.msg_flags;
-    copy_to_guest(c, a1, &g, sizeof g);
+    recvmsg_writeback(c, a1, &g, &h, iov, bounce, &ss, ctrl, n);
     free(iov); free(bounce);
     return (u64)n;
+}
+
+/* struct mmsghdr = { struct msghdr msg_hdr; unsigned msg_len; } — on arm64 LP64
+ * the msghdr is 56 bytes, msg_len at offset 56, whole struct padded to 64. */
+#define GMMSG_STRIDE 64
+#define GMMSG_LEN_OFF 56
+
+SYSDEF(sendmmsg) {
+    unsigned vlen = (unsigned)a2;
+    if (vlen > 1024) vlen = 1024;
+    int sent = 0;
+    for (unsigned i = 0; i < vlen; i++) {
+        u64 entry = a1 + (u64)i * GMMSG_STRIDE;
+        GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
+        struct sockaddr_storage ss; u8 ctrl[4096];
+        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1);
+        if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;
+        ssize_t n = sendmsg((int)a0, &h, (int)a3);
+        free(iov); free(bounce);
+        if (n < 0) return sent ? (u64)sent : host_err();
+        u32 mlen = (u32)n;
+        if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
+            return sent ? (u64)sent : (u64)(s64)-EFAULT;
+        sent++;
+    }
+    return (u64)sent;
+}
+
+SYSDEF(recvmmsg) {
+    unsigned vlen = (unsigned)a2;
+    int flags = (int)a3;
+    (void)a4;   /* timeout: honored only as "block for the first message" */
+    if (vlen > 1024) vlen = 1024;
+    int got = 0;
+    for (unsigned i = 0; i < vlen; i++) {
+        u64 entry = a1 + (u64)i * GMMSG_STRIDE;
+        GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
+        struct sockaddr_storage ss; u8 ctrl[4096];
+        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0);
+        if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
+        int mf = flags & ~MSG_WAITFORONE;
+        if (got > 0) mf |= MSG_DONTWAIT;   /* only the first message blocks */
+        ssize_t n = recvmsg((int)a0, &h, mf);
+        if (n < 0) {
+            free(iov); free(bounce);
+            if (got) break;   /* return the messages received so far */
+            return host_err();
+        }
+        recvmsg_writeback(c, entry, &g, &h, iov, bounce, &ss, ctrl, n);
+        u32 mlen = (u32)n;
+        copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4);
+        free(iov); free(bounce);
+        got++;
+    }
+    return (u64)got;
 }

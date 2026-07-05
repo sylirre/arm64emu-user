@@ -760,3 +760,10 @@ SYSDEF(copy_file_range) {
 SYSDEF(flock) {
     return flock((int)a0, (int)a1) < 0 ? host_err() : 0;
 }
+
+SYSDEF(fadvise64) {
+    /* Advisory: posix_fadvise returns the errno directly (not via errno). */
+    (void)a4; (void)a5;
+    int e = posix_fadvise((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (int)a3);
+    return e ? (u64)(s64)-e : 0;
+}

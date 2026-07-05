@@ -248,19 +248,24 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 return;
             default: break;
         }
-        /* FCVT*-to-integer: rmode selects rounding; opcode 0=..S 1=..U.
-         * We implement round-toward-zero (Z), nearest (N) and away (A); P/M map
-         * to ceil/floor. Saturation matches the architecture's clamping. */
-        if (opcode <= 1) {
+        /* FCVT*-to-integer. opcode 000/001 = FCVT{N,P,M,Z}{S,U} with the mode in
+         * `rmode`; opcode 100/101 = FCVTA{S,U} (round to nearest, ties away,
+         * independent of rmode — used by lround/llround). Even opcode = signed.
+         * Saturation matches the architecture's clamping. */
+        if (opcode <= 1 || opcode == 4 || opcode == 5) {
             double v = dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn);
             double r;
-            switch (rmode) {
-                case 0: r = f_round(v); break;   /* N: nearest (ties away) */
-                case 1: r = f_ceil(v);  break;   /* P: +inf */
-                case 2: r = f_floor(v); break;   /* M: -inf */
-                default: r = f_trunc(v); break;  /* Z: toward zero */
+            if (opcode >= 4) {
+                r = f_round(v);                  /* A: nearest, ties away */
+            } else {
+                switch (rmode) {
+                    case 0: r = f_round(v); break;   /* N: nearest */
+                    case 1: r = f_ceil(v);  break;   /* P: +inf */
+                    case 2: r = f_floor(v); break;   /* M: -inf */
+                    default: r = f_trunc(v); break;  /* Z: toward zero */
+                }
             }
-            if (opcode == 0) {   /* signed */
+            if ((opcode & 1) == 0) {   /* signed */
                 if (x64) { s64 m = (r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r; set_x(c, Rd, (u64)m); }
                 else     { s32 m = (r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r; set_x(c, Rd, (u64)(u32)m); }
             } else {             /* unsigned */

@@ -60,6 +60,10 @@ SYSDEF(socket); SYSDEF(socketpair); SYSDEF(bind); SYSDEF(connect);
 SYSDEF(listen); SYSDEF(accept); SYSDEF(accept4); SYSDEF(getsockname);
 SYSDEF(getpeername); SYSDEF(sendto); SYSDEF(recvfrom); SYSDEF(shutdown);
 SYSDEF(setsockopt); SYSDEF(getsockopt); SYSDEF(sendmsg); SYSDEF(recvmsg);
+SYSDEF(sendmmsg); SYSDEF(recvmmsg);
+
+/* more sys_file.c / sys_misc.c */
+SYSDEF(fadvise64); SYSDEF(keyctl); SYSDEF(add_key); SYSDEF(request_key);
 
 static const struct {
     u16 nr;
@@ -211,6 +215,12 @@ static const struct {
     { G_NR_getsockopt, sys_getsockopt, "getsockopt" },
     { G_NR_sendmsg, sys_sendmsg, "sendmsg" },
     { G_NR_recvmsg, sys_recvmsg, "recvmsg" },
+    { G_NR_sendmmsg, sys_sendmmsg, "sendmmsg" },
+    { G_NR_recvmmsg, sys_recvmmsg, "recvmmsg" },
+    { G_NR_fadvise64, sys_fadvise64, "fadvise64" },
+    { G_NR_keyctl, sys_keyctl, "keyctl" },
+    { G_NR_add_key, sys_add_key, "add_key" },
+    { G_NR_request_key, sys_request_key, "request_key" },
     { G_NR_membarrier, sys_membarrier, "membarrier" },
     { G_NR_getcpu, sys_getcpu, "getcpu" },
     { G_NR_sethostname, sys_sethostname, "sethostname" },
