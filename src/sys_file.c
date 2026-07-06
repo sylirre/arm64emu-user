@@ -516,6 +516,65 @@ SYSDEF(pwrite64) {
     return n < 0 ? host_err() : (u64)n;
 }
 
+/* preadv2/pwritev2 (fd, iov, iovcnt, pos_l, pos_h, flags): scatter/gather at
+ * an explicit offset with RWF_* flags. On the 64-bit guest kernel the full
+ * offset rides in pos_l (a3) and pos_from_hilo() drops pos_h (a4), matching
+ * pwrite64 above; the RWF_* flag bits are arch-generic, so a5 passes straight
+ * through. offset == -1 means "use the current file position" (as with
+ * readv/writev), which the host wrapper honors. Bionic (Termux) is LP64 and
+ * historically didn't declare the wrapper, so issue the raw syscall there with
+ * the offset in a single register and pos_h = 0. */
+SYSDEF(preadv2) {
+    struct iovec iov[1024];
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
+    if (cnt < 0) return (u64)(s64)cnt;
+    ssize_t n;
+#if defined(__BIONIC__) && defined(SYS_preadv2)
+    n = syscall(SYS_preadv2, (int)a0, iov, cnt, (long)(off_t)a3, 0L, (int)a5);
+#else
+    n = preadv2((int)a0, iov, cnt, (off_t)a3, (int)a5);
+#endif
+    if (n < 0) { free(bounce); return host_err(); }
+    /* scatter back */
+    GIovec g[1024];
+    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    ssize_t left = n;
+    for (int i = 0; i < cnt && left > 0; i++) {
+        size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
+        if (copy_to_guest(c, g[i].iov_base, iov[i].iov_base, chunk) < 0) {
+            free(bounce);
+            return (u64)(s64)-EFAULT;
+        }
+        left -= (ssize_t)chunk;
+    }
+    free(bounce);
+    return (u64)n;
+}
+
+SYSDEF(pwritev2) {
+    struct iovec iov[1024];
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
+    if (cnt < 0) return (u64)(s64)cnt;
+    GIovec g[1024];
+    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    for (int i = 0; i < cnt; i++)
+        if (iov[i].iov_len &&
+            copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
+            free(bounce);
+            return (u64)(s64)-EFAULT;
+        }
+    ssize_t n;
+#if defined(__BIONIC__) && defined(SYS_pwritev2)
+    n = syscall(SYS_pwritev2, (int)a0, iov, cnt, (long)(off_t)a3, 0L, (int)a5);
+#else
+    n = pwritev2((int)a0, iov, cnt, (off_t)a3, (int)a5);
+#endif
+    free(bounce);
+    return n < 0 ? host_err() : (u64)n;
+}
+
 SYSDEF(lseek) {
     off_t r = lseek((int)a0, (off_t)(s64)a1, (int)a2);
     return r == (off_t)-1 ? host_err() : (u64)r;

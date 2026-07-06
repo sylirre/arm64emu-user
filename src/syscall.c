@@ -13,6 +13,7 @@
 /* sys_file.c */
 SYSDEF(openat); SYSDEF(close); SYSDEF(read); SYSDEF(write);
 SYSDEF(readv); SYSDEF(writev); SYSDEF(pread64); SYSDEF(pwrite64);
+SYSDEF(preadv2); SYSDEF(pwritev2);
 SYSDEF(lseek); SYSDEF(fstat); SYSDEF(newfstatat); SYSDEF(faccessat);
 SYSDEF(readlinkat); SYSDEF(getdents64); SYSDEF(ioctl); SYSDEF(fcntl);
 SYSDEF(dup); SYSDEF(dup3); SYSDEF(pipe2); SYSDEF(getcwd); SYSDEF(chdir);
@@ -46,7 +47,8 @@ SYSDEF(setuid); SYSDEF(setgid); SYSDEF(setresuid); SYSDEF(setresgid);
 SYSDEF(getresuid); SYSDEF(getresgid); SYSDEF(setreuid); SYSDEF(setregid);
 SYSDEF(setfsuid); SYSDEF(setfsgid);
 SYSDEF(getpriority); SYSDEF(setpriority); SYSDEF(sched_yield);
-SYSDEF(sched_getaffinity); SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
+SYSDEF(sched_getparam); SYSDEF(sched_getaffinity);
+SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
 
 /* sys_sig.c */
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
@@ -113,6 +115,8 @@ static const struct {
     { G_NR_writev, sys_writev, "writev" },
     { G_NR_pread64, sys_pread64, "pread64" },
     { G_NR_pwrite64, sys_pwrite64, "pwrite64" },
+    { G_NR_preadv2, sys_preadv2, "preadv2" },
+    { G_NR_pwritev2, sys_pwritev2, "pwritev2" },
     { G_NR_sendfile, sys_sendfile, "sendfile" },
     { G_NR_ppoll, sys_ppoll, "ppoll" },
     { G_NR_pselect6, sys_pselect6, "pselect6" },
@@ -194,6 +198,7 @@ static const struct {
     { G_NR_getpriority, sys_getpriority, "getpriority" },
     { G_NR_setpriority, sys_setpriority, "setpriority" },
     { G_NR_sched_yield, sys_sched_yield, "sched_yield" },
+    { G_NR_sched_getparam, sys_sched_getparam, "sched_getparam" },
     { G_NR_sched_getaffinity, sys_sched_getaffinity, "sched_getaffinity" },
     { G_NR_getrusage, sys_getrusage, "getrusage" },
     { G_NR_times, sys_times, "times" },

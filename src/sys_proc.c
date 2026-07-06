@@ -631,6 +631,20 @@ SYSDEF(setpriority) {
 
 SYSDEF(sched_yield) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sched_yield(); return 0; }
 
+SYSDEF(sched_getparam) {
+    /* Only the real-time policies carry a non-zero priority; for the normal
+     * SCHED_OTHER processes the guest runs it is always 0. The guest pid maps
+     * 1:1 onto the host pid/tid, so pass it straight through as with
+     * sched_getaffinity. struct sched_param is { int sched_priority; }. */
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!a1) return (u64)(s64)-EINVAL;
+    struct sched_param sp;
+    if (sched_getparam((pid_t)(s32)a0, &sp) < 0) return host_err();
+    s32 prio = sp.sched_priority;
+    if (copy_to_guest(c, a1, &prio, sizeof prio) < 0) return (u64)(s64)-EFAULT;
+    return 0;
+}
+
 SYSDEF(sched_getaffinity) {
     /* Report a single CPU (we interpret on one thread anyway). */
     if (a1 < 8) return (u64)(s64)-EINVAL;
