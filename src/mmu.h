@@ -82,10 +82,20 @@ typedef struct Region {
     u64  file_off;            /* file offset at `start` (file-backed only) */
 } Region;
 
+/* Host backing whose guest mapping is gone but whose munmap is deferred:
+ * another guest thread may still hold a translated host pointer or a stale
+ * (lazily invalidated) D-TLB entry into it. Drained at as_destroy. */
+typedef struct RetiredMap {
+    void  *addr;
+    size_t len;
+} RetiredMap;
+
 typedef struct AddrSpace {
     uintptr_t **l1;           /* [1 << (39-26)] L1 entries -> L2[1 << 14] */
     Region *regions;          /* sorted by start */
     int nregions, cap_regions;
+    RetiredMap *retired;      /* quarantined host backing (see region_punch) */
+    int nretired, cap_retired;
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
     u64 stack_top;            /* initial stack top (guest VA) */
@@ -110,6 +120,8 @@ int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
 int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
+/* Caller must hold as_lock: the region array is realloc'd/memmove'd by
+ * concurrent mappers, and the returned pointer is only valid while held. */
 const Region *as_find_region(AddrSpace *as, u64 va);
 
 /* Stable host pointer for [va, va+size) if within one guest page and permitted

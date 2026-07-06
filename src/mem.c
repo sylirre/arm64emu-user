@@ -55,10 +55,10 @@ void casp16_mutex_lock(void)   { pthread_mutex_lock(&g_casp16_lock); }
 void casp16_mutex_unlock(void) { pthread_mutex_unlock(&g_casp16_lock); }
 
 /* Serializes address-space mutations (mmap/munmap/mprotect/brk and the page
- * table) across guest threads that share this address space. Reads (mem_read/
- * write via the table) are lock-free; a mutation briefly holds this while it
- * rewrites PTEs and the region list. Recursive so nested helpers can re-take
- * it. */
+ * table) across guest threads that share this address space. D-TLB-hit reads
+ * (mem_read/write via the table) are lock-free; a TLB-miss walk takes this
+ * briefly (translate()), as does a mutation while it rewrites PTEs and the
+ * region list. Recursive so nested helpers can re-take it. */
 static pthread_mutex_t g_as_lock;
 static void as_lock_init(void) {
     pthread_mutexattr_t a;
@@ -155,8 +155,26 @@ static u8 *host_alloc(u64 len, int prot) {
     return (p == MAP_FAILED) ? NULL : p;
 }
 
+/* Quarantine host backing instead of munmap'ing it inline. The guest PTEs are
+ * cleared before any unmap returns, so no new translation reaches the range;
+ * but another thread's D-TLB is only invalidated lazily (at its next access,
+ * via the generation check) and it may still hold a host pointer it already
+ * translated. Unmapping the backing under it would turn that stale-but-benign
+ * access into a host SIGSEGV. Drained in as_destroy (execve/exit). */
+static void as_retire(AddrSpace *as, void *addr, size_t len) {
+    if (as->nretired == as->cap_retired) {
+        as->cap_retired = as->cap_retired ? as->cap_retired * 2 : 16;
+        as->retired = realloc(as->retired,
+                              (size_t)as->cap_retired * sizeof *as->retired);
+        if (!as->retired) { perror("arm64chroot: realloc"); exit(127); }
+    }
+    as->retired[as->nretired].addr = addr;
+    as->retired[as->nretired].len = len;
+    as->nretired++;
+}
+
 /* Remove the guest range [addr, addr+len) from every overlapping region,
- * splitting as needed, releasing host backing when precisely possible. */
+ * splitting as needed, retiring host backing when precisely possible. */
 static void region_punch(AddrSpace *as, u64 addr, u64 end) {
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
@@ -165,9 +183,9 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
         u64 cut_hi = end < r->end ? end : r->end;
         int whole_region = (cut_lo == r->start && cut_hi == r->end);
         if (whole_region)
-            munmap(r->host - r->map_pad, (cut_hi - cut_lo) + r->map_pad);
+            as_retire(as, r->host - r->map_pad, (cut_hi - cut_lo) + r->map_pad);
         else if (g_host_pagesz == (long)GUEST_PAGE_SIZE)
-            munmap(r->host + (cut_lo - r->start), cut_hi - cut_lo);
+            as_retire(as, r->host + (cut_lo - r->start), cut_hi - cut_lo);
         if (whole_region) {
             region_delete(as, i);
             i--;
@@ -342,6 +360,9 @@ void as_destroy(AddrSpace *as) {
         free(as->regions[i].path);
     }
     free(as->regions);
+    for (int i = 0; i < as->nretired; i++)
+        munmap(as->retired[i].addr, as->retired[i].len);
+    free(as->retired);
     for (size_t i = 0; i < L1_SIZE; i++) free(as->l1[i]);
     free(as->l1);
     memset(as, 0, sizeof *as);
@@ -375,7 +396,15 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
     if (LIKELY(e->pte && e->page == page)) {
         pte = e->pte;
     } else {
+        /* Miss: walk the shared table under the AS lock so a concurrent
+         * mapper can't be mid-rewrite (torn L1/L2 reads on weakly-ordered
+         * hosts). The hit path above stays lock-free; stale hits are made
+         * safe by the generation check plus the retired-backing quarantine.
+         * Recursive lock: safe when the caller (a wrapped mm syscall)
+         * already holds it. */
+        as_lock();
         pte = pte_get(cpu_as(c), va);
+        as_unlock();
         if (!pte) return NULL;                 /* never cache misses */
         e->page = page;
         e->pte = pte;

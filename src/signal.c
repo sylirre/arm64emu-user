@@ -36,7 +36,14 @@
 #define G_SA_RESETHAND 0x80000000
 
 /* ---- host-side capture queue (async-signal-safe: handlers are installed
- * with everything masked, so they never nest) ---- */
+ * with everything masked, so they never nest) ----
+ *
+ * Per-thread: the kernel delivers a host signal on one specific thread
+ * (tgkill picks it explicitly; process-directed signals go to one thread with
+ * it unblocked), host_catcher queues it there, and the same thread consumes
+ * it from its run loop — single producer, single consumer, program-ordered.
+ * A shared ring would be multi-producer under Go's SIGURG async preemption
+ * and tears on weakly-ordered hosts (garbage signo -> bogus handler PC). */
 typedef struct {
     int signo;
     int code;
@@ -46,9 +53,9 @@ typedef struct {
 } PendSig;
 
 #define SIGQ_LEN 32
-static PendSig sigq[SIGQ_LEN];
-static volatile sig_atomic_t sigq_head, sigq_tail;
-volatile sig_atomic_t g_sig_npend;
+static __thread PendSig sigq[SIGQ_LEN];
+static __thread volatile sig_atomic_t sigq_head, sigq_tail;
+__thread volatile sig_atomic_t g_sig_npend;
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     (void)uctx;
@@ -120,7 +127,7 @@ void sig_reset_for_exec(struct Machine *m) {
             sig_host_update(m, s);
         }
     }
-    sigq_head = sigq_tail = 0;
+    sigq_head = sigq_tail = 0;   /* this thread's queue; post-exec is single-threaded */
     g_sig_npend = 0;
     m->sig_altstack_sp = m->sig_altstack_size = 0;
     g_tls.on_altstack = 0;

@@ -99,7 +99,8 @@ void syscall_dispatch(CPU *c);
 u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
 
 /* signal.c */
-extern volatile sig_atomic_t g_sig_npend;   /* host-caught signals queued */
+/* Host-caught signals queued on this thread (per-thread ring; see signal.c). */
+extern __thread volatile sig_atomic_t g_sig_npend;
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
 /* Deliver one deliverable queued signal, if any (called from the run loop). */
