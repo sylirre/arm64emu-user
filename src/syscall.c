@@ -263,14 +263,38 @@ static const struct {
 static sysfn table[G_NR_MAX];
 static const char *names[G_NR_MAX];
 
-/* Syscalls that libcs probe for and gracefully fall back from: return -ENOSYS
- * without a warning — that IS the correct emulated behavior. */
+/* Syscalls whose correct emulated behavior IS a silent -ENOSYS: calls libcs
+ * probe for and gracefully fall back from, plus everything not meaningfully
+ * emulatable in a user-mode chroot (privileged, host-global, or introspection
+ * the interpreter cannot honor). None of these is ever forwarded to the host
+ * — on Android most are seccomp-blocked and would SIGSYS. */
 static const u16 quiet_enosys[] = {
+    /* libc probe-and-fallback */
     G_NR_rseq, G_NR_clone3, G_NR_openat2, G_NR_close_range,
     G_NR_io_uring_setup, G_NR_io_uring_enter, G_NR_io_uring_register,
     G_NR_statmount, G_NR_listmount, G_NR_mseal, G_NR_cachestat,
     G_NR_futex_waitv, G_NR_epoll_pwait2, G_NR_fchmodat2, G_NR_pidfd_open,
     G_NR_process_madvise, G_NR_membarrier /* handled, listed for symmetry */,
+    G_NR_futex_wake, G_NR_futex_wait, G_NR_futex_requeue,
+    /* mount / namespaces */
+    G_NR_umount2, G_NR_mount, G_NR_chroot, G_NR_unshare, G_NR_setns,
+    G_NR_open_tree, G_NR_move_mount, G_NR_fsopen, G_NR_fsconfig,
+    G_NR_fsmount, G_NR_fspick, G_NR_mount_setattr,
+    /* privileged / system-global */
+    G_NR_vhangup, G_NR_quotactl, G_NR_acct, G_NR_kexec_load,
+    G_NR_init_module, G_NR_delete_module, G_NR_reboot, G_NR_setdomainname,
+    G_NR_swapon, G_NR_swapoff, G_NR_finit_module, G_NR_kexec_file_load,
+    /* clock setting */
+    G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
+    /* security / introspection */
+    G_NR_ptrace, G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
+    G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
+    G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
+    G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
+    G_NR_lsm_list_modules,
+    /* NUMA / memory placement */
+    G_NR_remap_file_pages, G_NR_mbind, G_NR_get_mempolicy, G_NR_set_mempolicy,
+    G_NR_set_mempolicy_home_node,
 };
 
 static void table_init(void) {
