@@ -163,7 +163,16 @@ SYSDEF(capset) {
 /* ---- kernel key management. Passes through to the host keyring (the guest
  * process is a host process, so its session keyring works); pointer arguments
  * are bounced through host buffers per operation. Used by PAM (pam_keyinit)
- * for `su -l` and by keyutils. ---- */
+ * for `su -l` and by keyutils.
+ *
+ * On Bionic (Termux) the Android 8+ app seccomp filter blocks the whole
+ * family — a forwarded call raises SIGSYS instead of failing. Report the
+ * facility as absent (-ENOSYS), like a kernel built without CONFIG_KEYS;
+ * guests degrade the same way. A64_KEYRING_ENOSYS compile-checks that branch
+ * on the glibc dev host. ---- */
+#if defined(__BIONIC__) || defined(A64_KEYRING_ENOSYS)
+#define KEYRING_ENOSYS 1
+#endif
 
 #define G_KEYCTL_JOIN_SESSION_KEYRING 1
 #define G_KEYCTL_UPDATE               2
@@ -174,6 +183,10 @@ SYSDEF(capset) {
 #define G_KEYCTL_CAPABILITIES         30
 
 SYSDEF(keyctl) {
+#ifdef KEYRING_ENOSYS
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return (u64)(s64)-ENOSYS;
+#else
     long op = (long)a0;
     switch (op) {
         case G_KEYCTL_JOIN_SESSION_KEYRING: {   /* (name-or-NULL) */
@@ -212,9 +225,14 @@ SYSDEF(keyctl) {
             return r < 0 ? host_err() : (u64)r;
         }
     }
+#endif
 }
 
 SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
+#ifdef KEYRING_ENOSYS
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return (u64)(s64)-ENOSYS;
+#else
     char type[64], desc[256];
     if (copy_str_from_guest(c, type, a0, sizeof type) < 0) return (u64)(s64)-EFAULT;
     if (copy_str_from_guest(c, desc, a1, sizeof desc) < 0) return (u64)(s64)-EFAULT;
@@ -230,9 +248,14 @@ SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
     long r = syscall(SYS_add_key, type, desc, pl, plen, (int)a4);
     free(pl);
     return r < 0 ? host_err() : (u64)r;
+#endif
 }
 
 SYSDEF(request_key) {   /* (type, desc, callout-or-NULL, keyring) */
+#ifdef KEYRING_ENOSYS
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return (u64)(s64)-ENOSYS;
+#else
     char type[64], desc[256], callout[256];
     if (copy_str_from_guest(c, type, a0, sizeof type) < 0) return (u64)(s64)-EFAULT;
     if (copy_str_from_guest(c, desc, a1, sizeof desc) < 0) return (u64)(s64)-EFAULT;
@@ -244,4 +267,5 @@ SYSDEF(request_key) {   /* (type, desc, callout-or-NULL, keyring) */
     (void)a4; (void)a5;
     long r = syscall(SYS_request_key, type, desc, cp, (int)a3);
     return r < 0 ? host_err() : (u64)r;
+#endif
 }

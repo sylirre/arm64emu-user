@@ -24,6 +24,14 @@ all four targets.
   presents 64-bit `off_t`/`time_t`, matching the guest's LP64 widths.
 - **`make m32`** builds the i386 binary natively on the x86-64 dev host, so ILP32
   correctness is on every test run.
+- **Raw `syscall(SYS_*)` calls must be audited against the Android seccomp
+  allow-list.** Android 8+ runs every app process (including Termux and
+  everything it execs) under a seccomp whitelist; a blocked syscall does not
+  return `ENOSYS` — it raises `SIGSYS` and kills the emulator. Prefer libc
+  wrappers: Bionic's only use whitelisted numbers (e.g. `accept` → `accept4`).
+  Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) allow-list
+  (`ANDROID_FORBIDDEN_SYSCALLS.md`, appendix) or be `__BIONIC__`-gated to a
+  safe alternative (precedent: the keyring family returns `-ENOSYS` on Bionic).
 
 ## Catalog of pitfalls (each is a bug we hit)
 

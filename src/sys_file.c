@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/xattr.h>
 #include <termios.h>
@@ -1305,6 +1306,49 @@ SYSDEF(fstatfs) {
     return statfs_out(c, a1, &h);
 }
 
+/* Host statx entry. Old host kernels lack it (ENOSYS), and Android 8.x blocks
+ * it in the app seccomp filter (the SIGSYS net turns that into ENOSYS too);
+ * callers then synthesize the result from the classic stat family. */
+static long host_statx(int dirfd, const char *path, int flags, unsigned mask,
+                       u8 *buf) {
+#if !defined(SYS_statx) || defined(A64_STATX_FORCE_FALLBACK)
+    (void)dirfd; (void)path; (void)flags; (void)mask; (void)buf;
+    errno = ENOSYS;
+    return -1;
+#else
+    return syscall(SYS_statx, dirfd, path, flags, mask, buf);
+#endif
+}
+
+/* Fill a struct statx (fixed 256-byte kernel ABI; explicit byte offsets, same
+ * ILP32 rule as the guest structs) from a classic struct stat. stx_mask
+ * reports STATX_BASIC_STATS (0x7ff) only: no btime, and none is advertised. */
+static void statx_from_stat(u8 *buf, const struct stat *st) {
+    memset(buf, 0, 256);
+    u32 v32; u16 v16; u64 v64;
+    v32 = 0x7ff;                         memcpy(buf + 0, &v32, 4);   /* stx_mask */
+    v32 = (u32)st->st_blksize;           memcpy(buf + 4, &v32, 4);
+    v32 = (u32)st->st_nlink;             memcpy(buf + 16, &v32, 4);
+    v32 = (u32)st->st_uid;               memcpy(buf + 20, &v32, 4);
+    v32 = (u32)st->st_gid;               memcpy(buf + 24, &v32, 4);
+    v16 = (u16)st->st_mode;              memcpy(buf + 28, &v16, 2);
+    v64 = (u64)st->st_ino;               memcpy(buf + 32, &v64, 8);
+    v64 = (u64)st->st_size;              memcpy(buf + 40, &v64, 8);
+    v64 = (u64)st->st_blocks;            memcpy(buf + 48, &v64, 8);
+    /* statx_timestamp {s64 sec; u32 nsec} at atime 64, ctime 96, mtime 112
+     * (btime at 80 stays zero) */
+    v64 = (u64)(s64)st->st_atim.tv_sec;  memcpy(buf + 64, &v64, 8);
+    v32 = (u32)st->st_atim.tv_nsec;      memcpy(buf + 72, &v32, 4);
+    v64 = (u64)(s64)st->st_ctim.tv_sec;  memcpy(buf + 96, &v64, 8);
+    v32 = (u32)st->st_ctim.tv_nsec;      memcpy(buf + 104, &v32, 4);
+    v64 = (u64)(s64)st->st_mtim.tv_sec;  memcpy(buf + 112, &v64, 8);
+    v32 = (u32)st->st_mtim.tv_nsec;      memcpy(buf + 120, &v32, 4);
+    v32 = (u32)major(st->st_rdev);       memcpy(buf + 128, &v32, 4);
+    v32 = (u32)minor(st->st_rdev);       memcpy(buf + 132, &v32, 4);
+    v32 = (u32)major(st->st_dev);        memcpy(buf + 136, &v32, 4);
+    v32 = (u32)minor(st->st_dev);        memcpy(buf + 140, &v32, 4);
+}
+
 SYSDEF(statx) {
     /* struct statx is a fixed-layout kernel ABI (same on all arches). */
     char gpath[PATH_MAX];
@@ -1315,7 +1359,12 @@ SYSDEF(statx) {
     u8 buf[256];
     long r;
     if ((gf & G_AT_EMPTY_PATH) && gpath[0] == 0) {
-        r = syscall(SYS_statx, (int)(s32)a0, "", AT_EMPTY_PATH, (unsigned)a3, buf);
+        r = host_statx((int)(s32)a0, "", AT_EMPTY_PATH, (unsigned)a3, buf);
+        if (r < 0 && errno == ENOSYS) {
+            struct stat st;
+            r = fstat((int)(s32)a0, &st);
+            if (r == 0) statx_from_stat(buf, &st);
+        }
     } else {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
         int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, NULL);
@@ -1324,13 +1373,26 @@ SYSDEF(statx) {
         char l2sb[PATH_MAX]; unsigned long l2sc;
         if (c->m->link2symlink && l2s_target(host, l2sb, &l2sc) == 1) {
             /* Present the backing file (regular) with the group's link count. */
-            r = syscall(SYS_statx, AT_FDCWD, l2sb, 0, (unsigned)a3, buf);
+            r = host_statx(AT_FDCWD, l2sb, 0, (unsigned)a3, buf);
+            if (r < 0 && errno == ENOSYS) {
+                struct stat st;
+                r = stat(l2sb, &st);
+                if (r == 0) statx_from_stat(buf, &st);
+            }
             if (r == 0) { u32 nl = l2sc ? (u32)l2sc : 1; memcpy(buf + 16, &nl, 4); }
         } else
 #endif
-        r = syscall(SYS_statx, AT_FDCWD, host,
-                    (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0,
-                    (unsigned)a3, buf);
+        {
+            r = host_statx(AT_FDCWD, host,
+                           (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0,
+                           (unsigned)a3, buf);
+            if (r < 0 && errno == ENOSYS) {
+                struct stat st;
+                r = (gf & G_AT_SYMLINK_NOFOLLOW) ? lstat(host, &st)
+                                                 : stat(host, &st);
+                if (r == 0) statx_from_stat(buf, &st);
+            }
+        }
     }
     if (r < 0) return host_err();
     if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) */

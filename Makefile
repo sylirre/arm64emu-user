@@ -36,8 +36,16 @@ test: arm64chroot
 test32: arm64chroot32
 	tests/run_tests.sh ./arm64chroot32
 
+# Android-behavior simulation on the dev host: force the statx ENOSYS
+# fallback and the Bionic keyring gate, then require the differential suite
+# to still match the qemu oracle.
+test-android-sim: $(SRCS) $(wildcard src/*.h src/core/*.h)
+	$(CC) $(CFLAGS) -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
+	    -o arm64chroot_asim $(SRCS) $(LDFLAGS)
+	tests/run_tests.sh ./arm64chroot_asim
+
 clean:
-	rm -f arm64chroot arm64chroot32
+	rm -f arm64chroot arm64chroot32 arm64chroot_asim
 	rm -f tests/asm/*.bin tests/c/*.bin
 
-.PHONY: m32 test test32 clean
+.PHONY: m32 test test32 test-android-sim clean
