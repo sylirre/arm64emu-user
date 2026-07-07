@@ -130,6 +130,47 @@ if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then
     else fail=$((fail+1)); echo "FAIL jobctl: external cmd under bash ($jc)"; fi
 fi
 
+# ---- Android seccomp-mimic: run the emulator under a SECCOMP_RET_TRAP
+# filter for the Android-8-blocked syscalls (tests/seccomp_wrap.c). The
+# SIGSYS net must convert a trapped forward into -ENOSYS: same differential
+# output for statx (fallback path), clean ENOSYS for the keyring family. ----
+HCC=$(command -v "${CC:-cc}" || command -v gcc)
+WRAP=tests/seccomp_wrap.bin
+wrap_ok=0
+# LP64 emulator builds only (matching the Android target): 32-bit glibc with
+# _TIME_BITS=64 issues statx internally during ld.so/libc startup, before
+# main() can arm the SIGSYS net — a CI-only artifact, Bionic never does that.
+if [ -n "$HCC" ] && [ "$(od -An -j4 -N1 -tu1 "$EMU" | tr -d ' ')" = "2" ]; then
+    if "$HCC" -O2 -o "$WRAP" tests/seccomp_wrap.c 2>/dev/null &&
+       "$WRAP" /bin/true 2>/dev/null; then
+        wrap_ok=1
+    fi
+fi
+if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
+    out_q=$("$QEMU" tests/c/statx_static.bin 2>/dev/null); rc_q=$?
+    out_e=$("$WRAP" "$EMU" / tests/c/statx_static.bin 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS seccomp: trapped statx -> ENOSYS fallback"
+    else
+        fail=$((fail+1)); echo "FAIL seccomp: trapped statx (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+    if "$AGCC" -static -O2 -o tests/fixtures/keyring_enosys.bin \
+            tests/fixtures/keyring_enosys.c 2>/dev/null; then
+        out=$("$WRAP" "$EMU" / tests/fixtures/keyring_enosys.bin 2>/dev/null)
+        exp=$'keyctl=ENOSYS\nadd_key=ENOSYS\nrequest_key=ENOSYS'
+        if [ "$out" = "$exp" ]; then
+            pass=$((pass+1)); echo "PASS seccomp: trapped keyring -> ENOSYS"
+        else
+            fail=$((fail+1)); echo "FAIL seccomp: trapped keyring -> ENOSYS"
+            echo "$out" | head -4 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/keyring_enosys.bin
+    fi
+else
+    echo "SKIP seccomp-mimic (needs LP64 build, host cc, seccomp)"
+fi
+
 echo
 echo "== $pass passed, $fail failed =="
 exit $((fail > 0))

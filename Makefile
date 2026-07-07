@@ -46,6 +46,6 @@ test-android-sim: $(SRCS) $(wildcard src/*.h src/core/*.h)
 
 clean:
 	rm -f arm64chroot arm64chroot32 arm64chroot_asim
-	rm -f tests/asm/*.bin tests/c/*.bin
+	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin
 
 .PHONY: m32 test test32 test-android-sim clean

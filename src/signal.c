@@ -14,10 +14,12 @@
  * __reserved, terminator record, x30 pointed at a trampoline page containing
  * `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel uses the vDSO
  * for this). rt_sigreturn restores everything from the frame at SP. */
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "machine.h"
@@ -79,6 +81,73 @@ static int is_sync_sig(int sig) {
            sig == SIGTRAP;
 }
 
+/* ---- SIGSYS safety net ----
+ *
+ * Android 8+ filters every app process with a seccomp whitelist whose action
+ * is SECCOMP_RET_TRAP: a non-whitelisted host syscall is *not executed* and
+ * SIGSYS is raised instead of returning ENOSYS. Convert that back into a
+ * plain -ENOSYS: patch the mcontext return register and return, which
+ * resumes right after the trapped svc/syscall instruction inside the host
+ * libc wrapper — it then sets errno normally and the emulator handler above
+ * it takes its ordinary ENOSYS fallback path. Any other SIGSYS (a guest
+ * kill()) goes through the normal capture queue.
+ *
+ * The net owns the host SIGSYS disposition for the process lifetime:
+ * sig_host_update skips SIGSYS so a guest sigaction can never replace it,
+ * and it is never blocked host-side (sig_sync_host_mask touches only the
+ * job-control trio) — a seccomp SIGSYS delivered while blocked force-kills
+ * regardless, so the net must stay armed. */
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+
+static void sigsys_net(int sig, siginfo_t *si, void *uctx) {
+    if (si->si_code != SYS_SECCOMP) {   /* guest-directed kill(SIGSYS) etc. */
+        host_catcher(sig, si, uctx);
+        return;
+    }
+    /* One-shot notice per host syscall number so gaps surface instead of
+     * hiding. Async-signal-safe: composed by hand, write(2) only. */
+    int nr = si->si_syscall;
+    static char warned[1024];
+    if (nr >= 0 && nr < (int)sizeof warned && !warned[nr]) {
+        warned[nr] = 1;
+        static const char pre[] = "arm64chroot: host syscall ";
+        static const char post[] = " blocked by seccomp filter, returning ENOSYS\n";
+        char msg[sizeof pre + sizeof post + 12];
+        size_t p = sizeof pre - 1;
+        memcpy(msg, pre, p);
+        char dig[12];
+        int nd = 0, v = nr;
+        do { dig[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (nd) msg[p++] = dig[--nd];
+        memcpy(msg + p, post, sizeof post - 1);
+        p += sizeof post - 1;
+        ssize_t ignored = write(2, msg, p); (void)ignored;
+    }
+    ucontext_t *uc = uctx;
+#if defined(__aarch64__)
+    uc->uc_mcontext.regs[0] = (u64)(s64)-ENOSYS;   /* glibc and Bionic */
+#elif defined(__arm__)
+    uc->uc_mcontext.arm_r0 = -ENOSYS;
+#elif defined(__x86_64__)
+    uc->uc_mcontext.gregs[REG_RAX] = -ENOSYS;
+#elif defined(__i386__)
+    uc->uc_mcontext.gregs[REG_EAX] = -ENOSYS;
+#else
+#error "no SIGSYS return-register accessor for this host arch"
+#endif
+}
+
+void sig_install_sigsys_net(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigsys_net;
+    sa.sa_flags = SA_SIGINFO;
+    sigfillset(&sa.sa_mask);
+    sigaction(SIGSYS, &sa, NULL);
+}
+
 /* Mirror the guest block-state of the terminal job-control signals to the host
  * process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
  * kernel* (tcsetpgrp, background terminal I/O) and would stop our process
@@ -102,6 +171,9 @@ void sig_sync_host_mask(struct Machine *m) {
 void sig_host_update(struct Machine *m, int sig) {
     if (sig < 1 || sig > 64 || sig == SIGKILL || sig == SIGSTOP) return;
     if (sig == 32 || sig == 33) return;          /* host-libc internal rt sigs */
+    if (sig == SIGSYS) return;                   /* owned by the SIGSYS net; guest
+                                                    dispositions are honored via
+                                                    the capture queue */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;

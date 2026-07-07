@@ -146,6 +146,10 @@ int main(int argc, char **argv) {
     g_tls.tid = getpid();     /* main thread tid == pid */
     m->next_tid = getpid();
 
+    /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
+     * the ELF loader below already forwards host syscalls. */
+    sig_install_sigsys_net();
+
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */
     if (argv0) gargv[0] = (char *)argv0;
