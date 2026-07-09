@@ -63,7 +63,12 @@ SYSDEF(prlimit64) {
 SYSDEF(sysinfo) {
     struct sysinfo h;
     if (sysinfo(&h) < 0) return host_err();
-    /* guest struct sysinfo (LP64): 4 s64, then loads/mem in u64, u16 procs... */
+    /* guest struct sysinfo (arm64/LP64) is exactly 112 bytes: s64 uptime,
+     * u64 loads[3] + 6 mem fields, u16 procs/pad, then (after 4 bytes of
+     * alignment padding for the u64s) totalhigh/freehigh, u32 mem_unit, and a
+     * zero-length _f[] tail. An earlier version carried a bogus trailing u8
+     * f[8], inflating the struct to 120 bytes; copy_to_guest then wrote 8 bytes
+     * past the guest's stack buffer, smashing its stack canary. */
     struct {
         s64 uptime;
         u64 loads[3];
@@ -73,8 +78,8 @@ SYSDEF(sysinfo) {
         u32 pad2;
         u64 totalhigh, freehigh;
         u32 mem_unit;
-        u8 f[8];
     } g;
+    _Static_assert(sizeof g == 112, "guest struct sysinfo must be 112 bytes");
     memset(&g, 0, sizeof g);
     g.uptime = h.uptime;
     for (int i = 0; i < 3; i++) g.loads[i] = h.loads[i];
