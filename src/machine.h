@@ -78,6 +78,25 @@ struct Machine {
     } nl_fds[NL_MAX_FDS];
     int nl_fds_count;
 
+    /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
+     * stat — sys_procfs.c): a read starting at offset 0 regenerates the
+     * backing memfd, because procps opens these once and lseek(0)+rereads
+     * every refresh cycle. Shared across guest threads, copied on fork —
+     * like the host fds. */
+#define PF_MAX_FDS 8
+    struct {
+        int fd;
+        u8 kind;              /* PF_* kind (sys_procfs.c) */
+        u64 ino;              /* memfd inode: stale-entry check on fd reuse */
+    } pf_fds[PF_MAX_FDS];
+    int pf_fds_count;
+
+    /* /proc/stat busy-CPU estimate: integral of the sysinfo() load average
+     * over time (sys_procfs.c stat_estimate). Monotonic within a process,
+     * which is what delta-computing readers (top, vmstat) require. */
+    u64 stat_busy;            /* accumulated busy jiffies (USER_HZ = 100) */
+    u64 stat_last_ns;         /* CLOCK_BOOTTIME at last sample; 0 = unseeded */
+
     /* Fake identity (-fake-id): proot-style fake uid/gid + credential set. */
     int fake_id;              /* mode enabled */
     u32 fake_uid, fake_gid;   /* configured identity = stat remap target (fixed) */

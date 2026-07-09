@@ -37,7 +37,8 @@ followed against the guest root and `..` cannot escape it — so no privilege or
 urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
 `/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
 cannot escape the rootfs), `maps`, `cmdline`, `comm`, `mounts`/`mountinfo`,
-`loadavg`, `uptime`, and `version` is synthesized.
+`loadavg`, `uptime`, and `version` is synthesized; `/proc/stat` falls back to
+a synthesized view where the host denies the real file (Android).
 
 ### Fake identity (`-fake-id`)
 

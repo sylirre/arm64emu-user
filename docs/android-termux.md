@@ -61,7 +61,13 @@ unfiltered:
   `uptime` and `version` are synthesized from `sysinfo()`/`CLOCK_BOOTTIME`
   (both permitted): Android SELinux denies apps the real files, which is why
   Termux carries per-package patches rewriting their readers to `sysinfo()` —
-  guest `procps`/`top`/`uptime`/`w` here work **unpatched**.
+  guest `procps`/`top`/`uptime`/`w` here work **unpatched**. `/proc/stat` is
+  synthesized too when the host denies it: `top`/`vmstat` show a CPU% *estimate*
+  (the load average integrated over time — the real jiffy split is not
+  readable by an app), and `ps`/`top` start times are correct because `btime`
+  is computed exactly. These time-varying files regenerate when procps-style
+  readers rewind and reread them through one long-lived fd, so a running
+  `top` updates live instead of freezing.
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).

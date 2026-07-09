@@ -88,7 +88,17 @@ task's canonical cwd string, which is tracked independently of the host cwd).
   SELinux denies apps the real ones, so they are rebuilt from `sysinfo()`/
   `CLOCK_BOOTTIME` — the same sources guest `sysinfo` marshals, so the views
   agree; `version` is built from the fixed kernel identity `sys_uname`
-  presents, which the host file would contradict on *any* host). The guest
+  presents, which the host file would contradict on *any* host). `/proc/stat`
+  is try-host-first: the readable real file is strictly richer (per-CPU
+  jiffies, intr, ctxt) and passes through; where the host denies it (Android
+  again) a fallback is synthesized — CPU time estimated by integrating the
+  load average (monotonic, so `top`/`vmstat` deltas work), `btime` exact from
+  `time() − CLOCK_BOOTTIME` (procps computes process start times from it),
+  the rest honest zeros. `/proc/uptime`'s idle field comes from the host
+  `stat` when readable, else the same estimate, so the two files agree. The
+  time-varying files (`loadavg`/`uptime`/`stat`) are regenerated when a read
+  starts at offset 0: procps opens them once and `lseek(0)`+rereads every
+  refresh cycle, so an open-time snapshot would freeze `top`. The guest
   program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
   correctly for every guest process. `/proc/self/fd/N` open/stat stays

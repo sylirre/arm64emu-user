@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
+#include <time.h>
 #include <unistd.h>
 
 static void rl(const char *p) {
@@ -138,5 +140,64 @@ int main(void) {
     if (f) fclose(f);
     printf("version_guest=%d\n",
            strncmp(b, "Linux version 6.1.0-arm64chroot ", 32) == 0);
+
+    /* /proc/stat — run_tests.sh sets A64_PROCSTAT_FORCE_SYNTH, so this is
+     * the synthesized fallback exactly: one cpuN line per online CPU, the
+     * loadavg-consistent procs_running 1, an exact btime, an idle figure
+     * agreeing with /proc/uptime's, and counters that advance when reread
+     * through one fd (the procps open-once/lseek/reread pattern). */
+    struct sysinfo si;
+    sysinfo(&si);
+    long long sum1 = -1, sum2 = -1, btime = -1, prunning = -1;
+    double sidle = -1;
+    int ncpu = 0;
+    fd = open("/proc/stat", O_RDONLY);
+    for (int pass = 0; pass < 2 && fd >= 0; pass++) {
+        static char sb[1 << 16];
+        ssize_t r, tot = 0;
+        lseek(fd, 0, SEEK_SET);
+        while ((r = read(fd, sb + tot, sizeof sb - 1 - (size_t)tot)) > 0)
+            tot += r;
+        sb[tot] = 0;
+        unsigned long long v[4] = { 0 };
+        long long *sum = pass ? &sum2 : &sum1;
+        if (sscanf(sb, "cpu %llu %llu %llu %llu",
+                   &v[0], &v[1], &v[2], &v[3]) == 4) {
+            *sum = (long long)(v[0] + v[1] + v[2] + v[3]);
+            sidle = (double)v[3] / 100.0;
+        }
+        for (char *q = sb; !pass && q; q = strchr(q + 1, '\n')) {
+            if (*q == '\n') q++;
+            /* "cpuN" only: %d after "cpu" would eat the aggregate line */
+            if (!strncmp(q, "cpu", 3) && q[3] >= '0' && q[3] <= '9') ncpu++;
+            sscanf(q, "btime %lld", &btime);
+            sscanf(q, "procs_running %lld", &prunning);
+        }
+        if (!pass) {
+            struct timespec ts = { 0, 120000000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    long long boot = (long long)time(NULL) - (long long)si.uptime;
+    printf("stat ncpu=%d running1=%d btime_ok=%d idle_agree=%d\n",
+           ncpu == (int)sysconf(_SC_NPROCESSORS_ONLN), prunning == 1,
+           btime >= boot - 3 && btime <= boot + 3,
+           sidle >= 0 && idle >= 0 && sidle - idle < 2.0 && idle - sidle < 2.0);
+    printf("stat_rewind=%d\n", sum1 > 0 && sum2 > sum1);
+
+    /* uptime through one fd must advance on reread too. */
+    fd = fd >= 0 ? (close(fd), open("/proc/uptime", O_RDONLY)) : -1;
+    double u1 = -1, u2 = -1;
+    if (fd >= 0) {
+        n = read(fd, b, sizeof b - 1);
+        if (n > 0) { b[n] = 0; sscanf(b, "%lf", &u1); }
+        struct timespec ts = { 0, 120000000 };
+        nanosleep(&ts, NULL);
+        lseek(fd, 0, SEEK_SET);
+        n = read(fd, b, sizeof b - 1);
+        if (n > 0) { b[n] = 0; sscanf(b, "%lf", &u2); }
+        close(fd);
+    }
+    printf("uptime_rewind=%d\n", u1 > 0 && u2 > u1);
     return 0;
 }

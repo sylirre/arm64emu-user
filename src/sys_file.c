@@ -440,10 +440,12 @@ SYSDEF(openat) {
 
 SYSDEF(close) {
     nl_unmark_fd(c->m, (int)a0);   /* drop any fake-netlink bookkeeping for this fd */
+    procfs_unmark_fd(c->m, (int)a0);
     return close((int)a0) < 0 ? host_err() : 0;
 }
 
 SYSDEF(read) {
+    procfs_pre_read(c, (int)a0, -1);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -465,6 +467,7 @@ SYSDEF(write) {
 }
 
 SYSDEF(readv) {
+    procfs_pre_read(c, (int)a0, -1);
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
@@ -506,6 +509,7 @@ SYSDEF(writev) {
 }
 
 SYSDEF(pread64) {
+    procfs_pre_read(c, (int)a0, (s64)a3);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -535,6 +539,7 @@ SYSDEF(pwrite64) {
  * historically didn't declare the wrapper, so issue the raw syscall there with
  * the offset in a single register and pos_h = 0. */
 SYSDEF(preadv2) {
+    procfs_pre_read(c, (int)a0, (s64)a3);   /* -1 = current pos, as here */
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
@@ -591,6 +596,7 @@ SYSDEF(pwritev2) {
  * position" escape -- the kernel rejects any negative offset with EINVAL --
  * and the host wrapper reproduces that. */
 SYSDEF(preadv) {
+    procfs_pre_read(c, (int)a0, (s64)a3);
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);

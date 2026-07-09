@@ -42,9 +42,18 @@ int oflags_h2g(int h);
 #define GUEST_KVER "#1 SMP arm64chroot"
 
 /* sys_procfs.c: synthesized /proc files (maps, cmdline, mounts, mountinfo,
- * loadavg, uptime, version).
+ * loadavg, uptime, version; stat where the host denies the real file).
  * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
+
+/* The time-varying synthesized files (loadavg/uptime/stat) are regenerated
+ * when a read starts at offset 0 — procps opens them once and lseek(0)+reads
+ * every refresh cycle, so an open-time snapshot would freeze top/vmstat.
+ * Call before the host read; off = the explicit pread-family offset, or -1
+ * for the fd's current position (read/readv). */
+void procfs_pre_read(CPU *c, int fd, s64 off);
+/* Drop refresh tracking for a closing fd. */
+void procfs_unmark_fd(struct Machine *m, int fd);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
