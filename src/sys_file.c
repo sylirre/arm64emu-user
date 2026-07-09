@@ -712,29 +712,33 @@ SYSDEF(faccessat2) {
 }
 
 SYSDEF(readlinkat) {
-    char gpath[PATH_MAX];
-    long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
-    if (n < 0) return (u64)(s64)n;
-    /* /proc/self/exe: the guest's idea of its executable. */
-    if (!strcmp(gpath, "/proc/self/exe")) {
-        size_t l = strlen(c->m->exec_path);
-        size_t out = l < a3 ? l : a3;
-        if (copy_to_guest(c, a2, c->m->exec_path, out) < 0) return (u64)(s64)-EFAULT;
-        return out;
-    }
-    char host[PATH_MAX];
-    int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, host, NULL);
+    char host[PATH_MAX], canon[PATH_MAX];
+    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, canon);
     if (r < 0) return (u64)(s64)r;
-#ifdef L2S_ENABLED
-    if (c->m->link2symlink) {
-        char backing[PATH_MAX]; unsigned long count;
-        if (l2s_resolve(host, backing, &count) == 1)
-            return (u64)(s64)-EINVAL;   /* guest sees a regular file, not a link */
-    }
-#endif
     char buf[PATH_MAX];
-    ssize_t rn = readlink(host, buf, sizeof buf);
-    if (rn < 0) return host_err();
+    ssize_t rn;
+    /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
+     * state; report the guest-view target instead. */
+    if (path_proc_magic(c->m, canon, buf)) {
+        rn = (ssize_t)strlen(buf);
+    } else {
+#ifdef L2S_ENABLED
+        if (c->m->link2symlink) {
+            char backing[PATH_MAX]; unsigned long count;
+            if (l2s_resolve(host, backing, &count) == 1)
+                return (u64)(s64)-EINVAL;   /* guest sees a regular file, not a link */
+        }
+#endif
+        rn = readlink(host, buf, sizeof buf - 1);
+        if (rn < 0) return host_err();
+        /* Passthrough /proc (and /dev/fd -> /proc/self/fd) links to a
+         * rootfs-contained file carry the rootfs prefix; strip it. */
+        if (!strncmp(host, "/proc/", 6)) {
+            buf[rn] = 0;
+            path_strip_rootfs(c->m, buf);
+            rn = (ssize_t)strlen(buf);
+        }
+    }
     size_t out = (size_t)rn < a3 ? (size_t)rn : a3;
     if (copy_to_guest(c, a2, buf, out) < 0) return (u64)(s64)-EFAULT;
     return out;

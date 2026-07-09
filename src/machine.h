@@ -142,4 +142,12 @@ int load_elf(struct Machine *m, const char *guest_path,
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out);
 
+/* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
+ * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
+int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
+
+/* Strip the rootfs prefix from a host path in place (guest view of e.g. a
+ * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
+void path_strip_rootfs(const struct Machine *m, char *path);
+
 #endif /* A64_MACHINE_H */

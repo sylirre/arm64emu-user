@@ -66,11 +66,43 @@ static int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     return 0;
 }
 
+/* Magic /proc symlinks of the CURRENT process — exe, cwd, root, in the "self"
+ * or own-pid spelling — whose host targets name emulator state (our binary,
+ * the host cwd, the host root). Following or reading them raw would leak host
+ * paths, and root/… would escape the rootfs entirely, so the resolver walk
+ * splices in the *guest* target instead (and readlinkat reports it). Writes
+ * the guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
+int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
+    const char *tail = NULL;
+    if (!strncmp(canon, "/proc/self/", 11)) tail = canon + 11;
+    else if (!strncmp(canon, "/proc/", 6)) {
+        char own[32];
+        int n = snprintf(own, sizeof own, "%d/", getpid());
+        if (n > 0 && !strncmp(canon + 6, own, (size_t)n)) tail = canon + 6 + n;
+    }
+    if (!tail) return 0;
+    if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
+    if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }
+    if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
+    return 0;
+}
+
+/* Strip the rootfs prefix from a host path in place, yielding the guest path.
+ * Anonymous targets (pipe:[..]) and passthrough paths (/dev, /proc) don't
+ * carry the prefix and pass through unchanged. */
+void path_strip_rootfs(const struct Machine *m, char *path) {
+    size_t rl = strlen(m->rootfs);
+    if (rl == 0 || strncmp(path, m->rootfs, rl)) return;
+    if (path[rl] == 0) { strcpy(path, "/"); return; }
+    if (path[rl] != '/') return;
+    memmove(path, path + rl, strlen(path + rl) + 1);
+}
+
 /* Special path zones, applied to the *canonical* guest path:
  *  - a /dev whitelist passes through to the host devices (the rootfs /dev is
  *    empty in a plain directory tree);
- *  - /proc passes through to the host, except /proc/self/exe and
- *    /proc/<own-pid>/exe which name the *guest* executable.
+ *  - /proc passes through to the host (the magic self-links above never get
+ *    here on a following resolution — the walk splices them out).
  * Returns 1 if host_out was filled, 0 to fall through to rootfs prefixing. */
 static int special_host_path(struct Machine *m, const char *canon, char *host_out) {
     if (!strncmp(canon, "/dev/", 5) || !strcmp(canon, "/dev")) {
@@ -95,12 +127,6 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         return 0;   /* everything else: rootfs/dev (usually ENOENT) */
     }
     if (!strncmp(canon, "/proc", 5) && (canon[5] == 0 || canon[5] == '/')) {
-        char selfexe[64];
-        snprintf(selfexe, sizeof selfexe, "/proc/%d/exe", getpid());
-        if (!strcmp(canon, "/proc/self/exe") || !strcmp(canon, selfexe)) {
-            to_host(m, m->exec_path, host_out);
-            return 1;
-        }
         strcpy(host_out, canon);   /* host /proc passthrough */
         return 1;
     }
@@ -150,12 +176,17 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
 
         /* Follow symlinks (last component only if the caller wants it). */
         if (last && (flags & PATH_NOFOLLOW_LAST)) continue;
-        r = to_host(m, canon, hostbuf);
-        if (r < 0) return r;
         char tgt[PATH_MAX];
-        ssize_t tn = readlink(hostbuf, tgt, sizeof tgt - 1);
-        if (tn < 0) continue;             /* not a symlink (or missing) */
-        tgt[tn] = 0;
+        ssize_t tn;
+        if (path_proc_magic(m, canon, tgt)) {   /* /proc self-link: guest target */
+            tn = (ssize_t)strlen(tgt);
+        } else {
+            r = to_host(m, canon, hostbuf);
+            if (r < 0) return r;
+            tn = readlink(hostbuf, tgt, sizeof tgt - 1);
+            if (tn < 0) continue;         /* not a symlink (or missing) */
+            tgt[tn] = 0;
+        }
         if (++nlinks > 40) return -ELOOP;
         /* Splice: target replaces the component; unprocessed remainder is
          * appended after it, and the walk restarts from the splice point. */
