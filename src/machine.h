@@ -60,6 +60,18 @@ struct Machine {
     /* Thread bookkeeping (CLONE_VM). */
     int next_tid;             /* monotonic tid allocator */
 
+    /* Emulated AF_NETLINK/NETLINK_ROUTE sockets. On Android the host denies a
+     * real netlink socket, so socket() hands out an AF_UNIX/SOCK_DGRAM stand-in
+     * and the netlink-shaped syscalls on it are synthesised (sys_netlink.c).
+     * Shared across guest threads, copied on fork — like the host fds. */
+#define NL_MAX_FDS 32
+    struct {
+        int fd;
+        u8 *reply;            /* pending reply buffer (malloc'd), or NULL */
+        size_t reply_len;     /* valid bytes in reply awaiting recv */
+    } nl_fds[NL_MAX_FDS];
+    int nl_fds_count;
+
     /* Fake identity (-fake-id): proot-style fake uid/gid + credential set. */
     int fake_id;              /* mode enabled */
     u32 fake_uid, fake_gid;   /* configured identity = stat remap target (fixed) */

@@ -10,12 +10,35 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <linux/netlink.h>   /* AF_NETLINK, NETLINK_ROUTE, NETLINK_AUDIT */
+
 #include "sys.h"
+#include "sys_netlink.h"
 
 SYSDEF(socket) {
     (void)a3; (void)a4; (void)a5;
-    int fd = socket((int)a0, (int)a1, (int)a2);
-    return fd < 0 ? host_err() : (u64)fd;
+    int domain = (int)a0, type = (int)a1, protocol = (int)a2;
+    /* On hosts that deny AF_NETLINK (Android), substitute an AF_UNIX/SOCK_DGRAM
+     * socket for a NETLINK_ROUTE request and synthesise its traffic; other
+     * netlink protocols fall through to the real kernel behavior. */
+    if (domain == AF_NETLINK && protocol == NETLINK_ROUTE && nl_host_blocks()) {
+        int fd = socket(AF_UNIX, SOCK_DGRAM | (type & (SOCK_CLOEXEC | SOCK_NONBLOCK)), 0);
+        if (fd < 0) return host_err();
+        nl_mark_fd(c->m, fd);
+        return (u64)fd;
+    }
+    int fd = socket(domain, type, protocol);
+    if (fd < 0) {
+        /* fake_id0-style shim: a would-be-root guest that the host denies a
+         * NETLINK_AUDIT socket gets EPROTONOSUPPORT ("audit not built in")
+         * rather than a hard permission error. */
+        if (c->m->fake_id && c->m->cred.euid == 0 &&
+            domain == AF_NETLINK && protocol == NETLINK_AUDIT &&
+            (errno == EPERM || errno == EACCES))
+            return (u64)(s64)-EPROTONOSUPPORT;
+        return host_err();
+    }
+    return (u64)fd;
 }
 
 SYSDEF(socketpair) {
@@ -34,6 +57,7 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
 }
 
 SYSDEF(bind) {
+    if (nl_is_fd(c->m, (int)a0)) return 0;   /* fake netlink socket: silent success */
     struct sockaddr_storage ss;
     socklen_t sl;
     int r = addr_in(c, a1, (u32)a2, &ss, &sl);
@@ -88,6 +112,7 @@ SYSDEF(accept4) {
 }
 
 SYSDEF(getsockname) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_getsockname(c, a1, a2);
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getsockname((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
@@ -95,6 +120,7 @@ SYSDEF(getsockname) {
 }
 
 SYSDEF(getpeername) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_getsockname(c, a1, a2);
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getpeername((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
@@ -102,6 +128,7 @@ SYSDEF(getpeername) {
 }
 
 SYSDEF(sendto) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -119,6 +146,8 @@ SYSDEF(sendto) {
 }
 
 SYSDEF(recvfrom) {
+    if (nl_is_fd(c->m, (int)a0))
+        return nl_recvfrom(c, (int)a0, a1, a2, (int)a3, a4, a5);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -220,6 +249,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
 }
 
 SYSDEF(sendmsg) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_sendmsg(c, (int)a0, a1);
     GMsghdr g;
     struct msghdr h;
     struct iovec *iov;
@@ -260,6 +290,7 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
 }
 
 SYSDEF(recvmsg) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_recvmsg(c, (int)a0, a1, (int)a2);
     GMsghdr g;
     struct msghdr h;
     struct iovec *iov;

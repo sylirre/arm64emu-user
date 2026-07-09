@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "sys.h"
+#include "sys_netlink.h"
 
 /* O_* translation: asm-generic (arm64/arm32 guest) vs host. Only these four
  * differ between asm-generic and x86; the rest pass through. */
@@ -433,7 +434,10 @@ SYSDEF(openat) {
     return fd < 0 ? host_err() : (u64)fd;
 }
 
-SYSDEF(close) { return close((int)a0) < 0 ? host_err() : 0; }
+SYSDEF(close) {
+    nl_unmark_fd(c->m, (int)a0);   /* drop any fake-netlink bookkeeping for this fd */
+    return close((int)a0) < 0 ? host_err() : 0;
+}
 
 SYSDEF(read) {
     size_t len = (size_t)a2;
@@ -969,6 +973,15 @@ SYSDEF(ioctl) {
         if (copy_to_guest(c, a2, buf, total) < 0) { free(buf); return (u64)(s64)-EFAULT; }
         free(buf);
         return (u64)r;
+    }
+    /* SIOCGIFINDEX: not in the whitelist below, and Android denies it (EACCES)
+     * on the socket glibc opens for if_nametoindex(); resolve it from the host's
+     * own interface table instead. Unresolvable names fall through unchanged.
+     * Ungated (like proot) so if_nametoindex() works whether or not the host
+     * blocks netlink. */
+    if (cmd == 0x8933 /*SIOCGIFINDEX*/) {
+        u64 ret;
+        if (nl_maybe_siocgifindex(c, a2, &ret)) return ret;
     }
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)

@@ -18,7 +18,8 @@ LDFLAGS += $(shell echo 'int main(){return 0;}' | $(CC) $(CFLAGS) -latomic -x c 
 CORE := src/core/cpu.c src/core/decode.c src/core/exec_fpsimd.c src/core/sysreg.c
 SRCS := $(CORE) src/mem.c src/exception.c src/loop.c src/predecode.c src/elf.c src/path.c \
         src/signal.c src/syscall.c src/sys_file.c src/sys_mm.c src/sys_proc.c \
-        src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/main.c
+        src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/sys_netlink.c \
+        src/main.c
 
 arm64chroot: $(SRCS) $(wildcard src/*.h src/core/*.h)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
