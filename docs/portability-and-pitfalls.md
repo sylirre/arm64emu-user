@@ -32,6 +32,9 @@ all four targets.
   Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) allow-list
   (`ANDROID_FORBIDDEN_SYSCALLS.md`, appendix) or be `__BIONIC__`-gated to a
   safe alternative (precedent: the keyring family returns `-ENOSYS` on Bionic).
+  The rule is enforced in CI by `make test-seccomp`, which runs the whole
+  differential suite with the emulator under a trap filter for the Oreo-blocked
+  set (see [android-termux.md](android-termux.md)).
 
 ## Catalog of pitfalls (each is a bug we hit)
 

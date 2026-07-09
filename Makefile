@@ -45,8 +45,20 @@ test-android-sim: $(SRCS) $(wildcard src/*.h src/core/*.h)
 	    -o arm64chroot_asim $(SRCS) $(LDFLAGS)
 	tests/run_tests.sh ./arm64chroot_asim
 
+# Android-seccomp regression gate: the ENTIRE differential suite with the
+# emulator under a SECCOMP_RET_TRAP filter for the full Oreo-blocked set
+# (tests/seccomp_wrap.c). Proves no handler forwards a blocked syscall and
+# the SIGSYS net covers the rest. Needs host seccomp (any normal Linux).
+test-seccomp: arm64chroot
+	$(CC) $(CFLAGS) -o tests/seccomp_wrap.bin tests/seccomp_wrap.c
+	printf '#!/bin/sh\nexec tests/seccomp_wrap.bin ./arm64chroot "$$@"\n' > tests/seccomp_emu.sh
+	chmod +x tests/seccomp_emu.sh
+	tests/run_tests.sh tests/seccomp_emu.sh
+	rm -f tests/seccomp_emu.sh
+
 clean:
 	rm -f arm64chroot arm64chroot32 arm64chroot_asim
 	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin
+	rm -f tests/seccomp_emu.sh
 
-.PHONY: m32 test test32 test-android-sim clean
+.PHONY: m32 test test32 test-android-sim test-seccomp clean

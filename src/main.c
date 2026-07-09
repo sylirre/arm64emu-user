@@ -62,6 +62,27 @@ static void parse_id_spec(const char *s, u32 *uid, u32 *gid) {
     else *gid = (u32)u;   /* single value applies to both */
 }
 
+/* Sandbox diagnosis: report an inherited seccomp filter (Seccomp: 2 in
+ * /proc/self/status — the Android app sandbox is the common case). Under one,
+ * a blocked host syscall raises SIGSYS instead of returning ENOSYS; the net
+ * armed in main() converts those, and this one-liner answers the first
+ * question in any "works on one device, dies on another" report. */
+static void seccomp_notice(void) {
+    FILE *f = fopen("/proc/self/status", "re");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "Seccomp:", 8)) {
+            if (atoi(line + 8) == 2)
+                fprintf(stderr, "arm64chroot: seccomp filter active on this "
+                                "process; trapped host syscalls return "
+                                "ENOSYS\n");
+            break;
+        }
+    }
+    fclose(f);
+}
+
 int main(int argc, char **argv) {
     struct Machine *m = &g_machine;
     const char *argv0 = NULL;
@@ -149,6 +170,7 @@ int main(int argc, char **argv) {
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */
     sig_install_sigsys_net();
+    seccomp_notice();
 
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */

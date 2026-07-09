@@ -10,6 +10,7 @@ user-space emulator. For build/usage, see the top-level [`README.md`](../README.
 | [syscalls.md](syscalls.md) | The syscall dispatcher, ABI, LP64↔host struct marshalling, rootfs path containment, and `-fake-id` mode. |
 | [signals-and-processes.md](signals-and-processes.md) | Guest signal delivery, job control, and the `fork`/`vfork`/`execve`/threads process model. |
 | [portability-and-pitfalls.md](portability-and-pitfalls.md) | Host portability (ARM32/ARM64/x86/x86-64) and a catalog of subtle bugs and the lessons behind them. |
+| [android-termux.md](android-termux.md) | Android/Termux: the seccomp-whitelist problem and the emulator's defenses, building with clang, the `make test-seccomp` no-device regression gate, on-device smoke tests. |
 
 ## One-paragraph summary
 

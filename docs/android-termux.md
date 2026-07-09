@@ -1,0 +1,131 @@
+# Android / Termux
+
+How to build and run `arm64chroot` on Android under [Termux](https://termux.dev),
+why Android needs special handling at all, and how that handling is regression-
+tested without a device.
+
+## The problem: Android's seccomp whitelist
+
+Android ≥ 8.0 (Oreo) installs a **seccomp-BPF whitelist** on every app process.
+Termux is an ordinary app, so the filter is inherited by everything it forks and
+execs — including this emulator. The filter's action for a non-whitelisted
+syscall is not `-ENOSYS`; it is **`SIGSYS`, which kills the process**. Because
+the emulator issues host syscalls from its own process (1:1 fd model), a single
+forwarded blocked syscall would kill the emulator itself, not just the guest.
+
+Two flavors of blocked call matter (analysis: `ANDROID_FORBIDDEN_SYSCALLS.md`):
+
+* **Whitelist gaps** — calls the kernel supports but Bionic never issues, so
+  Oreo never whitelisted them: SysV IPC, POSIX mqueue, the keyring family,
+  `set_robust_list`/`get_robust_list`, NUMA policy, …
+* **Post-Oreo syscalls** — `statx`, `rseq`, `clone3`, `faccessat2`, `openat2`,
+  io_uring, … trap instead of returning `-ENOSYS`, which breaks libc's
+  standard "probe the new syscall, fall back on ENOSYS" pattern.
+
+The baseline is **Oreo (8.0)**: later Androids whitelist a little more (e.g.
+`statx` from 9), but the same binary must also be correct there and on ordinary
+Linux, so nothing version-sniffs.
+
+## What the emulator does about it
+
+All of this is unconditional — the same binary behaves correctly filtered and
+unfiltered:
+
+* **SIGSYS net** (`src/signal.c`): a dedicated `SIGSYS` handler converts a
+  seccomp trap on a forwarded host syscall into a plain `-ENOSYS` return, so
+  the handler above it takes its ordinary fallback path instead of dying. The
+  first trap of each syscall number prints a one-shot notice
+  (`arm64chroot: host syscall N blocked by seccomp filter, returning ENOSYS`).
+* **`statx` fallback**: when host `statx` fails with `ENOSYS` (Android 8.0/8.1,
+  old kernels), the result is synthesized from `fstatat` with `STATX_BTIME`
+  cleared from the mask.
+* **Never-forwarded set**: the keyring family returns `-ENOSYS` on Bionic;
+  `set_robust_list`/`get_robust_list` are answered from per-thread emulator
+  state; guest probes of post-Oreo syscalls (`rseq`, `clone3`, `openat2`, …)
+  are quiet `-ENOSYS` dispatcher entries and never reach the host.
+* **Netlink emulation**: where the host denies `AF_NETLINK` sockets (common
+  under SELinux app policy), `NETLINK_ROUTE` is emulated in-process, so guest
+  `getifaddrs()`/`ip` keep working.
+* **Startup notice**: at startup the emulator reads `Seccomp:` from
+  `/proc/self/status` and, if a filter is active (mode 2), prints one line:
+  `arm64chroot: seccomp filter active on this process; trapped host syscalls
+  return ENOSYS`. Expected on every Android run; on a normal Linux box it
+  means you are inside some other sandbox (systemd, container, …).
+
+Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
+(rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
+
+## Building inside Termux
+
+```sh
+pkg install clang make
+make CC=clang
+```
+
+That is the whole build: clang predefines `__ANDROID__`/`__BIONIC__`, so the
+Bionic-specific raw-syscall paths and `-link2symlink` support compile in
+automatically. No cross toolchain, no root. An NDK clang from a Linux box
+(e.g. `CC=.../aarch64-linux-android24-clang`) also works for CI artifacts.
+
+## Running a rootfs on-device
+
+Keep the rootfs under Termux's `$HOME` (app-private storage). Do **not** unpack
+it on `/sdcard`/shared storage: that filesystem drops exec permission bits and
+symlinks, both of which a Linux rootfs needs.
+
+```sh
+# unpack e.g. a Debian arm64 rootfs tarball
+mkdir -p ~/debian && tar -xf debian-rootfs-arm64.tar.xz -C ~/debian
+
+./arm64chroot ~/debian /bin/bash -l                    # plain shell
+./arm64chroot -fake-id -link2symlink ~/debian /bin/bash -l   # for apt/dpkg
+```
+
+`-fake-id` (fake root) and `-link2symlink` (hard links via tracked symlinks —
+Android forbids `link()`) are what package managers need; see the top-level
+README for details.
+
+Reading the diagnostics on-device:
+
+| You see | It means |
+|---------|----------|
+| the one-line `seccomp filter active` notice | normal on Android; the SIGSYS net is armed |
+| `host syscall N blocked by seccomp filter, returning ENOSYS` | a handler forwarded a blocked syscall; the net absorbed it, but please report it (with N) — it should be on the never-forward list |
+| process dies with `Bad system call` (SIGSYS, exit 159) | the net failed or was bypassed — definitely report it |
+
+## The no-device regression gate: `make test-seccomp`
+
+```sh
+make test-seccomp
+```
+
+runs the **entire differential suite** with the emulator under a
+`SECCOMP_RET_TRAP` filter (`tests/seccomp_wrap.c`) covering the host-arch
+numbers of the full Oreo-blocked set. Any handler that forwards a blocked
+syscall either dies (net regression) or diverges from the unfiltered
+`qemu-aarch64` oracle — so "safe on Android 8" is a CI property on an ordinary
+Linux box, no device needed. A few numbers are deliberately exempt from the
+filter because the *host glibc* issues them before the net is armed or in ways
+Bionic never would (`rseq`, `set_robust_list`, `clone3`, `membarrier`,
+`accept`); the rationale lives in the `seccomp_wrap.c` header. The related
+`make test-android-sim` target additionally forces the statx-fallback and
+Bionic-keyring code paths at compile time.
+
+## On-device smoke-test checklist
+
+Manual sanity pass for a real device (Debian/Ubuntu arm64 rootfs under
+Termux). Everything must run without SIGSYS deaths, and the only expected
+seccomp output is the one-line startup notice.
+
+1. **stat paths** — `./arm64chroot ~/debian /bin/ls -l /usr/bin | head`
+   (`ls` uses `statx`; on Android 8.x this exercises trap → net → fallback).
+2. **Network, TLS, threads, getrandom** —
+   `./arm64chroot -fake-id ~/debian /usr/bin/apt-get update`.
+3. **Threads and robust lists** — any threaded guest binary, e.g.
+   `./arm64chroot ~/debian /usr/bin/openssl speed -multi 2 -seconds 1 sha256`
+   (glibc `pthread_create` hits `set_robust_list`/`rseq`/`clone` — all must be
+   absorbed, never forwarded).
+4. **Package install (fake root + hard links)** —
+   `./arm64chroot -fake-id -link2symlink ~/debian /usr/bin/dpkg -i some.deb`
+   then remove it again with `dpkg -r`.
+5. **Job control** — in `/bin/bash -l`: Ctrl-Z a `sleep`, `fg` it, Ctrl-C it.

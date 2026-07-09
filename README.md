@@ -90,6 +90,8 @@ threaded and crypto workloads — all byte-for-byte identical.
 make                 # native build (./arm64chroot)
 make m32             # 32-bit build via gcc -m32 (native ILP32-host CI on x86_64)
 make test            # differential test suite vs qemu-aarch64
+make test-seccomp    # same suite with the emulator under an Android-Oreo
+                     # seccomp mimic (no device needed)
 ```
 
 Cross-compile for a specific host (static, no runtime deps):
@@ -101,6 +103,19 @@ make CC=aarch64-linux-gnu-gcc  -static arm64chroot      # 64-bit ARM host
 
 Requires only a C11 compiler and libc (`-lm -lpthread`, plus `-latomic` where the
 host needs it for wide atomics — added automatically).
+
+### Android / Termux
+
+```sh
+pkg install clang make
+make CC=clang
+```
+
+The emulator is engineered to survive Android's app seccomp whitelist (a
+blocked host syscall SIGSYS-kills a normal process; here it degrades to
+`ENOSYS`) and includes `-link2symlink` for Android's `link()` ban. Details,
+device checklist, and how this is regression-tested without a device:
+[docs/android-termux.md](docs/android-termux.md).
 
 ## Design
 
