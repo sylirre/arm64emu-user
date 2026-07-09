@@ -4,16 +4,23 @@
  * describe the EMULATOR process, not the guest: maps (host mappings, the
  * wrong ISA's addresses), cmdline (the emulator invocation), and mounts /
  * mountinfo (the host — on Android, the app-sandbox — mount namespace, which
- * confuses df/apt-style tools). openat() diverts a read-only open of those
- * names to an anonymous in-memory file holding the guest view, regenerated on
- * every open. Everything else under /proc stays host-passthrough. */
+ * confuses df/apt-style tools). Three global files are synthesized too:
+ * loadavg and uptime because Android SELinux denies apps the real ones
+ * (Termux patches packages to call sysinfo() instead; here unpatched guest
+ * tools just work), and version because it must agree with the fixed kernel
+ * identity sys_uname presents, not the host's. openat() diverts a read-only
+ * open of those names to an anonymous in-memory file holding the guest view,
+ * regenerated on every open. Everything else under /proc stays
+ * host-passthrough — including stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
 
@@ -125,11 +132,49 @@ static void put_maps(int fd, struct Machine *m) {
     as_unlock();
 }
 
+/* Load averages and thread count from sysinfo() — the same source the guest's
+ * own sysinfo() is marshalled from, so the two views always agree. nr_running
+ * and the last-allocated pid are unknowable without /proc/stat (which Android
+ * also denies): claim 1 running (the reader is) and our own pid. */
+static void put_loadavg(int fd) {
+    struct sysinfo si;
+    unsigned long l[3] = { 0, 0, 0 };
+    unsigned nproc = 1;
+    if (sysinfo(&si) == 0) {
+        for (int i = 0; i < 3; i++) l[i] = si.loads[i];
+        nproc = si.procs ? si.procs : 1;
+    }
+    /* loads are fixed-point, scaled by 1 << SI_LOAD_SHIFT (65536) */
+    dprintf(fd, "%lu.%02lu %lu.%02lu %lu.%02lu 1/%u %d\n",
+            l[0] >> 16, (l[0] & 0xFFFF) * 100 / 65536,
+            l[1] >> 16, (l[1] & 0xFFFF) * 100 / 65536,
+            l[2] >> 16, (l[2] & 0xFFFF) * 100 / 65536,
+            nproc, getpid());
+}
+
+/* Uptime with sub-second precision from CLOCK_BOOTTIME (counts suspend, like
+ * the real file). The idle field is the sum across CPUs from /proc/stat —
+ * unknowable here, so 0.00; readers overwhelmingly use only field one. */
+static void put_uptime(int fd) {
+    struct timespec ts = { 0, 0 };
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) {
+        struct sysinfo si;
+        if (sysinfo(&si) == 0) ts.tv_sec = si.uptime;
+    }
+    dprintf(fd, "%lld.%02ld 0.00\n",
+            (long long)ts.tv_sec, ts.tv_nsec / 10000000);
+}
+
+static void put_version(int fd) {
+    dprintf(fd, "Linux version %s (arm64chroot) (arm64chroot) %s\n",
+            GUEST_KREL, GUEST_KVER);
+}
+
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
  * sets *ret to a host fd or -errno; returns 0 to fall through to the host. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     struct Machine *m = c->m;
-    enum { CMDLINE, MAPS, MOUNTS, MOUNTINFO } kind;
+    enum { CMDLINE, MAPS, MOUNTS, MOUNTINFO, LOADAVG, UPTIME, VERSION } kind;
     const char *tail = self_tail(canon);
     if (tail) {
         if      (!strcmp(tail, "cmdline"))   kind = CMDLINE;
@@ -139,6 +184,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         else return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = MOUNTS;   /* the /etc/mtab symlink usually lands here */
+    } else if (!strcmp(canon, "/proc/loadavg")) {
+        kind = LOADAVG;
+    } else if (!strcmp(canon, "/proc/uptime")) {
+        kind = UPTIME;
+    } else if (!strcmp(canon, "/proc/version")) {
+        kind = VERSION;
     } else {
         return 0;
     }
@@ -162,6 +213,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case MAPS:      put_maps(fd, m); break;
     case MOUNTS:    put_mounts(fd, m, 0); break;
     case MOUNTINFO: put_mounts(fd, m, 1); break;
+    case LOADAVG:   put_loadavg(fd); break;
+    case UPTIME:    put_uptime(fd); break;
+    case VERSION:   put_version(fd); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);

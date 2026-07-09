@@ -115,5 +115,28 @@ int main(void) {
     }
     if (f) fclose(f);
     printf("maps stack=%d exe=%d rx=%d\n", stack, exe_named, rx);
+
+    /* Global files: shape here, guest kernel id exactly (the differential
+     * test can't — qemu shows the host kernel). */
+    f = fopen("/proc/loadavg", "r");
+    double l0, l1, l2;
+    int running = 0, total = 0, lastpid = 0, nf = 0;
+    if (f) nf = fscanf(f, "%lf %lf %lf %d/%d %d",
+                       &l0, &l1, &l2, &running, &total, &lastpid);
+    if (f) fclose(f);
+    printf("loadavg fields=%d\n", nf);
+
+    f = fopen("/proc/uptime", "r");
+    double up = -1, idle = -1;
+    nf = f ? fscanf(f, "%lf %lf", &up, &idle) : 0;
+    if (f) fclose(f);
+    printf("uptime fields=%d up_pos=%d\n", nf, up > 0);
+
+    f = fopen("/proc/version", "r");
+    b[0] = 0;
+    if (f && !fgets(b, sizeof b, f)) b[0] = 0;
+    if (f) fclose(f);
+    printf("version_guest=%d\n",
+           strncmp(b, "Linux version 6.1.0-arm64chroot ", 32) == 0);
     return 0;
 }

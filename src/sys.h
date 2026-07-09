@@ -36,7 +36,13 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
 int oflags_g2h(int g);
 int oflags_h2g(int h);
 
-/* sys_procfs.c: synthesized /proc files (maps, cmdline, mounts, mountinfo).
+/* The kernel identity presented to the guest: sys_uname and the synthesized
+ * /proc/version must agree, so both build from these. */
+#define GUEST_KREL "6.1.0-arm64chroot"
+#define GUEST_KVER "#1 SMP arm64chroot"
+
+/* sys_procfs.c: synthesized /proc files (maps, cmdline, mounts, mountinfo,
+ * loadavg, uptime, version).
  * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
 

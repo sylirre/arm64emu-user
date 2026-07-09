@@ -57,7 +57,11 @@ unfiltered:
   confuses `df`, apt's sandbox checks and mount-table parsers. `maps` and
   `cmdline` likewise show the guest, not the emulator, and the magic
   `self/{exe,cwd,root,fd/N}` links resolve in guest terms (so nothing under
-  Termux's `$PREFIX` paths leaks into guest output).
+  Termux's `$PREFIX` paths leaks into guest output). The global `loadavg`,
+  `uptime` and `version` are synthesized from `sysinfo()`/`CLOCK_BOOTTIME`
+  (both permitted): Android SELinux denies apps the real files, which is why
+  Termux carries per-package patches rewriting their readers to `sysinfo()` —
+  guest `procps`/`top`/`uptime`/`w` here work **unpatched**.
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).

@@ -92,8 +92,8 @@ SYSDEF(uname) {
     snprintf(g.nodename, sizeof g.nodename, "%s", h.nodename);
     /* Report a fixed modern kernel: glibc refuses to run below its minimum
      * supported version, and the host kernel version is meaningless here. */
-    snprintf(g.release, sizeof g.release, "6.1.0-arm64chroot");
-    snprintf(g.version, sizeof g.version, "#1 SMP arm64chroot");
+    snprintf(g.release, sizeof g.release, GUEST_KREL);
+    snprintf(g.version, sizeof g.version, GUEST_KVER);
     snprintf(g.machine, sizeof g.machine, "aarch64");
     return copy_to_guest(c, a0, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }

@@ -84,7 +84,12 @@ task's canonical cwd string, which is tracked independently of the host cwd).
   PTE-true protections, `[heap]`/`[stack]` labels), `cmdline` (exec-time guest
   argv), `mounts`/`mountinfo` (the rootfs plus the passthrough zones — host
   `/proc` shows the emulator's mappings, argv and mount namespace, all wrong
-  for the guest). The guest program's name is also set as the process `comm`
+  for the guest), and the global `loadavg`/`uptime`/`version` (Android
+  SELinux denies apps the real ones, so they are rebuilt from `sysinfo()`/
+  `CLOCK_BOOTTIME` — the same sources guest `sysinfo` marshals, so the views
+  agree; `version` is built from the fixed kernel identity `sys_uname`
+  presents, which the host file would contradict on *any* host). The guest
+  program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
   correctly for every guest process. `/proc/self/fd/N` open/stat stays
   host-passthrough deliberately: host fd == guest fd, and reopen semantics

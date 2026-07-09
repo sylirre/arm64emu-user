@@ -149,8 +149,9 @@ check_fixture robust $'get0 rc=0 len=24 head_set=1\nset_badlen rc=-1 err=22\nset
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 
 # ---- /proc fidelity: guest-view magic links (root/cwd/exe/fd — root must not
-# escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo,
-# against a throwaway mini-rootfs (qemu has no rootfs concept). ----
+# escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo/
+# loadavg/uptime/version, against a throwaway mini-rootfs (qemu has no rootfs
+# concept). ----
 if "$AGCC" -static -O2 -o tests/fixtures/procfs_fidelity.bin \
         tests/fixtures/procfs_fidelity.c 2>/dev/null; then
     PFROOT=$(mktemp -d)
@@ -171,7 +172,10 @@ mounts dev0=/dev/root lines=4 proc=1 pts=1 shm=1
 mountinfo lines=4 sep=1
 mtab0=/dev/root
 mounts_wr=1
-maps stack=1 exe=1 rx=1'
+maps stack=1 exe=1 rx=1
+loadavg fields=6
+uptime fields=2 up_pos=1
+version_guest=1'
     got=$("$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
     if [ "$got" = "$expect_pf" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_fidelity"
     else
