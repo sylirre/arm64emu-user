@@ -78,6 +78,7 @@ SYSDEF(sysinfo) {
         u32 pad2;
         u64 totalhigh, freehigh;
         u32 mem_unit;
+        u32 pad3;   /* explicit tail pad: ILP32 hosts align u64 to 4 */
     } g;
     _Static_assert(sizeof g == 112, "guest struct sysinfo must be 112 bytes");
     memset(&g, 0, sizeof g);
