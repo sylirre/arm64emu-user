@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/file.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1574,6 +1575,28 @@ SYSDEF(fadvise64) {
 SYSDEF(eventfd2) {
     int r = eventfd((unsigned)a0, (int)a1);
     return r < 0 ? host_err() : (u64)r;
+}
+
+/* inotify: IN_NONBLOCK/IN_CLOEXEC equal O_NONBLOCK/O_CLOEXEC (identical on
+ * asm-generic and x86, the eventfd2 reasoning), the IN_* mask bits are
+ * arch-uniform, and struct inotify_event has no arch-dependent fields, so
+ * the fd and its event stream pass through 1:1. */
+SYSDEF(inotify_init1) {
+    int r = inotify_init1((int)(s32)a0);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(inotify_add_watch) {
+    char host[PATH_MAX], canon[PATH_MAX];
+    unsigned rf = ((u32)a2 & 0x02000000u /*IN_DONT_FOLLOW*/) ? PATH_NOFOLLOW_LAST : 0;
+    int r = resolve_at(c, G_AT_FDCWD, a1, rf, host, canon);
+    if (r < 0) return (u64)(s64)r;
+    r = inotify_add_watch((int)a0, host, (u32)a2);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(inotify_rm_watch) {
+    return inotify_rm_watch((int)a0, (int)(s32)a1) < 0 ? host_err() : 0;
 }
 
 SYSDEF(epoll_create1) {

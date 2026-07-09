@@ -372,6 +372,47 @@ SYSDEF(execve) {
     return r;
 }
 
+SYSDEF(execveat) {
+    /* (dirfd, path, argv, envp, flags). Reuses the internal ELF-load path
+     * (do_execve), so no host execveat is needed. AT_EMPTY_PATH executes
+     * dirfd itself through the host /proc/self/fd (guest fd == host fd),
+     * which path_resolve passes through to the host. */
+    unsigned gf = (unsigned)a4;
+    if (gf & ~(unsigned)(G_AT_EMPTY_PATH | G_AT_SYMLINK_NOFOLLOW))
+        return (u64)(s64)-EINVAL;
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (n < 0) return (u64)(s64)n;
+    char exec_path[PATH_MAX];
+    if (!gpath[0]) {
+        if (!(gf & G_AT_EMPTY_PATH)) return (u64)(s64)-ENOENT;
+        if (fcntl((int)(s32)a0, F_GETFD) < 0) return (u64)(s64)-EBADF;
+        snprintf(exec_path, sizeof exec_path, "/proc/self/fd/%d", (int)(s32)a0);
+    } else {
+        char host[PATH_MAX], canon[PATH_MAX];
+        int r = path_resolve(c->m, (int)(s32)a0, gpath,
+                             (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0,
+                             host, canon);
+        if (r < 0) return (u64)(s64)r;
+        if (gf & G_AT_SYMLINK_NOFOLLOW) {
+            struct stat st;
+            if (lstat(host, &st) == 0 && S_ISLNK(st.st_mode))
+                return (u64)(s64)-ELOOP;   /* kernel: refuse a final symlink */
+        }
+        snprintf(exec_path, sizeof exec_path, "%s", canon);
+    }
+    int err = 0;
+    char **argv = import_strvec(c, a2, &err);
+    if (!argv) return (u64)(s64)err;
+    char **envp = import_strvec(c, a3, &err);
+    if (!envp) { free_strvec(argv); return (u64)(s64)err; }
+    (void)a5;
+    u64 r = do_execve(c, exec_path, argv, envp);
+    free_strvec(argv);
+    free_strvec(envp);
+    return r;
+}
+
 /* struct rusage marshalling (timevals + 14 longs). */
 typedef struct {
     GTimeval ru_utime, ru_stime;

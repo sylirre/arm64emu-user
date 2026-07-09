@@ -31,6 +31,8 @@
 #define G_NR_dup3              24
 #define G_NR_fcntl             25
 #define G_NR_inotify_init1     26
+#define G_NR_inotify_add_watch 27
+#define G_NR_inotify_rm_watch  28
 #define G_NR_ioctl             29
 #define G_NR_mkdirat           34
 #define G_NR_unlinkat          35

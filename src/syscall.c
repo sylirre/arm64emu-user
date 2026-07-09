@@ -26,6 +26,7 @@ SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
 SYSDEF(sync_file_range); SYSDEF(eventfd2);
+SYSDEF(inotify_init1); SYSDEF(inotify_add_watch); SYSDEF(inotify_rm_watch);
 SYSDEF(epoll_create1); SYSDEF(epoll_ctl); SYSDEF(epoll_pwait);
 SYSDEF(setxattr); SYSDEF(lsetxattr); SYSDEF(fsetxattr);
 SYSDEF(getxattr); SYSDEF(lgetxattr); SYSDEF(fgetxattr);
@@ -43,7 +44,7 @@ SYSDEF(exit); SYSDEF(exit_group); SYSDEF(getpid); SYSDEF(getppid);
 SYSDEF(getuid); SYSDEF(geteuid); SYSDEF(getgid); SYSDEF(getegid);
 SYSDEF(gettid); SYSDEF(set_tid_address); SYSDEF(set_robust_list);
 SYSDEF(get_robust_list);
-SYSDEF(uname); SYSDEF(clone); SYSDEF(execve); SYSDEF(wait4);
+SYSDEF(uname); SYSDEF(clone); SYSDEF(execve); SYSDEF(execveat); SYSDEF(wait4);
 SYSDEF(setpgid); SYSDEF(getpgid); SYSDEF(setsid); SYSDEF(getsid);
 SYSDEF(prctl); SYSDEF(getgroups); SYSDEF(setgroups); SYSDEF(umask);
 SYSDEF(setuid); SYSDEF(setgid); SYSDEF(setresuid); SYSDEF(setresgid);
@@ -146,6 +147,9 @@ static const struct {
     { 32 /* flock */, sys_flock, "flock" },
     { G_NR_sync_file_range, sys_sync_file_range, "sync_file_range" },
     { G_NR_eventfd2, sys_eventfd2, "eventfd2" },
+    { G_NR_inotify_init1, sys_inotify_init1, "inotify_init1" },
+    { G_NR_inotify_add_watch, sys_inotify_add_watch, "inotify_add_watch" },
+    { G_NR_inotify_rm_watch, sys_inotify_rm_watch, "inotify_rm_watch" },
     { G_NR_epoll_create1, sys_epoll_create1, "epoll_create1" },
     { G_NR_epoll_ctl, sys_epoll_ctl, "epoll_ctl" },
     { G_NR_epoll_pwait, sys_epoll_pwait, "epoll_pwait" },
@@ -191,6 +195,7 @@ static const struct {
     { G_NR_uname, sys_uname, "uname" },
     { G_NR_clone, sys_clone, "clone" },
     { G_NR_execve, sys_execve, "execve" },
+    { G_NR_execveat, sys_execveat, "execveat" },
     { G_NR_wait4, sys_wait4, "wait4" },
     { G_NR_waitid, sys_waitid, "waitid" },
     { G_NR_setpgid, sys_setpgid, "setpgid" },
