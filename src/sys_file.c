@@ -425,11 +425,15 @@ static void l2s_fix_fd(int fd, struct stat *st) {
 #endif /* L2S_ENABLED */
 
 SYSDEF(openat) {
-    char host[PATH_MAX];
+    char host[PATH_MAX], canon[PATH_MAX];
     int gflags = (int)a2;
     unsigned rf = (gflags & G_O_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
+    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, canon);
     if (r < 0) return (u64)(s64)r;
+    if (!strncmp(canon, "/proc/", 6)) {   /* maps/cmdline/mounts: guest view */
+        s64 pf;
+        if (procfs_open(c, canon, gflags, &pf)) return (u64)pf;
+    }
     int fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
     return fd < 0 ? host_err() : (u64)fd;
 }

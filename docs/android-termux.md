@@ -51,6 +51,13 @@ unfiltered:
   `arm64chroot: seccomp filter active on this process; trapped host syscalls
   return ENOSYS`. Expected on every Android run; on a normal Linux box it
   means you are inside some other sandbox (systemd, container, …).
+* **Guest-view `/proc`** (`src/sys_procfs.c`): `mounts`/`mountinfo` are
+  synthesized as the guest's mount table — the host files expose the Android
+  app-sandbox namespace (dozens of `/apex`, `/vendor`, sdcardfs mounts), which
+  confuses `df`, apt's sandbox checks and mount-table parsers. `maps` and
+  `cmdline` likewise show the guest, not the emulator, and the magic
+  `self/{exe,cwd,root,fd/N}` links resolve in guest terms (so nothing under
+  Termux's `$PREFIX` paths leaks into guest output).
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 
 #include "machine.h"
@@ -38,8 +39,10 @@ static u32 pf_to_prot(u32 pf) {
 }
 
 /* Load one ELF file into the address space. `fixed_base`: ET_DYN load bias to
- * request, or -1 to allocate from the mmap area (used for the interpreter). */
-static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out) {
+ * request, or -1 to allocate from the mmap area (used for the interpreter).
+ * `gpath` (guest path) names the image's regions for /proc/self/maps. */
+static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
+                    const char *gpath) {
     Elf64_Ehdr eh;
     if (pread(fd, &eh, sizeof eh, 0) != sizeof eh) return -ENOEXEC;
     if (memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
@@ -117,6 +120,7 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out) {
     for (u64 i = 0; i < span_pages; i++)
         guest_protect(&m->as, base + lo + (i << 12), GUEST_PAGE_SIZE, pageprot[i]);
     free(pageprot);
+    as_set_region_path(&m->as, base + lo, base + hi, gpath);
 
     out->base = base;
     out->entry = base + eh.e_entry;
@@ -155,7 +159,7 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     LoadInfo exe = {0}, interp = {0};
     /* ET_EXEC ignores the base; ET_DYN main executables load at the fixed
      * ELF_ET_DYN_BASE analogue (the interpreter allocates from the mmap area). */
-    r = load_one(m, fd, ET_DYN_BASE, &exe);
+    r = load_one(m, fd, ET_DYN_BASE, &exe, canon);
     close(fd);
     if (r < 0) return r;
 
@@ -166,7 +170,7 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         if (r < 0) return r;
         int ifd = open(ihost, O_RDONLY | O_CLOEXEC);
         if (ifd < 0) return -errno;
-        r = load_one(m, ifd, (u64)-1, &interp);
+        r = load_one(m, ifd, (u64)-1, &interp, exe.interp);
         close(ifd);
         if (r < 0) return r;
         entry = interp.entry;
@@ -259,6 +263,29 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     m->phdr_va = exe.phdr_va;
     m->phnum = exe.phnum;
     memcpy(m->exec_path, canon, strlen(canon) + 1);
+
+    /* /proc/self/cmdline content: the guest argv, NUL-joined (the host file
+     * shows the emulator's own argv). */
+    size_t cl = 0;
+    for (int i = 0; i < argc; i++) cl += strlen(argv[i]) + 1;
+    char *cmd = malloc(cl ? cl : 1);
+    if (cmd) {
+        size_t off = 0;
+        for (int i = 0; i < argc; i++) {
+            size_t l = strlen(argv[i]) + 1;
+            memcpy(cmd + off, argv[i], l);
+            off += l;
+        }
+        free(m->cmdline);
+        m->cmdline = cmd;
+        m->cmdline_len = (u32)cl;
+    }
+    /* Present the guest program's name as this process's comm, so
+     * /proc/<pid>/comm, status Name: and stat field 2 — which pass through to
+     * the host — are right for every guest process, and host-side ps shows
+     * guest names. prctl(PR_SET_NAME) is on the Android 8 seccomp allow-list. */
+    const char *base = strrchr(canon, '/');
+    prctl(PR_SET_NAME, base && base[1] ? base + 1 : canon);
 
     /* rt_sigreturn trampoline page: `mov x8, #139; svc #0`. arm64 has no
      * sa_restorer; the kernel points lr at the vDSO sigtramp — we host it on a

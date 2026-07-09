@@ -73,8 +73,22 @@ task's canonical cwd string, which is tracked independently of the host cwd).
 - `/dev`: a whitelist passes through to host devices (`null`, `zero`, `full`,
   `random`, `urandom`, `tty`, `ptmx`, `pts/*`, `shm/*`, `fd/*`); everything else
   resolves into `rootfs/dev` (usually ENOENT).
-- `/proc`: passes through to host `/proc`, **except** `/proc/self/exe` (→ the
-  guest exe path) and `/proc/self/maps` (synthesized from the region list).
+- `/proc`: passes through to host `/proc`, with two guest-view exceptions.
+  The current process's **magic links** — `exe`, `cwd`, `root` in the `self`
+  or own-pid spelling — are spliced to their guest targets during the walk
+  (`path_proc_magic`), so `stat /proc/self/exe` reaches the guest binary and
+  `/proc/self/root/…` resolves inside the rootfs instead of escaping to the
+  host fs; `readlinkat` reports the same guest targets, and strips the rootfs
+  prefix from `fd/N` link targets. And `openat` diverts **synthesized files**
+  (`sys_procfs.c`) to an in-memory guest view: `maps` (from the region list,
+  PTE-true protections, `[heap]`/`[stack]` labels), `cmdline` (exec-time guest
+  argv), `mounts`/`mountinfo` (the rootfs plus the passthrough zones — host
+  `/proc` shows the emulator's mappings, argv and mount namespace, all wrong
+  for the guest). The guest program's name is also set as the process `comm`
+  (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
+  correctly for every guest process. `/proc/self/fd/N` open/stat stays
+  host-passthrough deliberately: host fd == guest fd, and reopen semantics
+  (including O_TMPFILE publishing) must keep working.
 
 ## `execve`
 

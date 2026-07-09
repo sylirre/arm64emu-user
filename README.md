@@ -34,8 +34,10 @@ Debian arm64 root filesystem). `/` is allowed to run host-native aarch64 binarie
 directly. Guest paths resolve **inside** the rootfs — absolute symlinks are
 followed against the guest root and `..` cannot escape it — so no privilege or
 `chroot(2)` is required. `/proc` and a `/dev` whitelist (null, zero, random,
-urandom, tty, ptmx, pts, shm, fd) pass through to the host; `/proc/self/exe` and
-`/proc/self/maps` are synthesized for the guest.
+urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
+`/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
+cannot escape the rootfs), `maps`, `cmdline`, `comm`, and `mounts`/`mountinfo`
+is synthesized.
 
 ### Fake identity (`-fake-id`)
 

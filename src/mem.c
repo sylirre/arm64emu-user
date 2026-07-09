@@ -575,3 +575,23 @@ int guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot) {
 u64 as_find_free(AddrSpace *as, u64 len) {
     as_lock(); u64 r = as_find_free_impl(as, len); as_unlock(); return r;
 }
+
+/* Page protection as mapped (0 if unmapped). Region records keep their
+ * creation prot; after guest_protect the PTEs are the truth — this is what
+ * /proc/self/maps synthesis reports. Caller holds as_lock. */
+u32 as_page_prot(AddrSpace *as, u64 va) {
+    return (u32)(pte_get(as, va) & PTE_FLAGS);
+}
+
+/* Name the pathless regions overlapping [start, end). The ELF loader preads
+ * segments into anonymous backing, so the exe/interp images would otherwise
+ * show as anonymous in /proc/self/maps. */
+void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path) {
+    as_lock();
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if (r->start < end && start < r->end && !r->path)
+            r->path = strdup(path);
+    }
+    as_unlock();
+}

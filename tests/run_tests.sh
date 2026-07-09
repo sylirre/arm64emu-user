@@ -148,6 +148,42 @@ check_fixture() {   # check_fixture <name> <expected>
 check_fixture robust $'get0 rc=0 len=24 head_set=1\nset_badlen rc=-1 err=22\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 
+# ---- /proc fidelity: guest-view magic links (root/cwd/exe/fd — root must not
+# escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo,
+# against a throwaway mini-rootfs (qemu has no rootfs concept). ----
+if "$AGCC" -static -O2 -o tests/fixtures/procfs_fidelity.bin \
+        tests/fixtures/procfs_fidelity.c 2>/dev/null; then
+    PFROOT=$(mktemp -d)
+    mkdir -p "$PFROOT/etc" "$PFROOT/proc" "$PFROOT/dev"
+    echo guest-marker > "$PFROOT/etc/hostname"
+    ln -s /proc/mounts "$PFROOT/etc/mtab"
+    cp tests/fixtures/procfs_fidelity.bin "$PFROOT/procfs_fidelity.bin"
+    expect_pf='root_etc_hostname=guest-marker
+readlink=/etc
+readlink=/
+readlink=/procfs_fidelity.bin
+readlink=/procfs_fidelity.bin
+readlink=/etc/hostname
+lstat_cwd_link=1
+cmdline=/procfs_fidelity.bin trailing_nul=1
+comm=procfs_fidelity
+mounts dev0=/dev/root lines=4 proc=1 pts=1 shm=1
+mountinfo lines=4 sep=1
+mtab0=/dev/root
+mounts_wr=1
+maps stack=1 exe=1 rx=1'
+    got=$("$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
+    if [ "$got" = "$expect_pf" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_fidelity"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: procfs_fidelity"
+        diff <(echo "$expect_pf") <(echo "$got") | head -10 | sed 's/^/     /'
+    fi
+    rm -rf "$PFROOT"
+    rm -f tests/fixtures/procfs_fidelity.bin
+else
+    echo "SKIP build fixtures/procfs_fidelity"
+fi
+
 # ---- Android seccomp-mimic: run the emulator under a SECCOMP_RET_TRAP
 # filter for the Android-8-blocked syscalls (tests/seccomp_wrap.c). The
 # SIGSYS net must convert a trapped forward into -ENOSYS: same differential

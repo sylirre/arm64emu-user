@@ -36,6 +36,10 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
 int oflags_g2h(int g);
 int oflags_h2g(int h);
 
+/* sys_procfs.c: synthesized /proc files (maps, cmdline, mounts, mountinfo).
+ * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
+int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
+
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
 /* Fill in x0 (return value) after a handler runs. */

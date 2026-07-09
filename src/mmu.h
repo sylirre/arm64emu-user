@@ -120,6 +120,11 @@ int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
 int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
+/* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.
+ * For /proc/self/maps synthesis. */
+u32  as_page_prot(AddrSpace *as, u64 va);
+/* Name pathless regions in [start, end) (ELF images, for /proc/self/maps). */
+void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path);
 /* Caller must hold as_lock: the region array is realloc'd/memmove'd by
  * concurrent mappers, and the returned pointer is only valid while held. */
 const Region *as_find_region(AddrSpace *as, u64 va);

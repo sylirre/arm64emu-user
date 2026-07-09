@@ -42,6 +42,12 @@ struct Machine {
     char cwd[PATH_MAX];       /* canonical guest cwd ("/" based) */
     char exec_path[PATH_MAX]; /* canonical guest path of the running exe */
 
+    /* Exec-time guest argv, NUL-joined — the /proc/self/cmdline content
+     * (host /proc shows the emulator's argv). Rebuilt by every load_elf;
+     * fork's copy-on-write duplicates it like the rest of the heap. */
+    char *cmdline;
+    u32 cmdline_len;
+
     /* Saved for auxv synthesis and /proc/self */
     u64 auxv_va;              /* guest VA of auxv block on the initial stack */
     u64 auxv_len;
