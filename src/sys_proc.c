@@ -645,12 +645,69 @@ SYSDEF(sched_getparam) {
     return 0;
 }
 
+SYSDEF(sched_setparam) {
+    /* Guest pid maps 1:1 onto the host, so pass through; under SCHED_OTHER
+     * the host enforces that only priority 0 is accepted. NULL param is
+     * EINVAL, not EFAULT, matching the kernel (as in sched_getparam). */
+    if (!a1) return (u64)(s64)-EINVAL;
+    s32 prio;
+    if (copy_from_guest(c, &prio, a1, sizeof prio) < 0) return (u64)(s64)-EFAULT;
+    struct sched_param sp = { .sched_priority = prio };
+    return sched_setparam((pid_t)(s32)a0, &sp) < 0 ? host_err() : 0;
+}
+
+SYSDEF(sched_setscheduler) {
+    /* Passthrough like sched_setparam: an unprivileged switch to a real-time
+     * policy fails with EPERM on the host exactly as it would for the guest. */
+    if (!a2) return (u64)(s64)-EINVAL;
+    s32 prio;
+    if (copy_from_guest(c, &prio, a2, sizeof prio) < 0) return (u64)(s64)-EFAULT;
+    struct sched_param sp = { .sched_priority = prio };
+    return sched_setscheduler((pid_t)(s32)a0, (int)(s32)a1, &sp) < 0 ? host_err() : 0;
+}
+
+SYSDEF(sched_getscheduler) {
+    int r = sched_getscheduler((pid_t)(s32)a0);
+    return r < 0 ? host_err() : (u64)r;
+}
+
 SYSDEF(sched_getaffinity) {
     /* Report a single CPU (we interpret on one thread anyway). */
     if (a1 < 8) return (u64)(s64)-EINVAL;
     u64 mask = 1;
     if (copy_to_guest(c, a2, &mask, 8) < 0) return (u64)(s64)-EFAULT;
     return 8;
+}
+
+SYSDEF(sched_setaffinity) {
+    /* Single-CPU interpreter (see sched_getaffinity): validate that the mask
+     * is readable and names at least one CPU in the first 64 -- more than we
+     * ever report -- then accept and ignore it. An empty set is EINVAL, as
+     * from the kernel. */
+    size_t len = (size_t)a1 < 8 ? (size_t)a1 : 8;
+    u64 mask = 0;
+    if (len && copy_from_guest(c, &mask, a2, len) < 0) return (u64)(s64)-EFAULT;
+    return mask ? 0 : (u64)(s64)-EINVAL;
+}
+
+SYSDEF(sched_get_priority_max) {
+    int r = sched_get_priority_max((int)(s32)a0);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(sched_get_priority_min) {
+    int r = sched_get_priority_min((int)(s32)a0);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(sched_rr_get_interval) {
+    /* Host call, GTimespec out. For non-SCHED_RR tasks the kernel reports
+     * the fair-class timeslice, which is scheduler state, not a constant --
+     * tests must not print the raw value. */
+    struct timespec ts;
+    if (sched_rr_get_interval((pid_t)(s32)a0, &ts) < 0) return host_err();
+    GTimespec g = { (s64)ts.tv_sec, (s64)ts.tv_nsec };
+    return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
 SYSDEF(getrusage) {

@@ -576,6 +576,52 @@ SYSDEF(pwritev2) {
     return n < 0 ? host_err() : (u64)n;
 }
 
+/* preadv/pwritev (fd, iov, iovcnt, pos_l, pos_h): the v2 calls above minus
+ * the flags argument; the same LP64 note applies, the full offset rides in
+ * pos_l (a3). Unlike the v2 calls there is no offset == -1 "current
+ * position" escape -- the kernel rejects any negative offset with EINVAL --
+ * and the host wrapper reproduces that. */
+SYSDEF(preadv) {
+    struct iovec iov[1024];
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
+    if (cnt < 0) return (u64)(s64)cnt;
+    ssize_t n = preadv((int)a0, iov, cnt, (off_t)a3);
+    if (n < 0) { free(bounce); return host_err(); }
+    /* scatter back */
+    GIovec g[1024];
+    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    ssize_t left = n;
+    for (int i = 0; i < cnt && left > 0; i++) {
+        size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
+        if (copy_to_guest(c, g[i].iov_base, iov[i].iov_base, chunk) < 0) {
+            free(bounce);
+            return (u64)(s64)-EFAULT;
+        }
+        left -= (ssize_t)chunk;
+    }
+    free(bounce);
+    return (u64)n;
+}
+
+SYSDEF(pwritev) {
+    struct iovec iov[1024];
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
+    if (cnt < 0) return (u64)(s64)cnt;
+    GIovec g[1024];
+    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    for (int i = 0; i < cnt; i++)
+        if (iov[i].iov_len &&
+            copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
+            free(bounce);
+            return (u64)(s64)-EFAULT;
+        }
+    ssize_t n = pwritev((int)a0, iov, cnt, (off_t)a3);
+    free(bounce);
+    return n < 0 ? host_err() : (u64)n;
+}
+
 SYSDEF(lseek) {
     off_t r = lseek((int)a0, (off_t)(s64)a1, (int)a2);
     return r == (off_t)-1 ? host_err() : (u64)r;

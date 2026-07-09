@@ -13,7 +13,7 @@
 /* sys_file.c */
 SYSDEF(openat); SYSDEF(close); SYSDEF(read); SYSDEF(write);
 SYSDEF(readv); SYSDEF(writev); SYSDEF(pread64); SYSDEF(pwrite64);
-SYSDEF(preadv2); SYSDEF(pwritev2);
+SYSDEF(preadv); SYSDEF(pwritev); SYSDEF(preadv2); SYSDEF(pwritev2);
 SYSDEF(lseek); SYSDEF(fstat); SYSDEF(newfstatat); SYSDEF(faccessat);
 SYSDEF(readlinkat); SYSDEF(getdents64); SYSDEF(ioctl); SYSDEF(fcntl);
 SYSDEF(dup); SYSDEF(dup3); SYSDEF(pipe2); SYSDEF(getcwd); SYSDEF(chdir);
@@ -47,7 +47,11 @@ SYSDEF(setuid); SYSDEF(setgid); SYSDEF(setresuid); SYSDEF(setresgid);
 SYSDEF(getresuid); SYSDEF(getresgid); SYSDEF(setreuid); SYSDEF(setregid);
 SYSDEF(setfsuid); SYSDEF(setfsgid);
 SYSDEF(getpriority); SYSDEF(setpriority); SYSDEF(sched_yield);
-SYSDEF(sched_getparam); SYSDEF(sched_getaffinity);
+SYSDEF(sched_getparam); SYSDEF(sched_setparam);
+SYSDEF(sched_setscheduler); SYSDEF(sched_getscheduler);
+SYSDEF(sched_getaffinity); SYSDEF(sched_setaffinity);
+SYSDEF(sched_get_priority_max); SYSDEF(sched_get_priority_min);
+SYSDEF(sched_rr_get_interval);
 SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
 
 /* sys_sig.c */
@@ -115,6 +119,8 @@ static const struct {
     { G_NR_writev, sys_writev, "writev" },
     { G_NR_pread64, sys_pread64, "pread64" },
     { G_NR_pwrite64, sys_pwrite64, "pwrite64" },
+    { G_NR_preadv, sys_preadv, "preadv" },
+    { G_NR_pwritev, sys_pwritev, "pwritev" },
     { G_NR_preadv2, sys_preadv2, "preadv2" },
     { G_NR_pwritev2, sys_pwritev2, "pwritev2" },
     { G_NR_sendfile, sys_sendfile, "sendfile" },
@@ -199,7 +205,14 @@ static const struct {
     { G_NR_setpriority, sys_setpriority, "setpriority" },
     { G_NR_sched_yield, sys_sched_yield, "sched_yield" },
     { G_NR_sched_getparam, sys_sched_getparam, "sched_getparam" },
+    { G_NR_sched_setparam, sys_sched_setparam, "sched_setparam" },
+    { G_NR_sched_setscheduler, sys_sched_setscheduler, "sched_setscheduler" },
+    { G_NR_sched_getscheduler, sys_sched_getscheduler, "sched_getscheduler" },
     { G_NR_sched_getaffinity, sys_sched_getaffinity, "sched_getaffinity" },
+    { G_NR_sched_setaffinity, sys_sched_setaffinity, "sched_setaffinity" },
+    { G_NR_sched_get_priority_max, sys_sched_get_priority_max, "sched_get_priority_max" },
+    { G_NR_sched_get_priority_min, sys_sched_get_priority_min, "sched_get_priority_min" },
+    { G_NR_sched_rr_get_interval, sys_sched_rr_get_interval, "sched_rr_get_interval" },
     { G_NR_getrusage, sys_getrusage, "getrusage" },
     { G_NR_times, sys_times, "times" },
 
