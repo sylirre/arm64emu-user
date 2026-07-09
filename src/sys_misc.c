@@ -3,6 +3,7 @@
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -116,6 +117,24 @@ SYSDEF(getcpu) {
     if (a0 && copy_to_guest(c, a0, &zero, 4) < 0) return (u64)(s64)-EFAULT;
     if (a1 && copy_to_guest(c, a1, &zero, 4) < 0) return (u64)(s64)-EFAULT;
     return 0;
+}
+
+SYSDEF(memfd_create) {
+    /* MFD_* flag values are arch-uniform, the fd is 1:1. The kernel caps the
+     * name at 249 chars, so a string that overflows the buffer would be its
+     * EINVAL anyway. Bionic only declares the wrapper on newer API levels;
+     * the raw syscall is on the Android 8 seccomp allow-list. */
+    char name[512];
+    long n = copy_str_from_guest(c, name, a0, sizeof name);
+    if (n == -ENAMETOOLONG) return (u64)(s64)-EINVAL;
+    if (n < 0) return (u64)(s64)n;
+    int r;
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    r = (int)syscall(SYS_memfd_create, name, (unsigned)a1);
+#else
+    r = memfd_create(name, (unsigned)a1);
+#endif
+    return r < 0 ? host_err() : (u64)r;
 }
 
 SYSDEF(sethostname) {

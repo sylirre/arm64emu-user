@@ -6,6 +6,8 @@
  * handler invocation arrives with the sigframe machinery in M5. */
 #include <signal.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "sys.h"
 
@@ -138,4 +140,33 @@ SYSDEF(tgkill) {
     (void)a3; (void)a4; (void)a5;
     /* single-threaded process: tgkill(tgid, tid, sig) == kill(tgid, sig) */
     return kill((pid_t)(s32)a0, (int)a2) < 0 ? host_err() : 0;
+}
+
+SYSDEF(rt_sigqueueinfo) {
+    /* (tgid, sig, siginfo*). Read the queueing fields from the guest LP64
+     * siginfo (code@8; SI_QUEUE union: pid@16, uid@20, value@24) and re-send
+     * through the host kernel, which enforces the same rules the guest
+     * expects (si_code >= 0 to another process -> EPERM, bad pid -> ESRCH).
+     * The receiving emulator instance queues it via host_catcher and frames
+     * the payload back into the guest handler's siginfo. glibc has no
+     * wrapper; the raw syscall is on the Android 8 seccomp allow-list. */
+    (void)a3; (void)a4; (void)a5;
+    u8 gsi[32];
+    if (copy_from_guest(c, gsi, a2, sizeof gsi) < 0) return (u64)(s64)-EFAULT;
+    s32 code, pid; u32 uid; u64 value;
+    memcpy(&code, gsi + 8, 4);
+    memcpy(&pid, gsi + 16, 4);
+    memcpy(&uid, gsi + 20, 4);
+    memcpy(&value, gsi + 24, 8);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = (int)(s32)a1;
+    si.si_code = code;
+    si.si_pid = (pid_t)pid;
+    si.si_uid = (uid_t)uid;
+    /* An ILP32 host truncates a pointer-sized payload to its 32-bit sival;
+     * int payloads (the sigqueue API) are preserved everywhere. */
+    si.si_value.sival_ptr = (void *)(uintptr_t)value;
+    long r = syscall(SYS_rt_sigqueueinfo, (pid_t)(s32)a0, (int)(s32)a1, &si);
+    return r < 0 ? host_err() : 0;
 }

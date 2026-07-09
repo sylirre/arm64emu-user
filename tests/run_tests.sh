@@ -130,6 +130,24 @@ if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then
     else fail=$((fail+1)); echo "FAIL jobctl: external cmd under bash ($jc)"; fi
 fi
 
+# ---- self-checking fixtures for syscalls qemu-user cannot model (it
+# returns ENOSYS for set/get_robust_list and mlock2) ----
+check_fixture() {   # check_fixture <name> <expected>
+    local name="$1" expect="$2"
+    "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
+        echo "SKIP build fixtures/$name"; return; }
+    local got
+    got=$("$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: $name"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: $name"
+        diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
+    fi
+    rm -f "tests/fixtures/$name.bin"
+}
+check_fixture robust $'get0 rc=0 len=24 head_set=1\nset_badlen rc=-1 err=22\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
+check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+
 # ---- Android seccomp-mimic: run the emulator under a SECCOMP_RET_TRAP
 # filter for the Android-8-blocked syscalls (tests/seccomp_wrap.c). The
 # SIGSYS net must convert a trapped forward into -ENOSYS: same differential

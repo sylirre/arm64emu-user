@@ -18,6 +18,7 @@ typedef struct {
 typedef struct {
     PendExc pend_exc;         /* recorded by exception.c, dispatched by loop.c */
     u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
+    u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;

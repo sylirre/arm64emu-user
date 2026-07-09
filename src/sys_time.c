@@ -3,6 +3,7 @@
 /* Time syscalls: clockid values and semantics are shared; only the struct
  * widths need marshalling (guest timespec/timeval are 2 x s64). */
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <time.h>
 
 #include "sys.h"
@@ -100,6 +101,46 @@ SYSDEF(getitimer) {
     GTimeval g[2] = {
         { (s64)ov.it_interval.tv_sec, (s64)ov.it_interval.tv_usec },
         { (s64)ov.it_value.tv_sec, (s64)ov.it_value.tv_usec },
+    };
+    return copy_to_guest(c, a1, g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+/* timerfd: clockids are shared and TFD_NONBLOCK/TFD_CLOEXEC equal
+ * O_NONBLOCK/O_CLOEXEC, which are identical on asm-generic and x86 (the
+ * eventfd2 reasoning), so flags pass straight through; the fd is 1:1.
+ * guest struct itimerspec: 2 x GTimespec {it_interval, it_value}. */
+SYSDEF(timerfd_create) {
+    int r = timerfd_create((int)(s32)a0, (int)(s32)a1);
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(timerfd_settime) {
+    if (!a2) return (u64)(s64)-EFAULT;   /* kernel: new_value is mandatory */
+    GTimespec g[2];
+    if (copy_from_guest(c, g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
+    struct itimerspec nv, ov;
+    nv.it_interval.tv_sec = (time_t)g[0].tv_sec;
+    nv.it_interval.tv_nsec = (long)g[0].tv_nsec;
+    nv.it_value.tv_sec = (time_t)g[1].tv_sec;
+    nv.it_value.tv_nsec = (long)g[1].tv_nsec;
+    if (timerfd_settime((int)a0, (int)(s32)a1, &nv, a3 ? &ov : NULL) < 0)
+        return host_err();
+    if (a3) {
+        GTimespec o[2] = {
+            { (s64)ov.it_interval.tv_sec, (s64)ov.it_interval.tv_nsec },
+            { (s64)ov.it_value.tv_sec, (s64)ov.it_value.tv_nsec },
+        };
+        if (copy_to_guest(c, a3, o, sizeof o) < 0) return (u64)(s64)-EFAULT;
+    }
+    return 0;
+}
+
+SYSDEF(timerfd_gettime) {
+    struct itimerspec ov;
+    if (timerfd_gettime((int)a0, &ov) < 0) return host_err();
+    GTimespec g[2] = {
+        { (s64)ov.it_interval.tv_sec, (s64)ov.it_interval.tv_nsec },
+        { (s64)ov.it_value.tv_sec, (s64)ov.it_value.tv_nsec },
     };
     return copy_to_guest(c, a1, g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }

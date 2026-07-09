@@ -21,6 +21,7 @@ SYSDEF(fchdir); SYSDEF(mkdirat); SYSDEF(unlinkat); SYSDEF(renameat);
 SYSDEF(renameat2); SYSDEF(symlinkat); SYSDEF(linkat); SYSDEF(ftruncate);
 SYSDEF(fchmod); SYSDEF(fchmodat); SYSDEF(fchownat); SYSDEF(fchown);
 SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
+SYSDEF(sync); SYSDEF(syncfs); SYSDEF(readahead);
 SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
@@ -34,12 +35,14 @@ SYSDEF(removexattr); SYSDEF(lremovexattr); SYSDEF(fremovexattr);
 /* sys_mm.c */
 SYSDEF(brk); SYSDEF(mmap); SYSDEF(munmap); SYSDEF(mprotect);
 SYSDEF(madvise); SYSDEF(mremap); SYSDEF(msync); SYSDEF(mincore);
-SYSDEF(mlock); SYSDEF(munlock); SYSDEF(mlockall); SYSDEF(munlockall);
+SYSDEF(mlock); SYSDEF(mlock2); SYSDEF(munlock); SYSDEF(mlockall);
+SYSDEF(munlockall);
 
 /* sys_proc.c */
 SYSDEF(exit); SYSDEF(exit_group); SYSDEF(getpid); SYSDEF(getppid);
 SYSDEF(getuid); SYSDEF(geteuid); SYSDEF(getgid); SYSDEF(getegid);
 SYSDEF(gettid); SYSDEF(set_tid_address); SYSDEF(set_robust_list);
+SYSDEF(get_robust_list);
 SYSDEF(uname); SYSDEF(clone); SYSDEF(execve); SYSDEF(wait4);
 SYSDEF(setpgid); SYSDEF(getpgid); SYSDEF(setsid); SYSDEF(getsid);
 SYSDEF(prctl); SYSDEF(getgroups); SYSDEF(setgroups); SYSDEF(umask);
@@ -58,16 +61,18 @@ SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
 SYSDEF(sigaltstack); SYSDEF(kill); SYSDEF(tkill); SYSDEF(tgkill);
 SYSDEF(rt_sigpending); SYSDEF(rt_sigsuspend); SYSDEF(rt_sigtimedwait);
+SYSDEF(rt_sigqueueinfo);
 
 /* sys_time.c */
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
 SYSDEF(gettimeofday); SYSDEF(nanosleep); SYSDEF(setitimer); SYSDEF(getitimer);
+SYSDEF(timerfd_create); SYSDEF(timerfd_settime); SYSDEF(timerfd_gettime);
 
 /* sys_misc.c */
 SYSDEF(getrandom); SYSDEF(getrlimit); SYSDEF(setrlimit); SYSDEF(prlimit64);
 SYSDEF(sysinfo); SYSDEF(futex); SYSDEF(membarrier); SYSDEF(getcpu);
 SYSDEF(sethostname); SYSDEF(syslog); SYSDEF(personality); SYSDEF(capget);
-SYSDEF(capset);
+SYSDEF(capset); SYSDEF(memfd_create);
 
 /* sys_net.c */
 SYSDEF(socket); SYSDEF(socketpair); SYSDEF(bind); SYSDEF(connect);
@@ -133,6 +138,9 @@ static const struct {
     { G_NR_fstat, sys_fstat, "fstat" },
     { G_NR_fsync, sys_fsync, "fsync" },
     { G_NR_fdatasync, sys_fdatasync, "fdatasync" },
+    { G_NR_sync, sys_sync, "sync" },
+    { G_NR_syncfs, sys_syncfs, "syncfs" },
+    { G_NR_readahead, sys_readahead, "readahead" },
     { G_NR_utimensat, sys_utimensat, "utimensat" },
     { G_NR_statx, sys_statx, "statx" },
     { 32 /* flock */, sys_flock, "flock" },
@@ -163,6 +171,7 @@ static const struct {
     { G_NR_msync, sys_msync, "msync" },
     { G_NR_mincore, sys_mincore, "mincore" },
     { G_NR_mlock, sys_mlock, "mlock" },
+    { G_NR_mlock2, sys_mlock2, "mlock2" },
     { G_NR_munlock, sys_munlock, "munlock" },
     { G_NR_mlockall, sys_mlockall, "mlockall" },
     { G_NR_munlockall, sys_munlockall, "munlockall" },
@@ -178,6 +187,7 @@ static const struct {
     { G_NR_gettid, sys_gettid, "gettid" },
     { G_NR_set_tid_address, sys_set_tid_address, "set_tid_address" },
     { G_NR_set_robust_list, sys_set_robust_list, "set_robust_list" },
+    { G_NR_get_robust_list, sys_get_robust_list, "get_robust_list" },
     { G_NR_uname, sys_uname, "uname" },
     { G_NR_clone, sys_clone, "clone" },
     { G_NR_execve, sys_execve, "execve" },
@@ -226,6 +236,7 @@ static const struct {
     { G_NR_kill, sys_kill, "kill" },
     { G_NR_tkill, sys_tkill, "tkill" },
     { G_NR_tgkill, sys_tgkill, "tgkill" },
+    { G_NR_rt_sigqueueinfo, sys_rt_sigqueueinfo, "rt_sigqueueinfo" },
 
     { G_NR_clock_gettime, sys_clock_gettime, "clock_gettime" },
     { G_NR_clock_getres, sys_clock_getres, "clock_getres" },
@@ -234,6 +245,9 @@ static const struct {
     { G_NR_nanosleep, sys_nanosleep, "nanosleep" },
     { G_NR_setitimer, sys_setitimer, "setitimer" },
     { G_NR_getitimer, sys_getitimer, "getitimer" },
+    { G_NR_timerfd_create, sys_timerfd_create, "timerfd_create" },
+    { G_NR_timerfd_settime, sys_timerfd_settime, "timerfd_settime" },
+    { G_NR_timerfd_gettime, sys_timerfd_gettime, "timerfd_gettime" },
 
     { G_NR_getrandom, sys_getrandom, "getrandom" },
     { G_NR_getrlimit, sys_getrlimit, "getrlimit" },
@@ -241,6 +255,7 @@ static const struct {
     { G_NR_prlimit64, sys_prlimit64, "prlimit64" },
     { G_NR_sysinfo, sys_sysinfo, "sysinfo" },
     { G_NR_futex, sys_futex, "futex" },
+    { G_NR_memfd_create, sys_memfd_create, "memfd_create" },
 
     { G_NR_socket, sys_socket, "socket" },
     { G_NR_socketpair, sys_socketpair, "socketpair" },

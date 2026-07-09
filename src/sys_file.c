@@ -1280,6 +1280,31 @@ SYSDEF(utimensat) {
 SYSDEF(fsync) { return fsync((int)a0) < 0 ? host_err() : 0; }
 SYSDEF(fdatasync) { return fdatasync((int)a0) < 0 ? host_err() : 0; }
 
+SYSDEF(sync) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sync(); return 0; }
+
+/* syncfs/readahead: Bionic only declares these wrappers on newer API levels,
+ * so issue the raw syscalls there -- both numbers are on the Android 8
+ * seccomp allow-list, and Android hosts are LP64 so the 64-bit readahead
+ * offset passes in a single register. glibc's wrappers handle the ILP32
+ * argument split. */
+SYSDEF(syncfs) {
+#ifdef __BIONIC__
+    return syscall(SYS_syncfs, (int)a0) < 0 ? host_err() : 0;
+#else
+    return syncfs((int)a0) < 0 ? host_err() : 0;
+#endif
+}
+
+SYSDEF(readahead) {
+    ssize_t n;
+#ifdef __BIONIC__
+    n = syscall(SYS_readahead, (int)a0, (off_t)a1, (size_t)a2);
+#else
+    n = readahead((int)a0, (off_t)a1, (size_t)a2);
+#endif
+    return n < 0 ? host_err() : (u64)n;
+}
+
 SYSDEF(sync_file_range) {
     /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic.
      * glibc's wrapper maps to the host's sync_file_range/sync_file_range2 ABI,

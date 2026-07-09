@@ -63,8 +63,23 @@ SYSDEF(set_tid_address) {
 
 SYSDEF(set_robust_list) {
     /* The guest robust-list layout is LP64; registering it with an ILP32 host
-     * kernel would be wrong, and without CLONE_VM threads it is inert anyway. */
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+     * kernel would be wrong, and without CLONE_VM threads it is inert anyway.
+     * Record the head per thread so get_robust_list can echo it -- that one
+     * must never be forwarded (blocked by the Android seccomp filter). */
+    (void)c; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (a1 != 24) return (u64)(s64)-EINVAL;   /* sizeof(struct robust_list_head) */
+    g_tls.robust_head = a0;
+    return 0;
+}
+
+SYSDEF(get_robust_list) {
+    /* Answered from the state above. Other guest processes are separate
+     * emulator instances whose registration we cannot see; the kernel would
+     * demand ptrace rights for them anyway. */
+    if (a0 && (int)(s32)a0 != g_tls.tid) return (u64)(s64)-ESRCH;
+    u64 head = g_tls.robust_head, len = 24;   /* kernel reports sizeof, always */
+    if (copy_to_guest(c, a1, &head, 8) < 0) return (u64)(s64)-EFAULT;
+    if (copy_to_guest(c, a2, &len, 8) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 

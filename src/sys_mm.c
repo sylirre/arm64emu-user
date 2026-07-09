@@ -173,6 +173,12 @@ SYSDEF(mincore) {
 }
 
 SYSDEF(mlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
+SYSDEF(mlock2) {
+    /* Accept-and-ignore like the rest of the mlock family, but keep the
+     * kernel's flag validation: only MLOCK_ONFAULT (1) is defined. */
+    (void)c; (void)a0; (void)a1; (void)a3; (void)a4; (void)a5;
+    return (a2 & ~1ULL) ? (u64)(s64)-EINVAL : 0;
+}
 SYSDEF(munlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
 SYSDEF(mlockall) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
 SYSDEF(munlockall) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }

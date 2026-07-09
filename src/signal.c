@@ -70,7 +70,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
     p->addr = (u64)(uintptr_t)si->si_addr;
-    p->value = (long)si->si_value.sival_int;
+    p->value = (long)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
     sigq_head = next;
     g_sig_npend = 1;
 }
@@ -282,6 +282,10 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     } else {
         wr32(c, frame, SI_OFF + 16, (u32)info->pid);
         wr32(c, frame, SI_OFF + 20, (u32)info->uid);
+        /* si_value: carries the rt_sigqueueinfo/sigqueue payload; the kernel
+         * zeroes this union region for plain kill (SI_USER), so the captured
+         * zero is faithful there too. */
+        wr64(c, frame, SI_OFF + 24, (u64)(s64)info->value);
     }
 
     /* ucontext */
