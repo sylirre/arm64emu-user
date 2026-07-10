@@ -184,28 +184,48 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     r = guest_map_anon(&m->as, STACK_TOP - STACK_SIZE, STACK_SIZE, PTE_R | PTE_W);
     if (r < 0) return r;
     m->as.stack_top = STACK_TOP;
-    u64 sp = STACK_TOP;
 
-    /* Strings at the top of the stack. */
-    u8 rnd[16];
-    if (syscall(SYS_getrandom, rnd, sizeof rnd, 0) != (long)sizeof rnd)
-        for (int i = 0; i < 16; i++) rnd[i] = (u8)(i * 41 + 7);
-    u64 rnd_va = stack_push(m, &sp, rnd, sizeof rnd);
-    u64 plat_va = stack_push(m, &sp, "aarch64", 8);
-    u64 execfn_va = stack_push(m, &sp, canon, strlen(canon) + 1);
-
+    /* Strings at the top of the stack, in the kernel's layout: argv strings
+     * lowest and ascending, envp strings byte-packed directly above them,
+     * execfn topmost. setproctitle-style rewriting (libuv's
+     * uv_set_process_title, postgres) derives its writable span from the
+     * argv/envp pointers assuming exactly this order; with argv[0] placed
+     * above argv[argc-1] the span underflows and the rewrite memsets off the
+     * stack top. */
     int argc = 0, envc = 0;
     while (argv[argc]) argc++;
     while (envp[envc]) envc++;
     u64 *argvp = malloc(sizeof(u64) * (size_t)(argc + 1));
     u64 *envpp = malloc(sizeof(u64) * (size_t)(envc + 1));
     if (!argvp || !envpp) { free(argvp); free(envpp); return -ENOMEM; }
-    for (int i = 0; i < argc; i++)
-        argvp[i] = stack_push(m, &sp, argv[i], strlen(argv[i]) + 1);
+
+    size_t strtab = strlen(canon) + 1;
+    for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
+    /* The kernel caps argv+envp at RLIMIT_STACK/4 (E2BIG past it). */
+    if (strtab > STACK_SIZE / 4) { free(argvp); free(envpp); return -E2BIG; }
+    u64 sp = STACK_TOP - strtab;
+    u64 str = sp;
+    for (int i = 0; i < argc; i++) {
+        size_t l = strlen(argv[i]) + 1;
+        copy_to_guest(&m->cpu, str, argv[i], l);
+        argvp[i] = str; str += l;
+    }
     argvp[argc] = 0;
-    for (int i = 0; i < envc; i++)
-        envpp[i] = stack_push(m, &sp, envp[i], strlen(envp[i]) + 1);
+    for (int i = 0; i < envc; i++) {
+        size_t l = strlen(envp[i]) + 1;
+        copy_to_guest(&m->cpu, str, envp[i], l);
+        envpp[i] = str; str += l;
+    }
     envpp[envc] = 0;
+    u64 execfn_va = str;
+    copy_to_guest(&m->cpu, str, canon, strlen(canon) + 1);
+
+    u8 rnd[16];
+    if (syscall(SYS_getrandom, rnd, sizeof rnd, 0) != (long)sizeof rnd)
+        for (int i = 0; i < 16; i++) rnd[i] = (u8)(i * 41 + 7);
+    u64 rnd_va = stack_push(m, &sp, rnd, sizeof rnd);
+    u64 plat_va = stack_push(m, &sp, "aarch64", 8);
 
     u64 hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
                 G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
