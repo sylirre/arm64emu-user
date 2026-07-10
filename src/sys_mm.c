@@ -115,6 +115,13 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3) {
     u64 old_addr = a0, old_len = PG_UP(a1), new_len = PG_UP(a2);
     int flags = (int)a3;
     if (old_addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+    /* The old range must be fully mapped; the kernel returns EFAULT when it
+     * is not. musl's pthread_getattr_np probes for the main-thread stack
+     * bottom with growing mremaps and relies on this non-ENOMEM failure to
+     * stop — succeeding here would hand it a bogus stack size and leak a
+     * stray mapping below the stack. */
+    for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
+        if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
     if (new_len <= old_len) {
         if (new_len < old_len) guest_unmap(as, old_addr + new_len, old_len - new_len);
         return old_addr;
