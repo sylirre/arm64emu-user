@@ -54,17 +54,26 @@ struct Machine {
     u64 entry, interp_base, phdr_va;
     int phnum;
 
-    /* Guest signal state (process-wide per POSIX; signal.c). */
+    /* Guest signal state (process-wide per POSIX; signal.c). The blocked
+     * set is per-thread and lives in g_tls (thread.h). */
     GSigAction sigact[65];    /* index 1..64 */
-    u64 sigmask;              /* guest blocked set (main thread) */
     u64 sig_altstack_sp, sig_altstack_size;
     u32 sig_altstack_flags;
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
-    u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
-    int have_saved_sigmask;
 
     /* Thread bookkeeping (CLONE_VM). */
     int next_tid;             /* monotonic tid allocator */
+
+    /* Live secondary threads: the synthetic guest tid handed out by clone
+     * mapped to the host tid of the pthread carrying it, so tid-addressed
+     * syscalls (sched_*, tkill) reach the right host thread instead of
+     * whatever process the synthetic value collides with. Slots are claimed
+     * and released with atomic ops rather than a lock so fork can never
+     * inherit a lock held by a thread that does not exist in the child; the
+     * child just clears the table. guest == 0 free, -1 mid-claim; host == 0
+     * until the thread first runs (sys_proc.c). */
+#define GT_MAX 256
+    struct { s32 guest; s32 host; } gtid[GT_MAX];
 
     /* Emulated AF_NETLINK/NETLINK_ROUTE sockets. On Android the host denies a
      * real netlink socket, so socket() hands out an AF_UNIX/SOCK_DGRAM stand-in
@@ -142,14 +151,18 @@ extern __thread volatile sig_atomic_t g_sig_npend;
 void sig_host_update(struct Machine *m, int sig);
 /* Deliver one deliverable queued signal, if any (called from the run loop). */
 void sig_deliver_pending(CPU *c);
+/* Would sig_deliver_pending act on this thread's queue right now?
+ * (rt_sigsuspend's sleep gate; see signal.c.) */
+int sig_pending_deliverable(struct Machine *m);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* rt_sigreturn implementation. */
 void sig_return(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */
 void sig_reset_for_exec(struct Machine *m);
-/* Mirror the guest block-state of terminal job-control signals to the host. */
-void sig_sync_host_mask(struct Machine *m);
+/* Mirror the calling thread's guest block-state of terminal job-control
+ * signals to the host process mask. */
+void sig_sync_host_mask(void);
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
 

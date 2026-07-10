@@ -36,6 +36,13 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
 int oflags_g2h(int g);
 int oflags_h2g(int h);
 
+/* sys_proc.c: map the tid operand of a tid-addressed syscall (sched_*,
+ * tkill) to the host tid to use. Secondary guest threads carry synthetic
+ * tids (m->gtid table); 0 and the caller's own tid map to 0 (self);
+ * everything unknown passes through -- the main thread's tid and forked
+ * children's tids are real host pids. */
+pid_t tid_to_host(struct Machine *m, s32 tid);
+
 /* The kernel identity presented to the guest: sys_uname and the synthesized
  * /proc/version must agree, so both build from these. */
 #define GUEST_KREL "6.1.0-arm64chroot"

@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sys.h"
@@ -41,22 +42,22 @@ SYSDEF(rt_sigaction) {
 }
 
 SYSDEF(rt_sigprocmask) {
+    /* The blocked set is per-thread (g_tls, POSIX). */
     int how = (int)a0;
     if (a3 != 8) return (u64)(s64)-EINVAL;
-    struct Machine *m = c->m;
-    u64 old = m->sigmask;
+    u64 old = g_tls.sigmask;
     if (a1) {
         u64 set;
         if (copy_from_guest(c, &set, a1, 8) < 0) return (u64)(s64)-EFAULT;
         switch (how) {
-            case 0: m->sigmask |= set; break;          /* SIG_BLOCK */
-            case 1: m->sigmask &= ~set; break;         /* SIG_UNBLOCK */
-            case 2: m->sigmask = set; break;           /* SIG_SETMASK */
+            case 0: g_tls.sigmask |= set; break;       /* SIG_BLOCK */
+            case 1: g_tls.sigmask &= ~set; break;      /* SIG_UNBLOCK */
+            case 2: g_tls.sigmask = set; break;        /* SIG_SETMASK */
             default: return (u64)(s64)-EINVAL;
         }
         /* SIGKILL/SIGSTOP cannot be blocked */
-        m->sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-        sig_sync_host_mask(m);   /* propagate job-control-signal block state */
+        g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        sig_sync_host_mask();   /* propagate job-control-signal block state */
     }
     if (a2 && copy_to_guest(c, a2, &old, 8) < 0) return (u64)(s64)-EFAULT;
     return 0;
@@ -76,23 +77,29 @@ SYSDEF(rt_sigpending) {
 
 SYSDEF(rt_sigsuspend) {
     if (a1 != 8) return (u64)(s64)-EINVAL;
-    struct Machine *m = c->m;
     u64 set;
     if (copy_from_guest(c, &set, a0, 8) < 0) return (u64)(s64)-EFAULT;
     set &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    /* Install the temporary mask, remember the caller's mask so the frame
-     * built at delivery records it, and block in the host until a signal
-     * arrives. The run loop then delivers it to the guest handler. */
-    m->saved_sigmask = m->sigmask;
-    m->have_saved_sigmask = 1;
-    m->sigmask = set;
-    sig_sync_host_mask(m);
-    /* Wait for any signal; the host catcher queues it, then we return EINTR
-     * and the loop delivers to the guest (which restores saved_sigmask via
-     * the sigframe ucontext on sigreturn). */
-    pause();
-    m->sigmask = m->saved_sigmask;
-    sig_sync_host_mask(m);
+    /* Install the temporary mask and remember the caller's so the delivery
+     * frame records it; sigreturn restores it (kernel semantics: the guest
+     * handler runs under the temporary mask). */
+    g_tls.saved_sigmask = g_tls.sigmask;
+    g_tls.have_saved_sigmask = 1;
+    g_tls.sigmask = set;
+    sig_sync_host_mask();
+    /* Sleep until the capture queue holds a deliverable signal. A bare
+     * pause() loses the race against a signal captured *before* it parks:
+     * the kernel's sigsuspend swaps the mask and sleeps atomically, but here
+     * a SIGCHLD that arrived while the guest still had it blocked sits in
+     * the queue already and pause() would wait for a second arrival that
+     * never comes (`sh -c 'sleep 0.2 & wait'` hung this way). The host
+     * catcher interrupts nanosleep (no SA_RESTART), so the tick only bounds
+     * the check-to-sleep window. On return the run loop delivers to the
+     * guest handler. */
+    while (!sig_pending_deliverable(c->m)) {
+        struct timespec ts = { 0, 20 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
     return (u64)(s64)-EINTR;
 }
 
@@ -132,14 +139,33 @@ SYSDEF(kill) {
 }
 
 SYSDEF(tkill) {
+    /* Thread-directed signal. Secondary guest threads carry synthetic tids
+     * (sys_proc.c), so translate to the host thread carrying the target --
+     * the raw value addresses whatever host process it collides with, which
+     * broke raise()/pthread_kill from worker threads. tid_to_host returns 0
+     * for the caller itself (the common raise() case). */
     (void)a2; (void)a3; (void)a4; (void)a5;
-    return kill((pid_t)(s32)a0, (int)a1) < 0 ? host_err() : 0;
+    s32 tid = (s32)a0;
+    if (tid <= 0) return (u64)(s64)-EINVAL;
+    pid_t htid = tid_to_host(c->m, tid);
+    if (htid == 0) htid = (pid_t)syscall(SYS_gettid);
+    return syscall(SYS_tkill, htid, (int)a1) < 0 ? host_err() : 0;
 }
 
 SYSDEF(tgkill) {
+    /* As tkill: translate the tid within the caller's own thread group.
+     * Foreign thread groups pass through -- their main-thread tid is a real
+     * host pid; their secondary tids are private to that emulator instance
+     * and get the kernel's ESRCH. */
     (void)a3; (void)a4; (void)a5;
-    /* single-threaded process: tgkill(tgid, tid, sig) == kill(tgid, sig) */
-    return kill((pid_t)(s32)a0, (int)a2) < 0 ? host_err() : 0;
+    s32 tgid = (s32)a0, tid = (s32)a1;
+    if (tgid <= 0 || tid <= 0) return (u64)(s64)-EINVAL;
+    pid_t htid = (pid_t)tid;
+    if (tgid == getpid()) {
+        htid = tid_to_host(c->m, tid);
+        if (htid == 0) htid = (pid_t)syscall(SYS_gettid);
+    }
+    return syscall(SYS_tgkill, (pid_t)tgid, htid, (int)a2) < 0 ? host_err() : 0;
 }
 
 SYSDEF(rt_sigqueueinfo) {

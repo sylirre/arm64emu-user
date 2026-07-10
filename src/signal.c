@@ -154,14 +154,16 @@ void sig_install_sigsys_net(void) {
  * before the run loop can mediate; SIGTSTP travels with them in bash's
  * give_terminal_to() critical section. When the guest blocks one of these
  * (as bash does around tcsetpgrp), we must block it on the host too — POSIX
- * then suppresses the signal entirely instead of stopping us. */
-void sig_sync_host_mask(struct Machine *m) {
+ * then suppresses the signal entirely instead of stopping us. The guest
+ * blocked set is per-thread (g_tls); the shells that need this mirroring are
+ * single-threaded, so mirroring the calling thread's view suffices. */
+void sig_sync_host_mask(void) {
     static const int sigs[] = { SIGTTOU, SIGTTIN, SIGTSTP };
     sigset_t block, unblock;
     sigemptyset(&block);
     sigemptyset(&unblock);
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
-        if (m->sigmask & (1ULL << (sigs[i] - 1))) sigaddset(&block, sigs[i]);
+        if (g_tls.sigmask & (1ULL << (sigs[i] - 1))) sigaddset(&block, sigs[i]);
         else sigaddset(&unblock, sigs[i]);
     }
     sigprocmask(SIG_BLOCK, &block, NULL);
@@ -289,8 +291,9 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     }
 
     /* ucontext */
-    u64 mask_to_save = m->have_saved_sigmask ? m->saved_sigmask : m->sigmask;
-    m->have_saved_sigmask = 0;
+    u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
+                                                : g_tls.sigmask;
+    g_tls.have_saved_sigmask = 0;
     wr64(c, frame, UC_STACK + 0, m->sig_altstack_sp);
     wr32(c, frame, UC_STACK + 8,
          m->sig_altstack_size ? (g_tls.on_altstack ? 1 /*SS_ONSTACK*/ : 0)
@@ -325,9 +328,9 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     if (used_altstack) g_tls.on_altstack = 1;
 
     /* New blocked set while the handler runs. */
-    m->sigmask |= act->mask;
-    if (!(act->flags & G_SA_NODEFER)) m->sigmask |= 1ULL << (sig - 1);
-    m->sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    g_tls.sigmask |= act->mask;
+    if (!(act->flags & G_SA_NODEFER)) g_tls.sigmask |= 1ULL << (sig - 1);
+    g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
     if (act->flags & G_SA_RESETHAND) {
         act->handler = GSIG_DFL;
@@ -338,7 +341,6 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
 }
 
 void sig_return(CPU *c) {
-    struct Machine *m = c->m;
     u64 frame = *cpu_cur_sp(c);
     u64 v;
     for (int i = 0; i < 31; i++) {
@@ -352,8 +354,8 @@ void sig_return(CPU *c) {
     if (copy_from_guest(c, &v, frame + MC_PSTATE, 8) < 0) goto bad;
     c->nzcv = (u32)v & (PS_N | PS_Z | PS_C | PS_V);
     if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) < 0) goto bad;
-    m->sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    sig_sync_host_mask(m);
+    g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sig_sync_host_mask();
     /* fpsimd */
     u32 magic = 0;
     copy_from_guest(c, &magic, frame + MC_RESERVED, 4);
@@ -374,17 +376,37 @@ bad:
     _exit(128 + SIGSEGV);
 }
 
+/* Does this thread's capture queue hold a signal that sig_deliver_pending
+ * would act on under the current per-thread mask? rt_sigsuspend polls this:
+ * its host sleep only wakes for new arrivals, so a signal queued before the
+ * mask swap must short-circuit the sleep. Skips what delivery would discard
+ * (ignored, and default-ignore dispositions), matching the kernel, where
+ * those never wake sigsuspend. */
+int sig_pending_deliverable(struct Machine *m) {
+    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+        int sig = sigq[t].signo;
+        if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
+        u64 h = m->sigact[sig].handler;
+        if (h == GSIG_IGN) continue;
+        if (h == GSIG_DFL && (sig == SIGCHLD || sig == SIGWINCH ||
+                              sig == SIGURG || sig == SIGCONT))
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
     while (sigq_tail != sigq_head) {
         PendSig p = sigq[sigq_tail];
         int sig = p.signo;
-        if (m->sigmask & (1ULL << (sig - 1))) {
+        if (g_tls.sigmask & (1ULL << (sig - 1))) {
             /* Blocked: leave it queued. Scan the rest for an unblocked one. */
             int t = sigq_tail;
             int found = -1;
             for (t = (t + 1) % SIGQ_LEN; t != sigq_head; t = (t + 1) % SIGQ_LEN)
-                if (!(m->sigmask & (1ULL << (sigq[t].signo - 1)))) { found = t; break; }
+                if (!(g_tls.sigmask & (1ULL << (sigq[t].signo - 1)))) { found = t; break; }
             if (found < 0) return;
             p = sigq[found];
             sig = p.signo;
@@ -422,7 +444,7 @@ void sig_deliver_pending(CPU *c) {
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr) {
     struct Machine *m = c->m;
     u64 h = m->sigact[sig].handler;
-    if (h > GSIG_IGN && !(m->sigmask & (1ULL << (sig - 1)))) {
+    if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
         PendSig p;
         memset(&p, 0, sizeof p);
         p.signo = sig;

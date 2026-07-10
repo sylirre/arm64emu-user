@@ -19,6 +19,14 @@ typedef struct {
     PendExc pend_exc;         /* recorded by exception.c, dispatched by loop.c */
     u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
     u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
+    /* Guest blocked-signal set: a per-thread attribute (POSIX), inherited
+     * from the creator on clone. A process-wide set loses signals when
+     * threads block/restore concurrently -- musl wraps every raise() and
+     * pthread_exit() in block-all/restore, so a thread could exit with its
+     * own raise()d signal still deferred by a sibling's block. */
+    u64 sigmask;
+    u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
+    int have_saved_sigmask;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;

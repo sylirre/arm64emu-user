@@ -114,9 +114,69 @@ typedef struct {
     CPU cpu;
     struct Machine *m;
     u64 flags, ctid, tls;
+    u64 sigmask;              /* creator's blocked set, inherited (POSIX) */
     int tid;
     pthread_t host;
 } GThread;
+
+/* Live-thread table (m->gtid): synthetic guest tid -> host tid. Claim with a
+ * CAS through the -1 sentinel so a concurrent lookup never pairs a fresh
+ * guest tid with a stale host value. */
+static void gtid_add(struct Machine *m, s32 guest) {
+    for (int i = 0; i < GT_MAX; i++) {
+        s32 free_slot = 0;
+        if (__atomic_compare_exchange_n(&m->gtid[i].guest, &free_slot, -1,
+                                        false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_RELAXED)) {
+            __atomic_store_n(&m->gtid[i].host, 0, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&m->gtid[i].guest, guest, __ATOMIC_SEQ_CST);
+            return;
+        }
+    }
+    /* Table full: the thread runs untracked and tid-addressed syscalls on it
+     * degrade to passthrough (usually ESRCH). */
+}
+
+static void gtid_set_host(struct Machine *m, s32 guest, s32 host) {
+    for (int i = 0; i < GT_MAX; i++)
+        if (__atomic_load_n(&m->gtid[i].guest, __ATOMIC_SEQ_CST) == guest) {
+            __atomic_store_n(&m->gtid[i].host, host, __ATOMIC_SEQ_CST);
+            return;
+        }
+}
+
+static void gtid_del(struct Machine *m, s32 guest) {
+    for (int i = 0; i < GT_MAX; i++)
+        if (__atomic_load_n(&m->gtid[i].guest, __ATOMIC_SEQ_CST) == guest) {
+            __atomic_store_n(&m->gtid[i].guest, 0, __ATOMIC_SEQ_CST);
+            return;
+        }
+}
+
+/* Map the tid operand of a tid-addressed guest syscall to the host tid to
+ * use: 0 and the caller's own tid become 0 (self), a live secondary thread
+ * becomes the host tid of the pthread carrying it, and anything else passes
+ * through -- the main thread's tid and forked children's tids are real host
+ * pids, and a stale tid gets the kernel's ESRCH. A thread already cloned but
+ * not yet running has no host tid, so wait out that startup window (bounded;
+ * it vanishes as soon as the new thread is first scheduled). */
+pid_t tid_to_host(struct Machine *m, s32 tid) {
+    if (tid == 0 || tid == (s32)g_tls.tid) return 0;
+    for (int spin = 0; spin < 100000; spin++) {
+        int i;
+        for (i = 0; i < GT_MAX; i++)
+            if (__atomic_load_n(&m->gtid[i].guest, __ATOMIC_SEQ_CST) == tid)
+                break;
+        if (i == GT_MAX) return (pid_t)tid;    /* not ours: pass through */
+        s32 host = __atomic_load_n(&m->gtid[i].host, __ATOMIC_SEQ_CST);
+        /* Slot may have been recycled between the two loads. */
+        if (__atomic_load_n(&m->gtid[i].guest, __ATOMIC_SEQ_CST) != tid)
+            continue;
+        if (host > 0) return (pid_t)host;
+        sched_yield();
+    }
+    return 0;                                  /* never started: treat as self */
+}
 
 /* futex(uaddr, FUTEX_WAKE, 1) helper for CLONE_CHILD_CLEARTID on thread exit. */
 static void futex_wake_addr(CPU *c, u64 va) {
@@ -133,11 +193,16 @@ static void *thread_entry(void *arg) {
     g_tls.tid = t->tid;
     g_tls.clear_child_tid = (t->flags & G_CLONE_CHILD_CLEARTID) ? t->ctid : 0;
     g_tls.pend_exc.valid = false;
+    g_tls.sigmask = t->sigmask;
+    gtid_set_host(t->m, t->tid, (s32)syscall(SYS_gettid));
     CPU *c = &t->cpu;
     c->m = t->m;
     if (t->flags & G_CLONE_SETTLS) c->tpidr[0] = t->tls;
     emu_loop(c);
-    /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes joiners. */
+    /* Thread exited via exit()/exit_group(): drop the tid mapping first so a
+     * woken joiner already sees the tid as stale, then CLONE_CHILD_CLEARTID
+     * wakes joiners. */
+    gtid_del(t->m, t->tid);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     free(t);
     return NULL;
@@ -164,7 +229,9 @@ SYSDEF(clone) {
         t->flags = flags;
         t->ctid = ctid;
         t->tls = tls;
+        t->sigmask = g_tls.sigmask;
         t->tid = __atomic_add_fetch(&m->next_tid, 1, __ATOMIC_SEQ_CST);
+        gtid_add(m, (s32)t->tid);   /* before the tid escapes to the guest */
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)t->tid;
             copy_to_guest(c, ctid, &tid, 4);
@@ -178,7 +245,7 @@ SYSDEF(clone) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         int e = pthread_create(&t->host, &at, thread_entry, t);
         pthread_attr_destroy(&at);
-        if (e) { free(t); return (u64)(s64)-EAGAIN; }
+        if (e) { gtid_del(m, (s32)t->tid); free(t); return (u64)(s64)-EAGAIN; }
         return (u64)t->tid;
     }
 
@@ -187,6 +254,9 @@ SYSDEF(clone) {
     if (pid < 0) return host_err();
     if (pid == 0) {
         g_tls.tid = getpid();             /* new process: tid == pid */
+        /* Only the forking thread exists here: the inherited live-thread
+         * table describes host threads of the parent. */
+        memset(m->gtid, 0, sizeof m->gtid);
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);
@@ -675,55 +745,65 @@ SYSDEF(getresgid) {
 }
 
 SYSDEF(getpriority) {
+    /* PRIO_PROCESS addresses a single thread by tid on Linux, so route
+     * synthetic thread tids to their host thread (tid_to_host). */
+    id_t who = (id_t)a1;
+    if ((int)a0 == PRIO_PROCESS) who = (id_t)tid_to_host(c->m, (s32)a1);
     errno = 0;
-    int r = getpriority((int)a0, (id_t)a1);
+    int r = getpriority((int)a0, who);
     if (errno) return host_err();
     return (u64)(20 - r);   /* kernel encoding */
 }
 
 SYSDEF(setpriority) {
-    return setpriority((int)a0, (id_t)a1, (int)a2) < 0 ? host_err() : 0;
+    id_t who = (id_t)a1;
+    if ((int)a0 == PRIO_PROCESS) who = (id_t)tid_to_host(c->m, (s32)a1);
+    return setpriority((int)a0, who, (int)a2) < 0 ? host_err() : 0;
 }
 
 SYSDEF(sched_yield) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sched_yield(); return 0; }
 
 SYSDEF(sched_getparam) {
     /* Only the real-time policies carry a non-zero priority; for the normal
-     * SCHED_OTHER processes the guest runs it is always 0. The guest pid maps
-     * 1:1 onto the host pid/tid, so pass it straight through as with
-     * sched_getaffinity. struct sched_param is { int sched_priority; }. */
+     * SCHED_OTHER processes the guest runs it is always 0. Secondary guest
+     * threads carry synthetic tids, so route through tid_to_host -- passing
+     * the raw value queries whatever the tid collides with on the host
+     * (abseil's pthread_getschedparam on node's worker pool spammed EACCES/
+     * ESRCH this way). struct sched_param is { int sched_priority; }. */
     (void)a2; (void)a3; (void)a4; (void)a5;
     if (!a1) return (u64)(s64)-EINVAL;
     struct sched_param sp;
-    if (sched_getparam((pid_t)(s32)a0, &sp) < 0) return host_err();
+    if (sched_getparam(tid_to_host(c->m, (s32)a0), &sp) < 0) return host_err();
     s32 prio = sp.sched_priority;
     if (copy_to_guest(c, a1, &prio, sizeof prio) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 
 SYSDEF(sched_setparam) {
-    /* Guest pid maps 1:1 onto the host, so pass through; under SCHED_OTHER
-     * the host enforces that only priority 0 is accepted. NULL param is
-     * EINVAL, not EFAULT, matching the kernel (as in sched_getparam). */
+    /* tid_to_host as in sched_getparam; under SCHED_OTHER the host enforces
+     * that only priority 0 is accepted. NULL param is EINVAL, not EFAULT,
+     * matching the kernel. */
     if (!a1) return (u64)(s64)-EINVAL;
     s32 prio;
     if (copy_from_guest(c, &prio, a1, sizeof prio) < 0) return (u64)(s64)-EFAULT;
     struct sched_param sp = { .sched_priority = prio };
-    return sched_setparam((pid_t)(s32)a0, &sp) < 0 ? host_err() : 0;
+    return sched_setparam(tid_to_host(c->m, (s32)a0), &sp) < 0 ? host_err() : 0;
 }
 
 SYSDEF(sched_setscheduler) {
-    /* Passthrough like sched_setparam: an unprivileged switch to a real-time
-     * policy fails with EPERM on the host exactly as it would for the guest. */
+    /* Passthrough on the translated tid: an unprivileged switch to a real-
+     * time policy fails with EPERM on the host exactly as it would for the
+     * guest. */
     if (!a2) return (u64)(s64)-EINVAL;
     s32 prio;
     if (copy_from_guest(c, &prio, a2, sizeof prio) < 0) return (u64)(s64)-EFAULT;
     struct sched_param sp = { .sched_priority = prio };
-    return sched_setscheduler((pid_t)(s32)a0, (int)(s32)a1, &sp) < 0 ? host_err() : 0;
+    return sched_setscheduler(tid_to_host(c->m, (s32)a0), (int)(s32)a1, &sp) < 0
+               ? host_err() : 0;
 }
 
 SYSDEF(sched_getscheduler) {
-    int r = sched_getscheduler((pid_t)(s32)a0);
+    int r = sched_getscheduler(tid_to_host(c->m, (s32)a0));
     return r < 0 ? host_err() : (u64)r;
 }
 
@@ -761,7 +841,8 @@ SYSDEF(sched_rr_get_interval) {
      * the fair-class timeslice, which is scheduler state, not a constant --
      * tests must not print the raw value. */
     struct timespec ts;
-    if (sched_rr_get_interval((pid_t)(s32)a0, &ts) < 0) return host_err();
+    if (sched_rr_get_interval(tid_to_host(c->m, (s32)a0), &ts) < 0)
+        return host_err();
     GTimespec g = { (s64)ts.tv_sec, (s64)ts.tv_nsec };
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
