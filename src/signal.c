@@ -24,6 +24,7 @@
 
 #include "machine.h"
 #include "guest_abi.h"
+#include "jit.h"
 
 #define GSIG_DFL 0
 #define GSIG_IGN 1
@@ -73,6 +74,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     p->value = (long)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
     sigq_head = next;
     g_sig_npend = 1;
+    jit_signal_interrupt();   /* make generated code exit at its next entry */
 }
 
 /* Signals delivered synchronously from the interpreter (never host-caught). */

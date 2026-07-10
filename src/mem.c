@@ -13,6 +13,7 @@
 
 #include "machine.h"
 #include "esr.h"
+#include "jit.h"
 
 #define L1_BITS (GUEST_VA_BITS - 26)          /* 13 -> 8192 entries */
 #define L2_BITS 14                            /* 16384 entries, 64 MiB per L2 */
@@ -39,11 +40,28 @@ static unsigned long g_as_gen = 1;         /* never 0; word-sized: lock-free on 
 
 static void as_gen_bump(void) {
     __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
+    /* JIT threads skip the per-access generation check in their inlined fast
+     * paths; kick them out of generated code so they resync at a safepoint. */
+    jit_notify_mapping_change();
 }
 
 void tlb_flush_all(void) {
     g_fcache.host = NULL;
     g_dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
+}
+
+/* ---- JIT D-TLB seam (see mmu.h) ---- */
+_Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
+_Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
+void *jit_dtlb_base(void) { return g_dtlb; }
+void jit_dtlb_reset(void) {
+    /* The interpreter empties lazily on a generation mismatch; the JIT's
+     * inline probe has no per-access generation check, so empty eagerly and
+     * adopt the current generation. Also drops the fetch cache. */
+    unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
+    memset(g_dtlb, 0, sizeof g_dtlb);
+    g_dtlb_gen = gen;
+    g_fcache.host = NULL;
 }
 
 /* 128-bit CAS fallback lock for hosts without lock-free __int128 (32-bit ARM
@@ -98,6 +116,7 @@ static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) 
         }
         (*slot)[L2_IDX(va)] = host ? ((uintptr_t)(host + off) | prot) : 0;
     }
+    jit_invalidate_range(addr, len);   /* map-over/unmap of translated code */
     as_gen_bump();
     tlb_flush_all();
 }
@@ -109,6 +128,7 @@ static void pte_prot_range(AddrSpace *as, u64 addr, u64 len, u32 prot) {
         if (l2 && l2[L2_IDX(va)])
             l2[L2_IDX(va)] = (l2[L2_IDX(va)] & ~(uintptr_t)PTE_FLAGS) | prot;
     }
+    jit_invalidate_range(addr, len);   /* e.g. mprotect over translated code */
     as_gen_bump();
     tlb_flush_all();
 }
@@ -366,6 +386,7 @@ void as_destroy(AddrSpace *as) {
     for (size_t i = 0; i < L1_SIZE; i++) free(as->l1[i]);
     free(as->l1);
     memset(as, 0, sizeof *as);
+    jit_execve_flush();
     as_gen_bump();
     tlb_flush_all();
 }

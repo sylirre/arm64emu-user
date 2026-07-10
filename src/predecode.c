@@ -439,7 +439,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
     }
 }
 
-static void pd_fill(PDEnt *e, u32 insn) {
+void pd_fill(PDEnt *e, u32 insn) {
     e->insn = insn;
     e->op = PD_GENERIC;
     e->rd = (u8)(insn & 31);

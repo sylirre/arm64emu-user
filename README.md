@@ -1,9 +1,10 @@
-# arm64chroot — interpreter-only AArch64 Linux user-space emulator
+# arm64chroot — AArch64 Linux user-space emulator
 
 Run an **AArch64 (ARM64) Linux** program from a rootfs directory on any Linux
 host — **ARM32, ARM64, x86, or x86-64** — with no privileges, no kernel modules,
 and no dependencies beyond libc. It's `qemu-aarch64` user-mode plus `proot`-style
-rootfs containment in one small C11 program. **Pure interpreter** — no JIT.
+rootfs containment in one small C11 program. Interpreter by default, with an
+**optional JIT** (`-jit`) for AArch64 and x86-64 hosts (see [docs/jit.md](docs/jit.md)).
 
 ```sh
 make
@@ -22,6 +23,8 @@ arm64chroot [options] <rootfs> <program> [args...]
 
   -strace          log guest syscalls to stderr
   -d               per-instruction trace (very verbose)
+  -jit             translate hot basic blocks to native code (AArch64 / x86-64
+                   hosts; falls back to the interpreter elsewhere). Off by default.
   -nopd            disable the decoded-instruction cache (diagnostic; slower)
   -E VAR=VAL       set an environment variable for the guest (repeatable)
   -0 ARG0          override argv[0] for the guest program

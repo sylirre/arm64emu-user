@@ -13,6 +13,7 @@
 #include "esr.h"
 #include "guest_abi.h"
 #include "predecode.h"
+#include "jit.h"
 
 /* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c weak hook):
  * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
@@ -53,6 +54,9 @@ int emu_loop(CPU *c) {
             /* Full step: keeps every per-instruction debug facility
              * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */
             cpu_step(c);
+        } else if (UNLIKELY(g_jit)) {
+            /* -jit: run translated blocks; same return contract as pd_run. */
+            jit_run(c);
         } else if (LIKELY(g_predecode)) {
             /* Threaded fast path: executes instructions back-to-back through
              * the decode cache, returning when this loop must intervene. */

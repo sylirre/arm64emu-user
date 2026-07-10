@@ -138,6 +138,21 @@ const Region *as_find_region(AddrSpace *as, u64 va);
  * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
 
+/* ---- JIT data-TLB seam ----
+ * The interpreter's per-thread direct-mapped D-TLB (mem.c) whose entry format
+ * the JIT inlines: 16-byte {u64 page; uintptr_t pte}, page = (va & TBI) >> 12,
+ * indexed by (page & (A64_DTLB_ENTRIES-1)). pte = host_ptr | prot (low 3 bits).
+ * The JIT probes it directly; on any miss/perm-fail/page-cross it calls the
+ * mem_* slow path, which refills the TLB. Generated code never does TLS math:
+ * jit_dtlb_base() (evaluated on the owning thread at cache init) hands back a
+ * stable pointer to this thread's array. */
+#define A64_DTLB_ENTRIES 256
+void *jit_dtlb_base(void);
+/* Empty this thread's D-TLB and resync it to the current address-space
+ * generation (what translate() does lazily; the JIT does it eagerly at a
+ * safepoint because its inline probe skips the per-access generation check). */
+void  jit_dtlb_reset(void);
+
 /* Bulk copies for the syscall layer. Never raise guest exceptions.
  * Return 0, or -EFAULT on an unmapped/forbidden page. */
 long copy_from_guest(CPU *c, void *dst, u64 va, size_t len);

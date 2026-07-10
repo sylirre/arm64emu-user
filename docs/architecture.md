@@ -114,6 +114,12 @@ hooks and the system emulator's IRQ/FIQ-line checks (never taken in
 linux-user). `-nopd` selects a plain fetch → `exec_a64` step (diagnostic mode
 for bisecting decode-cache suspicions).
 
+The optional `-jit` inserts one more rung above `pd_run`: `jit_run`
+(`src/jit/`) executes native translations of guest basic blocks and honors the
+same return contract, handing control back to `emu_loop` on the same rare
+events. It is off by default and only compiled-in for AArch64/x86-64 hosts; the
+debug ladder still wins, so `-d` forces the interpreter. See [jit.md](jit.md).
+
 ### One syscall (the run loop, `src/loop.c`)
 
 ```

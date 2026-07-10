@@ -24,6 +24,7 @@
 
 #include "machine.h"
 #include "thread.h"
+#include "jit.h"
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
@@ -33,8 +34,9 @@ extern char **environ;
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: arm64chroot [-strace] [-d] [-nopd] [-E VAR=VAL]... [-0 argv0] "
-            "[-fake-id [uid[:gid]]] [-link2symlink] <rootfs> <program> [args...]\n");
+            "usage: arm64chroot [-strace] [-d] [-jit] [-nopd] [-E VAR=VAL]... "
+            "[-0 argv0] [-fake-id [uid[:gid]]] [-link2symlink] "
+            "<rootfs> <program> [args...]\n");
     exit(2);
 }
 
@@ -96,6 +98,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-strace")) m->strace = 1;
         else if (!strcmp(argv[i], "-d")) { g_trace = 1; g_debug_hooks = 1; }
         else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
+        else if (!strcmp(argv[i], "-jit")) g_jit = 1;          /* native translation */
         else if (!strcmp(argv[i], "-link2symlink")) m->link2symlink = 1;
         else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
@@ -113,6 +116,19 @@ int main(int argc, char **argv) {
         else usage();
     }
     if (argc - i < 2) usage();
+
+    /* -jit yields to per-instruction debug facilities and to hosts without a
+     * code generator; the interpreter is always the correct fallback. */
+    if (g_jit && g_debug_hooks) {
+        fprintf(stderr, "arm64chroot: -jit disabled by per-instruction "
+                        "debug flags, using interpreter\n");
+        g_jit = 0;
+    }
+    if (g_jit && !jit_backend_available()) {
+        fprintf(stderr, "arm64chroot: -jit has no backend for this host, "
+                        "using interpreter\n");
+        g_jit = 0;
+    }
 
     /* Capture the real invoking identity (stat remap source) and, in fake mode,
      * seed the credential set to the configured identity. */

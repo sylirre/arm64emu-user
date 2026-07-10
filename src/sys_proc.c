@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "sys.h"
+#include "jit.h"
 
 SYSDEF(exit) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -202,6 +203,7 @@ static void *thread_entry(void *arg) {
     /* Thread exited via exit()/exit_group(): drop the tid mapping first so a
      * woken joiner already sees the tid as stale, then CLONE_CHILD_CLEARTID
      * wakes joiners. */
+    jit_thread_exit();
     gtid_del(t->m, t->tid);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     free(t);
@@ -257,6 +259,7 @@ SYSDEF(clone) {
         /* Only the forking thread exists here: the inherited live-thread
          * table describes host threads of the parent. */
         memset(m->gtid, 0, sizeof m->gtid);
+        jit_fork_child();                 /* same discipline for the JIT state */
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);

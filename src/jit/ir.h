@@ -1,0 +1,143 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* JIT intermediate representation. One guest instruction becomes 1..4 linear
+ * IR ops; the backends emit host code from them with per-block register
+ * allocation. The frontend (frontend.c) is a transcription of the predecode
+ * handler semantics (predecode.c, itself checked against decode.c by the
+ * differential suite) — XZR/SP resolution, width truncation, pre-decoded
+ * immediates and writeback ordering are all resolved HERE, never in a
+ * backend.
+ *
+ * Virtual registers: 0..30 = guest x0..x30, 31 = guest SP (sp_el[0]),
+ * 32..34 = block-local temps, 35 = the zero register (reads as 0, writes
+ * discarded — backends may have a real zero register). Between blocks all
+ * guest state lives in the CPU struct; helpers and block exits sync it.
+ *
+ * NZCV is not a numbered vreg: ops with an S suffix define the guest flags,
+ * cc-consumers (BCOND/CSEL/CCMP/ADC/CSET...) use them. The backend keeps
+ * flags lazily (host flags right after the producer; the architectural
+ * c->nzcv word otherwise) and materializes on the S-producer when the next
+ * op is not its consumer. IR_CC_AL never appears on consumers that cannot
+ * take it (frontend folds). The liveness pass strips dead S suffixes. */
+#ifndef A64_JIT_IR_H
+#define A64_JIT_IR_H
+
+#include "jit_priv.h"
+
+enum {
+    VREG_SP   = 31,
+    VREG_TMP0 = 32,
+    VREG_TMP1 = 33,
+    VREG_TMP2 = 34,
+    VREG_ZERO = 35,
+    VREG_N    = 36,
+};
+
+/* op semantics (w: 0 = 32-bit — result zero-extended on write, operands read
+ * truncated; 1 = 64-bit): */
+enum {
+    IRO_NOP = 0,
+    /* dst = imm / dst = a */
+    IRO_MOVI,               /* dst, imm */
+    IRO_MOV,                /* dst, a */
+    IRO_MOVK,               /* dst, a, imm = imm16<<sh, cc = sh: keep other bits */
+
+    /* dst = a (op) b; S-forms also define NZCV */
+    IRO_ADD,  IRO_ADDS,     /* dst, a, b */
+    IRO_SUB,  IRO_SUBS,
+    IRO_ADC,  IRO_ADCS,     /* + carry-in from guest C */
+    IRO_SBC,  IRO_SBCS,     /* a - b - !C */
+    IRO_AND,  IRO_ANDS,
+    IRO_BIC,  IRO_BICS,
+    IRO_ORR,  IRO_ORN,
+    IRO_EOR,  IRO_EON,
+
+    /* dst = a (op) imm; S-forms define NZCV */
+    IRO_ADDI, IRO_ADDIS,    /* dst, a, imm */
+    IRO_SUBI, IRO_SUBIS,
+    IRO_ANDI, IRO_ANDIS,
+    IRO_ORRI, IRO_EORI,
+
+    /* shifts (immediate amount in imm, 0..width-1; variable amount masked
+     * by width-1 like the guest) */
+    IRO_LSLI, IRO_LSRI, IRO_ASRI, IRO_RORI,   /* dst, a, imm = amount */
+    IRO_LSLV, IRO_LSRV, IRO_ASRV, IRO_RORV,   /* dst, a, b */
+
+    IRO_EXTR,               /* dst, a = hi, b = lo, imm = amount (0 => lo) */
+
+    /* multiply/divide */
+    IRO_MADD, IRO_MSUB,     /* dst = x[cc] +- a*b (cc = Ra vreg) */
+    IRO_SMADDL, IRO_SMSUBL, /* dst = x[cc] +- sext32(a)*sext32(b), 64-bit */
+    IRO_UMADDL, IRO_UMSUBL,
+    IRO_SMULH, IRO_UMULH,   /* dst = high 64 of 64x64 */
+    IRO_UDIV, IRO_SDIV,     /* guest semantics: /0 = 0, INT_MIN/-1 = INT_MIN */
+
+    IRO_CLZ,                /* dst, a (width per w; 0 input => width) */
+    IRO_REV64, IRO_REV32,   /* bswap64 / bswap32-zext */
+
+    /* conditional (consume NZCV; cc = guest condition 0..15) */
+    IRO_CSEL, IRO_CSINC, IRO_CSINV, IRO_CSNEG,  /* dst = cc ? a : op(b) */
+    IRO_CCMPR, IRO_CCMNR,   /* a vs b   if cc else NZCV = aux (defines NZCV) */
+    IRO_CCMPI, IRO_CCMNI,   /* a vs imm if cc else NZCV = aux (defines NZCV) */
+
+    /* memory (Phase C: inline D-TLB probe; until then frontend uses CALL1).
+     * addr = x[a] + imm. sz in aux low byte (1/2/4/8), sign-extend flag in
+     * aux bit 8 (loads; extension width = w). Faults exit the block with
+     * cur_insn_pc = the op's baked guest pc (aux bits 32..: insn index). */
+    IRO_LD,                 /* dst=rt(or ZERO), a=base, imm=offset, aux=desc,
+                             * cc=szlog, mempc=guest pc; commits to c->x[rt] */
+    IRO_ST,                 /* a=base, b=value, imm=offset, aux=desc, cc=szlog */
+    IRO_LDV,                /* FP/SIMD: aux=desc(rt,vsz), cc=vsz, into c->v[rt] */
+    IRO_STV,                /* FP/SIMD: from c->v[rt] */
+
+    /* control flow (terminal ops; a block's IR always ends with one or two
+     * of these). Chainable exits carry the successor guest pc in imm. */
+    IRO_JMP,                /* imm = target pc (chainable exit) */
+    IRO_BCOND,              /* cc, imm = taken pc; must be followed by JMP */
+    IRO_CBZ, IRO_CBNZ,      /* a, w, imm = taken pc; followed by JMP */
+    IRO_TBZ, IRO_TBNZ,      /* a, cc = bit, imm = taken pc; followed by JMP */
+    IRO_JMPIND,             /* a = target reg: c->pc = a, jcache probe */
+
+    /* helper fallback: sync state, c->{cur_insn_pc,pc} = imm/imm+4, call
+     * jit_exec1(c, imm, aux); nonzero return exits the block. Defines every
+     * guest register and NZCV as far as the allocator is concerned. */
+    IRO_CALL1,              /* imm = guest pc, aux = insn word */
+
+    IRO_N_
+};
+
+typedef struct IROp {
+    u64 imm;
+    u64 imm2pc;             /* memory ops: guest pc baked for a precise fault */
+    u32 aux;
+    u8  op;
+    u8  w;                  /* 0 = 32-bit, 1 = 64-bit */
+    u8  dst;
+    u8  a;
+    u8  b;
+    u8  cc;                 /* condition / bit index / Ra vreg / MOVK shift */
+    u8  flags_dead;         /* liveness: S-op whose NZCV def is never read */
+    u8  icnt;               /* natively-retired guest insns if exiting here
+                             * (helper-executed insns count themselves) */
+} IROp;
+
+#define IR_MAX_OPS (JIT_MAX_BLOCK_INSNS * 4 + 8)
+
+typedef struct IRBlock {
+    IROp ops[IR_MAX_OPS];
+    int  n;
+    u32  ninsns;            /* NATIVE-retired guest insn count (icount delta
+                             * added by exit stubs; CALL1 insns not included
+                             * — jit_exec1 counts those itself) */
+    /* per-op vreg liveness (bit v set = vreg v live after this op), filled
+     * by the liveness pass for the allocator's free-after-last-use */
+    u64  live_after[IR_MAX_OPS];
+} IRBlock;
+
+/* Translate the basic block starting at guest pc into ir (fetching via
+ * mem_ifetch, classifying via pd_fill), covering at most max_insns guest
+ * instructions. Returns the number consumed (0 = entry fetch fault,
+ * pend_exc recorded), and runs the liveness/flag-death pass first. */
+u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns);
+
+#endif /* A64_JIT_IR_H */

@@ -143,4 +143,8 @@ enum {
  * pending signal, stop/halt, or an instruction-fetch fault. */
 void pd_run(CPU *c);
 
+/* Classify one instruction word into a PDEnt (dense op id + pre-extracted
+ * operands; PD_GENERIC when unrecognized). Also the JIT frontend's decoder. */
+void pd_fill(PDEnt *e, u32 insn);
+
 #endif /* A64_PREDECODE_H */
