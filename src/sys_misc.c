@@ -92,24 +92,43 @@ SYSDEF(sysinfo) {
     return copy_to_guest(c, a0, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
-/* futex: without CLONE_VM threads every guest futex word is process-private,
- * so WAIT can only be satisfied by a signal/timeout and WAKE finds no waiters.
- * Pass through to the host on the translated address: correct for the
- * single-threaded milestones and already right for M6 shared memory. */
+/* futex: guest threads are host threads on one shared mapping, so waits and
+ * wakes pass through on the translated address. Argument 4 is a timespec for
+ * the waiting ops but a plain count (val2) for the requeue/wake-op family,
+ * whose argument 5 is a second futex word; both must be forwarded. Dropping
+ * them turns FUTEX_REQUEUE into a no-op, and musl's condvar broadcast wakes
+ * only the first waiter directly -- every later one is handed off by
+ * requeueing it onto the mutex (unlock_requeue), so those threads sleep
+ * forever (observed as node hanging at exit joining its V8 worker pool). */
 SYSDEF(futex) {
     int op = (int)a1 & 127;
     void *uaddr = mem_host_ptr(c, a0, 4, ACC_READ);
     if (!uaddr) return (u64)(s64)-EFAULT;
-    struct timespec ts, *tsp = NULL;
-    if ((op == 0 /*WAIT*/ || op == 9 /*WAIT_BITSET*/) && a3) {
-        GTimespec g;
-        if (copy_from_guest(c, &g, a3, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        ts.tv_sec = (time_t)g.tv_sec;
-        ts.tv_nsec = (long)g.tv_nsec;
-        tsp = &ts;
+    int takes_ts = op == 0 /*WAIT*/ || op == 6 /*LOCK_PI*/ ||
+                   op == 9 /*WAIT_BITSET*/ || op == 11 /*WAIT_REQUEUE_PI*/;
+    int takes_u2 = op == 3 /*REQUEUE*/ || op == 4 /*CMP_REQUEUE*/ ||
+                   op == 5 /*WAKE_OP*/ || op == 11 ||
+                   op == 12 /*CMP_REQUEUE_PI*/;
+    struct timespec ts;
+    unsigned long arg3 = 0;
+    if (takes_ts) {
+        if (a3) {
+            GTimespec g;
+            if (copy_from_guest(c, &g, a3, sizeof g) < 0) return (u64)(s64)-EFAULT;
+            ts.tv_sec = (time_t)g.tv_sec;
+            ts.tv_nsec = (long)g.tv_nsec;
+            arg3 = (unsigned long)&ts;
+        }
+    } else {
+        arg3 = (u32)a3;   /* val2: wake/requeue count */
     }
-    long r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, tsp,
-                     (void *)0, (u32)a5);
+    void *uaddr2 = NULL;
+    if (takes_u2) {
+        /* WAKE_OP writes through uaddr2; the requeue ops only key on it. */
+        uaddr2 = mem_host_ptr(c, a4, 4, op == 5 ? ACC_WRITE : ACC_READ);
+        if (!uaddr2) return (u64)(s64)-EFAULT;
+    }
+    long r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, arg3, uaddr2, (u32)a5);
     return r < 0 ? host_err() : (u64)r;
 }
 
