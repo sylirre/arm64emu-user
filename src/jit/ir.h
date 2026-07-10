@@ -103,8 +103,83 @@ enum {
      * guest register and NZCV as far as the allocator is concerned. */
     IRO_CALL1,              /* imm = guest pc, aux = insn word */
 
+    /* CPU-struct scalar access (TPIDR_EL0 and friends): 64-bit load/store at
+     * a byte offset into the CPU struct. No flags, no faults. */
+    IRO_CPULD,              /* dst, a = VREG_ZERO, imm = offsetof(CPU, ...) */
+    IRO_CPUST,              /* dst = VREG_ZERO, a = src, imm = offset */
+
+    IRO_FENCE,              /* guest DMB/DSB: host full memory barrier */
+
+    /* Inline vector / scalar-FP ALU (exec_fpsimd is the reference; the
+     * interpreter computes FP with host C float/double, so plain host FP
+     * ops match it bit-for-bit on the same host — no NaN or FPCR gating:
+     * the only FPCR-sensitive op, FCVT, stays a helper). aux = VC_* class
+     * (+ VF_* flags); imm = the raw insn word, which the backend re-decodes
+     * for Rd/Rn/Rm/size/Q/shift — except VC_MOVI, where imm/imm2pc hold the
+     * pre-expanded 128-bit pattern. dst/a are the guest GPRs involved
+     * (UMOV/SMOV/FMOV-to-gpr define dst; DUP/INS/FMOV-from-gpr read a);
+     * vector registers live in c->v[] and are not allocated. No faults. */
+    IRO_VOP,
+
+    /* Inline exclusives / LSE atomics / ordered accesses, [base] only (the
+     * guest encodings carry no offset). aux = AT_MAKE(kind, szlog, acq, rel);
+     * a = base, b = store value / RMW operand, cc = extra source vreg (CAS
+     * expected), dst = result (loaded / old value / STXR status; ZERO for
+     * the ST* forms). Any TLB miss, misalignment, or perm failure re-runs
+     * the whole instruction through jit_exec1 (imm2pc = pc, aux2 = insn in
+     * imm). NOT counted in ninsns: the fast path bumps icount inline and
+     * jit_exec1 counts itself, so both routes retire exactly once. */
+    IRO_ATOMIC,             /* imm = raw insn word (slow-path re-execution) */
+
     IRO_N_
 };
+
+/* IRO_ATOMIC kinds (aux bits 0..7) */
+enum {
+    AT_LDX,                 /* LDXR/LDAXR: load + record monitor */
+    AT_STX,                 /* STXR/STLXR: monitor check + host CAS, status */
+    AT_LDAR,                /* LDAR/LDLAR/LDAPR: atomic acquire load */
+    AT_STLR,                /* STLR/STLLR: atomic release store */
+    AT_SWP,                 /* SWP: dst = old, [base] = b */
+    AT_LDADD, AT_LDCLR, AT_LDEOR, AT_LDSET,   /* dst = old, [base] op= b */
+    AT_CAS,                 /* dst/cc = Rs (expected/old), b = Rt (new) */
+};
+#define AT_MAKE(kind, szlog, acq, rel) \
+    ((u32)((kind) | ((szlog) << 8) | ((acq) << 12) | ((rel) << 13)))
+#define AT_KIND(a)  ((a) & 0xff)
+#define AT_SZL(a)   (((a) >> 8) & 3)
+#define AT_ACQ(a)   (((a) >> 12) & 1)
+#define AT_REL(a)   (((a) >> 13) & 1)
+
+/* IRO_VOP classes (aux bits 0..5) + flags. The frontend whitelists exact
+ * encodings and asks the backend (be_vop_ok) about per-host gaps; anything
+ * declined stays an exec_fpsimd helper call. */
+enum {
+    VC_BITW,                /* 3-same opc 0x03: AND/BIC/ORR/EOR/BSL/BIT/BIF */
+    VC_ADDSUB,              /* 3-same opc 0x10: ADD/SUB, all sizes */
+    VC_CM3,                 /* 3-same compares: CMEQ(U1 0x11) CMGT/CMHI(0x06)
+                             * CMGE/CMHS(0x07) */
+    VC_SHIFTI,              /* shift-imm: SHL(0x0a U0) SSHR/USHR(0x00) */
+    VC_MOVI,                /* modified-imm MOVI/MVNI/FMOV/ORR/BIC: imm is
+                             * pre-expanded; aux carries rd/Q/op kind */
+    VC_COPY,                /* AdvSIMD copy: DUP/INS/UMOV/SMOV */
+    VC_F2,                  /* scalar FMUL/FDIV/FADD/FSUB/FNMUL (S/D) */
+    VC_F1,                  /* scalar FMOV/FABS/FNEG/FSQRT (S/D) */
+    VC_FCMP,                /* FCMP/FCMPE (reg or #0.0): writes NZCV */
+    VC_FCSEL,               /* reads NZCV */
+    VC_FMOVI,               /* scalar FMOV #imm (pattern in o->imm low half) */
+    VC_FMOVG,               /* FMOV gpr<->fpr incl. Vn.D[1] forms */
+};
+#define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
+#define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */
+#define VC(a)    ((a) & 0x3f)
+/* VC_MOVI packing: aux bits 8..12 = Rd, 13 = Q, 14..15 = kind
+ * (0 = write, 1 = ORR, 2 = BIC) */
+#define VMOVI_MAKE(rd, q, kind) \
+    ((u32)(VC_MOVI | ((rd) << 8) | ((q) << 13) | ((kind) << 14)))
+#define VMOVI_RD(a)   (((a) >> 8) & 31)
+#define VMOVI_Q(a)    (((a) >> 13) & 1)
+#define VMOVI_KIND(a) (((a) >> 14) & 3)
 
 typedef struct IROp {
     u64 imm;

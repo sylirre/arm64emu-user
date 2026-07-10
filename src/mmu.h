@@ -146,7 +146,7 @@ void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
  * mem_* slow path, which refills the TLB. Generated code never does TLS math:
  * jit_dtlb_base() (evaluated on the owning thread at cache init) hands back a
  * stable pointer to this thread's array. */
-#define A64_DTLB_ENTRIES 256
+#define A64_DTLB_ENTRIES 1024
 void *jit_dtlb_base(void);
 /* Empty this thread's D-TLB and resync it to the current address-space
  * generation (what translate() does lazily; the JIT does it eagerly at a

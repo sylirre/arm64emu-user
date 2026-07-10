@@ -68,6 +68,8 @@ typedef struct JitEnv {
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_stv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     u64 tmp_spill[4];           /* spill homes for IR temps (generated code) */
+    u32 slowmem;                /* A64_JIT_SLOWMEM: every mem op takes the
+                                 * helper path (fast-path codegen bisection) */
 
     /* Indirect-branch target cache, probed inline by generated code for
      * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */
@@ -129,6 +131,9 @@ int  be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir);
  * inverse (restore the dispatcher stub). Same-thread only. */
 void be_patch_chain(JitEnv *env, JBlock *b, int slot, const u8 *target_rx);
 void be_unpatch_chain(JitEnv *env, JBlock *b, int slot);
+/* Can this host inline the given IRO_VOP class for this insn word?
+ * (Per-host fidelity/capability table; 0 = keep the exec_fpsimd helper.) */
+int  be_vop_ok(unsigned vclass, u32 insn);
 /* Make [rx, rx+len) (written via rw) visible to instruction fetch. */
 void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
 
@@ -151,8 +156,12 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc);   /* from c->v[rt] */
 #define MDESC_SIGN(d)  (((d) >> 7) & 1)          /* sign-extend (loads) */
 #define MDESC_IS64(d)  (((d) >> 8) & 1)          /* result width */
 #define MDESC_VSZL(d)  (((d) >> 9) & 7)          /* vector byte-log: 0..4 = 1..16B */
+#define MDESC_TMP(d)   (((d) >> 12) & 1)         /* loads: RT field is an IR temp
+                                                  * index; commit to tmp_spill[RT]
+                                                  * (LDP's all-or-nothing halves) */
 #define MDESC_MAKE(rt, szlog, sign, is64) \
     ((u32)((rt) | ((szlog) << 5) | ((sign) << 7) | ((is64) << 8)))
 #define MDESC_MAKEV(rt, vszlog) ((u32)((rt) | ((vszlog) << 9)))
+#define MDESC_TMPBIT   (1u << 12)
 
 #endif /* A64_JIT_PRIV_H */

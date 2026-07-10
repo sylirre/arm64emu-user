@@ -65,6 +65,10 @@ void be_unpatch_chain(JitEnv *env, JBlock *b, int slot) {
 void be_flush_icache(const u8 *rx, const u8 *rw, size_t len) {
     (void)rx; (void)rw; (void)len;
 }
+int be_vop_ok(unsigned vclass, u32 insn) {
+    (void)vclass; (void)insn;
+    return 0;
+}
 #endif
 
 int jit_backend_available(void) { return be_available(); }
@@ -229,6 +233,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_ldv = (void *)jit_ldv;
     env->helper_stv = (void *)jit_stv;
     env->dtlb = jit_dtlb_base();
+    env->slowmem = getenv("A64_JIT_SLOWMEM") != NULL;
     if (cache_alloc(env) < 0) return -1;
     env->hash = calloc(JIT_HASH_SIZE, sizeof *env->hash);
     env->pages = calloc(JIT_PAGE_TBL, sizeof *env->pages);
@@ -344,7 +349,8 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
         v = (u64)((s64)(v << (64 - b)) >> (64 - b));
     }
     if (!MDESC_IS64(desc)) v = (u32)v;
-    if (rt != 31) c->x[rt] = v;
+    if (MDESC_TMP(desc)) g_jit_env.tmp_spill[rt & 3] = v;   /* IR temp home */
+    else if (rt != 31) c->x[rt] = v;
     return 0;
 }
 

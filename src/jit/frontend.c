@@ -167,6 +167,226 @@ static void put_stv(IRBlock *ir, u8 base, s64 off, unsigned rt, unsigned vszl,
 static void put_wb(IRBlock *ir, unsigned rn, s64 imm) {   /* base += imm */
     ir_put(ir, IRO_ADDI, 1, (u8)rn, (u8)rn, 0, 0, (u64)imm, 0);
 }
+/* Load into IR temp k (dst = VREG_TMP0+k, home = env->tmp_spill[k]): LDP's
+ * halves, committed to the guest registers only after both succeed. */
+static void put_ld_tmp(IRBlock *ir, u8 base, s64 off, unsigned k,
+                       unsigned szlog, int is64, u64 pc) {
+    IROp *o = ir_put(ir, IRO_LD, (u8)is64, (u8)(VREG_TMP0 + k), base, 0,
+                     (u8)szlog, (u64)off,
+                     MDESC_MAKE(k, szlog, 0, is64) | MDESC_TMPBIT);
+    o->imm2pc = pc;
+}
+
+/* Inline vector / scalar-FP ALU (exec_fpsimd is the reference; the
+ * interpreter computes FP in host C float/double, so host FP ops match it
+ * bit-for-bit on the same host). Emits one IRO_VOP and returns 1 for
+ * whitelisted encodings the host backend accepts (be_vop_ok); 0 = keep the
+ * helper. Counted in ninsns (fully native, no faults). */
+
+/* VFPExpandImm / AdvSIMDExpandImm — transcribed from exec_fpsimd.c (spec
+ * pseudocode; both must stay in sync with the interpreter's copies). */
+static u32 fe_vfp_imm32(unsigned imm8) {
+    /* sign:imm8<7>  exp8 = NOT(b6):Rep(b6,5):imm8<5:4>  frac = imm8<3:0> */
+    u32 s = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1, e = (imm8 >> 4) & 3;
+    u32 exp8 = ((!b6) << 7) | ((b6 ? 0x1fu : 0) << 2) | e;
+    return (s << 31) | (exp8 << 23) | ((u32)(imm8 & 0xf) << 19);
+}
+static u64 fe_vfp_imm64(unsigned imm8) {
+    u64 s = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1, e = (imm8 >> 4) & 3;
+    u64 exp11 = ((u64)(!b6) << 10) | ((u64)(b6 ? 0xffu : 0) << 2) | e;
+    return (s << 63) | (exp11 << 52) | ((u64)(imm8 & 0xf) << 48);
+}
+static u64 fe_rep8(u64 b)  { b &= 0xff;       return b * 0x0101010101010101ULL; }
+static u64 fe_rep16(u64 h) { h &= 0xffff;     return h * 0x0001000100010001ULL; }
+static u64 fe_rep32(u64 w) { w &= 0xffffffff; return w | (w << 32); }
+static u64 fe_expand_imm(unsigned op, unsigned cmode, unsigned imm8) {
+    unsigned hi = (cmode >> 1) & 7, lo = cmode & 1;
+    switch (hi) {
+        case 0: return fe_rep32(imm8);
+        case 1: return fe_rep32((u64)imm8 << 8);
+        case 2: return fe_rep32((u64)imm8 << 16);
+        case 3: return fe_rep32((u64)imm8 << 24);
+        case 4: return fe_rep16(imm8);
+        case 5: return fe_rep16((u64)imm8 << 8);
+        case 6: return lo ? fe_rep32(((u64)imm8 << 16) | 0xffff)
+                          : fe_rep32(((u64)imm8 << 8) | 0xff);
+        default:
+            if (lo == 0 && op == 0) return fe_rep8(imm8);
+            if (lo == 0 && op == 1) {
+                u64 v = 0;
+                for (int i = 0; i < 8; i++)
+                    if ((imm8 >> i) & 1) v |= 0xffULL << (i * 8);
+                return v;
+            }
+            if (lo == 1 && op == 0) return fe_rep32(fe_vfp_imm32(imm8));
+            return fe_vfp_imm64(imm8);
+    }
+}
+
+static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
+    (void)pc;
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31;
+    u32 vclass = ~0u;
+    u8 gdst = VREG_ZERO, gsrc = VREG_ZERO;   /* guest GPRs involved */
+    u32 aux_extra = 0;
+
+    if ((insn & 0x9F200400u) == 0x0E200400u) {
+        /* vector three-same (bit31=0, 28:24=01110, 21=1, 10=1) */
+        unsigned U = (insn >> 29) & 1;
+        unsigned opc = (insn >> 11) & 0x1f;
+        if (opc == 0x03) vclass = VC_BITW;
+        else if (opc == 0x10) vclass = VC_ADDSUB;
+        else if ((opc == 0x11 && U) || opc == 0x06 || opc == 0x07)
+            vclass = VC_CM3;
+    } else if ((insn & 0x9FF80400u) == 0x0F000400u) {
+        /* modified immediate (28:19 = 0111100000, bit10=1) */
+        unsigned Q = (insn >> 30) & 1, op = (insn >> 29) & 1;
+        unsigned cmode = (insn >> 12) & 0xf;
+        unsigned imm8 = (((insn >> 16) & 7) << 5) | ((insn >> 5) & 31);
+        unsigned hi = (cmode >> 1) & 7, lo = cmode & 1;
+        int orr_bic = (lo == 1) && (hi <= 5);
+        u64 v;
+        unsigned kind;
+        if (orr_bic) {
+            v = fe_expand_imm(0, cmode, imm8);
+            kind = op ? 2 : 1;                   /* BIC : ORR */
+        } else {
+            v = fe_expand_imm(op, cmode, imm8);
+            if (op == 1 && hi != 7) v = ~v;
+            kind = 0;                            /* plain write */
+        }
+        if (!be_vop_ok(VC_MOVI, insn)) return 0;
+        IROp *o = ir_put(ir, IRO_VOP, 0, VREG_ZERO, VREG_ZERO, VREG_ZERO, 0,
+                         v, VMOVI_MAKE(rd, Q, kind));
+        o->imm2pc = v;                           /* both lanes = v */
+        ir->ninsns++;
+        return 1;
+    } else if ((insn & 0x9F800400u) == 0x0F000400u &&
+               ((insn >> 19) & 0xf) != 0) {
+        /* shift immediate (28:23 = 011110, bit10 = 1, immh != 0) */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 11) & 0x1f;
+        if ((opc == 0x0a && !U) || opc == 0x00) vclass = VC_SHIFTI;
+    } else if ((insn & 0x9FE08400u) == 0x0E000400u) {
+        /* AdvSIMD copy (28:21 = 01110000, bit15 = 0, bit10 = 1); the
+         * interpreter's simd_copy semantics are mirrored exactly, including
+         * its permissive treatment of reserved imm5/Q combinations. */
+        unsigned op = (insn >> 29) & 1;
+        unsigned imm4 = (insn >> 11) & 0xf;
+        if (op == 1) {                           /* INS (element) */
+            vclass = VC_COPY;
+        } else if (imm4 == 0x0) {                /* DUP (element) */
+            vclass = VC_COPY;
+        } else if (imm4 == 0x1 || imm4 == 0x3) { /* DUP/INS (general) */
+            vclass = VC_COPY;
+            gsrc = rx(rn);
+        } else if (imm4 == 0x5 || imm4 == 0x7) { /* SMOV / UMOV */
+            vclass = VC_COPY;
+            gdst = rx(rd);
+        }
+    } else if ((insn & 0x7F000000u) == 0x1E000000u) {
+        /* scalar FP */
+        unsigned ftype = (insn >> 22) & 3, o2 = (insn >> 10) & 3;
+        if (((insn >> 24) & 0x1f) == 0x1e && ((insn >> 21) & 1) == 1 &&
+            ((insn >> 10) & 0x3f) == 0) {
+            /* FP<->integer: only the FMOV bit-move forms */
+            unsigned sf = insn >> 31, rmode = (insn >> 19) & 3;
+            unsigned opcode = (insn >> 16) & 7;
+            if (sf == 1 && ftype == 2 && rmode == 1 &&
+                (opcode == 6 || opcode == 7)) {  /* FMOV Xd,Vn.D[1] / inverse */
+                vclass = VC_FMOVG;
+                if (opcode == 6) gdst = rx(rd); else gsrc = rx(rn);
+            } else if (rmode == 0 && (opcode == 6 || opcode == 7) &&
+                       ((ftype == 0 && sf == 0) || (ftype == 1 && sf == 1))) {
+                vclass = VC_FMOVG;
+                if (opcode == 6) gdst = rx(rd); else gsrc = rx(rn);
+            }
+        } else if ((ftype == 0 || ftype == 1) && ((insn >> 21) & 1) == 1) {
+            if (o2 == 0 && ((insn >> 12) & 1) == 1) {        /* FMOV #imm */
+                unsigned imm8 = (insn >> 13) & 0xff;
+                if (!be_vop_ok(VC_FMOVI, insn)) return 0;
+                IROp *o = ir_put(ir, IRO_VOP, 0, VREG_ZERO, VREG_ZERO,
+                                 VREG_ZERO, 0,
+                                 ftype ? fe_vfp_imm64(imm8)
+                                       : (u64)fe_vfp_imm32(imm8),
+                                 VC_FMOVI | ((u32)rd << 8));
+                o->imm2pc = 0;
+                ir->ninsns++;
+                return 1;
+            }
+            if (o2 == 0 && ((insn >> 13) & 1) == 1 &&
+                ((insn >> 12) & 1) == 0) {                   /* FCMP/FCMPE */
+                vclass = VC_FCMP;
+                aux_extra = VF_SETF;
+            } else if (o2 == 0 && ((insn >> 14) & 1) == 1) { /* 1-source */
+                unsigned opc = (insn >> 15) & 0x3f;
+                if (opc <= 0x3) vclass = VC_F1;  /* FMOV/FABS/FNEG/FSQRT */
+            } else if (o2 == 2) {                            /* 2-source */
+                unsigned opc = (insn >> 12) & 0xf;
+                if (opc <= 0x3 || opc == 0x8) vclass = VC_F2; /* +FNMUL */
+            } else if (o2 == 3) {                            /* FCSEL */
+                vclass = VC_FCSEL;
+                aux_extra = VF_READF;
+            }
+        }
+    }
+
+    if (vclass == ~0u || !be_vop_ok(vclass, insn)) return 0;
+    ir_put(ir, IRO_VOP, 0, gdst, gsrc, VREG_ZERO, 0, (u64)insn,
+           vclass | aux_extra);
+    ir->ninsns++;
+    return 1;
+}
+
+/* Inline exclusives / LSE atomics / ordered accesses (decode.c
+ * ldst_exclusive and ldst_atomic are the reference; predecode classifies
+ * them all PD_GENERIC). Emits one IRO_ATOMIC and returns 1 when the word is
+ * a form the backends inline; 0 = caller falls back to the helper. These
+ * are NOT counted in ninsns — the fast path bumps icount itself and the
+ * slow path re-runs the insn through the self-counting jit_exec1. */
+static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rs = (insn >> 16) & 31;
+    IROp *o = NULL;
+
+    if ((insn & 0x3F000000u) == 0x08000000u) {   /* exclusives group */
+        unsigned szl = insn >> 30;               /* 00..11 = 1..8B */
+        int o2 = (insn >> 23) & 1, L = (insn >> 22) & 1, o1 = (insn >> 21) & 1;
+        int o0 = (insn >> 15) & 1;
+        if (o2 && o1) {                          /* CAS/CASA/CASL/CASAL */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
+                       rx(rs), (u64)insn,
+                       AT_MAKE(AT_CAS, szl, (insn >> 22) & 1, o0));
+        } else if (o2 && !o1) {                  /* LDAR/LDLAR / STLR/STLLR */
+            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
+            else   o = ir_put(ir, IRO_ATOMIC, 1, VREG_ZERO, rsp(rn), rx(rt),
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STLR, szl, 0, 1));
+        } else if (!o2 && !o1) {                 /* LDXR/LDAXR / STXR/STLXR */
+            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDX, szl, o0, 0));
+            else   o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STX, szl, 0, o0));
+        }
+        /* LDXP/STXP/CASP: helper (128-bit / pair monitor; rare) */
+    } else if ((insn & 0x3B200C00u) == 0x38200000u) {   /* LSE atomic memops */
+        unsigned szl = insn >> 30;
+        int A = (insn >> 23) & 1, R = (insn >> 22) & 1;
+        int o3 = (insn >> 15) & 1;
+        unsigned opc = (insn >> 12) & 7;
+        if (o3 && opc == 0)                      /* SWP */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
+                       (u64)insn, AT_MAKE(AT_SWP, szl, A, R));
+        else if (o3 && opc == 4 && rs == 31)     /* LDAPR */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                       VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
+        else if (!o3 && opc < 4)                 /* LDADD/LDCLR/LDEOR/LDSET */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
+                       (u64)insn, AT_MAKE(AT_LDADD + opc, szl, A, R));
+        /* LDSMAX..LDUMIN (opc 4-7): helper */
+    }
+    if (!o) return 0;
+    o->imm2pc = pc;
+    return 1;
+}
 
 /* Translate one classified instruction. Emits IR; returns FE_END when the
  * block must stop after it (all terminal ops emitted). */
@@ -631,8 +851,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             put_ld(ir, VREG_TMP0, 0, e->rd, 2, 0, 0, pc);
             break;
 
-        /* integer STP (rm = Rt2, imm = scaled offset): two stores + writeback.
-         * (Integer LDP defers both writes past both reads — kept as CALL1.) */
+        /* integer STP (rm = Rt2, imm = scaled offset): two stores + writeback. */
         case PD_STP64: case PD_STP64PRE: case PD_STP64POST:
         case PD_STP32: case PD_STP32PRE: case PD_STP32POST: {
             int is64 = (e->op == PD_STP64 || e->op == PD_STP64PRE || e->op == PD_STP64POST);
@@ -643,6 +862,28 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             put_st(ir, rsp(e->rn), a0,            rx(e->rd), szl, pc);
             put_st(ir, rsp(e->rn), a0 + (s64)esz, rx(e->rm), szl, pc);
             if (wb) put_wb(ir, e->rn, (s64)e->imm);
+            break;
+        }
+
+        /* Integer LDP: both register writes land only after BOTH reads
+         * succeed (predecode.c L_LDP64 is all-or-nothing), so read into IR
+         * temps and commit with MOVs. The address is computed once into TMP2
+         * up front, which also resolves the rd==rn / rm==rn hazards. */
+        case PD_LDP64: case PD_LDP64PRE: case PD_LDP64POST:
+        case PD_LDP32: case PD_LDP32PRE: case PD_LDP32POST: {
+            int is64 = (e->op == PD_LDP64 || e->op == PD_LDP64PRE || e->op == PD_LDP64POST);
+            int post = (e->op == PD_LDP64POST || e->op == PD_LDP32POST);
+            int wb = post || e->op == PD_LDP64PRE || e->op == PD_LDP32PRE;
+            unsigned szl = is64 ? 3 : 2, esz = is64 ? 8 : 4;
+            s64 a0 = post ? 0 : (s64)e->imm;
+            if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(e->rn), 0, 0, (u64)a0, 0);
+            else    ir_put(ir, IRO_MOV,  1, VREG_TMP2, rsp(e->rn), 0, 0, 0, 0);
+            put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, is64, pc);
+            put_ld_tmp(ir, VREG_TMP2, (s64)esz, 1, szl, is64, pc);
+            if (e->rd != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rd, VREG_TMP0, 0, 0, 0, 0);
+            if (e->rm != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rm, VREG_TMP1, 0, 0, 0, 0);
+            if (wb) ir_put(ir, IRO_ADDI, 1, rsp(e->rn), VREG_TMP2, 0, 0,
+                           post ? e->imm : 0, 0);
             break;
         }
 
@@ -695,16 +936,53 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             break;
         }
 
-        /* ---- everything else (integer LDP, atomics, FP/SIMD arith,
-         * system): interpreter helper ---- */
+        /* ---- everything else (FP/SIMD arith, system, rare atomics):
+         * interpreter helper ---- */
         default: {
+            if (e->op == PD_GENERIC && fe_atomic(ir, insn, pc))
+                return FE_CONT;      /* inline atomic (not in ninsns) */
+            if (e->op == PD_GENERIC && fe_fpsimd(ir, insn, pc))
+                return FE_CONT;      /* inline vector/FP (counted inside) */
+            if (e->op == PD_GENERIC && (insn >> 24) == 0xD5) {
+                /* System family: hints, barriers, sysreg moves, cache ops —
+                 * none can branch (IC IVAU is intercepted before pd_fill),
+                 * and jit_exec1's return catches faults/halt anyway, so the
+                 * block keeps going. The hot TLS/barrier cases are inline. */
+                unsigned rt = insn & 31;
+                if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {   /* MRS Xt, TPIDR_EL0 */
+                    if (rt != 31)
+                        ir_put(ir, IRO_CPULD, 1, (u8)rt, VREG_ZERO, 0, 0,
+                               offsetof(CPU, tpidr), 0);     /* tpidr[0] */
+                    break;
+                }
+                if ((insn & 0xFFFFFFE0u) == 0xD53BD060u) {   /* MRS Xt, TPIDRRO_EL0 */
+                    if (rt != 31)
+                        ir_put(ir, IRO_CPULD, 1, (u8)rt, VREG_ZERO, 0, 0,
+                               offsetof(CPU, tpidrro_el0), 0);
+                    break;
+                }
+                if ((insn & 0xFFFFFFE0u) == 0xD51BD040u) {   /* MSR TPIDR_EL0, Xt */
+                    ir_put(ir, IRO_CPUST, 1, VREG_ZERO, rx(rt), 0, 0,
+                           offsetof(CPU, tpidr), 0);
+                    break;
+                }
+                if ((insn & 0xFFFFF0FFu) == 0xD50330BFu ||   /* DMB */
+                    (insn & 0xFFFFF0FFu) == 0xD503309Fu) {   /* DSB */
+                    ir_put(ir, IRO_FENCE, 0, VREG_ZERO, VREG_ZERO, 0, 0, 0, 0);
+                    break;
+                }
+                if ((insn & 0xFFFFF0FFu) == 0xD50330DFu)     /* ISB */
+                    break;              /* context sync: nothing to do here */
+                put_call1(ir, pc, insn);
+                return FE_CONT;
+            }
             put_call1(ir, pc, insn);         /* jit_exec1 counts this insn */
             if (e->op == PD_GENERIC) {
                 unsigned grp = (insn >> 25) & 0xf;
                 if (grp == 0xa || grp == 0xb) {
-                    /* branch/system group: possible control transfer (or
-                     * SVC/BRK/barrier); end the block, fall through to the
-                     * sequential successor when the helper didn't branch. */
+                    /* branch/exception group: possible control transfer;
+                     * end the block, fall through to the sequential
+                     * successor when the helper didn't branch. */
                     ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
                     return FE_END;
                 }
@@ -725,6 +1003,8 @@ static int op_reads_flags(const IROp *o) {
         case IRO_BCOND:
         case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
             return 1;
+        case IRO_VOP:
+            return (o->aux & VF_READF) != 0;     /* FCSEL */
         default:
             return 0;
     }
@@ -737,6 +1017,8 @@ static int op_writes_flags(const IROp *o) {
         case IRO_ADCS: case IRO_SBCS:
         case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
             return 1;
+        case IRO_VOP:
+            return (o->aux & VF_SETF) != 0;      /* FCMP */
         default:
             return 0;
     }
@@ -791,7 +1073,7 @@ static void fe_liveness(IRBlock *ir) {
                         case IRO_UMULH: case IRO_UDIV: case IRO_SDIV:
                         case IRO_CSEL: case IRO_CSINC: case IRO_CSINV:
                         case IRO_CSNEG: case IRO_CCMPR: case IRO_CCMNR:
-                        case IRO_ST:
+                        case IRO_ST: case IRO_ATOMIC:
                             live |= 1ULL << o->b;
                             break;
                         default:
@@ -800,7 +1082,8 @@ static void fe_liveness(IRBlock *ir) {
                 }
                 if ((o->op == IRO_MADD || o->op == IRO_MSUB ||
                      o->op == IRO_SMADDL || o->op == IRO_SMSUBL ||
-                     o->op == IRO_UMADDL || o->op == IRO_UMSUBL) &&
+                     o->op == IRO_UMADDL || o->op == IRO_UMSUBL ||
+                     o->op == IRO_ATOMIC) &&
                     o->cc < VREG_N && o->cc != VREG_ZERO)
                     live |= 1ULL << o->cc;
                 break;

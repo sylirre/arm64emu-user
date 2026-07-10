@@ -31,7 +31,7 @@ __thread FetchCache g_fcache;
  * PTE mutation; a lookup that sees a generation other than the one its TLB
  * reflects empties the TLB first, so one thread's munmap/mprotect invalidates
  * every thread's cached translations at their next access. */
-#define DTLB_BITS 8                        /* 256 entries x 16 B = 4 KB/thread */
+#define DTLB_BITS 10                       /* 1024 entries x 16 B = 16 KB/thread */
 #define DTLB_SIZE (1u << DTLB_BITS)
 typedef struct { u64 page; uintptr_t pte; } DTlbEntry;
 static __thread DTlbEntry g_dtlb[DTLB_SIZE];
@@ -52,7 +52,9 @@ void tlb_flush_all(void) {
 
 /* ---- JIT D-TLB seam (see mmu.h) ---- */
 _Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
+#if defined(__x86_64__) || defined(__aarch64__)   /* hosts with a backend */
 _Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
+#endif
 void *jit_dtlb_base(void) { return g_dtlb; }
 void jit_dtlb_reset(void) {
     /* The interpreter empties lazily on a generation mismatch; the JIT's

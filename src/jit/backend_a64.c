@@ -67,6 +67,11 @@ static u8 *bcond_fwd(Emit *e, unsigned cond) {
     ei(e, 0x54000000u | cond);
     return p;
 }
+static u8 *tbz_fwd(Emit *e, unsigned rt, unsigned bit) {   /* bit < 32 */
+    u8 *p = e->rw;
+    ei(e, 0x36000000u | (bit << 19) | rt);
+    return p;
+}
 static void fwd_here(Emit *e, u8 *p) {
     if (!p || e->overflow) return;
     u32 insn;
@@ -74,6 +79,8 @@ static void fwd_here(Emit *e, u8 *p) {
     s64 off = (e->rw - p) >> 2;
     if ((insn & 0x7C000000u) == 0x14000000u)        /* B */
         insn |= ((u32)off & 0x03FFFFFFu);
+    else if ((insn & 0x7E000000u) == 0x36000000u)   /* TBZ/TBNZ: imm14 */
+        insn |= (((u32)off & 0x3FFFu) << 5);
     else if ((insn & 0x7E000000u) == 0x34000000u)   /* CBZ/CBNZ */
         insn |= (((u32)off & 0x7FFFFu) << 5);
     else                                            /* B.cond */
@@ -230,13 +237,20 @@ static void invalidate_all(BE *be) {
         if (be->v2h[v] >= 0) ra_unmap(be, v);
 }
 
-/* Caller-saved host regs (x9-x15 in our pool) don't survive a C call; drop
- * their (clean, post sync_all) mappings around a memory-op slow path. The
+/* Caller-saved pool regs (x9-x15) don't survive a C call. A memory-op slow
+ * path stores every dirty mapped vreg before its call (dirty bits kept: the
+ * fast path never ran those stores) and reloads the caller-saved-mapped ones
+ * after, so both paths converge on the same allocator state. The
  * callee-saved half (x19-x26) stays resident. */
 static int is_caller_saved(int h) { return h >= 9 && h <= 15; }
-static void drop_caller_saved(BE *be) {
+static void slow_store_dirty(BE *be) {
     for (int v = 0; v < VREG_N; v++)
-        if (be->v2h[v] >= 0 && is_caller_saved(be->v2h[v])) ra_unmap(be, v);
+        if (be->v2h[v] >= 0 && be->dirty[v]) v_store(be, v);
+}
+static void slow_reload_clobbered(BE *be) {
+    for (int v = 0; v < VREG_N; v++)
+        if (be->v2h[v] >= 0 && is_caller_saved(be->v2h[v]))
+            v_load_into(be, v, be->v2h[v]);
 }
 
 /* ---- flags ---- */
@@ -385,11 +399,21 @@ static u32 enc_sbfm(int sf, unsigned rd, unsigned rn, unsigned immr, unsigned im
 static u32 enc_bic(unsigned rd, unsigned rn, unsigned rm) {   /* Xn & ~Xm */
     return 0x8A200000u | (rm << 16) | (rn << 5) | rd;
 }
+/* AND Xd, Xn, #imm (64-bit logical immediate, caller supplies immr/imms:
+ * mask = ROR(ones(imms+1), immr) with N=1). */
+static u32 enc_andi64(unsigned rd, unsigned rn, unsigned immr, unsigned imms) {
+    return 0x92400000u | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+}
+/* size-log load/store, register offset: [Xn, Xm] (option=LSL #0). */
+static u32 enc_ldstr(unsigned szl, int load, unsigned rt, unsigned rn,
+                     unsigned rm) {
+    return ((u32)szl << 30) | (load ? 0x38606800u : 0x38206800u) |
+           (rm << 16) | (rn << 5) | rt;
+}
 static u32 enc_addr(unsigned rd, unsigned rn, unsigned rm) {  /* add Xd,Xn,Xm */
     return 0x8B000000u | (rm << 16) | (rn << 5) | rd;
 }
 static u32 enc_cmp(unsigned rn, unsigned rm) { return 0xEB000000u | (rm << 16) | (rn << 5) | 31; }
-static u32 enc_tst(unsigned rn, unsigned rm) { return 0xEA000000u | (rm << 16) | (rn << 5) | 31; }
 /* add/sub Xd,Xn,#imm12 (optionally <<12). Returns 0 if not encodable. */
 static int enc_addsub_imm(Emit *e, int sub, unsigned rd, unsigned rn, u64 imm) {
     u32 base = sub ? 0xD1000000u : 0x91000000u;
@@ -398,74 +422,83 @@ static int enc_addsub_imm(Emit *e, int sub, unsigned rd, unsigned rn, u64 imm) {
     return 0;
 }
 
-/* Inline memory op (mirrors backend_x86_64.c): sync state, probe the D-TLB,
- * fast host access via x17, or an out-of-line helper. Operands read from /
- * results written to the CPU struct, so no host register crosses the op. */
+/* Inline memory op (mirrors backend_x86_64.c). Fast path = probe + access
+ * only: operands and results live in allocated host registers and no guest
+ * state is written. The slow branch carries the whole cost: it stores every
+ * dirty mapped vreg (keeping the dirty bits — the fast path never ran those
+ * stores), calls the helper, and reloads the caller-saved-mapped vregs so
+ * both paths converge on the allocator state emission continues with. Loads
+ * converge with the extended value in x16; one post-merge ra_def commits it. */
 static void emit_mem(BE *be, const IRBlock *ir, int i) {
     Emit *e = be->e;
     const IROp *o = &ir->ops[i];
     int is_st = (o->op == IRO_ST || o->op == IRO_STV);
     int is_v  = (o->op == IRO_LDV || o->op == IRO_STV);
     unsigned desc = o->aux;
-    unsigned rt = MDESC_RT(desc);
     unsigned szl = is_v ? MDESC_VSZL(desc) : (unsigned)o->cc;
     unsigned sz = 1u << szl;
     int need = is_st ? 2 : 1;
 
-    sync_all(be);
-    materialize_flags(be);
-    drop_caller_saved(be);
+    materialize_flags(be);                        /* the probe needs NZCV */
+    int hb = -1;
+    if (o->op == IRO_ST) hb = ra_use(be, o->b);   /* store operand */
+    int ha = ra_use(be, o->a);                    /* base */
 
-    ld_home(be, 1, o->a);                         /* va -> x1 */
-    if (o->imm) {
+    /* va = base + offset -> x1 (scratch; also the slow call's arg1) */
+    if (o->imm == 0) {
+        ei(e, enc_mov(1, 1, (unsigned)ha));
+    } else {
         s64 off = (s64)o->imm;
         u64 mag = off < 0 ? (u64)(-off) : (u64)off;
-        if (!enc_addsub_imm(e, off < 0, 1, 1, mag)) {
+        if (!enc_addsub_imm(e, off < 0, 1, (unsigned)ha, mag)) {
             emit_imm64(e, 16, (u64)off);
-            ei(e, enc_addr(1, 1, 16));
+            ei(e, enc_addr(1, (unsigned)ha, 16));
         }
     }
-    ei(e, enc_ubfm(1, 16, 1, 12, 63));            /* lsr x16, x1, #12 (page) */
-    ei(e, enc_ubfm(1, 17, 16, 0, 7));             /* ubfx x17, x16, #0, #8 */
-    ei(e, enc_ubfm(1, 17, 17, (64 - 4) & 63, 63 - 4));   /* lsl x17, x17, #4 */
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = b_fwd(e);                         /* bisection: helper always */
+        goto fast;
+    }
+    /* The tag compare uses the LAST byte's page while the index (and the
+     * stored tag) come from the first byte's: a page-crossing access
+     * mismatches and falls to the slow helper — no separate cross gate.
+     * (TBI-tagged VAs mismatch the stripped stored tag the same way.) */
+    if (sz > 1) {
+        enc_addsub_imm(e, 0, 16, 1, sz - 1);      /* x16 = va + sz-1 */
+        ei(e, enc_ubfm(1, 16, 16, 12, 63));       /* lsr x16, x16, #12 */
+    } else {
+        ei(e, enc_ubfm(1, 16, 1, 12, 63));        /* lsr x16, x1, #12 */
+    }
+    ei(e, enc_ubfm(1, 17, 1, 8, 63));             /* lsr x17, x1, #8 */
+    ei(e, enc_andi64(17, 17,                      /* and x17,x17,#(idxmask<<4):
+                                                   * ROR(ones(idxbits), 60) */
+                     (64 - 4) & 63,
+                     (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
     ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
-    ei(e, enc_addr(17, 2, 17));                   /* x17 = dtlb + idx*16 */
+    ei(e, enc_addr(17, 2, 17));                   /* x17 = &dtlb[idx] */
     ei(e, enc_ldr(3, 2, 17, 0));                  /* tag = ent->page */
     ei(e, enc_cmp(2, 16));
-    u8 *slow1 = bcond_fwd(e, 1);                  /* b.ne slow */
+    slow1 = bcond_fwd(e, 1);                      /* b.ne slow */
     ei(e, enc_ldr(3, 2, 17, 8));                  /* pte -> x2 */
-    ei(e, enc_movz(1, 16, (unsigned)need, 0));
-    ei(e, enc_tst(2, 16));
-    u8 *slow2 = bcond_fwd(e, 0);                  /* b.eq slow (perm fail) */
-    u8 *slow3 = NULL;
-    if (sz > 1) {                                 /* page-cross gate */
-        ei(e, enc_ubfm(1, 16, 1, 0, 11));         /* x16 = va & 0xfff */
-        enc_addsub_imm(e, 0, 16, 16, sz);
-        emit_imm64(e, 17, 0x1000);                /* x17 clobbered; recomputed below */
-        ei(e, enc_cmp(16, 17));
-        slow3 = bcond_fwd(e, 8);                  /* b.hi slow */
-    }
-    ei(e, enc_movz(1, 16, 7, 0));
-    ei(e, enc_bic(2, 2, 16));                     /* x2 = pte & ~7 (host base) */
-    ei(e, enc_ubfm(1, 16, 1, 0, 11));             /* x16 = va & 0xfff */
-    ei(e, enc_addr(17, 2, 16));                   /* x17 = host ptr */
+    slow2 = tbz_fwd(e, 2, need == 2 ? 1 : 0);     /* perm bit clear -> slow */
+    ei(e, enc_andi64(2, 2, 61, 60));              /* and x2, x2, #~7 (host) */
+    ei(e, enc_andi64(16, 1, 0, 11));              /* and x16, x1, #0xfff */
 
-    /* ---- fast access (ptr = x17, data scratch = x16) ---- */
+fast:
+    /* ---- fast access (base = x2, page offset = x16; loads -> x16) ---- */
     if (!is_v) {
         if (is_st) {
-            ld_home(be, 16, o->b);
-            ei(e, enc_ldst0(szl, 0, 16, 17));
+            ei(e, enc_ldstr(szl, 0, (unsigned)hb, 2, 16));
         } else {
             int sign = MDESC_SIGN(desc), is64 = MDESC_IS64(desc);
-            ei(e, enc_ldst0(szl, 1, 16, 17));     /* zero-extended */
+            ei(e, enc_ldstr(szl, 1, 16, 2, 16));  /* zero-extended */
             if (sign) ei(e, enc_sbfm(is64, 16, 16, 0, sz * 8 - 1));
-            if (rt != 31) {
-                ei(e, enc_str(3, 16, 28, (unsigned)OFF_X(rt)));
-                ra_unmap(be, (int)rt);
-            }
         }
     } else {
-        unsigned vd = rt, gs = szl > 3 ? 3 : szl;
+        unsigned vd = MDESC_RT(desc), gs = szl > 3 ? 3 : szl;
+        ei(e, enc_addr(17, 2, 16));               /* x17 = host ptr */
         if (is_st) {
             ei(e, enc_ldr(3, 16, 28, (unsigned)OFF_V(vd)));
             ei(e, enc_ldst0(gs, 0, 16, 17));
@@ -488,18 +521,20 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     u8 *done = b_fwd(e);
 
     /* ---- slow path ---- */
+    fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
-    if (slow3) fwd_here(e, slow3);
-    ei(e, enc_mov(1, 0, 28));                     /* x0 = CPU* ; x1 = va */
+    slow_store_dirty(be);                         /* dirty bits kept: above */
     unsigned hoff;
     if (o->op == IRO_ST) {
-        ld_home(be, 2, o->b);                     /* x2 = value */
+        ei(e, enc_mov(1, 2, (unsigned)hb));       /* x2 = value (hb: pool) */
+        ei(e, enc_mov(1, 0, 28));                 /* x0 = CPU* ; x1 = va */
         emit_imm64(e, 3, o->imm2pc);
         ei(e, enc_movz(0, 4, desc & 0xffff, 0));
         if (desc >> 16) ei(e, enc_movk(0, 4, desc >> 16, 1));
         hoff = (unsigned)offsetof(JitEnv, helper_st);
     } else {
+        ei(e, enc_mov(1, 0, 28));                 /* x0 = CPU* ; x1 = va */
         emit_imm64(e, 2, o->imm2pc);
         ei(e, enc_movz(0, 3, desc & 0xffff, 0));
         if (desc >> 16) ei(e, enc_movk(0, 3, desc >> 16, 1));
@@ -510,9 +545,368 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     ei(e, enc_ldr(3, 16, 27, hoff));
     ei(e, enc_blr(16));
     u8 *ok = cbz_fwd(e, 0, 0);                    /* cbz w0, ok (no fault) */
+    exit_plain(be, o->icnt);                      /* all dirty state stored */
+    fwd_here(e, ok);
+    slow_reload_clobbered(be);                    /* helper ate x9-x15 */
+    if (o->op == IRO_LD && o->dst != VREG_ZERO)
+        ld_home(be, 16, o->dst);                  /* helper committed to home */
+    fwd_here(e, done);
+
+    /* ---- merge: commit a load to its register ---- */
+    if (o->op == IRO_LD && o->dst != VREG_ZERO) {
+        int hd = ra_def(be, o->dst);
+        ei(e, enc_mov(1, (unsigned)hd, 16));
+    }
+    be->fl = FL_MEM;
+}
+
+/* ---- inline vector / scalar FP (IRO_VOP; exec_fpsimd.c is the reference).
+ * Same-ISA host: whitelisted classes re-emit the guest word itself with the
+ * vector register fields renumbered onto host v0-v2 (loaded from / stored
+ * back to c->v[]), so semantics are the guest's by construction. GPR-linked
+ * forms substitute x16 into the Rn/Rd field. ---- */
+
+int be_vop_ok(unsigned vclass, u32 insn) {
+    (void)insn;
+    switch (vclass) {
+        case VC_BITW: case VC_ADDSUB: case VC_CM3: case VC_SHIFTI:
+        case VC_MOVI: case VC_COPY: case VC_F2: case VC_F1:
+        case VC_FCMP: case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static u32 enc_ldq(unsigned qt, unsigned rn, unsigned off) {   /* LDR Qt */
+    return 0x3DC00000u | ((off / 16) << 10) | (rn << 5) | qt;
+}
+static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
+    return 0x3D800000u | ((off / 16) << 10) | (rn << 5) | qt;
+}
+
+static void emit_vop(BE *be, const IROp *o) {
+    Emit *e = be->e;
+    u32 insn = (u32)o->imm;
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+    unsigned vclass = VC(o->aux);
+
+    switch (vclass) {
+        case VC_MOVI: {                          /* pre-expanded pattern */
+            unsigned vd = VMOVI_RD(o->aux), q = VMOVI_Q(o->aux);
+            unsigned kind = VMOVI_KIND(o->aux);
+            emit_imm64(e, 16, o->imm);
+            if (kind == 0) {                     /* plain write */
+                ei(e, enc_str(3, 16, 28, (unsigned)OFF_V(vd)));
+                if (q) ei(e, enc_str(3, 16, 28, (unsigned)OFF_V(vd) + 8));
+                else { ei(e, enc_movz(1, 17, 0, 0));
+                       ei(e, enc_str(3, 17, 28, (unsigned)OFF_V(vd) + 8)); }
+            } else {                             /* ORR (1) / BIC (2) */
+                ei(e, enc_ldr(3, 17, 28, (unsigned)OFF_V(vd)));
+                ei(e, kind == 2 ? enc_bic(17, 17, 16) : enc_orr(1, 17, 17, 16));
+                ei(e, enc_str(3, 17, 28, (unsigned)OFF_V(vd)));
+                if (q) {
+                    ei(e, enc_ldr(3, 17, 28, (unsigned)OFF_V(vd) + 8));
+                    ei(e, kind == 2 ? enc_bic(17, 17, 16)
+                                    : enc_orr(1, 17, 17, 16));
+                    ei(e, enc_str(3, 17, 28, (unsigned)OFF_V(vd) + 8));
+                } else {
+                    ei(e, enc_movz(1, 17, 0, 0));
+                    ei(e, enc_str(3, 17, 28, (unsigned)OFF_V(vd) + 8));
+                }
+            }
+            break;
+        }
+        case VC_FMOVI: {                         /* scalar FMOV #imm */
+            unsigned vd = (o->aux >> 8) & 31;
+            emit_imm64(e, 16, o->imm);
+            ei(e, enc_str(3, 16, 28, (unsigned)OFF_V(vd)));
+            ei(e, enc_movz(1, 17, 0, 0));
+            ei(e, enc_str(3, 17, 28, (unsigned)OFF_V(vd) + 8));
+            break;
+        }
+        case VC_FMOVG: {                         /* gpr <-> fpr bit moves */
+            unsigned sf = insn >> 31;
+            unsigned opcode = (insn >> 16) & 7;
+            int top = (sf == 1 && ((insn >> 22) & 3) == 2 &&
+                       ((insn >> 19) & 3) == 1);
+            if (opcode == 6) {                   /* to gpr */
+                if (o->dst == VREG_ZERO) break;
+                if (top)      ei(e, enc_ldr(3, 16, 28, (unsigned)OFF_V(rn) + 8));
+                else if (sf)  ei(e, enc_ldr(3, 16, 28, (unsigned)OFF_V(rn)));
+                else          ei(e, enc_ldr(2, 16, 28, (unsigned)OFF_V(rn)));
+                int hd = ra_def(be, o->dst);
+                ei(e, enc_mov(1, (unsigned)hd, 16));
+            } else {                             /* from gpr */
+                int hsrc = ra_use(be, o->a);
+                if (top) {
+                    ei(e, enc_str(3, (unsigned)hsrc, 28, (unsigned)OFF_V(rd) + 8));
+                } else {
+                    if (sf) ei(e, enc_str(3, (unsigned)hsrc, 28, (unsigned)OFF_V(rd)));
+                    else {
+                        ei(e, enc_mov(0, 16, (unsigned)hsrc));   /* zext32 */
+                        ei(e, enc_str(3, 16, 28, (unsigned)OFF_V(rd)));
+                    }
+                    ei(e, enc_movz(1, 16, 0, 0));
+                    ei(e, enc_str(3, 16, 28, (unsigned)OFF_V(rd) + 8));
+                }
+            }
+            break;
+        }
+        default: {
+            /* Renumber-and-replay. Vector sources -> v0 (Rn), v1 (Rm);
+             * Vd preloaded into the result reg v2 for the read-modify
+             * forms (BSL/BIT/BIF, INS). GPR-linked forms use x16. */
+            unsigned opc3 = (insn >> 11) & 0x1f;
+            int has_rm = (vclass == VC_BITW || vclass == VC_ADDSUB ||
+                          vclass == VC_CM3 || vclass == VC_F2 ||
+                          vclass == VC_FCSEL ||
+                          (vclass == VC_FCMP && !((insn >> 3) & 1)));
+            int reads_rd = (vclass == VC_BITW && ((insn >> 29) & 1) &&
+                            ((insn >> 22) & 3) != 0)     /* BSL/BIT/BIF */
+                        || (vclass == VC_COPY && ((insn >> 29) & 1))   /* INS(elem) */
+                        || (vclass == VC_COPY && ((insn >> 11) & 0xf) == 3
+                            && !((insn >> 29) & 1));     /* INS(general) */
+            int gpr_src = (vclass == VC_COPY &&
+                           !((insn >> 29) & 1) &&
+                           (((insn >> 11) & 0xf) == 1 ||   /* DUP (general) */
+                            ((insn >> 11) & 0xf) == 3));   /* INS (general) */
+            int gpr_dst = (vclass == VC_COPY &&
+                           !((insn >> 29) & 1) &&
+                           (((insn >> 11) & 0xf) == 5 ||   /* SMOV */
+                            ((insn >> 11) & 0xf) == 7));   /* UMOV */
+            (void)opc3;
+
+            if (vclass == VC_FCSEL) flags_to_host(be);
+            if (vclass == VC_FCMP) materialize_flags(be);   /* fcmp clobbers */
+            u32 w = insn & ~0x1Fu;               /* clear Rd */
+            if (gpr_dst) {
+                if (o->dst == VREG_ZERO) break;
+                ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
+                w = (w & ~(0x1Fu << 5)) | (0u << 5) | 16;    /* Rn=v0, Rd=x16 */
+                ei(e, w);
+                int hd = ra_def(be, o->dst);
+                ei(e, enc_mov(1, (unsigned)hd, 16));
+                break;
+            }
+            if (gpr_src) {
+                int hsrc = ra_use(be, o->a);
+                ei(e, enc_mov(1, 16, (unsigned)hsrc));
+                w = (w & ~(0x1Fu << 5)) | (16u << 5) | 2;    /* Rn=x16, Rd=v2 */
+                if (reads_rd)                    /* INS (general) */
+                    ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+                ei(e, w);
+                ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+                break;
+            }
+            /* vector-only (or FCMP, which writes NZCV instead of Vd) */
+            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
+            if (has_rm) ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
+            if (reads_rd) ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+            w = (w & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5) | 2;
+            if (has_rm) w |= 1u << 16;
+            else        w |= (insn & (0x1Fu << 16));   /* keep imm fields */
+            if (vclass == VC_SHIFTI)             /* bits 22:16 are immh:immb */
+                w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            if (vclass == VC_FCMP) {
+                w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5);
+                if (!((insn >> 3) & 1)) w |= 1u << 16;   /* Rm=v1 */
+                ei(e, w);                        /* host NZCV = result */
+                ei(e, 0xD53B4200u | 16);         /* mrs x16, nzcv */
+                ei(e, enc_str(2, 16, 28, (unsigned)OFF_NZCV));
+                be->fl = FL_MEM;
+                break;
+            }
+            ei(e, w);
+            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+            break;
+        }
+    }
+}
+
+/* ---- inline atomics (IRO_ATOMIC; decode.c ldst_exclusive/ldst_atomic are
+ * the reference) ---- */
+
+static void cbnz_to(Emit *e, int w, unsigned rt, const u8 *target) {
+    s64 off = target - e->rx;
+    ei(e, ((u32)w << 31) | 0x35000000u |
+          ((((u32)(off >> 2)) & 0x7FFFFu) << 5) | rt);
+}
+/* exclusives/ordered encodings, size-suffixed, [Xn] addressing */
+static u32 enc_ldaxr(unsigned szl, unsigned rt, unsigned rn) {
+    return ((u32)szl << 30) | 0x085FFC00u | (rn << 5) | rt;
+}
+static u32 enc_stlxr(unsigned szl, unsigned rs, unsigned rt, unsigned rn) {
+    return ((u32)szl << 30) | 0x0800FC00u | (rs << 16) | (rn << 5) | rt;
+}
+static u32 enc_ldar(unsigned szl, unsigned rt, unsigned rn) {
+    return ((u32)szl << 30) | 0x08DFFC00u | (rn << 5) | rt;
+}
+static u32 enc_stlr(unsigned szl, unsigned rt, unsigned rn) {
+    return ((u32)szl << 30) | 0x089FFC00u | (rn << 5) | rt;
+}
+static u32 enc_eor(unsigned rd, unsigned rn, unsigned rm) {   /* 64-bit */
+    return 0xCA000000u | (rm << 16) | (rn << 5) | rd;
+}
+static u32 enc_ldrb_off(unsigned rt, unsigned rn, unsigned off) {
+    return 0x39400000u | (off << 10) | (rn << 5) | rt;
+}
+static u32 enc_strb_off(unsigned rt, unsigned rn, unsigned off) {
+    return 0x39000000u | (off << 10) | (rn << 5) | rt;
+}
+
+#define OFF_EXCL_VALID ((unsigned)offsetof(CPU, excl_valid))
+#define OFF_EXCL_ADDR  ((unsigned)offsetof(CPU, excl_addr))
+#define OFF_EXCL_SIZE  ((unsigned)offsetof(CPU, excl_size))
+#define OFF_EXCL_VAL   ((unsigned)offsetof(CPU, excl_val))
+
+/* One IRO_ATOMIC (mirrors backend_x86_64.c). Fast path: align gate + probe
+ * + ldaxr/stlxr sequence; result converges in x16. Slow path re-runs the
+ * insn via jit_exec1 (self-counting; the fast path bumps icount inline). */
+static void emit_atomic(BE *be, const IRBlock *ir, int i) {
+    Emit *e = be->e;
+    const IROp *o = &ir->ops[i];
+    unsigned kind = AT_KIND(o->aux), szl = AT_SZL(o->aux);
+    unsigned sz = 1u << szl;
+    int is_load_kind = (kind == AT_LDX || kind == AT_LDAR);
+    int need = is_load_kind ? 1 : 2;
+    int uses_b = !(kind == AT_LDX || kind == AT_LDAR);
+
+    materialize_flags(be);
+    int hb = uses_b ? ra_use(be, o->b) : -1;
+    int hs = (kind == AT_CAS) ? ra_use(be, o->cc) : -1;
+    int ha = ra_use(be, o->a);
+    ei(e, enc_mov(1, 1, (unsigned)ha));           /* x1 = va */
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL, *slow3 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = b_fwd(e);
+    } else {
+        if (sz > 1) {                             /* alignment gate */
+            ei(e, enc_andi64(16, 1, 0, szl - 1)); /* and x16, x1, #sz-1 */
+            slow1 = cbnz_fwd(e, 1, 16);
+        }
+        ei(e, enc_ubfm(1, 16, 1, 12, 63));        /* page (aligned: no cross) */
+        ei(e, enc_ubfm(1, 17, 1, 8, 63));
+        ei(e, enc_andi64(17, 17, (64 - 4) & 63,
+                         (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
+        ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
+        ei(e, enc_addr(17, 2, 17));
+        ei(e, enc_ldr(3, 2, 17, 0));
+        ei(e, enc_cmp(2, 16));
+        slow2 = bcond_fwd(e, 1);                  /* b.ne slow */
+        ei(e, enc_ldr(3, 2, 17, 8));
+        slow3 = tbz_fwd(e, 2, need == 2 ? 1 : 0);
+        ei(e, enc_andi64(2, 2, 61, 60));          /* host base */
+        ei(e, enc_andi64(16, 1, 0, 11));          /* page offset */
+        ei(e, enc_addr(17, 2, 16));               /* x17 = host ptr */
+    }
+
+    icount_add(be, 1);                            /* retires from here (x16) */
+
+    switch (kind) {
+        case AT_LDX:
+            ei(e, enc_ldst0(szl, 1, 16, 17));     /* zero-extended load */
+            ei(e, enc_str(3, 1, 28, OFF_EXCL_ADDR));
+            ei(e, enc_movz(1, 2, sz, 0));
+            ei(e, enc_str(3, 2, 28, OFF_EXCL_SIZE));
+            ei(e, enc_str(3, 16, 28, OFF_EXCL_VAL));
+            ei(e, enc_movz(0, 2, 1, 0));
+            ei(e, enc_strb_off(2, 28, OFF_EXCL_VALID));
+            if (AT_ACQ(o->aux)) ei(e, 0xD50339BFu);   /* dmb ishld */
+            break;
+        case AT_STX: {
+            ei(e, enc_ldrb_off(16, 28, OFF_EXCL_VALID));
+            u8 *f1 = cbz_fwd(e, 0, 16);
+            ei(e, enc_ldr(3, 16, 28, OFF_EXCL_ADDR));
+            ei(e, enc_eor(16, 16, 1));
+            u8 *f2 = cbnz_fwd(e, 1, 16);
+            ei(e, enc_ldr(3, 16, 28, OFF_EXCL_SIZE));
+            ei(e, 0xF100001Fu | ((u32)sz << 10) | (16u << 5));  /* cmp x16,#sz */
+            u8 *f3 = bcond_fwd(e, 1);             /* b.ne fail */
+            ei(e, enc_ldr(3, 2, 28, OFF_EXCL_VAL));   /* expected */
+            const u8 *loop = e->rx;
+            ei(e, enc_ldaxr(szl, 16, 17));
+            ei(e, enc_cmp(16, 2));
+            u8 *f4 = bcond_fwd(e, 1);             /* memory changed: fail */
+            ei(e, enc_stlxr(szl, 16, (unsigned)hb, 17));
+            cbnz_to(e, 0, 16, loop);
+            ei(e, enc_movz(1, 16, 0, 0));         /* success: status 0 */
+            u8 *join = b_fwd(e);
+            fwd_here(e, f1); fwd_here(e, f2); fwd_here(e, f3); fwd_here(e, f4);
+            ei(e, enc_movz(1, 16, 1, 0));         /* status 1 */
+            fwd_here(e, join);
+            ei(e, enc_strb_off(31, 28, OFF_EXCL_VALID));   /* strb wzr */
+            break;
+        }
+        case AT_LDAR:
+            ei(e, enc_ldar(szl, 16, 17));
+            break;
+        case AT_STLR:
+            ei(e, enc_stlr(szl, (unsigned)hb, 17));
+            break;
+        case AT_SWP: {
+            const u8 *loop = e->rx;
+            ei(e, enc_ldaxr(szl, 16, 17));
+            ei(e, enc_stlxr(szl, 2, (unsigned)hb, 17));
+            cbnz_to(e, 0, 2, loop);
+            break;
+        }
+        case AT_LDADD: case AT_LDCLR: case AT_LDEOR: case AT_LDSET: {
+            const u8 *loop = e->rx;
+            ei(e, enc_ldaxr(szl, 16, 17));
+            switch (kind) {
+                case AT_LDADD: ei(e, enc_addr(2, 16, (unsigned)hb)); break;
+                case AT_LDCLR: ei(e, enc_bic(2, 16, (unsigned)hb)); break;
+                case AT_LDEOR: ei(e, enc_eor(2, 16, (unsigned)hb)); break;
+                default:       ei(e, enc_orr(1, 2, 16, (unsigned)hb)); break;
+            }
+            ei(e, enc_stlxr(szl, 1, 2, 17));      /* status in w1 (va dead) */
+            cbnz_to(e, 0, 1, loop);
+            break;
+        }
+        case AT_CAS: {
+            unsigned hexp = (unsigned)hs;
+            if (szl < 3) {                        /* compare truncated */
+                ei(e, enc_andi64(2, (unsigned)hs, 0, sz * 8 - 1));
+                hexp = 2;
+            }
+            const u8 *loop = e->rx;
+            ei(e, enc_ldaxr(szl, 16, 17));
+            ei(e, enc_cmp(16, hexp));
+            u8 *out = bcond_fwd(e, 1);            /* b.ne: no store */
+            ei(e, enc_stlxr(szl, 1, (unsigned)hb, 17));
+            cbnz_to(e, 0, 1, loop);
+            fwd_here(e, out);
+            break;
+        }
+    }
+    u8 *done = b_fwd(e);
+
+    /* ---- slow path: re-run the insn in the interpreter ---- */
+    fwd_here(e, slow0);
+    fwd_here(e, slow1);
+    fwd_here(e, slow2);
+    fwd_here(e, slow3);
+    slow_store_dirty(be);
+    ei(e, enc_mov(1, 0, 28));                     /* jit_exec1(c, pc, insn) */
+    emit_imm64(e, 1, o->imm2pc);
+    ei(e, enc_movz(0, 2, (u32)o->imm & 0xffff, 0));
+    ei(e, enc_movk(0, 2, ((u32)o->imm >> 16) & 0xffff, 1));
+    ei(e, enc_ldr(3, 16, 27, (unsigned)offsetof(JitEnv, helper_exec1)));
+    ei(e, enc_blr(16));
+    u8 *ok = cbz_fwd(e, 0, 0);
     exit_plain(be, o->icnt);
     fwd_here(e, ok);
+    slow_reload_clobbered(be);
+    if (o->dst != VREG_ZERO)
+        ld_home(be, 16, o->dst);
     fwd_here(e, done);
+
+    if (o->dst != VREG_ZERO) {
+        int hd = ra_def(be, o->dst);
+        ei(e, enc_mov(1, (unsigned)hd, 16));
+    }
     be->fl = FL_MEM;
 }
 
@@ -889,8 +1283,28 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
         case IRO_LD: case IRO_ST: case IRO_LDV: case IRO_STV:
             emit_mem(be, ir, i);
             break;
+        case IRO_ATOMIC:
+            emit_atomic(be, ir, i);
+            break;
+        case IRO_VOP:
+            emit_vop(be, o);
+            break;
         case IRO_CALL1:
             emit_call1(be, o);
+            break;
+
+        case IRO_CPULD: {                        /* dst = *(u64*)(CPU+imm) */
+            int hd = ra_def(be, o->dst);
+            ei(e, enc_ldr(3, (unsigned)hd, 28, (unsigned)o->imm));
+            break;
+        }
+        case IRO_CPUST: {
+            int ha = ra_use(be, o->a);
+            ei(e, enc_str(3, (unsigned)ha, 28, (unsigned)o->imm));
+            break;
+        }
+        case IRO_FENCE:
+            ei(e, 0xD5033BBFu);                  /* dmb ish */
             break;
 
         default:
