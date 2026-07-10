@@ -384,6 +384,12 @@ static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool 
 
 static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
     *perm_fault = false;
+    /* TBI0: data accesses ignore the VA top byte (see A64_TBI_MASK). Strip it
+     * before the range check and the walk. Instruction fetch (PTE_X) is left
+     * untouched — the PC is never tagged and the mmu.h fetch fast path compares
+     * the raw page. `va` is by value, so the caller keeps the tagged address for
+     * fault reporting (FAR retains the tag, as on hardware). */
+    if (need != PTE_X) va &= A64_TBI_MASK;
     if (UNLIKELY(va >= GUEST_TASK_SIZE)) return NULL;
     unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
     if (UNLIKELY(gen != g_dtlb_gen)) {

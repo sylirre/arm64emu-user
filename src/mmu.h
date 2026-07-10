@@ -64,6 +64,11 @@ void tlb_flush_all(void);
 #define GUEST_PAGE_SIZE 4096ULL
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - 1)
 
+/* AArch64 TBI0: on Linux, EL0 data accesses run with TCR_EL1.TBI0=1, so the top
+ * byte (VA bits [63:56]) is ignored during translation. Bionic's scudo allocator
+ * stores a tag there and dereferences the tagged pointer; the mask strips it. */
+#define A64_TBI_MASK    0x00ffffffffffffffULL
+
 /* Guest page protection (software-enforced; PTE low bits). */
 #define PTE_R 1u
 #define PTE_W 2u
