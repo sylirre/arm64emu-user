@@ -116,6 +116,35 @@ fork done rc=0" "$ALPINE" /tmp/ci_vfork
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
+# ---- guest /proc process view (self-checking; qemu also mis-reports these) ----
+# Each guest process is a separate host process (guest PID == host PID); the
+# shared PID registry lets ps/top see guest command lines and hides non-guest
+# host processes. pid 1 is host init here (the emulator runs with a large PID),
+# so it is a stable "definitely not a guest" probe.
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_procview() {   # check_procview <label> <expected> <args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS procview: $label"
+        else fail=$((fail+1)); echo "FAIL procview: $label (want '$expect' got '$got')"; fi
+    }
+    # other-PID cmdline is the guest argv, not the arm64chroot invocation.
+    check_procview "other-pid cmdline" "sleep 42" "$ALPINE" /bin/busybox sh -c \
+        'sleep 42 & p=$!; sleep 0.3; tr "\0" " " < /proc/$p/cmdline | sed "s/ $//"; kill $p'
+    # a non-guest host PID appears not to exist (direct access).
+    check_procview "hide host pid1" "hidden" "$ALPINE" /bin/busybox sh -c \
+        'cat /proc/1/comm 2>/dev/null || echo hidden'
+    # ...and is absent from the /proc listing.
+    check_procview "listing hides pid1" "no-pid1" "$ALPINE" /bin/busybox sh -c \
+        'ls /proc | grep -qx 1 && echo has-pid1 || echo no-pid1'
+    # self and guest children stay fully accessible.
+    check_procview "self comm works" "busybox" "$ALPINE" /bin/busybox sh -c \
+        'cat /proc/self/comm'
+    check_procview "guest child visible" "ok" "$ALPINE" /bin/busybox sh -c \
+        'sleep 55 & p=$!; sleep 0.3; test -r /proc/$p/comm && echo ok || echo missing; kill $p'
+fi
+
 # ---- interactive job control (needs a PTY): an external command under bash must
 # run, not get Stopped by a stray SIGTTOU during tcsetpgrp setup. ----
 if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then

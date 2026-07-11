@@ -26,12 +26,14 @@ SYSDEF(exit) {
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
      * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
     if (g_tls.tid != getpid()) { c->stop = true; return 0; }
+    proctab_unregister((s32)getpid());
     jit_stats_flush();
     _exit((int)a0);
 }
 
 SYSDEF(exit_group) {
     (void)c; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    proctab_unregister((s32)getpid());
     jit_stats_flush();
     _exit((int)a0);   /* terminates the whole process (all threads) */
 }
@@ -262,6 +264,10 @@ SYSDEF(clone) {
          * table describes host threads of the parent. */
         memset(m->gtid, 0, sizeof m->gtid);
         jit_fork_child();                 /* same discipline for the JIT state */
+        /* A plain fork does not re-run load_elf, so publish the child (with the
+         * inherited cmdline and its own fresh starttime) or it would be invisible
+         * in the hidden /proc view until it execve'd. */
+        proctab_register((s32)getpid(), m->cmdline, m->cmdline_len);
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);

@@ -127,6 +127,22 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         return 0;   /* everything else: rootfs/dev (usually ENOENT) */
     }
     if (!strncmp(canon, "/proc", 5) && (canon[5] == 0 || canon[5] == '/')) {
+        /* Hidden-process view: a numeric /proc/<pid> that is not a guest PID
+         * appears not to exist — fall through to rootfs prefixing (ENOENT).
+         * Guest PIDs and every non-numeric name (self, sys, net, version, …)
+         * pass through to the host as before. This one choke point covers
+         * open/stat/readlink/execve and the *at forms. */
+        if (canon[5] == '/' && canon[6] >= '0' && canon[6] <= '9') {
+            long pid = 0;
+            int numeric = 1;
+            for (const char *p = canon + 6; *p && *p != '/'; p++) {
+                if (*p < '0' || *p > '9') { numeric = 0; break; }
+                pid = pid * 10 + (*p - '0');
+                if (pid > 0x7fffffff) { numeric = 0; break; }
+            }
+            if (numeric && pid != (long)getpid() && !proctab_has((s32)pid))
+                return 0;
+        }
         strcpy(host_out, canon);   /* host /proc passthrough */
         return 1;
     }

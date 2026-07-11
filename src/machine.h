@@ -188,4 +188,16 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
  * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path);
 
+/* proctab.c: cross-process guest-PID registry in shared memory. Each guest
+ * process publishes its NUL-joined argv keyed by PID; readers synthesize
+ * /proc/<pid>/cmdline and recognize which numeric /proc entries are guest PIDs
+ * (hiding host processes from the guest's view). */
+#define PROCTAB_MAX      4096    /* max concurrent guest processes in the view */
+#define PROCTAB_CMDLINE  2048    /* per-entry cmdline cap (truncated beyond) */
+void proctab_init(void);                                   /* once, in main() */
+void proctab_register(s32 pid, const char *cmd, u32 len);  /* exec / fork */
+void proctab_unregister(s32 pid);                          /* exit */
+int  proctab_has(s32 pid);                                 /* is a guest PID? */
+int  proctab_cmdline(s32 pid, char *out, u32 *len);        /* guest cmdline */
+
 #endif /* A64_MACHINE_H */

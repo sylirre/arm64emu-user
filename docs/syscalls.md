@@ -105,6 +105,23 @@ task's canonical cwd string, which is tracked independently of the host cwd).
   host-passthrough deliberately: host fd == guest fd, and reopen semantics
   (including O_TMPFILE publishing) must keep working.
 
+  Those files and `comm` cover **this** process; the cross-process view that
+  `ps`/`top` build of *other* processes needs more, because every guest process
+  is a separate host process (guest PID == host PID) and one emulator instance
+  cannot read another's guest state. A shared-memory PID registry (`proctab.c`,
+  a `MAP_SHARED` region set up in `main()` before the first `fork`) carries it:
+  each process publishes its NUL-joined argv keyed by PID at `load_elf` and in
+  the `fork` child, with the `/proc/<pid>/stat` starttime as a stale-slot guard
+  against host PID reuse. `procfs_open` then synthesizes `/proc/<pid>/cmdline`
+  for any guest PID (otherwise the host file shows the `arm64chroot …`
+  invocation). The same registry powers a **hidden-process view**: the
+  top-level `/proc` `getdents64` stream drops numeric entries that are not guest
+  PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
+  the guest sees only its own process tree — a pid namespace without the
+  namespace. Limits: beyond the registry cap extra guest processes fall back to
+  the emulator cmdline and are hidden, and `stat`/`status` memory/state fields
+  still describe the emulator process.
+
 ## `execve`
 
 `do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, handles a

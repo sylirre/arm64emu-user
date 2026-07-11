@@ -34,6 +34,7 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
             "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
             sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
+    proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = SIG_DFL;
