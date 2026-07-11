@@ -368,11 +368,57 @@ out:
     pthread_mutex_unlock(&pf_lock);
 }
 
+/* Anonymous backing for a synthesized /proc view. Bionic only declares the
+ * wrapper on newer API levels; the raw syscall is on the Android 8 allow-list. */
+static int synth_memfd(void) {
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    return (int)syscall(SYS_memfd_create, "proc-synth", 1 /* MFD_CLOEXEC */);
+#else
+    return memfd_create("proc-synth", MFD_CLOEXEC);
+#endif
+}
+
+/* "/proc/<N>/cmdline" with N all-digits -> *pid = N, returns 1; else 0. */
+static int proc_other_cmdline(const char *canon, s32 *pid) {
+    if (strncmp(canon, "/proc/", 6)) return 0;
+    const char *p = canon + 6;
+    if (*p < '0' || *p > '9') return 0;
+    long n = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (*p - '0');
+        if (n > 0x7fffffff) return 0;
+    }
+    if (strcmp(p, "/cmdline")) return 0;
+    *pid = (s32)n;
+    return 1;
+}
+
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
  * sets *ret to a host fd or -errno; returns 0 to fall through to the host. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     struct Machine *m = c->m;
     int kind;
+
+    /* /proc/<pid>/cmdline of ANOTHER guest process: served from the shared PID
+     * registry (self / own-pid keep using m->cmdline via self_tail below). A
+     * non-guest PID misses here and, under the hidden view, path.c has already
+     * routed it to an ENOENT. */
+    s32 opid;
+    if (proc_other_cmdline(canon, &opid) && opid != (s32)getpid()) {
+        char cbuf[PROCTAB_CMDLINE];
+        u32 clen = 0;
+        if (!proctab_cmdline(opid, cbuf, &clen)) return 0;
+        if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+        if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+        int fd = synth_memfd();
+        if (fd < 0) return 0;
+        if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
+        lseek(fd, 0, SEEK_SET);
+        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        *ret = fd;
+        return 1;
+    }
+
     const char *tail = self_tail(canon);
     if (tail) {
         if      (!strcmp(tail, "cmdline"))   kind = PF_CMDLINE;
@@ -398,14 +444,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
     if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
 
-    /* Anonymous backing. Bionic only declares the wrapper on newer API
-     * levels; the raw syscall is on the Android 8 seccomp allow-list. */
-    int fd;
-#if defined(__BIONIC__) && defined(SYS_memfd_create)
-    fd = (int)syscall(SYS_memfd_create, "proc-synth", 1 /* MFD_CLOEXEC */);
-#else
-    fd = memfd_create("proc-synth", MFD_CLOEXEC);
-#endif
+    int fd = synth_memfd();
     if (fd < 0) return 0;   /* no memfd: degrade to host passthrough */
 
     ssize_t wr = 0;

@@ -22,7 +22,7 @@ JIT  := src/jit/jit.c src/jit/frontend.c src/jit/backend_x86_64.c src/jit/backen
 SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/elf.c src/path.c \
         src/signal.c src/syscall.c src/sys_file.c src/sys_mm.c src/sys_proc.c \
         src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/sys_netlink.c \
-        src/sys_procfs.c src/main.c
+        src/sys_procfs.c src/proctab.c src/main.c
 
 arm64chroot: $(SRCS) $(wildcard src/*.h src/core/*.h src/jit/*.h)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)

@@ -768,18 +768,47 @@ SYSDEF(readlinkat) {
     return out;
 }
 
+/* Keep predicate for the top-level /proc listing (hidden-process view): a
+ * numeric name is a PID and is kept only if it is a guest process; every
+ * non-numeric name (self, cpuinfo, sys, net, …) is always kept. */
+static int proc_keep_name(const char *name) {
+    if (*name < '0' || *name > '9') return 1;
+    long pid = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p < '0' || *p > '9') return 1;      /* mixed name: not a PID */
+        pid = pid * 10 + (*p - '0');
+        if (pid > 0x7fffffff) return 1;
+    }
+    return pid == (long)getpid() || proctab_has((s32)pid);
+}
+
 SYSDEF(getdents64) {
     /* linux_dirent64 layout is a fixed kernel ABI, identical for guest and
-     * host: pass the raw buffer through. */
+     * host. Two filters may apply: hide ".l2s.*" backing files (-link2symlink),
+     * and hide non-guest PIDs from the top-level /proc (pid-namespace view).
+     * Names sit at record offset +19 (8 d_ino + 8 d_off + 2 d_reclen + 1
+     * d_type). Otherwise the raw buffer passes straight through. */
     size_t len = (size_t)a2;
     if (len > (1u << 20)) len = 1u << 20;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
-    long n;
+
+    /* Is this fd the top-level /proc? (guest fd == host fd on the passthrough) */
+    int is_proc = 0;
+    {
+        char link[64], tgt[PATH_MAX];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
+        ssize_t ln = readlink(link, tgt, sizeof tgt - 1);
+        if (ln > 0) { tgt[ln] = 0; is_proc = !strcmp(tgt, "/proc"); }
+    }
+    int l2s = 0;
 #ifdef L2S_ENABLED
-    if (c->m->link2symlink) {
-        /* Hide ".l2s.*" backing files so the guest never sees or removes them.
-         * Re-read if a whole batch was filtered away (0 would look like EOF). */
+    l2s = c->m->link2symlink;
+#endif
+
+    long n;
+    if (is_proc || l2s) {
+        /* Re-read if a whole batch is filtered away (0 would look like EOF). */
         for (;;) {
             n = syscall(SYS_getdents64, (int)a0, buf, len);
             if (n <= 0) break;
@@ -788,7 +817,13 @@ SYSDEF(getdents64) {
                 u16 reclen;
                 memcpy(&reclen, buf + o + 16, 2);
                 if (reclen == 0 || o + reclen > (size_t)n) break;
-                if (!l2s_hidden((const char *)(buf + o + 19))) {
+                const char *nm = (const char *)(buf + o + 19);
+                int keep = 1;
+#ifdef L2S_ENABLED
+                if (l2s && l2s_hidden(nm)) keep = 0;
+#endif
+                if (keep && is_proc && !proc_keep_name(nm)) keep = 0;
+                if (keep) {
                     if (w != o) memmove(buf + w, buf + o, reclen);
                     w += reclen;
                 }
@@ -796,9 +831,9 @@ SYSDEF(getdents64) {
             }
             if (w > 0) { n = (long)w; break; }
         }
-    } else
-#endif
+    } else {
         n = syscall(SYS_getdents64, (int)a0, buf, len);
+    }
     if (n < 0) { free(buf); return host_err(); }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);

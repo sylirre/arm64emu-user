@@ -272,6 +272,10 @@ int main(int argc, char **argv) {
     sig_install_sigsys_net();
     seccomp_notice();
 
+    /* Shared guest-PID registry: must exist before the first do_execve (which
+     * registers this process) and before any fork inherits the mapping. */
+    proctab_init();
+
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */
     if (argv0) gargv[0] = (char *)argv0;

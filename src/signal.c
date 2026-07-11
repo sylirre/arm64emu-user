@@ -268,6 +268,7 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
         if (copy_to_guest(c, frame + off, zeros, chunk) < 0) {
             /* Unwritable stack: force default SIGSEGV (matches the kernel). */
             fprintf(stderr, "arm64chroot: cannot write sigframe, killing\n");
+            proctab_unregister((s32)getpid());
             signal(SIGSEGV, SIG_DFL);
             raise(SIGSEGV);
             _exit(128 + SIGSEGV);
@@ -373,6 +374,7 @@ void sig_return(CPU *c) {
     return;
 bad:
     fprintf(stderr, "arm64chroot: bad sigreturn frame, killing\n");
+    proctab_unregister((s32)getpid());
     signal(SIGSEGV, SIG_DFL);
     raise(SIGSEGV);
     _exit(128 + SIGSEGV);

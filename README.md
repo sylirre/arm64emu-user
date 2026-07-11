@@ -45,7 +45,12 @@ urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
 `/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
 cannot escape the rootfs), `maps`, `cmdline`, `comm`, `mounts`/`mountinfo`,
 `loadavg`, `uptime`, and `version` is synthesized; `/proc/stat` falls back to
-a synthesized view where the host denies the real file (Android).
+a synthesized view where the host denies the real file (Android). The **process
+view** is guest-scoped, too: `ps`/`top` show guest command lines (each guest
+process publishes its argv to a shared registry keyed by PID, since every guest
+process is a separate host process), and the guest's `/proc` lists **only its
+own process tree** — non-guest host processes are hidden and appear not to exist,
+a pid-namespace-like view without a real namespace.
 
 ### Fake identity (`-fake-id`)
 
