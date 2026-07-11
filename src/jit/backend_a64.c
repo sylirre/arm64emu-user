@@ -268,21 +268,53 @@ static void flags_to_host(BE *be) {               /* consumer needs NZCV */
     /* architectural copy still matches: stays FL_MEM upgraded to both */
 }
 
-static int next_consumes_flags(const IRBlock *ir, int i) {
-    if (i + 1 >= ir->n) return 0;
-    switch (ir->ops[i + 1].op) {
-        case IRO_BCOND:
-        case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
-        case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
-        case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
-            return 1;
-        default:
-            return 0;
+/* What happens to the guest flags next? FLAGS_CONSUMED: a cc-consumer or
+ * an exit reads them — keep them live in host NZCV. FLAGS_DEAD: an S-op
+ * redefines them first through NZCV-transparent ops — skip the mrs/str.
+ * FLAGS_UNKNOWN: materialize now. Every non-S ALU emission here is
+ * NZCV-transparent (host adds/logicals/shifts/muls don't touch flags), so
+ * the window only ends at ops that write NZCV or materialize on their own
+ * (mem probes, atomics, helpers, the cmn/fcmp-using VOPs). */
+enum { FLAGS_UNKNOWN, FLAGS_CONSUMED, FLAGS_DEAD };
+static int flags_next_use(const IRBlock *ir, int i) {
+    for (int k = i + 1; k < ir->n; k++) {
+        const IROp *o = &ir->ops[k];
+        switch (o->op) {
+            case IRO_BCOND: case IRO_JMP: case IRO_JMPIND:
+            case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
+            case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
+            case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
+                return FLAGS_CONSUMED;
+            case IRO_ADDS: case IRO_SUBS: case IRO_ADDIS: case IRO_SUBIS:
+            case IRO_ANDS: case IRO_BICS: case IRO_ANDIS:
+                return FLAGS_DEAD;               /* redefined unread */
+            case IRO_NOP: case IRO_MOVI: case IRO_MOV: case IRO_MOVK:
+            case IRO_CPULD: case IRO_CPUST:
+            case IRO_ADD: case IRO_SUB: case IRO_ADDI: case IRO_SUBI:
+            case IRO_AND: case IRO_BIC: case IRO_ORR: case IRO_ORN:
+            case IRO_EOR: case IRO_EON:
+            case IRO_ANDI: case IRO_ORRI: case IRO_EORI:
+            case IRO_LSLI: case IRO_LSRI: case IRO_ASRI: case IRO_RORI:
+            case IRO_LSLV: case IRO_LSRV: case IRO_ASRV: case IRO_RORV:
+            case IRO_EXTR: case IRO_MADD: case IRO_MSUB:
+            case IRO_SMADDL: case IRO_SMSUBL: case IRO_UMADDL:
+            case IRO_UMSUBL: case IRO_SMULH: case IRO_UMULH:
+            case IRO_UDIV: case IRO_SDIV:
+            case IRO_CLZ: case IRO_REV64: case IRO_REV32: case IRO_RBIT:
+                continue;                        /* NZCV-transparent */
+            case IRO_VOP:
+                if (o->aux & VF_READF) return FLAGS_CONSUMED;
+                if (o->aux & VF_SETF) return FLAGS_DEAD;    /* FCMP */
+                return FLAGS_UNKNOWN;
+            default:
+                return FLAGS_UNKNOWN;
+        }
     }
+    return FLAGS_CONSUMED;
 }
 static void set_flags_state(BE *be, const IRBlock *ir, int i) {
     be->fl = FL_HOST;
-    if (!next_consumes_flags(ir, i)) materialize_flags(be);
+    if (flags_next_use(ir, i) == FLAGS_UNKNOWN) materialize_flags(be);
 }
 
 /* ---- exits ---- */
@@ -1067,19 +1099,21 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     b->patched[0] = b->patched[1] = 0;
     b->in_head = ~0u;
 
-    /* safepoint. c->pc must be restored to the block's start on the exit
-     * path: a direct chain jump into this block bypassed the predecessor's
-     * exit-stub pc write, so c->pc is stale on entry. */
+    /* safepoint: hot entry is ldr+cbnz, the exit body sits after the
+     * block's last op (cold). c->pc must be restored to the block's start
+     * on that path: a direct chain jump into this block bypassed the
+     * predecessor's exit-stub pc write, so c->pc is stale on entry. */
     ei(e, enc_ldr(2, 16, 27, (unsigned)offsetof(JitEnv, interrupt)));
-    u8 *cont = cbz_fwd(e, 0, 16);
-    emit_imm64(e, 16, b->pc);
-    ei(e, enc_str(3, 16, 28, (unsigned)OFF_PC));
-    exit_plain(&be, 0);
-    fwd_here(e, cont);
+    u8 *cold = cbnz_fwd(e, 0, 16);
 
     for (int i = 0; i < ir->n && !e->overflow; )
         i += emit_op(&be, ir, i);
 
+    if (e->overflow) return -1;
+    fwd_here(e, cold);
+    emit_imm64(e, 16, b->pc);
+    ei(e, enc_str(3, 16, 28, (unsigned)OFF_PC));
+    exit_plain(&be, 0);
     return e->overflow ? -1 : 0;
 }
 

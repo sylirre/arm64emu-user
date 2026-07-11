@@ -363,24 +363,46 @@ static int cond_setup(BE *be, unsigned cond) {
     }
 }
 
-/* After emitting an S-op: decide whether host flags survive to the next op
- * (which will consume them) or must be recomposed now. */
-static int next_consumes_flags(const IRBlock *ir, int i) {
-    if (i + 1 >= ir->n) return 0;
-    const IROp *o = &ir->ops[i + 1];
-    switch (o->op) {
-        case IRO_BCOND:
-        case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
-        case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
-        case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
-            return 1;
-        default:
-            return 0;
+/* What happens to the guest flags next, looking through flag-transparent
+ * ops? FLAGS_CONSUMED: a cc-consumer or an exit's snapshot reads them —
+ * keep them live in EFLAGS. FLAGS_DEAD: an S-op redefines them with only
+ * transparent ops between — nobody can observe them, skip the NZCV
+ * recompose entirely. FLAGS_UNKNOWN: the window is broken by an op that
+ * may clobber EFLAGS or needs c->nzcv valid (mem probes, helpers, most
+ * VOPs) — materialize now. The plain ADD/SUB/ADDI/SUBI ops count as
+ * transparent because they switch to flag-preserving lea recipes inside a
+ * CONSUMED window (and may clobber freely inside a DEAD one); the
+ * mov-family ops emit no EFLAGS-touching instruction at all. */
+enum { FLAGS_UNKNOWN, FLAGS_CONSUMED, FLAGS_DEAD };
+static int flags_next_use(const IRBlock *ir, int i) {
+    for (int k = i + 1; k < ir->n; k++) {
+        const IROp *o = &ir->ops[k];
+        switch (o->op) {
+            case IRO_BCOND: case IRO_JMP: case IRO_JMPIND:
+            case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
+            case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
+            case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
+                return FLAGS_CONSUMED;
+            case IRO_ADDS: case IRO_SUBS: case IRO_ADDIS: case IRO_SUBIS:
+            case IRO_ANDS: case IRO_BICS: case IRO_ANDIS:
+                return FLAGS_DEAD;               /* redefined unread */
+            case IRO_NOP: case IRO_MOVI: case IRO_MOV:
+            case IRO_CPULD: case IRO_CPUST:
+            case IRO_ADD: case IRO_SUB: case IRO_ADDI: case IRO_SUBI:
+                continue;                        /* flag-transparent */
+            case IRO_VOP:
+                if (o->aux & VF_READF) return FLAGS_CONSUMED;
+                if (o->aux & VF_SETF) return FLAGS_DEAD;    /* FCMP */
+                return FLAGS_UNKNOWN;
+            default:
+                return FLAGS_UNKNOWN;
+        }
     }
+    return FLAGS_CONSUMED;
 }
 static void set_flags_state(BE *be, const IRBlock *ir, int i, int kind) {
     be->fl = kind;
-    if (!next_consumes_flags(ir, i)) materialize_flags(be);
+    if (flags_next_use(ir, i) == FLAGS_UNKNOWN) materialize_flags(be);
 }
 
 /* Host CF = guest C (inverted for the sbb forms: ARM SBC = a + ~b + C =
@@ -407,6 +429,16 @@ static void carry_to_host(BE *be, int inverted) {
     }
 }
 
+/* lea dst, [base + idx + disp8]: a flag-free 3-operand add. mod01+SIB
+ * uniformly (covers the r12/r13 special cases; the pool has no rsp). */
+static void lea_bid(Emit *e, int dst, int base, int idx, int disp) {
+    rex(e, 1, dst, idx, base);
+    e8(e, 0x8D);
+    e8(e, (u8)(0x44 | ((dst & 7) << 3)));
+    e8(e, (u8)(((idx & 7) << 3) | (base & 7)));
+    e8(e, (u8)disp);
+}
+
 /* ---- common op patterns ---- */
 
 /* dst = a; returns host reg of dst primed with a's value. Safe for d == a.
@@ -426,17 +458,14 @@ static int def_alias(BE *be, int d, int a, int w) {
     return hd;
 }
 
-/* icount += n without touching flags (mov/lea only). Clobbers rax. */
+/* icount += n as one RMW add. Clobbers EFLAGS — every call site (exit
+ * stubs after their recompose, fault arms after their jcc, the atomic and
+ * NaN-gate fast paths after theirs) has dead host flags here. */
 static void icount_add(BE *be, u32 n) {
     if (!n) return;
     Emit *e = be->e;
-    ld64(e, RAX, R14, OFF_ICOUNT);
-    /* lea rax, [rax + n] */
-    rex(e, 1, RAX, 0, RAX);
-    e8(e, 0x8D);
-    e8(e, 0x80 | ((RAX & 7) << 3) | (RAX & 7));
+    op_rm(e, 1, 0x81, 0, R14, OFF_ICOUNT);       /* add qword [r14+d], n */
     e32(e, n);
-    st64(e, RAX, R14, OFF_ICOUNT);
 }
 
 /* Exit stub: [recompose flags][icount][patch site: store pc, return eid].
@@ -2100,22 +2129,24 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     b->patched[0] = b->patched[1] = 0;
     b->in_head = ~0u;
 
-    /* safepoint: cmp dword [r15+interrupt], 0 ; je +cont ; set pc, exit.
-     * c->pc must be restored to the block's start here: a direct chain jump
-     * into this block bypassed the predecessor's exit-stub pc write, so
-     * c->pc is stale on entry — emu_loop needs the true resume pc to deliver
+    /* safepoint: the hot entry is just cmp+jcc; the exit body sits after
+     * the block's last op (cold, out of the decoder's way). c->pc must be
+     * restored to the block's start on that path: a direct chain jump into
+     * this block bypassed the predecessor's exit-stub pc write, so c->pc
+     * is stale on entry — emu_loop needs the true resume pc to deliver
      * the pending signal / dispatch correctly. */
     op_rm(e, 0, 0x83, 7, R15, (s32)offsetof(JitEnv, interrupt));
     e8(e, 0x00);                                  /* the imm8 of 83 /7 */
-    u8 *skip = jcc_fwd(e, CC_E);
-    mov_ri(e, 1, RAX, b->pc);
-    st64(e, RAX, R14, OFF_PC);
-    exit_plain(&be, 0);
-    fwd_here(e, skip);
+    u8 *cold = jcc_fwd(e, CC_NE);
 
     for (int i = 0; i < ir->n && !e->overflow; )
         i += emit_op(&be, ir, i);
 
+    if (e->overflow) return -1;
+    fwd_here(e, cold);
+    mov_ri(e, 1, RAX, b->pc);
+    st64(e, RAX, R14, OFF_PC);
+    exit_plain(&be, 0);
     return e->overflow ? -1 : 0;
 }
 
@@ -2182,8 +2213,30 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             break;
         }
 
-        case IRO_ADD:  alu_rrr(be, w, 0x01, 1, o->dst, o->a, o->b); break;
-        case IRO_SUB:  alu_rrr(be, w, 0x29, 0, o->dst, o->a, o->b); break;
+        case IRO_ADD:
+            if (be->fl != FL_MEM && flags_next_use(ir, i) == FLAGS_CONSUMED) {
+                int ha = ra_use(be, o->a);
+                int hb = ra_use(be, o->b);
+                int hd = ra_def(be, o->dst);
+                lea_bid(e, hd, ha, hb, 0);
+                if (!w) mov_rr(e, 0, hd, hd);
+                break;
+            }
+            alu_rrr(be, w, 0x01, 1, o->dst, o->a, o->b);
+            break;
+        case IRO_SUB:
+            if (be->fl != FL_MEM && flags_next_use(ir, i) == FLAGS_CONSUMED) {
+                int ha = ra_use(be, o->a);
+                int hb = ra_use(be, o->b);
+                mov_rr(e, 1, RDX, hb);
+                rex(e, 1, 0, 0, RDX); e8(e, 0xF7); e8(e, 0xD2);   /* not */
+                int hd = ra_def(be, o->dst);
+                lea_bid(e, hd, ha, RDX, 1);      /* a + ~b + 1 */
+                if (!w) mov_rr(e, 0, hd, hd);
+                break;
+            }
+            alu_rrr(be, w, 0x29, 0, o->dst, o->a, o->b);
+            break;
         case IRO_AND:  alu_rrr(be, w, 0x21, 1, o->dst, o->a, o->b); break;
         case IRO_ORR:  alu_rrr(be, w, 0x09, 1, o->dst, o->a, o->b); break;
         case IRO_EOR:  alu_rrr(be, w, 0x31, 1, o->dst, o->a, o->b); break;
@@ -2265,6 +2318,20 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
                 default:       n = 6; rr = 0x31; break;
             }
             u64 imm = w ? o->imm : (u32)o->imm;
+            if ((o->op == IRO_ADDI || o->op == IRO_SUBI) &&
+                be->fl != FL_MEM && flags_next_use(ir, i) == FLAGS_CONSUMED) {
+                /* flag-preserving: lea hd, [ha +- imm] (32-bit results
+                 * wrap identically in the low half, then zero-extend) */
+                s64 d = o->op == IRO_ADDI ? (s64)imm : -(s64)imm;
+                if (!w) d = (s32)(u32)d;
+                if (d >= INT32_MIN && d <= INT32_MAX) {
+                    int ha = ra_use(be, o->a);
+                    int hd = ra_def(be, o->dst);
+                    lea_rbd(e, hd, ha, (s32)d);
+                    if (!w) mov_rr(e, 0, hd, hd);
+                    break;
+                }
+            }
             int hd = def_alias(be, o->dst, o->a, 1);
             if (!w || imm_is_s32(imm)) {
                 alu_ri32(e, w, n, hd, (u32)imm);
@@ -2543,7 +2610,7 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             /* CSEL preserved EFLAGS (mov/lea/not/cmov only), but the next
              * op may clobber them: keep host flags only for a following
              * consumer, else store NZCV now. */
-            if (be->fl != FL_MEM && !next_consumes_flags(ir, i))
+            if (be->fl != FL_MEM && flags_next_use(ir, i) == FLAGS_UNKNOWN)
                 materialize_flags(be);
             break;
         }

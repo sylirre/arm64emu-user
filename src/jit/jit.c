@@ -216,6 +216,53 @@ static void jstat_dump(void) {
     pthread_mutex_unlock(&g_jstat_mu);
 }
 
+/* ---- optional per-block code dump (A64_JIT_DUMP=<prefix> or =1) ----
+ * Every translated block's host bytes are pwritten into
+ * <prefix>.<pid>.<tid>.code at the block's code-cache offset — the file is
+ * a sparse image of the cache, so chain/thunk jump targets in a
+ * disassembly line up with file offsets — plus one text line per block in
+ * <prefix>.<pid>.<tid>.map (pc, offset, length, the guest words).
+ * Disassemble a block with:
+ *   objdump -D -b binary -m i386:x86-64 (or aarch64) \
+ *     --start-address=0x<off> --stop-address=0x<off+len> <...>.code
+ * After a cache flush offsets are reused; correlate .map lines in order. */
+static const char *g_jdump_prefix;           /* NULL = off */
+static __thread int t_jdump_code_fd = -1, t_jdump_map_fd = -1;
+
+static void jdump_open(JitEnv *env) {
+    char name[256];
+    unsigned long tid = (unsigned long)syscall(SYS_gettid);
+    snprintf(name, sizeof name, "%s.%d.%lu.code", g_jdump_prefix,
+             (int)getpid(), tid);
+    t_jdump_code_fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    snprintf(name, sizeof name, "%s.%d.%lu.map", g_jdump_prefix,
+             (int)getpid(), tid);
+    t_jdump_map_fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (t_jdump_code_fd >= 0)                /* thunks live at offset 0 */
+        (void)!pwrite(t_jdump_code_fd, env->cache_rw,
+                      (size_t)(env->blocks_start_rw - env->cache_rw), 0);
+}
+
+static void jdump_block(JitEnv *env, CPU *c, JBlock *b, const u8 *rw_end) {
+    if (t_jdump_code_fd < 0 && t_jdump_map_fd < 0) jdump_open(env);
+    size_t off = (size_t)(b->code - env->cache_rx);
+    size_t len = (size_t)(rw_end - (env->cache_rw + off));
+    if (t_jdump_code_fd >= 0)
+        (void)!pwrite(t_jdump_code_fd, env->cache_rw + off, len, (off_t)off);
+    if (t_jdump_map_fd < 0) return;
+    char line[JIT_MAX_BLOCK_INSNS * 9 + 96];
+    int k = snprintf(line, sizeof line,
+                     "pc=0x%llx off=0x%zx len=%zu ninsns=%u guest:",
+                     (unsigned long long)b->pc, off, len, b->ninsns);
+    for (u32 i = 0; i < b->ninsns && k < (int)sizeof line - 10; i++) {
+        u32 w;
+        if (!mem_ifetch(c, b->pc + 4 * i, &w)) break;
+        k += snprintf(line + k, sizeof line - (size_t)k, " %08x", w);
+    }
+    line[k++] = '\n';
+    (void)!write(t_jdump_map_fd, line, (size_t)k);
+}
+
 /* ---- global sticky code-page map ----
  * One bit per guest 4 KB page that ever held a translation in any thread.
  * Monotonic (never cleared), so it is race-free with plain atomic OR and a
@@ -349,6 +396,9 @@ static int jit_env_init(JitEnv *env, CPU *c) {
             }
             atexit(jstat_dump);
         }
+        const char *d = getenv("A64_JIT_DUMP");
+        if (d) g_jdump_prefix = (d[0] && strcmp(d, "1") != 0)
+                                    ? d : "a64jit-dump";
     }
     pthread_mutex_unlock(&g_jstat_mu);
     if (cache_alloc(env) < 0) return -1;
@@ -567,6 +617,7 @@ retry:
     codemap_mark(pc);
 
     be_flush_icache(b->code, env->ptr, (size_t)(e.rw - env->ptr));
+    if (UNLIKELY(g_jdump_prefix != NULL)) jdump_block(env, c, b, e.rw);
     env->ptr = env->cache_rw + (((e.rw - env->cache_rw) + 15) & ~15L);
     return b;
 }
