@@ -20,12 +20,12 @@ Measured on an x86-64 host with small static AArch64 kernels
 
 | kernel   | speedup | notes                                       |
 |----------|---------|---------------------------------------------|
-| strops   | ~13×    | glibc strlen/memchr/strcmp/memset/memcpy (string-idiom vectors, DC ZVA; ~2× faster than qemu) |
-| int_alu  | ~12×    | register-bound ALU + data-dependent branches |
-| lockping | ~10×    | pthread mutex ping-pong + LSE fetch-add (inline atomics; faster than qemu) |
-| fpvec    | ~10×    | scalar FP recurrence + vectorized byte loop (inline FP/SIMD incl. FMA and conversions; ~2× faster than qemu) |
-| calls    | ~7×     | recursion + indirect calls (block chaining, jump cache) |
-| memops   | ~2×     | pure load/store/pointer-chase (softmmu-bound: a table walk per access is the price of decoupled guest VAs; qemu-user pays none) |
+| int_alu  | ~16×    | register-bound ALU + data-dependent branches (lazy-flag windows keep NZCV in host flags across the loop body) |
+| strops   | ~14×    | glibc strlen/memchr/strcmp/memset/memcpy (string-idiom vectors, DC ZVA; ~2× faster than qemu) |
+| fpvec    | ~11×    | scalar FP recurrence + vectorized byte loop (inline FP/SIMD incl. FMA and conversions, V-register cache; ~2.5× faster than qemu) |
+| calls    | ~8×     | recursion + indirect calls (block chaining, jump cache) |
+| lockping | ~7×     | pthread mutex ping-pong + LSE fetch-add (inline atomics; faster than qemu) |
+| memops   | ~3×     | pure load/store/pointer-chase (softmmu-bound: a table walk per access is the price of decoupled guest VAs; qemu-user pays none) |
 
 Real workloads land near the top of that range once translation warms up:
 `gzip` and `find` over a Debian rootfs retire **99.9%+ of their instructions
@@ -61,11 +61,29 @@ that a heavily-threaded guest re-translates hot code per thread.
 
 **Registers and flags.** Guest GPRs live in the `CPU` struct between blocks and
 are cached in host registers within a block (a pinned register holds `CPU*`,
-another holds `JitEnv*`). Guest `NZCV` maps onto host condition flags: the
-AArch64 backend uses them natively (`adds`/`b.cond`/`ccmp`); the x86-64 backend
-keeps a producer's flags in `EFLAGS` when the consumer is adjacent (the fused
-`SUBS; B.cond` case) and otherwise materializes the architectural `NZCV` word,
-inverting the carry sense on subtraction (ARM `C` = NOT x86 borrow).
+another holds `JitEnv*`). Guest V registers are cached the same way — a
+second block-local LRU allocator over a disjoint host vector-register pool
+(x86-64 `xmm5`–`xmm15`, AArch64 `v18`–`v29`, leaving the low scratch registers
+and the ABI-callee-saved `v8`–`v15` alone), with `c->v[]` as their home between
+blocks; the inline vector/FP recipes read operands and commit results through
+it (`A64_JIT_NOVRA=1` disables it). Guest `NZCV` maps onto host condition flags:
+the AArch64 backend uses them natively (`adds`/`b.cond`/`ccmp`); the x86-64
+backend keeps a producer's flags in `EFLAGS` and materializes the architectural
+`NZCV` word only when it must, inverting the carry sense on subtraction (ARM `C`
+= NOT x86 borrow). Both backends look *through* flag-transparent ops (moves and
+the non-flag ALU forms) to decide a producer's fate: if a `cc`-consumer or an
+exit will read the flags first they stay live in host flags (the x86 backend
+even emits `lea`-based `ADD/SUB` so a `SUBS; …; B.cond` window never leaves
+`EFLAGS`); if an `S`-op will redefine them unread first, the recompose is
+skipped entirely.
+
+`ADC/ADCS/SBC/SBCS` (and the `NGC` aliases) consume the guest carry inline:
+the AArch64 backend emits native `adc`/`sbc` (guest `NZCV` is already in host
+flags); the x86-64 backend recovers `CF = C` (or `!C` for the `sbb` forms, since
+ARM `SBC = a + ~b + C`) from whichever lazy-flag state is live — for a
+`SUBS; SBCS; …` multi-precision chain that costs no setup at all — then `adc`/
+`sbb`, whose carry-out and overflow are exactly the ARM `C`/`V`, so the chain
+stays live in `EFLAGS` end to end.
 
 **Inline softmmu.** Loads and stores inline the interpreter's per-thread D-TLB
 probe (`jit_dtlb_base()`; 1024 entries, shared with `translate()`). The fast
@@ -90,6 +108,16 @@ base-clobbering `ldr x2, [x2, #8]!` resolves writeback-wins exactly like the
 interpreter. `DC ZVA` — glibc memset's bulk path (DCZID advertises 64-byte
 blocks) — inlines as eight zero stores through the same write probe, which
 also keeps the self-modifying-code rules intact.
+
+A run of consecutive integer loads or stores off the same (unclobbered) base
+register with constant offsets — `LDP`/`STP`, prologue/epilogue spill runs,
+`DC ZVA`'s eight stores — **shares one D-TLB probe**. The span check folds
+into the same last-byte tag compare: the probe compares the page of the whole
+run's last byte against the tag stored for the first's, so any page crossing of
+the span mismatches and takes the slow route, where the accesses re-run through
+their helpers in program order (a fault at access *j* leaves accesses `< j`
+committed and *j*'s destination unwritten, exactly the interpreter's rule).
+`A64_JIT_NOFUSE=1` disables the sharing.
 
 **Inline atomics.** LDXR/LDAXR record the exclusive monitor and STXR/STLXR
 resolve it with a host compare-and-swap against the recorded value (the
@@ -117,14 +145,20 @@ the same host) enforces it on both backends.
 
 Inlined per a per-host fidelity table (`be_vop_ok`):
 
-- **integer vectors**: bitwise (AND/BIC/ORR/EOR/BSL/BIT/BIF), ADD/SUB,
-  MUL (AArch64), all register compares (CMEQ/CMGT/CMGE/CMHI/CMHS/CMTST) and
-  compares with zero, MIN/MAX (both signs), pairwise ADDP and MIN/MAX-P
-  (glibc's strlen/memchr inner loop), across-lanes ADDV/MINV/MAXV (AArch64),
-  ABS/NEG/NOT, CNT/CLZ/CLS/RBIT/REV (AArch64), XTN(2), shifts by immediate
-  including the narrowing SHRN(2) and widening USHLL/SSHLL(2), MOVI/MVNI,
-  DUP/INS/UMOV/SMOV lane moves. On x86-64 a few need SSSE3 (ABS) or SSE4.1
-  (32-bit min/max forms) and fall back to the helper on older CPUs.
+- **integer vectors**: bitwise (AND/BIC/ORR/EOR/BSL/BIT/BIF), ADD/SUB, MUL,
+  all register compares (CMEQ/CMGT/CMGE/CMHI/CMHS/CMTST) including the 64-bit
+  lane forms and compares with zero, MIN/MAX (both signs), pairwise ADDP and
+  MIN/MAX-P (glibc's strlen/memchr inner loop), across-lanes ADDV/MINV/MAXV,
+  ABS/NEG/NOT, CNT/RBIT/REV, S/UADDLP, XTN(2), shifts by immediate including
+  the accumulating S/USRA, the narrowing SHRN(2) and widening USHLL/SSHLL(2),
+  MOVI/MVNI, DUP/INS/UMOV/SMOV lane moves. The AArch64 backend re-emits these
+  by construction; on x86-64 the vector MUL/reductions/64-bit-compares/byte-
+  shifts and the `pshufb`-based CNT/RBIT/REV are open-coded, some gated on
+  SSSE3/SSE4.1/SSE4.2 (`__builtin_cpu_supports`, forced off by `A64_JIT_SSE=2`)
+  with a helper fallback on older CPUs.
+- **scalar AdvSIMD** (`0x5E`/`0x7E` D-form): integer ADD/SUB and the six
+  compares, and the shifts SHL/SSHR/USHR plus the accumulating SSRA/USRA —
+  glibc/gcc emit `add d,d,d` + `usra` shapes in hash/checksum loops.
 - **vector FP**: FADD/FSUB/FMUL/FDIV/FABD/FMLA/FMLS (NaN-gated) and the
   mask compares FCMEQ/FCMGE/FCMGT/FACGE/FACGT.
 - **scalar FP**: FADD/FSUB/FMUL/FDIV/FNMUL, the FMADD/FMSUB/FNMADD/FNMSUB
@@ -136,15 +170,17 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   helpers.
 
 The AArch64 backend re-emits the guest word itself with the register fields
-renumbered onto scratch host vector registers, so its semantics are the
+renumbered onto the V-register cache's host registers, so its semantics are the
 guest's by construction; the scalar-FP arithmetic classes instead emit
 explicit unfused sequences (see the NaN gate above).
 
 **Finding what still falls back.** `A64_JIT_STATS=1` (or `=/path/to/file`)
 counts every instruction executed through the `exec_a64` helper and dumps the
 top offenders by exact instruction word at process exit — feed the words to a
-disassembler. This is how the round-3 inlining list was chosen; `gzip` and
-`find` now retire ≥99.9% of instructions natively (the remainder is `SVC`).
+disassembler. This is how each round's inlining list was chosen (`memops`'
+last two residuals — a scalar-`D` integer `add` and a `usra` — drove round 4);
+`gzip` and `find` retire ≥99.9% of instructions natively (the remainder is
+`SVC`).
 
 ## Correctness model
 
@@ -172,10 +208,21 @@ same architectural signal `__builtin___clear_cache` emits. Mapping changes
 other threads must be interrupted. Each thread drops its own affected blocks at
 a safepoint and re-syncs its D-TLB (generated fast paths skip the interpreter's
 per-access generation check — the retired-backing quarantine in `mem.c` keeps a
-stale hit benign, exactly as for the interpreter). A page rewritten in a tight
-loop trips a **thrash guard** and is run purely interpreted, so a
+stale hit benign, exactly as for the interpreter). Dropping a page purges only
+the indirect-branch jump-cache entries whose target lies on it, not the whole
+cache, and a range too wide to visit page-by-page (a large `munmap`) is dropped
+by walking the bounded block arena rather than flushing every translation — so a
+data-region unmap no longer evicts unrelated hot code. A page rewritten in a
+tight loop trips a **thrash guard** and is run purely interpreted, so a
 self-modifying loop cannot dominate the translator (e.g. `tests/c/smc.c` runs
 at interpreter speed rather than retranslating every iteration).
+
+The code cache itself is a bump allocator with no partial eviction: an arena,
+edge-pool, or cache overflow flushes all translations at once (`jit_flush_all`),
+which `qemu-user` does for the same reason — partial reclaim would need cache
+compaction or region invalidation plus unpatching every incoming chain edge,
+disproportionate to a flush that, at the 32 MiB default per-thread cache
+(`A64CHROOT_JIT_MB`, up to 128), is rare and cheap to re-warm.
 
 **Plain stores to code are not instrumented.** A guest that rewrites code and
 skips `IC IVAU` is architecturally undefined on this CPU (as on real hardware);
@@ -200,19 +247,37 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
   consistency, jit vs. interpreter on the same host — the FP corner semantics
   are host-C by design and have no qemu oracle), then the entire differential
   suite (bit-exact vs. `qemu-aarch64`) with `-jit` on — the same wrapper
-  trick as `make test-seccomp`. `tests/asm/round3.S` is the targeted vector
-  for everything inlined in round 3 (addressing forms, bitfields, DC ZVA,
-  LSE min/max, the vector classes, scalar FP).
+  trick as `make test-seccomp`. `tests/asm/round3.S` and `tests/asm/round4.S`
+  are the targeted vectors for everything inlined in rounds 3–4 (addressing
+  forms, bitfields, DC ZVA, LSE min/max, the vector classes, scalar SIMD,
+  the ADC/SBC family through every x86 flag state, and fused-run page
+  straddles). `tests/fpconsist.c` additionally exercises cached-operand
+  NaN-gated FMLA.
 - `make test` (interpreter) must stay green: the JIT only adds a run-loop rung
   and leaves the default path untouched.
 - AArch64-host coverage is a cross build (`aarch64-linux-gnu-gcc -static`) run
   under `qemu-aarch64`; qemu executes the emitted AArch64 code faithfully.
-- `A64_JIT_PDMAX=N` (debug) forces every predecode op with id > N through the
-  `exec_a64` helper instead of native codegen — it bisects a codegen bug to a
-  single instruction class against the interpreter/qemu oracle.
-- `A64_JIT_SLOWMEM=1` (debug) forces every inline memory op down its slow
-  helper branch — it separates fast-path codegen bugs from the surrounding
+
+Debug/bisection knobs (all off by default):
+
+- `A64_JIT_STATS=1` (or `=/path`) ranks the instruction words still run through
+  the `exec_a64` helper (above).
+- `A64_JIT_DUMP=<prefix>` writes every translated block into a sparse image of
+  the code cache (`<prefix>.<pid>.<tid>.code`, file offset = cache offset, so a
+  disassembly's jump targets line up) plus a `.map` line per block (pc, offset,
+  guest words) for `objdump -b binary`.
+- `A64_JIT_PDMAX=N` forces every predecode op with id > N through the helper
+  instead of native codegen — it bisects a codegen bug to a single instruction
+  class. The raw-word `fe_*` families (atomics, FP/SIMD, load/store extras,
+  bitfields, LD1, RBIT, ADC/SBC) are gated by pseudo-ids just above `PD_NOPS_`
+  in that same order.
+- `A64_JIT_SLOWMEM=1` forces every inline memory op (and fused run) down its
+  slow helper branch — it separates fast-path codegen bugs from the surrounding
   register-sync machinery.
+- `A64_JIT_NOVRA=1` disables the V-register cache (recipes load/store `c->v[]`
+  per op); `A64_JIT_NOFUSE=1` disables D-TLB probe sharing; `A64_JIT_SSE=2`
+  (x86-64) forces the SSE2-baseline capability answers. Each isolates its
+  feature's codegen from the rest, and the full suite must pass under every one.
 
 ## 32-bit hosts (ARM32 / i686): feasibility
 

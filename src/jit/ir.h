@@ -118,8 +118,10 @@ enum {
      * (+ VF_* flags); imm = the raw insn word, which the backend re-decodes
      * for Rd/Rn/Rm/size/Q/shift — except VC_MOVI, where imm/imm2pc hold the
      * pre-expanded 128-bit pattern. dst/a are the guest GPRs involved
-     * (UMOV/SMOV/FMOV-to-gpr define dst; DUP/INS/FMOV-from-gpr read a);
-     * vector registers live in c->v[] and are not allocated. No faults. */
+     * (UMOV/SMOV/FMOV-to-gpr define dst; DUP/INS/FMOV-from-gpr read a).
+     * Guest V registers are block-locally cached in host vector registers
+     * (the backends' vop_src/vop_dst); c->v[] is their home between blocks.
+     * No faults. */
     IRO_VOP,
 
     /* Inline exclusives / LSE atomics / ordered accesses, [base] only (the

@@ -453,11 +453,40 @@ static int thrash_hot(JitEnv *env, u64 pc) {
            env->thrash[s].count >= JIT_THRASH_LIMIT;
 }
 
+/* Remove b from the pc-hash table and unpatch every chained direct jump
+ * INTO it (incoming-edge list) back to its dispatcher stub. The caller
+ * removes b from its page-list (the page-drop walk does so directly; the
+ * range walk searches). b's code memory stays allocated. */
+static void jit_unlink_block(JitEnv *env, JBlock *b) {
+    JBlock **hp = &env->hash[hash_pc(b->pc)];
+    while (*hp && *hp != b) hp = &(*hp)->hash_next;
+    if (*hp) *hp = b->hash_next;
+    for (u32 ei = b->in_head; ei != ~0u; ) {
+        JEdge *ed = &env->edges[ei];
+        JBlock *from = &env->arena[ed->from];
+        if (from->patched[ed->slot]) {
+            be_unpatch_chain(env, from, ed->slot);
+            be_flush_icache(from->code + from->exit_off[ed->slot],
+                            env->cache_rw + (from->code - env->cache_rx) +
+                                from->exit_off[ed->slot], 16);
+        }
+        ei = ed->next;
+    }
+    b->in_head = ~0u;
+}
+
+/* Invalidate only the jcache entries whose target pc lies in [lo, hi): an
+ * indirect branch to unrelated code keeps its warm entry across a drop.
+ * pc == 0 is the empty sentinel (a real guest target is never 0). */
+static void jit_jcache_purge(JitEnv *env, u64 lo, u64 hi) {
+    for (u32 i = 0; i < JIT_JC_SIZE; i++)
+        if (env->jcache[i].pc >= lo && env->jcache[i].pc < hi)
+            env->jcache[i].pc = 0;
+}
+
 /* Drop this thread's translations whose entry lies on `page`. Their code
  * memory stays allocated (bump allocator) until the next full flush, so a
- * block that is dropping itself from a helper can still run its own exit.
- * Chained direct jumps INTO a dropped block are unpatched back to their
- * dispatcher stubs (incoming-edge list); the jcache is purged wholesale. */
+ * block that is dropping itself from a helper can still run its own exit. */
 static void jit_drop_page(JitEnv *env, u64 page) {
     int dropped = 0;
     JBlock **pp = &env->pages[(u32)(page >> 12) & (JIT_PAGE_TBL - 1)];
@@ -465,28 +494,33 @@ static void jit_drop_page(JitEnv *env, u64 page) {
         JBlock *b = *pp;
         if ((b->pc & ~(GUEST_PAGE_SIZE - 1)) == page) {
             *pp = b->page_next;
-            JBlock **hp = &env->hash[hash_pc(b->pc)];
-            while (*hp && *hp != b) hp = &(*hp)->hash_next;
-            if (*hp) *hp = b->hash_next;
-            for (u32 ei = b->in_head; ei != ~0u; ) {
-                JEdge *ed = &env->edges[ei];
-                JBlock *from = &env->arena[ed->from];
-                if (from->patched[ed->slot]) {
-                    be_unpatch_chain(env, from, ed->slot);
-                    be_flush_icache(from->code + from->exit_off[ed->slot],
-                                    env->cache_rw +
-                                        (from->code - env->cache_rx) +
-                                        from->exit_off[ed->slot], 16);
-                }
-                ei = ed->next;
-            }
-            b->in_head = ~0u;
+            jit_unlink_block(env, b);
             dropped = 1;
         } else {
             pp = &b->page_next;
         }
     }
-    if (dropped) memset(env->jcache, 0, sizeof env->jcache);
+    if (dropped) jit_jcache_purge(env, page, page + GUEST_PAGE_SIZE);
+}
+
+/* Drop this thread's translations whose entry lies in [first, first +
+ * npages pages) by walking the bounded block arena — used when the range
+ * is too wide to visit page-by-page, so a huge data-only munmap no longer
+ * flushes unrelated hot code. Re-processing an already-dropped block is
+ * idempotent (off the hash, no incoming edges). */
+static void jit_drop_range(JitEnv *env, u64 first, u64 npages) {
+    u64 end = first + (npages << 12);
+    int dropped = 0;
+    for (u32 bi = 0; bi < env->nblocks; bi++) {
+        JBlock *b = &env->arena[bi];
+        if (b->pc < first || b->pc >= end) continue;
+        JBlock **pp = &env->pages[(u32)(b->pc >> 12) & (JIT_PAGE_TBL - 1)];
+        while (*pp && *pp != b) pp = &(*pp)->page_next;
+        if (*pp) *pp = b->page_next;
+        jit_unlink_block(env, b);
+        dropped = 1;
+    }
+    if (dropped) jit_jcache_purge(env, first, end);
 }
 
 /* exit/exit_group terminate via _exit (no atexit); the syscall handlers call
@@ -631,10 +665,13 @@ void jit_invalidate_range(u64 addr, u64 len) {
     u64 npages = ((addr + len - 1 - first) >> 12) + 1;
     int marked = 0;
     if (npages > JIT_PAGE_TBL) {
-        /* Range too large to walk (e.g. a huge munmap): assume marked and
-         * drop everything of ours. */
+        /* Range too large to walk page-by-page (e.g. a huge munmap). The
+         * codemap can't be probed cheaply over this many pages, so keep the
+         * conservative cross-thread notify (marked = 1), but drop only our
+         * own in-range blocks via the bounded arena instead of flushing the
+         * whole cache — a large data-region unmap must not evict hot code. */
         marked = 1;
-        if (env->active) jit_flush_all(env);
+        if (env->active) jit_drop_range(env, first, npages);
     } else {
         for (u64 i = 0; i < npages; i++) {
             u64 pg = first + (i << 12);
