@@ -42,9 +42,14 @@ for cfile in tests/c/*.c; do
     run_diff "c/${base}(static)" "$bs"
     GLIBC_ROOT="$HOME/arm64-rootfs/glibc"
     if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" -lm -lpthread 2>/dev/null; then
+        # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
+        # argv[0] (proctitle) need it to resolve — staged in the rootfs for
+        # us, at host /tmp for qemu. QEMU_LD_PREFIX (unlike -L) survives the
+        # host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
-        out_q=$("$QEMU" -L /usr/aarch64-linux-gnu "$bd" 2>/dev/null); rc_q=$?
-        out_e=$("$EMU" -0 "$bd" "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        cp "$bd" /tmp/t.bin
+        out_q=$(QEMU_LD_PREFIX=/usr/aarch64-linux-gnu "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX=/usr/aarch64-linux-gnu "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
@@ -53,6 +58,7 @@ for cfile in tests/c/*.c; do
         fi
     fi
 done
+rm -f /tmp/t.bin
 
 # ---- Alpine rootfs shell tests (if present) ----
 ALPINE="$HOME/arm64-rootfs/alpine"
