@@ -447,6 +447,30 @@ _start:
     mixv v7
     sect
 
+    // ---- section 6: V-register cache vs helper interleave — cached ALU
+    // results must survive a mid-block CALL1 (sqadd is a helper class) and
+    // a vector load/store, and feed back in correctly. ----
+    movz x1, #0x4030, lsl #48
+    movk x1, #0x2010
+    movz x2, #0x8070, lsl #48
+    movk x2, #0x6050
+    dup v0.2d, x1
+    dup v1.2d, x2
+    add v2.16b, v0.16b, v1.16b      // cached, dirty
+    eor v3.16b, v2.16b, v0.16b      // cached, dirty
+    sqadd v4.16b, v2.16b, v3.16b    // helper: syncs + invalidates cache
+    mixv v4
+    add v5.8h, v2.8h, v3.8h         // reloads the helper-era values
+    mixv v5
+    mixv v2
+    str q2, [x20]                   // STV of a cached value
+    ldr q6, [x20]                   // LDV over a cached register
+    mul v6.8h, v6.8h, v3.8h
+    mixv v6
+    cmeq v2.16b, v2.16b, v6.16b     // v2 was reloaded after the LDV/STV
+    mixv v2
+    sect
+
     // dump checksums
     mov x0, #1                      // fd 1
     adrp x1, out

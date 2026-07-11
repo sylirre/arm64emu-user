@@ -55,6 +55,11 @@ typedef struct BE {
     u32 lru[HREG_N];
     u32 stamp;
     int fl;                     /* FL_* lazy guest-flag location */
+    /* guest V-register cache: xmm5-15 (xmm0-4 stay recipe scratch) */
+    s8  vv2h[32];
+    u8  vh2v[16];               /* 32 = free */
+    u8  vdirty[32];
+    u32 vlru[16];
 } BE;
 
 /* ---- raw emission ---- */
@@ -234,13 +239,23 @@ static int ra_def(BE *be, int v) {
     return h;
 }
 
+/* V-register cache counterparts (defined after the SSE emitters). */
+static void vra_sync_all(BE *be);
+static void vra_inval_all(BE *be);
+static void vra_slow_store_dirty(BE *be);
+static void vra_slow_reload_all(BE *be);
+static void vra_spill(BE *be, unsigned vn);
+static void vra_flush(BE *be, unsigned vn);
+
 static void sync_all(BE *be) {                   /* flag-safe (movs only) */
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && be->dirty[v]) { v_store(be, v); be->dirty[v] = 0; }
+    vra_sync_all(be);
 }
 static void invalidate_all(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0) ra_unmap(be, v);
+    vra_inval_all(be);
 }
 
 /* Caller-saved pool regs (rdi/r8-r11) don't survive a C call. A memory-op
@@ -254,11 +269,13 @@ static int is_caller_saved(int h) {
 static void slow_store_dirty(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && be->dirty[v]) v_store(be, v);
+    vra_slow_store_dirty(be);
 }
 static void slow_reload_clobbered(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && is_caller_saved(be->v2h[v]))
             v_load_into(be, v, be->v2h[v]);
+    vra_slow_reload_all(be);                     /* xmm: all caller-saved */
 }
 
 /* ---- guest flags ---- */
@@ -632,6 +649,13 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     unsigned sz = 1u << szlog;                   /* 1..16 bytes */
     int need = is_st ? 2 /*PTE_W*/ : 1 /*PTE_R*/;
 
+    /* Vector mem ops work on c->v[] directly: an LDV overwrites the
+     * register (spill first so a fault still sees the old value; the
+     * mapping would then be stale — drop it), an STV reads it (make
+     * memory current, the mapping stays valid). */
+    if (o->op == IRO_LDV) vra_spill(be, MDESC_RT(desc));
+    else if (o->op == IRO_STV) vra_flush(be, MDESC_RT(desc));
+
     materialize_flags(be);                       /* the probe needs EFLAGS */
     int hb = -1;
     if (o->op == IRO_ST) hb = ra_use(be, o->b);  /* store operand */
@@ -774,23 +798,28 @@ fast:
  * host, so the same SSE2 ops match it bit-for-bit) ---- */
 
 /* SSE op xmm_dst, [r14+disp] / xmm_dst, xmm_src. pfx: 0, 0x66, 0xF2, 0xF3.
- * xmm0-7 only (no REX.R needed); r14 base needs REX.B. */
+ * xmm8-15 encode via REX (after the mandatory prefix). */
 static void sse_mem(Emit *e, u8 pfx, u8 opc, int xreg, s32 disp) {
     if (pfx) e8(e, pfx);
-    e8(e, 0x41);                                 /* REX.B: r14 base */
+    e8(e, (u8)(0x41 | ((xreg >> 3) << 2)));      /* REX.B r14 (+.R xmm8+) */
     e8(e, 0x0F); e8(e, opc);
-    e8(e, (u8)(0x80 | (xreg << 3) | (R14 & 7)));
+    e8(e, (u8)(0x80 | ((xreg & 7) << 3) | (R14 & 7)));
     e32(e, (u32)disp);
 }
 static void sse_rr(Emit *e, u8 pfx, u8 opc, int xdst, int xsrc) {
     if (pfx) e8(e, pfx);
+    u8 r = (u8)(0x40 | ((xdst >> 3) << 2) | (xsrc >> 3));
+    if (r != 0x40) e8(e, r);
     e8(e, 0x0F); e8(e, opc);
-    e8(e, (u8)(0xC0 | (xdst << 3) | xsrc));
+    e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc & 7)));
 }
 /* SSE4.1 three-byte-opcode form: 66 0F 38 opc /r */
 static void sse38_rr(Emit *e, u8 opc, int xdst, int xsrc) {
-    e8(e, 0x66); e8(e, 0x0F); e8(e, 0x38); e8(e, opc);
-    e8(e, (u8)(0xC0 | (xdst << 3) | xsrc));
+    e8(e, 0x66);
+    u8 r = (u8)(0x40 | ((xdst >> 3) << 2) | (xsrc >> 3));
+    if (r != 0x40) e8(e, r);
+    e8(e, 0x0F); e8(e, 0x38); e8(e, opc);
+    e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc & 7)));
 }
 /* cvtsi2ss/sd xmm, r32/r64 */
 static void cvtsi2f(Emit *e, int dbl, int w64, int xdst, int rsrc) {
@@ -824,8 +853,10 @@ static void movq_rax_x(Emit *e, int dbl, int xsrc) {
 }
 /* psll/psrl/psra xmm, imm8: opc 71/72/73 per size, /ext selects the op. */
 static void sse_shift_i(Emit *e, u8 opc, unsigned ext, int xreg, u8 imm) {
-    e8(e, 0x66); e8(e, 0x0F); e8(e, opc);
-    e8(e, (u8)(0xC0 | (ext << 3) | xreg));
+    e8(e, 0x66);
+    if (xreg >= 8) e8(e, 0x41);
+    e8(e, 0x0F); e8(e, opc);
+    e8(e, (u8)(0xC0 | (ext << 3) | (xreg & 7)));
     e8(e, imm);
 }
 
@@ -893,9 +924,9 @@ static int cpu_has_sse42(void) {
 /* SSE op xmm, [r15+disp] (JitEnv-relative). */
 static void sse_mem15(Emit *e, u8 pfx, u8 opc, int xreg, s32 disp) {
     if (pfx) e8(e, pfx);
-    e8(e, 0x41);                                 /* REX.B: r15 base */
+    e8(e, (u8)(0x41 | ((xreg >> 3) << 2)));      /* REX.B: r15 base */
     e8(e, 0x0F); e8(e, opc);
-    e8(e, (u8)(0x80 | (xreg << 3) | (R15 & 7)));
+    e8(e, (u8)(0x80 | ((xreg & 7) << 3) | (R15 & 7)));
     e32(e, (u32)disp);
 }
 
@@ -908,6 +939,115 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
     mov_ri(e, 1, RAX, hi);
     st64(e, RAX, R15, (s32)offsetof(JitEnv, vconst) + 8);
     sse_mem15(e, 0xF3, 0x6F, xreg, (s32)offsetof(JitEnv, vconst));
+}
+
+/* ---- guest V-register cache ----
+ * Block-local LRU cache of guest V registers in xmm5-15; xmm0-4 remain the
+ * recipes' fixed scratch. Recipes fetch operands with vop_src (a movdqa
+ * from the cached register, or the old movdqu from c->v[] under
+ * A64_JIT_NOVRA) and commit full-vector results with vop_dst; lane/GPR-
+ * crossing recipes instead spill the named registers and run their
+ * memory-based code unchanged. All xmm registers are caller-saved, so
+ * helper-calling slow paths store the dirty set before the call (dirty
+ * bits kept) and reload every mapped register after, converging with the
+ * fast path exactly like the GPR scheme. */
+#define VXPOOL_LO 5
+
+static int vra_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("A64_JIT_NOVRA") == NULL;
+    return v;
+}
+static void vld_q(BE *be, int hx, unsigned vn) { /* movdqu hx, c->v[vn] */
+    sse_mem(be->e, 0xF3, 0x6F, hx, OFF_V(vn));
+}
+static void vst_q(BE *be, int hx, unsigned vn) {
+    sse_mem(be->e, 0xF3, 0x7F, hx, OFF_V(vn));
+}
+static int vra_alloc(BE *be) {
+    int best = -1;
+    u32 oldest = ~0u;
+    for (int h = VXPOOL_LO; h < 16; h++) {
+        if (be->vh2v[h] == 32) return h;
+        if (be->vlru[h] < oldest) { oldest = be->vlru[h]; best = h; }
+    }
+    unsigned v = be->vh2v[best];
+    if (be->vdirty[v]) vst_q(be, best, v);
+    be->vv2h[v] = -1;
+    be->vdirty[v] = 0;
+    be->vh2v[best] = 32;
+    return best;
+}
+static int vra_use(BE *be, unsigned vn) {
+    int h = be->vv2h[vn];
+    if (h < 0) {
+        h = vra_alloc(be);
+        vld_q(be, h, vn);
+        be->vv2h[vn] = (s8)h;
+        be->vh2v[h] = (u8)vn;
+        be->vdirty[vn] = 0;
+    }
+    be->vlru[h] = ++be->stamp;
+    return h;
+}
+static int vra_def(BE *be, unsigned vn) {
+    int h = be->vv2h[vn];
+    if (h < 0) {
+        h = vra_alloc(be);
+        be->vv2h[vn] = (s8)h;
+        be->vh2v[h] = (u8)vn;
+    }
+    be->vdirty[vn] = 1;
+    be->vlru[h] = ++be->stamp;
+    return h;
+}
+/* memory made current; mapping kept (STV reads c->v[] on its fast path) */
+static void vra_flush(BE *be, unsigned vn) {
+    if (be->vv2h[vn] >= 0 && be->vdirty[vn]) {
+        vst_q(be, be->vv2h[vn], vn);
+        be->vdirty[vn] = 0;
+    }
+}
+/* memory made current and the mapping dropped (legacy recipes / LDV) */
+static void vra_spill(BE *be, unsigned vn) {
+    int h = be->vv2h[vn];
+    if (h < 0) return;
+    if (be->vdirty[vn]) vst_q(be, h, vn);
+    be->vv2h[vn] = -1;
+    be->vdirty[vn] = 0;
+    be->vh2v[h] = 32;
+}
+static void vra_sync_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++) vra_flush(be, v);
+}
+static void vra_inval_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0) {
+            be->vh2v[(int)be->vv2h[v]] = 32;
+            be->vv2h[v] = -1;
+            be->vdirty[v] = 0;
+        }
+}
+static void vra_slow_store_dirty(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0 && be->vdirty[v]) vst_q(be, be->vv2h[v], v);
+}
+static void vra_slow_reload_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0) vld_q(be, be->vv2h[v], v);
+}
+
+/* Recipe operand fetch: xscratch = guest Vn. */
+static void vop_src(BE *be, int xscratch, unsigned vn) {
+    if (!vra_enabled()) { vld_q(be, xscratch, vn); return; }
+    sse_rr(be->e, 0x66, 0x6F, xscratch, vra_use(be, vn));
+}
+/* Recipe result commit: Vd = xscratch; !q zero-extends first (the scalar /
+ * 64-bit forms' architectural clear-high). */
+static void vop_dst(BE *be, int xscratch, unsigned vn, int q) {
+    if (!q) sse_rr(be->e, 0xF3, 0x7E, xscratch, xscratch);  /* movq zext */
+    if (!vra_enabled()) { vst_q(be, xscratch, vn); return; }
+    sse_rr(be->e, 0x66, 0x6F, vra_def(be, vn), xscratch);
 }
 
 /* Per-host capability/fidelity table (see ir.h VC_*). */
@@ -1001,7 +1141,11 @@ int be_vop_ok(unsigned vclass, u32 insn) {
  * VC_F3): discard the inline result and re-run the insn via jit_exec1
  * (which handles icount and events). Mirrors emit_atomic's slow path; the
  * fast path stored its result and bumped icount before jumping over this. */
-static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
+/* res_scratch >= 0: a cached (V-allocated) NaN-gated class converges with
+ * its result in that scratch register — the slow arm reloads it from the
+ * interpreter's committed c->v[rd] so the post-merge vop_dst commits the
+ * same value on both paths. */
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res_scratch) {
     Emit *e = be->e;
     u8 *done = jmp_fwd(e);
     fwd_here(e, slow);
@@ -1016,23 +1160,64 @@ static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
     exit_plain(be, o->icnt);
     fwd_here(e, ok);
     slow_reload_clobbered(be);
+    if (res_scratch >= 0)
+        vld_q(be, res_scratch, (u32)o->imm & 31);
     fwd_here(e, done);
 }
 
-/* One IRO_VOP. Vector state stays in c->v[] (no vector allocator); xmm0-2
- * and rax/rcx are scratch. Only FCMP touches guest flags. */
+/* Which classes run with cached operands/results (full-vector recipes with
+ * the result in one scratch register)? The rest — lane and GPR-crossing
+ * shapes, scalar FP, the rax-composed narrows — spill the named registers
+ * and keep their memory-based recipes. */
+static int vop_cached(const IROp *o) {
+    u32 insn = (u32)o->imm;
+    if (!vra_enabled()) return 0;
+    switch (VC(o->aux)) {
+        case VC_BITW: case VC_ADDSUB: case VC_CM3: case VC_MINMAX:
+        case VC_MUL3: case VC_SSHIFTI: case VC_S3S:
+        case VC_VF3S: case VC_VFCM:
+            return 1;
+        case VC_SHIFTI:
+            return ((insn >> 11) & 0x1f) != 0x10;    /* SHRN(2): legacy */
+        case VC_2MISC:
+            return ((insn >> 12) & 0x1f) != 0x12;    /* XTN(2): legacy */
+        case VC_PAIRI:
+            return (insn >> 30) & 1;                 /* !Q: rax-composed */
+        default:
+            return 0;
+    }
+}
+
+/* One IRO_VOP. xmm0-4 and rax/rcx are scratch; operands come from the
+ * V-register cache (vop_src) for the cached classes. Only FCMP touches
+ * guest flags. */
 static void emit_vop(BE *be, const IROp *o) {
     Emit *e = be->e;
     u32 insn = (u32)o->imm;
     unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
     unsigned vclass = VC(o->aux);
 
+    if (!vop_cached(o)) {
+        /* legacy memory-based recipe: make c->v[] current and unmapped
+         * for every register the recipe may read or write */
+        if (vclass == VC_MOVI) {
+            vra_spill(be, VMOVI_RD(o->aux));
+        } else if (vclass == VC_FMOVI) {
+            vra_spill(be, (o->aux >> 8) & 31);
+        } else {
+            vra_spill(be, rn);
+            vra_spill(be, rm);
+            vra_spill(be, rd);
+            if (vclass == VC_F3) vra_spill(be, (insn >> 10) & 31);
+        }
+    }
+
     switch (vclass) {
         case VC_BITW: {
             unsigned U = (insn >> 29) & 1, size = (insn >> 22) & 3;
             unsigned Q = (insn >> 30) & 1;
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));            /* xmm0 = Vn */
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));            /* xmm1 = Vm */
+            vop_src(be, 0, rn);                              /* xmm0 = Vn */
+            vop_src(be, 1, rm);                              /* xmm1 = Vm */
             if (!U) switch (size) {
                 case 0: sse_rr(e, 0x66, 0xDB, 0, 1); break;  /* AND: pand */
                 case 1: sse_rr(e, 0x66, 0xDF, 1, 0);         /* BIC: pandn */
@@ -1047,7 +1232,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 if (size == 0) {
                     sse_rr(e, 0x66, 0xEF, 0, 1);             /* EOR: pxor */
                 } else {
-                    sse_mem(e, 0xF3, 0x6F, 2, OFF_V(rd));    /* xmm2 = Vd */
+                    vop_src(be, 2, rd);                      /* xmm2 = Vd */
                     if (size == 1) {                         /* BSL:
                                                               * m^((m^n)&d) */
                         sse_rr(e, 0x66, 0xEF, 0, 1);         /* x0 = n^m */
@@ -1062,13 +1247,12 @@ static void emit_vop(BE *be, const IROp *o) {
                                                               * d^((d^n)&~m) */
                         sse_rr(e, 0x66, 0xEF, 2, 0);         /* x2 = d^n */
                         sse_rr(e, 0x66, 0xDF, 1, 2);         /* x1=~m&(d^n) */
-                        sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rd));
+                        vop_src(be, 0, rd);
                         sse_rr(e, 0x66, 0xEF, 0, 1);         /* d ^ that */
                     }
                 }
             }
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));            /* Vd = xmm0 */
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);         /* clear high */
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_ADDSUB: {
@@ -1076,11 +1260,10 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned Q = (insn >> 30) & 1;
             static const u8 padd[4] = { 0xFC, 0xFD, 0xFE, 0xD4 };
             static const u8 psub[4] = { 0xF8, 0xF9, 0xFA, 0xFB };
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             sse_rr(e, 0x66, U ? psub[size] : padd[size], 0, 1);
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_CM3: {
@@ -1088,8 +1271,8 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned Q = (insn >> 30) & 1, opc3 = (insn >> 11) & 0x1f;
             static const u8 pcmpeq[3] = { 0x74, 0x75, 0x76 };
             static const u8 pcmpgt[3] = { 0x64, 0x65, 0x66 };
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (size == 3) {
                 /* 64-bit lanes: CMEQ via the pcmpeqd + swapped-pair pand
                  * composite; CMTST on top of it; the ordered compares via
@@ -1123,8 +1306,7 @@ static void emit_vop(BE *be, const IROp *o) {
                         sse_rr(e, 0x66, 0xEF, 0, 1);
                     }
                 }
-                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-                if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+                vop_dst(be, 0, rd, (int)Q);
                 break;
             }
             if (U && opc3 != 0x11) {
@@ -1156,8 +1338,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 sse_rr(e, 0x66, 0x76, 0, 0);     /* ones */
                 sse_rr(e, 0x66, 0xEF, 0, 1);     /* x0 = ~x1 */
             }
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_PAIRI: {
@@ -1171,8 +1352,13 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned Q = (insn >> 30) & 1, opc3 = (insn >> 11) & 0x1f;
             int add = (opc3 == 0x17), mx = (opc3 == 0x14);
             int res = 2;
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            if (Q) {
+                vop_src(be, 0, rn);
+                vop_src(be, 1, rm);
+            } else {                             /* legacy (rax-composed) */
+                sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+                sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            }
             if (size == 3) {                     /* ADDP.2d */
                 sse_rr(e, 0x66, 0x6F, 2, 0);
                 sse_rr(e, 0x66, 0x6C, 2, 1);     /* punpcklqdq: n0 m0 */
@@ -1216,7 +1402,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 sse_rr(e, 0x66, size ? 0x6B : 0x63, 2, 3);
             }
             if (Q) {
-                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
+                vop_dst(be, res, rd, 1);
             } else {
                 /* 64-bit form: [low pairs of n | low pairs of m] */
                 e8(e, 0x66); e8(e, 0x0F); e8(e, 0x7E);       /* movd eax */
@@ -1238,7 +1424,8 @@ static void emit_vop(BE *be, const IROp *o) {
             static const u8 pcmpeq[3] = { 0x74, 0x75, 0x76 };
             static const u8 pcmpgt[3] = { 0x64, 0x65, 0x66 };
             static const u8 psub[4] = { 0xF8, 0xF9, 0xFA, 0xFB };
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            if (key == 0x12) sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            else             vop_src(be, 0, rn);
             switch (key) {
                 case 0x08:                       /* CMGT #0 */
                     sse_rr(e, 0x66, 0xEF, 1, 1);
@@ -1360,18 +1547,15 @@ static void emit_vop(BE *be, const IROp *o) {
                     break;
                 }
             }
-            if (key != 0x12) {
-                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-                if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
-            }
+            if (key != 0x12) vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_MINMAX: {
             unsigned U = (insn >> 29) & 1, size = (insn >> 22) & 3;
             unsigned Q = (insn >> 30) & 1;
             int mx = (((insn >> 11) & 0x1f) == 0x0c);        /* MAX vs MIN */
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (size == 0 && U)                              /* pmax/pminub */
                 sse_rr(e, 0x66, mx ? 0xDE : 0xDA, 0, 1);
             else if (size == 1 && !U)                        /* pmax/pminsw */
@@ -1379,8 +1563,7 @@ static void emit_vop(BE *be, const IROp *o) {
             else                                             /* SSE4.1 */
                 sse38_rr(e, (u8)(0x38 | (mx ? 4 : 0) | (U ? 2 : 0) |
                                  (size == 2 ? 1 : 0)), 0, 1);
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_SHIFTI: {
@@ -1391,7 +1574,8 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned size = (immh & 8) ? 3 : (immh & 4) ? 2 : (immh & 2) ? 1 : 0;
             unsigned esize = 8u << size;
             static const u8 shopc[3] = { 0x71, 0x72, 0x73 };  /* h/s/d */
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            if (opc3 == 0x10) sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            else              vop_src(be, 0, rn);
             if (opc3 == 0x10) {
                 /* SHRN(2): shift the wide lanes right, then narrow (the
                  * same sign-extend-and-pack / lane-gather as XTN). Q form
@@ -1432,7 +1616,7 @@ static void emit_vop(BE *be, const IROp *o) {
                     sse_shift_i(e, shopc[size], 4, 0, (u8)esize);
                     sse_shift_i(e, shopc[size], 6, 0, (u8)(immhb - esize));
                 }
-                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
+                vop_dst(be, 0, rd, 1);
                 break;
             }
             if (size == 0) {
@@ -1450,11 +1634,10 @@ static void emit_vop(BE *be, const IROp *o) {
                 emit_const128(be, rep, rep, 1);
                 sse_rr(e, 0x66, 0xDB, 0, 1);                  /* pand */
                 if (opc3 == 0x02) {                           /* USRA.b */
-                    sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rd));
+                    vop_src(be, 1, rd);
                     sse_rr(e, 0x66, 0xFC, 0, 1);              /* paddb */
                 }
-                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-                if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+                vop_dst(be, 0, rd, (int)Q);
                 break;
             }
             if (opc3 == 0x02) {                               /* S/USRA */
@@ -1463,7 +1646,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 static const u8 padd[4] = { 0xFC, 0xFD, 0xFE, 0xD4 };
                 sse_shift_i(e, shopc[size - 1], U ? 2 : 4, 0,
                             (u8)(2 * esize - immhb));
-                sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rd));
+                vop_src(be, 1, rd);
                 sse_rr(e, 0x66, padd[size], 0, 1);
             } else if (opc3 == 0x0a) {                        /* SHL */
                 sse_shift_i(e, shopc[size - 1], 6, 0, (u8)(immhb - esize));
@@ -1472,8 +1655,7 @@ static void emit_vop(BE *be, const IROp *o) {
             } else {                                          /* SSHR */
                 sse_shift_i(e, shopc[size - 1], 4, 0, (u8)(2 * esize - immhb));
             }
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_S3S: {
@@ -1481,17 +1663,17 @@ static void emit_vop(BE *be, const IROp *o) {
              * stay pure SSE (movq loads zero-extend, matching the scalar
              * clear-high rule); the compares go through GPRs. */
             unsigned U = (insn >> 29) & 1, opc3 = (insn >> 11) & 0x1f;
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (opc3 == 0x10) {                               /* ADD / SUB */
-                sse_mem(e, 0xF3, 0x7E, 0, OFF_V(rn));         /* movq */
-                sse_mem(e, 0xF3, 0x7E, 1, OFF_V(rm));
                 sse_rr(e, 0x66, U ? 0xFB : 0xD4, 0, 1);       /* psub/addq */
-                sse_mem(e, 0x66, 0xD6, 0, OFF_V(rd));         /* movq store */
-                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                vop_dst(be, 0, rd, 0);           /* D-form: clear high */
                 break;
             }
             materialize_flags(be);                            /* cmp below */
-            ld64(e, RAX, R14, OFF_V(rn));
-            ld64(e, RCX, R14, OFF_V(rm));
+            movq_rax_x(e, 1, 0);                              /* rax = n */
+            e8(e, 0x66); e8(e, 0x48); e8(e, 0x0F); e8(e, 0x7E);
+            e8(e, (u8)(0xC0 | (1 << 3) | RCX));               /* rcx = m */
             int cc;
             if (opc3 == 0x11 && !U) {                         /* CMTST */
                 op_rr(e, 1, 0x85, RCX, RAX);                  /* test */
@@ -1505,8 +1687,8 @@ static void emit_vop(BE *be, const IROp *o) {
             e8(e, 0x0F); e8(e, (u8)(0x90 | cc)); e8(e, 0xC0); /* setcc al */
             e8(e, 0x0F); e8(e, 0xB6); e8(e, 0xC0);            /* movzx eax,al */
             rex(e, 1, 0, 0, RAX); e8(e, 0xF7); e8(e, 0xD8);   /* neg rax */
-            st64(e, RAX, R14, OFF_V(rd));
-            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            movq_xr(e, 0, RAX);
+            vop_dst(be, 0, rd, 0);
             break;
         }
         case VC_SSHIFTI: {
@@ -1515,35 +1697,38 @@ static void emit_vop(BE *be, const IROp *o) {
              * signed ones need sar, so they go through a GPR. */
             unsigned U = (insn >> 29) & 1, opc3 = (insn >> 11) & 0x1f;
             unsigned immhb = ((insn >> 16) & 0x7f);
+            vop_src(be, 0, rn);
             if (opc3 == 0x0a || U) {
-                sse_mem(e, 0xF3, 0x7E, 0, OFF_V(rn));         /* movq */
                 if (opc3 == 0x0a)                             /* SHL */
                     sse_shift_i(e, 0x73, 6, 0, (u8)(immhb - 64));
                 else                                          /* USHR/USRA */
                     sse_shift_i(e, 0x73, 2, 0, (u8)(128 - immhb));
                 if (opc3 == 0x02) {                           /* USRA */
-                    sse_mem(e, 0xF3, 0x7E, 1, OFF_V(rd));
+                    vop_src(be, 1, rd);
                     sse_rr(e, 0x66, 0xD4, 0, 1);              /* paddq */
                 }
-                sse_mem(e, 0x66, 0xD6, 0, OFF_V(rd));
-                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                vop_dst(be, 0, rd, 0);           /* D-form: clear high */
                 break;
             }
             /* SSHR / SSRA: sar with the interpreter's >=64 -> 63 clamp */
             unsigned sh = 128 - immhb;
             materialize_flags(be);
-            ld64(e, RAX, R14, OFF_V(rn));
+            movq_rax_x(e, 1, 0);
             shift_ri(e, 1, 7, RAX, sh >= 64 ? 63 : sh);       /* sar */
-            if (opc3 == 0x02)                                 /* SSRA */
-                op_rm(e, 1, 0x03, RAX, R14, OFF_V(rd));       /* add rax,[Vd] */
-            st64(e, RAX, R14, OFF_V(rd));
-            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            if (opc3 == 0x02) {                               /* SSRA */
+                vop_src(be, 1, rd);
+                e8(e, 0x66); e8(e, 0x48); e8(e, 0x0F); e8(e, 0x7E);
+                e8(e, (u8)(0xC0 | (1 << 3) | RCX));           /* rcx = Vd */
+                op_rr(e, 1, 0x01, RCX, RAX);                  /* add */
+            }
+            movq_xr(e, 0, RAX);
+            vop_dst(be, 0, rd, 0);
             break;
         }
         case VC_MUL3: {
             unsigned size = (insn >> 22) & 3, Q = (insn >> 30) & 1;
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (size == 1) {
                 sse_rr(e, 0x66, 0xD5, 0, 1);     /* pmullw */
             } else if (size == 2) {
@@ -1567,8 +1752,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 sse_rr(e, 0x66, 0x67, 2, 0);     /* packuswb */
                 sse_rr(e, 0x66, 0x6F, 0, 2);
             }
-            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
-            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_dst(be, 0, rd, (int)Q);
             break;
         }
         case VC_ACROSS: {
@@ -1717,7 +1901,7 @@ static void emit_vop(BE *be, const IROp *o) {
             }
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
-            if (slow) vop_slowpath(be, o, slow);
+            if (slow) vop_slowpath(be, o, slow, -1);
             break;
         }
         case VC_F1: {                            /* FMOV/FABS/FNEG/FSQRT */
@@ -1808,10 +1992,10 @@ static void emit_vop(BE *be, const IROp *o) {
             u8 pfx = sz ? 0x66 : 0;              /* pd : ps */
             int res = 0;
             materialize_flags(be);
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (opc3 == 0x19) {                  /* FMLA / FMLS: d +- n*m */
-                sse_mem(e, 0xF3, 0x6F, 2, OFF_V(rd));
+                vop_src(be, 2, rd);
                 sse_rr(e, pfx, 0x59, 0, 1);
                 sse_rr(e, pfx, a23 ? 0x5C : 0x58, 2, 0);
                 res = 2;
@@ -1835,14 +2019,10 @@ static void emit_vop(BE *be, const IROp *o) {
             op_rr(e, 0, 0x85, RAX, RAX);
             u8 *slow = jcc_fwd(e, CC_NE);
             icount_add(be, 1);
-            if (Q) {
-                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
-            } else {
-                movq_rax_x(e, 1, res);
-                st64(e, RAX, R14, OFF_V(rd));
-                st_imm_r14(e, OFF_V(rd) + 8, 0);
-            }
-            vop_slowpath(be, o, slow);
+            /* both arms converge with the result in `res` (the slow arm
+             * reloads the interpreter's commit); one post-merge vop_dst */
+            vop_slowpath(be, o, slow, res);
+            vop_dst(be, res, rd, (int)Q);
             break;
         }
         case VC_VFCM: {
@@ -1853,8 +2033,8 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned opc3 = (insn >> 11) & 0x1f, U = (insn >> 29) & 1;
             u8 pfx = sz ? 0x66 : 0;
             int res;
-            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
-            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (opc3 == 0x1d) {                  /* FACGE/FACGT: abs first */
                 sse_rr(e, 0x66, 0x76, 2, 2);
                 sse_shift_i(e, sz ? 0x73 : 0x72, 2, 2, 1);
@@ -1868,13 +2048,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 sse_rr(e, pfx, 0xC2, 1, 0); e8(e, a23 ? 1 : 2);
                 res = 1;
             }
-            if (Q) {
-                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
-            } else {
-                movq_rax_x(e, 1, res);
-                st64(e, RAX, R14, OFF_V(rd));
-                st_imm_r14(e, OFF_V(rd) + 8, 0);
-            }
+            vop_dst(be, res, rd, (int)Q);
             break;
         }
         case VC_F3: {
@@ -1906,7 +2080,7 @@ static void emit_vop(BE *be, const IROp *o) {
             movq_rax_x(e, dbl, res);
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
-            vop_slowpath(be, o, slow);
+            vop_slowpath(be, o, slow, -1);
             break;
         }
         case VC_FCVT: {                          /* S<->D: plain casts */
@@ -2364,6 +2538,8 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     be.b = b;
     for (int v = 0; v < VREG_N; v++) be.v2h[v] = -1;
     for (int h = 0; h < HREG_N; h++) be.h2v[h] = VREG_N;
+    for (int v = 0; v < 32; v++) be.vv2h[v] = -1;
+    for (int h = 0; h < 16; h++) be.vh2v[h] = 32;
     be.fl = FL_MEM;
     b->exit_pc[0] = b->exit_pc[1] = ~0ULL;
     b->exit_off[0] = b->exit_off[1] = 0;

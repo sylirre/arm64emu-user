@@ -122,6 +122,23 @@ int main(void) {
                     : "r"(va0), "r"(va1), "r"(vb0), "r"(vb1), "r"(nc)
                     : "v0", "v1", "v2");
             MIX(r0); MIX(r1);
+            /* cached-operand FMLA: every operand and the accumulator come
+             * from cached vector ALU results in the same block, so the
+             * NaN-gate's interpreter re-run must see the cache's
+             * store-dirty values (V-register cache, round 4) */
+            __asm__("fmov d0, %2\n\tmov v0.d[1], %3\n\t"
+                    "fmov d1, %4\n\tmov v1.d[1], %5\n\t"
+                    "fmov d2, %6\n\tmov v2.d[1], %2\n\t"
+                    "add v0.2d, v0.2d, v2.2d\n\t"
+                    "eor v1.16b, v1.16b, v2.16b\n\t"
+                    "add v2.2d, v2.2d, v2.2d\n\t"
+                    "fmla v2.4s, v0.4s, v1.4s\n\t"
+                    "fmla v2.2d, v1.2d, v0.2d\n\t"
+                    "fmov %0, d2\n\tmov %1, v2.d[1]"
+                    : "=r"(r0), "=r"(r1)
+                    : "r"(va0), "r"(va1), "r"(vb0), "r"(vb1), "r"(nc)
+                    : "v0", "v1", "v2");
+            MIX(r0); MIX(r1);
             __asm__("fmov d0, %2\n\tmov v0.d[1], %3\n\t"
                     "fmov d1, %4\n\tmov v1.d[1], %5\n\t"
                     "fdiv v2.2s, v0.2s, v1.2s\n\t"

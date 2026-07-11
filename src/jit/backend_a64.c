@@ -15,6 +15,7 @@
 
 #ifdef __aarch64__
 
+#include <stdlib.h>
 #include <string.h>
 
 enum { FL_MEM, FL_HOST };
@@ -40,6 +41,13 @@ typedef struct BE {
     u32 lru[HREG_N];
     u32 stamp;
     int fl;
+    /* guest V-register cache: host v18-v29 (v0-v3/v16-v17 stay recipe
+     * scratch; v8-v15 are AAPCS callee-saved and the thunks don't save
+     * them) */
+    s8  vv2h[32];
+    u8  vh2v[32];               /* 32 = free */
+    u8  vdirty[32];
+    u32 vlru[32];
 } BE;
 
 /* ---- raw emission ---- */
@@ -228,13 +236,17 @@ static int ra_def(BE *be, int v) {
     be->lru[h] = ++be->stamp;
     return h;
 }
+static void vra_sync_all(BE *be);
+static void vra_inval_all(BE *be);
 static void sync_all(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && be->dirty[v]) { v_store(be, v); be->dirty[v] = 0; }
+    vra_sync_all(be);
 }
 static void invalidate_all(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0) ra_unmap(be, v);
+    vra_inval_all(be);
 }
 
 /* Caller-saved pool regs (x9-x15) don't survive a C call. A memory-op slow
@@ -243,14 +255,25 @@ static void invalidate_all(BE *be) {
  * after, so both paths converge on the same allocator state. The
  * callee-saved half (x19-x26) stays resident. */
 static int is_caller_saved(int h) { return h >= 9 && h <= 15; }
+
+/* V-register cache counterparts (defined after the q-load/store encoders). */
+static void vra_sync_all(BE *be);
+static void vra_inval_all(BE *be);
+static void vra_slow_store_dirty(BE *be);
+static void vra_slow_reload_all(BE *be);
+static void vra_spill(BE *be, unsigned vn);
+static void vra_flush(BE *be, unsigned vn);
+
 static void slow_store_dirty(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && be->dirty[v]) v_store(be, v);
+    vra_slow_store_dirty(be);
 }
 static void slow_reload_clobbered(BE *be) {
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && is_caller_saved(be->v2h[v]))
             v_load_into(be, v, be->v2h[v]);
+    vra_slow_reload_all(be);                     /* v18-29: caller-saved */
 }
 
 /* ---- flags ---- */
@@ -472,6 +495,12 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     unsigned sz = 1u << szl;
     int need = is_st ? 2 : 1;
 
+    /* Vector mem ops work on c->v[] directly: LDV overwrites the register
+     * (spill first so a fault still sees the old value, then drop the
+     * stale mapping), STV reads it (make memory current, keep it). */
+    if (o->op == IRO_LDV) vra_spill(be, MDESC_RT(desc));
+    else if (o->op == IRO_STV) vra_flush(be, MDESC_RT(desc));
+
     materialize_flags(be);                        /* the probe needs NZCV */
     int hb = -1;
     if (o->op == IRO_ST) hb = ra_use(be, o->b);   /* store operand */
@@ -628,12 +657,130 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
     return 0x3D800000u | ((off / 16) << 10) | (rn << 5) | qt;
 }
 
+/* ---- guest V-register cache ----
+ * Block-local LRU cache of guest V registers in host v18-v29. The replay
+ * path fetches operands with vop_src (a 16B register move from the cached
+ * copy, or the old LDR Q under A64_JIT_NOVRA) and commits the replayed
+ * result from v2 with vop_dst; the GPR-composed recipes (MOVI/FMOVI/
+ * FMOVG) spill the named registers and run unchanged. All pool registers
+ * are caller-saved, so helper-calling slow paths store the dirty set and
+ * reload every mapped register (slow_store_dirty / slow_reload_clobbered
+ * carry both files). */
+#define VXPOOL_LO 18
+#define VXPOOL_HI 29
+
+static int vra_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("A64_JIT_NOVRA") == NULL;
+    return v;
+}
+static u32 enc_vmov16(unsigned vd, unsigned vn) {   /* mov vd.16b, vn.16b */
+    return 0x4EA01C00u | (vn << 16) | (vn << 5) | vd;
+}
+static int vra_alloc(BE *be) {
+    int best = -1;
+    u32 oldest = ~0u;
+    for (int h = VXPOOL_LO; h <= VXPOOL_HI; h++) {
+        if (be->vh2v[h] == 32) return h;
+        if (be->vlru[h] < oldest) { oldest = be->vlru[h]; best = h; }
+    }
+    unsigned v = be->vh2v[best];
+    if (be->vdirty[v]) ei(be->e, enc_stq((unsigned)best, 28,
+                                         (unsigned)OFF_V(v)));
+    be->vv2h[v] = -1;
+    be->vdirty[v] = 0;
+    be->vh2v[best] = 32;
+    return best;
+}
+static int vra_use(BE *be, unsigned vn) {
+    int h = be->vv2h[vn];
+    if (h < 0) {
+        h = vra_alloc(be);
+        ei(be->e, enc_ldq((unsigned)h, 28, (unsigned)OFF_V(vn)));
+        be->vv2h[vn] = (s8)h;
+        be->vh2v[h] = (u8)vn;
+        be->vdirty[vn] = 0;
+    }
+    be->vlru[h] = ++be->stamp;
+    return h;
+}
+static int vra_def(BE *be, unsigned vn) {
+    int h = be->vv2h[vn];
+    if (h < 0) {
+        h = vra_alloc(be);
+        be->vv2h[vn] = (s8)h;
+        be->vh2v[h] = (u8)vn;
+    }
+    be->vdirty[vn] = 1;
+    be->vlru[h] = ++be->stamp;
+    return h;
+}
+static void vra_flush(BE *be, unsigned vn) {     /* memory current, keep */
+    if (be->vv2h[vn] >= 0 && be->vdirty[vn]) {
+        ei(be->e, enc_stq((unsigned)be->vv2h[vn], 28, (unsigned)OFF_V(vn)));
+        be->vdirty[vn] = 0;
+    }
+}
+static void vra_spill(BE *be, unsigned vn) {     /* memory current, unmap */
+    int h = be->vv2h[vn];
+    if (h < 0) return;
+    if (be->vdirty[vn]) ei(be->e, enc_stq((unsigned)h, 28,
+                                          (unsigned)OFF_V(vn)));
+    be->vv2h[vn] = -1;
+    be->vdirty[vn] = 0;
+    be->vh2v[h] = 32;
+}
+static void vra_sync_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++) vra_flush(be, v);
+}
+static void vra_inval_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0) {
+            be->vh2v[(int)be->vv2h[v]] = 32;
+            be->vv2h[v] = -1;
+            be->vdirty[v] = 0;
+        }
+}
+static void vra_slow_store_dirty(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0 && be->vdirty[v])
+            ei(be->e, enc_stq((unsigned)be->vv2h[v], 28,
+                              (unsigned)OFF_V(v)));
+}
+static void vra_slow_reload_all(BE *be) {
+    for (unsigned v = 0; v < 32; v++)
+        if (be->vv2h[v] >= 0)
+            ei(be->e, enc_ldq((unsigned)be->vv2h[v], 28,
+                              (unsigned)OFF_V(v)));
+}
+
+/* Replay operand fetch: host v`scratch` = guest Vn. */
+static void vop_src(BE *be, unsigned scratch, unsigned vn) {
+    if (!vra_enabled()) {
+        ei(be->e, enc_ldq(scratch, 28, (unsigned)OFF_V(vn)));
+        return;
+    }
+    ei(be->e, enc_vmov16(scratch, (unsigned)vra_use(be, vn)));
+}
+/* Replay result commit: guest Vd = host v`scratch` (the replay always
+ * produces the full architectural Vd there). */
+static void vop_dst(BE *be, unsigned scratch, unsigned vn) {
+    if (!vra_enabled()) {
+        ei(be->e, enc_stq(scratch, 28, (unsigned)OFF_V(vn)));
+        return;
+    }
+    ei(be->e, enc_vmov16((unsigned)vra_def(be, vn), scratch));
+}
+
 /* NaN-result fallback for the self-counting scalar-FP classes (VC_F2 arith,
  * VC_F3): a NaN result means NaN inputs or an invalid operation — cases
  * where the result bits depend on the compiler's operand ordering in the
  * interpreter — so discard and re-run the insn via jit_exec1 (which counts
  * the insn and handles events). Mirrors emit_atomic's slow path. */
-static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
+/* res >= 0: the slow arm converges with the interpreter's committed
+ * c->v[rd] reloaded into host v`res`, so a post-merge vop_dst commits the
+ * same value on both paths. */
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res) {
     Emit *e = be->e;
     u8 *done = b_fwd(e);
     fwd_here(e, slow);
@@ -648,6 +795,8 @@ static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
     exit_plain(be, o->icnt);
     fwd_here(e, ok);
     slow_reload_clobbered(be);
+    if (res >= 0)
+        ei(e, enc_ldq((unsigned)res, 28, (unsigned)OFF_V((u32)o->imm & 31)));
     fwd_here(e, done);
 }
 
@@ -656,6 +805,11 @@ static void emit_vop(BE *be, const IROp *o) {
     u32 insn = (u32)o->imm;
     unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
     unsigned vclass = VC(o->aux);
+
+    /* the GPR-composed recipes below read/write c->v[] directly */
+    if (vclass == VC_MOVI) vra_spill(be, VMOVI_RD(o->aux));
+    else if (vclass == VC_FMOVI) vra_spill(be, (o->aux >> 8) & 31);
+    else if (vclass == VC_FMOVG) { vra_spill(be, rn); vra_spill(be, rd); }
 
     switch (vclass) {
         case VC_MOVI: {                          /* pre-expanded pattern */
@@ -728,9 +882,9 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
             int mla = (((insn >> 11) & 0x1f) == 0x19);
             materialize_flags(be);               /* cmn below */
-            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
-            ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
-            if (mla) ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            if (mla) vop_src(be, 2, rd);
             ei(e, (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
                   (1u << 16) | (0u << 5) | 2);
             /* v16 = per-lane (v2 == v2): NaN lanes -> 0 */
@@ -744,8 +898,8 @@ static void emit_vop(BE *be, const IROp *o) {
             ei(e, 0xB100041Fu | (16u << 5));          /* cmn x16, #1 */
             u8 *slow = bcond_fwd(e, 1);               /* b.ne: NaN lane */
             icount_add(be, 1);
-            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
-            vop_slowpath(be, o, slow);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
             break;
         }
         case VC_F2: case VC_F3: {
@@ -758,12 +912,12 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned ft = (insn >> 22) & 1;      /* 0 = S, 1 = D */
             u32 f = ft << 22;
             materialize_flags(be);               /* fcmp below */
-            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
-            ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
             if (vclass == VC_F3) {
                 unsigned ra = (insn >> 10) & 31;
                 int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
-                ei(e, enc_ldq(3, 28, (unsigned)OFF_V(ra)));
+                vop_src(be, 3, ra);
                 ei(e, 0x1E200800u | f | (1u << 16) | (0u << 5) | 2);  /* fmul */
                 if (o1)                                   /* fneg a */
                     ei(e, 0x1E214000u | f | (3u << 5) | 3);
@@ -779,8 +933,8 @@ static void emit_vop(BE *be, const IROp *o) {
             ei(e, 0x1E202008u | f | (2u << 16) | (2u << 5));  /* fcmp v2,v2 */
             u8 *slow = bcond_fwd(e, 6);          /* b.vs: NaN result */
             icount_add(be, 1);
-            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
-            vop_slowpath(be, o, slow);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
             break;
         }
         default: {
@@ -823,7 +977,7 @@ static void emit_vop(BE *be, const IROp *o) {
             u32 w = insn & ~0x1Fu;               /* clear Rd */
             if (gpr_dst) {
                 if (o->dst == VREG_ZERO) break;
-                ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
+                vop_src(be, 0, rn);
                 w = (w & ~(0x1Fu << 5)) | (0u << 5) | 16;    /* Rn=v0, Rd=x16 */
                 ei(e, w);
                 int hd = ra_def(be, o->dst);
@@ -835,15 +989,15 @@ static void emit_vop(BE *be, const IROp *o) {
                 ei(e, enc_mov(1, 16, (unsigned)hsrc));
                 w = (w & ~(0x1Fu << 5)) | (16u << 5) | 2;    /* Rn=x16, Rd=v2 */
                 if (reads_rd)                    /* INS (general) */
-                    ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+                    vop_src(be, 2, rd);
                 ei(e, w);
-                ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+                vop_dst(be, 2, rd);
                 break;
             }
             /* vector-only (or FCMP, which writes NZCV instead of Vd) */
-            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
-            if (has_rm) ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
-            if (reads_rd) ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+            vop_src(be, 0, rn);
+            if (has_rm) vop_src(be, 1, rm);
+            if (reads_rd) vop_src(be, 2, rd);
             w = (w & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5) | 2;
             if (has_rm) w |= 1u << 16;
             else        w |= (insn & (0x1Fu << 16));   /* keep imm fields */
@@ -861,7 +1015,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 break;
             }
             ei(e, w);
-            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+            vop_dst(be, 2, rd);
             break;
         }
     }
@@ -1093,6 +1247,8 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     be.b = b;
     for (int v = 0; v < VREG_N; v++) be.v2h[v] = -1;
     for (int h = 0; h < HREG_N; h++) be.h2v[h] = VREG_N;
+    for (int v = 0; v < 32; v++) be.vv2h[v] = -1;
+    for (int h = 0; h < 32; h++) be.vh2v[h] = 32;
     be.fl = FL_MEM;
     b->exit_pc[0] = b->exit_pc[1] = ~0ULL;
     b->exit_off[0] = b->exit_off[1] = 0;
