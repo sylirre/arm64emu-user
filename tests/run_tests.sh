@@ -116,6 +116,42 @@ fork done rc=0" "$ALPINE" /tmp/ci_vfork
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
+# ---- -bind mounts (self-checking; qemu has no bind-mount concept). Exercises
+# forward mapping, symlink containment inside a bind, reverse mapping (cwd),
+# dst canonicalization, longest-prefix nesting, :ro enforcement, and the
+# synthesized /proc/mounts row. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_bind() {   # check_bind <label> <expected> <emu args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS bind: $label"
+        else fail=$((fail+1)); echo "FAIL bind: $label (want '$expect' got '$got')"; fi
+    }
+    BSRC=$(mktemp -d); BSRC2=$(mktemp -d)
+    mkdir -p "$BSRC/sub"
+    echo bound-ok > "$BSRC/hello.txt"
+    echo in-sub   > "$BSRC/sub/deep.txt"
+    echo INNER    > "$BSRC2/i.txt"
+    ln -sf hello.txt        "$BSRC/rel.lnk"   # relative symlink: stays in the bind
+    ln -sf /mnt/x/hello.txt "$BSRC/abs.lnk"   # absolute symlink: re-roots to guest /
+                                              # (host has no /mnt/x, so a leak would ENOENT)
+    B="$BSRC:/mnt/x"
+    check_bind "read bound file"       "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
+    check_bind "nested path"           "in-sub"     -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/sub/deep.txt
+    check_bind "relative symlink"      "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/rel.lnk
+    check_bind "abs symlink re-roots"  "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/abs.lnk
+    check_bind "chdir+pwd (reverse)"   "/mnt/x/sub" -bind "$B" "$ALPINE" /bin/busybox sh -c 'cd /mnt/x/sub && pwd'
+    check_bind "dst canonicalization"  "bound-ok"   -bind "$BSRC:/mnt/./y/../x" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
+    check_bind "rw write-through"      "w-ok"       -bind "$B" "$ALPINE" /bin/busybox sh -c 'echo w-ok > /mnt/x/w.txt && cat /mnt/x/w.txt'
+    check_bind "nested longest-prefix" "INNER"      -bind "$B" -bind "$BSRC2:/mnt/x/sub" "$ALPINE" /bin/busybox cat /mnt/x/sub/i.txt
+    check_bind "ro read allowed"       "bound-ok"   -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox cat /mnt/ro/hello.txt
+    check_bind "ro write blocked"      "blocked"    -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'echo x > /mnt/ro/x 2>/dev/null; test -e /mnt/ro/x && echo created || echo blocked'
+    check_bind "ro mkdir blocked"      "blocked"    -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'mkdir /mnt/ro/d 2>/dev/null; test -d /mnt/ro/d && echo created || echo blocked'
+    check_bind "mounts row (ro)"       "ro,relatime" -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'awk "\$2==\"/mnt/ro\"{print \$4}" /proc/mounts'
+    rm -rf "$BSRC" "$BSRC2"
+fi
+
 # ---- interactive job control (needs a PTY): an external command under bash must
 # run, not get Stopped by a stray SIGTTOU during tcsetpgrp setup. ----
 if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then

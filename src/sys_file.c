@@ -53,6 +53,14 @@ int oflags_h2g(int h) {
     return g;
 }
 
+/* 1 if `host` (a resolved host path) lies under a read-only -bind mount, so a
+ * mutating syscall on it must return -EROFS. bind_of_host matches the bound
+ * host prefix at a '/' boundary; non-bind paths never match. */
+static int host_ro(struct Machine *m, const char *host) {
+    int i = bind_of_host(m, host, NULL);
+    return i >= 0 && m->binds[i].ro;
+}
+
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
     memset(g, 0, sizeof *g);
     g->st_dev = st->st_dev;
@@ -430,6 +438,12 @@ SYSDEF(openat) {
     unsigned rf = (gflags & G_O_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, canon);
     if (r < 0) return (u64)(s64)r;
+    /* Write intent (non-RDONLY, or create/truncate) into a :ro bind -> EROFS.
+     * O_CREAT/O_TRUNC/O_ACCMODE are in the pass-through set, so the host bits
+     * apply to the guest flags unchanged. */
+    if (((gflags & O_ACCMODE) != O_RDONLY || (gflags & (O_CREAT | O_TRUNC))) &&
+        host_ro(c->m, host))
+        return (u64)(s64)-EROFS;
     if (!strncmp(canon, "/proc/", 6)) {   /* maps/cmdline/mounts: guest view */
         s64 pf;
         if (procfs_open(c, canon, gflags, &pf)) return (u64)pf;
@@ -892,6 +906,7 @@ SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return xattr_write(c, host, -1, 1, name, a2, a3, (int)a4);
 }
 SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
@@ -900,6 +915,7 @@ SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return xattr_write(c, host, -1, 0, name, a2, a3, (int)a4);
 }
 SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
@@ -914,6 +930,7 @@ SYSDEF(removexattr) {  /* (path, name) — follow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     if (removexattr(host, name) < 0) return host_err();
     return 0;
 }
@@ -923,6 +940,7 @@ SYSDEF(lremovexattr) { /* (path, name) — nofollow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     if (lremovexattr(host, name) < 0) return host_err();
     return 0;
 }
@@ -1146,6 +1164,7 @@ SYSDEF(mkdirat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return mkdir(host, (mode_t)a2) < 0 ? host_err() : 0;
 }
 
@@ -1153,6 +1172,7 @@ SYSDEF(unlinkat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
 #ifdef L2S_ENABLED
     char backing[PATH_MAX]; unsigned long count; int isl = 0;
@@ -1174,6 +1194,7 @@ SYSDEF(renameat) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) return (u64)(s64)-EROFS;
 #ifdef L2S_ENABLED
     char backing[PATH_MAX]; unsigned long count; int isl = 0;
     if (c->m->link2symlink && strcmp(h1, h2) != 0) {
@@ -1195,6 +1216,7 @@ SYSDEF(renameat2) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) return (u64)(s64)-EROFS;
     long rr = syscall(SYS_renameat2, AT_FDCWD, h1, AT_FDCWD, h2, (unsigned)a4);
     return rr < 0 ? host_err() : 0;
 }
@@ -1205,6 +1227,7 @@ SYSDEF(symlinkat) {
     if (n < 0) return (u64)(s64)n;
     int r = resolve_at(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     /* The link *content* is stored as the guest wrote it. */
     return symlink(target, host) < 0 ? host_err() : 0;
 }
@@ -1217,6 +1240,7 @@ SYSDEF(linkat) {
     if (r < 0) return (u64)(s64)r;
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, h2)) return (u64)(s64)-EROFS;   /* new name on a :ro bind */
     /* Use host linkat with AT_SYMLINK_FOLLOW so the guest's flag is honored --
      * notably it lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) be
      * materialized, which plain link() cannot do. */
@@ -1247,6 +1271,7 @@ SYSDEF(truncate) {
     char host[PATH_MAX];
     int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return truncate(host, (off_t)(s64)a1) < 0 ? host_err() : 0;
 }
 
@@ -1265,6 +1290,7 @@ SYSDEF(fchmodat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, 0, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return chattr_result(c->m, chmod(host, (mode_t)a2));
 }
 
@@ -1274,6 +1300,7 @@ SYSDEF(fchownat) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     int rr = (gf & G_AT_SYMLINK_NOFOLLOW) ? lchown(host, (uid_t)a2, (gid_t)a3)
                                           : chown(host, (uid_t)a2, (gid_t)a3);
     return chattr_result(c->m, rr);
@@ -1300,6 +1327,7 @@ SYSDEF(utimensat) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
     if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     return utimensat(AT_FDCWD, host, tsp,
                      (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0) < 0
                ? host_err() : 0;

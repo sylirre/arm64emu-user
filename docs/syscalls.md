@@ -68,6 +68,17 @@ proot) and no privilege (unlike `chroot(2)`). `path_resolve` walks the guest pat
 `*at` syscalls resolve `dirfd` via the fd's recorded guest path (`AT_FDCWD` → the
 task's canonical cwd string, which is tracked independently of the host cwd).
 
+**`-bind src:dst[:ro]` mounts** are matched first, before the special zones and
+the rootfs prefix: a resolved guest path at or under `dst` maps to `src +
+remainder` on the host (longest `dst` wins), so a bound subtree is served from
+its real host location — symlinks and all — and reverse lookups (`dirfd`,
+`/proc/self/fd/N`, `getcwd`) translate back to the guest mount point
+(`bind_of_host`). Containment is preserved inside the bind: absolute symlinks
+re-root to the guest root and `..` climbs into the rootfs, never to the host
+parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
+(enforced in the `sys_file.c` handlers via `host_ro`). Binds are listed in the
+synthesized `/proc/mounts` and `/proc/mountinfo`.
+
 **Special zones** are checked on the canonical guest path before prefixing:
 
 - `/dev`: a whitelist passes through to host devices (`null`, `zero`, `full`,

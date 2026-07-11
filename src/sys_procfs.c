@@ -97,18 +97,37 @@ static void put_mounts(int fd, struct Machine *m, int mountinfo) {
           "rw,gid=5,mode=620,ptmxmode=666" },
         { "tmpfs",  "/dev/shm", "tmpfs",  "rw,nosuid,nodev", "rw" },
     };
+    /* -bind mounts follow the pseudo rows. Source is the host directory (as the
+     * user supplied it); the kernel doesn't tag /proc/mounts entries as "bind",
+     * so they read as ordinary mounts, ro or rw per the mount. */
+    size_t np = sizeof pseudo / sizeof pseudo[0];
     if (mountinfo) {
         dprintf(fd, "1 1 %u:%u / / rw,relatime - %s /dev/root rw\n",
                 maj, min, fstype);
-        for (size_t i = 0; i < sizeof pseudo / sizeof pseudo[0]; i++)
+        for (size_t i = 0; i < np; i++)
             dprintf(fd, "%zu 1 0:%zu / %s %s - %s %s %s\n",
                     i + 2, i + 5, pseudo[i].dir, pseudo[i].opts,
                     pseudo[i].type, pseudo[i].src, pseudo[i].sopts);
+        for (int i = 0; i < m->n_binds; i++) {
+            struct stat bst;
+            unsigned bmaj = maj, bmin = min;
+            if (stat(m->binds[i].host, &bst) == 0) {
+                bmaj = major(bst.st_dev);
+                bmin = minor(bst.st_dev);
+            }
+            const char *o = m->binds[i].ro ? "ro,relatime" : "rw,relatime";
+            dprintf(fd, "%zu 1 %u:%u / %s %s - %s %s %s\n",
+                    np + 2 + (size_t)i, bmaj, bmin, m->binds[i].guest, o,
+                    fstype, m->binds[i].host, m->binds[i].ro ? "ro" : "rw");
+        }
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
-        for (size_t i = 0; i < sizeof pseudo / sizeof pseudo[0]; i++)
+        for (size_t i = 0; i < np; i++)
             dprintf(fd, "%s %s %s %s 0 0\n", pseudo[i].src, pseudo[i].dir,
                     pseudo[i].type, pseudo[i].opts);
+        for (int i = 0; i < m->n_binds; i++)
+            dprintf(fd, "%s %s %s %s 0 0\n", m->binds[i].host, m->binds[i].guest,
+                    fstype, m->binds[i].ro ? "ro,relatime" : "rw,relatime");
     }
 }
 

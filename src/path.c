@@ -52,6 +52,7 @@ static int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     ssize_t n = readlink(link, buf, sizeof buf - 1);
     if (n < 0) return -EBADF;
     buf[n] = 0;
+    if (bind_of_host(m, buf, out) >= 0) return 0;   /* dirfd inside a -bind */
     size_t rl = strlen(m->rootfs);
     if (strncmp(buf, m->rootfs, rl) == 0 && (buf[rl] == '/' || buf[rl] == 0)) {
         if (buf[rl] == 0) strcpy(out, "/");
@@ -91,6 +92,8 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
  * Anonymous targets (pipe:[..]) and passthrough paths (/dev, /proc) don't
  * carry the prefix and pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path) {
+    char g[PATH_MAX];
+    if (bind_of_host(m, path, g) >= 0) { strcpy(path, g); return; }   /* -bind */
     size_t rl = strlen(m->rootfs);
     if (rl == 0 || strncmp(path, m->rootfs, rl)) return;
     if (path[rl] == 0) { strcpy(path, "/"); return; }
@@ -131,6 +134,54 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         return 1;
     }
     return 0;
+}
+
+/* host = bind.host + rem, where rem is "" or "/...". bind.host is realpath'd and
+ * never "/" (add_bind rejects a host-root bind), so this is a plain concat. */
+static int join_host(const char *host, const char *rem, char *out) {
+    size_t hl = strlen(host), rl = strlen(rem);
+    if (hl + rl + 1 > PATH_MAX) return -ENAMETOOLONG;
+    memcpy(out, host, hl);
+    memcpy(out + hl, rem, rl + 1);
+    return 0;
+}
+
+/* -bind forward map: longest guest-prefix match on the canonical guest path.
+ * Fills host_out with the bound host path and returns 1; 0 if no bind applies.
+ * Takes precedence over special zones and the rootfs prefix (see path_resolve),
+ * so a bound subtree is served from its real host location. */
+static int bind_match(struct Machine *m, const char *canon, char *host_out) {
+    int best = -1;
+    size_t bestlen = 0;
+    for (int i = 0; i < m->n_binds; i++) {
+        size_t gl = strlen(m->binds[i].guest);
+        if (strncmp(canon, m->binds[i].guest, gl)) continue;
+        if (canon[gl] != 0 && canon[gl] != '/') continue;   /* '/' boundary */
+        if (best < 0 || gl > bestlen) { best = i; bestlen = gl; }
+    }
+    if (best < 0) return 0;
+    return join_host(m->binds[best].host, canon + bestlen, host_out) == 0;
+}
+
+/* Reverse of bind_match: a host path back to its guest view. See machine.h. */
+int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out) {
+    int best = -1;
+    size_t bestlen = 0;
+    for (int i = 0; i < m->n_binds; i++) {
+        size_t hl = strlen(m->binds[i].host);
+        if (strncmp(hostpath, m->binds[i].host, hl)) continue;
+        if (hostpath[hl] != 0 && hostpath[hl] != '/') continue;
+        if (best < 0 || hl > bestlen) { best = i; bestlen = hl; }
+    }
+    if (best < 0) return -1;
+    if (guest_out) {
+        const char *g = m->binds[best].guest, *rem = hostpath + bestlen;
+        size_t gl = strlen(g), rl = strlen(rem);
+        if (gl + rl + 1 > PATH_MAX) return -1;
+        memcpy(guest_out, g, gl);
+        memcpy(guest_out + gl, rem, rl + 1);
+    }
+    return best;
 }
 
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
@@ -181,8 +232,10 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (path_proc_magic(m, canon, tgt)) {   /* /proc self-link: guest target */
             tn = (ssize_t)strlen(tgt);
         } else {
-            r = to_host(m, canon, hostbuf);
-            if (r < 0) return r;
+            if (!bind_match(m, canon, hostbuf)) {   /* -bind subtree, else rootfs */
+                r = to_host(m, canon, hostbuf);
+                if (r < 0) return r;
+            }
             tn = readlink(hostbuf, tgt, sizeof tgt - 1);
             if (tn < 0) continue;         /* not a symlink (or missing) */
             tgt[tn] = 0;
@@ -200,7 +253,8 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (tgt[0] == '/') { canon[0] = '/'; canon[1] = 0; }
     }
 
-    if (!special_host_path(m, canon, host_out)) {
+    if (!bind_match(m, canon, host_out) &&
+        !special_host_path(m, canon, host_out)) {   /* -bind > /dev,/proc > rootfs */
         int r = to_host(m, canon, host_out);
         if (r < 0) return r;
     }

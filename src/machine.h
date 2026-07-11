@@ -42,6 +42,19 @@ struct Machine {
     char cwd[PATH_MAX];       /* canonical guest cwd ("/" based) */
     char exec_path[PATH_MAX]; /* canonical guest path of the running exe */
 
+    /* -bind src:dst[:ro]: expose a host directory at a guest mount point,
+     * generalizing path.c's fixed /dev,/proc passthroughs. A resolved guest
+     * path under `guest` maps to `host` + remainder instead of rootfs+path;
+     * `ro` rejects mutating syscalls under it with -EROFS. Set at startup,
+     * then read-only for the process life (fork copies it, like rootfs). */
+#define BIND_MAX 8
+    struct {
+        char guest[PATH_MAX]; /* canonical guest mount point, no trailing slash */
+        char host[PATH_MAX];  /* realpath'd host source directory */
+        int ro;               /* read-only mount */
+    } binds[BIND_MAX];
+    int n_binds;
+
     /* Exec-time guest argv, NUL-joined — the /proc/self/cmdline content
      * (host /proc shows the emulator's argv). Rebuilt by every load_elf;
      * fork's copy-on-write duplicates it like the rest of the heap. */
@@ -187,5 +200,11 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
 /* Strip the rootfs prefix from a host path in place (guest view of e.g. a
  * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path);
+
+/* If `hostpath` lies under a -bind host prefix (at a '/' boundary), return the
+ * bind index and, when `guest_out` is non-NULL, write the guest-side path
+ * (binds[i].guest + remainder); return -1 if no bind matches. Longest host
+ * prefix wins. Used for reverse mapping (path.c) and the :ro check (sys_file). */
+int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out);
 
 #endif /* A64_MACHINE_H */
