@@ -471,6 +471,35 @@ _start:
     mixv v2
     sect
 
+    // ---- section 7: fused-run page straddles — a pair/ZVA whose span
+    // crosses the page boundary must take the bail path and still commit
+    // exactly like the interpreter. ----
+    adrp x0, pgbuf
+    add x0, x0, :lo12:pgbuf
+    add x0, x0, #4080
+    movz x1, #0x1111, lsl #16
+    movk x1, #0x2222
+    movz x2, #0x3333, lsl #48
+    stp x1, x2, [x0]                // last 16B of the page: fast path
+    ldp x3, x4, [x0]
+    mix x3
+    mix x4
+    add x0, x0, #8
+    stp x2, x1, [x0]                // straddles the boundary: bail
+    ldp x5, x6, [x0]                // (and a straddling load run)
+    mix x5
+    mix x6
+    ldur x7, [x0, #-8]
+    mix x7
+    adrp x0, pgbuf
+    add x0, x0, :lo12:pgbuf
+    add x0, x0, #4032
+    dc zva, x0                      // last ZVA line of the page (fast)
+    ldp x3, x4, [x0, #32]
+    mix x3
+    mix x4
+    sect
+
     // dump checksums
     mov x0, #1                      // fd 1
     adrp x1, out
@@ -483,7 +512,9 @@ _start:
     svc #0
 
     .bss
-    .balign 64
+    .balign 4096
+pgbuf:
+    .skip 8192                      // section 7 page-straddle target
 buf:
     .skip 256
 out:

@@ -247,6 +247,21 @@ static void vra_slow_reload_all(BE *be);
 static void vra_spill(BE *be, unsigned vn);
 static void vra_flush(BE *be, unsigned vn);
 
+/* Map without defining: the register keeps (or gets) a clean state, so a
+ * bail-path slow_store_dirty never stores a not-yet-written value. Used by
+ * the fused memory runs to pre-map load destinations outside the branch. */
+static int ra_map_clean(BE *be, int v) {
+    int h = be->v2h[v];
+    if (h < 0) {
+        h = ra_alloc(be);
+        be->v2h[v] = (s8)h;
+        be->h2v[h] = (u8)v;
+        be->dirty[v] = 0;
+    }
+    be->lru[h] = ++be->stamp;
+    return h;
+}
+
 static void sync_all(BE *be) {                   /* flag-safe (movs only) */
     for (int v = 0; v < VREG_N; v++)
         if (be->v2h[v] >= 0 && be->dirty[v]) { v_store(be, v); be->dirty[v] = 0; }
@@ -790,6 +805,162 @@ fast:
         int hd = ra_def(be, o->dst);
         mov_rr(e, 1, hd, RAX);
     }
+    be->fl = FL_MEM;
+}
+
+/* ---- fused memory runs (probe sharing) ---- */
+
+static int fuse_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("A64_JIT_NOFUSE") == NULL;
+    return v;
+}
+
+#define FUSE_VA_SLOT ((s32)(offsetof(JitEnv, tmp_spill) + 24))
+
+/* [rdx + disp] modrm tail (disp8/32) */
+static void modrm_rdx_disp(Emit *e, int reg, s32 d) {
+    if (d >= -128 && d <= 127) {
+        e8(e, (u8)(0x42 | ((reg & 7) << 3)));
+        e8(e, (u8)d);
+    } else {
+        e8(e, (u8)(0x82 | ((reg & 7) << 3)));
+        e32(e, (u32)d);
+    }
+}
+static void st_rdx_disp(Emit *e, unsigned szlog, int reg, s32 d) {
+    if (szlog == 1) e8(e, 0x66);
+    u8 r = (u8)(0x40 | ((szlog == 3) << 3) | (((reg >> 3) & 1) << 2));
+    if (r != 0x40 || (szlog == 0 && reg >= 4)) e8(e, r);
+    e8(e, szlog == 0 ? 0x88 : 0x89);
+    modrm_rdx_disp(e, reg, d);
+}
+static void ld_rdx_disp(Emit *e, const IROp *p, int reg, s32 d) {
+    unsigned szlog = p->cc;
+    int sign = MDESC_SIGN(p->aux), is64 = MDESC_IS64(p->aux);
+    if (szlog == 3) {
+        rex(e, 1, reg, 0, RDX); e8(e, 0x8B);
+    } else if (sign && is64) {
+        rex(e, 1, reg, 0, RDX);
+        if (szlog == 2) e8(e, 0x63);                     /* movsxd */
+        else { e8(e, 0x0F); e8(e, szlog == 0 ? 0xBE : 0xBF); }
+    } else if (sign) {
+        rex(e, 0, reg, 0, RDX);
+        e8(e, 0x0F); e8(e, szlog == 0 ? 0xBE : 0xBF);    /* movsx r32 */
+    } else if (szlog == 2) {
+        rex(e, 0, reg, 0, RDX); e8(e, 0x8B);
+    } else {
+        rex(e, 0, reg, 0, RDX);
+        e8(e, 0x0F); e8(e, szlog == 0 ? 0xB6 : 0xB7);    /* movzx */
+    }
+    modrm_rdx_disp(e, reg, d);
+}
+
+/* k same-base constant-offset accesses behind ONE span-checked probe
+ * (LDP/STP shapes, DC ZVA's eight stores, prologue spill runs). The bail
+ * path (miss / span page-cross / TBI / perm — or A64_JIT_SLOWMEM) re-runs
+ * every access through its helper in program order, each with its own
+ * baked pc and fault exit, so a fault at access j leaves accesses < j
+ * committed and j's destination unwritten, exactly like the interpreter.
+ * va0 survives the helper calls in a JitEnv spill slot. */
+static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
+    Emit *e = be->e;
+    const IROp *o = &ir->ops[i];
+    int is_st = (o->op == IRO_ST);
+    int need = is_st ? 2 : 1;
+    int hb[8], hd[8];
+
+    s64 lo = (s64)o->imm, hi = lo + (s64)(1u << o->cc);
+    for (int t = 1; t < k; t++) {
+        s64 plo = (s64)ir->ops[i + t].imm;
+        s64 phi = plo + (s64)(1u << ir->ops[i + t].cc);
+        if (plo < lo) lo = plo;
+        if (phi > hi) hi = phi;
+    }
+
+    materialize_flags(be);                       /* the probe needs EFLAGS */
+    int ha = ra_use(be, o->a);
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        if (is_st) hb[t] = ra_use(be, p->b);
+        else hd[t] = (p->dst == VREG_ZERO) ? -1 : ra_map_clean(be, p->dst);
+    }
+
+    /* rsi = va0 = base + lo */
+    if (lo == 0) mov_rr(e, 1, RSI, ha);
+    else if (lo >= INT32_MIN && lo <= INT32_MAX) lea_rbd(e, RSI, ha, (s32)lo);
+    else { mov_ri(e, 1, RSI, (u64)lo); op_rr(e, 1, 0x03, RSI, ha); }
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = jmp_fwd(e);
+        goto fast;
+    }
+    /* the probe compares the SPAN's last byte's page against the tag
+     * stored for va0's page: any crossing of the whole run mismatches */
+    lea_rbd(e, RAX, RSI, (s32)(hi - lo - 1));
+    shift_ri(e, 1, 5, RAX, 12);
+    mov_rr(e, 0, RCX, RSI);
+    shift_ri(e, 0, 5, RCX, 12);
+    alu_ri32(e, 0, 4, RCX, A64_DTLB_ENTRIES - 1);
+    shift_ri(e, 0, 4, RCX, 4);
+    op_rm(e, 1, 0x03, RCX, R15, (s32)offsetof(JitEnv, dtlb));
+    op_rm(e, 1, 0x39, RAX, RCX, 0);
+    slow1 = jcc_fwd(e, CC_NE);
+    ld64(e, RDX, RCX, 8);
+    e8(e, 0xF6); e8(e, 0xC2); e8(e, (u8)need);
+    slow2 = jcc_fwd(e, CC_E);
+    alu_ri32(e, 1, 4, RDX, 0xFFFFFFF8u);
+    mov_rr(e, 0, RAX, RSI);
+    alu_ri32(e, 0, 4, RAX, 0xfff);
+    op_rr(e, 1, 0x01, RAX, RDX);                 /* rdx = host ptr of va0 */
+
+fast:
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        s32 d = (s32)((s64)p->imm - lo);
+        if (is_st) st_rdx_disp(e, (unsigned)p->cc, hb[t], d);
+        else       ld_rdx_disp(e, p, hd[t] < 0 ? RAX : hd[t], d);
+    }
+    u8 *done = jmp_fwd(e);
+
+    /* ---- bail: the helpers, in program order ---- */
+    fwd_here(e, slow0);
+    fwd_here(e, slow1);
+    fwd_here(e, slow2);
+    slow_store_dirty(be);
+    st64(e, RSI, R15, FUSE_VA_SLOT);
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        s32 d = (s32)((s64)p->imm - lo);
+        ld64(e, RSI, R15, FUSE_VA_SLOT);
+        if (d) lea_rbd(e, RSI, RSI, d);
+        mov_rr(e, 1, RDI, R14);
+        if (is_st) {
+            ld_home(be, RDX, p->b);              /* homes are current */
+            mov_ri(e, 1, RCX, p->imm2pc);
+            mov_ri(e, 0, R8, p->aux);
+        } else {
+            mov_ri(e, 1, RDX, p->imm2pc);
+            mov_ri(e, 0, RCX, p->aux);
+        }
+        ld64(e, RAX, R15, is_st ? (s32)offsetof(JitEnv, helper_st)
+                                : (s32)offsetof(JitEnv, helper_ld));
+        e8(e, 0xFF); e8(e, 0xD0);
+        op_rr(e, 0, 0x85, RAX, RAX);
+        u8 *okk = jcc_fwd(e, CC_E);
+        exit_plain(be, p->icnt);
+        fwd_here(e, okk);
+    }
+    slow_reload_clobbered(be);
+    if (!is_st)
+        for (int t = 0; t < k; t++)              /* helpers committed home */
+            if (hd[t] >= 0) v_load_into(be, ir->ops[i + t].dst, hd[t]);
+    fwd_here(e, done);
+
+    if (!is_st)
+        for (int t = 0; t < k; t++)
+            if (hd[t] >= 0) be->dirty[ir->ops[i + t].dst] = 1;
     be->fl = FL_MEM;
 }
 
@@ -3173,7 +3344,13 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             jmp_to(e, be->env->epilogue_rx);
             break;
         }
-        case IRO_LD: case IRO_ST: case IRO_LDV: case IRO_STV:
+        case IRO_LD: case IRO_ST: {
+            int k = fuse_enabled() ? jit_mem_run_len(ir, i) : 1;
+            if (k >= 2) { emit_mem_run(be, ir, i, k); return k; }
+            emit_mem(be, ir, i);
+            break;
+        }
+        case IRO_LDV: case IRO_STV:
             emit_mem(be, ir, i);
             break;
         case IRO_ATOMIC:

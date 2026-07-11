@@ -236,6 +236,21 @@ static int ra_def(BE *be, int v) {
     be->lru[h] = ++be->stamp;
     return h;
 }
+/* Map without defining: keeps (or gets) a clean state so a bail-path
+ * slow_store_dirty never stores a not-yet-written value (fused mem runs
+ * pre-map their load destinations outside the branch). */
+static int ra_map_clean(BE *be, int v) {
+    int h = be->v2h[v];
+    if (h < 0) {
+        h = ra_alloc(be);
+        be->v2h[v] = (s8)h;
+        be->h2v[h] = (u8)v;
+        be->dirty[v] = 0;
+    }
+    be->lru[h] = ++be->stamp;
+    return h;
+}
+
 static void vra_sync_all(BE *be);
 static void vra_inval_all(BE *be);
 static void sync_all(BE *be) {
@@ -619,6 +634,138 @@ fast:
         int hd = ra_def(be, o->dst);
         ei(e, enc_mov(1, (unsigned)hd, 16));
     }
+    be->fl = FL_MEM;
+}
+
+/* ---- fused memory runs (probe sharing; mirrors backend_x86_64.c) ---- */
+
+static int fuse_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("A64_JIT_NOFUSE") == NULL;
+    return v;
+}
+
+#define FUSE_VA_SLOT ((unsigned)(offsetof(JitEnv, tmp_spill) + 24))
+
+/* k same-base constant-offset accesses behind ONE span-checked probe. The
+ * bail path re-runs every access through its helper in program order, each
+ * with its own baked pc and fault exit; va0 survives the calls in a JitEnv
+ * spill slot. */
+static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
+    Emit *e = be->e;
+    const IROp *o = &ir->ops[i];
+    int is_st = (o->op == IRO_ST);
+    int need = is_st ? 2 : 1;
+    int hb[8], hd[8];
+
+    s64 lo = (s64)o->imm, hi = lo + (s64)(1u << o->cc);
+    for (int t = 1; t < k; t++) {
+        s64 plo = (s64)ir->ops[i + t].imm;
+        s64 phi = plo + (s64)(1u << ir->ops[i + t].cc);
+        if (plo < lo) lo = plo;
+        if (phi > hi) hi = phi;
+    }
+
+    materialize_flags(be);                        /* the probe needs NZCV */
+    int ha = ra_use(be, o->a);
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        if (is_st) hb[t] = ra_use(be, p->b);
+        else hd[t] = (p->dst == VREG_ZERO) ? -1 : ra_map_clean(be, p->dst);
+    }
+
+    /* x1 = va0 = base + lo */
+    if (lo == 0) {
+        ei(e, enc_mov(1, 1, (unsigned)ha));
+    } else {
+        u64 mag = lo < 0 ? (u64)(-lo) : (u64)lo;
+        if (!enc_addsub_imm(e, lo < 0, 1, (unsigned)ha, mag)) {
+            emit_imm64(e, 16, (u64)lo);
+            ei(e, enc_addr(1, (unsigned)ha, 16));
+        }
+    }
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = b_fwd(e);
+        goto fast;
+    }
+    /* span-checked probe: compare the run's last byte's page against the
+     * tag stored for va0's page — any crossing of the span mismatches */
+    enc_addsub_imm(e, 0, 16, 1, (u64)(hi - lo - 1));
+    ei(e, enc_ubfm(1, 16, 16, 12, 63));           /* lsr x16, x16, #12 */
+    ei(e, enc_ubfm(1, 17, 1, 8, 63));
+    ei(e, enc_andi64(17, 17, (64 - 4) & 63,
+                     (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
+    ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
+    ei(e, enc_addr(17, 2, 17));
+    ei(e, enc_ldr(3, 2, 17, 0));
+    ei(e, enc_cmp(2, 16));
+    slow1 = bcond_fwd(e, 1);
+    ei(e, enc_ldr(3, 2, 17, 8));
+    slow2 = tbz_fwd(e, 2, need == 2 ? 1 : 0);
+    ei(e, enc_andi64(2, 2, 61, 60));              /* host backing base */
+    ei(e, enc_andi64(16, 1, 0, 11));              /* pageoff of va0 */
+    ei(e, enc_addr(17, 2, 16));                   /* x17 = host ptr va0 */
+
+fast:
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        u64 d = (u64)((s64)p->imm - lo);
+        unsigned szl = p->cc;
+        unsigned addr = 17;
+        if (d) { enc_addsub_imm(e, 0, 16, 17, d); addr = 16; }
+        if (is_st) {
+            ei(e, enc_ldst0(szl, 0, (unsigned)hb[t], addr));
+        } else {
+            unsigned rt = hd[t] < 0 ? 16u : (unsigned)hd[t];
+            int sign = MDESC_SIGN(p->aux), is64 = MDESC_IS64(p->aux);
+            ei(e, enc_ldst0(szl, 1, rt, addr));   /* zero-extended */
+            if (sign) ei(e, enc_sbfm(is64, rt, rt, 0, (1u << szl) * 8 - 1));
+        }
+    }
+    u8 *done = b_fwd(e);
+
+    /* ---- bail: the helpers, in program order ---- */
+    fwd_here(e, slow0);
+    fwd_here(e, slow1);
+    fwd_here(e, slow2);
+    slow_store_dirty(be);
+    ei(e, enc_str(3, 1, 27, FUSE_VA_SLOT));
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        u64 d = (u64)((s64)p->imm - lo);
+        ei(e, enc_ldr(3, 1, 27, FUSE_VA_SLOT));
+        if (d) enc_addsub_imm(e, 0, 1, 1, d);
+        ei(e, enc_mov(1, 0, 28));                 /* x0 = CPU* */
+        if (is_st) {
+            ld_home(be, 2, p->b);                 /* homes are current */
+            emit_imm64(e, 3, p->imm2pc);
+            ei(e, enc_movz(0, 4, p->aux & 0xffff, 0));
+            if (p->aux >> 16) ei(e, enc_movk(0, 4, p->aux >> 16, 1));
+        } else {
+            emit_imm64(e, 2, p->imm2pc);
+            ei(e, enc_movz(0, 3, p->aux & 0xffff, 0));
+            if (p->aux >> 16) ei(e, enc_movk(0, 3, p->aux >> 16, 1));
+        }
+        ei(e, enc_ldr(3, 16, 27,
+                      is_st ? (unsigned)offsetof(JitEnv, helper_st)
+                            : (unsigned)offsetof(JitEnv, helper_ld)));
+        ei(e, enc_blr(16));
+        u8 *okk = cbz_fwd(e, 0, 0);
+        exit_plain(be, p->icnt);
+        fwd_here(e, okk);
+    }
+    slow_reload_clobbered(be);
+    if (!is_st)
+        for (int t = 0; t < k; t++)               /* helpers committed home */
+            if (hd[t] >= 0)
+                v_load_into(be, ir->ops[i + t].dst, hd[t]);
+    fwd_here(e, done);
+
+    if (!is_st)
+        for (int t = 0; t < k; t++)
+            if (hd[t] >= 0) be->dirty[ir->ops[i + t].dst] = 1;
     be->fl = FL_MEM;
 }
 
@@ -1632,7 +1779,13 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             b_to(e, be->env->epilogue_rx);
             break;
         }
-        case IRO_LD: case IRO_ST: case IRO_LDV: case IRO_STV:
+        case IRO_LD: case IRO_ST: {
+            int k = fuse_enabled() ? jit_mem_run_len(ir, i) : 1;
+            if (k >= 2) { emit_mem_run(be, ir, i, k); return k; }
+            emit_mem(be, ir, i);
+            break;
+        }
+        case IRO_LDV: case IRO_STV:
             emit_mem(be, ir, i);
             break;
         case IRO_ATOMIC:

@@ -241,4 +241,10 @@ typedef struct IRBlock {
  * pend_exc recorded), and runs the liveness/flag-death pass first. */
 u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns);
 
+/* Length (>= 1) of the fusable memory-op run starting at op i: consecutive
+ * integer LD or ST ops off the same unclobbered base with constant offsets
+ * whose whole span fits one guest page (and a small register budget). The
+ * backends emit one span-checked D-TLB probe for the run. */
+int jit_mem_run_len(const IRBlock *ir, int i);
+
 #endif /* A64_JIT_IR_H */

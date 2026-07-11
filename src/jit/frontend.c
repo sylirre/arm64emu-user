@@ -1493,6 +1493,36 @@ static void fe_liveness(IRBlock *ir) {
     }
 }
 
+int jit_mem_run_len(const IRBlock *ir, int i) {
+    const IROp *o = &ir->ops[i];
+    if (o->op != IRO_LD && o->op != IRO_ST) return 1;
+    s64 lo = (s64)o->imm, hi = lo + (s64)(1u << o->cc);
+    u8 seen[6];
+    int nseen = 0;
+    seen[nseen++] = o->op == IRO_ST ? o->b : o->dst;
+    int k = 1;
+    for (; i + k < ir->n && k < 8; k++) {
+        const IROp *p = &ir->ops[i + k];
+        if (p->op != o->op || p->a != o->a) break;
+        if (o->op == IRO_LD && ir->ops[i + k - 1].dst == o->a)
+            break;                    /* a prior load clobbered the base */
+        s64 plo = (s64)p->imm, phi = plo + (s64)(1u << p->cc);
+        s64 nlo = plo < lo ? plo : lo, nhi = phi > hi ? phi : hi;
+        if (nhi - nlo > 4096) break;  /* span must fit one guest page */
+        u8 r = p->op == IRO_ST ? p->b : p->dst;
+        int found = 0;
+        for (int t = 0; t < nseen; t++)
+            if (seen[t] == r) { found = 1; break; }
+        if (!found) {
+            if (nseen >= 6) break;    /* register budget */
+            seen[nseen++] = r;
+        }
+        lo = nlo;
+        hi = nhi;
+    }
+    return k;
+}
+
 u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns) {
     ir->n = 0;
     ir->ninsns = 0;
