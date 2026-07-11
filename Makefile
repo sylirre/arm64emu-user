@@ -41,8 +41,11 @@ test32: arm64chroot32
 	tests/run_tests.sh ./arm64chroot32
 
 # The ENTIRE differential suite with the JIT enabled (same wrapper trick as
-# test-seccomp): the qemu oracle keeps the translator honest.
+# test-seccomp): the qemu oracle keeps the translator honest. Random-input
+# FP consistency (jit vs interpreter, same host) runs first — the FP corner
+# semantics are host-C by design and have no qemu oracle.
 test-jit: arm64chroot
+	tests/run_consist.sh ./arm64chroot
 	printf '#!/bin/sh\nexec ./arm64chroot -jit "$$@"\n' > tests/jit_emu.sh
 	chmod +x tests/jit_emu.sh
 	tests/run_tests.sh tests/jit_emu.sh

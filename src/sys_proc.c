@@ -26,11 +26,13 @@ SYSDEF(exit) {
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
      * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
     if (g_tls.tid != getpid()) { c->stop = true; return 0; }
+    jit_stats_flush();
     _exit((int)a0);
 }
 
 SYSDEF(exit_group) {
     (void)c; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    jit_stats_flush();
     _exit((int)a0);   /* terminates the whole process (all threads) */
 }
 

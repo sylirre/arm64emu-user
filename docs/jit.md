@@ -20,11 +20,16 @@ Measured on an x86-64 host with small static AArch64 kernels
 
 | kernel   | speedup | notes                                       |
 |----------|---------|---------------------------------------------|
+| strops   | ~13×    | glibc strlen/memchr/strcmp/memset/memcpy (string-idiom vectors, DC ZVA; ~2× faster than qemu) |
 | int_alu  | ~12×    | register-bound ALU + data-dependent branches |
-| lockping | ~9×     | pthread mutex ping-pong + LSE fetch-add (inline atomics; ~1.4× faster than qemu here) |
+| lockping | ~10×    | pthread mutex ping-pong + LSE fetch-add (inline atomics; faster than qemu) |
+| fpvec    | ~10×    | scalar FP recurrence + vectorized byte loop (inline FP/SIMD incl. FMA and conversions; ~2× faster than qemu) |
 | calls    | ~7×     | recursion + indirect calls (block chaining, jump cache) |
-| fpvec    | ~5×     | scalar FP recurrence + vectorized byte loop (inline FP/SIMD; on par with qemu) |
 | memops   | ~2×     | pure load/store/pointer-chase (softmmu-bound: a table walk per access is the price of decoupled guest VAs; qemu-user pays none) |
+
+Real workloads land near the top of that range once translation warms up:
+`gzip` and `find` over a Debian rootfs retire **99.9%+ of their instructions
+natively** (`A64_JIT_STATS`, below).
 
 Run `tests/bench/run_bench.sh ./arm64chroot` to reproduce (also times
 `qemu-aarch64` for scale). `A64CHROOT_JIT_MB=N` sets the per-thread code-cache
@@ -72,32 +77,74 @@ it stores the dirty register snapshot, calls the helper (`jit_ld`/`jit_st`/…,
 the full `translate()` path with the faulting PC baked in), and reloads the
 call-clobbered mappings, so both paths converge on the same allocator state
 and exceptions stay precise. Misses, permission failures, page crossings and
-top-byte-tagged pointers all take that branch. Integer and FP/SIMD single
-loads/stores and pairs are inlined — including integer `LDP`, whose
-all-or-nothing register commit is preserved by loading into IR temps and
-committing after both halves succeed.
+top-byte-tagged pointers all take that branch.
+
+Coverage is the full load/store map, not just the predecoded common forms:
+every addressing mode (unsigned/unscaled/pre/post-index, register-offset,
+literal) for every width and signedness, integer and SIMD alike; the pair
+forms including `LDPSW`, the non-temporal pairs and S-register pairs; and
+contiguous `LD1/ST1` multiple-structure (1–4 registers, immediate or register
+post-index). Integer `LDP`'s all-or-nothing register commit is preserved by
+loading into IR temps and committing after both halves succeed, and a
+base-clobbering `ldr x2, [x2, #8]!` resolves writeback-wins exactly like the
+interpreter. `DC ZVA` — glibc memset's bulk path (DCZID advertises 64-byte
+blocks) — inlines as eight zero stores through the same write probe, which
+also keeps the self-modifying-code rules intact.
 
 **Inline atomics.** LDXR/LDAXR record the exclusive monitor and STXR/STLXR
 resolve it with a host compare-and-swap against the recorded value (the
 interpreter's SMP-correct scheme, inlined); LSE `LDADD/LDCLR/LDEOR/LDSET/SWP/
 CAS` become host lock-prefixed RMW ops (x86-64) or `ldaxr/stlxr` loops
-(AArch64), and `LDAR/LDAPR/STLR` become single-copy-atomic ordered accesses.
-Guest `DMB/DSB` emit one host fence inline, and `MRS/MSR TPIDR_EL0` (TLS) is
-a CPU-struct move — none of these end the block anymore. Any misaligned or
-TLB-missing atomic re-runs the whole instruction through `jit_exec1`.
-`CASP/LDXP/STXP` and the min/max LSE ops stay helpers.
+(AArch64), `LDSMAX..LDUMIN` become compare-and-swap loops with a
+compare-select at the access width, and `LDAR/LDAPR/STLR` become
+single-copy-atomic ordered accesses. Guest `DMB/DSB` emit one host fence
+inline, and `MRS/MSR TPIDR_EL0` (TLS) is a CPU-struct move — none of these
+end the block anymore. Any misaligned or TLB-missing atomic re-runs the
+whole instruction through `jit_exec1`. `CASP/LDXP/STXP` stay helpers.
 
 **Inline vector / scalar FP.** The interpreter computes FP with host C
-`float`/`double`, so host FP instructions match it bit-for-bit on the same
-host — no NaN or rounding-mode gating is needed (the one FPCR-sensitive op,
-`FCVT`-class conversion, stays a helper, as does everything saturating or
-narrowing). Inlined per a per-host fidelity table (`be_vop_ok`): vector
-bitwise (AND/BIC/ORR/EOR/BSL/BIT/BIF), ADD/SUB, CMEQ/CMGT (SSE2 sizes on
-x86-64), shifts by immediate, MOVI/MVNI (expanded at translate time),
-DUP/INS/UMOV/SMOV lane moves, scalar FADD/FSUB/FMUL/FDIV/FNMUL/FSQRT/FABS/
-FNEG/FMOV(+imm, +gpr), FCMP/FCMPE and FCSEL. The AArch64 backend re-emits
-the guest word itself with the register fields renumbered onto scratch host
-vector registers, so its semantics are the guest's by construction.
+`float`/`double`, so host FP instructions match it on the same host — with
+one caveat: when an operation *produces a NaN* (NaN inputs, `inf×0`,
+`inf−inf`, `0/0`), the result bits depend on the compiler's operand ordering
+inside the interpreter (and, for the FMA family, on gcc having CSE'd `n*m`
+across the four forms, which defeats `-ffp-contract`). FP **arithmetic** is
+therefore *NaN-gated*: the inline code computes the result, and a NaN result
+discards it and re-runs the instruction in the interpreter — every non-NaN
+result is order-independent IEEE arithmetic and stays inline. The gate makes
+the equivalence robust against toolchain changes; `tests/run_consist.sh`
+(random bit patterns through every inline FP class, jit vs. interpreter on
+the same host) enforces it on both backends.
+
+Inlined per a per-host fidelity table (`be_vop_ok`):
+
+- **integer vectors**: bitwise (AND/BIC/ORR/EOR/BSL/BIT/BIF), ADD/SUB,
+  MUL (AArch64), all register compares (CMEQ/CMGT/CMGE/CMHI/CMHS/CMTST) and
+  compares with zero, MIN/MAX (both signs), pairwise ADDP and MIN/MAX-P
+  (glibc's strlen/memchr inner loop), across-lanes ADDV/MINV/MAXV (AArch64),
+  ABS/NEG/NOT, CNT/CLZ/CLS/RBIT/REV (AArch64), XTN(2), shifts by immediate
+  including the narrowing SHRN(2) and widening USHLL/SSHLL(2), MOVI/MVNI,
+  DUP/INS/UMOV/SMOV lane moves. On x86-64 a few need SSSE3 (ABS) or SSE4.1
+  (32-bit min/max forms) and fall back to the helper on older CPUs.
+- **vector FP**: FADD/FSUB/FMUL/FDIV/FABD/FMLA/FMLS (NaN-gated) and the
+  mask compares FCMEQ/FCMGE/FCMGT/FACGE/FACGT.
+- **scalar FP**: FADD/FSUB/FMUL/FDIV/FNMUL, the FMADD/FMSUB/FNMADD/FNMSUB
+  family (computed unfused on both hosts, matching the interpreter),
+  FSQRT/FABS/FNEG/FMOV(+imm, +gpr), FMAX/FMIN(NM) (x86-64: `maxsd` *is* the
+  interpreter's ternary), FCMP/FCMPE, FCCMP/FCCMPE, FCSEL, and the
+  conversions SCVTF/UCVTF, FCVTZS/FCVTZU and FCVT S↔D. The rounding-variant
+  conversions (FCVTNS/…), fixed-point forms and everything saturating stay
+  helpers.
+
+The AArch64 backend re-emits the guest word itself with the register fields
+renumbered onto scratch host vector registers, so its semantics are the
+guest's by construction; the scalar-FP arithmetic classes instead emit
+explicit unfused sequences (see the NaN gate above).
+
+**Finding what still falls back.** `A64_JIT_STATS=1` (or `=/path/to/file`)
+counts every instruction executed through the `exec_a64` helper and dumps the
+top offenders by exact instruction word at process exit — feed the words to a
+disassembler. This is how the round-3 inlining list was chosen; `gzip` and
+`find` now retire ≥99.9% of instructions natively (the remainder is `SVC`).
 
 ## Correctness model
 
@@ -149,9 +196,13 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
 
 ## Testing
 
-- `make test-jit` runs the entire differential suite (bit-exact vs.
-  `qemu-aarch64`) with `-jit` on — the same wrapper trick as `make
-  test-seccomp`.
+- `make test-jit` first runs `tests/run_consist.sh` (random-input FP
+  consistency, jit vs. interpreter on the same host — the FP corner semantics
+  are host-C by design and have no qemu oracle), then the entire differential
+  suite (bit-exact vs. `qemu-aarch64`) with `-jit` on — the same wrapper
+  trick as `make test-seccomp`. `tests/asm/round3.S` is the targeted vector
+  for everything inlined in round 3 (addressing forms, bitfields, DC ZVA,
+  LSE min/max, the vector classes, scalar FP).
 - `make test` (interpreter) must stay green: the JIT only adds a run-loop rung
   and leaves the default path untouched.
 - AArch64-host coverage is a cross build (`aarch64-linux-gnu-gcc -static`) run

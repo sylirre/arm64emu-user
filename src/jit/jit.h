@@ -54,4 +54,8 @@ void jit_fork_child(void);
 /* Guest thread exit: unregister and release this thread's JIT resources. */
 void jit_thread_exit(void);
 
+/* Process termination via _exit (exit/exit_group syscalls bypass atexit):
+ * flush the A64_JIT_STATS report if it is enabled. No-op otherwise. */
+void jit_stats_flush(void);
+
 #endif /* A64_JIT_H */

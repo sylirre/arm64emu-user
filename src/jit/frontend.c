@@ -170,11 +170,25 @@ static void put_wb(IRBlock *ir, unsigned rn, s64 imm) {   /* base += imm */
 /* Load into IR temp k (dst = VREG_TMP0+k, home = env->tmp_spill[k]): LDP's
  * halves, committed to the guest registers only after both succeed. */
 static void put_ld_tmp(IRBlock *ir, u8 base, s64 off, unsigned k,
-                       unsigned szlog, int is64, u64 pc) {
+                       unsigned szlog, int sign, int is64, u64 pc) {
     IROp *o = ir_put(ir, IRO_LD, (u8)is64, (u8)(VREG_TMP0 + k), base, 0,
                      (u8)szlog, (u64)off,
-                     MDESC_MAKE(k, szlog, 0, is64) | MDESC_TMPBIT);
+                     MDESC_MAKE(k, szlog, sign, is64) | MDESC_TMPBIT);
     o->imm2pc = pc;
+}
+/* Pre/post-indexed load: the interpreter computes the writeback value from
+ * the OLD base and applies it AFTER the register write (base wins when
+ * rt == rn), so a base-clobbering load must stash the base in TMP2 first. */
+static void put_ld_wb(IRBlock *ir, unsigned rn, s64 imm, unsigned rt,
+                      unsigned szlog, int sign, int is64, int pre, u64 pc) {
+    if (rt == rn && rt != 31) {
+        ir_put(ir, IRO_MOV, 1, VREG_TMP2, rsp(rn), 0, 0, 0, 0);
+        put_ld(ir, VREG_TMP2, pre ? imm : 0, rt, szlog, sign, is64, pc);
+        ir_put(ir, IRO_ADDI, 1, (u8)rn, VREG_TMP2, 0, 0, (u64)imm, 0);
+    } else {
+        put_ld(ir, rsp(rn), pre ? imm : 0, rt, szlog, sign, is64, pc);
+        put_wb(ir, rn, imm);
+    }
 }
 
 /* Inline vector / scalar-FP ALU (exec_fpsimd is the reference; the
@@ -224,7 +238,6 @@ static u64 fe_expand_imm(unsigned op, unsigned cmode, unsigned imm8) {
 }
 
 static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
-    (void)pc;
     unsigned rd = insn & 31, rn = (insn >> 5) & 31;
     u32 vclass = ~0u;
     u8 gdst = VREG_ZERO, gsrc = VREG_ZERO;   /* guest GPRs involved */
@@ -232,12 +245,84 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
 
     if ((insn & 0x9F200400u) == 0x0E200400u) {
         /* vector three-same (bit31=0, 28:24=01110, 21=1, 10=1) */
-        unsigned U = (insn >> 29) & 1;
+        unsigned U = (insn >> 29) & 1, Q = (insn >> 30) & 1;
         unsigned opc = (insn >> 11) & 0x1f;
+        unsigned size3 = (insn >> 22) & 3;
         if (opc == 0x03) vclass = VC_BITW;
         else if (opc == 0x10) vclass = VC_ADDSUB;
-        else if ((opc == 0x11 && U) || opc == 0x06 || opc == 0x07)
-            vclass = VC_CM3;
+        else if (opc == 0x11 || opc == 0x06 || opc == 0x07)
+            vclass = VC_CM3;                     /* +CMTST (U=0 0x11) */
+        else if ((opc == 0x0c || opc == 0x0d) && size3 != 3)
+            vclass = VC_MINMAX;
+        else if (opc == 0x13 && !U && size3 != 3)
+            vclass = VC_MUL3;
+        else if ((opc == 0x17 && !U && !(size3 == 3 && !Q)) ||
+                 ((opc == 0x14 || opc == 0x15) && size3 != 3))
+            vclass = VC_PAIRI;                   /* ADDP, S/U MAXP/MINP */
+        else if (opc >= 0x18 && !(((insn >> 22) & 1) && !Q)) {
+            /* FP page (sz=bit22; .2d needs Q). Arith is NaN-gated and
+             * self-counting; the mask compares are exact as-is. */
+            unsigned key = (U << 6) | (((insn >> 23) & 1) << 5) | opc;
+            switch (key) {
+                case 0x19: case 0x39:            /* FMLA / FMLS */
+                case 0x1a: case 0x3a:            /* FADD / FSUB */
+                case 0x5b: case 0x5f: case 0x7a: /* FMUL / FDIV / FABD */
+                    vclass = VC_VF3S; break;
+                case 0x1c: case 0x5c: case 0x7c: /* FCMEQ / FCMGE / FCMGT */
+                case 0x5d: case 0x7d:            /* FACGE / FACGT */
+                    vclass = VC_VFCM; break;
+                default: break;
+            }
+        }
+    } else if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
+        /* two-register misc (21:17 = 10000, 11:10 = 10); the whitelist
+         * mirrors simd_two_misc's coverage and the architectural size
+         * constraints, so anything else keeps the helper (and its
+         * undefined-instruction behavior). */
+        unsigned U = (insn >> 29) & 1, Q = (insn >> 30) & 1;
+        unsigned size = (insn >> 22) & 3;
+        switch ((U << 5) | ((insn >> 12) & 0x1f)) {
+            case 0x00:                           /* REV64 */
+                if (size <= 2) vclass = VC_2MISC;
+                break;
+            case 0x20:                           /* REV32 */
+                if (size <= 1) vclass = VC_2MISC;
+                break;
+            case 0x01:                           /* REV16 */
+                if (size == 0) vclass = VC_2MISC;
+                break;
+            case 0x02: case 0x22:                /* SADDLP / UADDLP */
+            case 0x04: case 0x24:                /* CLS / CLZ */
+                if (size <= 2) vclass = VC_2MISC;
+                break;
+            case 0x05:                           /* CNT */
+                if (size == 0) vclass = VC_2MISC;
+                break;
+            case 0x25:                           /* NOT (sz 0) / RBIT (sz 1) */
+                if (size <= 1) vclass = VC_2MISC;
+                break;
+            case 0x08: case 0x28:                /* CMGT / CMGE #0 */
+            case 0x09: case 0x29:                /* CMEQ / CMLE #0 */
+            case 0x0a:                           /* CMLT #0 */
+            case 0x0b: case 0x2b:                /* ABS / NEG */
+                if (!(size == 3 && !Q)) vclass = VC_2MISC;
+                break;
+            case 0x12:                           /* XTN / XTN2 */
+            case 0x33:                           /* SHLL / SHLL2 */
+                if (size <= 2) vclass = VC_2MISC;
+                break;
+            default:
+                break;
+        }
+    } else if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
+        /* across-lanes reductions (21:17 = 11000) */
+        unsigned U = (insn >> 29) & 1, Q = (insn >> 30) & 1;
+        unsigned size = (insn >> 22) & 3;
+        unsigned opc17 = (insn >> 12) & 0x1f;
+        if (((opc17 == 0x1b && !U) ||            /* ADDV */
+             opc17 == 0x0a || opc17 == 0x1a) &&  /* S/U MAXV / MINV */
+            (size <= 1 || (size == 2 && Q)))
+            vclass = VC_ACROSS;
     } else if ((insn & 0x9FF80400u) == 0x0F000400u) {
         /* modified immediate (28:19 = 0111100000, bit10=1) */
         unsigned Q = (insn >> 30) & 1, op = (insn >> 29) & 1;
@@ -265,7 +350,11 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                ((insn >> 19) & 0xf) != 0) {
         /* shift immediate (28:23 = 011110, bit10 = 1, immh != 0) */
         unsigned U = (insn >> 29) & 1, opc = (insn >> 11) & 0x1f;
+        unsigned immh = (insn >> 19) & 0xf;
         if ((opc == 0x0a && !U) || opc == 0x00) vclass = VC_SHIFTI;
+        else if ((opc == 0x10 && !U && immh <= 7) ||   /* SHRN(2): narrow */
+                 (opc == 0x14 && immh <= 7))           /* S/USHLL(2): widen */
+            vclass = VC_SHIFTI;
     } else if ((insn & 0x9FE08400u) == 0x0E000400u) {
         /* AdvSIMD copy (28:21 = 01110000, bit15 = 0, bit10 = 1); the
          * interpreter's simd_copy semantics are mirrored exactly, including
@@ -283,12 +372,19 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             vclass = VC_COPY;
             gdst = rx(rd);
         }
+    } else if ((insn & 0xFF000000u) == 0x1F000000u) {
+        /* scalar FP data-processing 3-source: FMADD/FMSUB/FNMADD/FNMSUB.
+         * exec_fp_dp3 computes a +- n*m in host C (uncontracted mul+add on
+         * SSE2; contracted to fmadd on the a64 cross build — both match the
+         * same-host interpreter binary). */
+        unsigned ftype = (insn >> 22) & 3;
+        if (ftype == 0 || ftype == 1) vclass = VC_F3;
     } else if ((insn & 0x7F000000u) == 0x1E000000u) {
         /* scalar FP */
         unsigned ftype = (insn >> 22) & 3, o2 = (insn >> 10) & 3;
         if (((insn >> 24) & 0x1f) == 0x1e && ((insn >> 21) & 1) == 1 &&
             ((insn >> 10) & 0x3f) == 0) {
-            /* FP<->integer: only the FMOV bit-move forms */
+            /* FP<->integer: FMOV bit moves, SCVTF/UCVTF, FCVTZS/FCVTZU */
             unsigned sf = insn >> 31, rmode = (insn >> 19) & 3;
             unsigned opcode = (insn >> 16) & 7;
             if (sf == 1 && ftype == 2 && rmode == 1 &&
@@ -299,6 +395,16 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                        ((ftype == 0 && sf == 0) || (ftype == 1 && sf == 1))) {
                 vclass = VC_FMOVG;
                 if (opcode == 6) gdst = rx(rd); else gsrc = rx(rn);
+            } else if (ftype <= 1 && rmode == 0 &&
+                       (opcode == 2 || opcode == 3) && rn != 31) {
+                vclass = VC_CVTIF;               /* SCVTF/UCVTF from gpr */
+                gsrc = rx(rn);
+            } else if (ftype <= 1 && rmode == 3 &&
+                       (opcode == 0 || opcode == 1)) {
+                vclass = VC_CVTFI;               /* FCVTZS/FCVTZU to gpr;
+                                                  * N/P/M/A modes stay helpers
+                                                  * (f_round is ties-away) */
+                gdst = rx(rd);
             }
         } else if ((ftype == 0 || ftype == 1) && ((insn >> 21) & 1) == 1) {
             if (o2 == 0 && ((insn >> 12) & 1) == 1) {        /* FMOV #imm */
@@ -320,20 +426,33 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             } else if (o2 == 0 && ((insn >> 14) & 1) == 1) { /* 1-source */
                 unsigned opc = (insn >> 15) & 0x3f;
                 if (opc <= 0x3) vclass = VC_F1;  /* FMOV/FABS/FNEG/FSQRT */
+                else if ((opc == 0x4 && ftype == 1) ||
+                         (opc == 0x5 && ftype == 0))
+                    vclass = VC_FCVT;            /* FCVT S<->D (plain casts) */
             } else if (o2 == 2) {                            /* 2-source */
                 unsigned opc = (insn >> 12) & 0xf;
-                if (opc <= 0x3 || opc == 0x8) vclass = VC_F2; /* +FNMUL */
+                if (opc <= 0x8) vclass = VC_F2;  /* +FNMUL, +FMAX..FMINNM */
             } else if (o2 == 3) {                            /* FCSEL */
                 vclass = VC_FCSEL;
                 aux_extra = VF_READF;
+            } else if (o2 == 1) {                            /* FCCMP(E) */
+                vclass = VC_FCCMP;
+                aux_extra = VF_READF | VF_SETF;
             }
         }
     }
 
     if (vclass == ~0u || !be_vop_ok(vclass, insn)) return 0;
-    ir_put(ir, IRO_VOP, 0, gdst, gsrc, VREG_ZERO, 0, (u64)insn,
-           vclass | aux_extra);
-    ir->ninsns++;
+    IROp *o = ir_put(ir, IRO_VOP, 0, gdst, gsrc, VREG_ZERO, 0, (u64)insn,
+                     vclass | aux_extra);
+    o->imm2pc = pc;
+    /* FP arithmetic results are NaN-gated (a NaN result means the
+     * compiler's operand-order-dependent NaN propagation in the interpreter
+     * would show — re-run there). Those classes follow the atomics'
+     * self-counting discipline: not in ninsns, the fast path bumps icount
+     * inline. */
+    if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S)
+        ir->ninsns++;
     return 1;
 }
 
@@ -378,14 +497,216 @@ static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
         else if (o3 && opc == 4 && rs == 31)     /* LDAPR */
             o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
                        VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
-        else if (!o3 && opc < 4)                 /* LDADD/LDCLR/LDEOR/LDSET */
+        else if (!o3)                            /* LDADD..LDSET, LDSMAX..LDUMIN */
             o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
                        (u64)insn, AT_MAKE(AT_LDADD + opc, szl, A, R));
-        /* LDSMAX..LDUMIN (opc 4-7): helper */
     }
     if (!o) return 0;
     o->imm2pc = pc;
     return 1;
+}
+
+/* Load/store forms predecode leaves PD_GENERIC (decode.c ldst_register /
+ * ldst_pair / ldst_literal are the reference): signed and sub-word pre/post
+ * index, signed register-offset, all SIMD register-offset and non-Q
+ * writeback forms, LDRSW literal, LDPSW, the non-temporal pairs and S-sized
+ * vector pairs. Address math and commit order mirror the interpreter:
+ * writeback only after a successful access, computed from the old base.
+ * Returns 1 when handled (caller counts the insn); 0 = helper. */
+static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
+    if (((insn >> 25) & 5) != 4) return 0;         /* loads/stores top group */
+    unsigned b2927 = (insn >> 27) & 7;
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rt2 = (insn >> 10) & 31;
+    unsigned size = insn >> 30, opc = (insn >> 22) & 3;
+    int V = (insn >> 26) & 1;
+
+    if (b2927 == 3 && ((insn >> 24) & 3) == 0) {   /* literal */
+        if (V) return 0;
+        if (size == 2) {                           /* LDRSW (literal) */
+            s64 off = (s64)((s32)(insn << 8) >> 13) << 2;
+            ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, pc + off, 0);
+            put_ld(ir, VREG_TMP0, 0, rt, 2, 1, 1, pc);
+            return 1;
+        }
+        if (size == 3) return 1;                   /* PRFM (literal): nop */
+        return 0;
+    }
+
+    if (b2927 == 5) {                              /* pairs (opc = size here) */
+        unsigned mode = (insn >> 23) & 7;          /* 0 NP, 1 post, 3 pre */
+        int L = (insn >> 22) & 1;
+        opc = size;
+        if (mode > 3) return 0;
+        if (V) {
+            if (opc > 2) return 0;
+            unsigned vszl = opc + 2;
+            s64 imm = (s64)((s32)(insn << 10) >> 25) << vszl;
+            s64 a0 = (mode == 1) ? 0 : imm;
+            if (L) {
+                put_ldv(ir, rsp(rn), a0, rt, vszl, pc);
+                put_ldv(ir, rsp(rn), a0 + (1 << vszl), rt2, vszl, pc);
+            } else {
+                put_stv(ir, rsp(rn), a0, rt, vszl, pc);
+                put_stv(ir, rsp(rn), a0 + (1 << vszl), rt2, vszl, pc);
+            }
+            if (mode == 1 || mode == 3) put_wb(ir, rn, imm);
+            return 1;
+        }
+        unsigned szl = (opc == 2) ? 3 : 2, esz = 1u << szl;
+        int sign = (opc == 1);                     /* LDPSW */
+        s64 imm = (s64)((s32)(insn << 10) >> 25) << szl;
+        if (opc == 3 || (sign && (!L || mode == 0))) return 0;
+        if (L) {                                   /* all-or-nothing commit */
+            int wb = (mode == 1 || mode == 3);
+            s64 a0 = (mode == 1) ? 0 : imm;
+            if (wb) {                              /* old base survives in TMP2 */
+                if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(rn), 0, 0, (u64)a0, 0);
+                else    ir_put(ir, IRO_MOV,  1, VREG_TMP2, rsp(rn), 0, 0, 0, 0);
+                put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, sign, 1, pc);
+                put_ld_tmp(ir, VREG_TMP2, (s64)esz, 1, szl, sign, 1, pc);
+            } else {
+                put_ld_tmp(ir, rsp(rn), a0,             0, szl, sign, 1, pc);
+                put_ld_tmp(ir, rsp(rn), a0 + (s64)esz,  1, szl, sign, 1, pc);
+            }
+            u8 w = (u8)(sign || opc == 2);
+            if (rt  != 31) ir_put(ir, IRO_MOV, w, (u8)rt,  VREG_TMP0, 0, 0, 0, 0);
+            if (rt2 != 31) ir_put(ir, IRO_MOV, w, (u8)rt2, VREG_TMP1, 0, 0, 0, 0);
+            if (wb) ir_put(ir, IRO_ADDI, 1, rsp(rn), VREG_TMP2, 0, 0,
+                           (mode == 1) ? (u64)imm : 0, 0);
+        } else {
+            if (mode != 0) return 0;               /* offset STP: PD covers */
+            put_st(ir, rsp(rn), imm,            rx(rt),  szl, pc);
+            put_st(ir, rsp(rn), imm + (s64)esz, rx(rt2), szl, pc);
+        }
+        return 1;
+    }
+
+    if (b2927 != 7 || ((insn >> 24) & 1)) return 0;    /* imm12: PD covers */
+    unsigned scale = V ? ((opc & 2) ? 4 : size) : size;
+
+    if ((insn >> 21) & 1) {                        /* register offset */
+        if (((insn >> 10) & 3) != 2) return 0;     /* LSE atomics: fe_atomic */
+        if (V) {
+            if ((opc & 2) && size != 0) return 0;
+        } else {
+            if (opc == 2 && size == 3) return 1;   /* PRFM (register): nop */
+            if (opc == 3 && size >= 2) return 0;   /* undefined: helper */
+        }
+        unsigned option = (insn >> 13) & 7;
+        unsigned shift = ((insn >> 12) & 1) ? scale : 0;
+        u8 idx = fe_extended(ir, (insn >> 16) & 31, option, shift);
+        ir_put(ir, IRO_ADD, 1, VREG_TMP1, rsp(rn), idx, 0, 0, 0);
+        if (V) {
+            unsigned vszl = (opc & 2) ? 4 : size;
+            if (opc & 1) put_ldv(ir, VREG_TMP1, 0, rt, vszl, pc);
+            else         put_stv(ir, VREG_TMP1, 0, rt, vszl, pc);
+        } else if (opc == 0) {
+            put_st(ir, VREG_TMP1, 0, rx(rt), size, pc);
+        } else {
+            put_ld(ir, VREG_TMP1, 0, rt, size, opc >= 2, opc != 3, pc);
+        }
+        return 1;
+    }
+
+    unsigned mode = (insn >> 10) & 3;              /* 1 post, 3 pre */
+    if (mode != 1 && mode != 3) return 0;          /* unscaled: PD covers */
+    int pre = (mode == 3);
+    s64 imm9 = (s64)((s32)(insn << 11) >> 23);
+    if (V) {
+        if (opc & 2) return 0;                     /* Q writeback: PD covers */
+        if (opc & 1) put_ldv(ir, rsp(rn), pre ? imm9 : 0, rt, size, pc);
+        else         put_stv(ir, rsp(rn), pre ? imm9 : 0, rt, size, pc);
+        put_wb(ir, rn, imm9);
+        return 1;
+    }
+    if (opc == 0) {                                /* store, any size */
+        put_st(ir, rsp(rn), pre ? imm9 : 0, rx(rt), size, pc);
+        put_wb(ir, rn, imm9);
+        return 1;
+    }
+    if (opc == 2 && size == 3) return 0;           /* PRFM-with-wb: helper */
+    if (opc == 3 && size >= 2) return 0;           /* undefined: helper */
+    put_ld_wb(ir, rn, imm9, rt, size, opc >= 2, opc != 3, pre, pc);
+    return 1;
+}
+
+/* LD1/ST1 multiple-structure, contiguous forms only (decode.c
+ * ldst_vector_multi): whole-register loads/stores of 1-4 consecutive V
+ * registers, committing per register exactly like the interpreter's loop
+ * (a mid-sequence fault keeps the earlier registers and skips writeback).
+ * The de-interleaved LD2/3/4 and single-lane forms stay helpers. */
+static int fe_ld1(IRBlock *ir, u32 insn, u64 pc) {
+    int post;
+    if      ((insn & 0xBFBF0000u) == 0x0C000000u) post = 0;
+    else if ((insn & 0xBFA00000u) == 0x0C800000u) post = 1;
+    else return 0;
+    unsigned nregs;
+    switch ((insn >> 12) & 0xf) {                  /* contiguous opcodes */
+        case 0x2: nregs = 4; break;
+        case 0x6: nregs = 3; break;
+        case 0x7: nregs = 1; break;
+        case 0xa: nregs = 2; break;
+        default: return 0;                         /* LD2/3/4: helper */
+    }
+    unsigned Q = (insn >> 30) & 1, L = (insn >> 22) & 1;
+    unsigned rm = (insn >> 16) & 31, rn = (insn >> 5) & 31, rt = insn & 31;
+    unsigned vszl = Q ? 4 : 3, regbytes = Q ? 16 : 8;
+    for (unsigned r = 0; r < nregs; r++) {
+        if (L) put_ldv(ir, rsp(rn), (s64)(r * regbytes), (rt + r) & 31, vszl, pc);
+        else   put_stv(ir, rsp(rn), (s64)(r * regbytes), (rt + r) & 31, vszl, pc);
+    }
+    if (post) {
+        if (rm == 31) put_wb(ir, rn, (s64)(nregs * regbytes));
+        else ir_put(ir, IRO_ADD, 1, rsp(rn), rsp(rn), (u8)rm, 0, 0, 0);
+    }
+    return 1;
+}
+
+/* Bitfield forms predecode leaves PD_GENERIC: SBFIZ (SBFM with imms < immr)
+ * and the BFM family (BFI/BFXIL). decode.c:189 is the reference; these are
+ * emitted from the ARM alias equivalences using existing shift/mask IR ops.
+ * The N/immr/imms validity filter mirrors predecode's — anything invalid
+ * stays on the helper, which raises the undefined exception. */
+static int fe_bitfield(IRBlock *ir, u32 insn, u64 pc) {
+    (void)pc;
+    if ((insn & 0x1F800000u) != 0x13000000u) return 0;
+    unsigned sf = insn >> 31, opc = (insn >> 29) & 3, N = (insn >> 22) & 1;
+    unsigned immr = (insn >> 16) & 0x3f, imms = (insn >> 10) & 0x3f;
+    unsigned rd = insn & 31, rn = (insn >> 5) & 31;
+    unsigned width = sf ? 64 : 32;
+    u8 w = (u8)sf;
+    if (sf ? (N != 1) : (N != 0 || immr >= 32 || imms >= 32)) return 0;
+
+    if (opc == 0 && imms < immr) {                 /* SBFIZ */
+        if (rd == 31) return 1;                    /* write to XZR: dead */
+        ir_put(ir, IRO_LSLI, w, VREG_TMP0, rx(rn), 0, 0, width - 1 - imms, 0);
+        ir_put(ir, IRO_ASRI, w, (u8)rd, VREG_TMP0, 0, 0, immr - imms - 1, 0);
+        return 1;
+    }
+    if (opc == 1) {                                /* BFM: BFXIL / BFI */
+        if (rd == 31) return 1;
+        /* Masks are < 2^width, and 32-bit guest regs are stored
+         * zero-extended, so full-width (w=1) mask ops are exact. */
+        if (imms >= immr) {                        /* BFXIL */
+            u64 mask = (imms - immr + 1 >= 64)
+                           ? ~0ULL : (1ULL << (imms - immr + 1)) - 1;
+            if (immr)          ir_put(ir, IRO_LSRI, w, VREG_TMP0, rx(rn), 0, 0, immr, 0);
+            else if (rn == 31) ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, 0, 0);
+            else               ir_put(ir, IRO_MOV,  1, VREG_TMP0, (u8)rn, 0, 0, 0, 0);
+            ir_put(ir, IRO_ANDI, 1, VREG_TMP0, VREG_TMP0, 0, 0, mask, 0);
+            ir_put(ir, IRO_ANDI, 1, VREG_TMP1, rx(rd), 0, 0, ~mask, 0);
+            ir_put(ir, IRO_ORR, w, (u8)rd, VREG_TMP0, VREG_TMP1, 0, 0, 0);
+        } else {                                   /* BFI */
+            unsigned lsb = width - immr;
+            u64 mask = (1ULL << (imms + 1)) - 1;   /* imms < immr < width */
+            ir_put(ir, IRO_ANDI, 1, VREG_TMP0, rx(rn), 0, 0, mask, 0);
+            ir_put(ir, IRO_LSLI, 1, VREG_TMP0, VREG_TMP0, 0, 0, lsb, 0);
+            ir_put(ir, IRO_ANDI, 1, VREG_TMP1, rx(rd), 0, 0, ~(mask << lsb), 0);
+            ir_put(ir, IRO_ORR, w, (u8)rd, VREG_TMP0, VREG_TMP1, 0, 0, 0);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* Translate one classified instruction. Emits IR; returns FE_END when the
@@ -810,16 +1131,17 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
         case PD_STRB:    put_st(ir, rsp(e->rn), (s64)e->imm, rx(e->rd), 0, pc); break;
         case PD_STRH:    put_st(ir, rsp(e->rn), (s64)e->imm, rx(e->rd), 1, pc); break;
 
-        /* pre/post-indexed (imm = simm9); writeback after the access */
-        case PD_LDR64PRE:  put_ld(ir, rsp(e->rn), (s64)e->imm, e->rd, 3, 0, 1, pc); put_wb(ir, e->rn, (s64)e->imm); break;
-        case PD_LDR64POST: put_ld(ir, rsp(e->rn), 0,          e->rd, 3, 0, 1, pc); put_wb(ir, e->rn, (s64)e->imm); break;
-        case PD_LDR32PRE:  put_ld(ir, rsp(e->rn), (s64)e->imm, e->rd, 2, 0, 0, pc); put_wb(ir, e->rn, (s64)e->imm); break;
-        case PD_LDR32POST: put_ld(ir, rsp(e->rn), 0,          e->rd, 2, 0, 0, pc); put_wb(ir, e->rn, (s64)e->imm); break;
+        /* pre/post-indexed (imm = simm9); writeback after the access, from
+         * the old base (put_ld_wb handles the rd==rn base-clobber case) */
+        case PD_LDR64PRE:  put_ld_wb(ir, e->rn, (s64)e->imm, e->rd, 3, 0, 1, 1, pc); break;
+        case PD_LDR64POST: put_ld_wb(ir, e->rn, (s64)e->imm, e->rd, 3, 0, 1, 0, pc); break;
+        case PD_LDR32PRE:  put_ld_wb(ir, e->rn, (s64)e->imm, e->rd, 2, 0, 0, 1, pc); break;
+        case PD_LDR32POST: put_ld_wb(ir, e->rn, (s64)e->imm, e->rd, 2, 0, 0, 0, pc); break;
         case PD_STR64PRE:  put_st(ir, rsp(e->rn), (s64)e->imm, rx(e->rd), 3, pc); put_wb(ir, e->rn, (s64)e->imm); break;
         case PD_STR64POST: put_st(ir, rsp(e->rn), 0,          rx(e->rd), 3, pc); put_wb(ir, e->rn, (s64)e->imm); break;
         case PD_STR32PRE:  put_st(ir, rsp(e->rn), (s64)e->imm, rx(e->rd), 2, pc); put_wb(ir, e->rn, (s64)e->imm); break;
         case PD_STR32POST: put_st(ir, rsp(e->rn), 0,          rx(e->rd), 2, pc); put_wb(ir, e->rn, (s64)e->imm); break;
-        case PD_LDRBPOST:  put_ld(ir, rsp(e->rn), 0,          e->rd, 0, 0, 1, pc); put_wb(ir, e->rn, (s64)e->imm); break;
+        case PD_LDRBPOST:  put_ld_wb(ir, e->rn, (s64)e->imm, e->rd, 0, 0, 1, 0, pc); break;
         case PD_STRBPOST:  put_st(ir, rsp(e->rn), 0,          rx(e->rd), 0, pc); put_wb(ir, e->rn, (s64)e->imm); break;
 
         /* register offset (imm = option<<3 | shift): va = base + extend(rm) */
@@ -878,8 +1200,8 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             s64 a0 = post ? 0 : (s64)e->imm;
             if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(e->rn), 0, 0, (u64)a0, 0);
             else    ir_put(ir, IRO_MOV,  1, VREG_TMP2, rsp(e->rn), 0, 0, 0, 0);
-            put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, is64, pc);
-            put_ld_tmp(ir, VREG_TMP2, (s64)esz, 1, szl, is64, pc);
+            put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, 0, is64, pc);
+            put_ld_tmp(ir, VREG_TMP2, (s64)esz, 1, szl, 0, is64, pc);
             if (e->rd != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rd, VREG_TMP0, 0, 0, 0, 0);
             if (e->rm != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rm, VREG_TMP1, 0, 0, 0, 0);
             if (wb) ir_put(ir, IRO_ADDI, 1, rsp(e->rn), VREG_TMP2, 0, 0,
@@ -943,6 +1265,27 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 return FE_CONT;      /* inline atomic (not in ninsns) */
             if (e->op == PD_GENERIC && fe_fpsimd(ir, insn, pc))
                 return FE_CONT;      /* inline vector/FP (counted inside) */
+            if (e->op == PD_GENERIC && fe_ldst_extra(ir, insn, pc)) {
+                ir->ninsns++;        /* inline leftover load/store form */
+                return FE_CONT;
+            }
+            if (e->op == PD_GENERIC && fe_bitfield(ir, insn, pc)) {
+                ir->ninsns++;        /* SBFIZ / BFM family */
+                return FE_CONT;
+            }
+            if (e->op == PD_GENERIC && fe_ld1(ir, insn, pc)) {
+                ir->ninsns++;        /* contiguous LD1/ST1 */
+                return FE_CONT;
+            }
+            if (e->op == PD_GENERIC &&
+                (insn & 0x7FFFFC00u) == 0x5AC00000u) {
+                /* RBIT (dp 1-source, opcode 0): strlen's rbit+clz idiom */
+                if ((insn & 31) != 31)
+                    ir_put(ir, IRO_RBIT, (u8)(insn >> 31), (u8)(insn & 31),
+                           rx((insn >> 5) & 31), 0, 0, 0, 0);
+                ir->ninsns++;
+                return FE_CONT;
+            }
             if (e->op == PD_GENERIC && (insn >> 24) == 0xD5) {
                 /* System family: hints, barriers, sysreg moves, cache ops —
                  * none can branch (IC IVAU is intercepted before pd_fill),
@@ -969,6 +1312,17 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 if ((insn & 0xFFFFF0FFu) == 0xD50330BFu ||   /* DMB */
                     (insn & 0xFFFFF0FFu) == 0xD503309Fu) {   /* DSB */
                     ir_put(ir, IRO_FENCE, 0, VREG_ZERO, VREG_ZERO, 0, 0, 0, 0);
+                    break;
+                }
+                if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {   /* DC ZVA */
+                    /* Zero 64 bytes at Xt & ~63 — glibc memset's bulk path.
+                     * Eight 8-byte zero stores mirror sysreg.c's mem_write
+                     * loop (same order, same first-fault stop), and the
+                     * inline write probes keep the SMC coherence rules. */
+                    ir_put(ir, IRO_ANDI, 1, VREG_TMP2, rx(rt), 0, 0,
+                           ~63ULL, 0);
+                    for (int zi = 0; zi < 8; zi++)
+                        put_st(ir, VREG_TMP2, 8 * zi, VREG_ZERO, 3, pc);
                     break;
                 }
                 if ((insn & 0xFFFFF0FFu) == 0xD50330DFu)     /* ISB */

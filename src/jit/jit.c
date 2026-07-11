@@ -32,6 +32,7 @@
  * jit_flush_all reuses cache memory; it must only run from jit_run's C loop
  * or a block's helper tail (never while another translation could reuse the
  * memory under a block still on this thread's native call stack). */
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +112,108 @@ void jit_notify_mapping_change(void) {
 
 void jit_signal_interrupt(void) {
     g_jit_env.interrupt = 1;        /* own-thread TLS store: signal-safe */
+}
+
+/* ---- optional helper-call profiler (A64_JIT_STATS=1) ----
+ * Ranks the exact instruction words still executed through the exec_a64
+ * helper, so inlining work can be aimed at what a workload actually runs
+ * (feed the words to a disassembler). Per-thread open-addressed tables are
+ * merged into a global one when a thread exits; the process dumps the top
+ * entries at exit. Threads still alive at exit_group are not merged and the
+ * icount ratio only covers merged threads — fine for a profiler. */
+#define JSTAT_SLOTS 4096
+typedef struct { u32 word; u32 pad_; u64 count; } JStat;
+static int g_jit_stats = -1;                 /* -1 until first jit_env_init */
+static int g_jstat_fd = -1;                  /* parked dup of stderr */
+static const char *g_jstat_path;             /* A64_JIT_STATS=/file: append */
+static __thread JStat *t_jstat;
+static __thread u64 t_jstat_lost;
+static JStat g_jstat[JSTAT_SLOTS];
+static u64 g_jstat_lost, g_jstat_icount;
+static pthread_mutex_t g_jstat_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void jstat_add(JStat *tab, u32 insn, u64 n, u64 *lost) {
+    u32 h = (insn ^ (insn >> 13) ^ (insn >> 25)) & (JSTAT_SLOTS - 1);
+    for (u32 i = 0; i < 8; i++) {
+        JStat *s = &tab[(h + i) & (JSTAT_SLOTS - 1)];
+        if (s->count == 0) s->word = insn;
+        if (s->word == insn) { s->count += n; return; }
+    }
+    *lost += n;
+}
+
+static void jstat_bump(u32 insn) {
+    if (!t_jstat) {
+        t_jstat = calloc(JSTAT_SLOTS, sizeof *t_jstat);
+        if (!t_jstat) { g_jit_stats = 0; return; }
+    }
+    jstat_add(t_jstat, insn, 1, &t_jstat_lost);
+}
+
+/* Fold the calling thread's table into the global one. */
+static void jstat_merge(u64 icount) {
+    if (!t_jstat) return;
+    pthread_mutex_lock(&g_jstat_mu);
+    for (u32 i = 0; i < JSTAT_SLOTS; i++)
+        if (t_jstat[i].count)
+            jstat_add(g_jstat, t_jstat[i].word, t_jstat[i].count,
+                      &g_jstat_lost);
+    g_jstat_lost += t_jstat_lost;
+    g_jstat_icount += icount;
+    pthread_mutex_unlock(&g_jstat_mu);
+    free(t_jstat);
+    t_jstat = NULL;
+    t_jstat_lost = 0;
+}
+
+static const char *jstat_class(u32 w) {
+    if ((w >> 24) == 0xD5) return "system";
+    if ((w & 0x3F000000u) == 0x08000000u) return "excl";
+    if ((w & 0x3B200C00u) == 0x38200000u) return "lse";
+    unsigned grp = (w >> 25) & 0xf;
+    if (grp == 0xa || grp == 0xb) return "branch";
+    if ((grp & 5) == 4) return "ldst";
+    if ((grp & 7) == 7) return "fpsimd";
+    return "other";
+}
+
+static int jstat_cmp(const void *a, const void *b) {
+    u64 ca = ((const JStat *)a)->count, cb = ((const JStat *)b)->count;
+    return (ca < cb) - (ca > cb);
+}
+
+static void jstat_dump(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    jstat_merge(g_jit_env.active ? g_jit_env.c->icount : 0);
+    pthread_mutex_lock(&g_jstat_mu);
+    u64 total = g_jstat_lost;
+    for (u32 i = 0; i < JSTAT_SLOTS; i++) total += g_jstat[i].count;
+    /* The guest may have closed stderr (fd 2 is shared with it): write to
+     * the fd parked at enable time, or append to A64_JIT_STATS=<path>. */
+    int fd = g_jstat_path
+                 ? open(g_jstat_path, O_WRONLY | O_CREAT | O_APPEND, 0644)
+                 : g_jstat_fd;
+    if (total && fd >= 0) {
+        qsort(g_jstat, JSTAT_SLOTS, sizeof *g_jstat, jstat_cmp);
+        dprintf(fd, "[jit-stats pid %d] %llu helper insns",
+                (int)getpid(), (unsigned long long)total);
+        if (g_jstat_icount)
+            dprintf(fd, " / %llu executed (%.2f%%)",
+                    (unsigned long long)g_jstat_icount,
+                    100.0 * (double)total / (double)g_jstat_icount);
+        dprintf(fd, "\n");
+        for (u32 i = 0; i < 32 && g_jstat[i].count; i++)
+            dprintf(fd, "[jit-stats]  %12llu  %08x  %s\n",
+                    (unsigned long long)g_jstat[i].count,
+                    (unsigned)g_jstat[i].word, jstat_class(g_jstat[i].word));
+        if (g_jstat_lost)
+            dprintf(fd, "[jit-stats]  %12llu  (table overflow)\n",
+                    (unsigned long long)g_jstat_lost);
+    }
+    if (g_jstat_path && fd >= 0) close(fd);
+    pthread_mutex_unlock(&g_jstat_mu);
 }
 
 /* ---- global sticky code-page map ----
@@ -234,6 +337,20 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_stv = (void *)jit_stv;
     env->dtlb = jit_dtlb_base();
     env->slowmem = getenv("A64_JIT_SLOWMEM") != NULL;
+    pthread_mutex_lock(&g_jstat_mu);
+    if (g_jit_stats < 0) {
+        const char *s = getenv("A64_JIT_STATS");
+        g_jit_stats = s != NULL;
+        if (g_jit_stats) {
+            if (s[0] == '/') g_jstat_path = s;
+            else {
+                g_jstat_fd = fcntl(2, F_DUPFD_CLOEXEC, 900);
+                if (g_jstat_fd < 0) g_jstat_fd = 2;
+            }
+            atexit(jstat_dump);
+        }
+    }
+    pthread_mutex_unlock(&g_jstat_mu);
     if (cache_alloc(env) < 0) return -1;
     env->hash = calloc(JIT_HASH_SIZE, sizeof *env->hash);
     env->pages = calloc(JIT_PAGE_TBL, sizeof *env->pages);
@@ -322,6 +439,12 @@ static void jit_drop_page(JitEnv *env, u64 page) {
     if (dropped) memset(env->jcache, 0, sizeof env->jcache);
 }
 
+/* exit/exit_group terminate via _exit (no atexit); the syscall handlers call
+ * this so an enabled stats report still gets written. */
+void jit_stats_flush(void) {
+    if (g_jit_stats > 0) jstat_dump();
+}
+
 /* ---- helpers called from generated code ---- */
 
 /* Execute one instruction with interpreter semantics. Returns nonzero when
@@ -332,6 +455,7 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->pc = pc + 4;
     exec_a64(c, insn);
     c->icount++;
+    if (UNLIKELY(g_jit_stats > 0)) jstat_bump(insn);
     if (UNLIKELY(g_tls.pend_exc.valid || c->stop || c->halted || g_sig_npend))
         return 1;
     return c->pc != pc + 4;
@@ -498,6 +622,15 @@ void jit_fork_child(void) {
     memset(g_jit_envs, 0, sizeof g_jit_envs);
     JitEnv *env = &g_jit_env;
     if (env->active) jit_env_destroy(env);
+    if (g_jit_stats > 0) {
+        /* Report per process; the mutex may be held by a dead thread. */
+        pthread_mutex_init(&g_jstat_mu, NULL);
+        free(t_jstat);
+        t_jstat = NULL;
+        t_jstat_lost = 0;
+        memset(g_jstat, 0, sizeof g_jstat);
+        g_jstat_lost = g_jstat_icount = 0;
+    }
 }
 
 void jit_thread_exit(void) {
@@ -505,6 +638,7 @@ void jit_thread_exit(void) {
     t_ir = NULL;
     JitEnv *env = &g_jit_env;
     if (!env->active) return;
+    if (g_jit_stats > 0) jstat_merge(env->c->icount);
     registry_del(env);
     jit_env_destroy(env);
 }

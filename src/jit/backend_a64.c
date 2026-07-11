@@ -567,12 +567,21 @@ fast:
  * forms substitute x16 into the Rn/Rd field. ---- */
 
 int be_vop_ok(unsigned vclass, u32 insn) {
-    (void)insn;
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_CM3: case VC_SHIFTI:
-        case VC_MOVI: case VC_COPY: case VC_F2: case VC_F1:
-        case VC_FCMP: case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
+        case VC_MINMAX: case VC_MUL3: case VC_PAIRI: case VC_2MISC:
+        case VC_ACROSS: case VC_VF3S: case VC_VFCM:
+        case VC_MOVI: case VC_COPY: case VC_F1: case VC_F3:
+        case VC_FCMP: case VC_FCCMP: case VC_FCSEL:
+        case VC_FMOVI: case VC_FMOVG:
+        case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
             return 1;
+        case VC_F2: {
+            /* FMAX/FMIN (opc 4-7): the interpreter's C ternary keeps NaN
+             * semantics native fmax does not have — helper stays. */
+            unsigned opc = (insn >> 12) & 0xf;
+            return opc <= 3 || opc == 8;
+        }
         default:
             return 0;
     }
@@ -583,6 +592,29 @@ static u32 enc_ldq(unsigned qt, unsigned rn, unsigned off) {   /* LDR Qt */
 }
 static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
     return 0x3D800000u | ((off / 16) << 10) | (rn << 5) | qt;
+}
+
+/* NaN-result fallback for the self-counting scalar-FP classes (VC_F2 arith,
+ * VC_F3): a NaN result means NaN inputs or an invalid operation — cases
+ * where the result bits depend on the compiler's operand ordering in the
+ * interpreter — so discard and re-run the insn via jit_exec1 (which counts
+ * the insn and handles events). Mirrors emit_atomic's slow path. */
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
+    Emit *e = be->e;
+    u8 *done = b_fwd(e);
+    fwd_here(e, slow);
+    slow_store_dirty(be);
+    ei(e, enc_mov(1, 0, 28));                    /* jit_exec1(c, pc, insn) */
+    emit_imm64(e, 1, o->imm2pc);
+    ei(e, enc_movz(0, 2, (u32)o->imm & 0xffff, 0));
+    ei(e, enc_movk(0, 2, ((u32)o->imm >> 16) & 0xffff, 1));
+    ei(e, enc_ldr(3, 16, 27, (unsigned)offsetof(JitEnv, helper_exec1)));
+    ei(e, enc_blr(16));
+    u8 *ok = cbz_fwd(e, 0, 0);
+    exit_plain(be, o->icnt);
+    fwd_here(e, ok);
+    slow_reload_clobbered(be);
+    fwd_here(e, done);
 }
 
 static void emit_vop(BE *be, const IROp *o) {
@@ -653,31 +685,104 @@ static void emit_vop(BE *be, const IROp *o) {
             }
             break;
         }
+        case VC_VF3S: {
+            /* Vector FP three-same arithmetic, self-counting: replay onto
+             * v0/v1 (FMLA/FMLS accumulate into a preloaded v2), then check
+             * the result lanes for NaN — same rationale as VC_F2/F3: a NaN
+             * result exposes the interpreter's compiler-chosen NaN operand
+             * priority, so re-run those in the interpreter. */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            int mla = (((insn >> 11) & 0x1f) == 0x19);
+            materialize_flags(be);               /* cmn below */
+            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
+            ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
+            if (mla) ei(e, enc_ldq(2, 28, (unsigned)OFF_V(rd)));
+            ei(e, (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            /* v16 = per-lane (v2 == v2): NaN lanes -> 0 */
+            ei(e, 0x0E20E400u | ((u32)Q << 30) | ((u32)sz << 22) |
+                  (2u << 16) | (2u << 5) | 16);
+            ei(e, 0x9E660000u | (16u << 5) | 16);     /* fmov x16, d16 */
+            if (Q) {
+                ei(e, 0x9EAE0000u | (16u << 5) | 17); /* fmov x17, v16.d[1] */
+                ei(e, 0x8A110210u);                   /* and x16, x16, x17 */
+            }
+            ei(e, 0xB100041Fu | (16u << 5));          /* cmn x16, #1 */
+            u8 *slow = bcond_fwd(e, 1);               /* b.ne: NaN lane */
+            icount_add(be, 1);
+            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+            vop_slowpath(be, o, slow);
+            break;
+        }
+        case VC_F2: case VC_F3: {
+            /* Scalar FP arithmetic, self-counting. The interpreter computes
+             * these as C expressions whose both-NaN operand priority (and,
+             * for the FMA family, gcc's CSE of n*m across the four forms —
+             * which defeats -ffp-contract) is a codegen artifact, so:
+             * compute UNFUSED in any order and NaN-gate the result; a NaN
+             * re-runs the insn in the interpreter (vop_slowpath). */
+            unsigned ft = (insn >> 22) & 1;      /* 0 = S, 1 = D */
+            u32 f = ft << 22;
+            materialize_flags(be);               /* fcmp below */
+            ei(e, enc_ldq(0, 28, (unsigned)OFF_V(rn)));
+            ei(e, enc_ldq(1, 28, (unsigned)OFF_V(rm)));
+            if (vclass == VC_F3) {
+                unsigned ra = (insn >> 10) & 31;
+                int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
+                ei(e, enc_ldq(3, 28, (unsigned)OFF_V(ra)));
+                ei(e, 0x1E200800u | f | (1u << 16) | (0u << 5) | 2);  /* fmul */
+                if (o1)                                   /* fneg a */
+                    ei(e, 0x1E214000u | f | (3u << 5) | 3);
+                /* v2 = a +- n*m (fadd/fsub v2, v3, v2) */
+                ei(e, (o0 == o1 ? 0x1E202800u : 0x1E203800u) | f |
+                      (2u << 16) | (3u << 5) | 2);
+            } else {
+                /* replay the 2-source op itself on v0/v1 -> v2 */
+                u32 w2 = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                         (1u << 16) | (0u << 5) | 2;
+                ei(e, w2);
+            }
+            ei(e, 0x1E202008u | f | (2u << 16) | (2u << 5));  /* fcmp v2,v2 */
+            u8 *slow = bcond_fwd(e, 6);          /* b.vs: NaN result */
+            icount_add(be, 1);
+            ei(e, enc_stq(2, 28, (unsigned)OFF_V(rd)));
+            vop_slowpath(be, o, slow);
+            break;
+        }
         default: {
             /* Renumber-and-replay. Vector sources -> v0 (Rn), v1 (Rm);
              * Vd preloaded into the result reg v2 for the read-modify
              * forms (BSL/BIT/BIF, INS). GPR-linked forms use x16. */
             unsigned opc3 = (insn >> 11) & 0x1f;
             int has_rm = (vclass == VC_BITW || vclass == VC_ADDSUB ||
-                          vclass == VC_CM3 || vclass == VC_F2 ||
-                          vclass == VC_FCSEL ||
+                          vclass == VC_CM3 || vclass == VC_MINMAX ||
+                          vclass == VC_MUL3 || vclass == VC_PAIRI ||
+                          vclass == VC_VFCM ||
+                          vclass == VC_FCSEL || vclass == VC_FCCMP ||
                           (vclass == VC_FCMP && !((insn >> 3) & 1)));
             int reads_rd = (vclass == VC_BITW && ((insn >> 29) & 1) &&
                             ((insn >> 22) & 3) != 0)     /* BSL/BIT/BIF */
                         || (vclass == VC_COPY && ((insn >> 29) & 1))   /* INS(elem) */
                         || (vclass == VC_COPY && ((insn >> 11) & 0xf) == 3
-                            && !((insn >> 29) & 1));     /* INS(general) */
-            int gpr_src = (vclass == VC_COPY &&
+                            && !((insn >> 29) & 1))      /* INS(general) */
+                        || (vclass == VC_2MISC && ((insn >> 12) & 0x1f) == 0x12
+                            && ((insn >> 30) & 1))       /* XTN2 keeps low */
+                        || (vclass == VC_SHIFTI && opc3 == 0x10
+                            && ((insn >> 30) & 1));      /* SHRN2 keeps low */
+            int gpr_src = (vclass == VC_CVTIF) ||
+                          (vclass == VC_COPY &&
                            !((insn >> 29) & 1) &&
                            (((insn >> 11) & 0xf) == 1 ||   /* DUP (general) */
                             ((insn >> 11) & 0xf) == 3));   /* INS (general) */
-            int gpr_dst = (vclass == VC_COPY &&
+            int gpr_dst = (vclass == VC_CVTFI) ||
+                          (vclass == VC_COPY &&
                            !((insn >> 29) & 1) &&
                            (((insn >> 11) & 0xf) == 5 ||   /* SMOV */
                             ((insn >> 11) & 0xf) == 7));   /* UMOV */
             (void)opc3;
 
             if (vclass == VC_FCSEL) flags_to_host(be);
+            if (vclass == VC_FCCMP) flags_to_host(be);   /* reads + writes */
             if (vclass == VC_FCMP) materialize_flags(be);   /* fcmp clobbers */
             u32 w = insn & ~0x1Fu;               /* clear Rd */
             if (gpr_dst) {
@@ -708,9 +813,10 @@ static void emit_vop(BE *be, const IROp *o) {
             else        w |= (insn & (0x1Fu << 16));   /* keep imm fields */
             if (vclass == VC_SHIFTI)             /* bits 22:16 are immh:immb */
                 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
-            if (vclass == VC_FCMP) {
+            if (vclass == VC_FCMP || vclass == VC_FCCMP) {
                 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5);
-                if (!((insn >> 3) & 1)) w |= 1u << 16;   /* Rm=v1 */
+                if (vclass == VC_FCCMP || !((insn >> 3) & 1))
+                    w |= 1u << 16;               /* Rm=v1 */
                 ei(e, w);                        /* host NZCV = result */
                 ei(e, 0xD53B4200u | 16);         /* mrs x16, nzcv */
                 ei(e, enc_str(2, 16, 28, (unsigned)OFF_NZCV));
@@ -862,6 +968,36 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
                 default:       ei(e, enc_orr(1, 2, 16, (unsigned)hb)); break;
             }
             ei(e, enc_stlxr(szl, 1, 2, 17));      /* status in w1 (va dead) */
+            cbnz_to(e, 0, 1, loop);
+            break;
+        }
+        case AT_LDSMAX: case AT_LDSMIN: case AT_LDUMAX: case AT_LDUMIN: {
+            /* ldaxr/stlxr loop; new value = compare-select of old vs operand
+             * at the access width/signedness (decode.c LSE_RMW cases 4-7).
+             * Sub-word compares run on sign/zero-extended copies in x1/x2;
+             * csel then picks between the raw registers (same low bytes). */
+            int sgn = (kind == AT_LDSMAX || kind == AT_LDSMIN);
+            int mx = (kind == AT_LDSMAX || kind == AT_LDUMAX);
+            unsigned cond = sgn ? (mx ? 0xCu : 0xBu)       /* GT / LT */
+                                : (mx ? 0x8u : 0x3u);      /* HI / LO */
+            const u8 *loop = e->rx;
+            ei(e, enc_ldaxr(szl, 16, 17));        /* x16 = old (zext) */
+            unsigned co = 16, cb = (unsigned)hb;
+            if (szl < 3) {
+                if (sgn) {                        /* sxt{b,h,w} x2/x1 */
+                    u32 imms = (8u << szl) - 1;
+                    ei(e, 0x93400000u | (imms << 10) | (16u << 5) | 2);
+                    ei(e, 0x93400000u | (imms << 10) | ((u32)hb << 5) | 1);
+                    co = 2; cb = 1;
+                } else {                          /* truncate the operand */
+                    ei(e, enc_andi64(1, (unsigned)hb, 0, sz * 8 - 1));
+                    cb = 1;
+                }
+            }
+            ei(e, enc_cmp(co, cb));
+            ei(e, 0x9A800000u | ((u32)hb << 16) | (cond << 12) |   /* csel */
+                  (16u << 5) | 2);                /* x2 = old wins ? x16 : hb */
+            ei(e, enc_stlxr(szl, 1, 2, 17));
             cbnz_to(e, 0, 1, loop);
             break;
         }
@@ -1158,6 +1294,12 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             int ha = ra_use(be, o->a);
             int hd = ra_def(be, o->dst);
             ei(e, 0xDAC00C00u | ((u32)ha << 5) | (u32)hd);
+            break;
+        }
+        case IRO_RBIT: {
+            int ha = ra_use(be, o->a);
+            int hd = ra_def(be, o->dst);
+            ei(e, ((u32)w << 31) | 0x5AC00000u | ((u32)ha << 5) | (u32)hd);
             break;
         }
         case IRO_REV32: {

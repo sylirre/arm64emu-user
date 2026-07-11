@@ -733,6 +733,41 @@ static void sse_rr(Emit *e, u8 pfx, u8 opc, int xdst, int xsrc) {
     e8(e, 0x0F); e8(e, opc);
     e8(e, (u8)(0xC0 | (xdst << 3) | xsrc));
 }
+/* SSE4.1 three-byte-opcode form: 66 0F 38 opc /r */
+static void sse38_rr(Emit *e, u8 opc, int xdst, int xsrc) {
+    e8(e, 0x66); e8(e, 0x0F); e8(e, 0x38); e8(e, opc);
+    e8(e, (u8)(0xC0 | (xdst << 3) | xsrc));
+}
+/* cvtsi2ss/sd xmm, r32/r64 */
+static void cvtsi2f(Emit *e, int dbl, int w64, int xdst, int rsrc) {
+    e8(e, dbl ? 0xF2 : 0xF3);
+    u8 r = (u8)(0x40 | ((w64 ? 1 : 0) << 3) | (rsrc >> 3));
+    if (r != 0x40) e8(e, r);
+    e8(e, 0x0F); e8(e, 0x2A);
+    e8(e, (u8)(0xC0 | (xdst << 3) | (rsrc & 7)));
+}
+/* cvttsd2si r32/r64, xmm (truncating; the only fp->int form we emit) */
+static void cvttd2si(Emit *e, int w64, int rdst, int xsrc) {
+    e8(e, 0xF2);
+    u8 r = (u8)(0x40 | ((w64 ? 1 : 0) << 3) | ((rdst >> 3) << 2));
+    if (r != 0x40) e8(e, r);
+    e8(e, 0x0F); e8(e, 0x2C);
+    e8(e, (u8)(0xC0 | ((rdst & 7) << 3) | xsrc));
+}
+/* movq xmm, r64 */
+static void movq_xr(Emit *e, int xdst, int rsrc) {
+    e8(e, 0x66);
+    e8(e, (u8)(0x48 | (rsrc >> 3)));
+    e8(e, 0x0F); e8(e, 0x6E);
+    e8(e, (u8)(0xC0 | (xdst << 3) | (rsrc & 7)));
+}
+/* movq/movd rax, xmm (scalar result extraction; movd zero-extends) */
+static void movq_rax_x(Emit *e, int dbl, int xsrc) {
+    e8(e, 0x66);
+    if (dbl) e8(e, 0x48);
+    e8(e, 0x0F); e8(e, 0x7E);
+    e8(e, (u8)(0xC0 | (xsrc << 3) | RAX));
+}
 /* psll/psrl/psra xmm, imm8: opc 71/72/73 per size, /ext selects the op. */
 static void sse_shift_i(Emit *e, u8 opc, unsigned ext, int xreg, u8 imm) {
     e8(e, 0x66); e8(e, 0x0F); e8(e, opc);
@@ -773,30 +808,95 @@ static void st_lane_rax(Emit *e, unsigned size, s32 disp) {
     e32(e, (u32)disp);
 }
 
+/* Baseline is SSE2 (x86-64); a few vector ops need SSE4.1 (any Intel/AMD
+ * core since ~2008) — probed once, helper fallback without it. */
+static int cpu_has_sse41(void) {
+    static int v = -1;
+    if (v < 0) v = __builtin_cpu_supports("sse4.1");
+    return v;
+}
+static int cpu_has_ssse3(void) {
+    static int v = -1;
+    if (v < 0) v = __builtin_cpu_supports("ssse3");
+    return v;
+}
+
 /* Per-host capability/fidelity table (see ir.h VC_*). */
 int be_vop_ok(unsigned vclass, u32 insn) {
     unsigned size = (insn >> 22) & 3, U = (insn >> 29) & 1;
     unsigned opc3 = (insn >> 11) & 0x1f;
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_MOVI: case VC_COPY:
-        case VC_F2: case VC_F1: case VC_FCMP: case VC_FCSEL:
-        case VC_FMOVI: case VC_FMOVG:
+        case VC_F2: case VC_F1: case VC_F3: case VC_FCMP: case VC_FCCMP:
+        case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
+        case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
             return 1;
         case VC_CM3:
-            /* SSE2: pcmpeq b/h/s, pcmpgt(signed) b/h/s only */
-            if (opc3 == 0x11 && U) return size <= 2;         /* CMEQ */
-            if (opc3 == 0x06 && !U) return size <= 2;        /* CMGT */
-            return 0;
+            /* pcmpeq/pcmpgt b/h/s; unsigned and GE/TST forms via sign-flip
+             * and inversion — 64-bit lanes would need SSE4.2, helper. */
+            return size <= 2;
+        case VC_MINMAX:
+            /* SSE2 natives: unsigned byte, signed halfword; the rest are
+             * SSE4.1 pm{in,ax}{s,u}{b,w,d}. */
+            if ((size == 0 && U) || (size == 1 && !U)) return 1;
+            return cpu_has_sse41();
         case VC_SHIFTI: {
             unsigned immh = (insn >> 19) & 0xf;
             unsigned sz = (immh & 8) ? 3 : (immh & 4) ? 2 : (immh & 2) ? 1 : 0;
+            if (opc3 == 0x10) return 1;          /* SHRN(2): psrl + narrow */
+            if (opc3 == 0x14)                    /* S/USHLL(2): widen */
+                return U ? 1 : sz <= 1;          /* no 64-bit arith shift */
             if (sz == 0) return 0;               /* no byte shifts in SSE2 */
             if (opc3 == 0x00 && !U && sz == 3) return 0;     /* no psraq */
             return 1;
         }
+        case VC_2MISC:
+            switch ((U << 5) | ((insn >> 12) & 0x1f)) {
+                case 0x08: case 0x28: case 0x09:
+                case 0x29: case 0x0a:            /* compares with #0 */
+                    return size <= 2;
+                case 0x0b:                       /* ABS */
+                    return size <= 2 && cpu_has_ssse3();
+                case 0x2b:                       /* NEG (psub from zero) */
+                    return 1;
+                case 0x25:                       /* NOT (RBIT.v: size 1) */
+                    return size == 0;
+                case 0x12:                       /* XTN / XTN2 */
+                    return size <= 2;
+                default:
+                    return 0;                    /* CNT/CLZ/REV/ADDLP/SHLL */
+            }
+        case VC_VF3S: case VC_VFCM:
+            return 1;
+        case VC_PAIRI:
+            if (opc3 == 0x17) return 1;          /* ADDP, all sizes */
+            if (size == 0) return 1;             /* byte min/max: SSE2 */
+            return cpu_has_sse41();              /* h/s via pmin/maxsd */
         default:
-            return 0;
+            return 0;                            /* MUL3/ACROSS: a64 only */
     }
+}
+
+/* NaN-result fallback for the self-counting scalar-FP classes (VC_F2 arith,
+ * VC_F3): discard the inline result and re-run the insn via jit_exec1
+ * (which handles icount and events). Mirrors emit_atomic's slow path; the
+ * fast path stored its result and bumped icount before jumping over this. */
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow) {
+    Emit *e = be->e;
+    u8 *done = jmp_fwd(e);
+    fwd_here(e, slow);
+    slow_store_dirty(be);
+    mov_rr(e, 1, RDI, R14);                      /* jit_exec1(c, pc, insn) */
+    rex(e, 1, 0, 0, RSI); e8(e, (u8)(0xB8 | RSI)); e64(e, o->imm2pc);
+    mov_ri(e, 0, RDX, (u32)o->imm);
+    ld64(e, RAX, R15, (s32)offsetof(JitEnv, helper_exec1));
+    e8(e, 0xFF); e8(e, 0xD0);
+    op_rr(e, 0, 0x85, RAX, RAX);
+    u8 *ok = jcc_fwd(e, CC_E);
+    exit_plain(be, o->icnt);
+    fwd_here(e, ok);
+    slow_reload_clobbered(be);
+    fwd_here(e, done);
 }
 
 /* One IRO_VOP. Vector state stays in c->v[] (no vector allocator); xmm0-2
@@ -870,8 +970,198 @@ static void emit_vop(BE *be, const IROp *o) {
             static const u8 pcmpgt[3] = { 0x64, 0x65, 0x66 };
             sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
             sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
-            sse_rr(e, 0x66, (opc3 == 0x11 && U) ? pcmpeq[size] : pcmpgt[size],
-                   0, 1);
+            if (U && opc3 != 0x11) {
+                /* CMHI/CMHS: flip sign bits, then signed compare */
+                sse_rr(e, 0x66, 0x76, 2, 2);     /* ones */
+                if (size == 0) {                 /* 0x80 bytes */
+                    sse_shift_i(e, 0x71, 6, 2, 15);
+                    sse_rr(e, 0x66, 0x63, 2, 2); /* packsswb: -32768 -> -128 */
+                } else if (size == 1) {
+                    sse_shift_i(e, 0x71, 6, 2, 15);
+                } else {
+                    sse_shift_i(e, 0x72, 6, 2, 31);
+                }
+                sse_rr(e, 0x66, 0xEF, 0, 2);
+                sse_rr(e, 0x66, 0xEF, 1, 2);
+            }
+            if (opc3 == 0x11 && U) {             /* CMEQ */
+                sse_rr(e, 0x66, pcmpeq[size], 0, 1);
+            } else if (opc3 == 0x11) {           /* CMTST: ~((n & m) == 0) */
+                sse_rr(e, 0x66, 0xDB, 0, 1);     /* pand */
+                sse_rr(e, 0x66, 0xEF, 1, 1);     /* zero */
+                sse_rr(e, 0x66, pcmpeq[size], 0, 1);
+                sse_rr(e, 0x66, 0x76, 1, 1);     /* ones */
+                sse_rr(e, 0x66, 0xEF, 0, 1);     /* invert */
+            } else if (opc3 == 0x06) {           /* CMGT / CMHI */
+                sse_rr(e, 0x66, pcmpgt[size], 0, 1);
+            } else {                             /* CMGE/CMHS: ~(m > n) */
+                sse_rr(e, 0x66, pcmpgt[size], 1, 0);
+                sse_rr(e, 0x66, 0x76, 0, 0);     /* ones */
+                sse_rr(e, 0x66, 0xEF, 0, 1);     /* x0 = ~x1 */
+            }
+            sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
+            if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_PAIRI: {
+            /* Pairwise ADDP / S,U MAXP/MINP: split each source into even
+             * and odd lanes widened one step (zero- or sign-extended per
+             * signedness), run the op at the wider width, and pack the two
+             * per-source results back side by side — the packed layout is
+             * exactly ARM's [pairs-of-Vn | pairs-of-Vm]. glibc's strlen /
+             * memchr inner loops are UMINP/UMAXP.16b. */
+            unsigned U = (insn >> 29) & 1, size = (insn >> 22) & 3;
+            unsigned Q = (insn >> 30) & 1, opc3 = (insn >> 11) & 0x1f;
+            int add = (opc3 == 0x17), mx = (opc3 == 0x14);
+            int res = 2;
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            if (size == 3) {                     /* ADDP.2d */
+                sse_rr(e, 0x66, 0x6F, 2, 0);
+                sse_rr(e, 0x66, 0x6C, 2, 1);     /* punpcklqdq: n0 m0 */
+                sse_rr(e, 0x66, 0x6D, 0, 1);     /* punpckhqdq: n1 m1 */
+                sse_rr(e, 0x66, 0xD4, 2, 0);     /* paddq */
+            } else if (size == 2) {              /* .4s via shufps */
+                sse_rr(e, 0x66, 0x6F, 2, 0);
+                sse_rr(e, 0, 0xC6, 2, 1); e8(e, 0x88);   /* evens */
+                sse_rr(e, 0, 0xC6, 0, 1); e8(e, 0xDD);   /* odds */
+                if (add) sse_rr(e, 0x66, 0xFE, 2, 0);
+                else sse38_rr(e, (u8)(0x38 | (mx ? 4 : 0) | (U ? 2 : 0) | 1),
+                              2, 0);
+            } else {
+                /* b/h: widen both sources' even/odd lanes, op, pack */
+                u8 shl = size ? 0x72 : 0x71;     /* pslld/w family */
+                u8 shift = size ? 16 : 8;
+                int sgn = (!add && !U);
+                sse_rr(e, 0x66, 0x6F, 2, 0);
+                sse_rr(e, 0x66, 0x6F, 3, 1);
+                sse_shift_i(e, shl, 6, 2, shift);            /* evens << */
+                sse_shift_i(e, shl, 6, 3, shift);
+                sse_shift_i(e, shl, sgn ? 4 : 2, 2, shift);  /* back (ext) */
+                sse_shift_i(e, shl, sgn ? 4 : 2, 3, shift);
+                sse_shift_i(e, shl, sgn ? 4 : 2, 0, shift);  /* odds */
+                sse_shift_i(e, shl, sgn ? 4 : 2, 1, shift);
+                if (add) {
+                    sse_rr(e, 0x66, size ? 0xFE : 0xFD, 2, 0);
+                    sse_rr(e, 0x66, size ? 0xFE : 0xFD, 3, 1);
+                } else if (size == 0) {          /* fits signed words */
+                    sse_rr(e, 0x66, mx ? 0xEE : 0xEA, 2, 0);
+                    sse_rr(e, 0x66, mx ? 0xEE : 0xEA, 3, 1);
+                } else {                         /* fits signed dwords */
+                    sse38_rr(e, mx ? 0x3D : 0x39, 2, 0);
+                    sse38_rr(e, mx ? 0x3D : 0x39, 3, 1);
+                }
+                /* pack exact: sign-extend the low element, packss */
+                sse_shift_i(e, shl, 6, 2, shift);
+                sse_shift_i(e, shl, 4, 2, shift);
+                sse_shift_i(e, shl, 6, 3, shift);
+                sse_shift_i(e, shl, 4, 3, shift);
+                sse_rr(e, 0x66, size ? 0x6B : 0x63, 2, 3);
+            }
+            if (Q) {
+                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
+            } else {
+                /* 64-bit form: [low pairs of n | low pairs of m] */
+                e8(e, 0x66); e8(e, 0x0F); e8(e, 0x7E);       /* movd eax */
+                e8(e, (u8)(0xC0 | (res << 3) | RAX));
+                sse_shift_i(e, 0x73, 3, res, 8);             /* psrldq 8 */
+                e8(e, 0x66); e8(e, 0x0F); e8(e, 0x7E);       /* movd ecx */
+                e8(e, (u8)(0xC0 | (res << 3) | RCX));
+                shift_ri(e, 1, 4, RCX, 32);
+                op_rr(e, 1, 0x0B, RAX, RCX);                 /* or */
+                st64(e, RAX, R14, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+            }
+            break;
+        }
+        case VC_2MISC: {
+            unsigned U = (insn >> 29) & 1, size = (insn >> 22) & 3;
+            unsigned Q = (insn >> 30) & 1;
+            unsigned key = (U << 5) | ((insn >> 12) & 0x1f);
+            static const u8 pcmpeq[3] = { 0x74, 0x75, 0x76 };
+            static const u8 pcmpgt[3] = { 0x64, 0x65, 0x66 };
+            static const u8 psub[4] = { 0xF8, 0xF9, 0xFA, 0xFB };
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            switch (key) {
+                case 0x08:                       /* CMGT #0 */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, pcmpgt[size], 0, 1);
+                    break;
+                case 0x09:                       /* CMEQ #0 */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, pcmpeq[size], 0, 1);
+                    break;
+                case 0x0a:                       /* CMLT #0: 0 > n */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, pcmpgt[size], 1, 0);
+                    sse_rr(e, 0x66, 0x6F, 0, 1);
+                    break;
+                case 0x28:                       /* CMGE #0: ~(0 > n) */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, pcmpgt[size], 1, 0);
+                    sse_rr(e, 0x66, 0x76, 0, 0); /* ones */
+                    sse_rr(e, 0x66, 0xEF, 0, 1);
+                    break;
+                case 0x29:                       /* CMLE #0: ~(n > 0) */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, pcmpgt[size], 0, 1);
+                    sse_rr(e, 0x66, 0x76, 1, 1); /* ones */
+                    sse_rr(e, 0x66, 0xEF, 0, 1);
+                    break;
+                case 0x2b:                       /* NEG: 0 - n */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, 0x66, psub[size], 1, 0);
+                    sse_rr(e, 0x66, 0x6F, 0, 1);
+                    break;
+                case 0x0b:                       /* ABS (SSSE3 pabs) */
+                    sse38_rr(e, (u8)(0x1C + size), 0, 0);
+                    break;
+                case 0x25:                       /* NOT */
+                    sse_rr(e, 0x66, 0x76, 1, 1); /* ones */
+                    sse_rr(e, 0x66, 0xEF, 0, 1);
+                    break;
+                case 0x12: {                     /* XTN / XTN2: narrow */
+                    if (size == 0) {             /* h -> b: sext + packsswb */
+                        sse_shift_i(e, 0x71, 6, 0, 8);
+                        sse_shift_i(e, 0x71, 4, 0, 8);
+                        sse_rr(e, 0x66, 0x63, 0, 0);
+                    } else if (size == 1) {      /* s -> h */
+                        sse_shift_i(e, 0x72, 6, 0, 16);
+                        sse_shift_i(e, 0x72, 4, 0, 16);
+                        sse_rr(e, 0x66, 0x6B, 0, 0);     /* packssdw */
+                    } else {                     /* d -> s: pshufd 0,2 */
+                        sse_rr(e, 0x66, 0x70, 0, 0);
+                        e8(e, 0x08);
+                    }
+                    movq_rax_x(e, 1, 0);         /* low 8 = narrowed */
+                    if (Q) {                     /* XTN2: high half only */
+                        st64(e, RAX, R14, OFF_V(rd) + 8);
+                    } else {
+                        st64(e, RAX, R14, OFF_V(rd));
+                        st_imm_r14(e, OFF_V(rd) + 8, 0);
+                    }
+                    break;
+                }
+            }
+            if (key != 0x12) {
+                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
+                if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            }
+            break;
+        }
+        case VC_MINMAX: {
+            unsigned U = (insn >> 29) & 1, size = (insn >> 22) & 3;
+            unsigned Q = (insn >> 30) & 1;
+            int mx = (((insn >> 11) & 0x1f) == 0x0c);        /* MAX vs MIN */
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            if (size == 0 && U)                              /* pmax/pminub */
+                sse_rr(e, 0x66, mx ? 0xDE : 0xDA, 0, 1);
+            else if (size == 1 && !U)                        /* pmax/pminsw */
+                sse_rr(e, 0x66, mx ? 0xEE : 0xEA, 0, 1);
+            else                                             /* SSE4.1 */
+                sse38_rr(e, (u8)(0x38 | (mx ? 4 : 0) | (U ? 2 : 0) |
+                                 (size == 2 ? 1 : 0)), 0, 1);
             sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
             if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
             break;
@@ -885,6 +1175,49 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned esize = 8u << size;
             static const u8 shopc[3] = { 0x71, 0x72, 0x73 };  /* h/s/d */
             sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            if (opc3 == 0x10) {
+                /* SHRN(2): shift the wide lanes right, then narrow (the
+                 * same sign-extend-and-pack / lane-gather as XTN). Q form
+                 * writes only the high half of Vd. */
+                sse_shift_i(e, shopc[size], 2, 0, (u8)(2 * esize - immhb));
+                if (size == 0) {
+                    sse_shift_i(e, 0x71, 6, 0, 8);
+                    sse_shift_i(e, 0x71, 4, 0, 8);
+                    sse_rr(e, 0x66, 0x63, 0, 0);              /* packsswb */
+                } else if (size == 1) {
+                    sse_shift_i(e, 0x72, 6, 0, 16);
+                    sse_shift_i(e, 0x72, 4, 0, 16);
+                    sse_rr(e, 0x66, 0x6B, 0, 0);              /* packssdw */
+                } else {
+                    sse_rr(e, 0x66, 0x70, 0, 0);              /* pshufd 0,2 */
+                    e8(e, 0x08);
+                }
+                movq_rax_x(e, 1, 0);
+                if (Q) {
+                    st64(e, RAX, R14, OFF_V(rd) + 8);
+                } else {
+                    st64(e, RAX, R14, OFF_V(rd));
+                    st_imm_r14(e, OFF_V(rd) + 8, 0);
+                }
+                break;
+            }
+            if (opc3 == 0x14) {
+                /* S/USHLL(2): widen the low (or, for the 2-form, high)
+                 * half, then shift left. esize here is the SOURCE width. */
+                if (Q) sse_shift_i(e, 0x73, 3, 0, 8);         /* psrldq 8 */
+                if (U) {
+                    sse_rr(e, 0x66, 0xEF, 1, 1);              /* zero */
+                    sse_rr(e, 0x66, size == 0 ? 0x60 :
+                                    size == 1 ? 0x61 : 0x62, 0, 1);
+                    sse_shift_i(e, shopc[size], 6, 0, (u8)(immhb - esize));
+                } else {                                      /* sext widen */
+                    sse_rr(e, 0x66, size == 0 ? 0x60 : 0x61, 0, 0);
+                    sse_shift_i(e, shopc[size], 4, 0, (u8)esize);
+                    sse_shift_i(e, shopc[size], 6, 0, (u8)(immhb - esize));
+                }
+                sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
+                break;
+            }
             if (opc3 == 0x0a) {                               /* SHL */
                 sse_shift_i(e, shopc[size - 1], 6, 0, (u8)(immhb - esize));
             } else if (U) {                                   /* USHR */
@@ -974,11 +1307,13 @@ static void emit_vop(BE *be, const IROp *o) {
             else   st_imm_r14(e, OFF_V(rd) + 8, 0);
             break;
         }
-        case VC_F2: {                            /* scalar arith, S/D */
+        case VC_F2: {                            /* scalar arith, S/D:
+                                                  * self-counting class */
             int dbl = ((insn >> 22) & 3) == 1;
             unsigned opc = (insn >> 12) & 0xf;
+            int arith = (opc <= 3 || opc == 8);  /* NaN-gated (see below) */
             u8 pfx = dbl ? 0xF2 : 0xF3;
-            if (opc == 0x8) materialize_flags(be);   /* xor below */
+            if (arith) materialize_flags(be);    /* ucomis / xor below */
             sse_mem(e, pfx, 0x10, 0, OFF_V(rn)); /* movss/sd xmm0, Vn */
             sse_mem(e, pfx, 0x10, 1, OFF_V(rm));
             switch (opc) {
@@ -986,17 +1321,32 @@ static void emit_vop(BE *be, const IROp *o) {
                 case 0x1: sse_rr(e, pfx, 0x5E, 0, 1); break; /* FDIV */
                 case 0x2: sse_rr(e, pfx, 0x58, 0, 1); break; /* FADD */
                 case 0x3: sse_rr(e, pfx, 0x5C, 0, 1); break; /* FSUB */
+                /* FMAX(NM)/FMIN(NM): the interpreter's `(a>b)?a:b` ternary
+                 * IS maxsd's exact semantic (NaN or equal -> src operand) */
+                case 0x4: case 0x6:
+                          sse_rr(e, pfx, 0x5F, 0, 1); break; /* maxss/sd */
+                case 0x5: case 0x7:
+                          sse_rr(e, pfx, 0x5D, 0, 1); break; /* minss/sd */
                 default:  sse_rr(e, pfx, 0x59, 0, 1); break; /* FNMUL: below */
             }
+            /* A NaN result means NaN inputs or an invalid op — cases where
+             * the bits depend on gcc's operand order in the interpreter.
+             * Discard and re-run the insn there (vop_slowpath). */
+            u8 *slow = NULL;
+            if (arith) {
+                sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);   /* ucomis x0, x0 */
+                slow = jcc_fwd(e, CC_P);
+            }
+            icount_add(be, 1);
             /* result -> rax (int path handles lane write + high clear) */
-            if (dbl) { e8(e, 0x66); e8(e, 0x48); e8(e, 0x0F); e8(e, 0x7E); e8(e, 0xC0); }
-            else     { e8(e, 0x66); e8(e, 0x0F); e8(e, 0x7E); e8(e, 0xC0); }
+            movq_rax_x(e, dbl, 0);
             if (opc == 0x8) {                    /* FNMUL: flip the sign bit */
                 mov_ri(e, 1, RCX, dbl ? 0x8000000000000000ULL : 0x80000000ULL);
                 op_rr(e, 1, 0x33, RAX, RCX);     /* xor rax, rcx */
             }
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
+            if (slow) vop_slowpath(be, o, slow);
             break;
         }
         case VC_F1: {                            /* FMOV/FABS/FNEG/FSQRT */
@@ -1076,6 +1426,274 @@ static void emit_vop(BE *be, const IROp *o) {
             /* loads/cmov preserve EFLAGS: be->fl stays whatever it was */
             break;
         }
+        case VC_VF3S: {
+            /* Vector FP three-same arithmetic (packed SSE2 = the
+             * interpreter's per-lane host C); self-counting, NaN-gated:
+             * any NaN result lane re-runs the insn in the interpreter
+             * (same rationale as VC_F2/F3). */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            unsigned a23 = (insn >> 23) & 1, U = (insn >> 29) & 1;
+            unsigned opc3 = (insn >> 11) & 0x1f;
+            u8 pfx = sz ? 0x66 : 0;              /* pd : ps */
+            int res = 0;
+            materialize_flags(be);
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            if (opc3 == 0x19) {                  /* FMLA / FMLS: d +- n*m */
+                sse_mem(e, 0xF3, 0x6F, 2, OFF_V(rd));
+                sse_rr(e, pfx, 0x59, 0, 1);
+                sse_rr(e, pfx, a23 ? 0x5C : 0x58, 2, 0);
+                res = 2;
+            } else if (opc3 == 0x1a && !U) {     /* FADD / FSUB */
+                sse_rr(e, pfx, a23 ? 0x5C : 0x58, 0, 1);
+            } else if (opc3 == 0x1b) {           /* FMUL */
+                sse_rr(e, pfx, 0x59, 0, 1);
+            } else if (opc3 == 0x1f) {           /* FDIV */
+                sse_rr(e, pfx, 0x5E, 0, 1);
+            } else {                             /* FABD: |n - m| */
+                sse_rr(e, pfx, 0x5C, 0, 1);
+                sse_rr(e, 0x66, 0x76, 1, 1);     /* ones */
+                sse_shift_i(e, sz ? 0x73 : 0x72, 2, 1, 1);   /* abs mask */
+                sse_rr(e, 0x66, 0xDB, 0, 1);     /* pand */
+            }
+            sse_rr(e, 0x66, 0x6F, 1, res);       /* copy for the NaN check */
+            sse_rr(e, pfx, 0xC2, 1, 1);          /* cmpps/pd unord */
+            e8(e, 3);
+            sse_rr(e, pfx, 0x50, RAX, 1);        /* movmskps/pd eax */
+            if (!sz && !Q) alu_ri32(e, 0, 4, RAX, 0x3);
+            op_rr(e, 0, 0x85, RAX, RAX);
+            u8 *slow = jcc_fwd(e, CC_NE);
+            icount_add(be, 1);
+            if (Q) {
+                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
+            } else {
+                movq_rax_x(e, 1, res);
+                st64(e, RAX, R14, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+            }
+            vop_slowpath(be, o, slow);
+            break;
+        }
+        case VC_VFCM: {
+            /* Vector FP compares: per-lane mask, NaN -> false — cmpps with
+             * the right predicate/order is the C expression exactly. */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            unsigned a23 = (insn >> 23) & 1;
+            unsigned opc3 = (insn >> 11) & 0x1f, U = (insn >> 29) & 1;
+            u8 pfx = sz ? 0x66 : 0;
+            int res;
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));
+            sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rm));
+            if (opc3 == 0x1d) {                  /* FACGE/FACGT: abs first */
+                sse_rr(e, 0x66, 0x76, 2, 2);
+                sse_shift_i(e, sz ? 0x73 : 0x72, 2, 2, 1);
+                sse_rr(e, 0x66, 0xDB, 0, 2);
+                sse_rr(e, 0x66, 0xDB, 1, 2);
+            }
+            if (!U) {                            /* FCMEQ */
+                sse_rr(e, pfx, 0xC2, 0, 1); e8(e, 0);
+                res = 0;
+            } else {                             /* GE: m<=n / GT: m<n */
+                sse_rr(e, pfx, 0xC2, 1, 0); e8(e, a23 ? 1 : 2);
+                res = 1;
+            }
+            if (Q) {
+                sse_mem(e, 0xF3, 0x7F, res, OFF_V(rd));
+            } else {
+                movq_rax_x(e, 1, res);
+                st64(e, RAX, R14, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+            }
+            break;
+        }
+        case VC_F3: {
+            /* FMADD family (a +- n*m, unfused; self-counting class). The
+             * arithmetic is order-independent for every non-NaN result;
+             * NaN results are re-run in the interpreter (vop_slowpath), so
+             * gcc's operand-order NaN propagation never has to be mirrored. */
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned ra = (insn >> 10) & 31;
+            int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
+            u8 pfx = dbl ? 0xF2 : 0xF3;
+            materialize_flags(be);                       /* ucomis below */
+            sse_mem(e, pfx, 0x10, 0, OFF_V(rn));         /* xmm0 = n */
+            sse_mem(e, pfx, 0x10, 1, OFF_V(rm));         /* xmm1 = m */
+            sse_mem(e, pfx, 0x10, 2, OFF_V(ra));         /* xmm2 = a */
+            sse_rr(e, pfx, 0x59, 0, 1);                  /* xmm0 = n*m */
+            if (o1) {                                    /* -a forms */
+                mov_ri(e, 1, RAX,
+                       dbl ? 0x8000000000000000ULL : 0x80000000ULL);
+                movq_xr(e, 1, RAX);                      /* xmm1 = signmask */
+                sse_rr(e, 0x66, 0x57, 2, 1);             /* xorpd xmm2, xmm1 */
+            }
+            if (o0 == o1) sse_rr(e, pfx, 0x58, 0, 2);    /* +-a + n*m */
+            else          sse_rr(e, pfx, 0x5C, 2, 0);    /* +-a - n*m */
+            int res = (o0 == o1) ? 0 : 2;
+            sse_rr(e, dbl ? 0x66 : 0, 0x2E, res, res);   /* NaN result? */
+            u8 *slow = jcc_fwd(e, CC_P);
+            icount_add(be, 1);
+            movq_rax_x(e, dbl, res);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow);
+            break;
+        }
+        case VC_FCVT: {                          /* S<->D: plain casts */
+            int to_dbl = ((insn >> 15) & 0x3f) == 0x5;
+            if (to_dbl) {
+                sse_mem(e, 0xF3, 0x10, 0, OFF_V(rn));
+                sse_rr(e, 0xF3, 0x5A, 0, 0);             /* cvtss2sd */
+            } else {
+                sse_mem(e, 0xF2, 0x10, 0, OFF_V(rn));
+                sse_rr(e, 0xF2, 0x5A, 0, 0);             /* cvtsd2ss */
+            }
+            movq_rax_x(e, to_dbl, 0);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_CVTIF: {                         /* SCVTF/UCVTF: C casts */
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned sf = insn >> 31, uns = ((insn >> 16) & 7) == 3;
+            int hsrc = ra_use(be, o->a);
+            if (!sf) {
+                if (uns) {                       /* (fp)(u32): zext + 64-cvt */
+                    mov_rr(e, 0, RAX, hsrc);
+                    cvtsi2f(e, dbl, 1, 0, RAX);
+                } else {
+                    cvtsi2f(e, dbl, 0, 0, hsrc); /* (fp)(s32) */
+                }
+            } else if (!uns) {
+                cvtsi2f(e, dbl, 1, 0, hsrc);     /* (fp)(s64) */
+            } else {                             /* (fp)(u64): gcc's shape */
+                materialize_flags(be);
+                mov_rr(e, 1, RAX, hsrc);
+                op_rr(e, 1, 0x85, RAX, RAX);     /* test rax, rax */
+                u8 *neg = jcc_fwd(e, CC_S);
+                cvtsi2f(e, dbl, 1, 0, RAX);
+                u8 *j = jmp_fwd(e);
+                fwd_here(e, neg);                /* halve, keep lsb, double */
+                mov_rr(e, 1, RCX, RAX);
+                alu_ri32(e, 0, 4, RCX, 1);       /* and ecx, 1 */
+                shift_ri(e, 1, 5, RAX, 1);       /* shr rax, 1 */
+                op_rr(e, 1, 0x0B, RAX, RCX);     /* or rax, rcx */
+                cvtsi2f(e, dbl, 1, 0, RAX);
+                sse_rr(e, dbl ? 0xF2 : 0xF3, 0x58, 0, 0);   /* x0 += x0 */
+                fwd_here(e, j);
+            }
+            movq_rax_x(e, dbl, 0);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_CVTFI: {
+            /* FCVTZS/FCVTZU: replicate the interpreter's expressions —
+             * saturation compares (NaN falls through both) around cvtt;
+             * the S source is widened to double first, like the C code. */
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned sf = insn >> 31, uns = ((insn >> 16) & 7) & 1;
+            if (o->dst == VREG_ZERO) break;
+            materialize_flags(be);
+            sse_mem(e, dbl ? 0xF2 : 0xF3, 0x10, 0, OFF_V(rn));
+            if (!dbl) sse_rr(e, 0xF3, 0x5A, 0, 0);       /* cvtss2sd */
+            if (!uns) {
+                mov_ri(e, 1, RAX, sf ? 0x43E0000000000000ULL     /* 2^63 */
+                                     : 0x41DFFFFFFFC00000ULL);   /* 2^31-1 */
+                movq_xr(e, 1, RAX);
+                sse_rr(e, 0x66, 0x2E, 0, 1);             /* ucomisd r, max */
+                u8 *jmax = jcc_fwd(e, CC_AE);
+                mov_ri(e, 1, RAX, sf ? 0xC3E0000000000000ULL     /* -2^63 */
+                                     : 0xC1E0000000000000ULL);   /* -2^31 */
+                movq_xr(e, 1, RAX);
+                sse_rr(e, 0x66, 0x2E, 1, 0);             /* ucomisd min, r */
+                u8 *jmin = jcc_fwd(e, CC_AE);
+                cvttd2si(e, sf, RAX, 0);                 /* in-range / NaN */
+                u8 *j1 = jmp_fwd(e);
+                fwd_here(e, jmax);
+                mov_ri(e, 1, RAX, sf ? 0x7FFFFFFFFFFFFFFFULL : 0x7FFFFFFFULL);
+                u8 *j2 = jmp_fwd(e);
+                fwd_here(e, jmin);
+                mov_ri(e, 1, RAX, sf ? 0x8000000000000000ULL : 0x80000000ULL);
+                fwd_here(e, j1); fwd_here(e, j2);
+            } else {
+                sse_rr(e, 0x66, 0xEF, 1, 1);             /* xmm1 = 0.0 */
+                sse_rr(e, 0x66, 0x2E, 1, 0);             /* ucomisd 0, r */
+                u8 *jneg = jcc_fwd(e, CC_A);             /* r < 0 -> 0 */
+                mov_ri(e, 1, RAX, sf ? 0x43F0000000000000ULL     /* 2^64 */
+                                     : 0x41EFFFFFFFE00000ULL);   /* 2^32-1 */
+                movq_xr(e, 1, RAX);
+                sse_rr(e, 0x66, 0x2E, 0, 1);
+                u8 *jmax = jcc_fwd(e, CC_AE);
+                if (sf) {                        /* gcc's (u64)double shape */
+                    mov_ri(e, 1, RAX, 0x43E0000000000000ULL);    /* 2^63 */
+                    movq_xr(e, 1, RAX);
+                    sse_rr(e, 0x66, 0x2F, 0, 1);         /* comisd r, 2^63 */
+                    u8 *big = jcc_fwd(e, CC_AE);
+                    cvttd2si(e, 1, RAX, 0);
+                    u8 *jj = jmp_fwd(e);
+                    fwd_here(e, big);
+                    sse_rr(e, 0xF2, 0x5C, 0, 1);         /* r -= 2^63 */
+                    cvttd2si(e, 1, RAX, 0);
+                    e8(e, 0x48); e8(e, 0x0F); e8(e, 0xBA);
+                    e8(e, 0xF8); e8(e, 0x3F);            /* btc rax, 63 */
+                    fwd_here(e, jj);
+                } else {                         /* (u32): 64-bit cvtt, low */
+                    cvttd2si(e, 1, RAX, 0);
+                    mov_rr(e, 0, RAX, RAX);
+                }
+                u8 *j1 = jmp_fwd(e);
+                fwd_here(e, jneg);
+                mov_ri(e, 0, RAX, 0);
+                u8 *j2 = jmp_fwd(e);
+                fwd_here(e, jmax);
+                mov_ri(e, 1, RAX, sf ? ~0ULL : 0xFFFFFFFFULL);
+                fwd_here(e, j1); fwd_here(e, j2);
+            }
+            int hd = ra_def(be, o->dst);
+            mov_rr(e, 1, hd, RAX);
+            break;
+        }
+        case VC_FCCMP: {
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned cond = (insn >> 12) & 0xf;
+            u32 nzcv_imm = (u32)(insn & 0xf) << 28;
+            int cc = cond_setup(be, cond);
+            if (cc == CC_NEVER) {
+                mov_ri(e, 0, RAX, nzcv_imm);
+                st32(e, RAX, R14, OFF_NZCV);
+                be->fl = FL_MEM;
+                break;
+            }
+            u8 *jf = (cc == CC_ALWAYS) ? NULL : jcc_fwd(e, cc ^ 1);
+            u8 mpfx = dbl ? 0xF2 : 0xF3;         /* taken: FCMP recompose */
+            sse_mem(e, mpfx, 0x10, 0, OFF_V(rn));
+            sse_mem(e, mpfx, 0x10, 1, OFF_V(rm));
+            if (dbl) sse_rr(e, 0x66, 0x2E, 0, 1);
+            else     sse_rr(e, 0, 0x2E, 0, 1);
+            u8 *juo = jcc_fwd(e, CC_P);
+            u8 *jlt = jcc_fwd(e, CC_B);
+            u8 *jeq = jcc_fwd(e, CC_E);
+            mov_ri(e, 0, RAX, 0x20000000u);      /* gt: C */
+            u8 *j1 = jmp_fwd(e);
+            fwd_here(e, juo);
+            mov_ri(e, 0, RAX, 0x30000000u);      /* uo: C|V */
+            u8 *j2 = jmp_fwd(e);
+            fwd_here(e, jlt);
+            mov_ri(e, 0, RAX, 0x80000000u);      /* lt: N */
+            u8 *j3 = jmp_fwd(e);
+            fwd_here(e, jeq);
+            mov_ri(e, 0, RAX, 0x60000000u);      /* eq: Z|C */
+            fwd_here(e, j1); fwd_here(e, j2); fwd_here(e, j3);
+            if (jf) {
+                u8 *jend = jmp_fwd(e);
+                fwd_here(e, jf);                 /* cond false: imm nzcv */
+                mov_ri(e, 0, RAX, nzcv_imm);
+                fwd_here(e, jend);
+            }
+            st32(e, RAX, R14, OFF_NZCV);
+            be->fl = FL_MEM;
+            break;
+        }
         case VC_FMOVI: {                         /* scalar FMOV #imm */
             unsigned vd = (o->aux >> 8) & 31;
             mov_ri(e, 1, RAX, o->imm);
@@ -1136,6 +1754,22 @@ static void ld_zext_rdx(Emit *e, unsigned szlog) {
     }
 }
 /* rax = zext_szlog(src). */
+static void mov_zext_r(Emit *e, unsigned szlog, int dst, int src) {
+    if (szlog == 3) { mov_rr(e, 1, dst, src); return; }
+    if (szlog == 2) { mov_rr(e, 0, dst, src); return; }
+    u8 r = (u8)(0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    if (r != 0x40 || (szlog == 0 && src >= 4)) e8(e, r);
+    e8(e, 0x0F);
+    e8(e, szlog == 0 ? 0xB6 : 0xB7);
+    e8(e, (u8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+static void mov_sext_r(Emit *e, unsigned szlog, int dst, int src) {
+    if (szlog == 3) { mov_rr(e, 1, dst, src); return; }
+    rex(e, 1, dst, 0, src);
+    if (szlog == 2) e8(e, 0x63);                 /* movsxd */
+    else { e8(e, 0x0F); e8(e, szlog ? 0xBF : 0xBE); }
+    e8(e, (u8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
 static void mov_zext_rax(Emit *e, unsigned szlog, int src) {
     if (szlog == 3) { mov_rr(e, 1, RAX, src); return; }
     if (szlog == 2) { mov_rr(e, 0, RAX, src); return; }
@@ -1288,6 +1922,30 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
                 mem_op_rdx(e, szlog, 1, 0xB1, RCX);
                 jcc_to(e, CC_NE, loop);          /* rax stays zero-extended */
             }
+            break;
+        }
+        case AT_LDSMAX: case AT_LDSMIN: case AT_LDUMAX: case AT_LDUMIN: {
+            /* cmpxchg loop; new value = compare-select of old vs operand at
+             * the access width/signedness (decode.c LSE_RMW cases 4-7). The
+             * extended copies feed the compare; the stored value's low bytes
+             * are the same either way, so cmov picks between raw regs. */
+            int sgn = (kind == AT_LDSMAX || kind == AT_LDSMIN);
+            int mx = (kind == AT_LDSMAX || kind == AT_LDUMAX);
+            u8 cc = (u8)(sgn ? (mx ? CC_G : CC_L) : (mx ? CC_A : CC_B));
+            ld_zext_rdx(e, szlog);               /* rax = expected (zext) */
+            const u8 *loop = e->rx;
+            if (sgn) {
+                mov_sext_r(e, szlog, RSI, RAX);  /* va in rsi is dead here */
+                mov_sext_r(e, szlog, RCX, hb);
+                op_rr(e, 1, 0x39, RCX, RSI);     /* cmp rsi, rcx */
+            } else {
+                mov_zext_r(e, szlog, RCX, hb);
+                op_rr(e, 1, 0x39, RCX, RAX);     /* cmp rax, rcx */
+            }
+            op0f_rr(e, 1, (u8)(0x40 | cc), RCX, RAX);   /* old wins: rcx=rax */
+            e8(e, 0xF0);                         /* lock cmpxchg [rdx], rcx */
+            mem_op_rdx(e, szlog, 1, 0xB1, RCX);
+            jcc_to(e, CC_NE, loop);              /* rax = old (zext) */
             break;
         }
         case AT_CAS:
@@ -1698,6 +2356,30 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             rex(e, w2, 0, 0, hd);
             e8(e, 0x0F); e8(e, (u8)(0xC8 | (hd & 7)));      /* bswap */
             if (!w2) mov_rr(e, 0, hd, hd);
+            break;
+        }
+
+        case IRO_RBIT: {
+            /* byte-reverse, then swap nibbles, 2-bit pairs, single bits */
+            static const u64 rm[3] = { 0x0f0f0f0f0f0f0f0fULL,
+                                       0x3333333333333333ULL,
+                                       0x5555555555555555ULL };
+            static const u8 rs[3] = { 4, 2, 1 };
+            int ha = ra_use(be, o->a);
+            mov_rr(e, 1, RAX, ha);
+            rex(e, w, 0, 0, RAX);
+            e8(e, 0x0F); e8(e, (u8)(0xC8 | RAX));           /* bswap */
+            for (int k = 0; k < 3; k++) {
+                mov_rr(e, 1, RCX, RAX);
+                shift_ri(e, w, 5, RCX, rs[k]);              /* shr */
+                mov_ri(e, w, RDX, w ? rm[k] : (u32)rm[k]);
+                op_rr(e, w, 0x23, RCX, RDX);                /* rcx &= m */
+                op_rr(e, w, 0x23, RAX, RDX);                /* rax &= m */
+                shift_ri(e, w, 4, RAX, rs[k]);              /* shl */
+                op_rr(e, w, 0x0B, RAX, RCX);                /* rax |= rcx */
+            }
+            int hd = ra_def(be, o->dst);
+            mov_rr(e, w, hd, RAX);
             break;
         }
 

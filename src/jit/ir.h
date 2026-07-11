@@ -74,6 +74,7 @@ enum {
 
     IRO_CLZ,                /* dst, a (width per w; 0 input => width) */
     IRO_REV64, IRO_REV32,   /* bswap64 / bswap32-zext */
+    IRO_RBIT,               /* dst, a: bit-reverse within width (per w) */
 
     /* conditional (consume NZCV; cc = guest condition 0..15) */
     IRO_CSEL, IRO_CSINC, IRO_CSINV, IRO_CSNEG,  /* dst = cc ? a : op(b) */
@@ -142,6 +143,7 @@ enum {
     AT_STLR,                /* STLR/STLLR: atomic release store */
     AT_SWP,                 /* SWP: dst = old, [base] = b */
     AT_LDADD, AT_LDCLR, AT_LDEOR, AT_LDSET,   /* dst = old, [base] op= b */
+    AT_LDSMAX, AT_LDSMIN, AT_LDUMAX, AT_LDUMIN,   /* (order = LSE opc 4-7) */
     AT_CAS,                 /* dst/cc = Rs (expected/old), b = Rt (new) */
 };
 #define AT_MAKE(kind, szlog, acq, rel) \
@@ -157,18 +159,36 @@ enum {
 enum {
     VC_BITW,                /* 3-same opc 0x03: AND/BIC/ORR/EOR/BSL/BIT/BIF */
     VC_ADDSUB,              /* 3-same opc 0x10: ADD/SUB, all sizes */
-    VC_CM3,                 /* 3-same compares: CMEQ(U1 0x11) CMGT/CMHI(0x06)
-                             * CMGE/CMHS(0x07) */
-    VC_SHIFTI,              /* shift-imm: SHL(0x0a U0) SSHR/USHR(0x00) */
+    VC_CM3,                 /* 3-same compares: CMEQ(U1 0x11) CMTST(U0 0x11)
+                             * CMGT/CMHI(0x06) CMGE/CMHS(0x07) */
+    VC_SHIFTI,              /* shift-imm: SHL(0x0a U0) SSHR/USHR(0x00)
+                             * SHRN(0x10 U0) USHLL/SSHLL(0x14) */
+    VC_MINMAX,              /* 3-same 0x0c/0x0d: SMAX/UMAX/SMIN/UMIN b/h/s */
+    VC_MUL3,                /* 3-same 0x13 U0: MUL b/h/s */
+    VC_PAIRI,               /* 3-same pairwise: ADDP(0x17 U0) S/UMAXP(0x14)
+                             * S/UMINP(0x15) */
+    VC_2MISC,               /* two-reg misc: CM*-#0, ABS/NEG, NOT, RBIT.v,
+                             * CNT, CLZ/CLS, XTN(2), REV*, SHLL, S/UADDLP */
+    VC_ACROSS,              /* across lanes: ADDV, S/UMAXV, S/UMINV */
+    VC_VF3S,                /* vector FP 3-same arith: FADD/FSUB/FMUL/FDIV/
+                             * FABD/FMLA/FMLS (NaN-gated, self-counting) */
+    VC_VFCM,                /* vector FP 3-same compares: FCMEQ/FCMGE/FCMGT/
+                             * FACGE/FACGT (mask result, no gate) */
     VC_MOVI,                /* modified-imm MOVI/MVNI/FMOV/ORR/BIC: imm is
                              * pre-expanded; aux carries rd/Q/op kind */
     VC_COPY,                /* AdvSIMD copy: DUP/INS/UMOV/SMOV */
-    VC_F2,                  /* scalar FMUL/FDIV/FADD/FSUB/FNMUL (S/D) */
+    VC_F2,                  /* scalar FMUL/FDIV/FADD/FSUB/FNMUL (S/D), and
+                             * FMAX/FMIN/FMAXNM/FMINNM (opc 4-7, per-host) */
     VC_F1,                  /* scalar FMOV/FABS/FNEG/FSQRT (S/D) */
+    VC_F3,                  /* scalar FMADD/FMSUB/FNMADD/FNMSUB (S/D) */
     VC_FCMP,                /* FCMP/FCMPE (reg or #0.0): writes NZCV */
+    VC_FCCMP,               /* FCCMP/FCCMPE: reads AND writes NZCV */
     VC_FCSEL,               /* reads NZCV */
     VC_FMOVI,               /* scalar FMOV #imm (pattern in o->imm low half) */
     VC_FMOVG,               /* FMOV gpr<->fpr incl. Vn.D[1] forms */
+    VC_CVTIF,               /* SCVTF/UCVTF gpr -> fp (a = gpr source) */
+    VC_CVTFI,               /* FCVTZS/FCVTZU fp -> gpr (dst = gpr) */
+    VC_FCVT,                /* FCVT S<->D precision change */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

@@ -22,7 +22,7 @@ ms() {                       # run "$@"; print wall ms; output lands in $OUTF
 }
 
 status=0
-for k in int_alu memops calls lockping fpvec; do
+for k in int_alu memops calls lockping fpvec strops; do
     bin="tests/bench/$k.bin"
     "$AGCC" -O2 -static -o "$bin" "tests/bench/$k.c" -lm -lpthread || { echo "FAIL build $k"; status=1; continue; }
     want=$("$QEMU" "$bin" 2>/dev/null || true)
