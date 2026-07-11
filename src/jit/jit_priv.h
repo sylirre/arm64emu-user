@@ -68,6 +68,10 @@ typedef struct JitEnv {
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_stv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     u64 tmp_spill[4];           /* spill homes for IR temps (generated code) */
+    u64 vconst[2];              /* 128-bit constant staging slot: generated
+                                 * code stores a translate-time constant here
+                                 * and movdqu-loads it (x86 pshufb LUTs and
+                                 * byte-shift masks; no RIP-relative pools) */
     u32 slowmem;                /* A64_JIT_SLOWMEM: every mem op takes the
                                  * helper path (fast-path codegen bisection) */
 

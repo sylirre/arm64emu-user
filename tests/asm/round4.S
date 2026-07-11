@@ -316,6 +316,137 @@ _start:
     mix x16
     sect
 
+    // ---- section 5: x86 SIMD-parity classes (a64 had them; the x86
+    // backend gained MUL, ADDV/MAXV/MINV, 64-bit compares, byte shifts,
+    // CNT/RBIT.v/REV*, S/UADDLP). Checksummed against qemu; the still-
+    // declined forms (SSHR.b, SSRA.2d) ride along to prove the helper. ----
+    movz x1, #0x80ff, lsl #48
+    movk x1, #0x7f01, lsl #32
+    movk x1, #0x00fe, lsl #16
+    movk x1, #0x8001
+    movz x2, #0x7f80, lsl #48
+    movk x2, #0x0180, lsl #32
+    movk x2, #0xff00, lsl #16
+    movk x2, #0x7ffe
+    dup v0.2d, x1
+    ins v0.d[1], x2
+    dup v1.2d, x2
+    ins v1.d[0], x1
+    // vector MUL, all sizes
+    mul v2.16b, v0.16b, v1.16b
+    mixv v2
+    mul v2.8b, v0.8b, v1.8b
+    mixv v2
+    mul v3.8h, v0.8h, v1.8h
+    mixv v3
+    mul v3.4h, v0.4h, v1.4h
+    mixv v3
+    mul v4.4s, v0.4s, v1.4s
+    mixv v4
+    mul v4.2s, v0.2s, v1.2s
+    mixv v4
+    // across-lanes reductions
+    addv b5, v0.16b
+    mixv v5
+    addv b5, v0.8b
+    mixv v5
+    addv h5, v0.8h
+    mixv v5
+    addv h5, v0.4h
+    mixv v5
+    addv s5, v0.4s
+    mixv v5
+    smaxv b6, v0.16b
+    mixv v6
+    umaxv b6, v0.16b
+    mixv v6
+    sminv b6, v0.8b
+    mixv v6
+    uminv b6, v0.8b
+    mixv v6
+    smaxv h6, v0.8h
+    mixv v6
+    uminv h6, v0.4h
+    mixv v6
+    sminv s6, v0.4s
+    mixv v6
+    umaxv s6, v0.4s
+    mixv v6
+    // 64-bit lane compares
+    cmeq v7.2d, v0.2d, v1.2d
+    mixv v7
+    cmgt v7.2d, v0.2d, v1.2d
+    mixv v7
+    cmge v7.2d, v0.2d, v1.2d
+    mixv v7
+    cmhi v7.2d, v0.2d, v1.2d
+    mixv v7
+    cmhs v7.2d, v0.2d, v1.2d
+    mixv v7
+    cmtst v7.2d, v0.2d, v1.2d
+    mixv v7
+    movi v7.2d, #0
+    cmeq v7.2d, v7.2d, v0.2d
+    mixv v7
+    // byte shifts (+ the declined SSHR.b/SSRA.b helper path)
+    shl v2.16b, v0.16b, #3
+    mixv v2
+    shl v2.8b, v0.8b, #7
+    mixv v2
+    ushr v3.16b, v0.16b, #2
+    mixv v3
+    ushr v3.16b, v0.16b, #8
+    mixv v3
+    dup v4.2d, x2
+    usra v4.16b, v0.16b, #3
+    mixv v4
+    sshr v5.16b, v0.16b, #5
+    mixv v5
+    dup v6.2d, x2
+    ssra v6.16b, v0.16b, #6
+    mixv v6
+    // CNT / RBIT.v / REV*
+    cnt v2.16b, v0.16b
+    mixv v2
+    cnt v2.8b, v0.8b
+    mixv v2
+    rbit v3.16b, v0.16b
+    mixv v3
+    rbit v3.8b, v0.8b
+    mixv v3
+    rev16 v4.16b, v0.16b
+    mixv v4
+    rev32 v4.16b, v0.16b
+    mixv v4
+    rev32 v4.8h, v0.8h
+    mixv v4
+    rev64 v5.16b, v0.16b
+    mixv v5
+    rev64 v5.8h, v0.8h
+    mixv v5
+    rev64 v5.4s, v0.4s
+    mixv v5
+    rev64 v5.4h, v0.4h
+    mixv v5
+    // pairwise widening adds
+    saddlp v6.8h, v0.16b
+    mixv v6
+    saddlp v6.4h, v0.8b
+    mixv v6
+    saddlp v6.4s, v0.8h
+    mixv v6
+    uaddlp v7.8h, v0.16b
+    mixv v7
+    uaddlp v7.4s, v0.8h
+    mixv v7
+    uaddlp v7.2d, v0.4s
+    mixv v7
+    uaddlp v7.2s, v0.4h
+    mixv v7
+    saddlp v7.2d, v0.4s             // declined on x86: helper path
+    mixv v7
+    sect
+
     // dump checksums
     mov x0, #1                      // fd 1
     adrp x1, out
