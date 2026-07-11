@@ -162,7 +162,8 @@ enum {
     VC_CM3,                 /* 3-same compares: CMEQ(U1 0x11) CMTST(U0 0x11)
                              * CMGT/CMHI(0x06) CMGE/CMHS(0x07) */
     VC_SHIFTI,              /* shift-imm: SHL(0x0a U0) SSHR/USHR(0x00)
-                             * SHRN(0x10 U0) USHLL/SSHLL(0x14) */
+                             * SSRA/USRA(0x02) SHRN(0x10 U0)
+                             * USHLL/SSHLL(0x14) */
     VC_MINMAX,              /* 3-same 0x0c/0x0d: SMAX/UMAX/SMIN/UMIN b/h/s */
     VC_MUL3,                /* 3-same 0x13 U0: MUL b/h/s */
     VC_PAIRI,               /* 3-same pairwise: ADDP(0x17 U0) S/UMAXP(0x14)
@@ -189,6 +190,11 @@ enum {
     VC_CVTIF,               /* SCVTF/UCVTF gpr -> fp (a = gpr source) */
     VC_CVTFI,               /* FCVTZS/FCVTZU fp -> gpr (dst = gpr) */
     VC_FCVT,                /* FCVT S<->D precision change */
+    VC_S3S,                 /* AdvSIMD scalar 3-same integer, D-form only:
+                             * ADD/SUB(0x10), CMGT/CMHI(0x06), CMGE/CMHS
+                             * (0x07), CMTST/CMEQ(0x11) */
+    VC_SSHIFTI,             /* AdvSIMD scalar shift-imm, D-form (immh<3>):
+                             * SHL(0x0a U0), S/USHR(0x00), S/USRA(0x02) */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

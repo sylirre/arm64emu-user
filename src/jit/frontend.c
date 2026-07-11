@@ -61,6 +61,7 @@ static void put_alu(IRBlock *ir, u8 op, u8 w, u8 dst, u8 a, u8 b) {
     if (dst == VREG_ZERO) {
         switch (op) {                       /* only flag-setters have effect */
             case IRO_ADDS: case IRO_SUBS: case IRO_ANDS: case IRO_BICS:
+            case IRO_ADCS: case IRO_SBCS:
                 break;
             default:
                 return;
@@ -274,6 +275,26 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 default: break;
             }
         }
+    } else if ((insn & 0xDF200400u) == 0x5E200400u) {
+        /* AdvSIMD scalar three-same (bit28 set): the D-form integer ADD/SUB
+         * and compares — size==3 only. The other sizes and opcodes are the
+         * saturating/rounding families, which keep the helper (and its
+         * undefined-instruction behavior). */
+        unsigned opc = (insn >> 11) & 0x1f;
+        unsigned size3 = (insn >> 22) & 3;
+        if (size3 == 3 &&
+            (opc == 0x10 || opc == 0x11 || opc == 0x06 || opc == 0x07))
+            vclass = VC_S3S;
+    } else if ((insn & 0xDF800400u) == 0x5F000400u &&
+               ((insn >> 19) & 0xf) != 0) {
+        /* AdvSIMD scalar shift-imm: the D-form same-width shifts (immh<3>
+         * set), incl. the S/USRA accumulators — glibc/gcc use `add d,d,d` +
+         * `usra` shapes in checksum/hash loops. Narrowing, rounding,
+         * saturating and fixed-point-convert forms keep the helper. */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 11) & 0x1f;
+        if (((insn >> 22) & 1) &&                /* immh & 8: esize 64 */
+            ((opc == 0x0a && !U) || opc == 0x00 || opc == 0x02))
+            vclass = VC_SSHIFTI;
     } else if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
         /* two-register misc (21:17 = 10000, 11:10 = 10); the whitelist
          * mirrors simd_two_misc's coverage and the architectural size
@@ -351,7 +372,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
         /* shift immediate (28:23 = 011110, bit10 = 1, immh != 0) */
         unsigned U = (insn >> 29) & 1, opc = (insn >> 11) & 0x1f;
         unsigned immh = (insn >> 19) & 0xf;
-        if ((opc == 0x0a && !U) || opc == 0x00) vclass = VC_SHIFTI;
+        if ((opc == 0x0a && !U) || opc == 0x00 || opc == 0x02)
+            vclass = VC_SHIFTI;                  /* +S/USRA accumulate */
         else if ((opc == 0x10 && !U && immh <= 7) ||   /* SHRN(2): narrow */
                  (opc == 0x14 && immh <= 7))           /* S/USHLL(2): widen */
             vclass = VC_SHIFTI;
@@ -1261,28 +1283,52 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
         /* ---- everything else (FP/SIMD arith, system, rare atomics):
          * interpreter helper ---- */
         default: {
-            if (e->op == PD_GENERIC && fe_atomic(ir, insn, pc))
+            /* The fe_* families decode raw words (no PD id), so each gets a
+             * pseudo-id above PD_NOPS_ for A64_JIT_PDMAX bisection:
+             *   +0 fe_atomic  +1 fe_fpsimd  +2 fe_ldst_extra  +3 fe_bitfield
+             *   +4 fe_ld1     +5 RBIT idiom +6 ADC/SBC family */
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 0) &&
+                fe_atomic(ir, insn, pc))
                 return FE_CONT;      /* inline atomic (not in ninsns) */
-            if (e->op == PD_GENERIC && fe_fpsimd(ir, insn, pc))
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 1) &&
+                fe_fpsimd(ir, insn, pc))
                 return FE_CONT;      /* inline vector/FP (counted inside) */
-            if (e->op == PD_GENERIC && fe_ldst_extra(ir, insn, pc)) {
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 2) &&
+                fe_ldst_extra(ir, insn, pc)) {
                 ir->ninsns++;        /* inline leftover load/store form */
                 return FE_CONT;
             }
-            if (e->op == PD_GENERIC && fe_bitfield(ir, insn, pc)) {
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 3) &&
+                fe_bitfield(ir, insn, pc)) {
                 ir->ninsns++;        /* SBFIZ / BFM family */
                 return FE_CONT;
             }
-            if (e->op == PD_GENERIC && fe_ld1(ir, insn, pc)) {
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 4) &&
+                fe_ld1(ir, insn, pc)) {
                 ir->ninsns++;        /* contiguous LD1/ST1 */
                 return FE_CONT;
             }
-            if (e->op == PD_GENERIC &&
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 5) &&
                 (insn & 0x7FFFFC00u) == 0x5AC00000u) {
                 /* RBIT (dp 1-source, opcode 0): strlen's rbit+clz idiom */
                 if ((insn & 31) != 31)
                     ir_put(ir, IRO_RBIT, (u8)(insn >> 31), (u8)(insn & 31),
                            rx((insn >> 5) & 31), 0, 0, 0, 0);
+                ir->ninsns++;
+                return FE_CONT;
+            }
+            if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 6) &&
+                (insn & 0x1FE0FC00u) == 0x1A000000u) {
+                /* ADC/ADCS/SBC/SBCS (+ NGC(S): Rn == 31). decode.c's
+                 * add_with_carry is the reference; the backends consume the
+                 * guest C flag natively. A non-S form writing XZR is
+                 * architecturally a no-op (put_alu drops it). */
+                unsigned sbc = (insn >> 30) & 1, S = (insn >> 29) & 1;
+                static const u8 ops[4] = { IRO_ADC, IRO_ADCS,
+                                           IRO_SBC, IRO_SBCS };
+                put_alu(ir, ops[(sbc << 1) | S], (u8)(insn >> 31),
+                        rx(insn & 31), rx((insn >> 5) & 31),
+                        rx((insn >> 16) & 31));
                 ir->ninsns++;
                 return FE_CONT;
             }
@@ -1417,7 +1463,9 @@ static void fe_liveness(IRBlock *ir) {
                 if (o->b < VREG_N && o->b != VREG_ZERO) {
                     switch (o->op) {
                         case IRO_ADD: case IRO_ADDS: case IRO_SUB:
-                        case IRO_SUBS: case IRO_AND: case IRO_ANDS:
+                        case IRO_SUBS: case IRO_ADC: case IRO_ADCS:
+                        case IRO_SBC: case IRO_SBCS:
+                        case IRO_AND: case IRO_ANDS:
                         case IRO_BIC: case IRO_BICS: case IRO_ORR:
                         case IRO_ORN: case IRO_EOR: case IRO_EON:
                         case IRO_LSLV: case IRO_LSRV: case IRO_ASRV:

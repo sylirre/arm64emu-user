@@ -372,6 +372,7 @@ static int next_consumes_flags(const IRBlock *ir, int i) {
         case IRO_BCOND:
         case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
         case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
+        case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
             return 1;
         default:
             return 0;
@@ -380,6 +381,30 @@ static int next_consumes_flags(const IRBlock *ir, int i) {
 static void set_flags_state(BE *be, const IRBlock *ir, int i, int kind) {
     be->fl = kind;
     if (!next_consumes_flags(ir, i)) materialize_flags(be);
+}
+
+/* Host CF = guest C (inverted for the sbb forms: ARM SBC = a + ~b + C =
+ * x86 sbb with CF = !C) from the current lazy flag location. Clobbers rax
+ * on the FL_MEM path; only flag-transparent movs may follow before the
+ * adc/sbb that consumes CF. */
+static void carry_to_host(BE *be, int inverted) {
+    Emit *e = be->e;
+    switch (be->fl) {
+        case FL_ADD:                             /* CF == C after addition */
+            if (inverted) e8(e, 0xF5);           /* cmc */
+            break;
+        case FL_SUB:                             /* CF == borrow == !C */
+            if (!inverted) e8(e, 0xF5);
+            break;
+        case FL_LOGIC:                           /* and/test: CF == 0 == C */
+            if (inverted) e8(e, 0xF9);           /* stc */
+            break;
+        default:                                 /* FL_MEM: C is nzcv<29> */
+            ld32(e, RAX, R14, OFF_NZCV);
+            e8(e, 0x0F); e8(e, 0xBA); e8(e, 0xE0); e8(e, 29);   /* bt eax,29 */
+            if (inverted) e8(e, 0xF5);
+            break;
+    }
 }
 
 /* ---- common op patterns ---- */
@@ -509,11 +534,10 @@ static void alu_rrr_S(BE *be, int w, u8 opc_rr, int d, int a, int b) {
         /* compare/test only */
         if (opc_rr == 0x29) { op_rr(e, w, 0x39, hb, ha); return; } /* cmp */
         if (opc_rr == 0x21) { op_rr(e, w, 0x85, hb, ha); return; } /* test */
-        if (opc_rr == 0x01) {                     /* adds xzr: need result */
-            mov_rr(e, 1, RAX, ha);
-            op_rr(e, w, 0x01, hb, RAX);
-            return;
-        }
+        /* adds/adcs/sbcs xzr: no compare form, compute into rax */
+        mov_rr(e, 1, RAX, ha);
+        op_rr(e, w, opc_rr, hb, RAX);
+        return;
     }
     if (d == b && d != a) {
         mov_rr(e, 1, RAX, ha);
@@ -847,9 +871,14 @@ int be_vop_ok(unsigned vclass, u32 insn) {
             if (opc3 == 0x14)                    /* S/USHLL(2): widen */
                 return U ? 1 : sz <= 1;          /* no 64-bit arith shift */
             if (sz == 0) return 0;               /* no byte shifts in SSE2 */
-            if (opc3 == 0x00 && !U && sz == 3) return 0;     /* no psraq */
+            if ((opc3 == 0x00 || opc3 == 0x02) && !U && sz == 3)
+                return 0;                        /* no psraq (SSHR/SSRA.2d) */
             return 1;
         }
+        case VC_S3S:
+            return 1;                            /* SSE2 / GPR recipes */
+        case VC_SSHIFTI:
+            return 1;                            /* psllq/psrlq; sar for S */
         case VC_2MISC:
             switch ((U << 5) | ((insn >> 12) & 0x1f)) {
                 case 0x08: case 0x28: case 0x09:
@@ -1218,7 +1247,15 @@ static void emit_vop(BE *be, const IROp *o) {
                 sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
                 break;
             }
-            if (opc3 == 0x0a) {                               /* SHL */
+            if (opc3 == 0x02) {                               /* S/USRA */
+                /* Shift right (psrl/psra saturate a count == esize exactly
+                 * like vreg_shift), then accumulate into Vd. */
+                static const u8 padd[4] = { 0xFC, 0xFD, 0xFE, 0xD4 };
+                sse_shift_i(e, shopc[size - 1], U ? 2 : 4, 0,
+                            (u8)(2 * esize - immhb));
+                sse_mem(e, 0xF3, 0x6F, 1, OFF_V(rd));
+                sse_rr(e, 0x66, padd[size], 0, 1);
+            } else if (opc3 == 0x0a) {                        /* SHL */
                 sse_shift_i(e, shopc[size - 1], 6, 0, (u8)(immhb - esize));
             } else if (U) {                                   /* USHR */
                 sse_shift_i(e, shopc[size - 1], 2, 0, (u8)(2 * esize - immhb));
@@ -1227,6 +1264,70 @@ static void emit_vop(BE *be, const IROp *o) {
             }
             sse_mem(e, 0xF3, 0x7F, 0, OFF_V(rd));
             if (!Q) st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_S3S: {
+            /* Scalar 3-same integer, D-form (size==3 whitelisted). ADD/SUB
+             * stay pure SSE (movq loads zero-extend, matching the scalar
+             * clear-high rule); the compares go through GPRs. */
+            unsigned U = (insn >> 29) & 1, opc3 = (insn >> 11) & 0x1f;
+            if (opc3 == 0x10) {                               /* ADD / SUB */
+                sse_mem(e, 0xF3, 0x7E, 0, OFF_V(rn));         /* movq */
+                sse_mem(e, 0xF3, 0x7E, 1, OFF_V(rm));
+                sse_rr(e, 0x66, U ? 0xFB : 0xD4, 0, 1);       /* psub/addq */
+                sse_mem(e, 0x66, 0xD6, 0, OFF_V(rd));         /* movq store */
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                break;
+            }
+            materialize_flags(be);                            /* cmp below */
+            ld64(e, RAX, R14, OFF_V(rn));
+            ld64(e, RCX, R14, OFF_V(rm));
+            int cc;
+            if (opc3 == 0x11 && !U) {                         /* CMTST */
+                op_rr(e, 1, 0x85, RCX, RAX);                  /* test */
+                cc = CC_NE;
+            } else {
+                op_rr(e, 1, 0x39, RCX, RAX);                  /* cmp n, m */
+                cc = (opc3 == 0x11) ? CC_E                    /* CMEQ */
+                   : (opc3 == 0x06) ? (U ? CC_A : CC_G)       /* CMHI/CMGT */
+                   : (U ? CC_AE : CC_GE);                     /* CMHS/CMGE */
+            }
+            e8(e, 0x0F); e8(e, (u8)(0x90 | cc)); e8(e, 0xC0); /* setcc al */
+            e8(e, 0x0F); e8(e, 0xB6); e8(e, 0xC0);            /* movzx eax,al */
+            rex(e, 1, 0, 0, RAX); e8(e, 0xF7); e8(e, 0xD8);   /* neg rax */
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_SSHIFTI: {
+            /* Scalar shift-imm, D-form. Logical shifts and the U-accumulate
+             * ride psllq/psrlq (count semantics match vreg_shift); the
+             * signed ones need sar, so they go through a GPR. */
+            unsigned U = (insn >> 29) & 1, opc3 = (insn >> 11) & 0x1f;
+            unsigned immhb = ((insn >> 16) & 0x7f);
+            if (opc3 == 0x0a || U) {
+                sse_mem(e, 0xF3, 0x7E, 0, OFF_V(rn));         /* movq */
+                if (opc3 == 0x0a)                             /* SHL */
+                    sse_shift_i(e, 0x73, 6, 0, (u8)(immhb - 64));
+                else                                          /* USHR/USRA */
+                    sse_shift_i(e, 0x73, 2, 0, (u8)(128 - immhb));
+                if (opc3 == 0x02) {                           /* USRA */
+                    sse_mem(e, 0xF3, 0x7E, 1, OFF_V(rd));
+                    sse_rr(e, 0x66, 0xD4, 0, 1);              /* paddq */
+                }
+                sse_mem(e, 0x66, 0xD6, 0, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                break;
+            }
+            /* SSHR / SSRA: sar with the interpreter's >=64 -> 63 clamp */
+            unsigned sh = 128 - immhb;
+            materialize_flags(be);
+            ld64(e, RAX, R14, OFF_V(rn));
+            shift_ri(e, 1, 7, RAX, sh >= 64 ? 63 : sh);       /* sar */
+            if (opc3 == 0x02)                                 /* SSRA */
+                op_rm(e, 1, 0x03, RAX, R14, OFF_V(rd));       /* add rax,[Vd] */
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
             break;
         }
         case VC_MOVI: {
@@ -2094,6 +2195,30 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             u8 opc = o->op == IRO_BIC ? 0x21 : o->op == IRO_ORN ? 0x09 : 0x31;
             op_rr(e, w, opc, RDX, hd);
             if (!w) mov_rr(e, 0, hd, hd);
+            break;
+        }
+
+        case IRO_ADC: case IRO_SBC: {
+            /* Non-S: guest NZCV must survive, but adc/sbb clobber EFLAGS —
+             * materialize first, then recover C from the word. */
+            int sbc = (o->op == IRO_SBC);
+            materialize_flags(be);
+            carry_to_host(be, sbc);
+            alu_rrr(be, w, sbc ? 0x19 : 0x11, !sbc, o->dst, o->a, o->b);
+            break;
+        }
+        case IRO_ADCS: case IRO_SBCS: {
+            int sbc = (o->op == IRO_SBCS);
+            if (o->flags_dead && o->dst == VREG_ZERO) break;   /* fully dead */
+            carry_to_host(be, sbc);
+            if (o->flags_dead) {
+                alu_rrr(be, w, sbc ? 0x19 : 0x11, !sbc, o->dst, o->a, o->b);
+                break;
+            }
+            alu_rrr_S(be, w, sbc ? 0x19 : 0x11, o->dst, o->a, o->b);
+            /* x86 adc/sbb CF and OF are exactly ARM's C (inverted for the
+             * subtract) and V of the 3-input op: the existing kinds fit. */
+            set_flags_state(be, ir, i, sbc ? FL_SUB : FL_ADD);
             break;
         }
 

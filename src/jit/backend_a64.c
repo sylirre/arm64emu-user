@@ -274,6 +274,7 @@ static int next_consumes_flags(const IRBlock *ir, int i) {
         case IRO_BCOND:
         case IRO_CSEL: case IRO_CSINC: case IRO_CSINV: case IRO_CSNEG:
         case IRO_CCMPR: case IRO_CCMNR: case IRO_CCMPI: case IRO_CCMNI:
+        case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS:
             return 1;
         default:
             return 0;
@@ -575,6 +576,7 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_FCMP: case VC_FCCMP: case VC_FCSEL:
         case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
+        case VC_S3S: case VC_SSHIFTI:
             return 1;
         case VC_F2: {
             /* FMAX/FMIN (opc 4-7): the interpreter's C ternary keeps NaN
@@ -757,7 +759,7 @@ static void emit_vop(BE *be, const IROp *o) {
             int has_rm = (vclass == VC_BITW || vclass == VC_ADDSUB ||
                           vclass == VC_CM3 || vclass == VC_MINMAX ||
                           vclass == VC_MUL3 || vclass == VC_PAIRI ||
-                          vclass == VC_VFCM ||
+                          vclass == VC_VFCM || vclass == VC_S3S ||
                           vclass == VC_FCSEL || vclass == VC_FCCMP ||
                           (vclass == VC_FCMP && !((insn >> 3) & 1)));
             int reads_rd = (vclass == VC_BITW && ((insn >> 29) & 1) &&
@@ -768,7 +770,9 @@ static void emit_vop(BE *be, const IROp *o) {
                         || (vclass == VC_2MISC && ((insn >> 12) & 0x1f) == 0x12
                             && ((insn >> 30) & 1))       /* XTN2 keeps low */
                         || (vclass == VC_SHIFTI && opc3 == 0x10
-                            && ((insn >> 30) & 1));      /* SHRN2 keeps low */
+                            && ((insn >> 30) & 1))       /* SHRN2 keeps low */
+                        || ((vclass == VC_SHIFTI || vclass == VC_SSHIFTI)
+                            && opc3 == 0x02);            /* S/USRA accumulate */
             int gpr_src = (vclass == VC_CVTIF) ||
                           (vclass == VC_COPY &&
                            !((insn >> 29) & 1) &&
@@ -811,7 +815,8 @@ static void emit_vop(BE *be, const IROp *o) {
             w = (w & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5) | 2;
             if (has_rm) w |= 1u << 16;
             else        w |= (insn & (0x1Fu << 16));   /* keep imm fields */
-            if (vclass == VC_SHIFTI)             /* bits 22:16 are immh:immb */
+            if (vclass == VC_SHIFTI || vclass == VC_SSHIFTI)
+                /* bits 22:16 are immh:immb */
                 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
             if (vclass == VC_FCMP || vclass == VC_FCCMP) {
                 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16))) | (0u << 5);
@@ -1136,6 +1141,21 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
         case IRO_ORN:  alu3(be, w, 0x2A200000u, o->dst, o->a, o->b); break;
         case IRO_EOR:  alu3(be, w, 0x4A000000u, o->dst, o->a, o->b); break;
         case IRO_EON:  alu3(be, w, 0x4A200000u, o->dst, o->a, o->b); break;
+        case IRO_ADC: case IRO_ADCS: case IRO_SBC: case IRO_SBCS: {
+            /* Native adc/sbc; guest C must be in host NZCV first. The non-S
+             * (and flags-dead) forms leave host NZCV untouched, so the lazy
+             * flag state is unaffected. */
+            static const u32 base[4] = { 0x1A000000u, 0x3A000000u,
+                                         0x5A000000u, 0x7A000000u };
+            int S = (o->op == IRO_ADCS || o->op == IRO_SBCS) &&
+                    !o->flags_dead;
+            int sbc = (o->op == IRO_SBC || o->op == IRO_SBCS);
+            if (o->flags_dead && o->dst == VREG_ZERO) break;   /* fully dead */
+            flags_to_host(be);
+            alu3(be, w, base[(sbc << 1) | S], o->dst, o->a, o->b);
+            if (S) set_flags_state(be, ir, i);
+            break;
+        }
         case IRO_ADDS:
             alu3(be, w, o->flags_dead ? 0x0B000000u : 0x2B000000u,
                  o->dst, o->a, o->b);
