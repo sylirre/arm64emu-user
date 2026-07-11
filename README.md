@@ -30,13 +30,17 @@ arm64chroot [options] <rootfs> <program> [args...]
   -0 ARG0          override argv[0] for the guest program
   -fake-id [ID]    present a fake identity (fakeroot-style); ID = uid | uid:gid,
                    default 0:0 (root)
+  -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
+                   (repeatable); append `:ro` for a read-only mount. Host paths
+                   may not contain ':'.
 ```
 
 `<rootfs>` is a directory tree containing an AArch64 userland (e.g. an Alpine or
 Debian arm64 root filesystem). `/` is allowed to run host-native aarch64 binaries
 directly. Guest paths resolve **inside** the rootfs — absolute symlinks are
 followed against the guest root and `..` cannot escape it — so no privilege or
-`chroot(2)` is required. `/proc` and a `/dev` whitelist (null, zero, random,
+`chroot(2)` is required. `-bind` (below) opens deliberate windows onto specific
+host directories. `/proc` and a `/dev` whitelist (null, zero, random,
 urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
 `/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
 cannot escape the rootfs), `maps`, `cmdline`, `comm`, `mounts`/`mountinfo`,
@@ -66,6 +70,27 @@ the host would reject succeed. The illusion is confined to what the emulator
 reports — it does **not** bypass host DAC, so fake-root still cannot read a file
 the host user genuinely cannot, and there is no persistent per-file ownership
 database (a `chown` to an arbitrary third uid is accepted but not remembered).
+
+### Host directory binds (`-bind`)
+
+`-bind src:dst` exposes host directory `src` at guest path `dst`, like a bind
+mount — a deliberate window through rootfs containment for sharing a project
+tree, build cache, or dataset without copying it in:
+
+```sh
+arm64chroot -bind "$PWD:/work" ./rootfs /bin/sh          # read-write
+arm64chroot -bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
+```
+
+Repeatable; nested binds resolve by longest guest-prefix. A `:ro` bind rejects
+mutating syscalls under it with `EROFS` (writable/creating `open`, `mkdir`,
+`unlink`, `rename`, `symlink`/`link`, `truncate`, `chmod`/`chown`, `utimensat`,
+xattr writes). Containment still holds *inside* a bind: an absolute symlink there
+re-roots to the guest root, and `..` climbs into the rootfs, never to the host
+parent of `src`. Binds appear in the guest's `/proc/mounts` and `/proc/mountinfo`.
+The mount point need not pre-exist in the rootfs, though it should for a seamless
+`readdir` of its parent. Host paths may not contain `:` (a trailing `:ro`/`:rw`
+is the option field).
 
 ## What works
 

@@ -14,6 +14,9 @@
  *                    default 0:0 (root)
  *   -link2symlink    emulate hardlinks with tracked symlinks where the host
  *                    forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
+ *   -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
+ *                    (repeatable); :ro makes it read-only. Host paths may not
+ *                    contain ':'.
  */
 #include <ctype.h>
 #include <limits.h>
@@ -36,6 +39,7 @@ static void usage(void) {
     fprintf(stderr,
             "usage: arm64chroot [-strace] [-d] [-jit] [-nopd] [-E VAR=VAL]... "
             "[-0 argv0] [-fake-id [uid[:gid]]] [-link2symlink] "
+            "[-bind src:dst[:ro]]... "
             "<rootfs> <program> [args...]\n");
     exit(2);
 }
@@ -62,6 +66,85 @@ static void parse_id_spec(const char *s, u32 *uid, u32 *gid) {
     *uid = (u32)u;
     if (*end == ':') *gid = (u32)strtoul(end + 1, NULL, 10);
     else *gid = (u32)u;   /* single value applies to both */
+}
+
+/* Lexically canonicalize an absolute guest path (collapse '.', '..', '//',
+ * strip trailing '/') into out (>= PATH_MAX) — the form -bind mount points are
+ * matched against in path.c. Returns 0, or -1 on overflow. */
+static int canon_guest(const char *in, char *out) {
+    strcpy(out, "/");
+    for (const char *p = in; *p;) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - p);
+        if (cl == 1 && p[0] == '.') { p = e; continue; }
+        if (cl == 2 && p[0] == '.' && p[1] == '.') {   /* pop, clamped at "/" */
+            char *s = strrchr(out, '/');
+            if (s == out) out[1] = 0; else *s = 0;
+            p = e; continue;
+        }
+        size_t ol = strlen(out);
+        if (ol + (ol > 1) + cl + 1 > PATH_MAX) return -1;
+        if (ol > 1) out[ol++] = '/';
+        memcpy(out + ol, p, cl);
+        out[ol + cl] = 0;
+        p = e;
+    }
+    return 0;
+}
+
+/* Parse and register a -bind mount "src:dst[:ro]": host directory src (realpath'd)
+ * is exposed at absolute guest mount point dst; an optional trailing ":ro" (or
+ * the default ":rw") marks it read-only. Host paths may not contain ':'. Fatal
+ * on any malformed spec. */
+static void add_bind(struct Machine *m, const char *spec) {
+    if (m->n_binds >= BIND_MAX) {
+        fprintf(stderr, "arm64chroot: too many -bind mounts (max %d)\n", BIND_MAX);
+        exit(2);
+    }
+    char buf[2 * PATH_MAX];
+    if (strlen(spec) + 1 > sizeof buf) {
+        fprintf(stderr, "arm64chroot: -bind '%s': too long\n", spec);
+        exit(2);
+    }
+    strcpy(buf, spec);
+    char *colon = strchr(buf, ':');   /* first ':' splits src | dst[:ro] */
+    if (!colon || colon == buf) {
+        fprintf(stderr, "arm64chroot: -bind '%s': expected src:dst[:ro]\n", spec);
+        exit(2);
+    }
+    *colon = 0;
+    const char *src = buf;
+    char *dst = colon + 1;
+    int ro = 0;
+    size_t dl = strlen(dst);
+    if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) { ro = 1; dst[dl - 3] = 0; }
+    else if (dl >= 3 && !strcmp(dst + dl - 3, ":rw")) { dst[dl - 3] = 0; }
+    if (dst[0] != '/') {
+        fprintf(stderr, "arm64chroot: -bind '%s': dst must be absolute\n", spec);
+        exit(2);
+    }
+    int k = m->n_binds;
+    if (!realpath(src, m->binds[k].host)) {
+        fprintf(stderr, "arm64chroot: -bind src '%s': not found\n", src);
+        exit(126);
+    }
+    if (!strcmp(m->binds[k].host, "/")) {
+        fprintf(stderr, "arm64chroot: -bind '%s': cannot bind host root\n", spec);
+        exit(2);
+    }
+    if (canon_guest(dst, m->binds[k].guest) < 0) {
+        fprintf(stderr, "arm64chroot: -bind '%s': dst too long\n", spec);
+        exit(2);
+    }
+    if (!strcmp(m->binds[k].guest, "/")) {
+        fprintf(stderr, "arm64chroot: -bind '%s': cannot bind over guest root\n", spec);
+        exit(2);
+    }
+    m->binds[k].ro = ro;
+    m->n_binds++;
 }
 
 /* Sandbox diagnosis: report an inherited seccomp filter (Seccomp: 2 in
@@ -100,6 +183,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
         else if (!strcmp(argv[i], "-jit")) g_jit = 1;          /* native translation */
         else if (!strcmp(argv[i], "-link2symlink")) m->link2symlink = 1;
+        else if (!strcmp(argv[i], "-bind") && i + 1 < argc) add_bind(m, argv[++i]);
         else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
             extra_env = realloc(extra_env, sizeof(char *) * (size_t)(n_extra + 1));
