@@ -2,6 +2,7 @@
 /* Copyright 2026 Sylirre */
 /* Memory-management syscalls over the guest address space (mem.c). */
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 
 #include "sys.h"
@@ -118,9 +119,40 @@ SYSDEF(mprotect) {
     return r < 0 ? (u64)(s64)r : 0;
 }
 
+/* Guest madvise advice values (asm-generic). */
+#define G_MADV_DONTNEED 4
+#define G_MADV_FREE     8
+
 SYSDEF(madvise) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return 0;   /* advice: accepted and ignored */
+    (void)a3; (void)a4; (void)a5;
+    /* MADV_DONTNEED / MADV_FREE return the pages to the kernel; on Linux the
+     * next access to an anonymous page then faults in a fresh zero page. Go's
+     * page allocator depends on this: after scavenging a range it treats those
+     * pages as already-zero on reuse (mspan.needzero stays 0, so mallocgc and
+     * green-tea's initInlineMarkBits both SKIP re-zeroing). Emulating madvise as
+     * a pure no-op left the scavenged pages holding stale heap data, so a reused
+     * span kept a live pointer in its inline-mark region and the GC read it as a
+     * mark -> "sweep increased allocation count" / "marked free object". Discard
+     * the range by zeroing its backing to match the kernel's zero-on-reuse
+     * guarantee. Only whole guest pages inside the range are cleared. */
+    if (a2 == G_MADV_DONTNEED || a2 == G_MADV_FREE) {
+        if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+        u64 len = PG_UP(a1);
+        AddrSpace *as = &c->m->as;
+        as_lock();
+        for (u64 va = a0; va < a0 + len; va += GUEST_PAGE_SIZE) {
+            /* Only anonymous private mappings get the kernel's zero-on-reuse
+             * behavior. MADV_DONTNEED on a file mapping re-faults from the file
+             * (and the host backing of a MAP_SHARED region *is* the file), so
+             * never scribble zeros there. */
+            const Region *r = as_find_region(as, va);
+            if (!r || r->path || r->shared) continue;
+            void *h = mem_host_ptr(c, va, GUEST_PAGE_SIZE, ACC_WRITE);
+            if (h) memset(h, 0, GUEST_PAGE_SIZE);
+        }
+        as_unlock();
+    }
+    return 0;   /* other advice: accepted and ignored */
 }
 
 static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3) {
