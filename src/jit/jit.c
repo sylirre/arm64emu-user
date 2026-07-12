@@ -269,13 +269,19 @@ static void jdump_block(JitEnv *env, CPU *c, JBlock *b, const u8 *rw_end) {
  * fork child can keep the inherited copy. Used only to decide whether a PTE
  * mutation must interrupt other threads; false positives merely cost an
  * unnecessary flush. 64 MiB of guest VA per lazily-allocated chunk. */
-#define CM_L1_BITS   13                          /* (39-12) - 14 */
-#define CM_L2_PAGES  (1u << 14)
+#define CM_L2_BITS   14                          /* guest pages per L2 chunk (log2) */
+/* L1 spans the rest of the guest page-number space. Derived from
+ * GUEST_VA_BITS (as mem.c's page table is) so widening the guest VA can never
+ * leave this table too small: a stale constant here indexes g_codemap[] out of
+ * bounds for high guest addresses (Go's arena hints live near the top of the
+ * VA), which reads a garbage pointer and faults the host in codemap_test. */
+#define CM_L1_BITS   (GUEST_VA_BITS - 12 - CM_L2_BITS)
+#define CM_L2_PAGES  (1u << CM_L2_BITS)
 static unsigned char *g_codemap[1u << CM_L1_BITS];
 
 static void codemap_mark(u64 pc) {
     u64 pageno = pc >> 12;
-    unsigned l1 = (unsigned)(pageno >> 14);
+    unsigned l1 = (unsigned)(pageno >> CM_L2_BITS);
     unsigned char *map = __atomic_load_n(&g_codemap[l1], __ATOMIC_ACQUIRE);
     if (!map) {
         unsigned char *fresh = calloc(1, CM_L2_PAGES / 8);
@@ -294,7 +300,7 @@ static void codemap_mark(u64 pc) {
 static int codemap_test(u64 pc) {
     u64 pageno = pc >> 12;
     unsigned char *map =
-        __atomic_load_n(&g_codemap[pageno >> 14], __ATOMIC_ACQUIRE);
+        __atomic_load_n(&g_codemap[pageno >> CM_L2_BITS], __ATOMIC_ACQUIRE);
     if (!map) return 0;
     unsigned bit = (unsigned)(pageno & (CM_L2_PAGES - 1));
     return (__atomic_load_n(&map[bit >> 3], __ATOMIC_ACQUIRE) >> (bit & 7)) & 1;
