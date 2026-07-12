@@ -30,9 +30,18 @@ u64 gt_count(CPU *c, bool virt) {
  * status (guest handler delivery arrives in M5). */
 void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
     (void)code;
-    fprintf(stderr,
-            "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
-            sig, (unsigned long long)c->pc, (unsigned long long)addr);
+    /* Include the faulting instruction word when the PC is still fetchable
+     * (always true for SIGILL/undefined, where it names the missing opcode).
+     * mem_ifetch is non-faulting: it reports failure instead of aborting. */
+    u32 insn = 0;
+    if (mem_ifetch(c, c->pc, &insn))
+        fprintf(stderr,
+                "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx insn=0x%08x\n",
+                sig, (unsigned long long)c->pc, (unsigned long long)addr, insn);
+    else
+        fprintf(stderr,
+                "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
+                sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     struct sigaction sa;
