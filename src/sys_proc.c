@@ -424,6 +424,15 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         fprintf(stderr, "arm64chroot: execve reload of %s failed (%d)\n", pathbuf, r);
         _exit(127);
     }
+    /* load_elf built the new image's initial state on m->cpu (the main-thread
+     * CPU). When a secondary guest thread execs -- Go fork+execs its tool
+     * children from an M thread via clone(CLONE_VM|CLONE_VFORK), so the forked
+     * child runs on that thread's own &t->cpu, not &m->cpu -- adopt that state
+     * onto the executing CPU. Otherwise the caller keeps running the previous
+     * program's registers (PC, g in x28, SP) against the freshly loaded address
+     * space and faults immediately. The initial exec and any main-thread exec
+     * pass c == &m->cpu, where this is a no-op. */
+    if (c != &m->cpu) *c = m->cpu;
     /* CLOEXEC fds are closed by the host on real execve; emulate. */
     /* (fds carry host FD_CLOEXEC; walk /proc/self/fd and close flagged ones) */
     {
