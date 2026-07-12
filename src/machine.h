@@ -70,8 +70,6 @@ struct Machine {
     /* Guest signal state (process-wide per POSIX; signal.c). The blocked
      * set is per-thread and lives in g_tls (thread.h). */
     GSigAction sigact[65];    /* index 1..64 */
-    u64 sig_altstack_sp, sig_altstack_size;
-    u32 sig_altstack_flags;
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
 
     /* Thread bookkeeping (CLONE_VM). */

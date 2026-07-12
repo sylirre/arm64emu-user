@@ -109,13 +109,12 @@ SYSDEF(rt_sigtimedwait) {
 }
 
 SYSDEF(sigaltstack) {
-    struct Machine *m = c->m;
     if (a1) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } old = {
-            m->sig_altstack_sp,
-            (s32)(m->sig_altstack_size ? m->sig_altstack_flags : 2 /*SS_DISABLE*/),
+            g_tls.sig_altstack_sp,
+            (s32)(g_tls.sig_altstack_size ? g_tls.sig_altstack_flags : 2 /*SS_DISABLE*/),
             0,
-            m->sig_altstack_size,
+            g_tls.sig_altstack_size,
         };
         if (copy_to_guest(c, a1, &old, sizeof old) < 0) return (u64)(s64)-EFAULT;
     }
@@ -123,12 +122,12 @@ SYSDEF(sigaltstack) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } ss;
         if (copy_from_guest(c, &ss, a0, sizeof ss) < 0) return (u64)(s64)-EFAULT;
         if (ss.flags & 2 /*SS_DISABLE*/) {
-            m->sig_altstack_sp = m->sig_altstack_size = 0;
+            g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
         } else {
             if (ss.size < 2048) return (u64)(s64)-ENOMEM;
-            m->sig_altstack_sp = ss.sp;
-            m->sig_altstack_size = ss.size;
-            m->sig_altstack_flags = (u32)ss.flags;
+            g_tls.sig_altstack_sp = ss.sp;
+            g_tls.sig_altstack_size = ss.size;
+            g_tls.sig_altstack_flags = (u32)ss.flags;
         }
     }
     return 0;

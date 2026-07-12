@@ -205,7 +205,7 @@ void sig_reset_for_exec(struct Machine *m) {
     }
     sigq_head = sigq_tail = 0;   /* this thread's queue; post-exec is single-threaded */
     g_sig_npend = 0;
-    m->sig_altstack_sp = m->sig_altstack_size = 0;
+    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
     g_tls.on_altstack = 0;
 }
 
@@ -255,8 +255,8 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     /* Pick the stack: guest sigaltstack if requested and configured. */
     u64 sp = *cpu_cur_sp(c);
     int used_altstack = 0;
-    if ((act->flags & G_SA_ONSTACK) && m->sig_altstack_size && !g_tls.on_altstack) {
-        sp = m->sig_altstack_sp + m->sig_altstack_size;
+    if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !g_tls.on_altstack) {
+        sp = g_tls.sig_altstack_sp + g_tls.sig_altstack_size;
         used_altstack = 1;
     }
     u64 frame = (sp - FRAME_SIZE) & ~15ULL;
@@ -297,11 +297,11 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
                                                 : g_tls.sigmask;
     g_tls.have_saved_sigmask = 0;
-    wr64(c, frame, UC_STACK + 0, m->sig_altstack_sp);
+    wr64(c, frame, UC_STACK + 0, g_tls.sig_altstack_sp);
     wr32(c, frame, UC_STACK + 8,
-         m->sig_altstack_size ? (g_tls.on_altstack ? 1 /*SS_ONSTACK*/ : 0)
+         g_tls.sig_altstack_size ? (g_tls.on_altstack ? 1 /*SS_ONSTACK*/ : 0)
                               : 2 /*SS_DISABLE*/);
-    wr64(c, frame, UC_STACK + 16, m->sig_altstack_size);
+    wr64(c, frame, UC_STACK + 16, g_tls.sig_altstack_size);
     wr64(c, frame, UC_SIGMASK, mask_to_save);
 
     /* sigcontext */
