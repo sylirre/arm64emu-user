@@ -62,7 +62,7 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,0,0,4,1): v = 0; break;                   /* ID_AA64PFR1_EL1 */
         case KEY(3,0,0,5,0): v = 0x10305106; break;          /* ID_AA64DFR0_EL1 (QEMU cortex-a57) */
         case KEY(3,0,0,5,1): v = 0; break;                   /* ID_AA64DFR1_EL1 */
-        case KEY(3,0,0,6,0): v = 0x100012120ULL; break;      /* ID_AA64ISAR0_EL1: AES=2,SHA1=1,SHA2=2(+SHA512),CRC32=1,SHA3=1 */
+        case KEY(3,0,0,6,0): v = 0x100212120ULL; break;      /* ID_AA64ISAR0_EL1: AES=2,SHA1=1,SHA2=2(+SHA512),CRC32=1,Atomic=2(LSE),SHA3=1 */
         case KEY(3,0,0,6,1): v = 0; break;                   /* ID_AA64ISAR1_EL1 */
         case KEY(3,0,0,7,0): v = 0x1124; break;              /* ID_AA64MMFR0_EL1 (matches QEMU cortex-a57) */
         case KEY(3,0,0,7,1): v = 0; break;                   /* ID_AA64MMFR1_EL1 */
