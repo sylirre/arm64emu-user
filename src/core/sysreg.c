@@ -6,13 +6,13 @@
 #include "mmu.h"
 #include <stdio.h>
 
-/* Generic-timer hooks, provided by timer.c (M3). */
-u64 gt_count(CPU *c, bool virt) __attribute__((weak));
+/* Generic-timer hooks. gt_count is provided by loop.c; timer_update's provider
+ * (timer.c, M3) was never added, so it stays weak and is NULL-checked. */
+u64 gt_count(CPU *c, bool virt);
 void timer_update(struct Machine *m) __attribute__((weak));
 
 static u64 timer_count(CPU *c, bool virt) {
-    if (gt_count) return gt_count(c, virt);
-    return c->icount;   /* rough fallback for M2 standalone */
+    return gt_count(c, virt);
 }
 
 #define KEY(op0, op1, crn, crm, op2) \

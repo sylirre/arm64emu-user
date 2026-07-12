@@ -15,7 +15,7 @@
 #include "predecode.h"
 #include "jit.h"
 
-/* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c weak hook):
+/* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c hook):
  * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
 u64 gt_count(CPU *c, bool virt) {
     (void)c; (void)virt;

@@ -117,7 +117,7 @@ void cpu_reset(CPU *c, u64 entry, unsigned reset_el) {
     c->cntfrq = 24000000ULL;             /* 24 MHz, matches virt DTB */
     /* MPIDR_EL1: bit31 RES1, single core affinity 0. */
     c->mpidr = (1ULL << 31);
-    if (sysreg_init) sysreg_init(c);
+    sysreg_init(c);
 }
 
 bool cond_holds(CPU *c, unsigned cond) {

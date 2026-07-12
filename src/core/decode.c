@@ -9,8 +9,8 @@
 #include "sysreg.h"
 #include <stdio.h>
 
-/* FP/SIMD group hook (M4). Weak so M1 links standalone. */
-void exec_fpsimd(CPU *c, u32 insn) __attribute__((weak));
+/* FP/SIMD group hook (M4), implemented in exec_fpsimd.c. */
+void exec_fpsimd(CPU *c, u32 insn);
 
 static void __attribute__((cold)) undefined(CPU *c, u32 insn) {
     /* Architecturally an UNDEFINED instruction takes a synchronous exception
@@ -1071,8 +1071,7 @@ static void branch_system(CPU *c, u32 insn) {
             return;
         }
         /* MSR(imm)/SYS/SYSL/MRS/MSR(reg) -> sysreg.c (M2) */
-        if (sysreg_exec) { sysreg_exec(c, insn); return; }
-        undefined(c, insn);
+        sysreg_exec(c, insn);
         return;
     }
     undefined(c, insn);
@@ -1085,12 +1084,7 @@ void exec_a64(CPU *c, u32 insn) {
         case 0xa: case 0xb: branch_system(c, insn); break;    /* 101x */
         case 0x4: case 0x6: case 0xc: case 0xe: loads_stores(c, insn); break; /* x1x0 */
         case 0x5: case 0xd: dp_register(c, insn); break;      /* x101 */
-        case 0x7: case 0xf:                                   /* x111 FP/SIMD */
-            if (exec_fpsimd) { exec_fpsimd(c, insn); break; }
-            if (g_dbg) fprintf(stderr, "[fpsimd] unimpl 0x%08x at pc=0x%llx\n",
-                               insn, (unsigned long long)c->cur_insn_pc);
-            undefined(c, insn);
-            break;
+        case 0x7: case 0xf: exec_fpsimd(c, insn); break;      /* x111 FP/SIMD */
         default: undefined(c, insn); break;                   /* 00xx reserved */
     }
 }
