@@ -490,6 +490,21 @@ static u64 usat_add(u64 a, u64 b, unsigned e) {
 }
 static u64 usat_sub(u64 a, u64 b, unsigned e) { (void)e; return (a < b) ? 0 : (a - b); }
 
+/* SUQADD: signed accumulator `d` + UNSIGNED addend `a`, clamped to the signed
+ * range. For esize==64 the addend must stay unsigned (casting it to s64 would
+ * misread a large value as negative); since a>=0, only the upper bound can be
+ * exceeded. */
+static u64 suqadd_sat(u64 d, u64 a, unsigned e) {
+    u64 emask = (e >= 64) ? ~0ULL : (((u64)1 << e) - 1);
+    s64 sd = sx(d, e);
+    u64 ua = a & emask;
+    if (e < 64) return sat_s(sd + (s64)ua, e);
+    u64 lim = (sd >= 0) ? ((u64)INT64_MAX - (u64)sd)      /* headroom above sd */
+                        : ((u64)INT64_MAX + (-(u64)sd));  /* INT64_MAX + |sd|  */
+    if (ua > lim) return (u64)INT64_MAX;
+    return (u64)sd + ua;   /* true sum fits s64; the wrapping sum is its 2's-comp */
+}
+
 /* AdvSIMD register variable shift kernel (S/USHL, S/URSHL, S/UQSHL, S/UQRSHL).
  * sh>=0 left, sh<0 right; round adds the rounding bias; sat clamps left-shift
  * overflow. Pure 64-bit arithmetic (portable to 32-bit hosts): saturation is
@@ -1343,7 +1358,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
             case (0 << 5) | 0x04: { u64 val = a & emask; unsigned msb = (val >> (esize-1)) & 1, cnt = 0; /* CLS */
                 for (int bit = esize - 2; bit >= 0; bit--) { if (((val >> bit) & 1) == msb) cnt++; else break; } v = cnt; } break;
             case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i);     /* SUQADD: signed acc + unsigned */
-                v = ssat_add(sx(d, esize), (s64)(a & emask), esize); } break;
+                v = suqadd_sat(d, a, esize); } break;
             case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i) & emask; s64 sa = sx(a, esize); /* USQADD */
                 v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
             case (0 << 5) | 0x07: { s64 s = sx(a, esize); v = sat_s(s < 0 ? -s : s, esize); } break; /* SQABS */
@@ -1433,7 +1448,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
     switch ((U << 5) | opcode) {
         case (0 << 5) | 0x07: { s64 s = sx(a,esize); v = sat_s(s < 0 ? -s : s, esize); } break;  /* SQABS */
         case (1 << 5) | 0x07: v = sat_s(-sx(a,esize), esize); break;                              /* SQNEG */
-        case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0); v = ssat_add(sx(d,esize), (s64)(a&emask), esize); } break; /* SUQADD */
+        case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0); v = suqadd_sat(d, a, esize); } break; /* SUQADD */
         case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0)&emask; s64 sa = sx(a,esize);  /* USQADD */
             v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
         case (0 << 5) | 0x08: v = (sx(a,esize) >  0) ? emask : 0; break;   /* CMGT #0 */
@@ -1517,8 +1532,11 @@ static void simd_shift_imm(CPU *c, u32 insn) {
         u64 a = velem_get(&c->v[Rn], size, i), v;
         switch ((U << 5) | opc) {
             case (0 << 5) | 0x0a: v = a << (immhb - esize); break;             /* SHL */
-            case (0 << 5) | 0x00: v = (u64)(sx(a, esize) >> (2 * esize - immhb)); break; /* SSHR */
-            case (1 << 5) | 0x00: v = (a & emask) >> (2 * esize - immhb); break; /* USHR */
+            /* Right-shift amount can equal the element width (e.g. USHR .2d #64),
+             * where a plain C `>>` is undefined; route through vreg_shift, which
+             * clamps a full-width shift to 0 (USHR) / sign-fill (SSHR). */
+            case (0 << 5) | 0x00: v = vreg_shift(a, -(int)(2 * esize - immhb), esize, 1, 0, 0); break; /* SSHR */
+            case (1 << 5) | 0x00: v = vreg_shift(a, -(int)(2 * esize - immhb), esize, 0, 0, 0); break; /* USHR */
             case (1 << 5) | 0x0a: {                                           /* SLI */
                 unsigned sh = immhb - esize;                                  /* keep low sh bits of Vd */
                 v = (a << sh) | (velem_get(&c->v[Rd], size, i) & (((u64)1 << sh) - 1));
