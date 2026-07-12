@@ -1194,6 +1194,10 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, pc + e->imm, 0);
             put_ld(ir, VREG_TMP0, 0, e->rd, 2, 0, 0, pc);
             break;
+        case PD_LDRLITV:   /* SIMD&FP literal (rm = byte count 4/8/16) */
+            ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, pc + e->imm, 0);
+            put_ldv(ir, VREG_TMP0, 0, e->rd, (unsigned)__builtin_ctz(e->rm), pc);
+            break;
 
         /* integer STP (rm = Rt2, imm = scaled offset): two stores + writeback. */
         case PD_STP64: case PD_STP64PRE: case PD_STP64POST:

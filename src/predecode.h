@@ -119,6 +119,7 @@ enum {
     PD_STR64RO, PD_STR32RO, PD_STRBRO, PD_STRHRO,
     /* literal */
     PD_LDRLIT64, PD_LDRLIT32,
+    PD_LDRLITV,          /* SIMD&FP literal (rd = Vt, rm = byte count 4/8/16) */
 
     /* integer pairs (rm = Rt2, imm = scaled offset) */
     PD_LDP64, PD_LDP64PRE, PD_LDP64POST,

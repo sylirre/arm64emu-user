@@ -702,10 +702,14 @@ static void ldst_pair(CPU *c, u32 insn) {
 static void ldst_literal(CPU *c, u32 insn) {
     unsigned opc = BITS(31, 30);
     bool V = BIT(26);
-    if (V) { undefined(c, insn); return; }
     unsigned Rt = BITS(4, 0);
     s64 off = (s64)sign_extend(BITS(23, 5), 19) << 2;
     u64 va = c->cur_insn_pc + off;
+    if (V) {                                     /* SIMD&FP: LDR St/Dt/Qt (literal) */
+        if (opc == 3) { undefined(c, insn); return; }   /* UNALLOCATED */
+        vreg_load(c, Rt, va, 4u << opc);         /* opc 0/1/2 -> 4/8/16 bytes */
+        return;
+    }
     u64 raw;
     switch (opc) {
         case 0: if (mem_read(c, va, 4, &raw)) set_x(c, Rt, (u32)raw); break;       /* LDR Wt */

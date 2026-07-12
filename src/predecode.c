@@ -205,8 +205,14 @@ static void fill_ldst(PDEnt *e, u32 insn) {
     unsigned b2927 = BITS(29, 27);
 
     if (b2927 == 0x3 && BITS(25, 24) == 0) {         /* literal */
-        if (BIT(26)) return;                         /* vector literal: GENERIC */
         unsigned opc = BITS(31, 30);
+        if (BIT(26)) {                               /* SIMD&FP: LDR St/Dt/Qt */
+            if (opc == 3) return;                    /* UNALLOCATED -> GENERIC -> UNDEF */
+            e->op  = PD_LDRLITV;
+            e->rm  = (u8)(4u << opc);                /* byte count 4/8/16 */
+            e->imm = (u64)((s64)sign_extend(BITS(23, 5), 19) << 2);
+            return;
+        }
         if (opc == 0) e->op = PD_LDRLIT32;
         else if (opc == 1) e->op = PD_LDRLIT64;
         else if (opc == 3) e->op = PD_NOP;           /* PRFM literal */
@@ -706,6 +712,7 @@ void pd_run(CPU *c) {
         [PD_STRHRO] = &&L_LDR64RO,
         [PD_LDRLIT64] = &&L_LDRLIT64,
         [PD_LDRLIT32] = &&L_LDRLIT32,
+        [PD_LDRLITV] = &&L_LDRLITV,
         [PD_LDP64] = &&L_LDP64,
         [PD_LDP64PRE] = &&L_LDP64,
         [PD_LDP64POST] = &&L_LDP64,
@@ -1352,6 +1359,14 @@ L_LDRLIT32:
     {
         u64 v;
         if (mem_read(c, c->cur_insn_pc + e->imm, 4, &v)) set_x(c, e->rd, (u32)v);
+        NEXT;
+    }
+L_LDRLITV:
+    {   /* SIMD&FP literal: rm = byte count 4/8/16; zero-extends into V[rd] */
+        V128 v; v.d[0] = 0; v.d[1] = 0;
+        u64 va = c->cur_insn_pc + e->imm;
+        if (e->rm == 16) { if (mem_read128(c, va, &v)) c->v[e->rd] = v; }
+        else { u64 t; if (mem_read(c, va, e->rm, &t)) { v.d[0] = t; c->v[e->rd] = v; } }
         NEXT;
     }
 
