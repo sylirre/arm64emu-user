@@ -59,7 +59,7 @@ void tlb_flush_all(void);
 
 /* ---- Guest address space (linux-user), defined in mem.c ---- */
 
-#define GUEST_VA_BITS   39
+#define GUEST_VA_BITS   47
 #define GUEST_TASK_SIZE (1ULL << GUEST_VA_BITS)
 #define GUEST_PAGE_SIZE 4096ULL
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - 1)

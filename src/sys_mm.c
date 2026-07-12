@@ -71,7 +71,20 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             for (u64 va = addr; va < addr + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) return (u64)(s64)-EEXIST;
     } else {
-        addr = as_find_free(as, len);
+        /* Honor a non-FIXED hint when the range is valid and free (Linux
+         * advisory-hint behavior). Go's arena reservation depends on this: it
+         * requests specific high addresses and discards (munmap) any mapping
+         * placed elsewhere, so ignoring the hint causes an unbounded map/unmap
+         * churn against a smaller-than-expected guest address space. */
+        u64 hint = addr;
+        addr = 0;
+        if (hint && !(hint & GUEST_PAGE_MASK) && hint + len <= GUEST_TASK_SIZE) {
+            int busy = 0;
+            for (u64 va = hint; va < hint + len; va += GUEST_PAGE_SIZE)
+                if (as_find_region(as, va)) { busy = 1; break; }
+            if (!busy) addr = hint;
+        }
+        if (!addr) addr = as_find_free(as, len);
         if (!addr) return (u64)(s64)-ENOMEM;
     }
 
