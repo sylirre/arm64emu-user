@@ -581,6 +581,20 @@ SYSDEF(prctl) {
             return 0;
         case PR_SET_PDEATHSIG:
             return prctl(PR_SET_PDEATHSIG, (unsigned long)a1) < 0 ? host_err() : 0;
+        /* Capability bounding set and keepcaps are real host-process kernel
+         * state, unrelated to the -fake-id credential illusion (unlike
+         * capget/capset in sys_misc.c) -- pass straight through. */
+        case PR_CAPBSET_READ:
+        case PR_CAPBSET_DROP: {
+            long r = prctl(op, (unsigned long)a1);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_GET_KEEPCAPS: {
+            long r = prctl(PR_GET_KEEPCAPS);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_SET_KEEPCAPS:
+            return prctl(PR_SET_KEEPCAPS, (unsigned long)a1) < 0 ? host_err() : 0;
         default:
             return (u64)(s64)-EINVAL;
     }

@@ -162,7 +162,10 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   owned by the **fake identity**; other owners pass through. Applied in
   `gstat_from_host`, `statx`, and the setuid-exec owner lookup.
 - **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
-  `capget` reporting the full capability set for fake-root.
+  `capget` reporting the full capability set for fake-root. The capability
+  *bounding set* (`prctl(PR_CAPBSET_READ/DROP)`) and `PR_SET/GET_KEEPCAPS`
+  are real host-kernel state independent of the fake identity, so those are
+  passed straight through to the host `prctl()` instead (`sys_proc.c`).
 
 Limitations (documented in the top-level README): no persistent per-file
 ownership DB, and host DAC is not actually bypassed for real I/O.
