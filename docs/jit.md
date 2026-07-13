@@ -1,12 +1,12 @@
-# The optional JIT (`-jit`)
+# The optional JIT (`--jit`)
 
-The emulator is an interpreter by default. Passing **`-jit`** turns on a
+The emulator is an interpreter by default. Passing **`--jit`** turns on a
 translating JIT that compiles guest AArch64 basic blocks to native host code.
 It exists for AArch64 and x86-64 hosts; on any other host (or under a
-per-instruction debug flag) `-jit` prints a notice and the interpreter runs
+per-instruction debug flag) `--jit` prints a notice and the interpreter runs
 instead. The interpreter stays the source of truth: anything the translator
 does not handle natively is executed by calling `exec_a64`, and the whole
-differential test suite must pass with `-jit` on (`make test-jit`).
+differential test suite must pass with `--jit` on (`make test-jit`).
 
 The core (`src/core/`) is a diffable copy of the sibling system emulator and is
 **not** touched. The JIT lives entirely in `src/jit/` plus a handful of small
@@ -236,7 +236,7 @@ host forbids that (SELinux `execmem`, common on Android app processes), it falls
 back to a `memfd_create` dual mapping (a writable view + an executable view of
 the same pages). If neither works — `memfd_create` may itself be seccomp-blocked
 on old Android, which the process-lifetime SIGSYS net turns into `-ENOSYS` —
-`-jit` warns once and the interpreter runs. Any new raw syscall here is subject
+`--jit` warns once and the interpreter runs. Any new raw syscall here is subject
 to the same Android Oreo allow-list audit as the rest of the tree; `make
 test-seccomp` gates it. On AArch64 hosts every emitted or patched range is
 flushed with `__builtin___clear_cache` (both views when dual-mapped).
@@ -246,7 +246,7 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
 - `make test-jit` first runs `tests/run_consist.sh` (random-input FP
   consistency, jit vs. interpreter on the same host — the FP corner semantics
   are host-C by design and have no qemu oracle), then the entire differential
-  suite (bit-exact vs. `qemu-aarch64`) with `-jit` on — the same wrapper
+  suite (bit-exact vs. `qemu-aarch64`) with `--jit` on — the same wrapper
   trick as `make test-seccomp`. `tests/asm/round3.S` and `tests/asm/round4.S`
   are the targeted vectors for everything inlined in rounds 3–4 (addressing
   forms, bitfields, DC ZVA, LSE min/max, the vector classes, scalar SIMD,
@@ -282,7 +282,7 @@ Debug/bisection knobs (all off by default):
 ## 32-bit hosts (ARM32 / i686): feasibility
 
 There is **no 32-bit backend today** — `make m32` builds and links the JIT
-sources with an inert stub backend, and `-jit` on i686/ARM32 warns and runs the
+sources with an inert stub backend, and `--jit` on i686/ARM32 warns and runs the
 interpreter. The design keeps the door open, and the analysis below is the plan
 for adding one.
 

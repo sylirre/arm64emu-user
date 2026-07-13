@@ -1,5 +1,5 @@
 #!/bin/sh
-# Benchmark: interpreter vs -jit (and qemu-aarch64 for scale, if present).
+# Benchmark: interpreter vs --jit (and qemu-aarch64 for scale, if present).
 # Usage: tests/bench/run_bench.sh [./arm64chroot]
 # Builds static aarch64 kernels, verifies identical output across runners,
 # reports wall-clock ms per runner.
@@ -28,7 +28,7 @@ for k in int_alu memops calls lockping fpvec strops; do
     want=$("$QEMU" "$bin" 2>/dev/null || true)
     t_int=$(ms "$EMU" / "$bin")
     out_int=$(cat "$OUTF")
-    t_jit=$(ms "$EMU" -jit / "$bin")
+    t_jit=$(ms "$EMU" --jit / "$bin")
     out_jit=$(cat "$OUTF")
     if [ -n "$want" ] && { [ "$out_int" != "$want" ] || [ "$out_jit" != "$want" ]; }; then
         echo "$k: OUTPUT MISMATCH (int='$out_int' jit='$out_jit' qemu='$want')"

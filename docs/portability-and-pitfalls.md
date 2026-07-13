@@ -127,7 +127,7 @@ architecture-value tests independent of `DCZID`.
 The differential suite (`tests/run_tests.sh`) runs each asm/C test under
 `qemu-aarch64` (the oracle) and under `arm64chroot`, requiring identical
 stdout+exit. It runs on the `x86_64`, `i386` (native), and `armhf`/`arm64` (under
-`qemu-arm`/`qemu-aarch64`) builds. Behaviors qemu does not model — `-fake-id`,
+`qemu-arm`/`qemu-aarch64`) builds. Behaviors qemu does not model — `--fake-id`,
 interactive job control — are self-checking cases instead. The rule that caught
 most of the bugs above: **a green run on x86-64 is necessary but not sufficient;
 the ARM and 32-bit builds are where the memory-model and ILP32 bugs live.**

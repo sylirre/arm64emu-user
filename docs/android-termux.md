@@ -80,7 +80,7 @@ make CC=clang
 ```
 
 That is the whole build: clang predefines `__ANDROID__`/`__BIONIC__`, so the
-Bionic-specific raw-syscall paths and `-link2symlink` support compile in
+Bionic-specific raw-syscall paths and `--link2symlink` support compile in
 automatically. No cross toolchain, no root. An NDK clang from a Linux box
 (e.g. `CC=.../aarch64-linux-android24-clang`) also works for CI artifacts.
 
@@ -95,10 +95,10 @@ symlinks, both of which a Linux rootfs needs.
 mkdir -p ~/debian && tar -xf debian-rootfs-arm64.tar.xz -C ~/debian
 
 ./arm64chroot ~/debian /bin/bash -l                    # plain shell
-./arm64chroot -fake-id -link2symlink ~/debian /bin/bash -l   # for apt/dpkg
+./arm64chroot --fake-id --link2symlink ~/debian /bin/bash -l   # for apt/dpkg
 ```
 
-`-fake-id` (fake root) and `-link2symlink` (hard links via tracked symlinks —
+`--fake-id` (fake root) and `--link2symlink` (hard links via tracked symlinks —
 Android forbids `link()`) are what package managers need; see the top-level
 README for details.
 
@@ -137,12 +137,12 @@ seccomp output is the one-line startup notice.
 1. **stat paths** — `./arm64chroot ~/debian /bin/ls -l /usr/bin | head`
    (`ls` uses `statx`; on Android 8.x this exercises trap → net → fallback).
 2. **Network, TLS, threads, getrandom** —
-   `./arm64chroot -fake-id ~/debian /usr/bin/apt-get update`.
+   `./arm64chroot --fake-id ~/debian /usr/bin/apt-get update`.
 3. **Threads and robust lists** — any threaded guest binary, e.g.
    `./arm64chroot ~/debian /usr/bin/openssl speed -multi 2 -seconds 1 sha256`
    (glibc `pthread_create` hits `set_robust_list`/`rseq`/`clone` — all must be
    absorbed, never forwarded).
 4. **Package install (fake root + hard links)** —
-   `./arm64chroot -fake-id -link2symlink ~/debian /usr/bin/dpkg -i some.deb`
+   `./arm64chroot --fake-id --link2symlink ~/debian /usr/bin/dpkg -i some.deb`
    then remove it again with `dpkg -r`.
 5. **Job control** — in `/bin/bash -l`: Ctrl-Z a `sleep`, `fg` it, Ctrl-C it.

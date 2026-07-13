@@ -4,7 +4,7 @@ Run an **AArch64 (ARM64) Linux** program from a rootfs directory on any Linux
 host — **ARM32, ARM64, x86, or x86-64** — with no privileges, no kernel modules,
 and no dependencies beyond libc. It's `qemu-aarch64` user-mode plus `proot`-style
 rootfs containment in one small C11 program. Interpreter by default, with an
-**optional JIT** (`-jit`) for AArch64 and x86-64 hosts (see [docs/jit.md](docs/jit.md)).
+**optional JIT** (`--jit`) for AArch64 and x86-64 hosts (see [docs/jit.md](docs/jit.md)).
 
 ```sh
 make
@@ -21,23 +21,23 @@ translation, and signal delivery — is new for user mode.
 ```
 arm64chroot [options] <rootfs> <program> [args...]
 
-  -h, --help       show detailed help (options + environment variables) and exit
-  -strace          log guest syscalls to stderr
-  -d               per-instruction trace (very verbose)
-  -jit             translate hot basic blocks to native code (AArch64 / x86-64
-                   hosts; falls back to the interpreter elsewhere). Off by default.
-  -nopd            disable the decoded-instruction cache (diagnostic; slower)
-  -E VAR=VAL       set an environment variable for the guest (repeatable)
-  -0 ARG0          override argv[0] for the guest program
-  -fake-id [ID]    present a fake identity (fakeroot-style); ID = uid | uid:gid,
-                   default 0:0 (root)
-  -link2symlink    emulate hardlinks with tracked symlinks where the host forbids
-                   link() (Android/SELinux -> EXDEV)
-  -shared-proc     key the shared guest-PID registry by rootfs so `ps`/`top` see
-                   guest processes across emulator invocations
-  -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
-                   (repeatable); append `:ro` for a read-only mount. Host paths
-                   may not contain ':'.
+  -h, --help              show this help (options + environment variables)
+      --strace            log guest syscalls to stderr
+  -d, --debug             per-instruction trace (very verbose)
+  -j, --jit               translate hot basic blocks to native code (AArch64 /
+                          x86-64 hosts; falls back to the interpreter elsewhere)
+      --no-predecode      disable the decoded-instruction cache (diagnostic; slower)
+  -l, --link2symlink      emulate hardlinks with tracked symlinks where the host
+                          forbids link() (Android/SELinux -> EXDEV)
+      --shared-proc       key the shared guest-PID registry by rootfs so `ps`/`top`
+                          see guest processes across emulator invocations
+  -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
+                          (repeatable); append `:ro` for a read-only mount. Host
+                          paths may not contain ':'.
+  -E, --env VAR=VAL       set an environment variable for the guest (repeatable)
+  -0, --argv0 ARG0        override argv[0] for the guest program
+  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid | uid:gid,
+                          default 0:0 (root)
 ```
 
 `arm64chroot --help` prints the full reference, including environment variables.
@@ -49,7 +49,7 @@ default 32); the JIT debug/bisection knobs are documented in
 Debian arm64 root filesystem). `/` is allowed to run host-native aarch64 binaries
 directly. Guest paths resolve **inside** the rootfs — absolute symlinks are
 followed against the guest root and `..` cannot escape it — so no privilege or
-`chroot(2)` is required. `-bind` (below) opens deliberate windows onto specific
+`chroot(2)` is required. `--bind` (below) opens deliberate windows onto specific
 host directories. `/proc` and a `/dev` whitelist (null, zero, random,
 urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
 `/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
@@ -62,16 +62,16 @@ process is a separate host process), and the guest's `/proc` lists **only its
 own process tree** — non-guest host processes are hidden and appear not to exist,
 a pid-namespace-like view without a real namespace.
 
-### Fake identity (`-fake-id`)
+### Fake identity (`--fake-id`)
 
-`-fake-id` makes the guest believe it runs as a chosen user — by default **root
+`--fake-id` makes the guest believe it runs as a chosen user — by default **root
 `0:0`** — like `proot -0` or `fakeroot`, so package managers, `make install`,
 `chown`/`chmod`, and `id -u == 0` checks work without real privilege:
 
 ```sh
-arm64chroot -fake-id            ./rootfs /bin/sh   # guest is root 0:0
-arm64chroot -fake-id 1000:1000  ./rootfs /bin/sh   # guest is 1000:1000
-arm64chroot -fake-id 1000       ./rootfs /bin/sh   # uid=gid=1000
+arm64chroot --fake-id            ./rootfs /bin/sh   # guest is root 0:0
+arm64chroot --fake-id 1000:1000  ./rootfs /bin/sh   # guest is 1000:1000
+arm64chroot --fake-id 1000       ./rootfs /bin/sh   # uid=gid=1000
 ```
 
 The whole `get`/`set` credential family (`setuid`/`setgid`/`setre*`/`setres*`/
@@ -86,15 +86,15 @@ reports — it does **not** bypass host DAC, so fake-root still cannot read a fi
 the host user genuinely cannot, and there is no persistent per-file ownership
 database (a `chown` to an arbitrary third uid is accepted but not remembered).
 
-### Host directory binds (`-bind`)
+### Host directory binds (`--bind`)
 
-`-bind src:dst` exposes host directory `src` at guest path `dst`, like a bind
+`--bind src:dst` exposes host directory `src` at guest path `dst`, like a bind
 mount — a deliberate window through rootfs containment for sharing a project
 tree, build cache, or dataset without copying it in:
 
 ```sh
-arm64chroot -bind "$PWD:/work" ./rootfs /bin/sh          # read-write
-arm64chroot -bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
+arm64chroot --bind "$PWD:/work" ./rootfs /bin/sh          # read-write
+arm64chroot --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
 ```
 
 Repeatable; nested binds resolve by longest guest-prefix. A `:ro` bind rejects
@@ -159,7 +159,7 @@ make CC=clang
 
 The emulator is engineered to survive Android's app seccomp whitelist (a
 blocked host syscall SIGSYS-kills a normal process; here it degrades to
-`ENOSYS`) and includes `-link2symlink` for Android's `link()` ban. Details,
+`ENOSYS`) and includes `--link2symlink` for Android's `link()` ban. Details,
 device checklist, and how this is regression-tested without a device:
 [docs/android-termux.md](docs/android-termux.md).
 
@@ -167,7 +167,7 @@ device checklist, and how this is regression-tested without a device:
 
 Deeper architecture notes live under [`docs/`](docs/README.md): the copied-core
 seams, the guest memory model and host-ordering discipline, the syscall layer and
-`-fake-id`, signal/job-control and the process model, and a catalog of
+`--fake-id`, signal/job-control and the process model, and a catalog of
 host-portability pitfalls.
 
 ```

@@ -88,7 +88,7 @@ mkdir -p /tmp/tdir && echo x > /tmp/tdir/f && cat /tmp/tdir/f && rm -r /tmp/tdir
 CMDS
 fi
 
-# ---- -fake-id mode (self-checking; qemu does not model it) ----
+# ---- --fake-id mode (self-checking; qemu does not model it) ----
 if [ -x "$ALPINE/bin/busybox" ]; then
     check_fakeid() {   # check_fakeid <label> <expected> <args...>
         local label="$1" expect="$2"; shift 2
@@ -97,12 +97,12 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fakeid: $label"
         else fail=$((fail+1)); echo "FAIL fakeid: $label (want '$expect' got '$got')"; fi
     }
-    check_fakeid "default 0:0"      "uid=0 gid=0"       -fake-id "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
-    check_fakeid "explicit 1000:1000" "uid=1000 gid=1000" -fake-id 1000:1000 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
-    check_fakeid "single 7 -> 7:7"  "uid=7 gid=7"       -fake-id 7 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
-    check_fakeid "whoami root"      "root"              -fake-id "$ALPINE" /bin/busybox whoami
-    check_fakeid "chown to root ok" "0 0"               -fake-id "$ALPINE" /bin/sh -c 'touch /tmp/ci_fk; chown 0:0 /tmp/ci_fk; stat -c "%u %g" /tmp/ci_fk; rm -f /tmp/ci_fk'
-    check_fakeid "setuid drop+deny" "ok"                -fake-id "$ALPINE" /bin/busybox sh -c 'id -u >/dev/null; echo ok'
+    check_fakeid "default 0:0"      "uid=0 gid=0"       --fake-id "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "explicit 1000:1000" "uid=1000 gid=1000" --fake-id 1000:1000 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "single 7 -> 7:7"  "uid=7 gid=7"       --fake-id 7 "$ALPINE" /bin/busybox sh -c 'echo uid=$(id -u) gid=$(id -g)'
+    check_fakeid "whoami root"      "root"              --fake-id "$ALPINE" /bin/busybox whoami
+    check_fakeid "chown to root ok" "0 0"               --fake-id "$ALPINE" /bin/sh -c 'touch /tmp/ci_fk; chown 0:0 /tmp/ci_fk; stat -c "%u %g" /tmp/ci_fk; rm -f /tmp/ci_fk'
+    check_fakeid "setuid drop+deny" "ok"                --fake-id "$ALPINE" /bin/busybox sh -c 'id -u >/dev/null; echo ok'
     # vfork+exec+wait must reap the child (regression: vfork treated as a thread
     # broke wait4 with ECHILD and corrupted the shared image).
     "$AGCC" -O1 -static -o "$ALPINE/tmp/ci_vfork" tests/fixtures/vfork.c 2>/dev/null &&
@@ -112,11 +112,11 @@ fork done rc=0" "$ALPINE" /tmp/ci_vfork
     rm -f "$ALPINE/tmp/ci_vfork"
     # adduser exercises vfork+exec of helpers under fake-root.
     check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
-        -fake-id "$ALPINE" /bin/sh -c \
+        --fake-id "$ALPINE" /bin/sh -c \
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
-# ---- -bind mounts (self-checking; qemu has no bind-mount concept). Exercises
+# ---- --bind mounts (self-checking; qemu has no bind-mount concept). Exercises
 # forward mapping, symlink containment inside a bind, reverse mapping (cwd),
 # dst canonicalization, longest-prefix nesting, :ro enforcement, and the
 # synthesized /proc/mounts row. ----
@@ -137,18 +137,18 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     ln -sf /mnt/x/hello.txt "$BSRC/abs.lnk"   # absolute symlink: re-roots to guest /
                                               # (host has no /mnt/x, so a leak would ENOENT)
     B="$BSRC:/mnt/x"
-    check_bind "read bound file"       "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
-    check_bind "nested path"           "in-sub"     -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/sub/deep.txt
-    check_bind "relative symlink"      "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/rel.lnk
-    check_bind "abs symlink re-roots"  "bound-ok"   -bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/abs.lnk
-    check_bind "chdir+pwd (reverse)"   "/mnt/x/sub" -bind "$B" "$ALPINE" /bin/busybox sh -c 'cd /mnt/x/sub && pwd'
-    check_bind "dst canonicalization"  "bound-ok"   -bind "$BSRC:/mnt/./y/../x" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
-    check_bind "rw write-through"      "w-ok"       -bind "$B" "$ALPINE" /bin/busybox sh -c 'echo w-ok > /mnt/x/w.txt && cat /mnt/x/w.txt'
-    check_bind "nested longest-prefix" "INNER"      -bind "$B" -bind "$BSRC2:/mnt/x/sub" "$ALPINE" /bin/busybox cat /mnt/x/sub/i.txt
-    check_bind "ro read allowed"       "bound-ok"   -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox cat /mnt/ro/hello.txt
-    check_bind "ro write blocked"      "blocked"    -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'echo x > /mnt/ro/x 2>/dev/null; test -e /mnt/ro/x && echo created || echo blocked'
-    check_bind "ro mkdir blocked"      "blocked"    -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'mkdir /mnt/ro/d 2>/dev/null; test -d /mnt/ro/d && echo created || echo blocked'
-    check_bind "mounts row (ro)"       "ro,relatime" -bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'awk "\$2==\"/mnt/ro\"{print \$4}" /proc/mounts'
+    check_bind "read bound file"       "bound-ok"   --bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
+    check_bind "nested path"           "in-sub"     --bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/sub/deep.txt
+    check_bind "relative symlink"      "bound-ok"   --bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/rel.lnk
+    check_bind "abs symlink re-roots"  "bound-ok"   --bind "$B" "$ALPINE" /bin/busybox cat /mnt/x/abs.lnk
+    check_bind "chdir+pwd (reverse)"   "/mnt/x/sub" --bind "$B" "$ALPINE" /bin/busybox sh -c 'cd /mnt/x/sub && pwd'
+    check_bind "dst canonicalization"  "bound-ok"   --bind "$BSRC:/mnt/./y/../x" "$ALPINE" /bin/busybox cat /mnt/x/hello.txt
+    check_bind "rw write-through"      "w-ok"       --bind "$B" "$ALPINE" /bin/busybox sh -c 'echo w-ok > /mnt/x/w.txt && cat /mnt/x/w.txt'
+    check_bind "nested longest-prefix" "INNER"      --bind "$B" --bind "$BSRC2:/mnt/x/sub" "$ALPINE" /bin/busybox cat /mnt/x/sub/i.txt
+    check_bind "ro read allowed"       "bound-ok"   --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox cat /mnt/ro/hello.txt
+    check_bind "ro write blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'echo x > /mnt/ro/x 2>/dev/null; test -e /mnt/ro/x && echo created || echo blocked'
+    check_bind "ro mkdir blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'mkdir /mnt/ro/d 2>/dev/null; test -d /mnt/ro/d && echo created || echo blocked'
+    check_bind "mounts row (ro)"       "ro,relatime" --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'awk "\$2==\"/mnt/ro\"{print \$4}" /proc/mounts'
     rm -rf "$BSRC" "$BSRC2"
 fi
 
@@ -181,11 +181,11 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         'sleep 55 & p=$!; sleep 0.3; test -r /proc/$p/comm && echo ok || echo missing; kill $p'
 fi
 
-# ---- cross-session /proc view (-shared-proc): a guest in one emulator invocation
+# ---- cross-session /proc view (--shared-proc): a guest in one emulator invocation
 # is visible to an independent invocation of the same rootfs, and is NOT visible
 # without the flag. Two separate emulator processes, orchestrated from the host. ----
 if [ -x "$ALPINE/bin/busybox" ]; then
-    "$EMU" -shared-proc "$ALPINE" /bin/sleep 300 &   # session A: long-lived guest
+    "$EMU" --shared-proc "$ALPINE" /bin/sleep 300 &   # session A: long-lived guest
     apid=$!
     # Bounded wait until A's guest ELF has loaded (host comm leaves "arm64chroot",
     # which is exactly where proctab_register ran) — no host sleep needed.
@@ -201,9 +201,9 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         else fail=$((fail+1)); echo "FAIL xsession: $label (want '$expect' got '$got')"; fi
     }
     # WITH the flag: another session synthesizes A's guest cmdline and lists its PID.
-    check_xsession "other-session cmdline" "/bin/sleep 300" -shared-proc "$ALPINE" \
+    check_xsession "other-session cmdline" "/bin/sleep 300" --shared-proc "$ALPINE" \
         /bin/busybox sh -c "tr '\0' ' ' < /proc/$apid/cmdline | sed 's/ \$//'"
-    check_xsession "other-session listed" "yes" -shared-proc "$ALPINE" \
+    check_xsession "other-session listed" "yes" --shared-proc "$ALPINE" \
         /bin/busybox sh -c "ls /proc | grep -qx $apid && echo yes || echo no"
     # WITHOUT the flag: A belongs to a different registry, so it stays hidden.
     check_xsession "isolated without flag" "no" "$ALPINE" \

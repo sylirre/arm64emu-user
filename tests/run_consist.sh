@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 "$AGCC" -O2 -static -o tests/fpconsist.bin tests/fpconsist.c || {
     echo "FAIL build fpconsist"; exit 1; }
 a=$("$EMU" / tests/fpconsist.bin) || { echo "FAIL fpconsist (interp rc=$?)"; exit 1; }
-b=$("$EMU" -jit / tests/fpconsist.bin) || { echo "FAIL fpconsist (jit rc=$?)"; exit 1; }
+b=$("$EMU" --jit / tests/fpconsist.bin) || { echo "FAIL fpconsist (jit rc=$?)"; exit 1; }
 if [ "$a" = "$b" ]; then
     echo "PASS fpconsist (jit == interpreter: $a)"
 else

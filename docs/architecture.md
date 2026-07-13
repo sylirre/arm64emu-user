@@ -111,10 +111,10 @@ something completely different.
 When any per-instruction debug facility is active (`g_debug_hooks`) the loop
 instead calls the full `cpu_step` (`src/core/cpu.c`), which adds the debug
 hooks and the system emulator's IRQ/FIQ-line checks (never taken in
-linux-user). `-nopd` selects a plain fetch → `exec_a64` step (diagnostic mode
+linux-user). `--no-predecode` selects a plain fetch → `exec_a64` step (diagnostic mode
 for bisecting decode-cache suspicions).
 
-The optional `-jit` inserts one more rung above `pd_run`: `jit_run`
+The optional `--jit` inserts one more rung above `pd_run`: `jit_run`
 (`src/jit/`) executes native translations of guest basic blocks and honors the
 same return contract, handing control back to `emu_loop` on the same rare
 events. It is off by default and only compiled-in for AArch64/x86-64 hosts; the
@@ -125,7 +125,7 @@ debug ladder still wins, so `-d` forces the interpreter. See [jit.md](jit.md).
 ```
 emu_loop:
   if c->stop: return
-  run instructions (pd_run burst; cpu_step under debug; plain step under -nopd)
+  run instructions (pd_run burst; cpu_step under debug; plain step under --no-predecode)
   if g_tls.pend_exc.valid:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret

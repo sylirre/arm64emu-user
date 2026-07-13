@@ -22,7 +22,7 @@ with a one-shot stderr warning naming it — invaluable during bring-up.
 `io_uring_*`, `statmount`, `close_range`, …) return `-ENOSYS` *silently*: libc
 probes them and falls back, so ENOSYS is the correct emulated answer, not a stub.
 
-The `-strace` flag prints one line per syscall in a qemu-compatible format; it is
+The `--strace` flag prints one line per syscall in a qemu-compatible format; it is
 the primary bring-up instrument (diff against `qemu-aarch64 -strace`).
 
 ## Struct marshalling: always convert
@@ -68,7 +68,7 @@ proot) and no privilege (unlike `chroot(2)`). `path_resolve` walks the guest pat
 `*at` syscalls resolve `dirfd` via the fd's recorded guest path (`AT_FDCWD` → the
 task's canonical cwd string, which is tracked independently of the host cwd).
 
-**`-bind src:dst[:ro]` mounts** are matched first, before the special zones and
+**`--bind src:dst[:ro]` mounts** are matched first, before the special zones and
 the rootfs prefix: a resolved guest path at or under `dst` maps to `src +
 remainder` on the host (longest `dst` wins), so a bound subtree is served from
 its real host location — symlinks and all — and reverse lookups (`dirfd`,
@@ -143,9 +143,9 @@ the emulator's own path. A wrong arch/format yields `ENOEXEC` so the guest shell
 script fallback works. `do_execve` takes private copies of argv/envp — the caller
 retains ownership (a subtle earlier use-after-free lives in the git history).
 
-## `-fake-id` (fakeroot/fake-uid)
+## `--fake-id` (fakeroot/fake-uid)
 
-`-fake-id [uid[:gid]]` (default `0:0`) makes the guest believe it runs as a chosen
+`--fake-id [uid[:gid]]` (default `0:0`) makes the guest believe it runs as a chosen
 identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
 
 - **Credential set** (`Cred` in `machine.h`): `ruid/euid/suid/fsuid` +

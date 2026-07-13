@@ -6,22 +6,22 @@
  *   arm64chroot [options] <rootfs> <program> [args...]
  *
  * Options (run `arm64chroot --help` for the full reference incl. env vars):
- *   -h, --help       show detailed help and exit
- *   -strace          log syscalls to stderr
- *   -d               per-instruction trace (very verbose; forces -jit off)
- *   -jit             translate hot basic blocks to native code (AArch64/x86-64)
- *   -nopd            disable the decoded-instruction cache (diagnostic; slower)
- *   -E VAR=VAL       set an environment variable for the guest (repeatable)
- *   -0 ARG0          set argv[0] for the guest program
- *   -fake-id [ID]    fake identity (fakeroot-style); ID = uid | uid:gid,
- *                    default 0:0 (root)
- *   -link2symlink    emulate hardlinks with tracked symlinks where the host
- *                    forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
- *   -shared-proc     key the shared guest-PID registry by rootfs so ps/top see
- *                    guest processes across emulator invocations
- *   -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
- *                    (repeatable); :ro makes it read-only. Host paths may not
- *                    contain ':'.
+ *   -h, --help              show detailed help and exit
+ *       --strace            log syscalls to stderr
+ *   -d, --debug             per-instruction trace (very verbose; forces --jit off)
+ *   -j, --jit               translate hot basic blocks to native code (AArch64/x86-64)
+ *       --no-predecode      disable the decoded-instruction cache (diagnostic; slower)
+ *   -l, --link2symlink      emulate hardlinks with tracked symlinks where the host
+ *                           forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
+ *       --shared-proc       key the shared guest-PID registry by rootfs so ps/top see
+ *                           guest processes across emulator invocations
+ *   -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
+ *                           (repeatable); :ro makes it read-only. Host paths may not
+ *                           contain ':'.
+ *   -E, --env VAR=VAL       set an environment variable for the guest (repeatable)
+ *   -0, --argv0 ARG0        set argv[0] for the guest program
+ *   -u, --fake-id[=ID]      fake identity (fakeroot-style); ID = uid | uid:gid,
+ *                           default 0:0 (root)
  */
 #include <ctype.h>
 #include <limits.h>
@@ -54,7 +54,7 @@ static void usage(void) {
 static void help(void) {
     fputs(
 "arm64chroot -- run an AArch64 (ARM64) Linux program from a rootfs directory\n"
-"under a pure user-space emulator (interpreter by default, optional -jit), with\n"
+"under a pure user-space emulator (interpreter by default, optional --jit), with\n"
 "proot-style rootfs containment. No privileges, kernel modules, or dependencies\n"
 "beyond libc are required.\n"
 "\n"
@@ -69,30 +69,31 @@ static void help(void) {
 "  args...     arguments passed on to the guest program.\n"
 "\n"
 "Options:\n"
-"  -h, --help          show this help and exit\n"
-"  -strace             log guest syscalls to stderr\n"
-"  -d                  per-instruction trace (very verbose; forces -jit off)\n"
-"  -jit                translate hot basic blocks to native code (AArch64 and\n"
-"                      x86-64 hosts; falls back to the interpreter elsewhere)\n"
-"  -nopd               disable the decoded-instruction cache (diagnostic; slower)\n"
-"  -E VAR=VAL          set an environment variable for the guest (repeatable)\n"
-"  -0 ARG0             override argv[0] for the guest program\n"
-"  -fake-id [ID]       present a fake identity (fakeroot-style); ID = uid or\n"
-"  -fake-id=ID         uid:gid, default 0:0 (root). '=' attached form accepted.\n"
-"  -link2symlink       emulate hardlinks with tracked symlinks where the host\n"
-"                      forbids link() (Android/SELinux -> EXDEV)\n"
-"  -shared-proc        key the shared guest-PID registry by rootfs so that\n"
-"                      ps/top see guest processes across emulator invocations\n"
-"  -bind src:dst[:ro]  expose host directory src at guest path dst (repeatable);\n"
-"                      append :ro for a read-only mount. Host paths may not\n"
-"                      contain ':'.\n"
-"  --                  stop option parsing\n"
+"  -h, --help              show this help and exit\n"
+"      --strace            log guest syscalls to stderr\n"
+"  -d, --debug             per-instruction trace (very verbose; forces --jit off)\n"
+"  -j, --jit               translate hot basic blocks to native code (AArch64 and\n"
+"                          x86-64 hosts; falls back to the interpreter elsewhere)\n"
+"      --no-predecode      disable the decoded-instruction cache (diagnostic;\n"
+"                          slower)\n"
+"  -l, --link2symlink      emulate hardlinks with tracked symlinks where the host\n"
+"                          forbids link() (Android/SELinux -> EXDEV)\n"
+"      --shared-proc       key the shared guest-PID registry by rootfs so that\n"
+"                          ps/top see guest processes across emulator invocations\n"
+"  -b, --bind SRC:DST[:ro] expose host directory SRC at guest path DST\n"
+"                          (repeatable); append :ro for a read-only mount. Host\n"
+"                          paths may not contain ':'.\n"
+"  -E, --env VAR=VAL       set an environment variable for the guest (repeatable)\n"
+"  -0, --argv0 ARG0        override argv[0] for the guest program\n"
+"  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid or\n"
+"                          uid:gid, default 0:0 (root)\n"
+"      --                  stop option parsing\n"
 "\n"
 "Environment variables:\n"
 "  Tuning:\n"
 "    A64CHROOT_JIT_MB     per-thread JIT code-cache size in MiB (default 32,\n"
 "                         clamped to 1-128)\n"
-"    XDG_RUNTIME_DIR      first writable of these holds the -shared-proc\n"
+"    XDG_RUNTIME_DIR      first writable of these holds the --shared-proc\n"
 "    TMPDIR               registry when /dev/shm is not writable; PREFIX is\n"
 "    PREFIX               tried as $PREFIX/tmp (Termux)\n"
 "  Diagnostics / developer (see docs/jit.md):\n"
@@ -112,8 +113,8 @@ static void help(void) {
 "\n"
 "Examples:\n"
 "  arm64chroot ./rootfs /bin/sh\n"
-"  arm64chroot -jit -fake-id ./rootfs /bin/bash -l\n"
-"  arm64chroot -bind \"$PWD:/work\" -bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh\n",
+"  arm64chroot --jit --fake-id ./rootfs /bin/bash -l\n"
+"  arm64chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh\n",
         stdout);
     exit(0);
 }
@@ -169,24 +170,24 @@ static int canon_guest(const char *in, char *out) {
     return 0;
 }
 
-/* Parse and register a -bind mount "src:dst[:ro]": host directory src (realpath'd)
+/* Parse and register a --bind mount "src:dst[:ro]": host directory src (realpath'd)
  * is exposed at absolute guest mount point dst; an optional trailing ":ro" (or
  * the default ":rw") marks it read-only. Host paths may not contain ':'. Fatal
  * on any malformed spec. */
 static void add_bind(struct Machine *m, const char *spec) {
     if (m->n_binds >= BIND_MAX) {
-        fprintf(stderr, "arm64chroot: too many -bind mounts (max %d)\n", BIND_MAX);
+        fprintf(stderr, "arm64chroot: too many --bind mounts (max %d)\n", BIND_MAX);
         exit(2);
     }
     char buf[2 * PATH_MAX];
     if (strlen(spec) + 1 > sizeof buf) {
-        fprintf(stderr, "arm64chroot: -bind '%s': too long\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': too long\n", spec);
         exit(2);
     }
     strcpy(buf, spec);
     char *colon = strchr(buf, ':');   /* first ':' splits src | dst[:ro] */
     if (!colon || colon == buf) {
-        fprintf(stderr, "arm64chroot: -bind '%s': expected src:dst[:ro]\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': expected src:dst[:ro]\n", spec);
         exit(2);
     }
     *colon = 0;
@@ -197,24 +198,24 @@ static void add_bind(struct Machine *m, const char *spec) {
     if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) { ro = 1; dst[dl - 3] = 0; }
     else if (dl >= 3 && !strcmp(dst + dl - 3, ":rw")) { dst[dl - 3] = 0; }
     if (dst[0] != '/') {
-        fprintf(stderr, "arm64chroot: -bind '%s': dst must be absolute\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': dst must be absolute\n", spec);
         exit(2);
     }
     int k = m->n_binds;
     if (!realpath(src, m->binds[k].host)) {
-        fprintf(stderr, "arm64chroot: -bind src '%s': not found\n", src);
+        fprintf(stderr, "arm64chroot: --bind src '%s': not found\n", src);
         exit(126);
     }
     if (!strcmp(m->binds[k].host, "/")) {
-        fprintf(stderr, "arm64chroot: -bind '%s': cannot bind host root\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': cannot bind host root\n", spec);
         exit(2);
     }
     if (canon_guest(dst, m->binds[k].guest) < 0) {
-        fprintf(stderr, "arm64chroot: -bind '%s': dst too long\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': dst too long\n", spec);
         exit(2);
     }
     if (!strcmp(m->binds[k].guest, "/")) {
-        fprintf(stderr, "arm64chroot: -bind '%s': cannot bind over guest root\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': cannot bind over guest root\n", spec);
         exit(2);
     }
     m->binds[k].ro = ro;
@@ -242,6 +243,53 @@ static void seccomp_notice(void) {
     fclose(f);
 }
 
+/* --- command-line option parsing helpers ------------------------------- */
+
+/* Fatal: a flag that takes no value was given one ("--help=x"). */
+static void opt_no_value(const char *opt) {
+    fprintf(stderr, "arm64chroot: option '%s' takes no value\n", opt);
+    exit(2);
+}
+
+/* Value for a long value-taking option: "--opt=VAL" (val, possibly "") if a '='
+ * was present, else the next argv token (consumed via *pi). Fatal if none. */
+static char *long_value(const char *opt, char *val, char **argv, int argc, int *pi) {
+    if (val) return val;
+    if (*pi + 1 < argc) return argv[++*pi];
+    fprintf(stderr, "arm64chroot: option '%s' requires an argument\n", opt);
+    exit(2);
+}
+
+/* Value for a short value-taking option: the attached rest-of-token "-oVAL"
+ * (rest) when non-empty, else the next argv token (consumed via *pi). */
+static char *short_value(const char *opt, char *rest, char **argv, int argc, int *pi) {
+    if (*rest) return rest;
+    if (*pi + 1 < argc) return argv[++*pi];
+    fprintf(stderr, "arm64chroot: option '%s' requires an argument\n", opt);
+    exit(2);
+}
+
+/* Append a guest -E/--env "VAR=VAL" entry. */
+static void push_env(char ***env, int *n, char *v) {
+    *env = realloc(*env, sizeof(char *) * (size_t)(*n + 1));
+    (*env)[(*n)++] = v;
+}
+
+/* Apply -u/--fake-id: enable fake identity and parse its optional ID. `attached`
+ * is the text glued to the flag ("--fake-id=ID" or "-uID"), NULL/"" when none;
+ * absent, the next argv token is taken as the ID iff it looks like an id-spec
+ * (the "-u 1000:1000" space-separated form). A bad attached spec is fatal. */
+static void set_fake_id(struct Machine *m, const char *attached,
+                        char **argv, int argc, int *pi, u32 *uid, u32 *gid) {
+    m->fake_id = 1;
+    if (attached && *attached) {
+        if (!is_id_spec(attached)) usage();
+        parse_id_spec(attached, uid, gid);
+    } else if (*pi + 1 < argc && is_id_spec(argv[*pi + 1])) {
+        parse_id_spec(argv[++*pi], uid, gid);
+    }
+}
+
 int main(int argc, char **argv) {
     struct Machine *m = &g_machine;
     const char *argv0 = NULL;
@@ -250,42 +298,58 @@ int main(int argc, char **argv) {
 
     u32 fake_uid = 0, fake_gid = 0;
 
+    /* GNU-style options: single-letter short (-j), --word long. Value-taking
+     * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg
+     * shorts bundle ("-dl"). Parsing stops at the first non-option, at "--", or
+     * at the <rootfs> argument, so guest args are never consumed as options. */
     int i = 1;
-    for (; i < argc && argv[i][0] == '-'; i++) {
-        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) help();
-        else if (!strcmp(argv[i], "-strace")) m->strace = 1;
-        else if (!strcmp(argv[i], "-d")) { g_trace = 1; g_debug_hooks = 1; }
-        else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
-        else if (!strcmp(argv[i], "-jit")) g_jit = 1;          /* native translation */
-        else if (!strcmp(argv[i], "-link2symlink")) m->link2symlink = 1;
-        else if (!strcmp(argv[i], "-shared-proc")) m->shared_proc = 1;
-        else if (!strcmp(argv[i], "-bind") && i + 1 < argc) add_bind(m, argv[++i]);
-        else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
-        else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
-            extra_env = realloc(extra_env, sizeof(char *) * (size_t)(n_extra + 1));
-            extra_env[n_extra++] = argv[++i];
-        } else if (!strcmp(argv[i], "-fake-id")) {   /* optional space-separated ID */
-            m->fake_id = 1;
-            if (i + 1 < argc && is_id_spec(argv[i + 1]))
-                parse_id_spec(argv[++i], &fake_uid, &fake_gid);
-        } else if (!strncmp(argv[i], "-fake-id=", 9)) {   /* attached form */
-            m->fake_id = 1;
-            if (is_id_spec(argv[i] + 9)) parse_id_spec(argv[i] + 9, &fake_uid, &fake_gid);
+    for (; i < argc; i++) {
+        char *arg = argv[i];
+        if (arg[0] != '-' || arg[1] == '\0') break;   /* positional (or lone "-") */
+        if (!strcmp(arg, "--")) { i++; break; }        /* explicit end of options */
+
+        if (arg[1] == '-') {                           /* long option: --name[=val] */
+            char *eq = strchr(arg, '='), *val = NULL;
+            if (eq) { *eq = '\0'; val = eq + 1; }      /* argv is writable */
+            const char *n = arg + 2;
+            if      (!strcmp(n, "help"))         { if (val) opt_no_value(arg); help(); }
+            else if (!strcmp(n, "strace"))       { if (val) opt_no_value(arg); m->strace = 1; }
+            else if (!strcmp(n, "debug"))        { if (val) opt_no_value(arg); g_trace = 1; g_debug_hooks = 1; }
+            else if (!strcmp(n, "jit"))          { if (val) opt_no_value(arg); g_jit = 1; }
+            else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_predecode = 0; }
+            else if (!strcmp(n, "link2symlink")) { if (val) opt_no_value(arg); m->link2symlink = 1; }
+            else if (!strcmp(n, "shared-proc"))  { if (val) opt_no_value(arg); m->shared_proc = 1; }
+            else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
+            else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
+            else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
+            else if (!strcmp(n, "fake-id")) set_fake_id(m, val, argv, argc, &i, &fake_uid, &fake_gid);
             else usage();
-        } else if (!strcmp(argv[i], "--")) { i++; break; }
-        else usage();
+        } else {                                       /* short cluster: -abc */
+            for (char *p = arg + 1; *p; ) {
+                char c = *p++;
+                if      (c == 'h') help();
+                else if (c == 'd') { g_trace = 1; g_debug_hooks = 1; }
+                else if (c == 'j') g_jit = 1;
+                else if (c == 'l') m->link2symlink = 1;
+                else if (c == 'b') { add_bind(m, short_value("--bind", p, argv, argc, &i)); break; }
+                else if (c == 'E') { push_env(&extra_env, &n_extra, short_value("--env", p, argv, argc, &i)); break; }
+                else if (c == '0') { argv0 = short_value("--argv0", p, argv, argc, &i); break; }
+                else if (c == 'u') { set_fake_id(m, p, argv, argc, &i, &fake_uid, &fake_gid); break; }
+                else usage();
+            }
+        }
     }
     if (argc - i < 2) usage();
 
     /* -jit yields to per-instruction debug facilities and to hosts without a
      * code generator; the interpreter is always the correct fallback. */
     if (g_jit && g_debug_hooks) {
-        fprintf(stderr, "arm64chroot: -jit disabled by per-instruction "
+        fprintf(stderr, "arm64chroot: --jit disabled by per-instruction "
                         "debug flags, using interpreter\n");
         g_jit = 0;
     }
     if (g_jit && !jit_backend_available()) {
-        fprintf(stderr, "arm64chroot: -jit has no backend for this host, "
+        fprintf(stderr, "arm64chroot: --jit has no backend for this host, "
                         "using interpreter\n");
         g_jit = 0;
     }

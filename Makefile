@@ -92,7 +92,7 @@ test32: arm64chroot32
 # semantics are host-C by design and have no qemu oracle.
 test-jit: arm64chroot
 	tests/run_consist.sh ./arm64chroot
-	printf '#!/bin/sh\nexec ./arm64chroot -jit "$$@"\n' > tests/jit_emu.sh
+	printf '#!/bin/sh\nexec ./arm64chroot --jit "$$@"\n' > tests/jit_emu.sh
 	chmod +x tests/jit_emu.sh
 	tests/run_tests.sh tests/jit_emu.sh
 	rm -f tests/jit_emu.sh
