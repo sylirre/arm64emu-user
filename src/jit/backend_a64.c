@@ -17,6 +17,16 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
+
+/* AT_HWCAP bits for FEAT_FP16 (half-precision arithmetic). Not all libc
+ * headers predefine these, so provide the architectural values. */
+#ifndef HWCAP_FPHP
+#define HWCAP_FPHP    (1u << 9)   /* scalar half-precision FP */
+#endif
+#ifndef HWCAP_ASIMDHP
+#define HWCAP_ASIMDHP (1u << 10)  /* SIMD half-precision FP */
+#endif
 
 enum { FL_MEM, FL_HOST };
 
@@ -775,6 +785,20 @@ fast:
  * back to c->v[]), so semantics are the guest's by construction. GPR-linked
  * forms substitute x16 into the Rn/Rd field. ---- */
 
+/* FEAT_FP16 (native half-precision arith/convert) probe. Gates the FP16
+ * classes: without it, half encodings stay interpreter helpers. Both HWCAP
+ * bits (scalar FPHP + SIMD ASIMDHP) come together on real FEAT_FP16 cores.
+ * A64_JIT_NOFP16 forces it off, exercising the helper fallback. */
+static int cpu_has_fp16(void) {
+    static int v = -1;
+    if (v < 0) {
+        unsigned long hw = getauxval(AT_HWCAP);
+        v = ((hw & (HWCAP_FPHP | HWCAP_ASIMDHP)) == (HWCAP_FPHP | HWCAP_ASIMDHP))
+            && getenv("A64_JIT_NOFP16") == NULL;
+    }
+    return v;
+}
+
 int be_vop_ok(unsigned vclass, u32 insn) {
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_CM3: case VC_SHIFTI:
@@ -785,6 +809,8 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
         case VC_S3S: case VC_SSHIFTI:
+            return 1;
+        case VC_FCVTH:                           /* half<->s/d converts: base ISA */
             return 1;
         case VC_F2: {
             /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
@@ -1080,6 +1106,48 @@ static void emit_vop(BE *be, const IROp *o) {
             }
             ei(e, 0x1E202008u | f | (2u << 16) | (2u << 5));  /* fcmp v2,v2 */
             u8 *slow = bcond_fwd(e, 6);          /* b.vs: NaN result */
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_FCVTH: {
+            /* FP16 precision converts (scalar FCVT h<->s/d, vector FCVTL/
+             * FCVTN); self-counting, NaN-gated. The interpreter's portable
+             * narrow routine canonicalizes NaN payloads where native fcvt
+             * preserves them, so a NaN operand re-runs in the interpreter:
+             * check the single/double side (result for widen, source for
+             * narrow), which is what a bare fcmp/fcmeq can see. */
+            int scalar = (insn >> 28) & 1;
+            u8 *slow;
+            materialize_flags(be);                       /* fcmp/cmn clobber NZCV */
+            vop_src(be, 0, rn);                          /* v0 = Vn */
+            /* renumber the guest fcvt: Rn -> v0, Rd -> v2 (imm/opcode fields,
+             * incl. the two-misc Rm slot, stay put) */
+            u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            if (scalar) {
+                unsigned ftype = (insn >> 22) & 3, opc = (insn >> 15) & 0x3f;
+                int widen = (opc == 0x4 || opc == 0x5);
+                ei(e, w);                                /* v2 = fcvt result */
+                unsigned creg = widen ? 2u : 0u;
+                unsigned cft  = widen ? (opc == 0x5 ? 1u : 0u) : (ftype & 1u);
+                ei(e, 0x1E202008u | (cft << 22) | (creg << 5));  /* fcmp reg,#0 */
+                slow = bcond_fwd(e, 6);                  /* b.vs: NaN */
+            } else {
+                unsigned Q = (insn >> 30) & 1, opc = (insn >> 12) & 0x1f;
+                int widen = (opc == 0x17);               /* FCVTL(2) */
+                if (!widen && Q) vop_src(be, 2, rd);     /* FCVTN2 keeps low 64 */
+                ei(e, w);                                /* v2 = fcvtl/fcvtn */
+                unsigned creg = widen ? 2u : 0u;         /* both are .4s (128b) */
+                /* fcmeq v16.4s, creg, creg : NaN lanes -> 0, then AND both
+                 * 64-bit halves and test against all-ones. */
+                ei(e, 0x0E20E400u | (1u << 30) | (creg << 16) | (creg << 5) | 16);
+                ei(e, 0x9E660000u | (16u << 5) | 16);    /* fmov x16, d16 */
+                ei(e, 0x9EAE0000u | (16u << 5) | 17);    /* fmov x17, v16.d[1] */
+                ei(e, 0x8A110210u);                      /* and x16, x16, x17 */
+                ei(e, 0xB100041Fu | (16u << 5));         /* cmn x16, #1 */
+                slow = bcond_fwd(e, 1);                  /* b.ne: NaN lane */
+            }
             icount_add(be, 1);
             vop_slowpath(be, o, slow, 2);
             vop_dst(be, 2, rd);

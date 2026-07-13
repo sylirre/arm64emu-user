@@ -332,6 +332,10 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             case 0x33:                           /* SHLL / SHLL2 */
                 if (size <= 2) vclass = VC_2MISC;
                 break;
+            case 0x16:                           /* FCVTN: 4s -> 4h (narrow) */
+            case 0x17:                           /* FCVTL: 4h -> 4s (widen) */
+                if (size == 0) vclass = VC_FCVTH; /* half form only (F16C) */
+                break;
             default:
                 break;
         }
@@ -451,6 +455,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 else if ((opc == 0x4 && ftype == 1) ||
                          (opc == 0x5 && ftype == 0))
                     vclass = VC_FCVT;            /* FCVT S<->D (plain casts) */
+                else if (opc == 0x7)
+                    vclass = VC_FCVTH;           /* FCVT Hd, Sn/Dn (narrow) */
             } else if (o2 == 2) {                            /* 2-source */
                 unsigned opc = (insn >> 12) & 0xf;
                 if (opc <= 0x8) vclass = VC_F2;  /* +FNMUL, +FMAX..FMINNM */
@@ -461,6 +467,11 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 vclass = VC_FCCMP;
                 aux_extra = VF_READF | VF_SETF;
             }
+        } else if (ftype == 3 && ((insn >> 21) & 1) == 1 &&
+                   ((insn >> 10) & 0x1f) == 0x10) {          /* half 1-source */
+            unsigned opc = (insn >> 15) & 0x3f;
+            if (opc == 0x4 || opc == 0x5)
+                vclass = VC_FCVTH;              /* FCVT Sd/Dd, Hn (widen) */
         }
     }
 
@@ -473,7 +484,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
      * would show — re-run there). Those classes follow the atomics'
      * self-counting discipline: not in ninsns, the fast path bumps icount
      * inline. */
-    if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S)
+    if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S &&
+        vclass != VC_FCVTH)
         ir->ninsns++;
     return 1;
 }

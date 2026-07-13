@@ -197,6 +197,9 @@ enum {
                              * (0x07), CMTST/CMEQ(0x11) */
     VC_SSHIFTI,             /* AdvSIMD scalar shift-imm, D-form (immh<3>):
                              * SHL(0x0a U0), S/USHR(0x00), S/USRA(0x02) */
+    VC_FCVTH,               /* FP16 precision converts: scalar FCVT h<->s/d,
+                             * vector FCVTL/FCVTN h<->s. F16C/FEAT_FP16-gated,
+                             * source/result NaN-gated (self-counting). */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

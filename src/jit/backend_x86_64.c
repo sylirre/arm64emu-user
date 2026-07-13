@@ -992,6 +992,35 @@ static void sse38_rr(Emit *e, u8 opc, int xdst, int xsrc) {
     e8(e, 0x0F); e8(e, 0x38); e8(e, opc);
     e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc & 7)));
 }
+/* ---- F16C (VEX-encoded half<->single vector converts) ----
+ * Only emitted behind cpu_has_f16c(); AVX (hence VEX) is implied by F16C.
+ * 3-byte VEX (0xC4): byte1 = R X B m-mmmm (R/X/B are the INVERTED high bits
+ * of ModRM.reg / SIB.index / ModRM.rm; map 2=0F38, 3=0F3A). byte2 = 0x79:
+ * W0, vvvv=1111 (no third operand), L=0 (128-bit), pp=01 (mandatory 0x66). */
+static void vex3(Emit *e, int map, int reg, int rm) {
+    e8(e, 0xC4);
+    e8(e, (u8)((((reg >> 3) & 1) ? 0 : 0x80) |   /* R = ~reg[3]  */
+               0x40 |                             /* X = 1 (unused) */
+               (((rm >> 3) & 1) ? 0 : 0x20) |    /* B = ~rm[3]   */
+               (u8)map));
+    e8(e, 0x79);
+}
+/* vcvtph2ps xmm_dst, [r14+disp]: widen 4 packed halves (low 64b) -> 4 singles */
+static void vcvtph2ps_m(Emit *e, int xdst, s32 disp) {
+    vex3(e, 0x02, xdst, R14);
+    e8(e, 0x13);
+    e8(e, (u8)(0x80 | ((xdst & 7) << 3) | (R14 & 7)));   /* mod=10, disp32 */
+    e32(e, (u32)disp);
+}
+/* vcvtps2ph xmm_dst, xmm_src, imm8: narrow 4 singles -> 4 halves (low 64b of
+ * dst). imm bit2=0 selects rounding from imm[1:0]; 0 = round-to-nearest-even.
+ * Encoding is store-shaped: ModRM.reg = source, ModRM.rm = dest. */
+static void vcvtps2ph_r(Emit *e, int xdst, int xsrc, u8 imm) {
+    vex3(e, 0x03, xsrc, xdst);
+    e8(e, 0x1D);
+    e8(e, (u8)(0xC0 | ((xsrc & 7) << 3) | (xdst & 7)));
+    e8(e, imm);
+}
 /* cvtsi2ss/sd xmm, r32/r64 */
 static void cvtsi2f(Emit *e, int dbl, int w64, int xdst, int rsrc) {
     e8(e, dbl ? 0xF2 : 0xF3);
@@ -1089,6 +1118,14 @@ static int cpu_has_ssse3(void) {
 static int cpu_has_sse42(void) {
     static int v = -1;
     if (v < 0) v = __builtin_cpu_supports("sse4.2");
+    return v && !sse_forced_baseline();
+}
+/* F16C: half<->single vector convert (vcvtph2ps / vcvtps2ph). The gate for the
+ * whole FP16 surface — without it every half encoding stays an interpreter
+ * helper. A64_JIT_SSE=2 forces it off, exercising that fallback. */
+static int cpu_has_f16c(void) {
+    static int v = -1;
+    if (v < 0) v = __builtin_cpu_supports("f16c");
     return v && !sse_forced_baseline();
 }
 
@@ -1231,6 +1268,8 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
             return 1;
+        case VC_FCVTH:                           /* FP16 converts: need F16C */
+            return cpu_has_f16c();
         case VC_F2: {
             /* FMUL/FDIV/FADD/FSUB/FNMUL inline; FMAX/FMIN/FMAXNM/FMINNM (opc
              * 4-7) keep the interpreter helper — maxss/minss get ARM's NaN
@@ -2269,6 +2308,73 @@ static void emit_vop(BE *be, const IROp *o) {
             movq_rax_x(e, to_dbl, 0);
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
+            break;
+        }
+        case VC_FCVTH: {   /* FP16 precision converts (F16C); self-counting.
+                            * The interpreter widens half->single->double and
+                            * narrows via a portable RNE routine that canon-
+                            * icalizes NaN; F16C matches for finite values, so
+                            * a NaN on the single/double side re-runs in the
+                            * interpreter (source for narrow, result for widen). */
+            int scalar = (insn >> 28) & 1;
+            materialize_flags(be);                   /* ucomis / cmpps below */
+            u8 *slow;
+            if (scalar) {
+                unsigned ftype = (insn >> 22) & 3, opc = (insn >> 15) & 0x3f;
+                if (opc == 0x4 || opc == 0x5) {      /* h -> s / d (widen) */
+                    int dbl = (opc == 0x5);
+                    vcvtph2ps_m(e, 0, OFF_V(rn));    /* xmm0 lane0 = widen(h0) */
+                    if (dbl) sse_rr(e, 0xF3, 0x5A, 0, 0);     /* cvtss2sd */
+                    sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);    /* ucomis x0,x0 */
+                    slow = jcc_fwd(e, CC_P);
+                    icount_add(be, 1);
+                    movq_rax_x(e, dbl, 0);
+                    st64(e, RAX, R14, OFF_V(rd));
+                    st_imm_r14(e, OFF_V(rd) + 8, 0);
+                } else {                             /* opc 0x7: s/d -> h (narrow) */
+                    int dbl = (ftype == 1);
+                    u8 pfx = dbl ? 0xF2 : 0xF3;
+                    sse_mem(e, pfx, 0x10, 0, OFF_V(rn));      /* movss/sd = src */
+                    sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);    /* NaN? on source */
+                    slow = jcc_fwd(e, CC_P);
+                    if (dbl) sse_rr(e, 0xF2, 0x5A, 0, 0);     /* cvtsd2ss */
+                    vcvtps2ph_r(e, 1, 0, 0);                  /* xmm1 low16 = half */
+                    icount_add(be, 1);
+                    movq_rax_x(e, 0, 1);                       /* movd eax */
+                    alu_ri32(e, 0, 4, RAX, 0xffff);           /* keep lane0 only */
+                    st64(e, RAX, R14, OFF_V(rd));
+                    st_imm_r14(e, OFF_V(rd) + 8, 0);
+                }
+            } else {                                 /* vector FCVTL / FCVTN */
+                unsigned Q = (insn >> 30) & 1, opc = (insn >> 12) & 0x1f;
+                if (opc == 0x17) {                   /* FCVTL: 4h -> 4s (widen) */
+                    vcvtph2ps_m(e, 0, OFF_V(rn) + (Q ? 8 : 0));
+                    sse_rr(e, 0x66, 0x6F, 1, 0);              /* movdqa copy */
+                    sse_rr(e, 0, 0xC2, 1, 1); e8(e, 3);       /* cmpps unord */
+                    sse_rr(e, 0, 0x50, RAX, 1);               /* movmskps eax */
+                    op_rr(e, 0, 0x85, RAX, RAX);
+                    slow = jcc_fwd(e, CC_NE);
+                    icount_add(be, 1);
+                    sse_mem(e, 0, 0x11, 0, OFF_V(rd));        /* movups [rd]=4s */
+                } else {                             /* FCVTN: 4s -> 4h (narrow) */
+                    sse_mem(e, 0, 0x10, 0, OFF_V(rn));        /* movups = 4 singles */
+                    sse_rr(e, 0x66, 0x6F, 1, 0);
+                    sse_rr(e, 0, 0xC2, 1, 1); e8(e, 3);       /* NaN? on source */
+                    sse_rr(e, 0, 0x50, RAX, 1);
+                    op_rr(e, 0, 0x85, RAX, RAX);
+                    slow = jcc_fwd(e, CC_NE);
+                    vcvtps2ph_r(e, 1, 0, 0);                  /* xmm1 low64 = 4h */
+                    icount_add(be, 1);
+                    movq_rax_x(e, 1, 1);                       /* rax = 4 halves */
+                    if (Q) {                                  /* FCVTN2: keep low */
+                        st64(e, RAX, R14, OFF_V(rd) + 8);
+                    } else {
+                        st64(e, RAX, R14, OFF_V(rd));
+                        st_imm_r14(e, OFF_V(rd) + 8, 0);
+                    }
+                }
+            }
+            vop_slowpath(be, o, slow, -1);
             break;
         }
         case VC_CVTIF: {                         /* SCVTF/UCVTF: C casts */

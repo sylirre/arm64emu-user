@@ -11,6 +11,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Enable FEAT_FP16 so the inline half-precision asm below assembles. A
+ * superset of the base arch; the compiler only emits half ops where written. */
+#pragma GCC target ("arch=armv8.2-a+fp16")
+
 static uint64_t s = 0x9e3779b97f4a7c15ULL;
 static uint64_t rnd(void) {
     s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -92,6 +96,41 @@ int main(void) {
         __asm__("fmov %w0, %s1" : "=r"(wi) : "w"(fr)); MIX(wi);
         __asm__("fcvt %d0, %s1" : "=w"(r) : "w"(fa));
         __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+
+        /* FP16 precision converts (FEAT_FP16): raw 16-bit patterns through the
+         * scalar h<->s/d forms and vector FCVTL/FCVTN/FCVTL2/FCVTN2. NaN
+         * payloads differ between the interpreter's portable narrow routine
+         * and F16C, so the JIT NaN-gates these — this drives that gate. The
+         * half source uses `fmov h,w` (a helper on the JIT: consistent). */
+        __asm__("fmov h0, %w1\n\tfcvt s0, h0\n\tfmov %w0, s0"
+                : "=r"(wi) : "r"((uint32_t)na) : "v0"); MIX(wi);
+        __asm__("fmov h0, %w1\n\tfcvt d0, h0\n\tfmov %0, d0"
+                : "=r"(xi) : "r"((uint32_t)nb) : "v0"); MIX(xi);
+        __asm__("fmov s0, %w1\n\tfcvt h0, s0\n\tfmov %w0, s0"
+                : "=r"(wi) : "r"((uint32_t)nc) : "v0"); MIX(wi);
+        __asm__("fmov d0, %1\n\tfcvt h0, d0\n\tfmov %w0, s0"
+                : "=r"(wi) : "r"(na) : "v0"); MIX(wi);
+        {
+            uint64_t va0 = rnd(), va1 = rnd(), r0, r1;
+            __asm__("fmov d0, %2\n\tmov v0.d[1], %3\n\t"
+                    "fcvtl v1.4s, v0.4h\n\tfmov %0, d1\n\tmov %1, v1.d[1]"
+                    : "=r"(r0), "=r"(r1) : "r"(va0), "r"(va1) : "v0", "v1");
+            MIX(r0); MIX(r1);
+            __asm__("fmov d0, %2\n\tmov v0.d[1], %3\n\t"
+                    "fcvtl2 v1.4s, v0.8h\n\tfmov %0, d1\n\tmov %1, v1.d[1]"
+                    : "=r"(r0), "=r"(r1) : "r"(va0), "r"(va1) : "v0", "v1");
+            MIX(r0); MIX(r1);
+            __asm__("fmov d0, %2\n\tmov v0.d[1], %3\n\t"
+                    "fcvtn v1.4h, v0.4s\n\tfmov %0, d1\n\tmov %1, v1.d[1]"
+                    : "=r"(r0), "=r"(r1) : "r"(va0), "r"(va1) : "v0", "v1");
+            MIX(r0); MIX(r1);
+            __asm__("fmov d2, %2\n\tmov v2.d[1], %3\n\t"
+                    "fmov d0, %4\n\tmov v0.d[1], %5\n\t"
+                    "fcvtn2 v2.8h, v0.4s\n\tfmov %0, d2\n\tmov %1, v2.d[1]"
+                    : "=r"(r0), "=r"(r1)
+                    : "r"(va0), "r"(va1), "r"(rnd()), "r"(rnd()) : "v0", "v2");
+            MIX(r0); MIX(r1);
+        }
 
         /* vector FP three-same (NaN-gated packed arithmetic + compares) */
         {
