@@ -821,6 +821,8 @@ int be_vop_ok(unsigned vclass, u32 insn) {
             if (opc >= 4 && opc <= 7) return 0;
             return cpu_has_fp16();
         }
+        case VC_VH3: case VC_VHCM: case VC_VH2M: /* vector half: FEAT_FP16 */
+            return cpu_has_fp16();
         case VC_F2: {
             /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
              * whose fop_d/fop_s carry ARM's NaN propagation and +0/-0 ordering
@@ -1223,6 +1225,52 @@ static void emit_vop(BE *be, const IROp *o) {
             vop_dst(be, 2, rd);
             break;
         }
+        case VC_VH3: {   /* vector half three-same arith: replay native + NaN
+                          * gate. Single ops, so native half == interp double. */
+            unsigned Q = (insn >> 30) & 1;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            u32 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                    (1u << 16) | (0u << 5) | 2;
+            ei(e, w);                                    /* v2 = fadd/.../fabd */
+            ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
+            ei(e, 0x9E660000u | (16u << 5) | 16);        /* fmov x16, d16 */
+            if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
+            ei(e, 0xB100041Fu | (16u << 5));             /* cmn x16, #1 */
+            u8 *slow = bcond_fwd(e, 1);                  /* b.ne: NaN lane */
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_VH2M: {   /* vector half two-reg misc: FABS/FNEG/FSQRT (replay
+                           * + NaN gate) or FCMxx#0 (replay, mask, no gate). */
+            unsigned Q = (insn >> 30) & 1;
+            unsigned key = (((insn >> 29) & 1) << 6) | (((insn >> 23) & 1) << 5) |
+                           ((insn >> 12) & 0x1f);
+            int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
+                          key == 0x6d || key == 0x2e);
+            vop_src(be, 0, rn);
+            u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            if (is_cmp) {                                /* FCMxx#0: no gate */
+                ei(e, w);                                /* v2 = fcmxx v0,#0 */
+                icount_add(be, 1);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            materialize_flags(be);
+            ei(e, w);                                    /* v2 = fabs/fneg/fsqrt */
+            ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
+            ei(e, 0x9E660000u | (16u << 5) | 16);
+            if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
+            ei(e, 0xB100041Fu | (16u << 5));
+            u8 *slow = bcond_fwd(e, 1);
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
         default: {
             /* Renumber-and-replay. Vector sources -> v0 (Rn), v1 (Rm);
              * Vd preloaded into the result reg v2 for the read-modify
@@ -1231,7 +1279,8 @@ static void emit_vop(BE *be, const IROp *o) {
             int has_rm = (vclass == VC_BITW || vclass == VC_ADDSUB ||
                           vclass == VC_CM3 || vclass == VC_MINMAX ||
                           vclass == VC_MUL3 || vclass == VC_PAIRI ||
-                          vclass == VC_VFCM || vclass == VC_S3S ||
+                          vclass == VC_VFCM || vclass == VC_VHCM ||
+                          vclass == VC_S3S ||
                           vclass == VC_FCSEL || vclass == VC_FCCMP ||
                           (vclass == VC_FCMP && !((insn >> 3) & 1)));
             int reads_rd = (vclass == VC_BITW && ((insn >> 29) & 1) &&

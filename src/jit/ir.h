@@ -207,6 +207,12 @@ enum {
                              * (FMAX/FMIN(NM) declined). NaN-gated, self-counting. */
     VC_H3,                  /* scalar half 3-source: FMADD/FMSUB/FNMADD/FNMSUB.
                              * NaN-gated, self-counting. */
+    VC_VH3,                 /* vector half three-same arith: FADD/FSUB/FMUL/
+                             * FDIV/FABD (.4h/.8h). NaN-gated, self-counting. */
+    VC_VHCM,                /* vector half three-same compares: FCMEQ/GE/GT,
+                             * FACGE/GT -> per-lane mask (no gate). */
+    VC_VH2M,                /* vector half two-reg misc: FABS/FNEG/FSQRT
+                             * (NaN-gated) + FCMxx#0 (mask). Self-counting. */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

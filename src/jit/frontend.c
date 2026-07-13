@@ -344,6 +344,33 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             default:
                 break;
         }
+    } else if ((insn & 0x9F60C400u) == 0x0E400400u) {
+        /* AdvSIMD three-same, FP16 page (bit22=1, bit21=0, bits[15:14]=0,
+         * bit10=1). Its own encoding; key = (U<<4)|(a<<3)|op3. Arith is
+         * NaN-gated/self-counting; compares are exact masks. FMLA/FMLS (FMA),
+         * FMULX/FRECPS/FRSQRTS (Phase 5), FMAX/FMIN(NM) + pairwise stay helpers. */
+        unsigned U = (insn >> 29) & 1, a = (insn >> 23) & 1;
+        unsigned op3 = (insn >> 11) & 7;
+        switch ((U << 4) | (a << 3) | op3) {
+            case 0x02: case 0x0a: case 0x13: case 0x17: case 0x1a:
+                vclass = VC_VH3; break;          /* FADD/FSUB/FMUL/FDIV/FABD */
+            case 0x04: case 0x14: case 0x1c: case 0x15: case 0x1d:
+                vclass = VC_VHCM; break;         /* FCMEQ/GE/GT, FACGE/GT */
+            default: break;
+        }
+    } else if ((insn & 0x9F7E0C00u) == 0x0E780800u) {
+        /* AdvSIMD two-reg misc, FP16 page (bit22=1, bits[21:17]=11100,
+         * bit11=1, bit10=0). key = (U<<6)|(hsz<<5)|opc. FABS/FNEG/FSQRT +
+         * FCMxx#0; FRINT, int converts, FRECPE/FRSQRTE stay helpers. */
+        unsigned U = (insn >> 29) & 1, hsz = (insn >> 23) & 1;
+        unsigned opc = (insn >> 12) & 0x1f;
+        switch ((U << 6) | (hsz << 5) | opc) {
+            case 0x2f: case 0x6f: case 0x7f:     /* FABS/FNEG/FSQRT */
+            case 0x2c: case 0x6c: case 0x2d:     /* FCMGT/GE/EQ #0 */
+            case 0x6d: case 0x2e:                /* FCMLE/LT #0 */
+                vclass = VC_VH2M; break;
+            default: break;
+        }
     } else if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
         /* across-lanes reductions (21:17 = 11000) */
         unsigned U = (insn >> 29) & 1, Q = (insn >> 30) & 1;
@@ -518,7 +545,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
      * inline. */
     if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S &&
         vclass != VC_FCVTH && vclass != VC_H1 && vclass != VC_H2 &&
-        vclass != VC_H3)
+        vclass != VC_H3 && vclass != VC_VH3 && vclass != VC_VH2M)
         ir->ninsns++;
     return 1;
 }

@@ -1285,6 +1285,8 @@ int be_vop_ok(unsigned vclass, u32 insn) {
              * a double-rounding error (a tiny addend lost below half a single
              * ULP on a half-midpoint product). Keep the interpreter helper. */
             return 0;
+        case VC_VH3: case VC_VHCM: case VC_VH2M: /* vector half: F16C */
+            return cpu_has_f16c();
         case VC_F2: {
             /* FMUL/FDIV/FADD/FSUB/FNMUL inline; FMAX/FMIN/FMAXNM/FMINNM (opc
              * 4-7) keep the interpreter helper — maxss/minss get ARM's NaN
@@ -2287,6 +2289,133 @@ static void emit_vop(BE *be, const IROp *o) {
                 res = 1;
             }
             vop_dst(be, res, rd, (int)Q);
+            break;
+        }
+        case VC_VH3: {   /* vector half three-same arith (self-counting, NaN-
+                          * gated). Widen each half lane to single, compute
+                          * packed (single ops round half correctly), narrow. */
+            unsigned Q = (insn >> 30) & 1;
+            unsigned key = (((insn >> 29) & 1) << 4) | (((insn >> 23) & 1) << 3) |
+                           ((insn >> 11) & 7);
+            u8 op = 0x58; int abd = 0;               /* FADD */
+            switch (key) {
+                case 0x0a: op = 0x5C; break;         /* FSUB */
+                case 0x13: op = 0x59; break;         /* FMUL */
+                case 0x17: op = 0x5E; break;         /* FDIV */
+                case 0x1a: op = 0x5C; abd = 1; break;/* FABD */
+                default: break;
+            }
+            materialize_flags(be);
+            vcvtph2ps_m(e, 0, OFF_V(rn));            /* n lo */
+            vcvtph2ps_m(e, 2, OFF_V(rm));            /* m lo */
+            sse_rr(e, 0, op, 0, 2);
+            if (abd) { sse_rr(e, 0x66, 0x76, 2, 2); sse_shift_i(e, 0x72, 2, 2, 1);
+                       sse_rr(e, 0, 0x54, 0, 2); }   /* |.|: andps 0x7fffffff */
+            if (Q) {
+                vcvtph2ps_m(e, 1, OFF_V(rn) + 8);
+                vcvtph2ps_m(e, 3, OFF_V(rm) + 8);
+                sse_rr(e, 0, op, 1, 3);
+                if (abd) { sse_rr(e, 0x66, 0x76, 3, 3); sse_shift_i(e, 0x72, 2, 3, 1);
+                           sse_rr(e, 0, 0x54, 1, 3); }
+            }
+            sse_rr(e, 0x66, 0x6F, 4, 0);             /* NaN check copy */
+            sse_rr(e, 0, 0xC2, 4, 4); e8(e, 3);      /* cmpps unord */
+            if (Q) { sse_rr(e, 0x66, 0x6F, 5, 1); sse_rr(e, 0, 0xC2, 5, 5); e8(e, 3);
+                     sse_rr(e, 0x66, 0xEB, 4, 5); }  /* por lo|hi */
+            sse_rr(e, 0, 0x50, RAX, 4);
+            op_rr(e, 0, 0x85, RAX, RAX);
+            u8 *slow = jcc_fwd(e, CC_NE);
+            icount_add(be, 1);
+            vcvtps2ph_r(e, 4, 0, 0);                 /* narrow lo -> 4 halves */
+            movq_rax_x(e, 1, 4);
+            st64(e, RAX, R14, OFF_V(rd));
+            if (Q) { vcvtps2ph_r(e, 5, 1, 0); movq_rax_x(e, 1, 5);
+                     st64(e, RAX, R14, OFF_V(rd) + 8); }
+            else st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        case VC_VHCM: {   /* vector half three-same compares -> per-lane mask */
+            unsigned Q = (insn >> 30) & 1, U = (insn >> 29) & 1, a = (insn >> 23) & 1;
+            int absf = (((insn >> 11) & 7) == 5);    /* FACGE/FACGT */
+            vcvtph2ps_m(e, 0, OFF_V(rn));
+            vcvtph2ps_m(e, 2, OFF_V(rm));
+            if (Q) { vcvtph2ps_m(e, 1, OFF_V(rn) + 8); vcvtph2ps_m(e, 3, OFF_V(rm) + 8); }
+            if (absf) {                              /* clear sign of all lanes */
+                sse_rr(e, 0x66, 0x76, 6, 6); sse_shift_i(e, 0x72, 2, 6, 1);
+                sse_rr(e, 0, 0x54, 0, 6); sse_rr(e, 0, 0x54, 2, 6);
+                if (Q) { sse_rr(e, 0, 0x54, 1, 6); sse_rr(e, 0, 0x54, 3, 6); }
+            }
+            int lo, hi;
+            if (!U) {                                /* FCMEQ: n==m */
+                sse_rr(e, 0, 0xC2, 0, 2); e8(e, 0);
+                if (Q) { sse_rr(e, 0, 0xC2, 1, 3); e8(e, 0); }
+                lo = 0; hi = 1;
+            } else {                                 /* GE: m<=n / GT: m<n */
+                sse_rr(e, 0, 0xC2, 2, 0); e8(e, a ? 1 : 2);
+                if (Q) { sse_rr(e, 0, 0xC2, 3, 1); e8(e, a ? 1 : 2); }
+                lo = 2; hi = 3;
+            }
+            if (Q) { sse_rr(e, 0x66, 0x6B, lo, hi); sse_mem(e, 0, 0x11, lo, OFF_V(rd)); }
+            else   { sse_rr(e, 0x66, 0x6B, lo, lo); movq_rax_x(e, 1, lo);
+                     st64(e, RAX, R14, OFF_V(rd)); st_imm_r14(e, OFF_V(rd) + 8, 0); }
+            break;
+        }
+        case VC_VH2M: {   /* vector half two-reg misc: FABS/FNEG/FSQRT (gated) +
+                           * FCMxx#0 (mask). Self-counting. */
+            unsigned Q = (insn >> 30) & 1;
+            unsigned key = (((insn >> 29) & 1) << 6) | (((insn >> 23) & 1) << 5) |
+                           ((insn >> 12) & 0x1f);
+            int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
+                          key == 0x6d || key == 0x2e);
+            vcvtph2ps_m(e, 0, OFF_V(rn));
+            if (Q) vcvtph2ps_m(e, 1, OFF_V(rn) + 8);
+            if (is_cmp) {                            /* compare vs 0 -> mask */
+                u8 imm; int swap;
+                switch (key) {
+                    case 0x2c: swap = 1; imm = 1; break; /* GT: 0<n */
+                    case 0x6c: swap = 1; imm = 2; break; /* GE: 0<=n */
+                    case 0x2d: swap = 0; imm = 0; break; /* EQ: n==0 */
+                    case 0x6d: swap = 0; imm = 2; break; /* LE: n<=0 */
+                    default:   swap = 0; imm = 1; break; /* LT: n<0 */
+                }
+                sse_rr(e, 0x66, 0xEF, 2, 2);         /* xmm2 = 0 */
+                if (Q) sse_rr(e, 0x66, 0xEF, 3, 3);
+                int lo, hi;
+                if (swap) { sse_rr(e, 0, 0xC2, 2, 0); e8(e, imm);
+                            if (Q) { sse_rr(e, 0, 0xC2, 3, 1); e8(e, imm); }
+                            lo = 2; hi = 3; }
+                else      { sse_rr(e, 0, 0xC2, 0, 2); e8(e, imm);
+                            if (Q) { sse_rr(e, 0, 0xC2, 1, 3); e8(e, imm); }
+                            lo = 0; hi = 1; }
+                icount_add(be, 1);
+                if (Q) { sse_rr(e, 0x66, 0x6B, lo, hi); sse_mem(e, 0, 0x11, lo, OFF_V(rd)); }
+                else   { sse_rr(e, 0x66, 0x6B, lo, lo); movq_rax_x(e, 1, lo);
+                         st64(e, RAX, R14, OFF_V(rd)); st_imm_r14(e, OFF_V(rd) + 8, 0); }
+                break;
+            }
+            materialize_flags(be);
+            if (key == 0x2f) {                       /* FABS */
+                sse_rr(e, 0x66, 0x76, 2, 2); sse_shift_i(e, 0x72, 2, 2, 1);
+                sse_rr(e, 0, 0x54, 0, 2); if (Q) sse_rr(e, 0, 0x54, 1, 2);
+            } else if (key == 0x6f) {                /* FNEG */
+                sse_rr(e, 0x66, 0x76, 2, 2); sse_shift_i(e, 0x72, 6, 2, 31);
+                sse_rr(e, 0, 0x57, 0, 2); if (Q) sse_rr(e, 0, 0x57, 1, 2);
+            } else {                                 /* FSQRT (0x7f) */
+                sse_rr(e, 0, 0x51, 0, 0); if (Q) sse_rr(e, 0, 0x51, 1, 1);
+            }
+            sse_rr(e, 0x66, 0x6F, 4, 0); sse_rr(e, 0, 0xC2, 4, 4); e8(e, 3);
+            if (Q) { sse_rr(e, 0x66, 0x6F, 5, 1); sse_rr(e, 0, 0xC2, 5, 5); e8(e, 3);
+                     sse_rr(e, 0x66, 0xEB, 4, 5); }
+            sse_rr(e, 0, 0x50, RAX, 4); op_rr(e, 0, 0x85, RAX, RAX);
+            u8 *slow = jcc_fwd(e, CC_NE);
+            icount_add(be, 1);
+            vcvtps2ph_r(e, 4, 0, 0); movq_rax_x(e, 1, 4);
+            st64(e, RAX, R14, OFF_V(rd));
+            if (Q) { vcvtps2ph_r(e, 5, 1, 0); movq_rax_x(e, 1, 5);
+                     st64(e, RAX, R14, OFF_V(rd) + 8); }
+            else st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
             break;
         }
         case VC_F3: {

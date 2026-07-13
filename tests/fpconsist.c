@@ -164,6 +164,32 @@ int main(void) {
                     : "=r"(hr) : "r"((uint32_t)nc) : "v0", "cc"); MIX(hr);
         }
 
+        /* FP16 vector three-same (arith + compares) and two-reg misc
+         * (FABS/FNEG/FSQRT + FCMxx#0) on .4h/.8h, random half lanes. */
+        {
+            uint64_t va0 = rnd(), va1 = rnd(), vb0 = rnd(), vb1 = rnd(), r0, r1;
+#define VH3(insn) \
+    __asm__("fmov d0,%2\n\tmov v0.d[1],%3\n\tfmov d1,%4\n\tmov v1.d[1],%5\n\t" \
+            insn "\n\tfmov %0,d2\n\tmov %1,v2.d[1]" : "=r"(r0), "=r"(r1) \
+            : "r"(va0), "r"(va1), "r"(vb0), "r"(vb1) : "v0", "v1", "v2"); \
+    MIX(r0); MIX(r1)
+            VH3("fadd v2.8h, v0.8h, v1.8h");  VH3("fsub v2.4h, v0.4h, v1.4h");
+            VH3("fmul v2.8h, v0.8h, v1.8h");  VH3("fdiv v2.8h, v0.8h, v1.8h");
+            VH3("fabd v2.8h, v0.8h, v1.8h");
+            VH3("fcmeq v2.8h, v0.8h, v1.8h"); VH3("fcmge v2.4h, v0.4h, v1.4h");
+            VH3("fcmgt v2.8h, v0.8h, v1.8h"); VH3("facge v2.8h, v0.8h, v1.8h");
+            VH3("facgt v2.8h, v0.8h, v1.8h");
+#define VH2(insn) \
+    __asm__("fmov d0,%2\n\tmov v0.d[1],%3\n\t" insn "\n\tfmov %0,d2\n\tmov %1,v2.d[1]" \
+            : "=r"(r0), "=r"(r1) : "r"(va0), "r"(va1) : "v0", "v2"); \
+    MIX(r0); MIX(r1)
+            VH2("fabs v2.8h, v0.8h");  VH2("fneg v2.4h, v0.4h");
+            VH2("fsqrt v2.8h, v0.8h");
+            VH2("fcmeq v2.8h, v0.8h, #0.0"); VH2("fcmgt v2.8h, v0.8h, #0.0");
+            VH2("fcmge v2.4h, v0.4h, #0.0"); VH2("fcmle v2.8h, v0.8h, #0.0");
+            VH2("fcmlt v2.8h, v0.8h, #0.0");
+        }
+
         /* vector FP three-same (NaN-gated packed arithmetic + compares) */
         {
             uint64_t va0 = rnd(), va1 = rnd(), vb0 = rnd(), vb1 = rnd();
