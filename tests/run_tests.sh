@@ -10,6 +10,12 @@ AGCC=$(command -v aarch64-linux-gnu-gcc || command -v aarch64-linux-gnu-gcc-13) 
     echo "SKIP: no aarch64 cross compiler"; exit 0; }
 QEMU=$(command -v qemu-aarch64) || { echo "SKIP: no qemu-aarch64"; exit 0; }
 
+# Provision the Alpine + glibc test rootfs from scratch into a repo-local cache
+# (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
+# offline, Alpine needs a one-time network fetch and otherwise degrades to SKIP.
+export A64_TEST_ROOT="${A64_TEST_ROOT:-$PWD/tests/.cache/rootfs}"
+tests/setup_env.sh || true
+
 pass=0 fail=0
 
 run_diff() {   # run_diff <name> <binary> [args...]
@@ -40,7 +46,7 @@ for cfile in tests/c/*.c; do
     "$AGCC" -static -O2 -o "$bs" "$cfile" -lm -lpthread 2>/dev/null || {
         echo "SKIP build $cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
-    GLIBC_ROOT="$HOME/arm64-rootfs/glibc"
+    GLIBC_ROOT="$A64_TEST_ROOT/glibc"
     if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" -lm -lpthread 2>/dev/null; then
         # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
@@ -48,8 +54,8 @@ for cfile in tests/c/*.c; do
         # host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
         cp "$bd" /tmp/t.bin
-        out_q=$(QEMU_LD_PREFIX=/usr/aarch64-linux-gnu "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX=/usr/aarch64-linux-gnu "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        out_q=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
@@ -61,7 +67,7 @@ done
 rm -f /tmp/t.bin
 
 # ---- Alpine rootfs shell tests (if present) ----
-ALPINE="$HOME/arm64-rootfs/alpine"
+ALPINE="$A64_TEST_ROOT/alpine"
 if [ -x "$ALPINE/bin/busybox" ] && command -v proot >/dev/null && command -v qemu-aarch64-static >/dev/null; then
     while IFS= read -r cmd; do
         [ -z "$cmd" ] && continue

@@ -16,5 +16,8 @@ tests/*.bin
 tests/fixtures/*.bin
 tests/bench/*.bin
 
+# provisioned test rootfs (Alpine + glibc) built by tests/setup_env.sh
+tests/.cache/
+
 # cross/host JIT build for AArch64-host testing under qemu
 /arm64chroot.a64

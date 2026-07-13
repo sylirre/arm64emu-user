@@ -80,6 +80,12 @@ m32: arm64chroot32
 # Per-object header dependencies emitted by -MMD (absent on the first build).
 -include $(NATIVE_OBJ:.o=.d) $(M32_OBJ:.o=.d) $(ASIM_OBJ:.o=.d)
 
+# Provision the Alpine + glibc test rootfs from scratch (repo-local cache under
+# tests/.cache). run_tests.sh also does this automatically on first run; this is
+# an explicit pre-provision step. Wiped by clean-testenv, not by clean.
+test-env:
+	tests/setup_env.sh
+
 test: arm64chroot
 	tests/run_tests.sh ./arm64chroot
 
@@ -120,4 +126,9 @@ clean:
 	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin tests/bench/*.bin
 	rm -f tests/seccomp_emu.sh tests/jit_emu.sh
 
-.PHONY: m32 test test32 test-jit test-android-sim test-seccomp clean
+# Separate from clean: removing the provisioned test rootfs forces a fresh
+# Alpine download, so keep it out of the fast rebuild path.
+clean-testenv:
+	rm -rf tests/.cache
+
+.PHONY: m32 test-env test test32 test-jit test-android-sim test-seccomp clean clean-testenv

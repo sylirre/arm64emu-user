@@ -140,6 +140,13 @@ make test-seccomp    # same suite with the emulator under an Android-Oreo
                      # seccomp mimic (no device needed)
 ```
 
+`make test` provisions the Alpine (busybox/bash) and glibc rootfs it needs
+from scratch into a repo-local cache (`tests/.cache/`) on first run — the glibc
+tree is built offline from the cross sysroot, the Alpine tree needs a one-time
+network fetch (offline just skips those sections). No hand-staged `$HOME` rootfs
+is required. Override the location with `A64_TEST_ROOT`; wipe it with `make
+clean-testenv` (kept out of `make clean` so rebuilds don't re-download).
+
 Cross-compile for a specific host (static, no runtime deps):
 
 ```sh
