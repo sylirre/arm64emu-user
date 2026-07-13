@@ -37,6 +37,11 @@ static u64 vfp_imm64(unsigned imm8) {
     u64 frac = (u64)(imm8 & 0xf) << 48;
     return sign | (exp11 << 52) | frac;
 }
+static u16 vfp_imm16(unsigned imm8) {                 /* half-precision FMOV #imm */
+    unsigned s = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1, e = (imm8 >> 4) & 3;
+    u16 exp5 = (u16)(((!b6) << 4) | ((b6 ? 3u : 0u) << 2) | e);  /* [4]=NOT b6, [3:2]=Rep(b6,2), [1:0]=imm8[5:4] */
+    return (u16)((s << 15) | (exp5 << 10) | ((imm8 & 0xf) << 6));
+}
 
 /* AdvSIMD modified immediate -> 64-bit element pattern (MOVI value). */
 static u64 expand_imm(unsigned op, unsigned cmode, unsigned imm8) {
@@ -238,6 +243,34 @@ static u16 f64_to_f16(double x) {
     return (u16)(sign | (u16)rounded);                 /* subnormal (carry -> normal) */
 }
 
+/* IEEE-754 binary64 -> binary32 with round-to-ODD (FCVTXN). Round-to-odd is
+ * truncation with the shifted-out remainder OR'd into the result LSB; unlike
+ * round-to-nearest it never rounds a finite value up to Inf (overflow caps at
+ * the largest finite float, whose mantissa is all-ones = odd). Pure integer so
+ * the host's rounding mode is irrelevant. */
+static u32 f64_to_f32_round_odd(double x) {
+    u64 b; memcpy(&b, &x, 8);
+    u32 sign = (u32)((b >> 32) & 0x80000000u);
+    u64 mag  = b & 0x7fffffffffffffffULL;
+
+    if (mag >= 0x7ff0000000000000ULL)                  /* Inf / NaN */
+        return sign | (mag > 0x7ff0000000000000ULL ? 0x7fc00000u : 0x7f800000u);
+    if (mag == 0) return sign;                         /* +/- zero */
+    if (mag < 0x36a0000000000000ULL) return sign | 1u; /* |x| < 2^-149: tiny -> smallest odd subnormal */
+
+    int fe  = (int)(mag >> 52) - 1023 + 127;           /* tentative float exponent */
+    u64 sig = (mag & 0xfffffffffffffULL) | 0x10000000000000ULL;  /* 1.frac, bit52 set */
+
+    if (fe >= 0xff) return sign | 0x7f7fffffu;         /* overflow -> largest finite (odd) */
+
+    int shift = (fe > 0) ? 29 : (30 - fe);             /* 52-23 normal; extra for subnormal */
+    u64 rounded = sig >> shift;
+    if (sig & (((u64)1 << shift) - 1)) rounded |= 1;   /* round-to-odd: sticky -> LSB */
+
+    if (fe > 0) return sign | (u32)(((u32)(fe - 1) << 23) + (u32)rounded);  /* implicit 1 carries into exp */
+    return sign | (u32)rounded;                        /* subnormal */
+}
+
 /* Per-lane FP <-> bits accessors for vector ops (lane i of a V128). */
 static float  vget_s(const V128 *v, unsigned i) { float  x; u32 b = v->s[i]; memcpy(&x, &b, 4); return x; }
 static double vget_d(const V128 *v, unsigned i) { double x; u64 b = v->d[i]; memcpy(&x, &b, 8); return x; }
@@ -278,6 +311,27 @@ static void fp_set_flags(CPU *c, int cmp /* -1 lt, 0 eq, 1 gt, 2 unordered */) {
     c->nzcv = n;
 }
 
+/* FP arithmetic op selectors + kernels. fop_d/fop_s (defined below with the
+ * vector helpers) implement FMAX/FMIN with ARM NaN-propagation and +0>-0, and
+ * FMAXNM/FMINNM returning the numeric operand — shared by the scalar and vector
+ * paths so both agree with the architecture (and with each other). */
+#define FOP_ADD 0
+#define FOP_SUB 1
+#define FOP_MUL 2
+#define FOP_DIV 3
+#define FOP_MLA 4
+#define FOP_MLS 5
+#define FOP_MAX 6
+#define FOP_MIN 7
+#define FOP_MAXNM 8
+#define FOP_MINNM 9
+#define FOP_ABD 10
+#define FOP_MULX 11
+#define FOP_RECPS 12
+#define FOP_RSQRTS 13
+static double fop_d(unsigned op, double n, double m, double d);
+static float  fop_s(unsigned op, float  n, float  m, float  d);
+
 static void exec_fp_scalar(CPU *c, u32 insn) {
     unsigned ftype = BITS(23, 22), Rn = BITS(9, 5), Rd = BITS(4, 0);
     bool dbl = (ftype == 1);
@@ -303,6 +357,84 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         if (opc == 0x5 && ftype == 3) { fp_wr_d(c, Rd, (double)f16_to_f32(fp_rd_h(c, Rn))); return; } /* FCVT Dd,Hn */
         if (opc == 0x7 && ftype == 0) { fp_wr_h(c, Rd, f64_to_f16((double)fp_rd_s(c, Rn))); return; } /* FCVT Hd,Sn */
         if (opc == 0x7 && ftype == 1) { fp_wr_h(c, Rd, f64_to_f16(fp_rd_d(c, Rn))); return; }         /* FCVT Hd,Dn */
+    }
+
+    /* FMOV between a general register and a half register (ftype=3): a raw
+     * 16-bit move (no conversion), in the FP<->int space (BITS(15,10)==0).
+     * Emitted to materialize _Float16 constants (memcpy). */
+    if (ftype == 3 && BIT(21) == 1 && BITS(15, 10) == 0 && BITS(20, 19) == 0) {
+        unsigned opcode = BITS(18, 16);
+        if (opcode == 6) { set_x(c, Rd, c->v[Rn].h[0]); return; }                          /* FMOV Wd, Hn */
+        if (opcode == 7) { c->v[Rd].d[0] = (u16)reg_x(c, Rn); c->v[Rd].d[1] = 0; return; }  /* FMOV Hd, Wn */
+    }
+
+    /* Half-precision (ftype=3) scalar data-processing: FP immediate, compare,
+     * FCCMP, FCSEL, and the 1-source (FMOV/FABS/FNEG/FSQRT/FRINT) and 2-source
+     * (FADD/FSUB/FMUL/FDIV/FMAX/FMIN/FMAXNM/FMINNM/FNMUL) groups. Operands widen
+     * h->double and compute in double; the single narrow-to-half via f64_to_f16
+     * is exact because double's 53-bit mantissa exceeds 2*11+2 (no double-round).
+     * FP<->integer (except FMOV above) and FP<->fixed converts stay UNDEF. */
+    if (ftype == 3 && BIT(21) == 1 && BITS(15, 10) != 0) {
+        unsigned o2 = BITS(11, 10);
+        if (o2 == 0 && BIT(12) == 1) {                    /* FMOV Hd, #imm */
+            fp_wr_h(c, Rd, vfp_imm16(BITS(20, 13))); return;
+        }
+        if (o2 == 0 && BIT(13) == 1) {                    /* FCMP / FCMPE (with 0.0 if opcode2<3>) */
+            unsigned Rm = BITS(20, 16); bool with_zero = BIT(3);
+            double a = (double)f16_to_f32(fp_rd_h(c, Rn));
+            double b = with_zero ? 0.0 : (double)f16_to_f32(fp_rd_h(c, Rm));
+            fp_set_flags(c, (a < b) ? -1 : (a == b) ? 0 : (a > b) ? 1 : 2); return;
+        }
+        if (o2 == 0 && BIT(14) == 1) {                    /* FP data-processing (1 source) */
+            unsigned opc = BITS(20, 15); double r;
+            double x = (double)f16_to_f32(fp_rd_h(c, Rn));
+            switch (opc) {
+                case 0x0: fp_wr_h(c, Rd, fp_rd_h(c, Rn)); return;      /* FMOV  */
+                case 0x1: r = __builtin_fabs(x); break;               /* FABS  */
+                case 0x2: r = -x; break;                              /* FNEG  */
+                case 0x3: r = __builtin_sqrt(x); break;               /* FSQRT */
+                case 0x8: r = fround_mode(x, 0); break;               /* FRINTN */
+                case 0x9: r = fround_mode(x, 1); break;               /* FRINTP */
+                case 0xa: r = fround_mode(x, 2); break;               /* FRINTM */
+                case 0xb: r = fround_mode(x, 3); break;               /* FRINTZ */
+                case 0xc: r = fround_mode(x, 4); break;               /* FRINTA */
+                case 0xe: case 0xf: r = fround_mode(x, (int)((c->fpcr >> 22) & 3)); break; /* FRINTX/I */
+                default: fpsimd_undef(c, insn); return;
+            }
+            fp_wr_h(c, Rd, f64_to_f16(r)); return;
+        }
+        if (o2 == 2) {                                    /* FP data-processing (2 source) */
+            unsigned Rm = BITS(20, 16), opc = BITS(15, 12); double r;
+            double a = (double)f16_to_f32(fp_rd_h(c, Rn)), b = (double)f16_to_f32(fp_rd_h(c, Rm));
+            switch (opc) {
+                case 0x0: r = a * b; break;                       /* FMUL   */
+                case 0x1: r = a / b; break;                       /* FDIV   */
+                case 0x2: r = a + b; break;                       /* FADD   */
+                case 0x3: r = a - b; break;                       /* FSUB   */
+                case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break; /* FMAX   */
+                case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break; /* FMIN   */
+                case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break; /* FMAXNM */
+                case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break; /* FMINNM */
+                case 0x8: r = -(a * b); break;                    /* FNMUL  */
+                default: fpsimd_undef(c, insn); return;
+            }
+            fp_wr_h(c, Rd, f64_to_f16(r)); return;
+        }
+        if (o2 == 3) {                                    /* FCSEL */
+            unsigned Rm = BITS(20, 16), cond = BITS(15, 12);
+            fp_wr_h(c, Rd, fp_rd_h(c, cond_holds(c, cond) ? Rn : Rm)); return;
+        }
+        if (o2 == 1) {                                    /* FCCMP / FCCMPE */
+            unsigned Rm = BITS(20, 16), cond = BITS(15, 12), nzcv = BITS(3, 0);
+            if (cond_holds(c, cond)) {
+                double a = (double)f16_to_f32(fp_rd_h(c, Rn)), b = (double)f16_to_f32(fp_rd_h(c, Rm));
+                fp_set_flags(c, (a < b) ? -1 : (a == b) ? 0 : (a > b) ? 1 : 2);
+            } else {
+                c->nzcv = ((nzcv & 8) ? PS_N : 0) | ((nzcv & 4) ? PS_Z : 0) |
+                          ((nzcv & 2) ? PS_C : 0) | ((nzcv & 1) ? PS_V : 0);
+            }
+            return;
+        }
     }
 
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }  /* half: on demand */
@@ -462,10 +594,10 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x1: r = a / b; break;                    /* FDIV */
                 case 0x2: r = a + b; break;                    /* FADD */
                 case 0x3: r = a - b; break;                    /* FSUB */
-                case 0x4: r = (a > b) ? a : b; break;          /* FMAX */
-                case 0x5: r = (a < b) ? a : b; break;          /* FMIN */
-                case 0x6: r = (a > b) ? a : b; break;          /* FMAXNM ~ */
-                case 0x7: r = (a < b) ? a : b; break;          /* FMINNM ~ */
+                case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break;  /* FMAX   */
+                case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break;  /* FMIN   */
+                case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break;  /* FMAXNM */
+                case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break;  /* FMINNM */
                 case 0x8: r = -(a * b); break;                 /* FNMUL */
                 default: fpsimd_undef(c, insn); return;
             }
@@ -477,10 +609,10 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x1: r = a / b; break;
                 case 0x2: r = a + b; break;
                 case 0x3: r = a - b; break;
-                case 0x4: r = (a > b) ? a : b; break;
-                case 0x5: r = (a < b) ? a : b; break;
-                case 0x6: r = (a > b) ? a : b; break;
-                case 0x7: r = (a < b) ? a : b; break;
+                case 0x4: r = fop_s(FOP_MAX,   a, b, 0.0f); break;  /* FMAX   */
+                case 0x5: r = fop_s(FOP_MIN,   a, b, 0.0f); break;  /* FMIN   */
+                case 0x6: r = fop_s(FOP_MAXNM, a, b, 0.0f); break;  /* FMAXNM */
+                case 0x7: r = fop_s(FOP_MINNM, a, b, 0.0f); break;  /* FMINNM */
                 case 0x8: r = -(a * b); break;
                 default: fpsimd_undef(c, insn); return;
             }
@@ -517,6 +649,15 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
 static void exec_fp_dp3(CPU *c, u32 insn) {
     unsigned ftype = BITS(23, 22), Rm = BITS(20, 16), Ra = BITS(14, 10);
     unsigned Rn = BITS(9, 5), Rd = BITS(4, 0), o1 = BIT(21), o0 = BIT(15);
+    if (ftype == 3) {                             /* half: fused in double (exact, no double-round) */
+        double n = (double)f16_to_f32(fp_rd_h(c, Rn)), m = (double)f16_to_f32(fp_rd_h(c, Rm)),
+               a = (double)f16_to_f32(fp_rd_h(c, Ra)), r;
+        if (!o1 && !o0)     r =  a + n * m;       /* FMADD  */
+        else if (!o1)       r =  a - n * m;       /* FMSUB  */
+        else if (o1 && !o0) r = -a - n * m;       /* FNMADD */
+        else                r = -a + n * m;       /* FNMSUB */
+        fp_wr_h(c, Rd, f64_to_f16(r)); return;
+    }
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }
     if (ftype == 1) {
         double n = fp_rd_d(c, Rn), m = fp_rd_d(c, Rm), a = fp_rd_d(c, Ra), r;
@@ -635,21 +776,8 @@ static u16 pmull8(u8 a, u8 b);                      /* defined in the crypto sec
  * Computed in host float/double. NaN-payload propagation, denormal flushing and
  * non-default rounding modes are NOT bit-exact to ARM (same caveat as the scalar
  * FP path); normal values match. FMAX/FMIN propagate NaN (unlike host fmax);
- * FMAXNM/FMINNM return the numeric operand. */
-#define FOP_ADD 0
-#define FOP_SUB 1
-#define FOP_MUL 2
-#define FOP_DIV 3
-#define FOP_MLA 4
-#define FOP_MLS 5
-#define FOP_MAX 6
-#define FOP_MIN 7
-#define FOP_MAXNM 8
-#define FOP_MINNM 9
-#define FOP_ABD 10
-#define FOP_MULX 11
-#define FOP_RECPS 12
-#define FOP_RSQRTS 13
+ * FMAXNM/FMINNM return the numeric operand. The FOP_* selectors are declared
+ * above (before exec_fp_scalar, their first user). */
 
 static double fop_d(unsigned op, double n, double m, double d) {
     switch (op) {
@@ -939,6 +1067,8 @@ static void simd_indexed_fp(CPU *c, u32 insn) {
     fpsimd_undef(c, insn);                        /* half-precision deferred */
 }
 
+static u64 sqdmull_sat(s64 sa, s64 sb, unsigned e);   /* defined below (three-different) */
+
 static void simd_indexed(CPU *c, u32 insn) {
     unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
     unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
@@ -972,6 +1102,27 @@ static void simd_indexed(CPU *c, u32 insn) {
             u64 d = velem_get(&vd, dsize, i);
             u64 v = (opc == 0xa) ? prod : (opc == 0x2) ? d + prod : d - prod;
             velem_set(&r, dsize, i, v & dmask);
+        }
+    } else if (!U && (opc == 0xc || opc == 0xd)) {                      /* SQDMULH/SQRDMULH by elem */
+        unsigned n = (Q ? 16u : 8u) >> size;
+        for (unsigned i = 0; i < n; i++) {
+            /* Overflow-safe: p = a*b fits s64 for esize<=32, so shift instead
+             * of forming 2*a*b (which overflows at the INT32_MIN^2 corner). */
+            s64 p = sx(velem_get(&vn, size, i) & emask, esize) * selt;
+            s64 pre = (opc == 0xd) ? ((p + ((s64)1 << (esize - 2))) >> (esize - 1))
+                                   :  (p >> (esize - 1));
+            velem_set(&r, size, i, sat_s(pre, esize) & emask);
+        }
+    } else if (!U && (opc == 0xb || opc == 0x3 || opc == 0x7)) {        /* SQDMULL/SQDMLAL/SQDMLSL by elem */
+        unsigned ndest = 64u / esize, base = Q ? ndest : 0, dsize = size + 1;
+        for (unsigned i = 0; i < ndest; i++) {
+            u64 a = velem_get(&vn, size, base + i) & emask;
+            s64 pr = (s64)sqdmull_sat(sx(a, esize), selt, 2 * esize);
+            u64 d = velem_get(&vd, dsize, i);
+            u64 v = (opc == 0xb) ? (u64)pr
+                  : (opc == 0x3) ? ssat_add(sx(d, 2 * esize), pr, 2 * esize)
+                                 : ssat_sub(sx(d, 2 * esize), pr, 2 * esize);
+            velem_set(&r, dsize, i, v);
         }
     } else { fpsimd_undef(c, insn); return; }
     c->v[Rd] = r;
@@ -1302,8 +1453,13 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
         }
         V128 res; if (Q) res = c->v[Rd]; else { res.d[0] = res.d[1] = 0; }
         unsigned base = Q ? 2 : 0;
-        vset_s(&res, base,     (float)vget_d(&vn, 0));
-        vset_s(&res, base + 1, (float)vget_d(&vn, 1));
+        if (U) {                                 /* FCVTXN/FCVTXN2: round-to-odd */
+            res.s[base]     = f64_to_f32_round_odd(vget_d(&vn, 0));
+            res.s[base + 1] = f64_to_f32_round_odd(vget_d(&vn, 1));
+        } else {                                 /* FCVTN/FCVTN2: round-to-nearest-even */
+            vset_s(&res, base,     (float)vget_d(&vn, 0));
+            vset_s(&res, base + 1, (float)vget_d(&vn, 1));
+        }
         c->v[Rd] = res; return;
     }
 
@@ -1340,6 +1496,17 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
                 continue;
             case 0x7d:  /* FRSQRTE */
                 if (dbl) r.d[i] = rsqrte_f64(vn.d[i]); else r.s[i] = rsqrte_f32(vn.s[i]);
+                continue;
+            case 0x3c:  /* URECPE  (32-bit unsigned reciprocal estimate) */
+            case 0x7c:  /* URSQRTE (32-bit unsigned reciprocal-sqrt estimate) */
+                if (dbl) { fpsimd_undef(c, insn); return; }   /* size==11 unallocated */
+                { u32 op = vn.s[i];                           /* operand<31:23> indexes the table */
+                  if (key == 0x3c)                            /* URECPE: operand<31>==0 -> Ones */
+                      r.s[i] = (op < 0x80000000u) ? 0xffffffffu
+                             : ((u32)recip_estimate((int)(op >> 23)) << 23);
+                  else                                        /* URSQRTE: operand<31:30>==00 -> Ones */
+                      r.s[i] = ((op & 0xc0000000u) == 0) ? 0xffffffffu
+                             : ((u32)recip_sqrt_estimate((int)(op >> 23)) << 23); }
                 continue;
             default: fpsimd_undef(c, insn); return;
         }
@@ -1714,6 +1881,11 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
             v = (u64)((s64)a >> (sh >= 64 ? 63 : sh)); } break;
         case (1 << 5) | 0x00: { unsigned sh = 128 - immhb;                  /* USHR */
             v = (sh >= 64) ? 0 : (a >> sh); } break;
+        case (1 << 5) | 0x0a: { unsigned sh = immhb - 64;                   /* SLI: keep low sh bits of Vd */
+            v = (a << sh) | (c->v[Rd].d[0] & (((u64)1 << sh) - 1)); } break;
+        case (1 << 5) | 0x08: { unsigned sh = 128 - immhb;                  /* SRI: keep high sh bits of Vd */
+            u64 keep = (sh >= 64) ? ~0ULL : ~(~0ULL >> sh);                 /* sh==64 (#64): result is Vd */
+            v = ((sh >= 64) ? 0 : (a >> sh)) | (c->v[Rd].d[0] & keep); } break;
         case (0 << 5) | 0x02: v = c->v[Rd].d[0] + vreg_shift(a, rsh, 64, 1, 0, 0); break; /* SSRA  */
         case (1 << 5) | 0x02: v = c->v[Rd].d[0] + vreg_shift(a, rsh, 64, 0, 0, 0); break; /* USRA  */
         case (0 << 5) | 0x04: v = vreg_shift(a, rsh, 64, 1, 1, 0); break;   /* SRSHR */

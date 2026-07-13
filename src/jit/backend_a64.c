@@ -787,8 +787,9 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_S3S: case VC_SSHIFTI:
             return 1;
         case VC_F2: {
-            /* FMAX/FMIN (opc 4-7): the interpreter's C ternary keeps NaN
-             * semantics native fmax does not have — helper stays. */
+            /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
+             * whose fop_d/fop_s carry ARM's NaN propagation and +0/-0 ordering
+             * that a bare fmax/fmin instruction does not. */
             unsigned opc = (insn >> 12) & 0xf;
             return opc <= 3 || opc == 8;
         }

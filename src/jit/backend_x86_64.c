@@ -1227,10 +1227,17 @@ int be_vop_ok(unsigned vclass, u32 insn) {
     unsigned opc3 = (insn >> 11) & 0x1f;
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_MOVI: case VC_COPY:
-        case VC_F2: case VC_F1: case VC_F3: case VC_FCMP: case VC_FCCMP:
+        case VC_F1: case VC_F3: case VC_FCMP: case VC_FCCMP:
         case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
             return 1;
+        case VC_F2: {
+            /* FMUL/FDIV/FADD/FSUB/FNMUL inline; FMAX/FMIN/FMAXNM/FMINNM (opc
+             * 4-7) keep the interpreter helper — maxss/minss get ARM's NaN
+             * propagation and +0/-0 ordering wrong (matches the a64 backend). */
+            unsigned f2opc = (insn >> 12) & 0xf;
+            return !(f2opc >= 4 && f2opc <= 7);
+        }
         case VC_CM3:
             /* pcmpeq/pcmpgt b/h/s; unsigned and GE/TST forms via sign-flip
              * and inversion. 64-bit lanes: CMEQ/CMTST via the pcmpeqd+
@@ -2039,6 +2046,8 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned opc = (insn >> 12) & 0xf;
             int arith = (opc <= 3 || opc == 8);  /* NaN-gated (see below) */
             u8 pfx = dbl ? 0xF2 : 0xF3;
+            /* FMAX/FMIN(NM) (opc 4-7) are declined by be_vop_ok and never reach
+             * here — they keep the interpreter helper for correct ARM NaN/±0. */
             if (arith) materialize_flags(be);    /* ucomis / xor below */
             sse_mem(e, pfx, 0x10, 0, OFF_V(rn)); /* movss/sd xmm0, Vn */
             sse_mem(e, pfx, 0x10, 1, OFF_V(rm));
@@ -2047,12 +2056,6 @@ static void emit_vop(BE *be, const IROp *o) {
                 case 0x1: sse_rr(e, pfx, 0x5E, 0, 1); break; /* FDIV */
                 case 0x2: sse_rr(e, pfx, 0x58, 0, 1); break; /* FADD */
                 case 0x3: sse_rr(e, pfx, 0x5C, 0, 1); break; /* FSUB */
-                /* FMAX(NM)/FMIN(NM): the interpreter's `(a>b)?a:b` ternary
-                 * IS maxsd's exact semantic (NaN or equal -> src operand) */
-                case 0x4: case 0x6:
-                          sse_rr(e, pfx, 0x5F, 0, 1); break; /* maxss/sd */
-                case 0x5: case 0x7:
-                          sse_rr(e, pfx, 0x5D, 0, 1); break; /* minss/sd */
                 default:  sse_rr(e, pfx, 0x59, 0, 1); break; /* FNMUL: below */
             }
             /* A NaN result means NaN inputs or an invalid op — cases where
