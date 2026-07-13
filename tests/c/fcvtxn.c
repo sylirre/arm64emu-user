@@ -28,6 +28,14 @@ static void show(const char *tag, const volatile uint64_t *p) {
     printf("%s %08x %08x\n", tag, o[0], o[1]);
 }
 
+/* Scalar FCVTXN Sd,Dn (round-to-odd .d -> .s), same corners as the vector form. */
+static void show_s(const char *tag, uint64_t raw) {
+    double d; memcpy(&d, &raw, 8);
+    float f = vcvtxd_f32_f64(d);
+    uint32_t o; memcpy(&o, &f, 4);
+    printf("%s %08x\n", tag, o);
+}
+
 int main(void) {
     show("fcvtxn0  ", db);
     show("fcvtxn1  ", db + 2);
@@ -39,5 +47,12 @@ int main(void) {
     float32x2_t lo = vreinterpret_f32_u32(vdup_n_u32(0xcafef00d));
     uint32_t o[4]; vst1q_u32(o, vreinterpretq_u32_f32(vcvtx_high_f32_f64(lo, vld1q_f64(d))));
     printf("fcvtxn2hi %08x %08x %08x %08x\n", o[0], o[1], o[2], o[3]);
+
+    show_s("scalar0  ", 0x3ff0000000000001ull);  /* inexact -> odd neighbor 0x3f800001 */
+    show_s("scalar1  ", 0x3ff0000000000000ull);  /* exact 1.0 -> 0x3f800000 */
+    show_s("scalar2  ", 0x7fefffffffffffffull);  /* max double -> overflow -> 0x7f7fffff */
+    show_s("scalar3  ", 0x7ff0000000000000ull);  /* +Inf -> 0x7f800000 */
+    show_s("scalar4  ", 0x0000000000000001ull);  /* tiny subnormal -> 0x00000001 */
+    show_s("scalar5  ", 0x400921fb54442d18ull);  /* pi -> inexact */
     return 0;
 }

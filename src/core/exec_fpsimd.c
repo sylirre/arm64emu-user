@@ -1699,6 +1699,11 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         c->v[Rd].d[0] = out; c->v[Rd].d[1] = 0;
         return;
     }
+    if (opcode == 0x16 && U == 1 && o2 == 0 && sz == 1) {  /* FCVTXN Sd,Dn: round-to-odd .d -> .s */
+        V128 r; r.d[0] = r.d[1] = 0;
+        r.s[0] = f64_to_f32_round_odd(vget_d(&c->v[Rn], 0));
+        c->v[Rd] = r; return;
+    }
 
     /* FP scalar misc: FRECPE/FRSQRTE (opcode 0x1d, hsz=1), FCMxx #0.0 (0x0c-0x0e). */
     if (opcode == 0x1d && o2 == 1) {
