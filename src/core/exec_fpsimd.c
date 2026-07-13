@@ -968,6 +968,65 @@ static void simd_three_same_fp(CPU *c, u32 insn) {
     c->v[Rd] = r;
 }
 
+/* AdvSIMD three-same (FP16): the half-precision page of the FP three-same group.
+ * Separate encoding from the single/double form (bit22=1, bit21=0, 3-bit opcode
+ * in bits[13:11]). Widen each half lane to double, compute with the shared fop_d
+ * kernels, narrow once via f64_to_f16 (exact: 53 >= 2*11+2). Compares write an
+ * all-ones/zero half mask. Mirrors simd_three_same_fp lane-for-lane. */
+static void simd_three_same_fp16(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), U = BIT(29), a = BIT(23), op3 = BITS(13, 11);
+    unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned key = (U << 4) | (a << 3) | op3;
+    V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
+    unsigned n = Q ? 8 : 4, op = FOP_ADD; int pair = 0, cmp = 0;
+    switch (key) {
+        case 0x00: op = FOP_MAXNM;  break;             /* FMAXNM  */
+        case 0x08: op = FOP_MINNM;  break;             /* FMINNM  */
+        case 0x01: op = FOP_MLA;    break;             /* FMLA    */
+        case 0x09: op = FOP_MLS;    break;             /* FMLS    */
+        case 0x02: op = FOP_ADD;    break;             /* FADD    */
+        case 0x0a: op = FOP_SUB;    break;             /* FSUB    */
+        case 0x03: op = FOP_MULX;   break;             /* FMULX   */
+        case 0x06: op = FOP_MAX;    break;             /* FMAX    */
+        case 0x0e: op = FOP_MIN;    break;             /* FMIN    */
+        case 0x07: op = FOP_RECPS;  break;             /* FRECPS  */
+        case 0x0f: op = FOP_RSQRTS; break;             /* FRSQRTS */
+        case 0x13: op = FOP_MUL;    break;             /* FMUL    */
+        case 0x17: op = FOP_DIV;    break;             /* FDIV    */
+        case 0x1a: op = FOP_ABD;    break;             /* FABD    */
+        case 0x10: op = FOP_MAXNM; pair = 1; break;    /* FMAXNMP */
+        case 0x12: op = FOP_ADD;   pair = 1; break;    /* FADDP   */
+        case 0x16: op = FOP_MAX;   pair = 1; break;    /* FMAXP   */
+        case 0x18: op = FOP_MINNM; pair = 1; break;    /* FMINNMP */
+        case 0x1e: op = FOP_MIN;   pair = 1; break;    /* FMINP   */
+        case 0x04: case 0x14: case 0x1c:               /* FCMEQ / FCMGE / FCMGT */
+        case 0x15: case 0x1d: cmp = 1; break;          /* FACGE / FACGT */
+        default: fpsimd_undef(c, insn); return;
+    }
+    if (pair) {
+        for (unsigned i = 0; i < n; i++) {
+            const V128 *src = (i < n/2) ? &vn : &vm;
+            unsigned base = (i < n/2) ? 2*i : 2*(i - n/2);
+            double x = (double)f16_to_f32(src->h[base]), y = (double)f16_to_f32(src->h[base + 1]);
+            r.h[i] = f64_to_f16(fop_d(op, x, y, 0));
+        }
+        c->v[Rd] = r; return;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        double x = (double)f16_to_f32(vn.h[i]), y = (double)f16_to_f32(vm.h[i]);
+        if (cmp) {
+            int t = (key == 0x04) ? (x == y)                                    /* FCMEQ */
+                  : (key == 0x14) ? (x >= y)                                    /* FCMGE */
+                  : (key == 0x1c) ? (x >  y)                                    /* FCMGT */
+                  : (key == 0x15) ? (__builtin_fabs(x) >= __builtin_fabs(y))    /* FACGE */
+                                  : (__builtin_fabs(x) >  __builtin_fabs(y));   /* FACGT */
+            r.h[i] = t ? 0xffffu : 0; continue;
+        }
+        r.h[i] = f64_to_f16(fop_d(op, x, y, (double)f16_to_f32(vd.h[i])));
+    }
+    c->v[Rd] = r;
+}
+
 /* AdvSIMD three-same (vector integer): element-wise ADD/SUB/compare/min/max/mul
  * and the bitwise logical group. The workhorse vector group for string/memory
  * routines (CMEQ/CMHS...) in EDK2 and Linux. */
@@ -2518,6 +2577,11 @@ void exec_fpsimd(CPU *c, u32 insn) {
     if (BIT(31) == 0 && BIT(29) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 0 &&
         BIT(15) == 0 && BITS(11, 10) == 2) {
         simd_permute(c, insn); return;
+    }
+    /* AdvSIMD three-same (FP16): FADD/FMUL/FMLA/FMAX/FCMEQ/... on .4h/.8h. Its own
+     * encoding page (bit22=1, bit21=0, bits[15:14]=0), distinct from the s/d form. */
+    if (BITS(28, 24) == 0x0e && BIT(22) == 1 && BIT(21) == 0 && BITS(15, 14) == 0 && BIT(10) == 1) {
+        simd_three_same_fp16(c, insn); return;
     }
     /* AdvSIMD three-same (vector integer): ADD/SUB/CMP/MIN/MAX/MUL/logical. */
     if (BITS(28, 24) == 0x0e && BIT(21) == 1 && BIT(10) == 1) { simd_three_same(c, insn); return; }
