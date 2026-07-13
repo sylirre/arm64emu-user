@@ -281,7 +281,8 @@ static void   vset_d(V128 *v, unsigned i, double x) { u64 b; memcpy(&b, &x, 8); 
  * via an integer cast (which truncates toward zero) and adjust. __builtin_fabs
  * and __builtin_sqrt are inlined to hardware ops (see -fno-math-errno). */
 #define FP_INTEGRAL 4503599627370496.0   /* 2^52 */
-static double fround_mode(double v, int rmode);   /* defined below */
+static double fround_mode(double v, int rmode);        /* defined below */
+static u64 fcvt_to_int(double r, int is_signed, int x64); /* defined below */
 
 static double f_trunc(double v) {
     if (!(v == v) || __builtin_fabs(v) >= FP_INTEGRAL) return v;
@@ -434,6 +435,43 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                           ((nzcv & 2) ? PS_C : 0) | ((nzcv & 1) ? PS_V : 0);
             }
             return;
+        }
+    }
+
+    /* Half-precision (ftype=3) FP<->integer converts (GPR form): SCVTF/UCVTF
+     * (int->half) and FCVT{N,P,M,Z,A}{S,U} (half->int). Widen h->double / narrow
+     * once via f64_to_f16 (exact, 53>=2*11+2); round + saturate reuse the shared
+     * fround_mode / fcvt_to_int helpers so half matches the S/D forms and qemu.
+     * FMOV general<->half (opcode 6/7) is handled above and returns before here. */
+    if (ftype == 3 && BITS(28, 24) == 0x1e && BIT(21) == 1 && BITS(15, 10) == 0) {
+        unsigned sf = BIT(31), rmode = BITS(20, 19), opcode = BITS(18, 16);
+        if (opcode == 2 || opcode == 3) {                 /* SCVTF / UCVTF: int -> half */
+            double iv = (opcode == 2) ? (sf ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn))
+                                      : (sf ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
+            fp_wr_h(c, Rd, f64_to_f16(iv)); return;
+        }
+        if (opcode <= 1 || opcode == 4 || opcode == 5) {  /* FCVT{N,P,M,Z,A}{S,U}: half -> int */
+            double r = fround_mode((double)f16_to_f32(fp_rd_h(c, Rn)), (opcode >= 4) ? 4 : (int)rmode);
+            set_x(c, Rd, fcvt_to_int(r, (opcode & 1) == 0, sf != 0)); return;
+        }
+    }
+
+    /* Half-precision (ftype=3) FP<->fixed-point converts (GPR form, bit21==0):
+     * the integer side carries #fbits fractional bits (fbits = 64 - scale).
+     * SCVTF/UCVTF divide by 2^fbits; FCVTZS/FCVTZU multiply then round toward
+     * zero (saturating). Same widen/narrow-in-double approach as above. */
+    if (ftype == 3 && BIT(21) == 0) {
+        unsigned sf = BIT(31), rmode = BITS(20, 19), opcode = BITS(18, 16);
+        unsigned fbits = 64 - BITS(15, 10);
+        u64 pb = (u64)(fbits + 1023) << 52; double pow2; memcpy(&pow2, &pb, 8); /* 2^fbits, exact */
+        if (rmode == 0 && (opcode == 2 || opcode == 3)) {       /* SCVTF / UCVTF: fixed -> half */
+            double iv = (opcode == 2) ? (sf ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn))
+                                      : (sf ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
+            fp_wr_h(c, Rd, f64_to_f16(iv / pow2)); return;
+        }
+        if (rmode == 3 && (opcode == 0 || opcode == 1)) {       /* FCVTZS / FCVTZU: half -> fixed */
+            double r = f_trunc((double)f16_to_f32(fp_rd_h(c, Rn)) * pow2);
+            set_x(c, Rd, fcvt_to_int(r, opcode == 0, sf != 0)); return;
         }
     }
 
