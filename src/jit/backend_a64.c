@@ -822,6 +822,7 @@ int be_vop_ok(unsigned vclass, u32 insn) {
             return cpu_has_fp16();
         }
         case VC_VH3: case VC_VHCM: case VC_VH2M: /* vector half: FEAT_FP16 */
+        case VC_VHMULX: case VC_VHEST:           /* FMULX / FRECPE / FRSQRTE */
             return cpu_has_fp16();
         case VC_F2: {
             /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
@@ -1225,15 +1226,16 @@ static void emit_vop(BE *be, const IROp *o) {
             vop_dst(be, 2, rd);
             break;
         }
-        case VC_VH3: {   /* vector half three-same arith: replay native + NaN
-                          * gate. Single ops, so native half == interp double. */
+        case VC_VH3: case VC_VHMULX: {  /* vector half three-same arith / FMULX:
+                          * replay native + NaN gate. Single ops (and FMULX's
+                          * 0*inf->2 special case) match the interpreter. */
             unsigned Q = (insn >> 30) & 1;
             materialize_flags(be);
             vop_src(be, 0, rn);
             vop_src(be, 1, rm);
             u32 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
                     (1u << 16) | (0u << 5) | 2;
-            ei(e, w);                                    /* v2 = fadd/.../fabd */
+            ei(e, w);                                    /* v2 = fadd/.../fmulx */
             ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
             ei(e, 0x9E660000u | (16u << 5) | 16);        /* fmov x16, d16 */
             if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
@@ -1265,6 +1267,25 @@ static void emit_vop(BE *be, const IROp *o) {
             ei(e, 0x9E660000u | (16u << 5) | 16);
             if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
             ei(e, 0xB100041Fu | (16u << 5));
+            u8 *slow = bcond_fwd(e, 1);
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_VHEST: {  /* vector half FRECPE/FRSQRTE: replay native estimate
+                           * + result NaN gate (the interpreter returns a
+                           * canonical NaN for NaN/negative inputs; finite
+                           * estimates are the architected table). */
+            unsigned Q = (insn >> 30) & 1;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            ei(e, w);                                    /* v2 = frecpe/frsqrte v0 */
+            ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
+            ei(e, 0x9E660000u | (16u << 5) | 16);        /* fmov x16, d16 */
+            if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
+            ei(e, 0xB100041Fu | (16u << 5));             /* cmn x16, #1 */
             u8 *slow = bcond_fwd(e, 1);
             icount_add(be, 1);
             vop_slowpath(be, o, slow, 2);

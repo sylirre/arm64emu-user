@@ -213,6 +213,10 @@ enum {
                              * FACGE/GT -> per-lane mask (no gate). */
     VC_VH2M,                /* vector half two-reg misc: FABS/FNEG/FSQRT
                              * (NaN-gated) + FCMxx#0 (mask). Self-counting. */
+    VC_VHMULX,              /* vector half FMULX (three-same). a64-only (native
+                             * replay + result NaN gate); x86 declines. */
+    VC_VHEST,               /* vector half FRECPE/FRSQRTE (two-misc estimate).
+                             * a64-only (native replay + NaN gate); x86 declines. */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

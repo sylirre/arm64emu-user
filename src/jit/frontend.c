@@ -356,7 +356,10 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 vclass = VC_VH3; break;          /* FADD/FSUB/FMUL/FDIV/FABD */
             case 0x04: case 0x14: case 0x1c: case 0x15: case 0x1d:
                 vclass = VC_VHCM; break;         /* FCMEQ/GE/GT, FACGE/GT */
-            default: break;
+            case 0x03: vclass = VC_VHMULX; break;/* FMULX (a64 only) */
+            default: break;                      /* FRECPS/FRSQRTS: helper
+                                                  * (interp omits ARM's 0*inf
+                                                  * special case -> needs double) */
         }
     } else if ((insn & 0x9F7E0C00u) == 0x0E780800u) {
         /* AdvSIMD two-reg misc, FP16 page (bit22=1, bits[21:17]=11100,
@@ -369,6 +372,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             case 0x2c: case 0x6c: case 0x2d:     /* FCMGT/GE/EQ #0 */
             case 0x6d: case 0x2e:                /* FCMLE/LT #0 */
                 vclass = VC_VH2M; break;
+            case 0x3d: case 0x7d:                /* FRECPE / FRSQRTE (a64 only) */
+                vclass = VC_VHEST; break;
             default: break;
         }
     } else if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
@@ -545,7 +550,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
      * inline. */
     if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S &&
         vclass != VC_FCVTH && vclass != VC_H1 && vclass != VC_H2 &&
-        vclass != VC_H3 && vclass != VC_VH3 && vclass != VC_VH2M)
+        vclass != VC_H3 && vclass != VC_VH3 && vclass != VC_VH2M &&
+        vclass != VC_VHMULX && vclass != VC_VHEST)
         ir->ninsns++;
     return 1;
 }

@@ -175,7 +175,7 @@ int main(void) {
     MIX(r0); MIX(r1)
             VH3("fadd v2.8h, v0.8h, v1.8h");  VH3("fsub v2.4h, v0.4h, v1.4h");
             VH3("fmul v2.8h, v0.8h, v1.8h");  VH3("fdiv v2.8h, v0.8h, v1.8h");
-            VH3("fabd v2.8h, v0.8h, v1.8h");
+            VH3("fabd v2.8h, v0.8h, v1.8h");   VH3("fmulx v2.8h, v0.8h, v1.8h");
             VH3("fcmeq v2.8h, v0.8h, v1.8h"); VH3("fcmge v2.4h, v0.4h, v1.4h");
             VH3("fcmgt v2.8h, v0.8h, v1.8h"); VH3("facge v2.8h, v0.8h, v1.8h");
             VH3("facgt v2.8h, v0.8h, v1.8h");
@@ -188,6 +188,7 @@ int main(void) {
             VH2("fcmeq v2.8h, v0.8h, #0.0"); VH2("fcmgt v2.8h, v0.8h, #0.0");
             VH2("fcmge v2.4h, v0.4h, #0.0"); VH2("fcmle v2.8h, v0.8h, #0.0");
             VH2("fcmlt v2.8h, v0.8h, #0.0");
+            VH2("frecpe v2.8h, v0.8h");  VH2("frsqrte v2.4h, v0.4h");
         }
 
         /* vector FP three-same (NaN-gated packed arithmetic + compares) */
