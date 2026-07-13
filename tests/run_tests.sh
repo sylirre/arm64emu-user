@@ -210,8 +210,10 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         /bin/busybox sh -c "ls /proc | grep -qx $apid && echo yes || echo no"
 
     kill $apid 2>/dev/null; wait $apid 2>/dev/null
-    rm -f /dev/shm/arm64chroot-proctab.v1."$(id -u)".* \
-          /tmp/arm64chroot-proctab.v1."$(id -u)".* 2>/dev/null
+    for d in /dev/shm "${XDG_RUNTIME_DIR:-}" "${TMPDIR:-}" "${PREFIX:+$PREFIX/tmp}" \
+             /data/local/tmp /tmp; do
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v1."$(id -u)".* 2>/dev/null
+    done
 fi
 
 # ---- interactive job control (needs a PTY): an external command under bash must

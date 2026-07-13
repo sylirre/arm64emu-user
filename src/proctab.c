@@ -13,10 +13,11 @@
  * Backing (proctab_init): by default a MAP_SHARED anonymous region created once
  * in main() and inherited by every fork descendant, so the view is limited to a
  * single invocation's process tree. With -shared-proc it is instead a named
- * tmpfs file keyed by rootfs+uid that every invocation of the same rootfs maps,
- * so the view spans independent invocations (ps/top in one session see the
- * guest processes of another). If no writable tmpfs exists it degrades to the
- * anonymous region (today's per-invocation behavior).
+ * shared file keyed by rootfs+uid that every invocation of the same rootfs maps
+ * (tmpfs like /dev/shm on desktop, else an app-writable dir such as $TMPDIR on
+ * Android — see shared_dir), so the view spans independent invocations (ps/top
+ * in one session see the guest processes of another). If no usable directory
+ * exists it degrades to the anonymous region (today's per-invocation behavior).
  *
  * Concurrency: a slot is claimed with an atomic CAS on `pid` (as gtid_add does);
  * the mutable bytes are guarded by a per-entry seqlock so a reader in another
@@ -77,22 +78,38 @@ static u32 fnv1a32(const char *s) {
     return h;
 }
 
-/* First writable RAM-backed directory for the -shared-proc registry file, or
- * NULL if none is usable (then we degrade to the anonymous mapping). */
+/* First writable directory that can hold the -shared-proc registry file, or
+ * NULL if none is usable (then we degrade to the anonymous mapping). Desktop
+ * RAM-backed tmpfs is preferred; Android has no ownerless tmpfs an app may
+ * write, so the app's own data/tmp dirs ($TMPDIR, $PREFIX/tmp, /data/local/tmp)
+ * are accepted next. Those are ext4, not tmpfs, but MAP_SHARED works there and
+ * registry writes are rare (only exec/fork/exit — the hot path is read-only
+ * slot scans that just fault pages in), so the writeback cost is negligible.
+ * Returned pointers are consumed immediately by the caller's snprintf. */
 static const char *shared_dir(void) {
-    if (access("/dev/shm", W_OK) == 0) return "/dev/shm";
-    const char *xdg = getenv("XDG_RUNTIME_DIR");
-    if (xdg && *xdg && access(xdg, W_OK) == 0) return xdg;
-    if (access("/tmp", W_OK) == 0) return "/tmp";
+    static char buf[PATH_MAX];
+    const char *e;
+    if (access("/dev/shm", W_OK) == 0) return "/dev/shm";              /* desktop */
+    if ((e = getenv("XDG_RUNTIME_DIR")) && *e && access(e, W_OK) == 0) return e;
+    if ((e = getenv("TMPDIR")) && *e && access(e, W_OK) == 0) return e; /* Termux */
+    if ((e = getenv("PREFIX")) && *e &&
+        (size_t)snprintf(buf, sizeof buf, "%s/tmp", e) < sizeof buf &&
+        access(buf, W_OK) == 0) return buf;                            /* Termux */
+    if (access("/data/local/tmp", W_OK) == 0) return "/data/local/tmp"; /* Android */
+    if (access("/tmp", W_OK) == 0) return "/tmp";                      /* desktop */
     return NULL;
 }
 
-/* Back the registry with a named tmpfs file every invocation of `rootfs_key`
- * maps MAP_SHARED. Returns 1 on success. */
+/* Back the registry with a named shared file (on tmpfs where available, else an
+ * app-writable dir) every invocation of `rootfs_key` maps MAP_SHARED. Returns 1
+ * on success. */
 static int proctab_open_shared(const char *rootfs_key, size_t size) {
     const char *dir = shared_dir();
     if (!dir) return 0;
-    char path[PATH_MAX];
+    /* +64 holds the fixed "/arm64chroot-proctab.v1.<uid>.<hash>" suffix on top of
+     * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
+     * name that open() rejects -> degrade. */
+    char path[PATH_MAX + 64];
     /* v1 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. */
     snprintf(path, sizeof path, "%s/arm64chroot-proctab.v1.%u.%08x",
