@@ -4,18 +4,27 @@
  *
  * Every guest process is a separate host process (fork) and guest PID == host
  * PID, so one emulator instance cannot read another's guest state to answer
- * `ps`/`top`. This table lives in a MAP_SHARED anonymous region created once in
- * main() and inherited by every fork descendant; each process publishes its own
- * guest command line keyed by PID. Readers use it to (a) synthesize
- * /proc/<pid>/cmdline for any guest PID (sys_procfs.c) and (b) tell which numeric
- * /proc entries are guest PIDs, hiding host processes from the guest's view
- * (sys_file.c getdents64 + path.c special_host_path).
+ * `ps`/`top`. Each process publishes its own guest command line keyed by PID
+ * into this shared table. Readers use it to (a) synthesize /proc/<pid>/cmdline
+ * for any guest PID (sys_procfs.c) and (b) tell which numeric /proc entries are
+ * guest PIDs, hiding host processes from the guest's view (sys_file.c
+ * getdents64 + path.c special_host_path).
+ *
+ * Backing (proctab_init): by default a MAP_SHARED anonymous region created once
+ * in main() and inherited by every fork descendant, so the view is limited to a
+ * single invocation's process tree. With -shared-proc it is instead a named
+ * tmpfs file keyed by rootfs+uid that every invocation of the same rootfs maps,
+ * so the view spans independent invocations (ps/top in one session see the
+ * guest processes of another). If no writable tmpfs exists it degrades to the
+ * anonymous region (today's per-invocation behavior).
  *
  * Concurrency: a slot is claimed with an atomic CAS on `pid` (as gtid_add does);
  * the mutable bytes are guarded by a per-entry seqlock so a reader in another
  * process never tears a half-written cmdline. `start` (the /proc/<pid>/stat
  * starttime) lets a reader reject a stale slot left by a process the host
- * SIGKILL'd (no unregister ran) whose PID was later reused. */
+ * SIGKILL'd (no unregister ran) whose PID was later reused. With the persistent
+ * shared backing such stale slots accumulate, so a full-table register reclaims
+ * slots whose process is gone before giving up. */
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,9 +69,54 @@ static u64 proc_starttime(s32 pid) {
     return 0;
 }
 
-void proctab_init(void) {
-    void *p = mmap(NULL, sizeof(struct ProcEnt) * PROCTAB_MAX,
-                   PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+/* FNV-1a 32-bit over the rootfs path: keys the per-rootfs backing file so
+ * sessions of the same rootfs (and uid) share one registry. */
+static u32 fnv1a32(const char *s) {
+    u32 h = 2166136261u;
+    for (; *s; s++) { h = (h ^ (u8)*s) * 16777619u; }
+    return h;
+}
+
+/* First writable RAM-backed directory for the -shared-proc registry file, or
+ * NULL if none is usable (then we degrade to the anonymous mapping). */
+static const char *shared_dir(void) {
+    if (access("/dev/shm", W_OK) == 0) return "/dev/shm";
+    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg && *xdg && access(xdg, W_OK) == 0) return xdg;
+    if (access("/tmp", W_OK) == 0) return "/tmp";
+    return NULL;
+}
+
+/* Back the registry with a named tmpfs file every invocation of `rootfs_key`
+ * maps MAP_SHARED. Returns 1 on success. */
+static int proctab_open_shared(const char *rootfs_key, size_t size) {
+    const char *dir = shared_dir();
+    if (!dir) return 0;
+    char path[PATH_MAX];
+    /* v1 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+     * stale file from an older build is never reinterpreted. */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v1.%u.%08x",
+             dir, (unsigned)getuid(), fnv1a32(rootfs_key));
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    /* Grow-only ftruncate: idempotent under racing creators, and guarantees the
+     * mapping is fully backed and zero-filled (a fresh file is an all-free table
+     * since pid==0 means free). */
+    if (ftruncate(fd, (off_t)size) != 0) { close(fd); return 0; }
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return 0;
+    g_tab = p;
+    g_tab_n = PROCTAB_MAX;
+    return 1;
+}
+
+void proctab_init(const char *rootfs_key) {
+    size_t size = sizeof(struct ProcEnt) * PROCTAB_MAX;
+    if (rootfs_key && proctab_open_shared(rootfs_key, size)) return;
+    /* Default / fallback: per-invocation table inherited across fork only. */
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { g_tab = NULL; g_tab_n = 0; return; }   /* degrade off */
     g_tab = p;
     g_tab_n = PROCTAB_MAX;
@@ -82,6 +136,17 @@ void proctab_register(s32 pid, const char *cmd, u32 len) {
         for (int i = 0; i < g_tab_n; i++) {
             s32 expect = 0;
             if (__atomic_compare_exchange_n(&g_tab[i].pid, &expect, pid, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                slot = i; break;
+            }
+        }
+    if (slot < 0)   /* full: reclaim a slot whose process is gone (stale after a
+                     * missed unregister — common with the persistent shared
+                     * backing) by CAS'ing its dead pid straight to ours. */
+        for (int i = 0; i < g_tab_n; i++) {
+            s32 dead = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
+            if (dead <= 0 || proc_starttime(dead) != 0) continue;
+            if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
                 slot = i; break;
             }

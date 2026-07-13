@@ -181,6 +181,39 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         'sleep 55 & p=$!; sleep 0.3; test -r /proc/$p/comm && echo ok || echo missing; kill $p'
 fi
 
+# ---- cross-session /proc view (-shared-proc): a guest in one emulator invocation
+# is visible to an independent invocation of the same rootfs, and is NOT visible
+# without the flag. Two separate emulator processes, orchestrated from the host. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    "$EMU" -shared-proc "$ALPINE" /bin/sleep 300 &   # session A: long-lived guest
+    apid=$!
+    # Bounded wait until A's guest ELF has loaded (host comm leaves "arm64chroot",
+    # which is exactly where proctab_register ran) — no host sleep needed.
+    for _ in $(seq 1 500); do
+        c=$(cat /proc/$apid/comm 2>/dev/null)
+        [ -n "$c" ] && [ "$c" != arm64chroot ] && break
+    done
+
+    check_xsession() {   # check_xsession <label> <expected> <args...>
+        local label="$1" expect="$2"; shift 2
+        local got; got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS xsession: $label"
+        else fail=$((fail+1)); echo "FAIL xsession: $label (want '$expect' got '$got')"; fi
+    }
+    # WITH the flag: another session synthesizes A's guest cmdline and lists its PID.
+    check_xsession "other-session cmdline" "/bin/sleep 300" -shared-proc "$ALPINE" \
+        /bin/busybox sh -c "tr '\0' ' ' < /proc/$apid/cmdline | sed 's/ \$//'"
+    check_xsession "other-session listed" "yes" -shared-proc "$ALPINE" \
+        /bin/busybox sh -c "ls /proc | grep -qx $apid && echo yes || echo no"
+    # WITHOUT the flag: A belongs to a different registry, so it stays hidden.
+    check_xsession "isolated without flag" "no" "$ALPINE" \
+        /bin/busybox sh -c "ls /proc | grep -qx $apid && echo yes || echo no"
+
+    kill $apid 2>/dev/null; wait $apid 2>/dev/null
+    rm -f /dev/shm/arm64chroot-proctab.v1."$(id -u)".* \
+          /tmp/arm64chroot-proctab.v1."$(id -u)".* 2>/dev/null
+fi
+
 # ---- interactive job control (needs a PTY): an external command under bash must
 # run, not get Stopped by a stray SIGTTOU during tcsetpgrp setup. ----
 if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then

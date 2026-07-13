@@ -38,7 +38,7 @@ extern char **environ;
 static void usage(void) {
     fprintf(stderr,
             "usage: arm64chroot [-strace] [-d] [-jit] [-nopd] [-E VAR=VAL]... "
-            "[-0 argv0] [-fake-id [uid[:gid]]] [-link2symlink] "
+            "[-0 argv0] [-fake-id [uid[:gid]]] [-link2symlink] [-shared-proc] "
             "[-bind src:dst[:ro]]... "
             "<rootfs> <program> [args...]\n");
     exit(2);
@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
         else if (!strcmp(argv[i], "-jit")) g_jit = 1;          /* native translation */
         else if (!strcmp(argv[i], "-link2symlink")) m->link2symlink = 1;
+        else if (!strcmp(argv[i], "-shared-proc")) m->shared_proc = 1;
         else if (!strcmp(argv[i], "-bind") && i + 1 < argc) add_bind(m, argv[++i]);
         else if (!strcmp(argv[i], "-0") && i + 1 < argc) argv0 = argv[++i];
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) {
@@ -273,8 +274,10 @@ int main(int argc, char **argv) {
     seccomp_notice();
 
     /* Shared guest-PID registry: must exist before the first do_execve (which
-     * registers this process) and before any fork inherits the mapping. */
-    proctab_init();
+     * registers this process) and before any fork inherits the mapping. With
+     * -shared-proc the registry is keyed by the rootfs so ps/top see the guest
+     * processes of other emulator invocations of the same rootfs. */
+    proctab_init(m->shared_proc ? m->rootfs : NULL);
 
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */

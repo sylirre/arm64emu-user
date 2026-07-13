@@ -127,6 +127,9 @@ struct Machine {
     int strace;               /* -strace */
     int link2symlink;         /* -link2symlink: emulate hardlinks with tracked
                                * symlinks where the host forbids link() (Android) */
+    u8 shared_proc;           /* -shared-proc: back the guest-PID registry with a
+                               * named, per-rootfs shared file so ps/top see the
+                               * guest processes of other emulator invocations */
 };
 
 /* The singleton task of this process (fork copies it naturally). */
@@ -208,10 +211,13 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
 /* proctab.c: cross-process guest-PID registry in shared memory. Each guest
  * process publishes its NUL-joined argv keyed by PID; readers synthesize
  * /proc/<pid>/cmdline and recognize which numeric /proc entries are guest PIDs
- * (hiding host processes from the guest's view). */
+ * (hiding host processes from the guest's view). Backed by anonymous shared
+ * memory (per-invocation, fork-inherited) by default; with rootfs_key != NULL
+ * (-shared-proc) by a named tmpfs file keyed by rootfs+uid, so the registry
+ * spans independent emulator invocations of the same rootfs. */
 #define PROCTAB_MAX      4096    /* max concurrent guest processes in the view */
 #define PROCTAB_CMDLINE  2048    /* per-entry cmdline cap (truncated beyond) */
-void proctab_init(void);                                   /* once, in main() */
+void proctab_init(const char *rootfs_key);                 /* once, in main() */
 void proctab_register(s32 pid, const char *cmd, u32 len);  /* exec / fork */
 void proctab_unregister(s32 pid);                          /* exit */
 int  proctab_has(s32 pid);                                 /* is a guest PID? */
