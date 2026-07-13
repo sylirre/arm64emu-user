@@ -1563,6 +1563,13 @@ static u16 rsqrte_f16(u16 v) {
     u64 f = call_recip_sqrt_estimate(&exp, 44, ((u64)frac) << 42);
     return sbit | (((u16)exp << 10) & 0x7c00) | (u16)((f >> 42) & 0x3ff);
 }
+/* Half-precision FRECPX (reciprocal of the exponent): sign kept, mantissa zeroed,
+ * exponent ones-complemented (0x1e for a subnormal input). Mirrors the s/d form. */
+static u16 frecpx_f16(u16 x) {
+    u16 sign = x & 0x8000; unsigned exp = (x >> 10) & 0x1f, mant = x & 0x3ff;
+    if (exp == 0x1f && mant) return x | 0x0200;                    /* NaN -> quiet */
+    return sign | ((u16)((exp == 0) ? 0x1e : (~exp & 0x1f)) << 10);
+}
 
 /* AdvSIMD two-register misc, floating-point page: FABS/FNEG/FSQRT, FRINTx,
  * FCVT{N,M,P,Z,A}{S,U}, SCVTF/UCVTF, FCMxx #0.0, FCVTL/FCVTN/FCVTXN. hsz=bit23
@@ -1814,6 +1821,37 @@ static void simd_two_misc(CPU *c, u32 insn) {
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
+    }
+    c->v[Rd] = r;
+}
+
+/* AdvSIMD scalar two-register misc (FP16): the half Hd,Hn forms — SCVTF/UCVTF,
+ * FCVT{N,M,P,Z,A}{S,U}, FCM{EQ,GT,GE,LE,LT}#0, FRECPE/FRSQRTE, and the scalar-only
+ * FRECPX. Own page (bit22=1, bits[21:17]=0x1c) but the SAME (U:hsz:opcode) key as
+ * simd_two_misc_fp, applied to the single low half lane. */
+static void simd_scalar_cvt_fp16(CPU *c, u32 insn) {
+    unsigned U = BIT(29), hsz = BIT(23), opc = BITS(16, 12);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned key = (U << 6) | (hsz << 5) | opc;
+    u16 h = c->v[Rn].h[0]; double x = (double)f16_to_f32(h);
+    V128 r; r.d[0] = r.d[1] = 0;
+    switch (key) {
+        case 0x1d: r.h[0] = f64_to_f16((double)(s16)h); break;     /* SCVTF */
+        case 0x5d: r.h[0] = f64_to_f16((double)(u16)h); break;     /* UCVTF */
+        case 0x1a: case 0x3a: case 0x1b: case 0x3b: case 0x1c:     /* FCVT*S (signed) */
+        case 0x5a: case 0x7a: case 0x5b: case 0x7b: case 0x5c: {   /* FCVT*U (unsigned) */
+            int rmode = (opc == 0x1a) ? (hsz ? 1 : 0) : (opc == 0x1b) ? (hsz ? 3 : 2) : 4;
+            r.h[0] = fcvt_to_int16(fround_mode(x, rmode), U == 0); break;
+        }
+        case 0x2c: r.h[0] = (x >  0.0) ? 0xffffu : 0; break;       /* FCMGT #0 */
+        case 0x6c: r.h[0] = (x >= 0.0) ? 0xffffu : 0; break;       /* FCMGE #0 */
+        case 0x2d: r.h[0] = (x == 0.0) ? 0xffffu : 0; break;       /* FCMEQ #0 */
+        case 0x6d: r.h[0] = (x <= 0.0) ? 0xffffu : 0; break;       /* FCMLE #0 */
+        case 0x2e: r.h[0] = (x <  0.0) ? 0xffffu : 0; break;       /* FCMLT #0 */
+        case 0x3d: r.h[0] = recpe_f16(h);  break;                  /* FRECPE  */
+        case 0x7d: r.h[0] = rsqrte_f16(h); break;                  /* FRSQRTE */
+        case 0x3f: r.h[0] = frecpx_f16(h); break;                  /* FRECPX  */
+        default: fpsimd_undef(c, insn); return;
     }
     c->v[Rd] = r;
 }
@@ -2640,6 +2678,11 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* AdvSIMD scalar two-register misc (bit30=1): scalar int<->FP converts. */
     if (BITS(28, 24) == 0x1e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
         simd_scalar_cvt(c, insn); return;
+    }
+    /* AdvSIMD scalar two-register misc (FP16): the Hd,Hn half forms (own page,
+     * bit22=1, bits[21:17]=0x1c). */
+    if (BITS(28, 24) == 0x1e && BIT(22) == 1 && BITS(21, 17) == 0x1c && BIT(11) == 1 && BIT(10) == 0) {
+        simd_scalar_cvt_fp16(c, insn); return;
     }
     /* Cryptographic AES (AESE/AESD/AESMC/AESIMC). */
     if (BITS(31, 24) == 0x4e && BITS(23, 22) == 0 && BITS(21, 17) == 0x14 && BITS(11, 10) == 2) {
