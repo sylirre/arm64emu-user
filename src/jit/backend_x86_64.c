@@ -1264,12 +1264,27 @@ int be_vop_ok(unsigned vclass, u32 insn) {
     unsigned opc3 = (insn >> 11) & 0x1f;
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_MOVI: case VC_COPY:
-        case VC_F1: case VC_F3: case VC_FCMP: case VC_FCCMP:
+        case VC_F1: case VC_F3:
         case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
             return 1;
+        case VC_FCMP: case VC_FCCMP:             /* half needs F16C to widen */
+            return (((insn >> 22) & 3) == 3) ? cpu_has_f16c() : 1;
         case VC_FCVTH:                           /* FP16 converts: need F16C */
             return cpu_has_f16c();
+        case VC_H1:                              /* scalar half 1-src: F16C */
+            return cpu_has_f16c();
+        case VC_H2: {                            /* half 2-src; MAX/MIN decline */
+            unsigned opc = (insn >> 12) & 0xf;
+            if (opc >= 4 && opc <= 7) return 0;
+            return cpu_has_f16c();
+        }
+        case VC_H3:
+            /* half FMADD: the interpreter computes in double and narrows once;
+             * x86 has no double->half, and double->single->half re-introduces
+             * a double-rounding error (a tiny addend lost below half a single
+             * ULP on a half-midpoint product). Keep the interpreter helper. */
+            return 0;
         case VC_F2: {
             /* FMUL/FDIV/FADD/FSUB/FNMUL inline; FMAX/FMIN/FMAXNM/FMINNM (opc
              * 4-7) keep the interpreter helper — maxss/minss get ARM's NaN
@@ -2146,15 +2161,23 @@ static void emit_vop(BE *be, const IROp *o) {
             break;
         }
         case VC_FCMP: {
-            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned ft = (insn >> 22) & 3;
+            int dbl = (ft == 1), half = (ft == 3);
             int with_zero = (insn >> 3) & 1;
             materialize_flags(be);               /* about to clobber EFLAGS */
-            u8 mpfx = dbl ? 0xF2 : 0xF3;
-            sse_mem(e, mpfx, 0x10, 0, OFF_V(rn));
-            if (with_zero) sse_rr(e, 0x66, 0xEF, 1, 1);      /* pxor: +0.0 */
-            else sse_mem(e, mpfx, 0x10, 1, OFF_V(rm));
-            if (dbl) sse_rr(e, 0x66, 0x2E, 0, 1);            /* ucomisd */
-            else     sse_rr(e, 0, 0x2E, 0, 1);               /* ucomiss */
+            if (half) {                          /* widen halves -> single */
+                vcvtph2ps_m(e, 0, OFF_V(rn));
+                if (with_zero) sse_rr(e, 0x66, 0xEF, 1, 1);  /* pxor: +0.0 */
+                else vcvtph2ps_m(e, 1, OFF_V(rm));
+                sse_rr(e, 0, 0x2E, 0, 1);                    /* ucomiss */
+            } else {
+                u8 mpfx = dbl ? 0xF2 : 0xF3;
+                sse_mem(e, mpfx, 0x10, 0, OFF_V(rn));
+                if (with_zero) sse_rr(e, 0x66, 0xEF, 1, 1);  /* pxor: +0.0 */
+                else sse_mem(e, mpfx, 0x10, 1, OFF_V(rm));
+                if (dbl) sse_rr(e, 0x66, 0x2E, 0, 1);        /* ucomisd */
+                else     sse_rr(e, 0, 0x2E, 0, 1);           /* ucomiss */
+            }
             /* interpreter mapping: lt->N eq->Z|C gt->C uo->C|V */
             u8 *juo = jcc_fwd(e, CC_P);
             u8 *jlt = jcc_fwd(e, CC_B);
@@ -2175,13 +2198,14 @@ static void emit_vop(BE *be, const IROp *o) {
             break;
         }
         case VC_FCSEL: {
-            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned ft = (insn >> 22) & 3;
+            int dbl = (ft == 1), half = (ft == 3);
             unsigned cond = (insn >> 12) & 0xf;
             int cc = cond_setup(be, cond);       /* may clobber rax/rcx/rdx */
             if (dbl) {
                 ld64(e, RAX, R14, OFF_V(rn));
                 ld64(e, RCX, R14, OFF_V(rm));
-            } else {
+            } else {                             /* single or half: low 32b */
                 ld32(e, RAX, R14, OFF_V(rn));
                 ld32(e, RCX, R14, OFF_V(rm));
             }
@@ -2189,6 +2213,7 @@ static void emit_vop(BE *be, const IROp *o) {
                 if (cc == CC_NEVER) mov_rr(e, 1, RAX, RCX);
                 else op0f_rr(e, 1, (u8)(0x40 | (cc ^ 1)), RAX, RCX); /* cmovncc */
             }
+            if (half) alu_ri32(e, 0, 4, RAX, 0xffff);   /* Hd = low 16 bits */
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
             /* loads/cmov preserve EFLAGS: be->fl stays whatever it was */
@@ -2296,6 +2321,70 @@ static void emit_vop(BE *be, const IROp *o) {
             vop_slowpath(be, o, slow, -1);
             break;
         }
+        case VC_H1: {   /* scalar half 1-source (self-counting). Compute in
+                         * single (widen->op->narrow); FABS/FNEG/FSQRT NaN-gate
+                         * (the interpreter's f64_to_f16 canonicalizes NaN),
+                         * FMOV is a plain 16-bit copy. */
+            unsigned opc = (insn >> 15) & 0x3f;
+            if (opc == 0x0) {                        /* FMOV: 16-bit copy */
+                ld32(e, RAX, R14, OFF_V(rn));
+                alu_ri32(e, 0, 4, RAX, 0xffff);
+                icount_add(be, 1);
+                st64(e, RAX, R14, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                break;
+            }
+            materialize_flags(be);
+            vcvtph2ps_m(e, 0, OFF_V(rn));            /* widen Hn -> single */
+            if (opc == 0x1) {                        /* FABS: clear sign */
+                sse_rr(e, 0x66, 0x76, 1, 1);         /* pcmpeqd ones */
+                sse_shift_i(e, 0x72, 2, 1, 1);       /* psrld 1 -> 0x7fffffff */
+                sse_rr(e, 0, 0x54, 0, 1);            /* andps */
+            } else if (opc == 0x2) {                 /* FNEG: flip sign */
+                sse_rr(e, 0x66, 0x76, 1, 1);
+                sse_shift_i(e, 0x72, 6, 1, 31);      /* pslld 31 -> 0x80000000 */
+                sse_rr(e, 0, 0x57, 0, 1);            /* xorps */
+            } else {                                 /* opc 0x3: FSQRT */
+                sse_rr(e, 0xF3, 0x51, 0, 0);         /* sqrtss */
+            }
+            sse_rr(e, 0, 0x2E, 0, 0);                /* ucomiss NaN? */
+            u8 *slow = jcc_fwd(e, CC_P);
+            vcvtps2ph_r(e, 1, 0, 0);                 /* narrow -> half */
+            icount_add(be, 1);
+            movq_rax_x(e, 0, 1);
+            alu_ri32(e, 0, 4, RAX, 0xffff);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        case VC_H2: {   /* scalar half 2-source arith (self-counting, NaN-gated).
+                         * FMAX/FMIN(NM) declined by be_vop_ok. */
+            unsigned opc = (insn >> 12) & 0xf;
+            materialize_flags(be);
+            vcvtph2ps_m(e, 0, OFF_V(rn));
+            vcvtph2ps_m(e, 1, OFF_V(rm));
+            switch (opc) {
+                case 0x1: sse_rr(e, 0, 0x5E, 0, 1); break;   /* FDIV */
+                case 0x2: sse_rr(e, 0, 0x58, 0, 1); break;   /* FADD */
+                case 0x3: sse_rr(e, 0, 0x5C, 0, 1); break;   /* FSUB */
+                default:  sse_rr(e, 0, 0x59, 0, 1); break;   /* FMUL / FNMUL */
+            }
+            sse_rr(e, 0, 0x2E, 0, 0);                /* ucomiss NaN? */
+            u8 *slow = jcc_fwd(e, CC_P);
+            vcvtps2ph_r(e, 1, 0, 0);                 /* narrow -> half */
+            icount_add(be, 1);
+            movq_rax_x(e, 0, 1);
+            alu_ri32(e, 0, 4, RAX, 0xffff);
+            if (opc == 0x8) alu_ri32(e, 0, 6, RAX, 0x8000);  /* FNMUL: flip sign */
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        /* VC_H3 (half FMADD) is declined by be_vop_ok on x86 (keeps the
+         * interpreter helper) -- see the note there -- so it never reaches
+         * here. The a64 backend computes it natively in double. */
         case VC_FCVT: {                          /* S<->D: plain casts */
             int to_dbl = ((insn >> 15) & 0x3f) == 0x5;
             if (to_dbl) {
@@ -2490,11 +2579,18 @@ static void emit_vop(BE *be, const IROp *o) {
                 break;
             }
             u8 *jf = (cc == CC_ALWAYS) ? NULL : jcc_fwd(e, cc ^ 1);
-            u8 mpfx = dbl ? 0xF2 : 0xF3;         /* taken: FCMP recompose */
-            sse_mem(e, mpfx, 0x10, 0, OFF_V(rn));
-            sse_mem(e, mpfx, 0x10, 1, OFF_V(rm));
-            if (dbl) sse_rr(e, 0x66, 0x2E, 0, 1);
-            else     sse_rr(e, 0, 0x2E, 0, 1);
+            int half = ((insn >> 22) & 3) == 3;  /* taken: FCMP recompose */
+            if (half) {                          /* widen halves -> single */
+                vcvtph2ps_m(e, 0, OFF_V(rn));
+                vcvtph2ps_m(e, 1, OFF_V(rm));
+                sse_rr(e, 0, 0x2E, 0, 1);        /* ucomiss */
+            } else {
+                u8 mpfx = dbl ? 0xF2 : 0xF3;
+                sse_mem(e, mpfx, 0x10, 0, OFF_V(rn));
+                sse_mem(e, mpfx, 0x10, 1, OFF_V(rm));
+                if (dbl) sse_rr(e, 0x66, 0x2E, 0, 1);
+                else     sse_rr(e, 0, 0x2E, 0, 1);
+            }
             u8 *juo = jcc_fwd(e, CC_P);
             u8 *jlt = jcc_fwd(e, CC_B);
             u8 *jeq = jcc_fwd(e, CC_E);

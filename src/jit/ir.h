@@ -200,6 +200,13 @@ enum {
     VC_FCVTH,               /* FP16 precision converts: scalar FCVT h<->s/d,
                              * vector FCVTL/FCVTN h<->s. F16C/FEAT_FP16-gated,
                              * source/result NaN-gated (self-counting). */
+    VC_H1,                  /* scalar half 1-source: FMOV/FABS/FNEG/FSQRT.
+                             * FMOV is a bit copy; FABS/FNEG/FSQRT round-trip
+                             * through half (NaN-gated, self-counting). */
+    VC_H2,                  /* scalar half 2-source: FMUL/FDIV/FADD/FSUB/FNMUL
+                             * (FMAX/FMIN(NM) declined). NaN-gated, self-counting. */
+    VC_H3,                  /* scalar half 3-source: FMADD/FMSUB/FNMADD/FNMSUB.
+                             * NaN-gated, self-counting. */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

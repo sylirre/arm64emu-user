@@ -132,6 +132,38 @@ int main(void) {
             MIX(r0); MIX(r1);
         }
 
+        /* FP16 scalar data-processing (FEAT_FP16): 1/2/3-source arith, FMOV,
+         * FMOV #imm, FCMP/FCCMP/FCSEL. Widen/op/narrow on x86, native replay on
+         * a64; the arith/sign/sqrt forms are NaN-gated. `fmov h,w` setup is a
+         * helper on the JIT (consistent). */
+        {
+            uint32_t hr;
+#define HOP2(insn, xa, xb) \
+    __asm__("fmov h0, %w1\n\tfmov h1, %w2\n\t" insn " h2, h0, h1\n\tfmov %w0, s2" \
+            : "=r"(hr) : "r"((uint32_t)(xa)), "r"((uint32_t)(xb)) \
+            : "v0", "v1", "v2"); MIX(hr)
+            HOP2("fadd", na, nb); HOP2("fsub", nb, nc); HOP2("fmul", na, nc);
+            HOP2("fdiv", nc, na); HOP2("fnmul", na, nb);
+#define HOP1(insn, xa) \
+    __asm__("fmov h0, %w1\n\t" insn " h1, h0\n\tfmov %w0, s1" \
+            : "=r"(hr) : "r"((uint32_t)(xa)) : "v0", "v1"); MIX(hr)
+            HOP1("fabs", na); HOP1("fneg", nb); HOP1("fsqrt", nc); HOP1("fmov", na);
+#define HOP3(insn, xa, xb, xc) \
+    __asm__("fmov h0, %w1\n\tfmov h1, %w2\n\tfmov h2, %w3\n\t" \
+            insn " h3, h0, h1, h2\n\tfmov %w0, s3" \
+            : "=r"(hr) : "r"((uint32_t)(xa)), "r"((uint32_t)(xb)), "r"((uint32_t)(xc)) \
+            : "v0", "v1", "v2", "v3"); MIX(hr)
+            HOP3("fmadd", na, nb, nc); HOP3("fmsub", nb, nc, na);
+            HOP3("fnmadd", nc, na, nb); HOP3("fnmsub", na, nc, nb);
+            __asm__("fmov h0, #1.5\n\tfmov %w0, s0" : "=r"(hr) :: "v0"); MIX(hr);
+            __asm__("fmov h0, %w1\n\tfmov h1, %w2\n\tfcmp h0, h1\n\t"
+                    "fccmp h1, h0, #5, gt\n\tfcsel h2, h0, h1, mi\n\tfmov %w0, s2"
+                    : "=r"(hr) : "r"((uint32_t)na), "r"((uint32_t)nb)
+                    : "v0", "v1", "v2", "cc"); MIX(hr);
+            __asm__("fmov h0, %w1\n\tfcmp h0, #0.0\n\tcset %w0, vs"
+                    : "=r"(hr) : "r"((uint32_t)nc) : "v0", "cc"); MIX(hr);
+        }
+
         /* vector FP three-same (NaN-gated packed arithmetic + compares) */
         {
             uint64_t va0 = rnd(), va1 = rnd(), vb0 = rnd(), vb1 = rnd();

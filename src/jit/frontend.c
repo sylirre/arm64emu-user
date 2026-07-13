@@ -211,6 +211,11 @@ static u64 fe_vfp_imm64(unsigned imm8) {
     u64 exp11 = ((u64)(!b6) << 10) | ((u64)(b6 ? 0xffu : 0) << 2) | e;
     return (s << 63) | (exp11 << 52) | ((u64)(imm8 & 0xf) << 48);
 }
+static u16 fe_vfp_imm16(unsigned imm8) {              /* half-precision FMOV #imm */
+    unsigned s = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1, e = (imm8 >> 4) & 3;
+    unsigned exp5 = ((!b6) << 4) | ((b6 ? 3u : 0u) << 2) | e;
+    return (u16)((s << 15) | (exp5 << 10) | ((imm8 & 0xf) << 6));
+}
 static u64 fe_rep8(u64 b)  { b &= 0xff;       return b * 0x0101010101010101ULL; }
 static u64 fe_rep16(u64 h) { h &= 0xffff;     return h * 0x0001000100010001ULL; }
 static u64 fe_rep32(u64 w) { w &= 0xffffffff; return w | (w << 32); }
@@ -405,6 +410,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
          * same-host interpreter binary). */
         unsigned ftype = (insn >> 22) & 3;
         if (ftype == 0 || ftype == 1) vclass = VC_F3;
+        else if (ftype == 3) vclass = VC_H3;     /* half FMADD family */
     } else if ((insn & 0x7F000000u) == 0x1E000000u) {
         /* scalar FP */
         unsigned ftype = (insn >> 22) & 3, o2 = (insn >> 10) & 3;
@@ -468,10 +474,36 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 aux_extra = VF_READF | VF_SETF;
             }
         } else if (ftype == 3 && ((insn >> 21) & 1) == 1 &&
-                   ((insn >> 10) & 0x1f) == 0x10) {          /* half 1-source */
-            unsigned opc = (insn >> 15) & 0x3f;
-            if (opc == 0x4 || opc == 0x5)
-                vclass = VC_FCVTH;              /* FCVT Sd/Dd, Hn (widen) */
+                   ((insn >> 10) & 0x3f) != 0) {             /* half data-proc */
+            if (o2 == 0 && ((insn >> 12) & 1) == 1) {        /* FMOV Hd, #imm */
+                unsigned imm8 = (insn >> 13) & 0xff;
+                if (!be_vop_ok(VC_FMOVI, insn)) return 0;
+                IROp *o = ir_put(ir, IRO_VOP, 0, VREG_ZERO, VREG_ZERO,
+                                 VREG_ZERO, 0, (u64)fe_vfp_imm16(imm8),
+                                 VC_FMOVI | ((u32)rd << 8));
+                o->imm2pc = 0;
+                ir->ninsns++;
+                return 1;
+            }
+            if (o2 == 0 && ((insn >> 13) & 1) == 1 &&
+                ((insn >> 12) & 1) == 0) {                   /* FCMP/FCMPE */
+                vclass = VC_FCMP;
+                aux_extra = VF_SETF;
+            } else if (o2 == 0 && ((insn >> 14) & 1) == 1) { /* 1-source */
+                unsigned opc = (insn >> 15) & 0x3f;
+                if (opc <= 0x3) vclass = VC_H1;  /* FMOV/FABS/FNEG/FSQRT */
+                else if (opc == 0x4 || opc == 0x5)
+                    vclass = VC_FCVTH;           /* FCVT Sd/Dd, Hn (widen) */
+            } else if (o2 == 2) {                            /* 2-source */
+                unsigned opc = (insn >> 12) & 0xf;
+                if (opc <= 0x8) vclass = VC_H2;  /* +FNMUL, +FMAX..FMINNM */
+            } else if (o2 == 3) {                            /* FCSEL */
+                vclass = VC_FCSEL;
+                aux_extra = VF_READF;
+            } else if (o2 == 1) {                            /* FCCMP(E) */
+                vclass = VC_FCCMP;
+                aux_extra = VF_READF | VF_SETF;
+            }
         }
     }
 
@@ -485,7 +517,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
      * self-counting discipline: not in ninsns, the fast path bumps icount
      * inline. */
     if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S &&
-        vclass != VC_FCVTH)
+        vclass != VC_FCVTH && vclass != VC_H1 && vclass != VC_H2 &&
+        vclass != VC_H3)
         ir->ninsns++;
     return 1;
 }

@@ -805,13 +805,22 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_MINMAX: case VC_MUL3: case VC_PAIRI: case VC_2MISC:
         case VC_ACROSS: case VC_VF3S: case VC_VFCM:
         case VC_MOVI: case VC_COPY: case VC_F1: case VC_F3:
-        case VC_FCMP: case VC_FCCMP: case VC_FCSEL:
-        case VC_FMOVI: case VC_FMOVG:
+        case VC_FMOVG:
         case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
         case VC_S3S: case VC_SSHIFTI:
             return 1;
         case VC_FCVTH:                           /* half<->s/d converts: base ISA */
             return 1;
+        case VC_FCMP: case VC_FCCMP: case VC_FCSEL: case VC_FMOVI:
+            /* half forms use FEAT_FP16 instructions (native replay); s/d base. */
+            return (((insn >> 22) & 3) == 3) ? cpu_has_fp16() : 1;
+        case VC_H1: case VC_H3:                  /* scalar half 1/3-source arith */
+            return cpu_has_fp16();
+        case VC_H2: {                            /* half 2-src; MAX/MIN decline */
+            unsigned opc = (insn >> 12) & 0xf;
+            if (opc >= 4 && opc <= 7) return 0;
+            return cpu_has_fp16();
+        }
         case VC_F2: {
             /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
              * whose fop_d/fop_s carry ARM's NaN propagation and +0/-0 ordering
@@ -1148,6 +1157,67 @@ static void emit_vop(BE *be, const IROp *o) {
                 ei(e, 0xB100041Fu | (16u << 5));         /* cmn x16, #1 */
                 slow = bcond_fwd(e, 1);                  /* b.ne: NaN lane */
             }
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_H1: {   /* scalar half 1-source (self-counting). FMOV is a bit
+                         * copy (native fmov h matches, no gate); FABS/FNEG/
+                         * FSQRT replay native + NaN gate (interp canonicalizes). */
+            unsigned opc = (insn >> 15) & 0x3f;
+            vop_src(be, 0, rn);                          /* v0 = Vn */
+            u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            if (opc == 0x0) {                            /* FMOV: no gate */
+                ei(e, w);                                /* fmov h2, h0 */
+                icount_add(be, 1);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            materialize_flags(be);
+            ei(e, w);                                    /* fabs/fneg/fsqrt h2,h0 */
+            ei(e, 0x1EE02008u | (2u << 5));              /* fcmp h2, #0 : NaN? */
+            u8 *slow = bcond_fwd(e, 6);                  /* b.vs */
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_H2: {   /* scalar half 2-source arith: replay native + NaN gate
+                         * (single ops, so native half == the interpreter's
+                         * double). FMAX/FMIN(NM) declined by be_vop_ok. */
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            u32 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                    (1u << 16) | (0u << 5) | 2;
+            ei(e, w);                                    /* fadd/.../fnmul h2,h0,h1 */
+            ei(e, 0x1EE02008u | (2u << 5));              /* fcmp h2, #0 : NaN? */
+            u8 *slow = bcond_fwd(e, 6);
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, 2);
+            vop_dst(be, 2, rd);
+            break;
+        }
+        case VC_H3: {   /* half FMADD family. The interpreter computes in double
+                         * and narrows once via f64_to_f16 -- a native half FMA
+                         * would differ (a tiny addend below double's ULP), so
+                         * mirror it: widen exact to double, double FMA, fcvt
+                         * h,d (single narrow). NaN-gated. */
+            unsigned ra = (insn >> 10) & 31;
+            int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            vop_src(be, 3, ra);
+            ei(e, 0x1EE2C000u | (0u << 5) | 0);          /* fcvt d0, h0 */
+            ei(e, 0x1EE2C000u | (1u << 5) | 1);          /* fcvt d1, h1 */
+            ei(e, 0x1EE2C000u | (3u << 5) | 3);          /* fcvt d3, h3 */
+            ei(e, 0x1F400000u | ((u32)o1 << 21) | (1u << 16) |
+                  ((u32)o0 << 15) | (3u << 10) | (0u << 5) | 2);  /* fmadd d2 */
+            ei(e, 0x1E602008u | (2u << 5));              /* fcmp d2, #0 : NaN? */
+            u8 *slow = bcond_fwd(e, 6);
+            ei(e, 0x1E63C000u | (2u << 5) | 2);          /* fcvt h2, d2 */
             icount_add(be, 1);
             vop_slowpath(be, o, slow, 2);
             vop_dst(be, 2, rd);
