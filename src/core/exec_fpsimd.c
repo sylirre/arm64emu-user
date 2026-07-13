@@ -1146,9 +1146,18 @@ static void simd_three_same(CPU *c, u32 insn) {
  * FMUL(0x9,U=0)/FMULX(0x9,U=1). size=10 .4s/.2s (idx=H:L), size=11 .2d (idx=H). */
 static void simd_indexed_fp(CPU *c, u32 insn) {
     unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
-    unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0), H = BIT(11), L = BIT(21);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0), H = BIT(11), L = BIT(21);
+    unsigned Rm = (size == 0) ? BITS(19, 16) : BITS(20, 16);   /* half: Vm limited to v0-v15 */
     V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
     unsigned op = (opc == 0x1) ? FOP_MLA : (opc == 0x5) ? FOP_MLS : (U ? FOP_MULX : FOP_MUL);
+    if (size == 0) {                              /* .4h/.8h (idx = H:L:M) */
+        unsigned idx = (H << 2) | (L << 1) | BIT(20);
+        double e = (double)f16_to_f32(vm.h[idx]);
+        unsigned n = Q ? 8 : 4;
+        for (unsigned i = 0; i < n; i++)
+            r.h[i] = f64_to_f16(fop_d(op, (double)f16_to_f32(vn.h[i]), e, (double)f16_to_f32(vd.h[i])));
+        c->v[Rd] = r; return;
+    }
     if (size == 3) {                              /* .2d (idx = H, L must be 0) */
         double e = vget_d(&vm, H);
         unsigned n = Q ? 2 : 1;
