@@ -121,7 +121,12 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         if (!strncmp(canon, "/dev/shm", 8) &&
             (canon[8] == 0 || canon[8] == '/')) { strcpy(host_out, canon); return 1; }
         if (!strncmp(canon, "/dev/fd", 7) && (canon[7] == 0 || canon[7] == '/')) {
-            snprintf(host_out, PATH_MAX, "/proc/self/fd%s", canon + 7);
+            /* /dev/fd[/...] -> /proc/self/fd[/...]; the 13-byte prefix is longer
+             * than /dev/fd, so guard the length and fall through if it won't fit. */
+            size_t tl = strlen(canon + 7);
+            if (13 + tl + 1 > PATH_MAX) return 0;
+            memcpy(host_out, "/proc/self/fd", 13);
+            memcpy(host_out + 13, canon + 7, tl + 1);
             return 1;
         }
         if (!strcmp(canon, "/dev/stdin"))  { strcpy(host_out, "/proc/self/fd/0"); return 1; }
