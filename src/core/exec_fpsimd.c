@@ -1960,11 +1960,20 @@ static void simd_shift_imm(CPU *c, u32 insn) {
 
     /* Fixed-point convert: SCVTF/UCVTF (0x1c), FCVTZS/FCVTZU (0x1f). */
     if (opc == 0x1c || opc == 0x1f) {
-        if (size != 2 && size != 3) { fpsimd_undef(c, insn); return; }   /* 16-bit = FP16 */
+        if (size == 0) { fpsimd_undef(c, insn); return; }   /* 8-bit has no fp form */
         unsigned fbits = 2 * esize - immhb, n = (Q ? 16 : 8) >> size;
         int dbl = (size == 3);
         u64 pb = (u64)(fbits + 1023) << 52; double pw; memcpy(&pw, &pb, 8);  /* 2^fbits */
         V128 r; r.d[0] = r.d[1] = 0;
+        if (size == 1) {                                  /* FP16 lanes: int16 <-> half / 2^fbits */
+            for (unsigned i = 0; i < n; i++) {
+                if (opc == 0x1c)                          /* fixed -> half */
+                    r.h[i] = f64_to_f16((U ? (double)(u16)c->v[Rn].h[i] : (double)(s16)c->v[Rn].h[i]) / pw);
+                else                                      /* half -> fixed (trunc, saturating) */
+                    r.h[i] = fcvt_to_int16(f_trunc((double)f16_to_f32(c->v[Rn].h[i]) * pw), U == 0);
+            }
+            c->v[Rd] = r; return;
+        }
         for (unsigned i = 0; i < n; i++) {
             if (opc == 0x1c) {                            /* fixed -> FP */
                 if (dbl) vset_d(&r, i, (U ? (double)(u64)c->v[Rn].d[i] : (double)(s64)c->v[Rn].d[i]) / pw);
@@ -2048,13 +2057,20 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
     }
 
     /* Fixed-point convert: SCVTF/UCVTF (0x1c), FCVTZS/FCVTZU (0x1f) — scalar
-     * S/D form (size==1 is FP16, left UNDEF). Mirrors the vector block. */
+     * H/S/D form. Mirrors the vector block. */
     if (opc == 0x1c || opc == 0x1f) {
-        if (size != 2 && size != 3) { fpsimd_undef(c, insn); return; }   /* 16-bit = FP16 */
+        if (size == 0) { fpsimd_undef(c, insn); return; }   /* 8-bit has no fp form */
         unsigned fbits = 2 * esize - immhb;
         int dbl = (size == 3);
         u64 pb = (u64)(fbits + 1023) << 52; double pw; memcpy(&pw, &pb, 8);  /* 2^fbits */
         V128 r; r.d[0] = r.d[1] = 0;
+        if (size == 1) {                              /* FP16: int16 <-> half / 2^fbits */
+            if (opc == 0x1c)                          /* fixed -> half */
+                r.h[0] = f64_to_f16((U ? (double)(u16)c->v[Rn].h[0] : (double)(s16)c->v[Rn].h[0]) / pw);
+            else                                      /* half -> fixed (trunc, saturating) */
+                r.h[0] = fcvt_to_int16(f_trunc((double)f16_to_f32(c->v[Rn].h[0]) * pw), U == 0);
+            c->v[Rd] = r; return;
+        }
         if (opc == 0x1c) {                            /* fixed -> FP */
             if (dbl) vset_d(&r, 0, (U ? (double)(u64)c->v[Rn].d[0] : (double)(s64)c->v[Rn].d[0]) / pw);
             else     vset_s(&r, 0, (U ? (float)(u32)c->v[Rn].s[0]  : (float)(s32)c->v[Rn].s[0])  / (float)pw);
