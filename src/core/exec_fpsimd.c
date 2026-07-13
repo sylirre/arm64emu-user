@@ -1362,6 +1362,17 @@ static void simd_across(CPU *c, u32 insn) {
         V128 r; r.d[0] = r.d[1] = 0; vset_s(&r, 0, acc); c->v[Rd] = r;
         return;
     }
+    /* FP across (FP16, .4h/.8h): same ops with U=0, sz(bit22)=0; result in h0. */
+    if (U == 0 && BIT(22) == 0 && (opc == 0x0c || opc == 0x0f)) {
+        unsigned a = BIT(23);
+        unsigned fop = (opc == 0x0f) ? (a ? FOP_MIN : FOP_MAX) : (a ? FOP_MINNM : FOP_MAXNM);
+        unsigned n = Q ? 8 : 4;
+        double acc = (double)f16_to_f32(c->v[Rn].h[0]);
+        for (unsigned i = 1; i < n; i++)
+            acc = fop_d(fop, acc, (double)f16_to_f32(c->v[Rn].h[i]), 0);
+        V128 r; r.d[0] = r.d[1] = 0; r.h[0] = f64_to_f16(acc); c->v[Rd] = r;
+        return;
+    }
 
     unsigned esize = 8u << size, n = (Q ? 16 : 8) >> size;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
