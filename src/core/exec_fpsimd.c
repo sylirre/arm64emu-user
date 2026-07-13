@@ -1398,6 +1398,13 @@ static u64 fcvt_to_int(double r, int is_signed, int x64) {
     if (x64) { u64 m = (r >= 18446744073709551615.0) ? UINT64_MAX : (u64)r; return m; }
     u32 m = (r >= 4294967295.0) ? UINT32_MAX : (u32)r; return m;
 }
+/* 16-bit saturating fp->int, for the FP16 vector converts (int result sits in a
+ * half-width lane). Mirrors fcvt_to_int's clamp at the .8h element width. */
+static u16 fcvt_to_int16(double r, int is_signed) {
+    if (is_signed) { s32 m = (r >= 32767.0) ? 32767 : (r <= -32768.0) ? -32768 : (s32)r; return (u16)(s16)m; }
+    if (r < 0) r = 0;
+    return (r >= 65535.0) ? 0xffffu : (u16)r;
+}
 /* Round to nearest, ties to even (the f_round helper rounds ties away). Built
  * from f_trunc to avoid a libm dependency (see the FP_INTEGRAL helpers above). */
 static double f_round_even(double v) {
@@ -1516,6 +1523,26 @@ static u64 rsqrte_f64(u64 v) {
     u64 f = call_recip_sqrt_estimate(&exp, 3068, frac);   /* 52-bit frac: MSB at bit 51 */
     return sbit | (((u64)exp << 52) & 0x7ff0000000000000ULL) | (f & 0xfffffffffffffULL);
 }
+/* Half-precision FRECPE/FRSQRTE. Same estimate machinery as the f32/f64 forms;
+ * the exp offset follows the (2*bias-1)/(3*bias-1) pattern (bias=15 -> 29/44) and
+ * the 10-bit fraction aligns its MSB at bit 51 (shift 42). */
+static u16 recpe_f16(u16 v) {
+    u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
+    if (exp == 0x1f) return frac ? 0x7e00 : sbit;                  /* nan / inf -> 0 */
+    if (exp == 0 && frac == 0) return sbit | 0x7c00;              /* 0 -> inf */
+    if ((v & 0x7fff) < (1u << 8)) return sbit | 0x7c00;           /* |x| < 2^-16 -> inf */
+    u64 f = call_recip_estimate(&exp, 29, ((u64)frac) << 42);
+    return sbit | ((u16)(exp & 0x1f) << 10) | (u16)((f >> 42) & 0x3ff);
+}
+static u16 rsqrte_f16(u16 v) {
+    u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
+    if (exp == 0x1f && frac) return 0x7e00;                        /* nan */
+    if (exp == 0 && frac == 0) return sbit | 0x7c00;              /* 0 -> inf */
+    if (sbit) return 0x7e00;                                       /* negative -> nan */
+    if (exp == 0x1f) return 0;                                     /* +inf -> 0 */
+    u64 f = call_recip_sqrt_estimate(&exp, 44, ((u64)frac) << 42);
+    return sbit | (((u16)exp << 10) & 0x7c00) | (u16)((f >> 42) & 0x3ff);
+}
 
 /* AdvSIMD two-register misc, floating-point page: FABS/FNEG/FSQRT, FRINTx,
  * FCVT{N,M,P,Z,A}{S,U}, SCVTF/UCVTF, FCMxx #0.0, FCVTL/FCVTN/FCVTXN. hsz=bit23
@@ -1610,6 +1637,51 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
         if (is_int)       { if (dbl) r.d[i] = ires; else r.s[i] = (u32)ires; }
         else if (is_mask) { if (dbl) r.d[i] = mask; else r.s[i] = (u32)mask; }
         else              { if (dbl) vset_d(&r, i, res); else vset_s(&r, i, (float)res); }
+    }
+    c->v[Rd] = r;
+}
+
+/* AdvSIMD two-register misc (FP16): the half page of the FP two-misc group.
+ * Its own encoding (bit22=1, bits[21:17]=0x1c) but the same (U:hsz:opcode) key as
+ * simd_two_misc_fp, so the op selection matches lane-for-lane. Half lanes widen
+ * to double and narrow once via f64_to_f16; int<->fp converts use the .8h element
+ * width (16-bit source ints / fcvt_to_int16 saturation). FCVTL/FCVTN/FCVTXN are
+ * NOT here — those stay in the single/double page. */
+static void simd_two_misc_fp16(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), U = BIT(29), hsz = BIT(23), opc = BITS(16, 12);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned key = (U << 6) | (hsz << 5) | opc;
+    V128 vn = c->v[Rn], r; r.d[0] = r.d[1] = 0;
+    unsigned n = Q ? 8 : 4;
+    for (unsigned i = 0; i < n; i++) {
+        double x = (double)f16_to_f32(vn.h[i]), res = 0; int done = 0;
+        switch (key) {
+            case 0x2f: res = __builtin_fabs(x); break;                 /* FABS   */
+            case 0x6f: res = -x; break;                                /* FNEG   */
+            case 0x7f: res = __builtin_sqrt(x); break;                 /* FSQRT  */
+            case 0x18: res = fround_mode(x, 0); break;                 /* FRINTN */
+            case 0x38: res = fround_mode(x, 1); break;                 /* FRINTP */
+            case 0x58: res = fround_mode(x, 4); break;                 /* FRINTA */
+            case 0x19: res = fround_mode(x, 2); break;                 /* FRINTM */
+            case 0x39: res = fround_mode(x, 3); break;                 /* FRINTZ */
+            case 0x59: case 0x79: res = fround_mode(x, 0); break;      /* FRINTX/FRINTI */
+            case 0x1d: r.h[i] = f64_to_f16((double)(s16)vn.h[i]); done = 1; break; /* SCVTF */
+            case 0x5d: r.h[i] = f64_to_f16((double)(u16)vn.h[i]); done = 1; break; /* UCVTF */
+            case 0x1a: case 0x3a: case 0x1b: case 0x3b: case 0x1c:     /* FCVT*S (signed) */
+            case 0x5a: case 0x7a: case 0x5b: case 0x7b: case 0x5c: {   /* FCVT*U (unsigned) */
+                int rmode = (opc == 0x1a) ? (hsz ? 1 : 0) : (opc == 0x1b) ? (hsz ? 3 : 2) : 4;
+                r.h[i] = fcvt_to_int16(fround_mode(x, rmode), U == 0); done = 1; break;
+            }
+            case 0x2c: r.h[i] = (x >  0.0) ? 0xffffu : 0; done = 1; break;  /* FCMGT #0 */
+            case 0x6c: r.h[i] = (x >= 0.0) ? 0xffffu : 0; done = 1; break;  /* FCMGE #0 */
+            case 0x2d: r.h[i] = (x == 0.0) ? 0xffffu : 0; done = 1; break;  /* FCMEQ #0 */
+            case 0x6d: r.h[i] = (x <= 0.0) ? 0xffffu : 0; done = 1; break;  /* FCMLE #0 */
+            case 0x2e: r.h[i] = (x <  0.0) ? 0xffffu : 0; done = 1; break;  /* FCMLT #0 */
+            case 0x3d: r.h[i] = recpe_f16(vn.h[i]);  done = 1; break;   /* FRECPE  */
+            case 0x7d: r.h[i] = rsqrte_f16(vn.h[i]); done = 1; break;   /* FRSQRTE */
+            default: fpsimd_undef(c, insn); return;
+        }
+        if (!done) r.h[i] = f64_to_f16(res);
     }
     c->v[Rd] = r;
 }
@@ -2522,6 +2594,12 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* AdvSIMD two-register misc (NOT/NEG/ABS/compare-with-zero): bits[11:10]=10. */
     if (BITS(28, 24) == 0x0e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
         simd_two_misc(c, insn); return;
+    }
+    /* AdvSIMD two-register misc (FP16): FABS/FNEG/FSQRT, FRINTx, FCVT-to-int,
+     * SCVTF/UCVTF, FCMxx #0, FRECPE/FRSQRTE on .4h/.8h. Its own encoding page
+     * (bit22=1, bits[21:17]=0x1c). */
+    if (BITS(28, 24) == 0x0e && BIT(22) == 1 && BITS(21, 17) == 0x1c && BIT(11) == 1 && BIT(10) == 0) {
+        simd_two_misc_fp16(c, insn); return;
     }
     /* AdvSIMD scalar two-register misc (bit30=1): scalar int<->FP converts. */
     if (BITS(28, 24) == 0x1e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
