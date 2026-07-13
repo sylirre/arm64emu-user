@@ -24,15 +24,61 @@ SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/
         src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/sys_netlink.c \
         src/sys_procfs.c src/proctab.c src/main.c
 
-arm64chroot: $(SRCS) $(wildcard src/*.h src/core/*.h src/jit/*.h)
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+# ---- Incremental build -------------------------------------------------------
+# Each .c compiles to its own .o under build/<variant>/, and the compiler emits a
+# .d sidecar (-MMD -MP) listing the headers that .o pulled in. Editing one .c or
+# one .h then rebuilds only the affected objects instead of the whole program.
+# Variants that differ in compile flags (m32, asim) get their own object tree so
+# their objects never collide with the native ones.
+BUILDDIR  := build
+M32FLAGS  := -m32
+ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS
+DEPFLAGS   = -MMD -MP
+
+NATIVE_OBJ := $(SRCS:%.c=$(BUILDDIR)/native/%.o)
+M32_OBJ    := $(SRCS:%.c=$(BUILDDIR)/m32/%.o)
+ASIM_OBJ   := $(SRCS:%.c=$(BUILDDIR)/asim/%.o)
+
+# Full-rebuild guard: a stamp holding the compiler + flags. When CC/CFLAGS/LTO
+# change (e.g. switching to a cross compiler), the stamp's contents change, its
+# mtime bumps, and every object depending on it recompiles — preserving the old
+# single-invocation build's "changing the compiler rebuilds cleanly".
+BUILDCFG := $(BUILDDIR)/.buildcfg
+$(shell mkdir -p $(BUILDDIR); \
+        printf '%s\n' '$(CC) $(CFLAGS)' > $(BUILDDIR)/.cfg.tmp; \
+        cmp -s $(BUILDDIR)/.cfg.tmp $(BUILDCFG) 2>/dev/null \
+          || mv $(BUILDDIR)/.cfg.tmp $(BUILDCFG); \
+        rm -f $(BUILDDIR)/.cfg.tmp)
+
+$(BUILDDIR)/native/%.o: %.c $(BUILDCFG)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILDDIR)/m32/%.o: %.c $(BUILDCFG)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(M32FLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILDDIR)/asim/%.o: %.c $(BUILDCFG)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(ASIMFLAGS) $(DEPFLAGS) -c $< -o $@
+
+arm64chroot: $(NATIVE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # 32-bit build (native on x86_64 with gcc-multilib): keeps ILP32-host
 # correctness continuously tested.
-arm64chroot32: $(SRCS) $(wildcard src/*.h src/core/*.h src/jit/*.h)
-	$(CC) $(CFLAGS) -m32 -o $@ $(SRCS) $(LDFLAGS)
+arm64chroot32: $(M32_OBJ)
+	$(CC) $(CFLAGS) $(M32FLAGS) -o $@ $^ $(LDFLAGS)
+
+# Android-behavior variant: force the statx ENOSYS fallback and the Bionic
+# keyring gate. Built and exercised by test-android-sim.
+arm64chroot_asim: $(ASIM_OBJ)
+	$(CC) $(CFLAGS) $(ASIMFLAGS) -o $@ $^ $(LDFLAGS)
 
 m32: arm64chroot32
+
+# Per-object header dependencies emitted by -MMD (absent on the first build).
+-include $(NATIVE_OBJ:.o=.d) $(M32_OBJ:.o=.d) $(ASIM_OBJ:.o=.d)
 
 test: arm64chroot
 	tests/run_tests.sh ./arm64chroot
@@ -54,9 +100,7 @@ test-jit: arm64chroot
 # Android-behavior simulation on the dev host: force the statx ENOSYS
 # fallback and the Bionic keyring gate, then require the differential suite
 # to still match the qemu oracle.
-test-android-sim: $(SRCS) $(wildcard src/*.h src/core/*.h)
-	$(CC) $(CFLAGS) -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
-	    -o arm64chroot_asim $(SRCS) $(LDFLAGS)
+test-android-sim: arm64chroot_asim
 	tests/run_tests.sh ./arm64chroot_asim
 
 # Android-seccomp regression gate: the ENTIRE differential suite with the
@@ -71,6 +115,7 @@ test-seccomp: arm64chroot
 	rm -f tests/seccomp_emu.sh
 
 clean:
+	rm -rf $(BUILDDIR)
 	rm -f arm64chroot arm64chroot32 arm64chroot_asim
 	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin tests/bench/*.bin
 	rm -f tests/seccomp_emu.sh tests/jit_emu.sh
