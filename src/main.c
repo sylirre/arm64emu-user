@@ -290,7 +290,12 @@ static void set_fake_id(struct Machine *m, const char *attached,
     }
 }
 
+// JNI entrypoint used by https://github.com/sylirre/ghostty-android-terminal
+#ifdef ANDROID_JNI
+int arm64chroot_main(int argc, char **argv)
+#else
 int main(int argc, char **argv) {
+#endif
     struct Machine *m = &g_machine;
     const char *argv0 = NULL;
     char **extra_env = NULL;
