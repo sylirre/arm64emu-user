@@ -1,0 +1,52 @@
+name: CI
+
+# Build and run the full differential test suite on every push, and on pull
+# requests. A push to a branch that also has an open PR fires BOTH a `push`
+# and a `pull_request` event — the concurrency group below collapses those two
+# (and any superseded run) into a single run per branch, so the suite never
+# executes twice for the same ref.
+on:
+  push:
+  pull_request:
+
+# Same group for the push and the pull_request of a given branch:
+#   push       -> head_ref is empty, so ref_name ("my-branch") is used
+#   pull_request -> head_ref is the source branch ("my-branch")
+# cancel-in-progress then leaves exactly one live run per branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test (x86_64 host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # gcc-aarch64-linux-gnu   -> aarch64-linux-gnu-gcc (the suite's $AGCC)
+      # libc6-dev-arm64-cross   -> /usr/aarch64-linux-gnu glibc: static+dynamic
+      #                            linking, and the offline source setup_env.sh
+      #                            copies the glibc test rootfs from
+      # qemu-user               -> qemu-aarch64 (the differential oracle)
+      # qemu-user-static, proot -> Alpine minirootfs bootstrap + shell-test oracle
+      # expect                  -> interactive job-control (PTY) test
+      - name: Install cross toolchain, qemu oracle and rootfs bootstrap tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            qemu-user qemu-user-static proot expect
+
+      - name: Build
+        run: make
+
+      # run_tests.sh auto-provisions the Alpine + glibc test rootfs from scratch
+      # into tests/.cache (one-time Alpine fetch from the CDN); no hand-staged
+      # $HOME rootfs is required.
+      - name: Test suite
+        run: make test
