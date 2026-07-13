@@ -5,15 +5,20 @@
  *
  *   arm64chroot [options] <rootfs> <program> [args...]
  *
- * Options:
+ * Options (run `arm64chroot --help` for the full reference incl. env vars):
+ *   -h, --help       show detailed help and exit
  *   -strace          log syscalls to stderr
- *   -d               per-instruction trace (very verbose)
+ *   -d               per-instruction trace (very verbose; forces -jit off)
+ *   -jit             translate hot basic blocks to native code (AArch64/x86-64)
+ *   -nopd            disable the decoded-instruction cache (diagnostic; slower)
  *   -E VAR=VAL       set an environment variable for the guest (repeatable)
  *   -0 ARG0          set argv[0] for the guest program
  *   -fake-id [ID]    fake identity (fakeroot-style); ID = uid | uid:gid,
  *                    default 0:0 (root)
  *   -link2symlink    emulate hardlinks with tracked symlinks where the host
  *                    forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
+ *   -shared-proc     key the shared guest-PID registry by rootfs so ps/top see
+ *                    guest processes across emulator invocations
  *   -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
  *                    (repeatable); :ro makes it read-only. Host paths may not
  *                    contain ':'.
@@ -35,13 +40,82 @@ struct Machine g_machine;
 
 extern char **environ;
 
+/* Terse synopsis for argument errors: one line to stderr, exit 2. The full
+ * reference lives in help() below, reachable via -h/--help. */
 static void usage(void) {
     fprintf(stderr,
-            "usage: arm64chroot [-strace] [-d] [-jit] [-nopd] [-E VAR=VAL]... "
-            "[-0 argv0] [-fake-id [uid[:gid]]] [-link2symlink] [-shared-proc] "
-            "[-bind src:dst[:ro]]... "
-            "<rootfs> <program> [args...]\n");
+            "usage: arm64chroot [options] <rootfs> <program> [args...]\n"
+            "try 'arm64chroot --help' for details\n");
     exit(2);
+}
+
+/* Full reference help: purpose, usage, arguments, every option, environment
+ * variables, and examples. Printed to stdout on -h/--help, exit 0. */
+static void help(void) {
+    fputs(
+"arm64chroot -- run an AArch64 (ARM64) Linux program from a rootfs directory\n"
+"under a pure user-space emulator (interpreter by default, optional -jit), with\n"
+"proot-style rootfs containment. No privileges, kernel modules, or dependencies\n"
+"beyond libc are required.\n"
+"\n"
+"Usage:\n"
+"  arm64chroot [options] <rootfs> <program> [args...]\n"
+"\n"
+"Arguments:\n"
+"  <rootfs>    directory tree holding an AArch64 userland (e.g. an Alpine or\n"
+"              Debian arm64 root filesystem); '/' runs host-native aarch64\n"
+"              binaries directly. Guest paths resolve inside the rootfs.\n"
+"  <program>   guest program to execute (a path resolved inside the rootfs).\n"
+"  args...     arguments passed on to the guest program.\n"
+"\n"
+"Options:\n"
+"  -h, --help          show this help and exit\n"
+"  -strace             log guest syscalls to stderr\n"
+"  -d                  per-instruction trace (very verbose; forces -jit off)\n"
+"  -jit                translate hot basic blocks to native code (AArch64 and\n"
+"                      x86-64 hosts; falls back to the interpreter elsewhere)\n"
+"  -nopd               disable the decoded-instruction cache (diagnostic; slower)\n"
+"  -E VAR=VAL          set an environment variable for the guest (repeatable)\n"
+"  -0 ARG0             override argv[0] for the guest program\n"
+"  -fake-id [ID]       present a fake identity (fakeroot-style); ID = uid or\n"
+"  -fake-id=ID         uid:gid, default 0:0 (root). '=' attached form accepted.\n"
+"  -link2symlink       emulate hardlinks with tracked symlinks where the host\n"
+"                      forbids link() (Android/SELinux -> EXDEV)\n"
+"  -shared-proc        key the shared guest-PID registry by rootfs so that\n"
+"                      ps/top see guest processes across emulator invocations\n"
+"  -bind src:dst[:ro]  expose host directory src at guest path dst (repeatable);\n"
+"                      append :ro for a read-only mount. Host paths may not\n"
+"                      contain ':'.\n"
+"  --                  stop option parsing\n"
+"\n"
+"Environment variables:\n"
+"  Tuning:\n"
+"    A64CHROOT_JIT_MB     per-thread JIT code-cache size in MiB (default 32,\n"
+"                         clamped to 1-128)\n"
+"    XDG_RUNTIME_DIR      first writable of these holds the -shared-proc\n"
+"    TMPDIR               registry when /dev/shm is not writable; PREFIX is\n"
+"    PREFIX               tried as $PREFIX/tmp (Termux)\n"
+"  Diagnostics / developer (see docs/jit.md):\n"
+"    A64_JIT_STATS        rank instruction words still run via the exec_a64\n"
+"                         helper; =/path dumps the ranking to a file at exit\n"
+"    A64_JIT_DUMP=PREFIX  write each translated block into a sparse code-cache\n"
+"                         image (PREFIX.<pid>.<tid>.code plus a .map)\n"
+"    A64_JIT_PDMAX=N      force predecode ops with id > N through the helper\n"
+"                         (bisects a codegen bug to one instruction class)\n"
+"    A64_JIT_SLOWMEM      force every inline memory op down its slow helper branch\n"
+"    A64_JIT_NOFUSE       disable instruction / D-TLB-probe fusion\n"
+"    A64_JIT_NOFP16       disable FP16 native codegen (AArch64 backend)\n"
+"    A64_JIT_NOVRA        disable the V-register cache\n"
+"    A64_JIT_SSE=2        force SSE2-baseline capability answers (x86-64)\n"
+"    A64_PROCSTAT_FORCE_SYNTH  force the synthetic /proc/stat fallback\n"
+"    A64_NETLINK_FORCE_BLOCK   force the netlink fallback path\n"
+"\n"
+"Examples:\n"
+"  arm64chroot ./rootfs /bin/sh\n"
+"  arm64chroot -jit -fake-id ./rootfs /bin/bash -l\n"
+"  arm64chroot -bind \"$PWD:/work\" -bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh\n",
+        stdout);
+    exit(0);
 }
 
 /* Recognize a fake-id spec: "N" or "N:N" (all digits). */
@@ -178,7 +252,8 @@ int main(int argc, char **argv) {
 
     int i = 1;
     for (; i < argc && argv[i][0] == '-'; i++) {
-        if (!strcmp(argv[i], "-strace")) m->strace = 1;
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) help();
+        else if (!strcmp(argv[i], "-strace")) m->strace = 1;
         else if (!strcmp(argv[i], "-d")) { g_trace = 1; g_debug_hooks = 1; }
         else if (!strcmp(argv[i], "-nopd")) g_predecode = 0;   /* decode cache off */
         else if (!strcmp(argv[i], "-jit")) g_jit = 1;          /* native translation */

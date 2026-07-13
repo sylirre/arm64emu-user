@@ -21,6 +21,7 @@ translation, and signal delivery — is new for user mode.
 ```
 arm64chroot [options] <rootfs> <program> [args...]
 
+  -h, --help       show detailed help (options + environment variables) and exit
   -strace          log guest syscalls to stderr
   -d               per-instruction trace (very verbose)
   -jit             translate hot basic blocks to native code (AArch64 / x86-64
@@ -30,10 +31,19 @@ arm64chroot [options] <rootfs> <program> [args...]
   -0 ARG0          override argv[0] for the guest program
   -fake-id [ID]    present a fake identity (fakeroot-style); ID = uid | uid:gid,
                    default 0:0 (root)
+  -link2symlink    emulate hardlinks with tracked symlinks where the host forbids
+                   link() (Android/SELinux -> EXDEV)
+  -shared-proc     key the shared guest-PID registry by rootfs so `ps`/`top` see
+                   guest processes across emulator invocations
   -bind src:dst[:ro]  expose host directory `src` at guest path `dst`
                    (repeatable); append `:ro` for a read-only mount. Host paths
                    may not contain ':'.
 ```
+
+`arm64chroot --help` prints the full reference, including environment variables.
+The main tunable is `A64CHROOT_JIT_MB` (per-thread JIT code-cache size in MiB,
+default 32); the JIT debug/bisection knobs are documented in
+[docs/jit.md](docs/jit.md).
 
 `<rootfs>` is a directory tree containing an AArch64 userland (e.g. an Alpine or
 Debian arm64 root filesystem). `/` is allowed to run host-native aarch64 binaries
