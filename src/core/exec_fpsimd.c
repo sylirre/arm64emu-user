@@ -1277,16 +1277,29 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
     unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
     V128 vn = c->v[Rn], r; r.d[0] = r.d[1] = 0;
 
-    /* Lane-size-changing converts (half-precision variants deferred to UNDEF). */
-    if (opc == 0x17 && U == 0) {                 /* FCVTL: .2s -> .2d */
-        if (sz == 0) { fpsimd_undef(c, insn); return; }
+    /* Lane-size-changing converts: FCVTL/FCVTN, both half- and single-precision
+     * source forms (sz selects .4h<->.4s vs .2s<->.2d). */
+    if (opc == 0x17 && U == 0) {                 /* FCVTL: .4h -> .4s or .2s -> .2d */
+        if (sz == 0) {                           /* FCVTL/FCVTL2: .4h -> .4s */
+            unsigned base = Q ? 4 : 0;
+            for (unsigned i = 0; i < 4; i++)
+                vset_s(&r, i, f16_to_f32(vn.h[base + i]));
+            c->v[Rd] = r; return;
+        }
         unsigned base = Q ? 2 : 0;
         vset_d(&r, 0, (double)vget_s(&vn, base));
         vset_d(&r, 1, (double)vget_s(&vn, base + 1));
         c->v[Rd] = r; return;
     }
-    if (opc == 0x16) {                           /* FCVTN (U=0) / FCVTXN (U=1): .2d -> .2s */
-        if (sz == 0) { fpsimd_undef(c, insn); return; }
+    if (opc == 0x16) {                           /* FCVTN (U=0) / FCVTXN (U=1): .2d -> .2s, .4s -> .4h */
+        if (sz == 0) {                           /* FCVTN/FCVTN2: .4s -> .4h (U==0 only; no FCVTXN) */
+            if (U) { fpsimd_undef(c, insn); return; }
+            V128 res; unsigned hbase;
+            if (Q) { res = c->v[Rd]; hbase = 4; } else { res.d[0] = res.d[1] = 0; hbase = 0; }
+            for (unsigned i = 0; i < 4; i++)
+                res.h[hbase + i] = f64_to_f16((double)vget_s(&vn, i));
+            c->v[Rd] = res; return;
+        }
         V128 res; if (Q) res = c->v[Rd]; else { res.d[0] = res.d[1] = 0; }
         unsigned base = Q ? 2 : 0;
         vset_s(&res, base,     (float)vget_d(&vn, 0));
