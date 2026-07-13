@@ -171,6 +171,72 @@ static double fp_rd_d(CPU *c, unsigned n) { double x; u64 b = c->v[n].d[0]; memc
 static float  fp_rd_s(CPU *c, unsigned n) { float  x; u32 b = c->v[n].s[0]; memcpy(&x, &b, 4); return x; }
 static void fp_wr_d(CPU *c, unsigned d, double x) { u64 b; memcpy(&b, &x, 8); c->v[d].d[0] = b; c->v[d].d[1] = 0; }
 static void fp_wr_s(CPU *c, unsigned d, float  x) { u32 b; memcpy(&b, &x, 4); c->v[d].d[0] = b; c->v[d].d[1] = 0; }
+static u16  fp_rd_h(CPU *c, unsigned n) { return c->v[n].h[0]; }
+static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] = 0; }
+
+/* IEEE-754 binary16 <-> binary32/64 conversion in pure integer arithmetic.
+ * The host is not assumed to have _Float16, so these avoid host FP16 support.
+ * Only FCVT uses half precision so far (the rest of the FP16 surface stays on
+ * the on-demand UNDEF path). */
+
+/* binary16 -> binary32, exact (every half value is representable as a single). */
+static float f16_to_f32(u16 h) {
+    u32 sign = (u32)(h & 0x8000u) << 16;
+    u32 exp  = (h >> 10) & 0x1fu;
+    u32 mant = h & 0x3ffu;
+    u32 bits;
+    if (exp == 0x1f) {                        /* Inf / NaN: payload shifts up 13 */
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;                      /* +/- zero */
+        } else {                              /* subnormal half -> normal single */
+            exp = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3ffu;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else {                                  /* normal: rebias exponent by +112 */
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+/* binary64 -> binary16, round-to-nearest-even. This is the single "to half"
+ * routine: S->H widens the float to double first (exact), so one rounding step
+ * here yields the correct single-rounded result without a second routine. */
+static u16 f64_to_f16(double x) {
+    u64 b; memcpy(&b, &x, 8);
+    u16 sign = (u16)((b >> 48) & 0x8000u);
+    u64 mag  = b & 0x7fffffffffffffffULL;              /* |x| bit pattern */
+
+    if (mag >= 0x7ff0000000000000ULL)                  /* Inf / NaN */
+        return (u16)(sign | (mag > 0x7ff0000000000000ULL ? 0x7e00u : 0x7c00u));
+    if (mag == 0) return sign;                         /* +/- zero */
+
+    int he  = (int)(mag >> 52) - 1023 + 15;            /* tentative half exponent */
+    u64 sig = (mag & 0xfffffffffffffULL) | 0x10000000000000ULL; /* 1.frac, bit52 set */
+
+    if (he >= 0x1f) return (u16)(sign | 0x7c00u);      /* overflow -> Inf */
+
+    int shift;
+    if (he > 0) {
+        shift = 42;                                    /* 52 - 10 fraction bits */
+    } else {                                           /* subnormal / underflow */
+        shift = 43 - he;                               /* extra right shift */
+        if (shift >= 54) return sign;                  /* below half a ULP -> +/-0 */
+    }
+
+    u64 rounded  = sig >> shift;
+    u64 rem      = sig & (((u64)1 << shift) - 1);
+    u64 halfway  = (u64)1 << (shift - 1);
+    if (rem > halfway || (rem == halfway && (rounded & 1)))
+        rounded++;                                     /* nearest, ties to even */
+
+    if (he > 0)                                        /* normal: carry bumps exp */
+        return (u16)(sign | (u16)(((he - 1) << 10) + rounded));
+    return (u16)(sign | (u16)rounded);                 /* subnormal (carry -> normal) */
+}
 
 /* Per-lane FP <-> bits accessors for vector ops (lane i of a V128). */
 static float  vget_s(const V128 *v, unsigned i) { float  x; u32 b = v->s[i]; memcpy(&x, &b, 4); return x; }
@@ -224,6 +290,19 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         unsigned opcode = BITS(18, 16);
         if (opcode == 6) { set_x(c, Rd, c->v[Rn].d[1]); return; }   /* FMOV Xd, Vn.D[1] */
         if (opcode == 7) { c->v[Rd].d[1] = reg_x(c, Rn); return; }  /* FMOV Vd.D[1], Xn */
+    }
+
+    /* Half-precision FCVT: FP data-processing (1 source). opcode 0x4/0x5 widen
+     * from half; 0x7 narrows to half. Handled ahead of the general half-
+     * precision deferral below. BIT(21)==1 && BITS(14,10)==0x10 uniquely
+     * selects the 1-source group (BITS(28,24)==0x1e is already guaranteed by
+     * the exec_fpsimd dispatch), excluding FP<->int/fixed, compare, and imm. */
+    if (BIT(21) == 1 && BITS(14, 10) == 0x10) {
+        unsigned opc = BITS(20, 15);
+        if (opc == 0x4 && ftype == 3) { fp_wr_s(c, Rd, f16_to_f32(fp_rd_h(c, Rn))); return; }        /* FCVT Sd,Hn */
+        if (opc == 0x5 && ftype == 3) { fp_wr_d(c, Rd, (double)f16_to_f32(fp_rd_h(c, Rn))); return; } /* FCVT Dd,Hn */
+        if (opc == 0x7 && ftype == 0) { fp_wr_h(c, Rd, f64_to_f16((double)fp_rd_s(c, Rn))); return; } /* FCVT Hd,Sn */
+        if (opc == 0x7 && ftype == 1) { fp_wr_h(c, Rd, f64_to_f16(fp_rd_d(c, Rn))); return; }         /* FCVT Hd,Dn */
     }
 
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }  /* half: on demand */
