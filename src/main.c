@@ -43,7 +43,8 @@ static void usage(void) {
 
 /* Print the program version to stdout and exit 0 (-v/--version). */
 static void version(void) {
-    fputs("arm64chroot " PROGRAM_VERSION "\n", stdout);
+    fputs("Version: " PROGRAM_VERSION "\n", stdout);
+    fputs("GitHub: https://github.com/sylirre/arm64emu-user\n", stdout);
     exit(0);
 }
 
