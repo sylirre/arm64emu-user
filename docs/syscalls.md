@@ -91,12 +91,12 @@ host path. Abstract-namespace sockets (leading NUL in `sun_path`) and
 unnamed/autobind addresses pass through unchanged — abstract sockets share the
 host's global namespace, a known limitation (there is no network namespace).
 When the rootfs prefix pushes the translated path past the 108-byte `sun_path`
-limit, `bind`/`connect`/`sendto` fall back to opening the parent directory and
-binding relative to it via `/proc/self/fd/<fd>/<basename>`, so only the socket
-basename must fit — the residual limits are a basename ≳90 bytes and `sendmsg`
-destination names (which still return `ENAMETOOLONG`). A socket bound through the
-fallback reports that `/proc/self/fd` path from `getsockname` rather than its
-guest path (cosmetic; real software reads back the bound pathname only rarely).
+limit, `bind`/`connect`/`sendto`/`sendmsg` fall back to opening the parent
+directory and operating relative to it via `/proc/self/fd/<fd>/<basename>`, so
+only the socket basename must fit (the residual limit is a basename ≳90 bytes).
+A socket bound through the fallback reports that `/proc/self/fd` path from
+`getsockname` rather than its guest path (cosmetic; real software reads back the
+bound pathname only rarely).
 
 **Special zones** are checked on the canonical guest path before prefixing:
 

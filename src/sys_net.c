@@ -6,8 +6,8 @@
  * pathname sockets carry a filesystem path in sun_path, so bind/connect/sendto/
  * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
  * the kernel reports back is stripped to its guest view (unix_path_out). A
- * translated path that overflows the 108-byte sun_path is bound/connected
- * relative to a parent-directory fd via /proc/self/fd (unix_path_in fallback). */
+ * translated path that overflows the 108-byte sun_path is reached relative to a
+ * parent-directory fd via /proc/self/fd (unix_path_in fallback). */
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -317,7 +317,7 @@ typedef struct {
 static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
                       struct iovec **iov_out, u8 **bounce_out,
                       struct sockaddr_storage *ss, u8 *ctrl, size_t ctrl_cap,
-                      int for_send) {
+                      int for_send, int *dirfd_out) {
     if (copy_from_guest(c, g, va, sizeof *g) < 0) return -EFAULT;
     memset(h, 0, sizeof *h);
     if (g->msg_name && g->msg_namelen) {
@@ -325,14 +325,6 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
         if (copy_from_guest(c, ss, g->msg_name, nl) < 0) return -EFAULT;
         h->msg_name = ss;
         h->msg_namelen = nl;
-        if (for_send) {   /* AF_UNIX dest path -> host (no allocations yet) */
-            socklen_t sl = h->msg_namelen;
-            /* No dirfd fallback here: msg_import returns before the send and
-             * runs in sendmmsg's loop, so a >108-byte dest gets -ENAMETOOLONG. */
-            int tr = unix_path_in(c, ss, &sl, 1, NULL);
-            if (tr < 0) return tr;
-            h->msg_namelen = sl;
-        }
     }
     unsigned cnt = (unsigned)g->msg_iovlen;
     if (cnt > 1024) return -EINVAL;
@@ -367,6 +359,16 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     h->msg_flags = g->msg_flags;
     *iov_out = iov;
     *bounce_out = bounce;
+    /* Translate an AF_UNIX destination path last: unix_path_in may open a dirfd
+     * (for a path that overflows sun_path) which the caller closes after the
+     * send, so doing it after every fallible step above means an error can never
+     * leak that fd. dirfd_out is left -1 by unix_path_in on any error. */
+    if (for_send && h->msg_name) {
+        socklen_t sl = h->msg_namelen;
+        int tr = unix_path_in(c, ss, &sl, 1, dirfd_out);
+        if (tr < 0) { free(iov); free(bounce); return tr; }
+        h->msg_namelen = sl;
+    }
     return (int)cnt;
 }
 
@@ -378,10 +380,12 @@ SYSDEF(sendmsg) {
     u8 *bounce;
     struct sockaddr_storage ss;
     u8 ctrl[4096];
-    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1);
-    if (cnt < 0) return (u64)(s64)cnt;
+    int dfd = -1;
+    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
+    if (cnt < 0) return (u64)(s64)cnt;   /* dfd == -1 on error: nothing to close */
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
     free(iov); free(bounce);
+    if (dfd >= 0) close(dfd);
     return n < 0 ? host_err() : (u64)n;
 }
 
@@ -423,7 +427,7 @@ SYSDEF(recvmsg) {
     u8 *bounce;
     struct sockaddr_storage ss;
     u8 ctrl[4096];
-    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0);
+    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
     if (n < 0) { free(iov); free(bounce); return host_err(); }
@@ -445,10 +449,12 @@ SYSDEF(sendmmsg) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
         GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
-        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1);
-        if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;
+        int dfd = -1;
+        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
+        if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;   /* dfd == -1 */
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
         free(iov); free(bounce);
+        if (dfd >= 0) close(dfd);
         if (n < 0) return sent ? (u64)sent : host_err();
         u32 mlen = (u32)n;
         if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
@@ -468,7 +474,7 @@ SYSDEF(recvmmsg) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
         GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
-        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0);
+        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
         if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
         int mf = flags & ~MSG_WAITFORONE;
         if (got > 0) mf |= MSG_DONTWAIT;   /* only the first message blocks */

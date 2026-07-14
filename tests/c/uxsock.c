@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 
 /* mkdir <dir>, bind <dir>/s, connect, exchange "ping", print "<label>=<msg>".
@@ -56,6 +57,53 @@ static int roundtrip(const char *dir, const char *label) {
     return 0;
 }
 
+/* SOCK_DGRAM sendmsg() to a bound socket at <dir>/d, using msg_name for the
+ * destination — exercises the sendmsg AF_UNIX path (distinct from sendto). With
+ * a long <dir> the emulator's translated dest overflows sun_path and takes the
+ * dirfd fallback. Prints "<label>=<msg>". Returns 0 on success, 1 on failure. */
+static int dgram_roundtrip(const char *dir, const char *label) {
+    char path[256];
+    snprintf(path, sizeof path, "%s/d", dir);
+    mkdir(dir, 0700);
+    unlink(path);
+
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    if (strlen(path) + 1 > sizeof un.sun_path) { fprintf(stderr, "path too long\n"); return 1; }
+    strcpy(un.sun_path, path);
+
+    int srv = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (srv < 0) { perror("socket"); return 1; }
+    if (bind(srv, (struct sockaddr *)&un, sizeof un) < 0) { perror("bind"); return 1; }
+
+    int cli = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (cli < 0) { perror("socket"); return 1; }
+    struct iovec iov = { "ping", 4 };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    msg.msg_name = &un;
+    msg.msg_namelen = sizeof un;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    if (sendmsg(cli, &msg, 0) != 4) { perror("sendmsg"); return 1; }
+
+    char buf[8] = {0};
+    struct iovec riov = { buf, sizeof buf - 1 };
+    struct msghdr rmsg;
+    memset(&rmsg, 0, sizeof rmsg);
+    rmsg.msg_iov = &riov;
+    rmsg.msg_iovlen = 1;
+    ssize_t n = recvmsg(srv, &rmsg, 0);
+    if (n < 0) { perror("recvmsg"); return 1; }
+    printf("%s=%s\n", label, buf);
+
+    close(cli); close(srv);
+    unlink(path);
+    rmdir(dir);
+    return 0;
+}
+
 int main(void) {
     char dir[128];
     /* short path: plain containment */
@@ -63,9 +111,13 @@ int main(void) {
     if (roundtrip(dir, "ux") != 0) return 1;
 
     /* long path: forces the sun_path overflow / dirfd fallback in the emulator */
-    snprintf(dir, sizeof dir, "/tmp/a64ux_deep_%d_%s", (int)getpid(),
-             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const char *pad = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    snprintf(dir, sizeof dir, "/tmp/a64ux_deep_%d_%s", (int)getpid(), pad);
     if (roundtrip(dir, "deep") != 0) return 1;
+
+    /* long path via sendmsg(): exercises the sendmsg dest-name fallback */
+    snprintf(dir, sizeof dir, "/tmp/a64ux_dgram_%d_%s", (int)getpid(), pad);
+    if (dgram_roundtrip(dir, "dgram") != 0) return 1;
 
     printf("bind=ok\n");
     return 0;
