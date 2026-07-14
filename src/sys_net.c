@@ -5,8 +5,12 @@
  * converted explicitly, so the code is correct on ILP32 hosts too. AF_UNIX
  * pathname sockets carry a filesystem path in sun_path, so bind/connect/sendto/
  * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
- * the kernel reports back is stripped to its guest view (unix_path_out). */
+ * the kernel reports back is stripped to its guest view (unix_path_out). A
+ * translated path that overflows the 108-byte sun_path is bound/connected
+ * relative to a parent-directory fd via /proc/self/fd (unix_path_in fallback). */
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -65,8 +69,17 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
  * not the host's. Abstract sockets (sun_path[0]==0, len>off), unnamed/autobind
  * (len<=off), and every non-AF_UNIX family pass through untouched. `follow`
  * selects final-component symlink handling: connect/sendto follow, bind does
- * not. Rewrites the address and its length in place; returns 0 or -errno. */
-static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl, int follow) {
+ * not. Rewrites the address and its length in place; returns 0 or -errno.
+ *
+ * The rootfs prefix can push the host path past the 108-byte sun_path limit.
+ * When it does and `dirfd_out` is non-NULL, only the socket basename need fit:
+ * open the parent directory and rewrite sun_path to "/proc/self/fd/<fd>/<base>"
+ * (the kernel follows that magic symlink to the real directory). The caller
+ * runs the syscall and then closes *dirfd_out. `dirfd_out` is set to -1 unless a
+ * fd was opened; passing NULL keeps the plain -ENAMETOOLONG behavior. */
+static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
+                        int follow, int *dirfd_out) {
+    if (dirfd_out) *dirfd_out = -1;
     if (ss->ss_family != AF_UNIX) return 0;
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
@@ -86,9 +99,26 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl, int 
                          follow ? 0 : PATH_NOFOLLOW_LAST, host, NULL);
     if (r < 0) return r;
     size_t hl = strlen(host);
-    if (hl + 1 > sizeof un->sun_path) return -ENAMETOOLONG;
-    memcpy(un->sun_path, host, hl + 1);
-    *sl = (socklen_t)(poff + hl + 1);
+    if (hl + 1 <= sizeof un->sun_path) {       /* fits directly */
+        memcpy(un->sun_path, host, hl + 1);
+        *sl = (socklen_t)(poff + hl + 1);
+        return 0;
+    }
+    /* Overlong: bind/connect relative to the parent dir so only the basename
+     * lands in sun_path. Needs a caller that will close the returned fd. */
+    if (!dirfd_out) return -ENAMETOOLONG;
+    char *slash = strrchr(host, '/');
+    if (!slash || slash == host) return -ENAMETOOLONG;   /* need a real parent */
+    *slash = 0;                                /* host := parent dir */
+    const char *base = slash + 1;
+    int dfd = open(host, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -errno;
+    char proc[sizeof un->sun_path];
+    int n = snprintf(proc, sizeof proc, "/proc/self/fd/%d/%s", dfd, base);
+    if (n < 0 || (size_t)n >= sizeof proc) { close(dfd); return -ENAMETOOLONG; }
+    memcpy(un->sun_path, proc, (size_t)n + 1);
+    *sl = (socklen_t)(poff + (size_t)n + 1);
+    *dirfd_out = dfd;
     return 0;
 }
 
@@ -119,19 +149,23 @@ SYSDEF(bind) {
     if (nl_is_fd(c->m, (int)a0)) return 0;   /* fake netlink socket: silent success */
     struct sockaddr_storage ss;
     socklen_t sl;
-    int r = addr_in(c, a1, (u32)a2, &ss, &sl);
+    int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
-    if ((r = unix_path_in(c, &ss, &sl, 0)) < 0) return (u64)(s64)r;
-    return bind((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
+    if ((r = unix_path_in(c, &ss, &sl, 0, &dfd)) < 0) return (u64)(s64)r;
+    u64 ret = bind((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
+    if (dfd >= 0) close(dfd);
+    return ret;
 }
 
 SYSDEF(connect) {
     struct sockaddr_storage ss;
     socklen_t sl;
-    int r = addr_in(c, a1, (u32)a2, &ss, &sl);
+    int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
-    if ((r = unix_path_in(c, &ss, &sl, 1)) < 0) return (u64)(s64)r;
-    return connect((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
+    if ((r = unix_path_in(c, &ss, &sl, 1, &dfd)) < 0) return (u64)(s64)r;
+    u64 ret = connect((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
+    if (dfd >= 0) close(dfd);
+    return ret;
 }
 
 SYSDEF(listen) {
@@ -198,14 +232,16 @@ SYSDEF(sendto) {
     struct sockaddr_storage ss;
     socklen_t sl = 0;
     struct sockaddr *dp = NULL;
+    int dfd = -1;
     if (a4 && a5) {
         if (addr_in(c, a4, (u32)a5, &ss, &sl) < 0) { free(buf); return (u64)(s64)-EFAULT; }
-        int tr = unix_path_in(c, &ss, &sl, 1);
+        int tr = unix_path_in(c, &ss, &sl, 1, &dfd);
         if (tr < 0) { free(buf); return (u64)(s64)tr; }
         dp = (struct sockaddr *)&ss;
     }
     ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
     free(buf);
+    if (dfd >= 0) close(dfd);
     return n < 0 ? host_err() : (u64)n;
 }
 
@@ -291,7 +327,9 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
         h->msg_namelen = nl;
         if (for_send) {   /* AF_UNIX dest path -> host (no allocations yet) */
             socklen_t sl = h->msg_namelen;
-            int tr = unix_path_in(c, ss, &sl, 1);
+            /* No dirfd fallback here: msg_import returns before the send and
+             * runs in sendmmsg's loop, so a >108-byte dest gets -ENAMETOOLONG. */
+            int tr = unix_path_in(c, ss, &sl, 1, NULL);
             if (tr < 0) return tr;
             h->msg_namelen = sl;
         }
