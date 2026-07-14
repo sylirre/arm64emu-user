@@ -392,12 +392,12 @@ static void add_bind(struct Machine *m, const char *spec) {
     if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) { ro = 1; dst[dl - 3] = 0; }
     else if (dl >= 3 && !strcmp(dst + dl - 3, ":rw")) { dst[dl - 3] = 0; }
     if (dst[0] != '/') {
-        fprintf(stderr, "arm64chroot: --bind '%s': dst must be absolute\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': destination path must be absolute\n", spec);
         exit(2);
     }
     int k = m->n_binds;
     if (!realpath(src, m->binds[k].host)) {
-        fprintf(stderr, "arm64chroot: --bind src '%s': not found\n", src);
+        fprintf(stderr, "arm64chroot: --bind source path '%s': not found\n", src);
         exit(126);
     }
     if (!strcmp(m->binds[k].host, "/")) {
@@ -405,7 +405,7 @@ static void add_bind(struct Machine *m, const char *spec) {
         exit(2);
     }
     if (canon_guest(dst, m->binds[k].guest) < 0) {
-        fprintf(stderr, "arm64chroot: --bind '%s': dst too long\n", spec);
+        fprintf(stderr, "arm64chroot: --bind '%s': destination path too long\n", spec);
         exit(2);
     }
     if (!strcmp(m->binds[k].guest, "/")) {
@@ -549,12 +549,12 @@ int main(int argc, char **argv) {
     /* -jit yields to per-instruction debug facilities and to hosts without a
      * code generator; the interpreter is always the correct fallback. */
     if (g_jit && g_debug_hooks) {
-        fprintf(stderr, "arm64chroot: --jit disabled by per-instruction "
+        fprintf(stderr, "arm64chroot: JIT disabled by per-instruction "
                         "debug flags, using interpreter\n");
         g_jit = 0;
     }
     if (g_jit && !jit_backend_available()) {
-        fprintf(stderr, "arm64chroot: --jit has no backend for this host, "
+        fprintf(stderr, "arm64chroot: JIT has no backend for this host, "
                         "using interpreter\n");
         g_jit = 0;
     }

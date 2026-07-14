@@ -643,7 +643,7 @@ retry:
             max_insns = n / 2;
             goto retry;
         }
-        fprintf(stderr, "arm64chroot: jit emitter overflow, disabling jit\n");
+        fprintf(stderr, "arm64chroot: JIT emitter overflow, disabling jit\n");
         g_jit = 0;
         return NULL;
     }
@@ -757,7 +757,7 @@ void jit_run(CPU *c) {
     if (UNLIKELY(!env->active)) {
         if (jit_env_init(env, c) < 0) {
             fprintf(stderr,
-                    "arm64chroot: cannot allocate jit code cache, "
+                    "arm64chroot: cannot allocate JIT code cache, "
                     "using interpreter\n");
             g_jit = 0;
             return;
