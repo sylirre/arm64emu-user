@@ -1014,6 +1014,7 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x80045430 /*TIOCGPTN*/, 4, 1 },
     { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
     { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
+    { 0x4b33 /*KDGKBTYPE*/,   1, 1 },   /* char keyboard type, out; ENOTTY off a real VT */
 };
 
 SYSDEF(ioctl) {
