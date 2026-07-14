@@ -82,6 +82,16 @@ parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
 (enforced in the `sys_file.c` handlers via `host_ro`). Binds are listed in the
 synthesized `/proc/mounts` and `/proc/mountinfo`.
 
+**AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
+contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
+`sendmsg` route it through `path_resolve` (`bind` keeps the final component
+literal, the rest follow symlinks), and `getsockname`/`getpeername`/`accept`/
+`recvfrom`/`recvmsg` strip the rootfs prefix back off so the guest never sees a
+host path. Abstract-namespace sockets (leading NUL in `sun_path`) and
+unnamed/autobind addresses pass through unchanged — abstract sockets share the
+host's global namespace, a known limitation (there is no network namespace). The
+108-byte `sun_path` limit can reject a very deep rootfs path with `ENAMETOOLONG`.
+
 **Special zones** are checked on the canonical guest path before prefixing:
 
 - `/dev`: a whitelist passes through to host devices (`null`, `zero`, `full`,
@@ -163,7 +173,10 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
 - **Ownership remap** (proot-style, no per-file database): a file the host
   reports as owned by the **real invoking user** is presented to the guest as
   owned by the **fake identity**; other owners pass through. Applied in
-  `gstat_from_host`, `statx`, and the setuid-exec owner lookup.
+  `gstat_from_host`, `statx`, and the setuid-exec owner lookup. The same remap
+  covers **`SO_PEERCRED`** (`getsockopt` in `sys_net.c`): the peer `ucred`
+  uid/gid the host reports for a Unix socket is remapped to the fake identity so
+  peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()`.
 - **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
   `capget` reporting the full capability set for fake-root. The capability
   *bounding set* (`prctl(PR_CAPBSET_READ/DROP)`) and `PR_SET/GET_KEEPCAPS`

@@ -2,12 +2,16 @@
 /* Copyright 2026 Sylirre */
 /* Socket syscalls. sockaddr layouts (sockaddr_in/in6/un) are identical across
  * arm64/arm/x86; msghdr and cmsghdr differ only in pointer/size_t width and are
- * converted explicitly, so the code is correct on ILP32 hosts too. */
+ * converted explicitly, so the code is correct on ILP32 hosts too. AF_UNIX
+ * pathname sockets carry a filesystem path in sun_path, so bind/connect/sendto/
+ * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
+ * the kernel reports back is stripped to its guest view (unix_path_out). */
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <linux/netlink.h>   /* AF_NETLINK, NETLINK_ROUTE, NETLINK_AUDIT */
@@ -56,12 +60,68 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
     return 0;
 }
 
+/* AF_UNIX pathname sockets carry a filesystem path in sun_path; route it
+ * through the rootfs resolver so bind/connect/sendto reach the guest's socket,
+ * not the host's. Abstract sockets (sun_path[0]==0, len>off), unnamed/autobind
+ * (len<=off), and every non-AF_UNIX family pass through untouched. `follow`
+ * selects final-component symlink handling: connect/sendto follow, bind does
+ * not. Rewrites the address and its length in place; returns 0 or -errno. */
+static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl, int follow) {
+    if (ss->ss_family != AF_UNIX) return 0;
+    struct sockaddr_un *un = (struct sockaddr_un *)ss;
+    const size_t poff = offsetof(struct sockaddr_un, sun_path);
+    if (*sl <= poff) return 0;                 /* unnamed / autobind */
+    if (un->sun_path[0] == '\0') return 0;     /* abstract namespace */
+    size_t maxp = (size_t)*sl - poff;
+    if (maxp > sizeof un->sun_path) maxp = sizeof un->sun_path;
+    char gpath[PATH_MAX];
+    size_t i = 0;
+    for (; i < maxp && un->sun_path[i]; i++) {
+        if (i + 1 >= sizeof gpath) return -ENAMETOOLONG;
+        gpath[i] = un->sun_path[i];
+    }
+    gpath[i] = 0;
+    char host[PATH_MAX];
+    int r = path_resolve(c->m, G_AT_FDCWD, gpath,
+                         follow ? 0 : PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return r;
+    size_t hl = strlen(host);
+    if (hl + 1 > sizeof un->sun_path) return -ENAMETOOLONG;
+    memcpy(un->sun_path, host, hl + 1);
+    *sl = (socklen_t)(poff + hl + 1);
+    return 0;
+}
+
+/* Reverse of unix_path_in: rewrite a host sun_path the kernel reports back
+ * (getsockname/getpeername/accept/recvfrom/recvmsg) to its guest view, so the
+ * guest never sees a host path. No-op for non-AF_UNIX, unnamed, and abstract
+ * addresses. Rewrites the address and its length in place. */
+static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
+    if (ss->ss_family != AF_UNIX) return;
+    struct sockaddr_un *un = (struct sockaddr_un *)ss;
+    const size_t poff = offsetof(struct sockaddr_un, sun_path);
+    if ((size_t)*sl <= poff || un->sun_path[0] == '\0') return;
+    size_t maxp = (size_t)*sl - poff;
+    if (maxp > sizeof un->sun_path) maxp = sizeof un->sun_path;
+    char path[PATH_MAX];
+    size_t i = 0;
+    for (; i < maxp && i + 1 < sizeof path && un->sun_path[i]; i++)
+        path[i] = un->sun_path[i];
+    path[i] = 0;
+    path_strip_rootfs(c->m, path);
+    size_t pl = strlen(path);
+    if (pl + 1 > sizeof un->sun_path) return;   /* leave as-is if it won't fit */
+    memcpy(un->sun_path, path, pl + 1);
+    *sl = (socklen_t)(poff + pl + 1);
+}
+
 SYSDEF(bind) {
     if (nl_is_fd(c->m, (int)a0)) return 0;   /* fake netlink socket: silent success */
     struct sockaddr_storage ss;
     socklen_t sl;
     int r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
+    if ((r = unix_path_in(c, &ss, &sl, 0)) < 0) return (u64)(s64)r;
     return bind((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
 }
 
@@ -70,6 +130,7 @@ SYSDEF(connect) {
     socklen_t sl;
     int r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
+    if ((r = unix_path_in(c, &ss, &sl, 1)) < 0) return (u64)(s64)r;
     return connect((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
 }
 
@@ -82,6 +143,7 @@ SYSDEF(listen) {
 static u64 addr_out(CPU *c, u64 addr_va, u64 len_va, struct sockaddr_storage *ss,
                     socklen_t sl) {
     if (!addr_va || !len_va) return 0;
+    unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
     u32 glen;
     if (copy_from_guest(c, &glen, len_va, 4) < 0) return (u64)(s64)-EFAULT;
     u32 out = sl < glen ? sl : glen;
@@ -138,6 +200,8 @@ SYSDEF(sendto) {
     struct sockaddr *dp = NULL;
     if (a4 && a5) {
         if (addr_in(c, a4, (u32)a5, &ss, &sl) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+        int tr = unix_path_in(c, &ss, &sl, 1);
+        if (tr < 0) { free(buf); return (u64)(s64)tr; }
         dp = (struct sockaddr *)&ss;
     }
     ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
@@ -182,6 +246,20 @@ SYSDEF(getsockopt) {
     u8 buf[4096];
     socklen_t sl = glen;
     if (getsockopt((int)a0, (int)a1, (int)a2, buf, &sl) < 0) return host_err();
+    /* -fake-id: SO_PEERCRED reports the peer's *real* invoking uid/gid; present
+     * the fake identity instead (same remap as stat ownership), so peer-uid
+     * checks — tmux's server ACL, polkit, ... — agree with getuid(). struct
+     * ucred is {pid,uid,gid}, three u32s; the layout is identical on arm64/x86.
+     * The pid is left as the host pid (no guest-view consumer checks it). */
+    if (c->m->fake_id && (int)a1 == SOL_SOCKET && (int)a2 == SO_PEERCRED && sl >= 12) {
+        u32 uid, gid;
+        memcpy(&uid, buf + 4, 4);
+        memcpy(&gid, buf + 8, 4);
+        uid = remap_uid(c->m, uid);
+        gid = remap_gid(c->m, gid);
+        memcpy(buf + 4, &uid, 4);
+        memcpy(buf + 8, &gid, 4);
+    }
     if (a3 && sl && copy_to_guest(c, a3, buf, sl) < 0) return (u64)(s64)-EFAULT;
     u32 real = sl;
     if (a4 && copy_to_guest(c, a4, &real, 4) < 0) return (u64)(s64)-EFAULT;
@@ -211,6 +289,12 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
         if (copy_from_guest(c, ss, g->msg_name, nl) < 0) return -EFAULT;
         h->msg_name = ss;
         h->msg_namelen = nl;
+        if (for_send) {   /* AF_UNIX dest path -> host (no allocations yet) */
+            socklen_t sl = h->msg_namelen;
+            int tr = unix_path_in(c, ss, &sl, 1);
+            if (tr < 0) return tr;
+            h->msg_namelen = sl;
+        }
     }
     unsigned cnt = (unsigned)g->msg_iovlen;
     if (cnt > 1024) return -EINVAL;
@@ -279,8 +363,12 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
         off += iov[i].iov_len;
         left -= (ssize_t)chunk;
     }
-    if (g->msg_name && h->msg_namelen)
+    if (g->msg_name && h->msg_namelen) {
+        socklen_t sl = h->msg_namelen;
+        unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
+        h->msg_namelen = sl;
         copy_to_guest(c, g->msg_name, ss, h->msg_namelen);
+    }
     if (g->msg_control && h->msg_controllen)
         copy_to_guest(c, g->msg_control, ctrl, h->msg_controllen);
     g->msg_namelen = h->msg_namelen;
