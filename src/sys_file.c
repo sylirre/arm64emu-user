@@ -1011,6 +1011,7 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x5418 /*TIOCMSET*/,     4, 2 },   /* set all modem bits (in) */
     { 0x5419 /*TIOCGSOFTCAR*/, 4, 1 },   /* get CLOCAL/soft-carrier flag (out) */
     { 0x541A /*TIOCSSOFTCAR*/, 4, 2 },   /* set CLOCAL/soft-carrier flag (in) */
+    { 0x5420 /*TIOCPKT*/,      4, 2 },   /* enable/disable pty packet mode (in: int); screen's OpenPTY needs it */
     { 0x541B /*FIONREAD*/,   4, 1 },
     { 0x5421 /*FIONBIO*/,    4, 2 },
     { 0x5422 /*TIOCNOTTY*/,  0, 0 },
