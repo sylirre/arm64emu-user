@@ -17,9 +17,8 @@ Emulator has 2 modes:
 
 * Interpreter: very slow, doesn't use translation to host machine code and
   therefore is portable.
-* JIT: fast, available only for AArch64 and x86-64 hosts; needs executable
-  memory (where the host forbids it — SELinux `execmem` — it falls back to a
-  memfd dual-mapping, and failing that to the interpreter).
+* JIT: fast, available only for AArch64 and x86-64 hosts. If SELinux restricts
+  execmem, emulator falls back to memfd dual-mapping or to the interpreter.
 
 If you are interested in a system-mode emulator that can actually boot
 AArch64 Linux disk image, see this repository:
@@ -33,8 +32,8 @@ and JIT. The host is Intel i7-8665U and used benchmark program is
 
 Benchmark configuration: `./Run -i 2 arithmetic dhry syscall context1 spawn`
 
-The final index of single core tests taken into account. Higher the index,
-the faster system is.
+The final index of single core tests taken into account. Higher score means
+the faster execution.
 
 | Setup                  | Benchmark Score |
 |------------------------|-----------------|
@@ -44,56 +43,65 @@ the faster system is.
 | **This (interpreter)** | 93.4            |
 | **This (JIT)**         | 245.6           |
 
+Here we see that `arm64choot` in JIT mode outperforms `qemu-aarch64` (chroot
+with binfmt_misc).
+
 ## Usage
 
-Command line options overview (the built-in `--help` prints this same
-reference, reflowed to the current terminal width):
+Command line options overview. The same reference can be obtained through
+`arm64chroot --help`.
 
 ```
 arm64chroot [options] <rootfs> <program> [args...]
 
-  -h, --help              show this help (options + environment variables)
-  -v, --version           show version and exit
-      --strace            log guest syscalls to stderr
-  -d, --debug             per-instruction trace (very verbose)
-  -j, --jit               translate hot basic blocks to native code (AArch64 /
+  -h, --help              Show this help (options + environment variables)
+  -v, --version           Show version and exit
+      --strace            Log guest syscalls to stderr
+  -d, --debug             Per-instruction trace (very verbose)
+  -j, --jit               Translate hot basic blocks to native code (AArch64 /
                           x86-64 hosts; falls back to the interpreter elsewhere)
-      --no-predecode      disable the decoded-instruction cache (diagnostic; slower)
-  -l, --link2symlink      emulate hardlinks with tracked symlinks where the host
+      --no-predecode      Disable the decoded-instruction cache (diagnostic; slower)
+  -l, --link2symlink      Emulate hardlinks with tracked symlinks where the host
                           forbids link() (Android/SELinux -> EXDEV)
-      --shared-proc       key the shared guest-PID registry by rootfs so `ps`/`top`
+      --shared-proc       Key the shared guest-PID registry by rootfs so `ps`/`top`
                           see guest processes across emulator invocations
-  -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
+  -b, --bind SRC:DST[:ro] Expose host directory `src` at guest path `dst`
                           (repeatable); append `:ro` for a read-only mount. Host
                           paths may not contain ':'.
-  -E, --env VAR=VAL       set/override a guest environment variable (repeatable).
+  -E, --env VAR=VAL       Set/override a guest environment variable (repeatable).
                           The guest does not inherit the host environment; only
                           TERM and COLORTERM are passed through, and -E overrides
                           them.
-  -0, --argv0 ARG0        override argv[0] for the guest program
-  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid | uid:gid,
+  -0, --argv0 ARG0        Override argv[0] for the guest program
+  -u, --fake-id[=ID]      Present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)
-      --share-abstract-sockets  do NOT isolate abstract-namespace AF_UNIX sockets
+      --share-abstract-sockets  Do not isolate abstract-namespace AF_UNIX sockets
                           per rootfs; share the host's global abstract namespace
                           (default: isolate, like pathname sockets)
-  -w, --work-dir DIR      start the guest with this directory as its working
+  -w, --work-dir DIR      Start the guest with this directory as its working
                           directory (a guest path resolved inside the rootfs);
                           default is '/'
 ```
 
 Basic usage example with Alpine Linux rootfs:
 
-```sh
-curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz
-mkdir -p ./alpine
-tar -C alpine -zxf alpine-minirootfs-3.24.1-aarch64.tar.gz
-arm64chroot ./alpine /bin/ash -l
-```
+1. Obtain Alpine Linux rootfs:
+
+   ```sh
+   curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz
+   mkdir -p ./alpine
+   tar -C alpine -zxf alpine-minirootfs-3.24.1-aarch64.tar.gz
+   ```
+
+2. Start emulator:
+   ```sh
+   arm64chroot ./alpine /bin/ash -l
+   ```
 
 The program automatically whitelists access to certain /dev nodes: null, zero,
-full, random, urandom, tty, ptmx, and the pts/ and shm/ trees. console maps to
-the controlling terminal, and stdin/stdout/stderr and fd/* to the process's own
-file descriptors.
+full, random, urandom, tty, ptmx and the directories pts/ and shm/. Console
+maps to the controlling terminal, stdin/stdout/stderr and fd/* to the
+process's own file descriptors.
 
 Many /proc entries are synthesized: maps, cmdline, comm, mounts, mountinfo,
 loadavg, uptime, version. The /proc/stat is being synthesized only when can't
@@ -295,4 +303,5 @@ set, FP/Advanced-SIMD, reciprocal estimates, and cryptographic extensions are
 implemented from the *Arm Architecture Reference Manual* pseudocode;
 `qemu-aarch64` is used only as a differential-testing oracle and is neither
 included nor linked. The `src/core/` interpreter is shared, near-verbatim, with
-the sibling **ARM64EMU_System** emulator under the same license.
+the sibling [ARM64EMU_System](https://github.com/sylirre/arm64emu-system)
+emulator under the same license.
