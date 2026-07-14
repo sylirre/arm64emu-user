@@ -112,17 +112,21 @@ bound pathname only rarely).
   `random`, `urandom`, `tty`, `ptmx`, `pts/*`, `shm/*`, `fd/*`); everything else
   resolves into `rootfs/dev` (usually ENOENT).
 - `/proc`: passes through to host `/proc`, with two guest-view exceptions.
-  The current process's **magic links** — `exe`, `cwd`, `root` in the `self`
-  or own-pid spelling — are spliced to their guest targets during the walk
-  (`path_proc_magic`), so `stat /proc/self/exe` reaches the guest binary and
-  `/proc/self/root/…` resolves inside the rootfs instead of escaping to the
-  host fs; `readlinkat` reports the same guest targets, and strips the rootfs
-  prefix from `fd/N` link targets. And `openat` diverts **synthesized files**
-  (`sys_procfs.c`) to an in-memory guest view: `maps` (from the region list,
-  PTE-true protections, `[heap]`/`[stack]` labels), `cmdline` (exec-time guest
-  argv), `mounts`/`mountinfo` (the rootfs plus the passthrough zones — host
-  `/proc` shows the emulator's mappings, argv and mount namespace, all wrong
-  for the guest), and the global `loadavg`/`uptime`/`version` (Android
+  The **magic links** — `exe`, `cwd`, `root` — are spliced to their guest
+  targets during the walk (`path_proc_magic`), so `stat /proc/self/exe` reaches
+  the guest binary and `/proc/self/root/…` resolves inside the rootfs instead of
+  escaping to the host fs; `readlinkat` reports the same guest targets, and
+  strips the rootfs prefix from `fd/N` link targets. This covers the `self`/
+  own-pid spelling (served from this `Machine`) *and* any other guest PID (`exe`/
+  `cwd` served from the shared PID registry, `root` being the common rootfs), so
+  a child reading `/proc/$$/exe` sees the guest binary, not the emulator. And
+  `openat` diverts **synthesized files** (`sys_procfs.c`) to an in-memory guest
+  view: `maps` (from the region list, PTE-true protections, `[heap]`/`[stack]`
+  labels), `cmdline` (exec-time guest argv), `environ` (exec-time guest
+  environment — the host file shows the emulator's), `mounts`/`mountinfo`/
+  `mountstats` (the rootfs plus the passthrough zones — host `/proc` shows the
+  emulator's mappings, argv, environment and mount namespace, all wrong for the
+  guest), and the global `loadavg`/`uptime`/`version` (Android
   SELinux denies apps the real ones, so they are rebuilt from `sysinfo()`/
   `CLOCK_BOOTTIME` — the same sources guest `sysinfo` marshals, so the views
   agree; `version` is built from the fixed kernel identity `sys_uname`
@@ -151,14 +155,18 @@ bound pathname only rarely).
   is a separate host process (guest PID == host PID) and one emulator instance
   cannot read another's guest state. A shared-memory PID registry (`proctab.c`,
   a `MAP_SHARED` region set up in `main()` before the first `fork`) carries it:
-  each process publishes its NUL-joined argv keyed by PID at `load_elf` and in
-  the `fork` child, with the `/proc/<pid>/stat` starttime as a stale-slot guard
-  against host PID reuse. `procfs_open` then synthesizes `/proc/<pid>/cmdline`
-  for any guest PID (otherwise the host file shows the `arm64chroot …`
-  invocation), and `/proc/<pid>/mounts`/`mountinfo` for any guest PID from the
-  session's own mount table (the guest view is process-independent, so a plain
-  `cat /proc/$$/mountinfo` read by a child no longer leaks the host mount
-  namespace). The same registry powers a **hidden-process view**: the
+  each process publishes its NUL-joined argv, guest exe path, cwd and NUL-joined
+  environ keyed by PID at `load_elf` and in the `fork` child (and refreshes cwd
+  on `chdir`/`fchdir`), with the `/proc/<pid>/stat` starttime as a stale-slot
+  guard against host PID reuse. `procfs_open` then synthesizes
+  `/proc/<pid>/cmdline` and `/proc/<pid>/environ` for any guest PID (otherwise
+  the host files show the `arm64chroot …` invocation and the emulator's
+  environment), and `/proc/<pid>/mounts`/`mountinfo`/`mountstats` for any guest
+  PID from the session's own mount table (the guest view is process-independent,
+  so a plain `cat /proc/$$/mountinfo` read by a child no longer leaks the host
+  mount namespace); `path_proc_magic` likewise resolves another guest PID's
+  `exe`/`cwd` from the registry. The same registry powers a **hidden-process
+  view**: the
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
   PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
   the guest sees only its own process tree — a pid namespace without the

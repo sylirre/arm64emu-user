@@ -285,6 +285,28 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         'p=$$; grep -q "/dev/root" /proc/$p/mountinfo && echo guest || echo host'
     check_procview "other-pid mounts is guest view" "guest" "$ALPINE" /bin/busybox sh -c \
         'p=$$; grep -q "^/dev/root / " /proc/$p/mounts && echo guest || echo host'
+    # exe/cwd/environ/mountstats of another guest pid must be the guest view, not
+    # the emulator binary / host cwd / host env / host mount namespace (regression:
+    # a child reading the parent's /proc/$$/{exe,cwd,environ,mountstats} leaked host
+    # state). The trailing ';:' on the symlink readers defeats ash's last-command
+    # exec optimization, so readlink runs as a real child while $$ stays the shell.
+    # HOSTLEAKMARK is a host-only env var; -E GUESTMARK=1 is a guest-only one.
+    export HOSTLEAKMARK=1
+    check_procview "other-pid exe is guest path" "/bin/busybox" "$ALPINE" /bin/busybox sh -c \
+        'p=$$; readlink /proc/$p/exe; :'
+    check_procview "other-pid cwd is guest path" "/" "$ALPINE" /bin/busybox sh -c \
+        'cd /; p=$$; readlink /proc/$p/cwd; :'
+    check_procview "other-pid cwd tracks chdir" "/tmp" "$ALPINE" /bin/busybox sh -c \
+        'cd /tmp; p=$$; readlink /proc/$p/cwd; :'
+    check_procview "other-pid mountstats is guest view" "guest" "$ALPINE" /bin/busybox sh -c \
+        'p=$$; grep -q "device /dev/root mounted on / " /proc/$p/mountstats && echo guest || echo host'
+    check_procview "other-pid environ shows guest env" "GUESTMARK=1" -E GUESTMARK=1 "$ALPINE" /bin/busybox sh -c \
+        'p=$$; tr "\0" "\n" < /proc/$p/environ | grep "^GUESTMARK="'
+    check_procview "other-pid environ hides host vars" "clean" -E GUESTMARK=1 "$ALPINE" /bin/busybox sh -c \
+        'p=$$; tr "\0" "\n" < /proc/$p/environ | grep -q HOSTLEAKMARK && echo leak || echo clean'
+    check_procview "self environ is guest env" "GUESTMARK=1" -E GUESTMARK=1 "$ALPINE" /bin/busybox sh -c \
+        'tr "\0" "\n" < /proc/self/environ | grep "^GUESTMARK="'
+    unset HOSTLEAKMARK
 fi
 
 # ---- cross-session /proc view (--shared-proc): a guest in one emulator invocation

@@ -16,12 +16,17 @@
  * the guest view. The time-varying files (loadavg/uptime/stat) are also
  * regenerated when a read starts at offset 0 (procfs_pre_read): procps
  * opens them once and lseek(0)+rereads every refresh cycle, so an open-time
- * snapshot would freeze top/vmstat. Under --fake-id, /proc/<pid>/status is also
- * synthesized: the host file's Uid:/Gid:/Groups: lines carry the real invoking
- * uid, but ps/top read them to name the user, so those lines are rewritten
- * through the fake-id remap (a static snapshot; the rest of the file passes
- * through). Everything else under /proc stays host-passthrough — including
- * stat() of these paths (readers open+read). */
+ * snapshot would freeze top/vmstat. environ and mountstats are synthesized like
+ * cmdline and mounts: environ is the guest's own environment (the host file
+ * shows the emulator's), and mountstats is the guest mount device list (the host
+ * file exposes the real mount namespace). For any guest PID (not just self), the
+ * exe/cwd/root symlinks resolve to the guest view too, spliced in path.c from
+ * this Machine (self) or the shared PID registry (another guest process). Under
+ * --fake-id, /proc/<pid>/status is also synthesized: the host file's
+ * Uid:/Gid:/Groups: lines carry the real invoking uid, but ps/top read them to
+ * name the user, so those lines are rewritten through the fake-id remap (a static
+ * snapshot; the rest of the file passes through). Everything else under /proc
+ * stays host-passthrough — including stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -41,7 +46,11 @@
 enum {
     PF_CMDLINE, PF_MAPS, PF_MOUNTS, PF_MOUNTINFO,
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
+    PF_ENVIRON, PF_MOUNTSTATS,
 };
+
+/* put_mounts format selector. */
+enum { MNT_MOUNTS = 0, MNT_MOUNTINFO = 1, MNT_MOUNTSTATS = 2 };
 
 /* Guards the pf_fds refresh registry (one struct Machine per process;
  * these files are opened rarely, so a single lock is fine). */
@@ -82,8 +91,9 @@ static const char *rootfs_fstype(const struct Machine *m) {
 
 /* The guest mount table: the rootfs plus the passthrough zones path.c binds
  * (/proc, /dev/pts, /dev/shm). Fixed mount IDs; the root's major:minor is
- * real so tools cross-referencing stat().st_dev find it. */
-static void put_mounts(int fd, struct Machine *m, int mountinfo) {
+ * real so tools cross-referencing stat().st_dev find it. `fmt` selects the
+ * /proc/<pid>/{mounts,mountinfo,mountstats} rendering (MNT_* above). */
+static void put_mounts(int fd, struct Machine *m, int fmt) {
     const char *fstype = rootfs_fstype(m);
     unsigned maj = 0, min = 0;
     struct stat st;
@@ -105,7 +115,7 @@ static void put_mounts(int fd, struct Machine *m, int mountinfo) {
      * user supplied it); the kernel doesn't tag /proc/mounts entries as "bind",
      * so they read as ordinary mounts, ro or rw per the mount. */
     size_t np = sizeof pseudo / sizeof pseudo[0];
-    if (mountinfo) {
+    if (fmt == MNT_MOUNTINFO) {
         dprintf(fd, "1 1 %u:%u / / rw,relatime - %s /dev/root rw\n",
                 maj, min, fstype);
         for (size_t i = 0; i < np; i++)
@@ -124,6 +134,16 @@ static void put_mounts(int fd, struct Machine *m, int mountinfo) {
                     np + 2 + (size_t)i, bmaj, bmin, m->binds[i].guest, o,
                     fstype, m->binds[i].host, m->binds[i].ro ? "ro" : "rw");
         }
+    } else if (fmt == MNT_MOUNTSTATS) {
+        /* mountstats: a device line per mount (no NFS per-op stats, since these
+         * are all local filesystems). */
+        dprintf(fd, "device /dev/root mounted on / with fstype %s\n", fstype);
+        for (size_t i = 0; i < np; i++)
+            dprintf(fd, "device %s mounted on %s with fstype %s\n",
+                    pseudo[i].src, pseudo[i].dir, pseudo[i].type);
+        for (int i = 0; i < m->n_binds; i++)
+            dprintf(fd, "device %s mounted on %s with fstype %s\n",
+                    m->binds[i].host, m->binds[i].guest, fstype);
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
         for (size_t i = 0; i < np; i++)
@@ -482,21 +502,45 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 1;
     }
 
-    /* /proc/<pid>/mounts and /proc/<pid>/mountinfo of ANOTHER guest process:
-     * the guest mount table is process-independent (this session's rootfs +
-     * binds), so serve it from this Machine instead of leaking the host's real
-     * mount namespace (self / own-pid go through self_tail below). A non-guest
-     * PID misses proctab_has and falls through to the host path's ENOENT. */
+    /* /proc/<pid>/{mounts,mountinfo,mountstats} of ANOTHER guest process: the
+     * guest mount table is process-independent (this session's rootfs + binds),
+     * so serve it from this Machine instead of leaking the host's real mount
+     * namespace (self / own-pid go through self_tail below). A non-guest PID
+     * misses proctab_has and falls through to the host path's ENOENT. */
     s32 mpid;
     const char *mtail = proc_num_tail(canon, &mpid);
     if (mtail && mpid != (s32)getpid() &&
-        (!strcmp(mtail, "mounts") || !strcmp(mtail, "mountinfo"))) {
+        (!strcmp(mtail, "mounts") || !strcmp(mtail, "mountinfo") ||
+         !strcmp(mtail, "mountstats"))) {
         if (!proctab_has(mpid)) return 0;
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
         if (fd < 0) return 0;
-        put_mounts(fd, m, !strcmp(mtail, "mountinfo"));
+        int fmt = !strcmp(mtail, "mountinfo")  ? MNT_MOUNTINFO :
+                  !strcmp(mtail, "mountstats") ? MNT_MOUNTSTATS : MNT_MOUNTS;
+        put_mounts(fd, m, fmt);
+        lseek(fd, 0, SEEK_SET);
+        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        *ret = fd;
+        return 1;
+    }
+
+    /* /proc/<pid>/environ of ANOTHER guest process: served from the guest environ
+     * that process published in the registry (self / own-pid use m->environ via
+     * self_tail below). Off the registry (non-guest / raced) it falls through to
+     * the host path's ENOENT rather than leaking the emulator's own environment. */
+    s32 epid;
+    const char *etail = proc_num_tail(canon, &epid);
+    if (etail && epid != (s32)getpid() && !strcmp(etail, "environ")) {
+        if (!proctab_has(epid)) return 0;
+        if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+        if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+        struct ProcSnap snap;
+        if (!proctab_get(epid, &snap)) return 0;
+        int fd = synth_memfd();
+        if (fd < 0) return 0;
+        if (snap.env_len) { ssize_t w = write(fd, snap.env, snap.env_len); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         *ret = fd;
@@ -522,10 +566,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
 
     const char *tail = self_tail(canon);
     if (tail) {
-        if      (!strcmp(tail, "cmdline"))   kind = PF_CMDLINE;
-        else if (!strcmp(tail, "maps"))      kind = PF_MAPS;
-        else if (!strcmp(tail, "mounts"))    kind = PF_MOUNTS;
-        else if (!strcmp(tail, "mountinfo")) kind = PF_MOUNTINFO;
+        if      (!strcmp(tail, "cmdline"))    kind = PF_CMDLINE;
+        else if (!strcmp(tail, "environ"))    kind = PF_ENVIRON;
+        else if (!strcmp(tail, "maps"))       kind = PF_MAPS;
+        else if (!strcmp(tail, "mounts"))     kind = PF_MOUNTS;
+        else if (!strcmp(tail, "mountinfo"))  kind = PF_MOUNTINFO;
+        else if (!strcmp(tail, "mountstats")) kind = PF_MOUNTSTATS;
         else return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS;   /* the /etc/mtab symlink usually lands here */
@@ -542,6 +588,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 0;
     }
     if (kind == PF_CMDLINE && !m->cmdline) return 0;
+    if (kind == PF_ENVIRON && !m->environ) return 0;
     if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
     if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
 
@@ -550,14 +597,16 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
 
     ssize_t wr = 0;
     switch (kind) {
-    case PF_CMDLINE:   wr = write(fd, m->cmdline, m->cmdline_len); break;
-    case PF_MAPS:      put_maps(fd, m); break;
-    case PF_MOUNTS:    put_mounts(fd, m, 0); break;
-    case PF_MOUNTINFO: put_mounts(fd, m, 1); break;
-    case PF_LOADAVG:   put_loadavg(fd); break;
-    case PF_UPTIME:    put_uptime(fd, m); break;
-    case PF_VERSION:   put_version(fd); break;
-    case PF_STAT:      put_stat(fd, m); break;
+    case PF_CMDLINE:    wr = write(fd, m->cmdline, m->cmdline_len); break;
+    case PF_ENVIRON:    wr = write(fd, m->environ, m->environ_len); break;
+    case PF_MAPS:       put_maps(fd, m); break;
+    case PF_MOUNTS:     put_mounts(fd, m, MNT_MOUNTS); break;
+    case PF_MOUNTINFO:  put_mounts(fd, m, MNT_MOUNTINFO); break;
+    case PF_MOUNTSTATS: put_mounts(fd, m, MNT_MOUNTSTATS); break;
+    case PF_LOADAVG:    put_loadavg(fd); break;
+    case PF_UPTIME:     put_uptime(fd, m); break;
+    case PF_VERSION:    put_version(fd); break;
+    case PF_STAT:       put_stat(fd, m); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);

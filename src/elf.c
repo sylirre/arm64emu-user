@@ -300,10 +300,28 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         m->cmdline = cmd;
         m->cmdline_len = (u32)cl;
     }
-    /* Publish the guest command line in the shared PID registry so other guest
-     * processes' ps/top see it (and this process counts as a guest PID for the
+    /* /proc/self/environ content: the guest envp, NUL-joined (the host file
+     * shows the emulator's own environment). */
+    size_t el = 0;
+    for (int i = 0; i < envc; i++) el += strlen(envp[i]) + 1;
+    char *env = malloc(el ? el : 1);
+    if (env) {
+        size_t off = 0;
+        for (int i = 0; i < envc; i++) {
+            size_t l = strlen(envp[i]) + 1;
+            memcpy(env + off, envp[i], l);
+            off += l;
+        }
+        free(m->environ);
+        m->environ = env;
+        m->environ_len = (u32)el;
+    }
+    /* Publish the guest command line, exe path, cwd and environ in the shared PID
+     * registry so other guest processes' ps/top and /proc/<pid>/{cmdline,environ,
+     * exe,cwd} see the guest view (and this process counts as a guest PID for the
      * hidden /proc view). Covers the initial exec and every execve reload. */
-    proctab_register((s32)getpid(), m->cmdline, m->cmdline_len);
+    proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
+                     m->exec_path, m->cwd, m->environ, m->environ_len);
     /* Present the guest program's name as this process's comm, so
      * /proc/<pid>/comm, status Name: and stat field 2 — which pass through to
      * the host — are right for every guest process, and host-side ps shows

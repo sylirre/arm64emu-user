@@ -67,25 +67,61 @@ static int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     return 0;
 }
 
-/* Magic /proc symlinks of the CURRENT process — exe, cwd, root, in the "self"
- * or own-pid spelling — whose host targets name emulator state (our binary,
- * the host cwd, the host root). Following or reading them raw would leak host
- * paths, and root/… would escape the rootfs entirely, so the resolver walk
- * splices in the *guest* target instead (and readlinkat reports it). Writes
- * the guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
+/* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
+ * state (our binary, the host cwd, the host root). Following or reading them raw
+ * would leak host paths, and root/… would escape the rootfs entirely, so the
+ * resolver walk splices in the *guest* target instead (and readlinkat reports
+ * it). The CURRENT process (self / own-pid spelling) is served from this Machine;
+ * ANOTHER guest process is served the guest exe/cwd it published in the shared
+ * PID registry (root is the shared rootfs). A non-guest or unregistered PID is
+ * not magic, so the host-path resolution / hidden-PID ENOENT stands. Writes the
+ * guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
+    if (strncmp(canon, "/proc/", 6)) return 0;
+    const char *rest = canon + 6;
+
+    /* self / own-pid: this Machine's own live state. */
     const char *tail = NULL;
     if (!strncmp(canon, "/proc/self/", 11)) tail = canon + 11;
-    else if (!strncmp(canon, "/proc/", 6)) {
+    else {
         char own[32];
         int n = snprintf(own, sizeof own, "%d/", getpid());
-        if (n > 0 && !strncmp(canon + 6, own, (size_t)n)) tail = canon + 6 + n;
+        if (n > 0 && !strncmp(rest, own, (size_t)n)) tail = rest + n;
     }
-    if (!tail) return 0;
-    if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
-    if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }
-    if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
-    return 0;
+    if (tail) {
+        if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
+        if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }
+        if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
+        return 0;
+    }
+
+    /* /proc/<N>/<tail> of another process: only a registered guest PID is magic. */
+    if (*rest < '0' || *rest > '9') return 0;
+    s32 pid = 0;
+    const char *p = rest;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        pid = pid * 10 + (*p - '0');
+        if (pid > 0x7fffffff) return 0;
+    }
+    if (*p != '/') return 0;
+    const char *ot = p + 1;
+    if (pid == (s32)getpid() || !proctab_has(pid)) return 0;
+    if (!strcmp(ot, "root")) { strcpy(tgt, "/"); return 1; }
+    int want_exe = !strcmp(ot, "exe"), want_cwd = !strcmp(ot, "cwd");
+    if (!want_exe && !want_cwd) return 0;
+    struct ProcSnap snap;
+    if (!proctab_get(pid, &snap)) return 0;   /* raced away: fall through */
+    if (want_exe) {
+        if (!snap.exe_len) return 0;
+        memcpy(tgt, snap.exe, snap.exe_len);
+        tgt[snap.exe_len] = 0;
+    } else if (snap.cwd_len) {
+        memcpy(tgt, snap.cwd, snap.cwd_len);
+        tgt[snap.cwd_len] = 0;
+    } else {
+        strcpy(tgt, "/");
+    }
+    return 1;
 }
 
 /* Strip the rootfs prefix from a host path in place, yielding the guest path.

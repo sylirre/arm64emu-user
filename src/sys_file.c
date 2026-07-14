@@ -1189,6 +1189,7 @@ SYSDEF(chdir) {
     if (stat(host, &st) < 0) return host_err();
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
     strcpy(c->m->cwd, canon);
+    proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
     return 0;
 }
 
@@ -1207,6 +1208,7 @@ SYSDEF(fchdir) {
         if (buf[rl] == 0) strcpy(c->m->cwd, "/");
         else strcpy(c->m->cwd, buf + rl);
     } else strcpy(c->m->cwd, "/");
+    proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
     return 0;
 }
 
