@@ -155,7 +155,10 @@ bound pathname only rarely).
   the `fork` child, with the `/proc/<pid>/stat` starttime as a stale-slot guard
   against host PID reuse. `procfs_open` then synthesizes `/proc/<pid>/cmdline`
   for any guest PID (otherwise the host file shows the `arm64chroot …`
-  invocation). The same registry powers a **hidden-process view**: the
+  invocation), and `/proc/<pid>/mounts`/`mountinfo` for any guest PID from the
+  session's own mount table (the guest view is process-independent, so a plain
+  `cat /proc/$$/mountinfo` read by a child no longer leaks the host mount
+  namespace). The same registry powers a **hidden-process view**: the
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
   PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
   the guest sees only its own process tree — a pid namespace without the

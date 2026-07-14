@@ -382,22 +382,32 @@ static int synth_memfd(void) {
 #endif
 }
 
-/* True if canon names "/proc/<pid>/status" for a VISIBLE process: self,
- * own-pid, or a registered guest pid. A hidden (non-guest) pid returns 0 so the
- * path layer's ENOENT stands and no foreign process's status can leak -- the
- * same visibility rule proc_other_cmdline relies on. */
-static int status_target(const char *canon) {
-    const char *t = self_tail(canon);
-    if (t) return !strcmp(t, "status");
-    if (strncmp(canon, "/proc/", 6)) return 0;
+/* "/proc/<N>/<leaf>" with N all-digits -> *pid = N, returns the leaf after the
+ * slash (e.g. "status"); NULL if canon isn't of that shape. */
+static const char *proc_num_tail(const char *canon, s32 *pid) {
+    if (strncmp(canon, "/proc/", 6)) return NULL;
     const char *p = canon + 6;
-    if (*p < '0' || *p > '9') return 0;
+    if (*p < '0' || *p > '9') return NULL;
     long n = 0;
     for (; *p >= '0' && *p <= '9'; p++) {
         n = n * 10 + (*p - '0');
-        if (n > 0x7fffffff) return 0;
+        if (n > 0x7fffffff) return NULL;
     }
-    return !strcmp(p, "/status") && proctab_has((s32)n);
+    if (*p != '/') return NULL;
+    *pid = (s32)n;
+    return p + 1;
+}
+
+/* True if canon names "/proc/<pid>/status" for a VISIBLE process: self,
+ * own-pid, or a registered guest pid. A hidden (non-guest) pid returns 0 so the
+ * path layer's ENOENT stands and no foreign process's status can leak -- the
+ * same visibility rule the other-pid handlers rely on. */
+static int status_target(const char *canon) {
+    const char *t = self_tail(canon);
+    if (t) return !strcmp(t, "status");
+    s32 pid;
+    t = proc_num_tail(canon, &pid);
+    return t && !strcmp(t, "status") && proctab_has(pid);
 }
 
 /* Copy the host /proc/<pid>/status through, rewriting only the Uid:/Gid:/Groups:
@@ -442,17 +452,8 @@ static int put_status(int fd, struct Machine *m, const char *canon) {
 
 /* "/proc/<N>/cmdline" with N all-digits -> *pid = N, returns 1; else 0. */
 static int proc_other_cmdline(const char *canon, s32 *pid) {
-    if (strncmp(canon, "/proc/", 6)) return 0;
-    const char *p = canon + 6;
-    if (*p < '0' || *p > '9') return 0;
-    long n = 0;
-    for (; *p >= '0' && *p <= '9'; p++) {
-        n = n * 10 + (*p - '0');
-        if (n > 0x7fffffff) return 0;
-    }
-    if (strcmp(p, "/cmdline")) return 0;
-    *pid = (s32)n;
-    return 1;
+    const char *t = proc_num_tail(canon, pid);
+    return t && !strcmp(t, "cmdline");
 }
 
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
@@ -475,6 +476,27 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fd = synth_memfd();
         if (fd < 0) return 0;
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
+        lseek(fd, 0, SEEK_SET);
+        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        *ret = fd;
+        return 1;
+    }
+
+    /* /proc/<pid>/mounts and /proc/<pid>/mountinfo of ANOTHER guest process:
+     * the guest mount table is process-independent (this session's rootfs +
+     * binds), so serve it from this Machine instead of leaking the host's real
+     * mount namespace (self / own-pid go through self_tail below). A non-guest
+     * PID misses proctab_has and falls through to the host path's ENOENT. */
+    s32 mpid;
+    const char *mtail = proc_num_tail(canon, &mpid);
+    if (mtail && mpid != (s32)getpid() &&
+        (!strcmp(mtail, "mounts") || !strcmp(mtail, "mountinfo"))) {
+        if (!proctab_has(mpid)) return 0;
+        if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+        if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+        int fd = synth_memfd();
+        if (fd < 0) return 0;
+        put_mounts(fd, m, !strcmp(mtail, "mountinfo"));
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         *ret = fd;

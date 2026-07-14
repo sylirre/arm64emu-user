@@ -276,6 +276,15 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         'cat /proc/self/comm'
     check_procview "guest child visible" "ok" "$ALPINE" /bin/busybox sh -c \
         'sleep 55 & p=$!; sleep 0.3; test -r /proc/$p/comm && echo ok || echo missing; kill $p'
+    # another guest pid's mount table must be the guest view (rootfs + binds),
+    # not the host mount namespace (regression: cat /proc/$$/mountinfo, read by a
+    # child, leaked the host's /proc/<pid>/mountinfo). "/dev/root" is the
+    # synthesized root source and never appears in the host table here. Capturing
+    # $$ first forces a separate reader process (own-pid stays via self_tail).
+    check_procview "other-pid mountinfo is guest view" "guest" "$ALPINE" /bin/busybox sh -c \
+        'p=$$; grep -q "/dev/root" /proc/$p/mountinfo && echo guest || echo host'
+    check_procview "other-pid mounts is guest view" "guest" "$ALPINE" /bin/busybox sh -c \
+        'p=$$; grep -q "^/dev/root / " /proc/$p/mounts && echo guest || echo host'
 fi
 
 # ---- cross-session /proc view (--shared-proc): a guest in one emulator invocation
