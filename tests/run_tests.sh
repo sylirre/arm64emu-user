@@ -182,6 +182,41 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     rm -rf "$BSRC" "$BSRC2"
 fi
 
+# ---- -w/--work-dir initial working directory (self-checking; qemu-user has no
+# equivalent). Exercises absolute/relative guest paths, the long form, combining
+# with --bind, and the fatal-on-invalid-path behavior. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_wd() {   # check_wd <label> <expected> <emu args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS workdir: $label"
+        else fail=$((fail+1)); echo "FAIL workdir: $label (want '$expect' got '$got')"; fi
+    }
+    check_wd "default is /"        "/"      "$ALPINE" /bin/busybox pwd
+    check_wd "-w /etc absolute"    "/etc"   -w /etc "$ALPINE" /bin/busybox pwd
+    check_wd "--work-dir long"     "/etc"   --work-dir /etc "$ALPINE" /bin/busybox pwd
+    check_wd "-w etc relative to /" "/etc"  -w etc "$ALPINE" /bin/busybox pwd
+    # combines with --bind: cwd resolves through the bind mount
+    WBSRC=$(mktemp -d)
+    check_wd "-w into a bind mount" "/mnt/w" --bind "$WBSRC:/mnt/w" -w /mnt/w "$ALPINE" /bin/busybox pwd
+    rm -rf "$WBSRC"
+    # invalid dir is fatal (exit 126, message names work-dir); nothing runs.
+    err=$("$EMU" -w /no/such/dir "$ALPINE" /bin/busybox pwd 2>&1 >/dev/null); rc=$?
+    if [ "$rc" -eq 126 ] && printf '%s' "$err" | grep -q "work-dir"; then
+        pass=$((pass+1)); echo "PASS workdir: invalid dir is fatal"
+    else
+        fail=$((fail+1)); echo "FAIL workdir: invalid dir is fatal (rc=$rc err='$err')"
+    fi
+    # a file (non-directory) is rejected too.
+    err=$("$EMU" -w /etc/hosts "$ALPINE" /bin/busybox pwd 2>&1 >/dev/null); rc=$?
+    if [ "$rc" -eq 126 ]; then
+        pass=$((pass+1)); echo "PASS workdir: non-directory is fatal"
+    else
+        fail=$((fail+1)); echo "FAIL workdir: non-directory is fatal (rc=$rc)"
+    fi
+fi
+
 # ---- guest /proc process view (self-checking; qemu also mis-reports these) ----
 # Each guest process is a separate host process (guest PID == host PID); the
 # shared PID registry lets ps/top see guest command lines and hides non-guest

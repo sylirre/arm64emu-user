@@ -69,6 +69,9 @@ arm64chroot [options] <rootfs> <program> [args...]
   -0, --argv0 ARG0        override argv[0] for the guest program
   -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)
+  -w, --work-dir DIR      start the guest with this directory as its working
+                          directory (a guest path resolved inside the rootfs);
+                          default is '/'
 ```
 
 Basic usage example with Alpine Linux rootfs:

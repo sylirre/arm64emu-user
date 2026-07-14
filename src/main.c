@@ -24,17 +24,22 @@
  *   -0, --argv0 ARG0        set argv[0] for the guest program
  *   -u, --fake-id[=ID]      fake identity (fakeroot-style); ID = uid | uid:gid,
  *                           default 0:0 (root)
+ *   -w, --work-dir DIR      start the guest with DIR as its working directory
+ *                           (a guest path resolved inside the rootfs); default /
  */
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "machine.h"
 #include "thread.h"
 #include "jit.h"
+#include "guest_abi.h"
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
@@ -92,6 +97,9 @@ static void help(void) {
 "  -0, --argv0 ARG0        override argv[0] for the guest program\n"
 "  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid or\n"
 "                          uid:gid, default 0:0 (root)\n"
+"  -w, --work-dir DIR      start the guest with this directory as its working\n"
+"                          directory (a guest path resolved inside the rootfs);\n"
+"                          default is '/'\n"
 "      --                  stop option parsing\n"
 "\n"
 "Environment variables:\n"
@@ -303,6 +311,7 @@ int main(int argc, char **argv) {
 #endif
     struct Machine *m = &g_machine;
     const char *argv0 = NULL;
+    const char *work_dir = NULL;
     char **extra_env = NULL;
     int n_extra = 0;
 
@@ -332,6 +341,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
+            else if (!strcmp(n, "work-dir")) work_dir = long_value("--work-dir", val, argv, argc, &i);
             else if (!strcmp(n, "fake-id")) set_fake_id(m, val, argv, argc, &i, &fake_uid, &fake_gid);
             else usage();
         } else {                                       /* short cluster: -abc */
@@ -344,6 +354,7 @@ int main(int argc, char **argv) {
                 else if (c == 'b') { add_bind(m, short_value("--bind", p, argv, argc, &i)); break; }
                 else if (c == 'E') { push_env(&extra_env, &n_extra, short_value("--env", p, argv, argc, &i)); break; }
                 else if (c == '0') { argv0 = short_value("--argv0", p, argv, argc, &i); break; }
+                else if (c == 'w') { work_dir = short_value("--work-dir", p, argv, argc, &i); break; }
                 else if (c == 'u') { set_fake_id(m, p, argv, argc, &i, &fake_uid, &fake_gid); break; }
                 else usage();
             }
@@ -393,6 +404,24 @@ int main(int argc, char **argv) {
         size_t rl = strlen(m->rootfs);
         if (!strncmp(hcwd, m->rootfs, rl) && (hcwd[rl] == '/' || hcwd[rl] == 0))
             strcpy(m->cwd, hcwd[rl] ? hcwd + rl : "/");
+    }
+
+    /* -w/--work-dir overrides the initial cwd with a guest path (resolved inside
+     * the rootfs, honoring -bind and symlinks). An absolute DIR resolves from
+     * guest "/", a relative one against the default cwd above. Must land before
+     * do_execve, which resolves <program> against m->cwd. Fatal on a bad path. */
+    if (work_dir) {
+        char host[PATH_MAX], canon[PATH_MAX];
+        struct stat st;
+        int r = path_resolve(m, G_AT_FDCWD, work_dir, 0, host, canon);
+        if (r == 0 && stat(host, &st) < 0) r = -errno;
+        else if (r == 0 && !S_ISDIR(st.st_mode)) r = -ENOTDIR;
+        if (r < 0) {
+            fprintf(stderr, "arm64chroot: work-dir '%s': %s\n",
+                    work_dir, strerror(-r));
+            return 126;
+        }
+        strcpy(m->cwd, canon);
     }
 
     /* Guest argv: program args as given; argv[0] overridable. */

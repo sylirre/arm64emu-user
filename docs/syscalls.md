@@ -66,7 +66,10 @@ proot) and no privilege (unlike `chroot(2)`). `path_resolve` walks the guest pat
 - `ELOOP` after 40 hops.
 
 `*at` syscalls resolve `dirfd` via the fd's recorded guest path (`AT_FDCWD` → the
-task's canonical cwd string, which is tracked independently of the host cwd).
+task's canonical cwd string, which is tracked independently of the host cwd). That
+string starts at `/` — or, via `-w/--work-dir dir`, at any existing guest directory
+(resolved with `path_resolve`, so `--bind` and symlinks apply); `chdir`/`fchdir`
+update it thereafter.
 
 **`--bind src:dst[:ro]` mounts** are matched first, before the special zones and
 the rootfs prefix: a resolved guest path at or under `dst` maps to `src +
