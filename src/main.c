@@ -5,27 +5,9 @@
  *
  *   arm64chroot [options] <rootfs> <program> [args...]
  *
- * Options (run `arm64chroot --help` for the full reference incl. env vars):
- *   -h, --help              show detailed help and exit
- *       --strace            log syscalls to stderr
- *   -d, --debug             per-instruction trace (very verbose; forces --jit off)
- *   -j, --jit               translate hot basic blocks to native code (AArch64/x86-64)
- *       --no-predecode      disable the decoded-instruction cache (diagnostic; slower)
- *   -l, --link2symlink      emulate hardlinks with tracked symlinks where the host
- *                           forbids link() (e.g. Android/SELinux -> EXDEV). Android only.
- *       --shared-proc       key the shared guest-PID registry by rootfs so ps/top see
- *                           guest processes across emulator invocations
- *   -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
- *                           (repeatable); :ro makes it read-only. Host paths may not
- *                           contain ':'.
- *   -E, --env VAR=VAL       set/override a guest env var (repeatable). The guest
- *                           does NOT inherit the host environment; only TERM and
- *                           COLORTERM are passed through, and -E overrides them.
- *   -0, --argv0 ARG0        set argv[0] for the guest program
- *   -u, --fake-id[=ID]      fake identity (fakeroot-style); ID = uid | uid:gid,
- *                           default 0:0 (root)
- *   -w, --work-dir DIR      start the guest with DIR as its working directory
- *                           (a guest path resolved inside the rootfs); default /
+ * The full option / environment-variable reference lives in help() below
+ * (reachable via -h/--help), which reflows it to the terminal width. Keep the
+ * option strings there and the overview in README.md in sync.
  */
 #include <ctype.h>
 #include <errno.h>
@@ -33,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -56,82 +39,256 @@ static void usage(void) {
     exit(2);
 }
 
+/* --- help renderer: reflow the reference to the terminal width ---------
+ * Layout logic mirrors the proot-distro help renderer (a two-column table
+ * that collapses to a stacked layout on narrow PTYs), minus its coloring. */
+
+#define HELP_MIN_COLS 32   /* clamp for very narrow phone PTYs           */
+#define HELP_MAX_COLS 92   /* clamp so wide terminals stay readable      */
+#define HELP_NARROW   60   /* below this, name+description stack vertically */
+
+/* A named entry (option / argument / env var) with its description. */
+struct help_def { const char *name, *desc; };
+
+/* Terminal width for help output, clamped to [HELP_MIN_COLS, HELP_MAX_COLS].
+ * Help is written to stdout, so probe stdout first, then stdin/stderr, then
+ * $COLUMNS (for redirected runs), finally a sane default. */
+static int help_cols(void) {
+    struct winsize ws;
+    static const int fds[] = { 1, 0, 2 };   /* stdout, stdin, stderr */
+    for (int i = 0; i < 3; i++) {
+        if (ioctl(fds[i], TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+            int c = ws.ws_col;
+            return c < HELP_MIN_COLS ? HELP_MIN_COLS
+                 : c > HELP_MAX_COLS ? HELP_MAX_COLS : c;
+        }
+    }
+    int c = 80;
+    const char *cols = getenv("COLUMNS");
+    if (cols && *cols) { int v = atoi(cols); if (v > 0) c = v; }
+    return c < HELP_MIN_COLS ? HELP_MIN_COLS
+         : c > HELP_MAX_COLS ? HELP_MAX_COLS : c;
+}
+
+/* Greedy word-wrap: emit *text* to *f* wrapped to *width* columns, every line
+ * prefixed with *indent* spaces. Words are never split; a blank line in the
+ * source ("\n\n") starts a new paragraph. When *skip_first* is set the leading
+ * indent of the very first line is suppressed — the caller has already placed
+ * the cursor at column *indent* (used by the two-column table for line 1). */
+static void help_wrap(FILE *f, const char *text, int width, int indent,
+                      int skip_first) {
+    int avail = width - indent;
+    if (avail < 8) avail = 8;
+    const char *p = text;
+    int col = 0;                 /* chars used on the current line (past indent) */
+    int need_indent = !skip_first;
+    while (*p) {
+        if (p[0] == '\n' && p[1] == '\n') {   /* paragraph break */
+            if (col) fputc('\n', f);
+            fputc('\n', f);
+            col = 0;
+            need_indent = 1;
+            p += 2;
+            while (*p == ' ' || *p == '\n') p++;
+            continue;
+        }
+        if (*p == ' ' || *p == '\n') { p++; continue; }
+        const char *e = p;                    /* one word: [p, e) */
+        while (*e && *e != ' ' && *e != '\n') e++;
+        int wlen = (int)(e - p);
+        if (col == 0) {
+            if (need_indent) fprintf(f, "%*s", indent, "");
+            fwrite(p, 1, wlen, f);
+            col = wlen;
+            need_indent = 1;      /* every subsequent line is indented */
+        } else if (col + 1 + wlen <= avail) {
+            fputc(' ', f);
+            fwrite(p, 1, wlen, f);
+            col += 1 + wlen;
+        } else {
+            fprintf(f, "\n%*s", indent, "");
+            fwrite(p, 1, wlen, f);
+            col = wlen;
+        }
+        p = e;
+    }
+    if (col) fputc('\n', f);
+}
+
+/* Render name/description pairs as an aligned two-column table, falling back
+ * to a stacked layout (name on its own line, description indented below) when
+ * the terminal is too narrow to give the description a usable column. */
+static void help_defs(FILE *f, const struct help_def *d, int n, int width) {
+    size_t longest = 0;
+    for (int i = 0; i < n; i++)
+        if (strlen(d[i].name) > longest) longest = strlen(d[i].name);
+
+    int cap = width / 3; if (cap < 16) cap = 16;
+    int opt_col = (int)longest < cap ? (int)longest : cap;
+    int desc_col = width - opt_col - 4;
+    int stacked = width < HELP_NARROW || desc_col < 24;
+
+    for (int i = 0; i < n; i++) {
+        if (stacked) {
+            fprintf(f, "  %s\n", d[i].name);
+            help_wrap(f, d[i].desc, width, 4, 0);
+            continue;
+        }
+        int cont = 2 + opt_col + 2;   /* description column start */
+        if ((int)strlen(d[i].name) <= opt_col) {
+            /* Name and its 2-space pad place the cursor at column *cont*, so
+             * the first description line skips its own indent. */
+            fprintf(f, "  %-*s  ", opt_col, d[i].name);
+            help_wrap(f, d[i].desc, width, cont, 1);
+        } else {
+            fprintf(f, "  %s\n", d[i].name);
+            help_wrap(f, d[i].desc, width, cont, 0);
+        }
+    }
+}
+
+/* Print shell examples, each prefixed with "  $ " and wrapped with a trailing
+ * " \\" continuation so long command lines stay copy-pasteable. */
+static void help_examples(FILE *f, const char *const *ex, int n, int width) {
+    int avail = width - 6; if (avail < 8) avail = 8;   /* -4 prefix, -2 " \\" */
+    for (int i = 0; i < n; i++) {
+        const char *p = ex[i];
+        int first = 1, col = 0;
+        while (*p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            const char *e = p;
+            while (*e && *e != ' ') e++;
+            int wlen = (int)(e - p);
+            if (col == 0) {
+                fputs(first ? "  $ " : "    ", f);
+                fwrite(p, 1, wlen, f);
+                col = wlen;
+            } else if (col + 1 + wlen <= avail) {
+                fputc(' ', f);
+                fwrite(p, 1, wlen, f);
+                col += 1 + wlen;
+            } else {
+                fputs(" \\\n", f);
+                fputs("    ", f);
+                fwrite(p, 1, wlen, f);
+                col = wlen;
+                first = 0;
+            }
+            p = e;
+        }
+        fputc('\n', f);
+    }
+}
+
+/* Blank line, then an UPPERCASE section heading (no rule; no color). */
+static void help_section(FILE *f, const char *title) {
+    fprintf(f, "\n%s\n", title);
+}
+
 /* Full reference help: purpose, usage, arguments, every option, environment
- * variables, and examples. Printed to stdout on -h/--help, exit 0. */
+ * variables, and examples. Reflowed to the terminal width. Printed to stdout
+ * on -h/--help, exit 0. */
 static void help(void) {
-    fputs(
-"arm64chroot -- run an AArch64 (ARM64) Linux program from a rootfs directory\n"
-"under a pure user-space emulator (interpreter by default, optional --jit), with\n"
-"proot-style rootfs containment. No privileges, kernel modules, or dependencies\n"
-"beyond libc are required.\n"
-"\n"
-"Usage:\n"
-"  arm64chroot [options] <rootfs> <program> [args...]\n"
-"\n"
-"Arguments:\n"
-"  <rootfs>    directory tree holding an AArch64 userland (e.g. an Alpine or\n"
-"              Debian arm64 root filesystem); '/' runs host-native aarch64\n"
-"              binaries directly. Guest paths resolve inside the rootfs.\n"
-"  <program>   guest program to execute (a path resolved inside the rootfs).\n"
-"  args...     arguments passed on to the guest program.\n"
-"\n"
-"Options:\n"
-"  -h, --help              show this help and exit\n"
-"      --strace            log guest syscalls to stderr\n"
-"  -d, --debug             per-instruction trace (very verbose; forces --jit off)\n"
-"  -j, --jit               translate hot basic blocks to native code (AArch64 and\n"
-"                          x86-64 hosts; falls back to the interpreter elsewhere)\n"
-"      --no-predecode      disable the decoded-instruction cache (diagnostic;\n"
-"                          slower)\n"
-"  -l, --link2symlink      emulate hardlinks with tracked symlinks where the host\n"
-"                          forbids link() (Android/SELinux -> EXDEV)\n"
-"      --shared-proc       key the shared guest-PID registry by rootfs so that\n"
-"                          ps/top see guest processes across emulator invocations\n"
-"  -b, --bind SRC:DST[:ro] expose host directory SRC at guest path DST\n"
-"                          (repeatable); append :ro for a read-only mount. Host\n"
-"                          paths may not contain ':'.\n"
-"  -E, --env VAR=VAL       set/override a guest environment variable (repeatable).\n"
-"                          The guest does NOT inherit the host environment; only\n"
-"                          TERM and COLORTERM are passed through, and -E overrides\n"
-"                          them.\n"
-"  -0, --argv0 ARG0        override argv[0] for the guest program\n"
-"  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid or\n"
-"                          uid:gid, default 0:0 (root)\n"
-"      --share-abstract-sockets  do NOT isolate abstract-namespace AF_UNIX\n"
-"                          sockets per rootfs; share the host's global abstract\n"
-"                          namespace (default: isolate, like pathname sockets)\n"
-"  -w, --work-dir DIR      start the guest with this directory as its working\n"
-"                          directory (a guest path resolved inside the rootfs);\n"
-"                          default is '/'\n"
-"      --                  stop option parsing\n"
-"\n"
-"Environment variables:\n"
-"  Tuning:\n"
-"    A64CHROOT_JIT_MB     per-thread JIT code-cache size in MiB (default 32,\n"
-"                         clamped to 1-128)\n"
-"    XDG_RUNTIME_DIR      first writable of these holds the --shared-proc\n"
-"    TMPDIR               registry when /dev/shm is not writable; PREFIX is\n"
-"    PREFIX               tried as $PREFIX/tmp (Termux)\n"
-"  Diagnostics / developer (see docs/jit.md):\n"
-"    A64_JIT_STATS        rank instruction words still run via the exec_a64\n"
-"                         helper; =/path dumps the ranking to a file at exit\n"
-"    A64_JIT_DUMP=PREFIX  write each translated block into a sparse code-cache\n"
-"                         image (PREFIX.<pid>.<tid>.code plus a .map)\n"
-"    A64_JIT_PDMAX=N      force predecode ops with id > N through the helper\n"
-"                         (bisects a codegen bug to one instruction class)\n"
-"    A64_JIT_SLOWMEM      force every inline memory op down its slow helper branch\n"
-"    A64_JIT_NOFUSE       disable instruction / D-TLB-probe fusion\n"
-"    A64_JIT_NOFP16       disable FP16 native codegen (AArch64 backend)\n"
-"    A64_JIT_NOVRA        disable the V-register cache\n"
-"    A64_JIT_SSE=2        force SSE2-baseline capability answers (x86-64)\n"
-"    A64_PROCSTAT_FORCE_SYNTH  force the synthetic /proc/stat fallback\n"
-"    A64_NETLINK_FORCE_BLOCK   force the netlink fallback path\n"
-"\n"
-"Examples:\n"
-"  arm64chroot ./rootfs /bin/sh\n"
-"  arm64chroot --jit --fake-id ./rootfs /bin/bash -l\n"
-"  arm64chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh\n",
-        stdout);
+    FILE *f = stdout;
+    int w = help_cols();
+
+    static const struct help_def args[] = {
+        {"<rootfs>",  "directory tree holding an AArch64 userland (e.g. an "
+                      "Alpine or Debian arm64 root filesystem); '/' runs "
+                      "host-native aarch64 binaries directly. Guest paths "
+                      "resolve inside the rootfs."},
+        {"<program>", "guest program to execute (a path resolved inside the "
+                      "rootfs)."},
+        {"args...",   "arguments passed on to the guest program."},
+    };
+    static const struct help_def opts[] = {
+        {"-h, --help",  "show this help and exit"},
+        {"    --strace", "log guest syscalls to stderr"},
+        {"-d, --debug", "per-instruction trace (very verbose; forces --jit off)"},
+        {"-j, --jit",   "translate hot basic blocks to native code (AArch64 and "
+                        "x86-64 hosts; falls back to the interpreter elsewhere)"},
+        {"    --no-predecode", "disable the decoded-instruction cache "
+                        "(diagnostic; slower)"},
+        {"-l, --link2symlink", "emulate hardlinks with tracked symlinks where "
+                        "the host forbids link() (Android/SELinux -> EXDEV)"},
+        {"    --shared-proc", "key the shared guest-PID registry by rootfs so "
+                        "that ps/top see guest processes across emulator "
+                        "invocations"},
+        {"-b, --bind SRC:DST[:ro]", "expose host directory SRC at guest path "
+                        "DST (repeatable); append :ro for a read-only mount. "
+                        "Host paths may not contain ':'."},
+        {"-E, --env VAR=VAL", "set/override a guest environment variable "
+                        "(repeatable). The guest does NOT inherit the host "
+                        "environment; only TERM and COLORTERM are passed "
+                        "through, and -E overrides them."},
+        {"-0, --argv0 ARG0", "override argv[0] for the guest program"},
+        {"-u, --fake-id[=ID]", "present a fake identity (fakeroot-style); ID = "
+                        "uid or uid:gid, default 0:0 (root)"},
+        {"    --share-abstract-sockets", "do NOT isolate abstract-namespace "
+                        "AF_UNIX sockets per rootfs; share the host's global "
+                        "abstract namespace (default: isolate, like pathname "
+                        "sockets)"},
+        {"-w, --work-dir DIR", "start the guest with this directory as its "
+                        "working directory (a guest path resolved inside the "
+                        "rootfs); default is '/'"},
+        {"    --",      "stop option parsing"},
+    };
+    static const struct help_def env_tune[] = {
+        {"A64CHROOT_JIT_MB", "per-thread JIT code-cache size in MiB (default "
+                        "32, clamped to 1-128)"},
+        {"XDG_RUNTIME_DIR, TMPDIR, PREFIX", "first writable of these holds the "
+                        "--shared-proc registry when /dev/shm is not writable; "
+                        "PREFIX is tried as $PREFIX/tmp (Termux)"},
+    };
+    static const struct help_def env_diag[] = {
+        {"A64_JIT_STATS", "rank instruction words still run via the exec_a64 "
+                        "helper; =/path dumps the ranking to a file at exit"},
+        {"A64_JIT_DUMP=PREFIX", "write each translated block into a sparse "
+                        "code-cache image (PREFIX.<pid>.<tid>.code plus a .map)"},
+        {"A64_JIT_PDMAX=N", "force predecode ops with id > N through the helper "
+                        "(bisects a codegen bug to one instruction class)"},
+        {"A64_JIT_SLOWMEM", "force every inline memory op down its slow helper "
+                        "branch"},
+        {"A64_JIT_NOFUSE", "disable instruction / D-TLB-probe fusion"},
+        {"A64_JIT_NOFP16", "disable FP16 native codegen (AArch64 backend)"},
+        {"A64_JIT_NOVRA", "disable the V-register cache"},
+        {"A64_JIT_SSE=2", "force SSE2-baseline capability answers (x86-64)"},
+        {"A64_PROCSTAT_FORCE_SYNTH", "force the synthetic /proc/stat fallback"},
+        {"A64_NETLINK_FORCE_BLOCK", "force the netlink fallback path"},
+    };
+    static const char *const examples[] = {
+        "arm64chroot ./rootfs /bin/sh",
+        "arm64chroot --jit --fake-id ./rootfs /bin/bash -l",
+        "arm64chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro "
+            "./rootfs /bin/sh",
+    };
+
+    help_wrap(f,
+        "arm64chroot -- run an AArch64 (ARM64) Linux program from a rootfs "
+        "directory under a pure user-space emulator (interpreter by default, "
+        "optional --jit), with proot-style rootfs containment. No privileges, "
+        "kernel modules, or dependencies beyond libc are required.", w, 0, 0);
+
+    help_section(f, "USAGE");
+    help_wrap(f, "arm64chroot [options] <rootfs> <program> [args...]", w, 2, 0);
+
+    help_section(f, "ARGUMENTS");
+    help_defs(f, args, (int)(sizeof args / sizeof *args), w);
+
+    help_section(f, "OPTIONS");
+    help_defs(f, opts, (int)(sizeof opts / sizeof *opts), w);
+
+    help_section(f, "ENVIRONMENT");
+    help_wrap(f, "Tuning:", w, 2, 0);
+    help_defs(f, env_tune, (int)(sizeof env_tune / sizeof *env_tune), w);
+    fputc('\n', f);
+    help_wrap(f, "Diagnostics / developer (see docs/jit.md):", w, 2, 0);
+    help_defs(f, env_diag, (int)(sizeof env_diag / sizeof *env_diag), w);
+
+    help_section(f, "EXAMPLES");
+    help_examples(f, examples, (int)(sizeof examples / sizeof *examples), w);
+
     exit(0);
 }
 

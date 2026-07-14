@@ -46,7 +46,8 @@ the faster system is.
 
 ## Usage
 
-Command line options overview:
+Command line options overview (the built-in `--help` prints this same
+reference, reflowed to the current terminal width):
 
 ```
 arm64chroot [options] <rootfs> <program> [args...]
