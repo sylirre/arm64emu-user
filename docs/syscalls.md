@@ -139,7 +139,10 @@ bound pathname only rarely).
   refresh cycle, so an open-time snapshot would freeze `top`. The guest
   program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
-  correctly for every guest process. `/proc/self/fd/N` open/stat stays
+  correctly for every guest process — except that under `--fake-id` the
+  `Uid:`/`Gid:`/`Groups:` lines of `status` are rewritten through the ownership
+  remap (the host file carries the real invoking uid, which `ps`/`top` read to
+  name the user). `/proc/self/fd/N` open/stat stays
   host-passthrough deliberately: host fd == guest fd, and reopen semantics
   (including O_TMPFILE publishing) must keep working.
 
@@ -191,6 +194,11 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   covers **`SO_PEERCRED`** (`getsockopt` in `sys_net.c`): the peer `ucred`
   uid/gid the host reports for a Unix socket is remapped to the fake identity so
   peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()`.
+- **`/proc/<pid>/status`** (`sys_procfs.c`): the `Uid:`/`Gid:`/`Groups:` lines
+  of the passthrough host file carry the real invoking uid, but `ps`/`top` read
+  them (not `getuid()`) to name the USER/GROUP. Under fake-id those lines are
+  synthesized through the same remap — a static snapshot of the host file, self
+  or any visible guest pid — so `ps` shows the fake identity's user.
 - **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
   `capget` reporting the full capability set for fake-root. The capability
   *bounding set* (`prctl(PR_CAPBSET_READ/DROP)`) and `PR_SET/GET_KEEPCAPS`

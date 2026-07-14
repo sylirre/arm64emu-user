@@ -109,6 +109,21 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     check_fakeid "whoami root"      "root"              --fake-id "$ALPINE" /bin/busybox whoami
     check_fakeid "chown to root ok" "0 0"               --fake-id "$ALPINE" /bin/sh -c 'touch /tmp/ci_fk; chown 0:0 /tmp/ci_fk; stat -c "%u %g" /tmp/ci_fk; rm -f /tmp/ci_fk'
     check_fakeid "setuid drop+deny" "ok"                --fake-id "$ALPINE" /bin/busybox sh -c 'id -u >/dev/null; echo ok'
+    # /proc/<pid>/status Uid/Gid must reflect the fake identity: ps/top read the
+    # Uid: line to name the USER, and it otherwise carried the real host uid
+    # (regression: ps showed uid 1000 instead of fake root). Every host uid field
+    # equals the invoking uid, so the remap collapses all four to the fake id
+    # regardless of the CI host's real uid -> deterministic.
+    check_fakeid "status Uid -> fake root" "Uid: 0 0 0 0" --fake-id "$ALPINE" \
+        /bin/busybox awk '/^Uid:/{print $1,$2,$3,$4,$5}' /proc/self/status
+    check_fakeid "status Gid -> fake root" "Gid: 0 0 0 0" --fake-id "$ALPINE" \
+        /bin/busybox awk '/^Gid:/{print $1,$2,$3,$4,$5}' /proc/self/status
+    check_fakeid "status Uid honors 1000:1000" "Uid: 1000 1000 1000 1000" \
+        --fake-id 1000:1000 "$ALPINE" \
+        /bin/busybox awk '/^Uid:/{print $1,$2,$3,$4,$5}' /proc/self/status
+    # another guest pid, through the proctab visibility guard
+    check_fakeid "other-pid status remapped" "0" --fake-id "$ALPINE" /bin/busybox \
+        sh -c 'sleep 5 & p=$!; sleep 0.3; awk "/^Uid:/{print \$2}" /proc/$p/status; kill $p'
     # vfork+exec+wait must reap the child (regression: vfork treated as a thread
     # broke wait4 with ECHILD and corrupted the shared image).
     "$AGCC" -O1 -static -o "$ALPINE/tmp/ci_vfork" tests/fixtures/vfork.c 2>/dev/null &&

@@ -16,8 +16,12 @@
  * the guest view. The time-varying files (loadavg/uptime/stat) are also
  * regenerated when a read starts at offset 0 (procfs_pre_read): procps
  * opens them once and lseek(0)+rereads every refresh cycle, so an open-time
- * snapshot would freeze top/vmstat. Everything else under /proc stays
- * host-passthrough — including stat() of these paths (readers open+read). */
+ * snapshot would freeze top/vmstat. Under --fake-id, /proc/<pid>/status is also
+ * synthesized: the host file's Uid:/Gid:/Groups: lines carry the real invoking
+ * uid, but ps/top read them to name the user, so those lines are rewritten
+ * through the fake-id remap (a static snapshot; the rest of the file passes
+ * through). Everything else under /proc stays host-passthrough — including
+ * stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -378,6 +382,64 @@ static int synth_memfd(void) {
 #endif
 }
 
+/* True if canon names "/proc/<pid>/status" for a VISIBLE process: self,
+ * own-pid, or a registered guest pid. A hidden (non-guest) pid returns 0 so the
+ * path layer's ENOENT stands and no foreign process's status can leak -- the
+ * same visibility rule proc_other_cmdline relies on. */
+static int status_target(const char *canon) {
+    const char *t = self_tail(canon);
+    if (t) return !strcmp(t, "status");
+    if (strncmp(canon, "/proc/", 6)) return 0;
+    const char *p = canon + 6;
+    if (*p < '0' || *p > '9') return 0;
+    long n = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (*p - '0');
+        if (n > 0x7fffffff) return 0;
+    }
+    return !strcmp(p, "/status") && proctab_has((s32)n);
+}
+
+/* Copy the host /proc/<pid>/status through, rewriting only the Uid:/Gid:/Groups:
+ * numeric fields via the fake-id remap so ps/top resolve the fake identity's
+ * user/group (they read the Uid: line, which otherwise carries the emulator's
+ * real host uid). Only called under m->fake_id; canon is the passthrough host
+ * path. Returns 0 on success, -1 if the host file can't be read (caller then
+ * falls through to plain passthrough). */
+static int put_status(int fd, struct Machine *m, const char *canon) {
+    FILE *hf = fopen(canon, "re");
+    if (!hf) return -1;
+    char line[4096];
+    while (fgets(line, sizeof line, hf)) {
+        if (!strncmp(line, "Uid:", 4) || !strncmp(line, "Gid:", 4)) {
+            int is_uid = line[0] == 'U';
+            u32 id[4];   /* real, effective, saved-set, filesystem */
+            if (sscanf(line + 4, "%u %u %u %u",
+                       &id[0], &id[1], &id[2], &id[3]) == 4) {
+                for (int i = 0; i < 4; i++)
+                    id[i] = is_uid ? remap_uid(m, id[i]) : remap_gid(m, id[i]);
+                dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
+                        id[0], id[1], id[2], id[3]);
+                continue;
+            }
+        } else if (!strncmp(line, "Groups:", 7)) {
+            dprintf(fd, "Groups:");
+            const char *p = line + 7;
+            u32 g; int adv;
+            while (sscanf(p, " %u%n", &g, &adv) == 1) {
+                dprintf(fd, " %u", remap_gid(m, g));
+                p += adv;
+            }
+            dprintf(fd, "\n");
+            continue;
+        }
+        size_t len = strlen(line);
+        ssize_t w = write(fd, line, len); (void)w;
+    }
+    fclose(hf);
+    return 0;
+}
+
 /* "/proc/<N>/cmdline" with N all-digits -> *pid = N, returns 1; else 0. */
 static int proc_other_cmdline(const char *canon, s32 *pid) {
     if (strncmp(canon, "/proc/", 6)) return 0;
@@ -413,6 +475,23 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fd = synth_memfd();
         if (fd < 0) return 0;
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
+        lseek(fd, 0, SEEK_SET);
+        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        *ret = fd;
+        return 1;
+    }
+
+    /* /proc/<pid>/status under --fake-id: the host file's Uid:/Gid:/Groups:
+     * lines carry the real invoking uid, but ps/top read them to name the user.
+     * Rewrite those lines through the fake-id remap. Off fake-id the host file
+     * is already correct and passes through. A static snapshot (uid never
+     * changes), so no pf_track refresh entry is needed. */
+    if (m->fake_id && status_target(canon)) {
+        if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+        if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+        int fd = synth_memfd();
+        if (fd < 0) return 0;                       /* no memfd: passthrough */
+        if (put_status(fd, m, canon) < 0) { close(fd); return 0; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         *ret = fd;
