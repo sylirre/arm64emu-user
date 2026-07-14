@@ -1015,6 +1015,14 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
     { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
     { 0x4b33 /*KDGKBTYPE*/,   1, 1 },   /* char keyboard type, out; ENOTTY off a real VT */
+    /* fs reflink (copy-on-write clone) ioctls, arch-independent cmd values.
+     * cp --reflink=auto (coreutils default) issues these on every copy. Guest
+     * fd == host fd, so they forward verbatim; host_err() hands back the real
+     * errno (EOPNOTSUPP/EXDEV) so the guest falls back to a plain copy. Unlike
+     * the tty entries above, FICLONE's "int" payload is a by-value source fd,
+     * not a pointer -> it takes the size-0 int-arg path (a2 passed through). */
+    { 0x40049409 /*FICLONE*/,      0, 0 },
+    { 0x4020940D /*FICLONERANGE*/, 32, 2 }, /* struct file_clone_range: 4 u64, in */
 };
 
 SYSDEF(ioctl) {
