@@ -736,8 +736,19 @@ SYSDEF(faccessat2) {
 }
 
 SYSDEF(readlinkat) {
+    char gpath[PATH_MAX];
+    long gn = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (gn < 0) return (u64)(s64)gn;
+    if (gn == 0) {   /* empty path: readlink the O_PATH symlink fd itself (Linux >= 2.6.39) */
+        char lbuf[PATH_MAX];
+        ssize_t ln = readlinkat((int)(s32)a0, "", lbuf, sizeof lbuf - 1);
+        if (ln < 0) return host_err();
+        size_t out = (size_t)ln < a3 ? (size_t)ln : a3;
+        if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
+        return out;
+    }
     char host[PATH_MAX], canon[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, canon);
+    int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, host, canon);
     if (r < 0) return (u64)(s64)r;
     char buf[PATH_MAX];
     ssize_t rn;
@@ -1057,6 +1068,23 @@ SYSDEF(ioctl) {
         free(buf);
         return (u64)r;
     }
+    /* FS_IOC_GETFLAGS/SETFLAGS carry sizeof(long) in the size field, so the 64-bit
+     * guest word differs from a 32-bit host build's; the handler only touches an int.
+     * Translate to the host-native command and marshal 4 bytes. lsattr/chattr and
+     * systemd-tmpfiles read these to preserve inode attribute flags. */
+    if (cmd == 0x80086601 /*guest FS_IOC_GETFLAGS*/ ||
+        cmd == 0x40086602 /*guest FS_IOC_SETFLAGS*/) {
+        int is_set = (cmd == 0x40086602);
+        unsigned long hcmd = is_set ? _IOW('f', 2, long) : _IOR('f', 1, long);
+        int flags = 0;
+        if (is_set && copy_from_guest(c, &flags, a2, sizeof flags) < 0)
+            return (u64)(s64)-EFAULT;
+        int r = ioctl((int)a0, hcmd, &flags);
+        if (r < 0) return host_err();
+        if (!is_set && copy_to_guest(c, a2, &flags, sizeof flags) < 0)
+            return (u64)(s64)-EFAULT;
+        return (u64)r;
+    }
     /* SIOCGIFINDEX: not in the whitelist below, and Android denies it (EACCES)
      * on the socket glibc opens for if_nametoindex(); resolve it from the host's
      * own interface table instead. Unresolvable names fall through unchanged.
@@ -1350,6 +1378,14 @@ SYSDEF(fchmodat) {
 SYSDEF(fchownat) {
     char host[PATH_MAX];
     unsigned gf = (unsigned)a4;
+    if (gf & G_AT_EMPTY_PATH) {   /* fchownat(fd, "", ..., AT_EMPTY_PATH): operate on the fd */
+        char gpath[PATH_MAX];
+        long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+        if (n < 0) return (u64)(s64)n;
+        if (n == 0)
+            return chattr_result(c->m,
+                fchownat((int)(s32)a0, "", (uid_t)a2, (gid_t)a3, AT_EMPTY_PATH));
+    }
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
     if (r < 0) return (u64)(s64)r;
