@@ -57,6 +57,8 @@ arm64chroot [options] <rootfs> <program> [args...]
   -h, --help              Show this help (options + environment variables)
   -v, --version           Show version and exit
       --strace            Log guest syscalls to stderr
+      --strace-full       Like --strace, but decode pathname arguments to
+                          quoted strings
   -d, --debug             Per-instruction trace (very verbose)
   -j, --jit               Translate hot basic blocks to native code (AArch64 /
                           x86-64 hosts; falls back to the interpreter elsewhere)

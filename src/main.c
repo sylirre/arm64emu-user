@@ -219,6 +219,8 @@ static void help(void) {
         {"-h, --help",  "Show this help and exit."},
         {"-v, --version", "Show version and exit."},
         {"    --strace", "Log guest syscalls to stderr."},
+        {"    --strace-full", "Like --strace, but decode pathname arguments to "
+                        "quoted strings."},
         {"-d, --debug", "Per-instruction trace. Very verbose, disables JIT."},
         {"-j, --jit",   "Translate hot basic blocks to native code on AArch64 and "
                         "x86-64 hosts. Falls back to the interpreter elsewhere."},
@@ -515,6 +517,7 @@ int main(int argc, char **argv) {
             if      (!strcmp(n, "help"))         { if (val) opt_no_value(arg); help(); }
             else if (!strcmp(n, "version"))      { if (val) opt_no_value(arg); version(); }
             else if (!strcmp(n, "strace"))       { if (val) opt_no_value(arg); m->strace = 1; }
+            else if (!strcmp(n, "strace-full"))   { if (val) opt_no_value(arg); m->strace = 1; m->strace_full = 1; }
             else if (!strcmp(n, "debug"))        { if (val) opt_no_value(arg); g_trace = 1; g_debug_hooks = 1; }
             else if (!strcmp(n, "jit"))          { if (val) opt_no_value(arg); g_jit = 1; }
             else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_predecode = 0; }

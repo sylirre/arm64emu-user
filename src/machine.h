@@ -131,6 +131,7 @@ struct Machine {
 
     /* Flags */
     int strace;               /* -strace */
+    int strace_full;          /* --strace-full: decode pathname args in the trace */
     int link2symlink;         /* -link2symlink: emulate hardlinks with tracked
                                * symlinks where the host forbids link() (Android) */
     u8 shared_proc;           /* -shared-proc: back the guest-PID registry with a

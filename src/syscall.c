@@ -296,6 +296,26 @@ static const struct {
 static sysfn table[G_NR_MAX];
 static const char *names[G_NR_MAX];
 
+/* --strace-full: per-syscall bitmask of which arguments (bit i = arg i, a0..a5)
+ * are guest pathname pointers, so the trace can print the string instead of the
+ * raw hex address. Only input pathnames are decoded; output buffers (getcwd,
+ * readlinkat/getxattr value) and fd-based variants are deliberately left hex. */
+static u8 path_arg_mask[G_NR_MAX];
+static const struct { u16 nr; u8 mask; } pathdefs[] = {
+    { G_NR_openat, 0x02 }, { G_NR_mkdirat, 0x02 }, { G_NR_unlinkat, 0x02 },
+    { G_NR_faccessat, 0x02 }, { G_NR_faccessat2, 0x02 }, { G_NR_fchmodat, 0x02 },
+    { G_NR_fchownat, 0x02 }, { G_NR_readlinkat, 0x02 }, { G_NR_newfstatat, 0x02 },
+    { G_NR_utimensat, 0x02 }, { G_NR_statx, 0x02 }, { G_NR_inotify_add_watch, 0x02 },
+    { G_NR_execveat, 0x02 },
+    { G_NR_statfs, 0x01 }, { G_NR_truncate, 0x01 }, { G_NR_chdir, 0x01 },
+    { G_NR_execve, 0x01 },
+    { G_NR_setxattr, 0x01 }, { G_NR_lsetxattr, 0x01 }, { G_NR_getxattr, 0x01 },
+    { G_NR_lgetxattr, 0x01 }, { G_NR_listxattr, 0x01 }, { G_NR_llistxattr, 0x01 },
+    { G_NR_removexattr, 0x01 }, { G_NR_lremovexattr, 0x01 },
+    { G_NR_symlinkat, 0x05 },                       /* a0 target, a2 linkpath */
+    { G_NR_linkat, 0x0A }, { G_NR_renameat, 0x0A }, { G_NR_renameat2, 0x0A },
+};
+
 /* Syscalls whose correct emulated behavior IS a silent -ENOSYS: calls libcs
  * probe for and gracefully fall back from, plus everything not meaningfully
  * emulatable in a user-mode chroot (privileged, host-global, or introspection
@@ -335,6 +355,29 @@ static void table_init(void) {
         table[defs[i].nr] = defs[i].fn;
         names[defs[i].nr] = defs[i].name;
     }
+    for (size_t i = 0; i < sizeof pathdefs / sizeof pathdefs[0]; i++)
+        path_arg_mask[pathdefs[i].nr] = pathdefs[i].mask;
+}
+
+/* Longest guest pathname the trace captures; longer strings fall back to hex. */
+#define STRACE_STR_MAX 512
+
+/* Render a captured guest string as a C-style quoted literal into dst, escaping
+ * '"', '\\', and non-printable bytes as \xHH. dst should hold 4*len+4 bytes;
+ * output is always NUL-terminated. */
+static void strace_quote(char *dst, size_t dstsz, const char *src) {
+    size_t j = 0;
+    if (j < dstsz) dst[j++] = '"';
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        char tmp[5]; size_t rlen;
+        if (*p == '"' || *p == '\\')          { tmp[0] = '\\'; tmp[1] = (char)*p; rlen = 2; }
+        else if (*p >= 0x20 && *p < 0x7f)     { tmp[0] = (char)*p; rlen = 1; }
+        else { snprintf(tmp, sizeof tmp, "\\x%02x", *p); rlen = 4; }
+        if (j + rlen + 2 > dstsz) break;      /* keep room for closing quote + NUL */
+        memcpy(dst + j, tmp, rlen); j += rlen;
+    }
+    if (j + 1 < dstsz) dst[j++] = '"';
+    dst[j] = '\0';
 }
 
 void syscall_return(CPU *c, u64 ret) { c->x[0] = ret; }
@@ -352,6 +395,19 @@ void syscall_dispatch(CPU *c) {
     g_tls.sc_svc_pc = c->pc - 4;
     g_tls.sc_orig_x0 = a0;
     g_tls.sc_nr = nr;
+
+    /* --strace-full: snapshot pathname args before the handler runs, since
+     * execve/execveat replace the address space on success. */
+    char sbuf[6][STRACE_STR_MAX];
+    char shave[6] = { 0 };
+    if (m->strace_full && nr < G_NR_MAX && path_arg_mask[nr]) {
+        u64 av[6] = { a0, a1, a2, a3, a4, a5 };
+        u8 mask = path_arg_mask[nr];
+        for (int i = 0; i < 6; i++)
+            if ((mask & (1u << i)) &&
+                copy_str_from_guest(c, sbuf[i], av[i], STRACE_STR_MAX) >= 0)
+                shave[i] = 1;
+    }
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;
@@ -377,12 +433,29 @@ void syscall_dispatch(CPU *c) {
 
     if (m->strace) {
         const char *name = (nr < G_NR_MAX && names[nr]) ? names[nr] : "?";
-        fprintf(stderr, "%d %s(%llu,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx) = %lld\n",
-                getpid(), name, (unsigned long long)nr,
-                (unsigned long long)a0, (unsigned long long)a1,
-                (unsigned long long)a2, (unsigned long long)a3,
-                (unsigned long long)a4, (unsigned long long)a5,
-                (long long)(s64)ret);
+        if (!m->strace_full) {
+            fprintf(stderr, "%d %s(%llu,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx) = %lld\n",
+                    getpid(), name, (unsigned long long)nr,
+                    (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)a2, (unsigned long long)a3,
+                    (unsigned long long)a4, (unsigned long long)a5,
+                    (long long)(s64)ret);
+        } else {
+            /* Same column layout as above, but masked pathname args print as a
+             * quoted string instead of hex. */
+            u64 av[6] = { a0, a1, a2, a3, a4, a5 };
+            char q[STRACE_STR_MAX * 4 + 4];
+            fprintf(stderr, "%d %s(%llu", getpid(), name, (unsigned long long)nr);
+            for (int i = 0; i < 6; i++) {
+                if (shave[i]) {
+                    strace_quote(q, sizeof q, sbuf[i]);
+                    fprintf(stderr, ",%s", q);
+                } else {
+                    fprintf(stderr, ",0x%llx", (unsigned long long)av[i]);
+                }
+            }
+            fprintf(stderr, ") = %lld\n", (long long)(s64)ret);
+        }
     }
     syscall_return(c, ret);
 }

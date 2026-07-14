@@ -23,7 +23,13 @@ with a one-shot stderr warning naming it — invaluable during bring-up.
 probes them and falls back, so ENOSYS is the correct emulated answer, not a stub.
 
 The `--strace` flag prints one line per syscall in a qemu-compatible format; it is
-the primary bring-up instrument (diff against `qemu-aarch64 -strace`).
+the primary bring-up instrument (diff against `qemu-aarch64 -strace`). `--strace-full`
+is the same trace but decodes pathname arguments (of `openat`, `execve`, the `*at`
+family, `statfs`, the `*xattr` calls, …) into quoted strings — plain `--strace`
+stays byte-identical so it remains diffable. The path-argument positions live in a
+small `path_arg_mask[]` table beside the dispatch table in `src/syscall.c`; each
+string is snapshotted *before* the handler runs so `execve` still shows its program
+path after the address space is replaced.
 
 ## Struct marshalling: always convert
 
