@@ -62,7 +62,10 @@ arm64chroot [options] <rootfs> <program> [args...]
   -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
                           (repeatable); append `:ro` for a read-only mount. Host
                           paths may not contain ':'.
-  -E, --env VAR=VAL       set an environment variable for the guest (repeatable)
+  -E, --env VAR=VAL       set/override a guest environment variable (repeatable).
+                          The guest does not inherit the host environment; only
+                          TERM and COLORTERM are passed through, and -E overrides
+                          them.
   -0, --argv0 ARG0        override argv[0] for the guest program
   -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)

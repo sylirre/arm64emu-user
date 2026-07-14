@@ -122,6 +122,30 @@ fork done rc=0" "$ALPINE" /tmp/ci_vfork
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
+# ---- guest env inheritance (self-checking; qemu-user inherits the full host
+# env by design, so this cannot be differential). Only TERM/COLORTERM are passed
+# through from the host; -E/--env adds and overrides. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_env() {   # check_env <label> <expected> <got>
+        if [ "$3" = "$2" ]; then pass=$((pass+1)); echo "PASS env: $1"
+        else fail=$((fail+1)); echo "FAIL env: $1 (want '$2' got '$3')"; fi
+    }
+    # A non-terminal host var must NOT reach the guest.
+    check_env "host var not leaked" "none" \
+        "$(A64_ENV_LEAK=leaked "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "${A64_ENV_LEAK:-none}"' 2>/dev/null)"
+    # TERM / COLORTERM are the only inherited host vars.
+    check_env "TERM inherited" "xterm-a64test" \
+        "$(TERM=xterm-a64test "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "$TERM"' 2>/dev/null)"
+    check_env "COLORTERM inherited" "truecolor" \
+        "$(COLORTERM=truecolor "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "$COLORTERM"' 2>/dev/null)"
+    # -E precedes the inherited pair, so it overrides host TERM.
+    check_env "-E overrides host TERM" "flagval" \
+        "$(TERM=hostval "$EMU" -E TERM=flagval "$ALPINE" /bin/busybox sh -c 'echo "$TERM"' 2>/dev/null)"
+    # -E adds a variable the host never had.
+    check_env "-E sets a fresh var" "bar" \
+        "$("$EMU" -E A64CH_FOO=bar "$ALPINE" /bin/busybox sh -c 'echo "${A64CH_FOO:-none}"' 2>/dev/null)"
+fi
+
 # ---- --bind mounts (self-checking; qemu has no bind-mount concept). Exercises
 # forward mapping, symlink containment inside a bind, reverse mapping (cwd),
 # dst canonicalization, longest-prefix nesting, :ro enforcement, and the

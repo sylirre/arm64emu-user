@@ -18,7 +18,9 @@
  *   -b, --bind SRC:DST[:ro] expose host directory `src` at guest path `dst`
  *                           (repeatable); :ro makes it read-only. Host paths may not
  *                           contain ':'.
- *   -E, --env VAR=VAL       set an environment variable for the guest (repeatable)
+ *   -E, --env VAR=VAL       set/override a guest env var (repeatable). The guest
+ *                           does NOT inherit the host environment; only TERM and
+ *                           COLORTERM are passed through, and -E overrides them.
  *   -0, --argv0 ARG0        set argv[0] for the guest program
  *   -u, --fake-id[=ID]      fake identity (fakeroot-style); ID = uid | uid:gid,
  *                           default 0:0 (root)
@@ -83,7 +85,10 @@ static void help(void) {
 "  -b, --bind SRC:DST[:ro] expose host directory SRC at guest path DST\n"
 "                          (repeatable); append :ro for a read-only mount. Host\n"
 "                          paths may not contain ':'.\n"
-"  -E, --env VAR=VAL       set an environment variable for the guest (repeatable)\n"
+"  -E, --env VAR=VAL       set/override a guest environment variable (repeatable).\n"
+"                          The guest does NOT inherit the host environment; only\n"
+"                          TERM and COLORTERM are passed through, and -E overrides\n"
+"                          them.\n"
 "  -0, --argv0 ARG0        override argv[0] for the guest program\n"
 "  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid or\n"
 "                          uid:gid, default 0:0 (root)\n"
@@ -398,13 +403,28 @@ int main(int argc, char **argv) {
     gargv[gargc] = NULL;
     if (argv0) gargv[0] = (char *)argv0;
 
-    /* Guest environ: host environment plus -E overrides. */
-    int henvc = 0;
-    while (environ[henvc]) henvc++;
-    char **genv = malloc(sizeof(char *) * (size_t)(henvc + n_extra + 1));
+    /* Guest environ: a clean environment. Only the host's terminal-appearance
+     * variables (TERM, COLORTERM) are inherited; every other host variable
+     * (PATH, HOME, LD_*, XDG_*, ...) refers to the host, not the guest rootfs.
+     * -E/--env entries come first and win: a host var is inherited only when no
+     * -E entry already sets that key. (Emitting both as duplicates is not
+     * enough -- getenv() would return the -E copy but a shell importing envp
+     * keeps the *last* duplicate, i.e. the host value, defeating the override.)
+     * Callers re-add anything else they need with -E. */
+    static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
+    int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
+    char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + 1));
     int ge = 0;
-    for (int k = 0; k < henvc; k++) genv[ge++] = environ[k];
     for (int k = 0; k < n_extra; k++) genv[ge++] = extra_env[k];
+    for (int k = 0; k < n_keep; k++) {
+        size_t kl = strlen(host_keep[k]);
+        int overridden = 0;
+        for (int j = 0; j < n_extra; j++)
+            if (!strncmp(extra_env[j], host_keep[k], kl)) { overridden = 1; break; }
+        if (overridden) continue;                 /* -E already set this key */
+        for (char **e = environ; *e; e++)
+            if (!strncmp(*e, host_keep[k], kl)) { genv[ge++] = *e; break; }
+    }
     genv[ge] = NULL;
 
     as_init(&m->as);
