@@ -1652,13 +1652,45 @@ SYSDEF(pselect6) {
 }
 
 SYSDEF(splice) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return (u64)(s64)-ENOSYS;   /* rarely required; fall back path exists */
+    /* splice(fd_in, off_in*, fd_out, off_out*, len, flags). Guest fd == host fd,
+     * so the fds pass straight through; the optional loff_t* offsets are
+     * marshalled like sendfile's, and the SPLICE_F_* flags are arch-generic.
+     * GNU grep (>=3.5) relies on splice for its input->output fast path and,
+     * because splice always exists on a real kernel, treats -ENOSYS as a fatal
+     * I/O error ("(standard input): Function not implemented") -- so we forward
+     * to the host rather than stub. */
+    loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
+    if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    ssize_t n;
+#ifdef __BIONIC__
+    n = syscall(SYS_splice, (int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+#else
+    n = splice((int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+#endif
+    if (n < 0) return host_err();
+    if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    if (outp) { s64 g = out_off; if (copy_to_guest(c, a3, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    return (u64)n;
 }
 
 SYSDEF(copy_file_range) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return (u64)(s64)-ENOSYS;   /* callers fall back to read/write */
+    /* copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags). Same offset
+     * marshalling as splice; forwarded so callers that don't fall back on ENOSYS
+     * (like splice's grep case) keep working. */
+    loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
+    if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    ssize_t n;
+#ifdef __BIONIC__
+    n = syscall(SYS_copy_file_range, (int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+#else
+    n = copy_file_range((int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+#endif
+    if (n < 0) return host_err();
+    if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    if (outp) { s64 g = out_off; if (copy_to_guest(c, a3, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    return (u64)n;
 }
 
 SYSDEF(flock) {
