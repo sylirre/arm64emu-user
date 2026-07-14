@@ -53,6 +53,7 @@ reference, reflowed to the current terminal width):
 arm64chroot [options] <rootfs> <program> [args...]
 
   -h, --help              show this help (options + environment variables)
+  -v, --version           show version and exit
       --strace            log guest syscalls to stderr
   -d, --debug             per-instruction trace (very verbose)
   -j, --jit               translate hot basic blocks to native code (AArch64 /

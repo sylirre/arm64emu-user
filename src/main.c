@@ -26,6 +26,8 @@
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
+#define PROGRAM_VERSION "1.0.0"
+
 struct Machine g_machine;
 
 extern char **environ;
@@ -37,6 +39,12 @@ static void usage(void) {
             "usage: arm64chroot [options] <rootfs> <program> [args...]\n"
             "try 'arm64chroot --help' for details\n");
     exit(2);
+}
+
+/* Print the program version to stdout and exit 0 (-v/--version). */
+static void version(void) {
+    fputs("arm64chroot " PROGRAM_VERSION "\n", stdout);
+    exit(0);
 }
 
 /* --- help renderer: reflow the reference to the terminal width ---------
@@ -204,6 +212,7 @@ static void help(void) {
     };
     static const struct help_def opts[] = {
         {"-h, --help",  "show this help and exit"},
+        {"-v, --version", "show version and exit"},
         {"    --strace", "log guest syscalls to stderr"},
         {"-d, --debug", "per-instruction trace (very verbose; forces --jit off)"},
         {"-j, --jit",   "translate hot basic blocks to native code (AArch64 and "
@@ -492,6 +501,7 @@ int main(int argc, char **argv) {
             if (eq) { *eq = '\0'; val = eq + 1; }      /* argv is writable */
             const char *n = arg + 2;
             if      (!strcmp(n, "help"))         { if (val) opt_no_value(arg); help(); }
+            else if (!strcmp(n, "version"))      { if (val) opt_no_value(arg); version(); }
             else if (!strcmp(n, "strace"))       { if (val) opt_no_value(arg); m->strace = 1; }
             else if (!strcmp(n, "debug"))        { if (val) opt_no_value(arg); g_trace = 1; g_debug_hooks = 1; }
             else if (!strcmp(n, "jit"))          { if (val) opt_no_value(arg); g_jit = 1; }
@@ -509,6 +519,7 @@ int main(int argc, char **argv) {
             for (char *p = arg + 1; *p; ) {
                 char c = *p++;
                 if      (c == 'h') help();
+                else if (c == 'v') version();
                 else if (c == 'd') { g_trace = 1; g_debug_hooks = 1; }
                 else if (c == 'j') g_jit = 1;
                 else if (c == 'l') m->link2symlink = 1;
