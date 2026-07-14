@@ -1,22 +1,50 @@
-# arm64chroot — AArch64 Linux user-space emulator
+# arm64chroot
 
-Run an **AArch64 (ARM64) Linux** program from a rootfs directory on any Linux
-host — **ARM32, ARM64, x86, or x86-64** — with no privileges, no kernel modules,
-and no dependencies beyond libc. It's `qemu-aarch64` user-mode plus `proot`-style
-rootfs containment in one small C11 program. Interpreter by default, with an
-**optional JIT** (`--jit`) for AArch64 and x86-64 hosts (see [docs/jit.md](docs/jit.md)).
+This is Linux user-space emulator for running unprivileged, isolated
+AArch64 chroot environments.
 
-```sh
-make
-./arm64chroot ./path/to/rootfs /bin/bash -l
-```
+Utility was developed as runtime engine for my other project —
+[terminal app](https://github.com/sylirre/ghostty-android-terminal) for
+Android OS. Being loaded through JNI there is no need even for a single
+`execve()` call, so it falls through SELinux barrier. It can even ignore
+`noexec` mount option and absence of executable bit in file access mode.
 
-The instruction decode/execute core is shared with the sibling **`ARM64EMU_System`**
-full-system emulator (`src/core/` is copied from it, near-verbatim); everything
-else — the guest address space, ELF loader, syscall layer, rootfs path
-translation, and signal delivery — is new for user mode.
+Specifically for Android there also link2symlink option for emulating
+hard links where they are restricted by SELinux, approach similar to used by
+[proot](https://github.com/termux/proot).
+
+Emulator has 2 modes:
+
+* Interpreter: very slow, doesn't use translation to host machine code and
+  therefore is portable.
+* JIT: fast, available only for AArch64 and x86-64 hosts, requires execmem.
+
+If you are interested in a system-mode emulator that can actually boot
+AArch64 Linux disk image, see this repository:
+https://github.com/sylirre/arm64emu-system
+
+## Benchmark
+
+Below is a comparison between native execution, proot, arm64chroot interpreter
+and JIT. The host is Intel i7-8665U and used benchmark program is
+[byte-unixbench](https://github.com/kdlucas/byte-unixbench).
+
+Benchmark configuration: `./Run -i 2 arithmetic dhry syscall context1 spawn`
+
+The final index of single core tests taken into account. Higher the index,
+the faster system is.
+
+| Setup                  | Benchmark Score |
+|------------------------|-----------------|
+| native                 | 1143.4          |
+| proot                  | 291.9           |
+| QEMU user              | 103.4           |
+| **This (interpreter)** | 93.4            |
+| **This (JIT)**         | 245.6           |
 
 ## Usage
+
+Command line options overview:
 
 ```
 arm64chroot [options] <rootfs> <program> [args...]
@@ -40,33 +68,53 @@ arm64chroot [options] <rootfs> <program> [args...]
                           default 0:0 (root)
 ```
 
-`arm64chroot --help` prints the full reference, including environment variables.
-The main tunable is `A64CHROOT_JIT_MB` (per-thread JIT code-cache size in MiB,
-default 32); the JIT debug/bisection knobs are documented in
-[docs/jit.md](docs/jit.md).
+Basic usage example with Alpine Linux rootfs:
 
-`<rootfs>` is a directory tree containing an AArch64 userland (e.g. an Alpine or
-Debian arm64 root filesystem). `/` is allowed to run host-native aarch64 binaries
-directly. Guest paths resolve **inside** the rootfs — absolute symlinks are
-followed against the guest root and `..` cannot escape it — so no privilege or
-`chroot(2)` is required. `--bind` (below) opens deliberate windows onto specific
-host directories. `/proc` and a `/dev` whitelist (null, zero, random,
-urandom, tty, ptmx, pts, shm, fd) pass through to the host; the guest's view of
-`/proc/self/{exe,cwd,root,fd/N}` (magic links resolve in guest terms — `root`
-cannot escape the rootfs), `maps`, `cmdline`, `comm`, `mounts`/`mountinfo`,
-`loadavg`, `uptime`, and `version` is synthesized; `/proc/stat` falls back to
-a synthesized view where the host denies the real file (Android). The **process
-view** is guest-scoped, too: `ps`/`top` show guest command lines (each guest
-process publishes its argv to a shared registry keyed by PID, since every guest
-process is a separate host process), and the guest's `/proc` lists **only its
-own process tree** — non-guest host processes are hidden and appear not to exist,
-a pid-namespace-like view without a real namespace.
+```sh
+curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz
+mkdir -p ./alpine
+tar -C alpine -zxf alpine-minirootfs-3.24.1-aarch64.tar.gz
+arm64chroot ./alpine /bin/ash -l
+```
 
-### Fake identity (`--fake-id`)
+The program automatically whitelists access to certain /dev nodes such as
+null, zero, random, urandom, tty, ptmx, pts.
 
-`--fake-id` makes the guest believe it runs as a chosen user — by default **root
-`0:0`** — like `proot -0` or `fakeroot`, so package managers, `make install`,
-`chown`/`chmod`, and `id -u == 0` checks work without real privilege:
+Many /proc entries are synthesized: maps, cmdline, comm, mounts, mountinfo,
+loadavg, uptime, version. The /proc/stat is being synthesized only when can't
+be read (Android OS primarily).
+
+Emulator can't be escaped and guest programs can't see processes running
+on the host.
+
+### Host directory bindings
+
+Command line option `--bind src:dst` exposes host directory `src` at guest
+path `dst`, like a `mount --bind ./src ./dst`. The binding can be read-write
+(default) and read-only, in both cases configuration is permanent and set
+during emulator invocation.
+
+Multiple directories can be shared by repeating `--bind src:dst` as needed. 
+
+Read-only mode enabled by specifying `:ro` suffix.
+
+Examples:
+
+```sh
+arm64chroot --bind "$PWD:/work" ./rootfs /bin/sh          # read-write
+arm64chroot --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
+```
+
+All bindings get registered in the guest's `/proc/mounts` and
+`/proc/PID/mountinfo`. The host information about mount points is discarded.
+
+Caveat: the src/dst paths must not contain the colon character (`:`).
+
+### Fake identity
+
+Option `--fake-id` emulates specific UID and GID in guest environment, by
+default a root user and group. The primary use case is to satisfy certain
+utilities such as package managers which may refuse to work as non-root user.
 
 ```sh
 arm64chroot --fake-id            ./rootfs /bin/sh   # guest is root 0:0
@@ -74,57 +122,42 @@ arm64chroot --fake-id 1000:1000  ./rootfs /bin/sh   # guest is 1000:1000
 arm64chroot --fake-id 1000       ./rootfs /bin/sh   # uid=gid=1000
 ```
 
-The whole `get`/`set` credential family (`setuid`/`setgid`/`setre*`/`setres*`/
-`setfsuid`/`setfsgid`/`setgroups`) works with real Linux privilege rules — a fake
-euid of 0 is privileged, a dropped identity cannot regain it. setuid/setgid-bit
-executables take on the file owner's (remapped) identity on exec, `AT_SECURE` is
-set on such transitions, `capget` reports full capabilities for fake-root, and
-`stat`/`chown` present a consistent view: a file the host reports as owned by the
-real invoking user appears owned by the fake identity, and `chown`/`chmod` that
-the host would reject succeed. The illusion is confined to what the emulator
-reports — it does **not** bypass host DAC, so fake-root still cannot read a file
-the host user genuinely cannot, and there is no persistent per-file ownership
-database (a `chown` to an arbitrary third uid is accepted but not remembered).
+The whole `get*()`/`set*()` credential syscall family works with real Linux
+privilege rules: a fake euid of 0 is privileged, a dropped identity cannot
+regain it. Executables with setuid/setgid bit take on the file owner's
+(remapped) identity on exec, `AT_SECURE` is set on such transitions, `capget`
+reports full capabilities for fake-root.
 
-### Host directory binds (`--bind`)
-
-`--bind src:dst` exposes host directory `src` at guest path `dst`, like a bind
-mount — a deliberate window through rootfs containment for sharing a project
-tree, build cache, or dataset without copying it in:
-
-```sh
-arm64chroot --bind "$PWD:/work" ./rootfs /bin/sh          # read-write
-arm64chroot --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
-```
-
-Repeatable; nested binds resolve by longest guest-prefix. A `:ro` bind rejects
-mutating syscalls under it with `EROFS` (writable/creating `open`, `mkdir`,
-`unlink`, `rename`, `symlink`/`link`, `truncate`, `chmod`/`chown`, `utimensat`,
-xattr writes). Containment still holds *inside* a bind: an absolute symlink there
-re-roots to the guest root, and `..` climbs into the rootfs, never to the host
-parent of `src`. Binds appear in the guest's `/proc/mounts` and `/proc/mountinfo`.
-The mount point need not pre-exist in the rootfs, though it should for a seamless
-`readdir` of its parent. Host paths may not contain `:` (a trailing `:ro`/`:rw`
-is the option field).
+`stat` present a consistent view: a file the host reports as owned by the
+real invoking user appears owned by the fake identity. `chown` or `chmod`
+that the host would reject succeed. The illusion is confined to what the
+emulator reports. It does not bypass host DAC, so fake-root still cannot
+read a file the host user genuinely cannot and there is no persistent
+per-file ownership database (a `chown` to an arbitrary third uid is accepted
+but not remembered).
 
 ## What works
 
-- **Full AArch64 user ISA**: integer, branches, the complete load/store family,
-  CRC32, scalar FP + Advanced-SIMD + crypto (AES/SHA1/SHA2/SHA512/SHA3/PMULL),
-  **ARMv8.1 LSE atomics** (CAS/CASP/SWP/LDADD/…), exclusives, and **FPCR
-  rounding modes**. HWCAP advertises FP/ASIMD/AES/PMULL/SHA*/CRC32/ATOMICS.
-- **Dynamic linking** through the guest `ld.so` loaded from the rootfs.
-- **Processes**: `fork`, `execve` (in-process reload, shebang-aware), `wait4`,
-  and **job control** (`setpgid`/`setsid`/`tcsetpgrp`, tty signals) — Ctrl-C,
-  Ctrl-Z, `fg`/`bg` all work under `bash -l`.
-- **Threads**: `clone(CLONE_VM)` → one host thread per guest thread over a shared
-  software address space; exclusives and LSE atomics are **SMP-correct** (real
-  host compare-and-swap), and guest memory barriers map to host fences, so
-  pthread mutexes/condvars and lock-free code are correct **even on weakly
-  ordered ARM hosts**.
-- **Signals**: full arm64 `rt_sigframe`/`rt_sigreturn`, `sigaltstack`, precise
-  `SIGSEGV` siginfo from guest faults, `SA_RESTART`.
-- **Sockets**, `getrandom`, `statx`, `futex`, and ~150 syscalls total.
+- **Full AArch64 user ISA**
+
+  Integer, branches, the complete load/store family, scalar FP,
+  Advanced-SIMD, CRC32, crypto (AES/SHA1/SHA2/SHA512/SHA3/PMULL),
+  ARMv8.1 LSE atomics (CAS/CASP/SWP/LDADD/…), exclusives, and FPCR
+  rounding modes.
+
+  HWCAP advertises FP/ASIMD/AES/PMULL/SHA*/CRC32/ATOMICS.
+
+- **Threads**
+
+  `clone(CLONE_VM)`: one host thread per guest thread over a shared
+  software address space. Exclusives and LSE atomics are SMP-correct (real
+  host compare-and-swap) and guest memory barriers map to host fences, so
+  pthread mutexes/condvars and lock-free code are correct even on weakly
+  ordered ARM hosts.
+
+- **190+ Linux system calls**
+
+  Almost everything needed for normal operation of Linux userland.
 
 Validated against `qemu-aarch64` as an oracle: static and dynamic C programs,
 `busybox`, an Alpine (musl) rootfs with `apk`, `bash`, and `openssl`, plus
@@ -141,11 +174,12 @@ make test-seccomp    # same suite with the emulator under an Android-Oreo
 ```
 
 `make test` provisions the Alpine (busybox/bash) and glibc rootfs it needs
-from scratch into a repo-local cache (`tests/.cache/`) on first run — the glibc
-tree is built offline from the cross sysroot, the Alpine tree needs a one-time
-network fetch (offline just skips those sections). No hand-staged `$HOME` rootfs
-is required. Override the location with `A64_TEST_ROOT`; wipe it with `make
-clean-testenv` (kept out of `make clean` so rebuilds don't re-download).
+from scratch into a repo-local cache (`tests/.cache/`) on first run. The
+glibc tree is built offline from the cross sysroot. The Alpine tree needs
+a one-time network fetch.
+
+Override the location of test environment with variable `A64_TEST_ROOT`.
+Wipe test environment with `make clean-testenv`.
 
 Cross-compile for a specific host (static, no runtime deps):
 
@@ -154,27 +188,24 @@ make CC=arm-linux-gnueabihf-gcc -static arm64chroot     # 32-bit ARM host
 make CC=aarch64-linux-gnu-gcc  -static arm64chroot      # 64-bit ARM host
 ```
 
-Requires only a C11 compiler and libc (`-lm -lpthread`, plus `-latomic` where the
-host needs it for wide atomics — added automatically).
+Requires only a C11 compiler and libc (`-lm -lpthread`, plus `-latomic`
+where the host needs it for wide atomics — added automatically).
 
-### Android / Termux
+### Termux
 
 ```sh
 pkg install clang make
 make CC=clang
 ```
 
-The emulator is engineered to survive Android's app seccomp whitelist (a
-blocked host syscall SIGSYS-kills a normal process; here it degrades to
-`ENOSYS`) and includes `--link2symlink` for Android's `link()` ban. Details,
-device checklist, and how this is regression-tested without a device:
-[docs/android-termux.md](docs/android-termux.md).
+The emulator is engineered to survive Android's app seccomp configuration
+and includes `--link2symlink` to workaround hardlink restriction.
 
 ## Design
 
 Deeper architecture notes live under [`docs/`](docs/README.md): the copied-core
-seams, the guest memory model and host-ordering discipline, the syscall layer and
-`--fake-id`, signal/job-control and the process model, and a catalog of
+seams, the guest memory model and host-ordering discipline, the syscall layer
+and `--fake-id`, signal/job-control and the process model, and a catalog of
 host-portability pitfalls.
 
 ```
@@ -190,9 +221,17 @@ src/
                 guest VAs never become host pointers except through the table.
   exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c        run loop + exception dispatch + signal delivery point
+  predecode.c   decoded-instruction cache: direct-threaded fast path over ~200
+                hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
+  jit/          optional --jit translator (AArch64 & x86-64 hosts):
+    ir.h frontend.c   per-block decode -> linear IR -> liveness / flag fusion
+    backend_a64.c backend_x86_64.c   register-allocating single-pass emitters
+    jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c        rootfs containment resolver, /proc & /dev special cases
-  syscall.c sys_*.c   dispatcher + per-area handlers (~150 syscalls)
+  syscall.c sys_*.c   dispatcher + per-area handlers (~190 syscalls)
+  sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
+  proctab.c     shared-memory guest-PID registry (cross-process ps/top view)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn
   thread.h      per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h   arm64 syscall numbers + explicit guest struct layouts
@@ -200,17 +239,28 @@ src/
 tests/          asm + C differential tests, run_tests.sh (oracle: qemu-aarch64)
 ```
 
-**Guest memory model.** A 39-bit guest address space is mapped by a two-level
-page table whose leaves are `host_pointer | R/W/X` flag bits. Because guest and
-host addresses are fully decoupled, the same layout works on a 32-bit host (where
-a leaf is a 4-byte `uintptr_t`). The instruction-fetch fast path caches one
-page's host pointer per thread.
+**Execution.** Three tiers share one run loop and return contract. By default a
+**predecode decoded-instruction cache** direct-threads ~200 hot instruction forms —
+a per-thread, per-PC cache of the *decoded* form that self-validates against the
+fetched word, so self-modifying/remapped code needs no flush — and everything else
+falls back to `exec_a64`. `--no-predecode` and any per-instruction debug flag select
+the plain `exec_a64` step. The optional `--jit` (`src/jit/`, AArch64 and x86-64 hosts
+only) adds a translating tier above both: it compiles guest basic blocks to native
+host code and falls back to `exec_a64` for anything it does not emit. It is off by
+default and the interpreter stays the source of truth. See
+[`docs/jit.md`](docs/jit.md) and [`docs/architecture.md`](docs/architecture.md).
 
-**Portability.** No 128-bit host types are required (64×64→128 multiply and the
-saturating-SIMD helpers use pure 64-bit arithmetic); little-endian host assumed
-(all four targets qualify). The `make m32` build runs natively on x86-64 so
-ILP32-host correctness — struct conversions, `uintptr_t` leaves, wide atomics —
-is exercised continuously, not just on real 32-bit hardware.
+**Guest memory model.** A 47-bit guest address space is mapped by a two-level
+page table whose leaves are `host_pointer | R/W/X` flag bits. Because guest
+and host addresses are fully decoupled, the same layout works on a 32-bit
+host (where a leaf is a 4-byte `uintptr_t`). The instruction-fetch fast path
+caches one page's host pointer per thread.
+
+**Portability.** No 128-bit host types are required (64×64→128 multiply and
+the saturating-SIMD helpers use pure 64-bit arithmetic); little-endian host
+assumed (all four targets qualify). The `make m32` build runs natively on
+x86-64 so ILP32-host correctness — struct conversions, `uintptr_t` leaves,
+wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
 ## Known limitations
 

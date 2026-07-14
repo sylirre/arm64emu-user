@@ -15,7 +15,7 @@
 #include "esr.h"
 #include "jit.h"
 
-#define L1_BITS (GUEST_VA_BITS - 26)          /* 13 -> 8192 entries */
+#define L1_BITS (GUEST_VA_BITS - 26)          /* 21 -> ~2M entries (~16 MiB L1) */
 #define L2_BITS 14                            /* 16384 entries, 64 MiB per L2 */
 #define L1_SIZE (1u << L1_BITS)
 #define L2_SIZE (1u << L2_BITS)

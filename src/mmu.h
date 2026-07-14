@@ -96,7 +96,7 @@ typedef struct RetiredMap {
 } RetiredMap;
 
 typedef struct AddrSpace {
-    uintptr_t **l1;           /* [1 << (39-26)] L1 entries -> L2[1 << 14] */
+    uintptr_t **l1;           /* [1 << (47-26)] L1 entries -> L2[1 << 14] */
     Region *regions;          /* sorted by start */
     int nregions, cap_regions;
     RetiredMap *retired;      /* quarantined host backing (see region_punch) */

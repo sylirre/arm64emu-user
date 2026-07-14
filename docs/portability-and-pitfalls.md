@@ -11,7 +11,7 @@ all four targets.
 - **Guest addresses never become host pointers except through the page table.**
   The core keeps every guest address as a `u64` and goes through the `mem_*`
   seam; only `mem.c` turns a translated PTE into a host pointer. This is what lets
-  a 39-bit guest space run on a 32-bit host (where a page-table leaf is a 4-byte
+  a 47-bit guest space run on a 32-bit host (where a page-table leaf is a 4-byte
   `uintptr_t`).
 - **No `__int128` in the hot paths.** The 64×64→128 multiply (`SMULH`/`UMULH`) and
   the saturating-SIMD helpers use pure 64-bit arithmetic (`umulh64`/`smulh64`,

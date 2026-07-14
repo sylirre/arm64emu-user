@@ -290,7 +290,7 @@ for adding one.
 caches, block table, chaining and the incoming-edge unpatch list, the jump
 cache, the invalidation protocol, safepoints, the thrash guard — is pointer-width
 clean: block descriptors hold `uintptr_t`/`const u8 *`, the software page table
-already stores host pointers as `uintptr_t` (that is precisely why a 39-bit
+already stores host pointers as `uintptr_t` (that is precisely why a 47-bit
 guest space runs on a 32-bit host), and the memory-op descriptor and helper ABI
 pass `u64` values that the C compiler already splits into register pairs on
 ILP32. The IR and the frontend carry over as-is because every IR op already

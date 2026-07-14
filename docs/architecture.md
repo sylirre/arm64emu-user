@@ -12,7 +12,7 @@ seam is rewritten for user mode.
                  copied, near-verbatim (src/core/)             new (src/)
  ┌───────────────────────────────────────────────┐   ┌──────────────────────────────┐
  │ types.h esr.h cpu.h sysreg.h                   │   │ loop.c   run loop + dispatch │
- │ decode.c      A64 integer/branch/load-store,   │   │ syscall.c + sys_*.c  (~150)  │
+ │ decode.c      A64 integer/branch/load-store,   │   │ syscall.c + sys_*.c  (~190)  │
  │               LSE atomics, exclusives          │   │ path.c   rootfs containment  │
  │ exec_fpsimd.c FP / Advanced-SIMD / crypto      │   │ signal.c guest sigframes     │
  │ cpu.c         fetch/decode/execute driver      │   │ elf.c    loader + stack/auxv │
@@ -136,7 +136,7 @@ emu_loop:
   if g_sig_npend:  sig_deliver_pending(c)   // host-caught guest signals, at a safe point
 ```
 
-`syscall_dispatch` (`src/syscall.c`) indexes a table of ~150 handlers grouped
+`syscall_dispatch` (`src/syscall.c`) indexes a table of ~190 handlers grouped
 into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 (except a "designed-ENOSYS" set that libcs probe and fall back from). See
 [syscalls.md](syscalls.md).
@@ -155,7 +155,11 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/predecode.h`, `src/predecode.c` | Decoded-instruction cache: classifier + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
 | `src/elf.c` | ELF64 loader, `PT_INTERP`, initial stack/auxv/HWCAP, sigreturn trampoline page. |
 | `src/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |
-| `src/syscall.c` + `src/sys_*.c` | Syscall dispatcher and per-area handlers. |
+| `src/syscall.c` + `src/sys_*.c` | Syscall dispatcher and per-area handlers (~190). |
+| `src/sys_procfs.c` | Synthesized guest `/proc` views (`maps`, `cmdline`, `mounts`/`mountinfo`, `stat`, `loadavg`/`uptime`/`version`). |
+| `src/sys_netlink.c` | In-process `NETLINK_ROUTE` emulation for hosts that deny `AF_NETLINK` (Android/SELinux). |
+| `src/proctab.c` | Shared-memory guest-PID registry powering the cross-process `ps`/`top` and hidden-process views. |
+| `src/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
 | `src/signal.c` | Host signal capture → guest `rt_sigframe`; `rt_sigreturn`; job-control mask mirroring. |
 | `src/thread.h` | Per-thread state (`g_tls`): pending exception, tid, syscall-restart bookkeeping. |
 | `src/machine.h` | `struct Machine` = the shared per-process task state. |

@@ -5,22 +5,26 @@ Files: `src/mmu.h` (interface + fetch fast path), `src/mem.c` (implementation).
 ## Design constraint
 
 The core hands the seam a 64-bit guest virtual address. On a 32-bit host a
-39-bit guest address space cannot be direct-mapped into the host's address space,
+47-bit guest address space cannot be direct-mapped into the host's address space,
 so guest and host addresses must be **fully decoupled**. That rules out
 qemu-user's `guest_base` offset trick and dictates a software page table whose
 leaves are host pointers. The same table works unchanged on 64-bit hosts.
 
 ## The address space
 
-- **Guest VA size: 39 bits** (`GUEST_TASK_SIZE = 1 << 39`, 512 GiB), matching the
-  common `CONFIG_ARM64_VA_BITS=39` kernels real userland runs on. Any
-  `va >= TASK_SIZE` faults.
+- **Guest VA size: 47 bits** (`GUEST_TASK_SIZE = 1 << 47`, 128 TiB). Any
+  `va >= TASK_SIZE` faults. Widened from 39 bits (commit `e372840`) so that
+  non-`MAP_FIXED` mmap *hints* at high addresses — notably Go's heap-arena
+  reservations — fit and are honored (see [Mapping operations](#mapping-operations))
+  instead of being bump-relocated and then munmapped in a startup churn loop.
 - **2-level page table** (`AddrSpace` in `mmu.h`):
-  - L1: `8192` entries indexed by `va[38:26]`, each pointing to an on-demand L2.
+  - L1: `2^21` (~2M) entries indexed by `va[46:26]`, each pointing to an on-demand
+    L2. The L1 array is ~16 MiB of virtual memory per address space, lazily backed
+    by the host — untouched entries never fault in a physical page.
   - L2: `16384` `uintptr_t` entries indexed by `va[25:12]`, one L2 covering 64 MiB.
   - **PTE = host page pointer `|` permission bits** in the low 12 (host pages are
     4 KB-aligned): `PTE_R=1`, `PTE_W=2`, `PTE_X=4`. A PTE of `0` is unmapped.
-  - On a 32-bit host an L2 entry is 4 bytes — this is *why* a 39-bit guest space
+  - On a 32-bit host an L2 entry is 4 bytes — this is *why* a 47-bit guest space
     works there: the leaf stores a host pointer, never a guest address.
 - **Region list**: a sorted array of `{guest range, prot, shared, host_base,
   path, file offset}`. It backs `munmap`/`mremap` splitting, `mprotect`
@@ -37,7 +41,7 @@ raises the appropriate data/instruction abort ESR via `cpu_raise_sync`, so later
 `SIGSEGV` `si_code` is precise.
 
 In front of the walk sits a **data-side TLB** (`g_dtlb`, `__thread`): a
-256-entry direct-mapped VA-page → PTE cache, so a hit is one tag compare
+1024-entry direct-mapped VA-page → PTE cache, so a hit is one tag compare
 instead of the two dependent table loads. The permission check still runs per
 access (one entry serves R/W/X), and negative results are never cached.
 Cross-thread coherence — the page table is shared — comes from a global
@@ -75,6 +79,13 @@ bit.
 Host pages larger than 4 KB (64 K arm64 kernels) are detected at startup:
 anonymous maps over-allocate and slice; a file `MAP_PRIVATE` whose offset is not
 host-page-aligned falls back to `pread` into anonymous backing.
+
+An `mmap` **address hint** without `MAP_FIXED` is treated the way Linux treats it —
+as advisory, not ignored: if `[hint, hint+len)` lies in range and is free the hint
+is honored, otherwise `as_find_free` bump-allocates a fresh range. Honoring the hint
+is what keeps runtimes that reserve specific high addresses and munmap anything
+placed elsewhere — Go's heap-arena reservation is the motivating case — from
+thrashing at startup, and is why the guest VA space is 47 bits (`sys_mm.c`).
 
 ## Host memory-ordering discipline
 
