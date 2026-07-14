@@ -29,12 +29,13 @@ all four targets.
   everything it execs) under a seccomp whitelist; a blocked syscall does not
   return `ENOSYS` — it raises `SIGSYS` and kills the emulator. Prefer libc
   wrappers: Bionic's only use whitelisted numbers (e.g. `accept` → `accept4`).
-  Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) allow-list
-  (`ANDROID_FORBIDDEN_SYSCALLS.md`, appendix) or be `__BIONIC__`-gated to a
-  safe alternative (precedent: the keyring family returns `-ENOSYS` on Bionic).
-  The rule is enforced in CI by `make test-seccomp`, which runs the whole
-  differential suite with the emulator under a trap filter for the Oreo-blocked
-  set (see [android-termux.md](android-termux.md)).
+  Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) app seccomp
+  allow-list or be `__BIONIC__`-gated to a safe alternative (precedent: the
+  keyring family returns `-ENOSYS` on Bionic). The rule is checked by `make
+  test-seccomp`, which runs the whole differential suite with the emulator under
+  a trap filter for the Oreo-blocked set — a maintainer pre-release gate; the
+  committed CI runs the native x86_64 `make test` (see
+  [android-termux.md](android-termux.md)).
 
 ## Catalog of pitfalls (each is a bug we hit)
 
@@ -126,8 +127,10 @@ architecture-value tests independent of `DCZID`.
 
 The differential suite (`tests/run_tests.sh`) runs each asm/C test under
 `qemu-aarch64` (the oracle) and under `arm64chroot`, requiring identical
-stdout+exit. It runs on the `x86_64`, `i386` (native), and `armhf`/`arm64` (under
-`qemu-arm`/`qemu-aarch64`) builds. Behaviors qemu does not model — `--fake-id`,
-interactive job control — are self-checking cases instead. The rule that caught
-most of the bugs above: **a green run on x86-64 is necessary but not sufficient;
+stdout+exit. The committed CI runs it on the native `x86_64` build; before a
+release the maintainer also runs it across the `i386` (native, via `make m32`)
+and `armhf`/`arm64` (cross-built, under `qemu-arm`/`qemu-aarch64`) builds.
+Behaviors qemu does not model — `--fake-id`, interactive job control — are
+self-checking cases instead. The rule that caught most of the bugs above: **a
+green run on x86-64 is necessary but not sufficient;
 the ARM and 32-bit builds are where the memory-model and ILP32 bugs live.**

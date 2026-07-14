@@ -17,7 +17,9 @@ Emulator has 2 modes:
 
 * Interpreter: very slow, doesn't use translation to host machine code and
   therefore is portable.
-* JIT: fast, available only for AArch64 and x86-64 hosts, requires execmem.
+* JIT: fast, available only for AArch64 and x86-64 hosts; needs executable
+  memory (where the host forbids it — SELinux `execmem` — it falls back to a
+  memfd dual-mapping, and failing that to the interpreter).
 
 If you are interested in a system-mode emulator that can actually boot
 AArch64 Linux disk image, see this repository:
@@ -83,8 +85,10 @@ tar -C alpine -zxf alpine-minirootfs-3.24.1-aarch64.tar.gz
 arm64chroot ./alpine /bin/ash -l
 ```
 
-The program automatically whitelists access to certain /dev nodes such as
-null, zero, random, urandom, tty, ptmx, pts.
+The program automatically whitelists access to certain /dev nodes: null, zero,
+full, random, urandom, tty, ptmx, and the pts/ and shm/ trees. console maps to
+the controlling terminal, and stdin/stdout/stderr and fd/* to the process's own
+file descriptors.
 
 Many /proc entries are synthesized: maps, cmdline, comm, mounts, mountinfo,
 loadavg, uptime, version. The /proc/stat is being synthesized only when can't

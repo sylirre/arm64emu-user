@@ -168,6 +168,16 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   conversions SCVTF/UCVTF, FCVTZS/FCVTZU and FCVT S↔D. The rounding-variant
   conversions (FCVTNS/…), fixed-point forms and everything saturating stay
   helpers.
+- **half-precision (FP16)**: the FCVT half↔single/double converts (and
+  FCVTL/FCVTN) inline on the base ISA, always. The half arithmetic surface —
+  scalar and vector FADD/FSUB/FMUL/FDIV, the FMULX/FRECPE/FRSQRTE estimates, the
+  mask compares, and the two-register-misc page — is gated per host: the AArch64
+  backend replays the native FEAT_FP16 instructions (advertised by the
+  FPHP+ASIMDHP HWCAP pair; `cpu_has_fp16`, `A64_JIT_NOFP16` forces the helper),
+  while the x86-64 backend widens each half operand to single through **F16C**,
+  computes, and narrows back (`cpu_has_f16c`, disabled together with the rest of
+  the SSE surface by `A64_JIT_SSE=2`). As with the s/d forms, half `FMAX/FMIN(NM)`
+  stay interpreter helpers so ARM's NaN propagation and ±0 ordering are exact.
 
 The AArch64 backend re-emits the guest word itself with the register fields
 renumbered onto the V-register cache's host registers, so its semantics are the
@@ -275,9 +285,11 @@ Debug/bisection knobs (all off by default):
   slow helper branch — it separates fast-path codegen bugs from the surrounding
   register-sync machinery.
 - `A64_JIT_NOVRA=1` disables the V-register cache (recipes load/store `c->v[]`
-  per op); `A64_JIT_NOFUSE=1` disables D-TLB probe sharing; `A64_JIT_SSE=2`
-  (x86-64) forces the SSE2-baseline capability answers. Each isolates its
-  feature's codegen from the rest, and the full suite must pass under every one.
+  per op); `A64_JIT_NOFUSE=1` disables D-TLB probe sharing; `A64_JIT_NOFP16=1`
+  (AArch64) forces the half-precision surface through the interpreter helper;
+  `A64_JIT_SSE=2` (x86-64) forces the SSE2-baseline capability answers (which
+  also disables the F16C half-precision path). Each isolates its feature's
+  codegen from the rest, and the full suite must pass under every one.
 
 ## 32-bit hosts (ARM32 / i686): feasibility
 
