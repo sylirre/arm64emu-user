@@ -657,7 +657,11 @@ int main(int argc, char **argv) {
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */
     sig_install_sigsys_net();
+
+#ifndef ANDROID_JNI
+    // Suppress seccomp notice on Android JNI component builds.
     seccomp_notice();
+#endif
 
     /* Shared guest-PID registry: must exist before the first do_execve (which
      * registers this process) and before any fork inherits the mapping. With
