@@ -122,6 +122,23 @@ fork done rc=0" "$ALPINE" /tmp/ci_vfork
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
+# ---- abstract AF_UNIX socket isolation (self-checking; qemu has no rootfs, so
+# it can't model per-rootfs abstract-namespace tagging). By default a guest's
+# abstract name is tagged per rootfs on the host; --share-abstract-sockets
+# leaves it raw. The probe reads host /proc/net/unix in-process (no race). ----
+if [ -x "$ALPINE/bin/busybox" ] && \
+   "$AGCC" -O2 -static -o "$ALPINE/tmp/ci_absprobe" tests/fixtures/absprobe.c 2>/dev/null; then
+    check_abs() {   # check_abs <label> <expected> <emu args...>
+        local label="$1" expect="$2"; shift 2
+        local got; got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS absns: $label"
+        else fail=$((fail+1)); echo "FAIL absns: $label (want '$expect' got '$got')"; fi
+    }
+    check_abs "isolated per rootfs by default" "abstract=tag" "$ALPINE" /tmp/ci_absprobe
+    check_abs "shared via opt-out flag"        "abstract=raw" --share-abstract-sockets "$ALPINE" /tmp/ci_absprobe
+    rm -f "$ALPINE/tmp/ci_absprobe"
+fi
+
 # ---- guest env inheritance (self-checking; qemu-user inherits the full host
 # env by design, so this cannot be differential). Only TERM/COLORTERM are passed
 # through from the host; -E/--env adds and overrides. ----

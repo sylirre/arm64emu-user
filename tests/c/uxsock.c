@@ -11,6 +11,7 @@
  * sun_path, exercising the /proc/self/fd parent-dirfd fallback (the guest path
  * itself stays < 108 so qemu, which has no rootfs prefix, still binds directly).
  * Output is pid-independent so it matches under qemu (oracle) and the emulator. */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +105,38 @@ static int dgram_roundtrip(const char *dir, const char *label) {
     return 0;
 }
 
+/* Abstract-namespace (leading-NUL) SOCK_STREAM roundtrip. The emulator tags the
+ * name per-rootfs transparently; qemu uses it raw. Both complete the exchange,
+ * so this is differential-safe and proves the tagging doesn't break a guest's
+ * own abstract IPC. Prints "<label>=<msg>". */
+static int abstract_roundtrip(const char *name, const char *label) {
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    size_t nl = strlen(name);
+    memcpy(un.sun_path + 1, name, nl);          /* sun_path[0] stays NUL */
+    socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nl);
+
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) { perror("socket"); return 1; }
+    if (bind(srv, (struct sockaddr *)&un, alen) < 0) { perror("bind"); return 1; }
+    if (listen(srv, 1) < 0) { perror("listen"); return 1; }
+
+    int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (cli < 0) { perror("socket"); return 1; }
+    if (connect(cli, (struct sockaddr *)&un, alen) < 0) { perror("connect"); return 1; }
+
+    int s = accept(srv, NULL, NULL);
+    if (s < 0) { perror("accept"); return 1; }
+    if (write(cli, "ping", 4) != 4) { perror("write"); return 1; }
+    char buf[8] = {0};
+    if (read(s, buf, sizeof buf - 1) < 0) { perror("read"); return 1; }
+    printf("%s=%s\n", label, buf);
+
+    close(s); close(cli); close(srv);
+    return 0;
+}
+
 int main(void) {
     char dir[128];
     /* short path: plain containment */
@@ -118,6 +151,11 @@ int main(void) {
     /* long path via sendmsg(): exercises the sendmsg dest-name fallback */
     snprintf(dir, sizeof dir, "/tmp/a64ux_dgram_%d_%s", (int)getpid(), pad);
     if (dgram_roundtrip(dir, "dgram") != 0) return 1;
+
+    /* abstract socket: per-rootfs tagging must stay transparent to the guest */
+    char aname[64];
+    snprintf(aname, sizeof aname, "a64abs_%d", (int)getpid());
+    if (abstract_roundtrip(aname, "abstract") != 0) return 1;
 
     printf("bind=ok\n");
     return 0;

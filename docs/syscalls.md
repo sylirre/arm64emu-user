@@ -87,10 +87,18 @@ contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
 `sendmsg` route it through `path_resolve` (`bind` keeps the final component
 literal, the rest follow symlinks), and `getsockname`/`getpeername`/`accept`/
 `recvfrom`/`recvmsg` strip the rootfs prefix back off so the guest never sees a
-host path. Abstract-namespace sockets (leading NUL in `sun_path`) and
-unnamed/autobind addresses pass through unchanged — abstract sockets share the
-host's global namespace, a known limitation (there is no network namespace).
-When the rootfs prefix pushes the translated path past the 108-byte `sun_path`
+host path. **Abstract-namespace sockets** (leading NUL in `sun_path`) have no
+filesystem node, so they can't be scoped by the rootfs prefix — and the
+unprivileged emulator can't give the guest its own network namespace
+(`unshare`/`setns` are `-ENOSYS`). Instead they are isolated per rootfs by
+splicing a short per-rootfs tag (`\x01a64<hash>`, from `fnv1a32(rootfs)`) right
+after the leading NUL on `bind`/`connect`/`sendto`/`sendmsg` and stripping it
+back on the readback calls: same-rootfs guests still rendezvous, while the host
+and other rootfs instances (untagged or differently tagged) are isolated.
+`--share-abstract-sockets` opts out (shares the host's global abstract
+namespace); names too long to fit the tag under 108 bytes, and unnamed/autobind
+addresses, pass through untagged. When the rootfs prefix pushes the translated
+path past the 108-byte `sun_path`
 limit, `bind`/`connect`/`sendto`/`sendmsg` fall back to opening the parent
 directory and operating relative to it via `/proc/self/fd/<fd>/<basename>`, so
 only the socket basename must fit (the residual limit is a basename ≳90 bytes).

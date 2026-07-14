@@ -97,6 +97,9 @@ static void help(void) {
 "  -0, --argv0 ARG0        override argv[0] for the guest program\n"
 "  -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid or\n"
 "                          uid:gid, default 0:0 (root)\n"
+"      --share-abstract-sockets  do NOT isolate abstract-namespace AF_UNIX\n"
+"                          sockets per rootfs; share the host's global abstract\n"
+"                          namespace (default: isolate, like pathname sockets)\n"
 "  -w, --work-dir DIR      start the guest with this directory as its working\n"
 "                          directory (a guest path resolved inside the rootfs);\n"
 "                          default is '/'\n"
@@ -338,6 +341,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_predecode = 0; }
             else if (!strcmp(n, "link2symlink")) { if (val) opt_no_value(arg); m->link2symlink = 1; }
             else if (!strcmp(n, "shared-proc"))  { if (val) opt_no_value(arg); m->shared_proc = 1; }
+            else if (!strcmp(n, "share-abstract-sockets")) { if (val) opt_no_value(arg); m->share_abstract = 1; }
             else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
@@ -396,6 +400,15 @@ int main(int argc, char **argv) {
         return 126;
     }
     if (!strcmp(m->rootfs, "/")) m->rootfs[0] = 0;   /* rootfs "/": no prefix */
+
+    /* Per-rootfs tag spliced into guest abstract AF_UNIX socket names to isolate
+     * them from the host and from other rootfs instances (sys_net.c). Same
+     * rootfs -> same tag, so guest processes still rendezvous. The 0x01 lead
+     * makes a collision with a real host abstract name essentially impossible. */
+    m->abs_tag[0] = 0x01;
+    int atn = snprintf(m->abs_tag + 1, sizeof m->abs_tag - 1, "a64%08x",
+                       (unsigned)fnv1a32(m->rootfs));
+    m->abs_tag_len = (u8)(1 + atn);
 
     /* Guest cwd: the host cwd when it lies inside the rootfs, else "/". */
     strcpy(m->cwd, "/");

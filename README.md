@@ -71,6 +71,9 @@ arm64chroot [options] <rootfs> <program> [args...]
   -0, --argv0 ARG0        override argv[0] for the guest program
   -u, --fake-id[=ID]      present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)
+      --share-abstract-sockets  do NOT isolate abstract-namespace AF_UNIX sockets
+                          per rootfs; share the host's global abstract namespace
+                          (default: isolate, like pathname sockets)
   -w, --work-dir DIR      start the guest with this directory as its working
                           directory (a guest path resolved inside the rootfs);
                           default is '/'

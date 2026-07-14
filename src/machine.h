@@ -130,6 +130,12 @@ struct Machine {
     u8 shared_proc;           /* -shared-proc: back the guest-PID registry with a
                                * named, per-rootfs shared file so ps/top see the
                                * guest processes of other emulator invocations */
+    u8 share_abstract;        /* --share-abstract-sockets: opt out of per-rootfs
+                               * abstract-socket isolation, sharing the host's
+                               * global abstract namespace (default: isolate) */
+    char abs_tag[16];         /* per-rootfs prefix spliced into guest abstract
+                               * AF_UNIX names for isolation (see sys_net.c) */
+    u8 abs_tag_len;           /* bytes of abs_tag in use */
 };
 
 /* The singleton task of this process (fork copies it naturally). */
@@ -143,6 +149,15 @@ static inline u32 remap_uid(const struct Machine *m, u32 host) {
 }
 static inline u32 remap_gid(const struct Machine *m, u32 host) {
     return (m->fake_id && host == m->host_gid) ? m->fake_gid : host;
+}
+
+/* FNV-1a 32-bit hash. Keys per-rootfs state from the rootfs path: the
+ * -shared-proc registry file (proctab.c) and the abstract-socket tag (main.c),
+ * so every invocation of the same rootfs derives the same key. */
+static inline u32 fnv1a32(const char *s) {
+    u32 h = 2166136261u;
+    for (; *s; s++) h = (h ^ (u8)*s) * 16777619u;
+    return h;
 }
 
 /* loop.c */

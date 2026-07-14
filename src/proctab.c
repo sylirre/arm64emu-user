@@ -70,13 +70,8 @@ static u64 proc_starttime(s32 pid) {
     return 0;
 }
 
-/* FNV-1a 32-bit over the rootfs path: keys the per-rootfs backing file so
- * sessions of the same rootfs (and uid) share one registry. */
-static u32 fnv1a32(const char *s) {
-    u32 h = 2166136261u;
-    for (; *s; s++) { h = (h ^ (u8)*s) * 16777619u; }
-    return h;
-}
+/* fnv1a32 (per-rootfs registry key) lives in machine.h, shared with the
+ * abstract-socket tag in main.c. */
 
 /* First writable directory that can hold the -shared-proc registry file, or
  * NULL if none is usable (then we degrade to the anonymous mapping). Desktop

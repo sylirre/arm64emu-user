@@ -7,7 +7,9 @@
  * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
  * the kernel reports back is stripped to its guest view (unix_path_out). A
  * translated path that overflows the 108-byte sun_path is reached relative to a
- * parent-directory fd via /proc/self/fd (unix_path_in fallback). */
+ * parent-directory fd via /proc/self/fd (unix_path_in fallback). Abstract
+ * sockets, which have no filesystem node, are instead isolated per rootfs by a
+ * name tag (abs_tag_in/out) unless --share-abstract-sockets is given. */
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -64,12 +66,40 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
     return 0;
 }
 
+/* Abstract AF_UNIX sockets (leading NUL in sun_path) live in one global,
+ * netns-scoped namespace the unprivileged emulator can't partition — so by
+ * default we isolate them per rootfs by splicing m->abs_tag in right after the
+ * leading NUL. The name after the NUL is opaque bytes of length (*sl-poff-1);
+ * shift it right by the tag and copy the tag in. Same rootfs -> same tag, so
+ * guest processes still rendezvous, while the host and other rootfs (untagged
+ * or differently tagged) don't. No-op with --share-abstract-sockets, or when
+ * the tag would push the name past the 108-byte sun_path (left untagged). */
+static void abs_tag_in(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t poff) {
+    size_t T = c->m->abs_tag_len, total = (size_t)*sl - poff;
+    if (c->m->share_abstract || T == 0 || total + T > sizeof un->sun_path) return;
+    memmove(un->sun_path + 1 + T, un->sun_path + 1, total - 1);
+    memcpy(un->sun_path + 1, c->m->abs_tag, T);
+    *sl = (socklen_t)(*sl + T);
+}
+
+/* Reverse of abs_tag_in: strip our rootfs tag from an abstract address the
+ * kernel reports back, so the guest sees its original name. Leaves foreign
+ * (untagged or other-rootfs) abstract names as-is. */
+static void abs_tag_out(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t poff) {
+    size_t T = c->m->abs_tag_len, total = (size_t)*sl - poff;
+    if (c->m->share_abstract || T == 0 || total < 1 + T) return;
+    if (memcmp(un->sun_path + 1, c->m->abs_tag, T) != 0) return;   /* not ours */
+    memmove(un->sun_path + 1, un->sun_path + 1 + T, total - 1 - T);
+    *sl = (socklen_t)(*sl - T);
+}
+
 /* AF_UNIX pathname sockets carry a filesystem path in sun_path; route it
  * through the rootfs resolver so bind/connect/sendto reach the guest's socket,
- * not the host's. Abstract sockets (sun_path[0]==0, len>off), unnamed/autobind
- * (len<=off), and every non-AF_UNIX family pass through untouched. `follow`
- * selects final-component symlink handling: connect/sendto follow, bind does
- * not. Rewrites the address and its length in place; returns 0 or -errno.
+ * not the host's. Abstract sockets are per-rootfs isolated (abs_tag_in);
+ * unnamed/autobind (len<=off) and every non-AF_UNIX family pass through
+ * untouched. `follow` selects final-component symlink handling: connect/sendto
+ * follow, bind does not. Rewrites the address and its length in place; returns
+ * 0 or -errno.
  *
  * The rootfs prefix can push the host path past the 108-byte sun_path limit.
  * When it does and `dirfd_out` is non-NULL, only the socket basename need fit:
@@ -84,7 +114,10 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
     if (*sl <= poff) return 0;                 /* unnamed / autobind */
-    if (un->sun_path[0] == '\0') return 0;     /* abstract namespace */
+    if (un->sun_path[0] == '\0') {             /* abstract namespace */
+        abs_tag_in(c, un, sl, poff);
+        return 0;
+    }
     size_t maxp = (size_t)*sl - poff;
     if (maxp > sizeof un->sun_path) maxp = sizeof un->sun_path;
     char gpath[PATH_MAX];
@@ -124,13 +157,17 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
 
 /* Reverse of unix_path_in: rewrite a host sun_path the kernel reports back
  * (getsockname/getpeername/accept/recvfrom/recvmsg) to its guest view, so the
- * guest never sees a host path. No-op for non-AF_UNIX, unnamed, and abstract
- * addresses. Rewrites the address and its length in place. */
+ * guest never sees a host path (pathname) or our rootfs tag (abstract). No-op
+ * for non-AF_UNIX and unnamed addresses. Rewrites address and length in place. */
 static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
     if (ss->ss_family != AF_UNIX) return;
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
-    if ((size_t)*sl <= poff || un->sun_path[0] == '\0') return;
+    if ((size_t)*sl <= poff) return;           /* unnamed */
+    if (un->sun_path[0] == '\0') {             /* abstract: strip our tag */
+        abs_tag_out(c, un, sl, poff);
+        return;
+    }
     size_t maxp = (size_t)*sl - poff;
     if (maxp > sizeof un->sun_path) maxp = sizeof un->sun_path;
     char path[PATH_MAX];
