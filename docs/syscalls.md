@@ -112,6 +112,21 @@ A socket bound through the fallback reports that `/proc/self/fd` path from
 `getsockname` rather than its guest path (cosmetic; real software reads back the
 bound pathname only rarely).
 
+**Interface-query ioctls.** The read-only `SIOCGIF*` family that `ifconfig` /
+net-tools issue on an `AF_INET` socket — `SIOCGIFCONF` (enumerate) plus the
+per-interface `SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,DSTADDR,MTU,METRIC,
+HWADDR,TXQLEN,MAP}` — is answered in `src/sys_netlink.c` (`nl_maybe_siocgifconf`
+/ `nl_maybe_ifreq_ioctl`, dispatched from the `sys_file.c` ioctl handler) from
+the host's own interface table via `getifaddrs(3)` plus best-effort host ioctls,
+with a synthesized loopback fallback (index 1, `127.0.0.1/8`, MTU 65536,
+`ARPHRD_LOOPBACK`). This is the same interface set the `NETLINK_ROUTE` emulation
+draws on, so it stays consistent, works on Android where the socket ioctls are
+denied (EACCES), and covers rootfs setups with no `/proc/net/dev` to enumerate
+from. Results are written at fixed guest `struct ifreq` offsets (never a raw
+host-struct bounce), so the marshalling is correct on 64-bit and 32-bit hosts
+alike. Write (`SIOCSIF*`) ioctls are not emulated. Like `SIOCGIFINDEX`, the
+family is ungated (it does not depend on the host actually blocking netlink).
+
 **Special zones** are checked on the canonical guest path before prefixing:
 
 - `/dev`: a whitelist passes through to host devices (`null`, `zero`, `full`,

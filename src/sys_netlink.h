@@ -26,8 +26,14 @@ u64 nl_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags, u64 addr_va, u64 si
 u64 nl_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags);
 u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va);
 
-/* SIOCGIFINDEX answered from the host's own interface table. Returns 1 and
- * stores the guest x0 in *ret when handled; 0 to let the real ioctl run. */
-int nl_maybe_siocgifindex(CPU *c, u64 arg, u64 *ret);
+/* Read-only interface-query ioctls answered from the host's own interface
+ * table (getifaddrs + best-effort host ioctls) with a synthesised loopback
+ * fallback. Each returns 1 and stores the guest x0 in *ret when handled; 0 to
+ * let the real ioctl run.
+ *   nl_maybe_ifreq_ioctl: SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,
+ *                         DSTADDR,MTU,METRIC,HWADDR,TXQLEN,MAP} on a struct ifreq.
+ *   nl_maybe_siocgifconf: SIOCGIFCONF enumeration into a struct ifconf. */
+int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret);
+int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret);
 
 #endif /* A64_SYS_NETLINK_H */

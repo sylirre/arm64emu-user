@@ -45,7 +45,9 @@ unfiltered:
   are quiet `-ENOSYS` dispatcher entries and never reach the host.
 * **Netlink emulation**: where the host denies `AF_NETLINK` sockets (common
   under SELinux app policy), `NETLINK_ROUTE` is emulated in-process, so guest
-  `getifaddrs()`/`ip` keep working.
+  `getifaddrs()`/`ip` keep working. The read-only `SIOCGIF*` interface-query
+  ioctls (`ifconfig`/net-tools) are likewise answered in-process from the host
+  interface table, so they work even where the socket ioctls return EACCES.
 * **Startup notice**: at startup the emulator reads `Seccomp:` from
   `/proc/self/status` and, if a filter is active (mode 2), prints one line:
   `arm64chroot: seccomp filter active on this process; trapped host syscalls

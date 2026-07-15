@@ -964,10 +964,166 @@ u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va)
     return (u64)(s64) nl_write_sockname(c, addr_va, size_va, (uint32_t) getpid());
 }
 
-int nl_maybe_siocgifindex(CPU *c, u64 arg, u64 *ret)
+/* Guest ABI struct ifreq size (LP64): ifr_name[16] + a 24-byte union = 40. We
+ * never memcpy a host struct ifreq (32 bytes on an ILP32 host build), so this
+ * fixed stride keeps SIOCGIFCONF correct on 64-bit and 32-bit hosts alike. */
+#define GUEST_IFREQ_SZ 40
+
+/* Host facts for one interface, gathered from getifaddrs plus best-effort host
+ * ioctls (mirrors build_host_links above). Addresses are kept in network byte
+ * order so they drop straight into a guest sockaddr_in. */
+struct ifq {
+    int          found;
+    int          ifindex;
+    unsigned int flags;      /* IFF_* */
+    int          mtu, txqlen;
+    uint16_t     hwtype;     /* ARPHRD_* */
+    uint8_t      hwaddr[8];
+    uint8_t      hwlen;
+    uint32_t     addr, netmask, broadaddr, dstaddr;
+    int          have_addr;
+};
+
+/* Zero @ifr and copy the (validated, NUL-terminated) interface name into
+ * ifr_name. Uses strnlen+memcpy rather than strncpy so GCC doesn't warn about
+ * a length-bounded source possibly truncating (-Wstringop-truncation). */
+static void ifr_set_name(struct ifreq *ifr, const char *name)
+{
+    size_t n = strnlen(name, IFNAMSIZ - 1);
+    memset(ifr, 0, sizeof *ifr);
+    memcpy(ifr->ifr_name, name, n);
+    ifr->ifr_name[n] = '\0';
+}
+
+/* Fill @q for interface @name. Synthesises loopback defaults when the host has
+ * no such interface but the guest asked for "lo". Returns 1 on success. */
+static int gather_ifq(const char *name, struct ifq *q)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    int sock;
+
+    memset(q, 0, sizeof *q);
+
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_name == NULL || strcmp(ifa->ifa_name, name) != 0)
+                continue;
+            q->found = 1;
+            q->flags = ifa->ifa_flags;
+
+            if (ifa->ifa_addr == NULL)
+                continue;
+            if (ifa->ifa_addr->sa_family == AF_PACKET) {
+                struct sockaddr_ll *sll = (struct sockaddr_ll *) ifa->ifa_addr;
+                if (sll->sll_ifindex != 0)
+                    q->ifindex = sll->sll_ifindex;
+                q->hwtype = sll->sll_hatype;
+                if (sll->sll_halen > 0 && sll->sll_halen <= sizeof q->hwaddr) {
+                    memcpy(q->hwaddr, sll->sll_addr, sll->sll_halen);
+                    q->hwlen = sll->sll_halen;
+                }
+            } else if (ifa->ifa_addr->sa_family == AF_INET && !q->have_addr) {
+                struct sockaddr_in *si = (struct sockaddr_in *) ifa->ifa_addr;
+                q->addr = si->sin_addr.s_addr;
+                q->have_addr = 1;
+                if (ifa->ifa_netmask != NULL) {
+                    si = (struct sockaddr_in *) ifa->ifa_netmask;
+                    q->netmask = si->sin_addr.s_addr;
+                }
+                /* ifa_broadaddr / ifa_dstaddr alias the same union member. */
+                if ((ifa->ifa_flags & IFF_BROADCAST) &&
+                    ifa->ifa_broadaddr != NULL) {
+                    si = (struct sockaddr_in *) ifa->ifa_broadaddr;
+                    q->broadaddr = si->sin_addr.s_addr;
+                } else if ((ifa->ifa_flags & IFF_POINTOPOINT) &&
+                           ifa->ifa_dstaddr != NULL) {
+                    si = (struct sockaddr_in *) ifa->ifa_dstaddr;
+                    q->dstaddr = si->sin_addr.s_addr;
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+
+    if (q->found && q->ifindex == 0)
+        q->ifindex = (int) if_nametoindex(name);
+
+    /* Best-effort MTU / tx queue length / hwaddr from the host kernel. */
+    sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (q->found && sock >= 0) {
+        struct ifreq ifr;
+
+        ifr_set_name(&ifr, name);
+        if (ioctl(sock, SIOCGIFMTU, &ifr) == 0)
+            q->mtu = ifr.ifr_mtu;
+
+        ifr_set_name(&ifr, name);
+        if (ioctl(sock, SIOCGIFTXQLEN, &ifr) == 0)
+            q->txqlen = ifr.ifr_qlen;
+
+        if (q->hwlen == 0) {
+            ifr_set_name(&ifr, name);
+            if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
+                q->hwtype = ifr.ifr_hwaddr.sa_family;
+                memcpy(q->hwaddr, ifr.ifr_hwaddr.sa_data, 6);
+                q->hwlen = 6;
+            }
+        }
+    }
+    if (sock >= 0)
+        close(sock);
+
+    if (!q->found && strcmp(name, "lo") == 0) {
+        q->found     = 1;
+        q->ifindex   = 1;                            /* index 1 on every kernel */
+        q->flags     = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+        q->mtu       = 65536;
+        q->hwtype    = ARPHRD_LOOPBACK;
+        q->addr      = htonl(INADDR_LOOPBACK);       /* 127.0.0.1 */
+        q->netmask   = htonl(0xff000000u);           /* 255.0.0.0  */
+        q->have_addr = 1;
+    }
+
+    return q->found;
+}
+
+int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
 {
     char name[IFNAMSIZ];
-    int ifindex;
+    struct ifq q;
+    uint8_t out[GUEST_IFREQ_SZ - IFNAMSIZ];   /* the ifr union, at offset 16 */
+    size_t outlen = 0;
+
+    /* SIOCGIFNAME is the reverse mapping: ifr_ifindex in, ifr_name out. */
+    if (cmd == 0x8910 /*SIOCGIFNAME*/) {
+        int idx;
+        char nm[IFNAMSIZ];
+        if (arg == 0)
+            return 0;
+        if (copy_from_guest(c, &idx, arg + IFNAMSIZ, sizeof idx) < 0)
+            return 0;
+        memset(nm, 0, sizeof nm);
+        if (idx > 0 && if_indextoname((unsigned) idx, nm) == NULL) {
+            if (idx != 1) { *ret = (u64)(s64) -ENODEV; return 1; }
+            strcpy(nm, "lo");                        /* loopback is index 1 */
+        }
+        if (copy_to_guest(c, arg, nm, sizeof nm) < 0)
+            return 0;
+        *ret = 0;
+        return 1;
+    }
+
+    switch (cmd) {
+    case 0x8913: /*SIOCGIFFLAGS*/   case 0x8915: /*SIOCGIFADDR*/
+    case 0x8917: /*SIOCGIFDSTADDR*/ case 0x8919: /*SIOCGIFBRDADDR*/
+    case 0x891b: /*SIOCGIFNETMASK*/ case 0x891d: /*SIOCGIFMETRIC*/
+    case 0x8921: /*SIOCGIFMTU*/     case 0x8927: /*SIOCGIFHWADDR*/
+    case 0x8933: /*SIOCGIFINDEX*/   case 0x8942: /*SIOCGIFTXQLEN*/
+    case 0x8970: /*SIOCGIFMAP*/
+        break;
+    default:
+        return 0;                                    /* not ours; fall through */
+    }
 
     if (arg == 0)
         return 0;
@@ -975,16 +1131,115 @@ int nl_maybe_siocgifindex(CPU *c, u64 arg, u64 *ret)
         return 0;
     name[IFNAMSIZ - 1] = '\0';
 
-    ifindex = (int) if_nametoindex(name);
-    if (ifindex <= 0) {
-        if (strcmp(name, "lo") != 0)
-            return 0;
-        ifindex = 1;    /* loopback is index 1 on every Linux kernel */
+    if (!gather_ifq(name, &q)) {
+        *ret = (u64)(s64) -ENODEV;                   /* real kernel's errno */
+        return 1;
     }
 
-    /* struct ifreq: ifr_name (IFNAMSIZ) then the union; ifr_ifindex is the
-     * first member, at offset IFNAMSIZ, 4 bytes on both ABIs. */
-    if (copy_to_guest(c, arg + IFNAMSIZ, &ifindex, sizeof ifindex) < 0)
+    memset(out, 0, sizeof out);
+    switch (cmd) {
+    case 0x8933: { int v = q.ifindex; memcpy(out, &v, sizeof v); outlen = sizeof v; break; }
+    case 0x8921: { int v = q.mtu;     memcpy(out, &v, sizeof v); outlen = sizeof v; break; }
+    case 0x8942: { int v = q.txqlen;  memcpy(out, &v, sizeof v); outlen = sizeof v; break; }
+    case 0x891d: { int v = 0;         memcpy(out, &v, sizeof v); outlen = sizeof v; break; }  /* metric */
+    case 0x8913: { short v = (short)(q.flags & 0xffff); memcpy(out, &v, sizeof v); outlen = sizeof v; break; }
+    case 0x8915:   /* SIOCGIFADDR    */
+    case 0x8917:   /* SIOCGIFDSTADDR */
+    case 0x8919:   /* SIOCGIFBRDADDR */
+    case 0x891b: { /* SIOCGIFNETMASK */
+        struct sockaddr_in si;
+        uint32_t a = (cmd == 0x8915) ? q.addr :
+                     (cmd == 0x8917) ? q.dstaddr :
+                     (cmd == 0x8919) ? q.broadaddr : q.netmask;
+        memset(&si, 0, sizeof si);
+        si.sin_family = AF_INET;
+        si.sin_addr.s_addr = a;
+        memcpy(out, &si, sizeof si); outlen = sizeof si; break;
+    }
+    case 0x8927: { /* SIOCGIFHWADDR: sockaddr(sa_family=hwtype, sa_data=hwaddr) */
+        struct sockaddr sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_family = q.hwtype;
+        memcpy(sa.sa_data, q.hwaddr, q.hwlen ? q.hwlen : 6);
+        memcpy(out, &sa, sizeof sa); outlen = sizeof sa; break;
+    }
+    case 0x8970:   /* SIOCGIFMAP: struct ifmap, zero-filled (out already zeroed) */
+        outlen = GUEST_IFREQ_SZ - IFNAMSIZ; break;
+    }
+
+    if (copy_to_guest(c, arg + IFNAMSIZ, out, outlen) < 0)
+        return 0;
+    *ret = 0;
+    return 1;
+}
+
+int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
+{
+    uint32_t ifc_len;
+    uint64_t bufp;
+    struct { char name[IFNAMSIZ]; uint32_t addr; } ent[64];
+    int n = 0;
+    struct ifaddrs *ifaddr, *ifa;
+    uint32_t total, cap, produced, i;
+
+    if (arg == 0)
+        return 0;
+    /* guest struct ifconf: int ifc_len @0, pad @4, ifc_buf/ifc_req ptr @8. */
+    if (copy_from_guest(c, &ifc_len, arg, sizeof ifc_len) < 0)
+        return 0;
+    if (copy_from_guest(c, &bufp, arg + 8, sizeof bufp) < 0)
+        return 0;
+
+    /* SIOCGIFCONF is IPv4-only: one ifreq per AF_INET address (aliases too). */
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa != NULL && n < 64; ifa = ifa->ifa_next) {
+            struct sockaddr_in *si;
+            if (ifa->ifa_name == NULL || ifa->ifa_addr == NULL)
+                continue;
+            if (ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            memset(ent[n].name, 0, IFNAMSIZ);
+            strncpy(ent[n].name, ifa->ifa_name, IFNAMSIZ - 1);
+            si = (struct sockaddr_in *) ifa->ifa_addr;
+            ent[n].addr = si->sin_addr.s_addr;
+            n++;
+        }
+        freeifaddrs(ifaddr);
+    }
+    if (n == 0) {                                    /* loopback fallback */
+        memset(ent[0].name, 0, IFNAMSIZ);
+        strcpy(ent[0].name, "lo");
+        ent[0].addr = htonl(INADDR_LOOPBACK);
+        n = 1;
+    }
+
+    total = (uint32_t) n * GUEST_IFREQ_SZ;
+
+    /* NULL buffer => report the size needed to hold every entry (netdevice(7)). */
+    if (bufp == 0) {
+        if (copy_to_guest(c, arg, &total, sizeof total) < 0)
+            return 0;
+        *ret = 0;
+        return 1;
+    }
+
+    cap = ifc_len / GUEST_IFREQ_SZ;                  /* whole entries that fit */
+    produced = 0;
+    for (i = 0; i < (uint32_t) n && i < cap; i++) {
+        uint8_t e[GUEST_IFREQ_SZ];
+        struct sockaddr_in si;
+        memset(e, 0, sizeof e);
+        memcpy(e, ent[i].name, IFNAMSIZ);
+        memset(&si, 0, sizeof si);
+        si.sin_family = AF_INET;
+        si.sin_addr.s_addr = ent[i].addr;
+        memcpy(e + IFNAMSIZ, &si, sizeof si);        /* ifr_addr @ offset 16 */
+        if (copy_to_guest(c, bufp + (uint64_t) i * GUEST_IFREQ_SZ,
+                          e, GUEST_IFREQ_SZ) < 0)
+            return 0;
+        produced += GUEST_IFREQ_SZ;
+    }
+    if (copy_to_guest(c, arg, &produced, sizeof produced) < 0)
         return 0;
     *ret = 0;
     return 1;

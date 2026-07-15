@@ -1085,14 +1085,18 @@ SYSDEF(ioctl) {
             return (u64)(s64)-EFAULT;
         return (u64)r;
     }
-    /* SIOCGIFINDEX: not in the whitelist below, and Android denies it (EACCES)
-     * on the socket glibc opens for if_nametoindex(); resolve it from the host's
-     * own interface table instead. Unresolvable names fall through unchanged.
-     * Ungated (like proot) so if_nametoindex() works whether or not the host
-     * blocks netlink. */
-    if (cmd == 0x8933 /*SIOCGIFINDEX*/) {
+    /* Interface-query ioctls (ifconfig/net-tools, if_nametoindex, ...). Answered
+     * from the host's own interface table so they work on Android, where the
+     * socket ioctls are denied (EACCES), and on rootfs setups without a
+     * /proc/net/dev to enumerate from. Ungated (like proot) so they work whether
+     * or not the host blocks netlink; non-network cmds fall through to ioctl_tab. */
+    {
         u64 ret;
-        if (nl_maybe_siocgifindex(c, a2, &ret)) return ret;
+        if (cmd == 0x8912 /*SIOCGIFCONF*/) {
+            if (nl_maybe_siocgifconf(c, a2, &ret)) return ret;
+        } else if (nl_maybe_ifreq_ioctl(c, cmd, a2, &ret)) {
+            return ret;
+        }
     }
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)

@@ -157,7 +157,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |
 | `src/syscall.c` + `src/sys_*.c` | Syscall dispatcher and per-area handlers (~190). |
 | `src/sys_procfs.c` | Synthesized guest `/proc` views (`maps`, `cmdline`, `mounts`/`mountinfo`, `stat`, `loadavg`/`uptime`/`version`). |
-| `src/sys_netlink.c` | In-process `NETLINK_ROUTE` emulation for hosts that deny `AF_NETLINK` (Android/SELinux). |
+| `src/sys_netlink.c` | In-process `NETLINK_ROUTE` emulation for hosts that deny `AF_NETLINK` (Android/SELinux); also answers the read-only `SIOCGIF*` interface-query ioctls (ifconfig/net-tools) from the host interface table. |
 | `src/proctab.c` | Shared-memory guest-PID registry powering the cross-process `ps`/`top` and hidden-process views. |
 | `src/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
 | `src/signal.c` | Host signal capture → guest `rt_sigframe`; `rt_sigreturn`; job-control mask mirroring. |
