@@ -140,6 +140,11 @@ SYSDEF(kill) {
      * at the host. */
     if ((a0 == (u64)getpid() || a0 == 0) && ptrace_selfstop((int)a1))
         return 0;
+    /* A stop signal to *another* process that is a tracee likewise becomes a
+     * cooperative group-stop (a tracer stopping its tracee with SIGSTOP before
+     * detaching, as strace does on ^C); a real host SIGSTOP would freeze it. */
+    if ((s32)a0 > 0 && a0 != (u64)getpid() && ptrace_signal_stop((s32)a0, (int)a1))
+        return 0;
     return kill((pid_t)(s32)a0, (int)a1) < 0 ? host_err() : 0;
 }
 
@@ -152,6 +157,8 @@ SYSDEF(tkill) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     s32 tid = (s32)a0;
     if (tid <= 0) return (u64)(s64)-EINVAL;
+    /* Stop signal to another traced process's main thread -> cooperative stop. */
+    if (tid != (s32)getpid() && ptrace_signal_stop(tid, (int)a1)) return 0;
     pid_t htid = tid_to_host(c->m, tid);
     if (htid == 0) {   /* self: route a traced self-stop through ptrace */
         if (ptrace_selfstop((int)a1)) return 0;
@@ -175,6 +182,9 @@ SYSDEF(tgkill) {
             if (ptrace_selfstop((int)a2)) return 0;
             htid = (pid_t)syscall(SYS_gettid);
         }
+    } else if (ptrace_signal_stop(tgid, (int)a2)) {
+        /* Stop signal to another traced process -> cooperative group-stop. */
+        return 0;
     }
     return syscall(SYS_tgkill, (pid_t)tgid, htid, (int)a2) < 0 ? host_err() : 0;
 }

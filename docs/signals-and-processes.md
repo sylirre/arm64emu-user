@@ -142,6 +142,14 @@ requests about itself**, the same way it already mediates every other syscall:
   execs — is intercepted at the send site (`sys_sig.c`, `ptrace_selfstop`) and
   routed through this cooperative stop instead of a real host job-control stop,
   which would freeze the tracee so it could no longer serve its ptrace mailbox.
+  A stop signal sent to *another* process that is a tracee is intercepted the
+  same way (`ptrace_signal_stop`): the send site records the signal on the
+  tracee's registry link and kicks it, and the tracee reports a cooperative
+  group-stop (`WSTOPSIG == the stop signal`) at its next run-loop boundary. This
+  is the path a tracer takes to stop a running tracee with `SIGSTOP` before
+  detaching — e.g. `strace -p` on `^C`; a real (uncatchable) host `SIGSTOP` would
+  both freeze the tracee's service loop (deadlocking the follow-up `DETACH`) and
+  never reach the emulator to be reported.
 - *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
   `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
   dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the

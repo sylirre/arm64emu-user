@@ -84,6 +84,8 @@ typedef struct {
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
     u32 attach_pending;  /* tracer ATTACH/SEIZE'd us: adopt at the next boundary */
     u32 interrupt_pending; /* tracer PTRACE_INTERRUPT'd us: stop at the next boundary */
+    u32 stopsig_pending; /* a stop signal (SIGSTOP/...) was sent to us as a tracee:
+                          * report it as a cooperative group-stop, not a host stop */
     u32 seize;           /* attached via SEIZE (no initial SIGSTOP; group stops) */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
@@ -145,6 +147,8 @@ static PtLink *pt_claim(s32 tracee) {
             e->tracer = 0; e->options = 0; e->state = PT_ST_RUNNING;
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
             e->eventmsg = 0; e->si_signo = e->si_code = e->si_errno = 0;
+            e->attach_pending = e->interrupt_pending = 0;
+            e->stopsig_pending = 0; e->seize = 0;
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
             return e;
         }
@@ -427,6 +431,15 @@ void ptrace_service_kick(CPU *c) {
         __atomic_store_n(&g_self_link->interrupt_pending, 0, __ATOMIC_RELEASE);
         pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
     }
+    /* A stop signal (SIGSTOP/SIGTSTP/...) another process sent us as a tracee:
+     * report it as a cooperative group-stop with that signal as WSTOPSIG. */
+    if (g_self_link) {
+        u32 ss = __atomic_load_n(&g_self_link->stopsig_pending, __ATOMIC_ACQUIRE);
+        if (ss) {
+            __atomic_store_n(&g_self_link->stopsig_pending, 0, __ATOMIC_RELEASE);
+            pt_stop(c, (int)ss, 0, 0, 0, 0);
+        }
+    }
 }
 
 int ptrace_selfstop(int sig) {
@@ -551,6 +564,25 @@ static void pt_send_kick(s32 pid) {
     union sigval v;
     v.sival_int = PT_KICK_MAGIC;
     sigqueue(pid, PTRACE_KICKSIG, v);
+}
+
+/* A stop signal aimed at another process that is a ptrace tracee: route it into
+ * a cooperative group-stop instead of a real host stop. An uncatchable SIGSTOP
+ * delivered to the host would freeze the tracee inside its ptrace service loop,
+ * so the follow-up tracer requests (e.g. the DETACH strace issues on ^C after it
+ * stops the tracee with SIGSTOP) would deadlock -- and the emulator would never
+ * see the signal to report it. We record the signal on the tracee's link and
+ * kick it; at its run-loop boundary ptrace_service_kick reports the group-stop.
+ * Returns 1 if routed (the caller must not also host-signal), 0 otherwise. */
+int ptrace_signal_stop(s32 pid, int sig) {
+    if (!g_tab || pid <= 0) return 0;
+    if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
+        return 0;
+    PtLink *e = pt_find(pid);
+    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
+    __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
+    pt_send_kick(pid);
+    return 1;
 }
 
 /* ---- tracer: guest ptrace(2) dispatch ---- */
