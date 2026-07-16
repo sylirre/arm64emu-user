@@ -210,7 +210,7 @@ static int join_host(const char *host, const char *rem, char *out) {
  * It lives in a MAP_SHARED region created before the first fork (bindtab_init),
  * so a mount done by any guest process is visible session-wide, as a single
  * shared mount namespace would be — the `mount` command runs in a child, and its
- * bind must reach the parent shell. Slots are lock-free, mirroring m->gtid:
+ * bind must reach the parent shell. Slots are lock-free:
  * `active` is CAS'd 0 -> -1 to claim, filled, then published with a store to 1;
  * a reader gates on observing active == 1, which also orders the guest/host
  * writes preceding the publish (release/acquire, cross-process via the shared
@@ -273,9 +273,9 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
     return best;
 }
 
-/* Runtime bind-table mutation (machine.h). Lock-free, mirroring m->gtid: a slot
- * is claimed by CAS'ing active 0 -> -1, filled, then published with a store to
- * 1; readers (bind_match/bind_of_host above) skip anything not observed as 1. */
+/* Runtime bind-table mutation (machine.h). Lock-free: a slot is claimed by
+ * CAS'ing active 0 -> -1, filled, then published with a store to 1; readers
+ * (bind_match/bind_of_host above) skip anything not observed as 1. */
 int bind_add(struct Machine *m, const char *guest_canon, const char *host, int ro) {
     (void)m;
     if (strlen(guest_canon) + 1 > PATH_MAX || strlen(host) + 1 > PATH_MAX)

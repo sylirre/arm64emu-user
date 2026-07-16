@@ -19,7 +19,7 @@
  * in one session see the guest processes of another). If no usable directory
  * exists it degrades to the anonymous region (today's per-invocation behavior).
  *
- * Concurrency: a slot is claimed with an atomic CAS on `pid` (as gtid_add does);
+ * Concurrency: a slot is claimed with an atomic CAS on `pid`;
  * the mutable bytes are guarded by a per-entry seqlock so a reader in another
  * process never tears a half-written cmdline. `start` (the /proc/<pid>/stat
  * starttime) lets a reader reject a stale slot left by a process the host

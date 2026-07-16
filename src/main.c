@@ -667,7 +667,6 @@ int main(int argc, char **argv) {
     as_init(&m->as);
     m->cpu.m = m;
     g_tls.tid = getpid();     /* main thread tid == pid */
-    m->next_tid = getpid();
 
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */

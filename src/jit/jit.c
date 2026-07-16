@@ -76,9 +76,9 @@ int jit_backend_available(void) { return be_available(); }
 
 /* ---- thread registry (cross-thread interrupt only) ----
  * Slots are claimed/released with atomics under as_lock; the fork child
- * clears the table outright (same discipline as the gtid table: a fork must
- * never inherit a lock or a pointer owned by a thread that does not exist
- * in the child). Notifiers run under as_lock too, so a slot they loaded
+ * clears the table outright (a fork must never inherit a lock or a pointer
+ * owned by a thread that does not exist in the child). Notifiers run under
+ * as_lock too, so a slot they loaded
  * cannot be unregistered-and-freed mid-dereference. */
 #define JIT_ENVS_MAX 256
 static JitEnv *g_jit_envs[JIT_ENVS_MAX];

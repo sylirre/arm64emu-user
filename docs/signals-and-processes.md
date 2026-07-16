@@ -94,7 +94,15 @@ One host thread per guest thread over the shared `Machine`/address space:
 
 - each thread gets its own `CPU` and its own `__thread` state (`g_tls`,
   `g_fcache`);
-- `gettid` returns a per-thread tid; the main thread's tid equals the pid;
+- the guest tid **is** the host tid of the pthread carrying the thread — the
+  thread analogue of the guest pid == host pid invariant. The tid is known only
+  once the new thread runs, so `clone` parks on a startup handshake until
+  `thread_entry` publishes its `gettid()` (writing `CLONE_CHILD_SETTID` first,
+  matching kernel ordering). Tid-addressed syscalls (`tkill`, `tgkill`,
+  `sched_*`, `getpriority`) therefore pass through unmodified, host
+  `/proc/<pid>/task` lists exactly the guest tids, and tid-keyed shared state
+  (the ptrace registry) cannot collide across processes. The main thread's tid
+  equals the pid;
 - exclusives and LSE atomics are SMP-correct host CAS, and guest barriers are host
   fences (see [memory.md](memory.md)) — this is what makes pthread mutexes/condvars
   and lock-free code correct even on weakly-ordered ARM hosts;

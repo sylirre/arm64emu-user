@@ -153,48 +153,40 @@ SYSDEF(kill) {
 }
 
 SYSDEF(tkill) {
-    /* Thread-directed signal. Secondary guest threads carry synthetic tids
-     * (sys_proc.c), so translate to the host thread carrying the target --
-     * the raw value addresses whatever host process it collides with, which
-     * broke raise()/pthread_kill from worker threads. tid_to_host returns 0
-     * for the caller itself (the common raise() case). */
-    (void)a2; (void)a3; (void)a4; (void)a5;
+    /* Thread-directed signal. Guest tids ARE host tids (sys_proc.c clone), so
+     * the raw value addresses the right host task and a stale tid gets the
+     * kernel's ESRCH. */
+    (void)c; (void)a2; (void)a3; (void)a4; (void)a5;
     s32 tid = (s32)a0;
     if (tid <= 0) return (u64)(s64)-EINVAL;
-    /* Stop/cont signal to another traced process's main thread -> cooperative
-     * group-stop / listening group-stop end. */
-    if (tid != (s32)getpid() && ptrace_signal_stop(tid, (int)a1)) return 0;
-    if (tid != (s32)getpid() && ptrace_signal_cont(tid, (int)a1)) return 0;
-    pid_t htid = tid_to_host(c->m, tid);
-    if (htid == 0) {   /* self: route a traced self-stop through ptrace */
+    if (tid == (s32)g_tls.tid) {
+        /* Self (the common raise() case): route a traced self-stop via ptrace. */
         if (ptrace_selfstop((int)a1)) return 0;
-        htid = (pid_t)syscall(SYS_gettid);
+    } else {
+        /* Stop/cont signal to another traced task -> cooperative group-stop /
+         * listening group-stop end. */
+        if (ptrace_signal_stop(tid, (int)a1)) return 0;
+        if (ptrace_signal_cont(tid, (int)a1)) return 0;
     }
-    return syscall(SYS_tkill, htid, (int)a1) < 0 ? host_err() : 0;
+    return syscall(SYS_tkill, (pid_t)tid, (int)a1) < 0 ? host_err() : 0;
 }
 
 SYSDEF(tgkill) {
-    /* As tkill: translate the tid within the caller's own thread group.
-     * Foreign thread groups pass through -- their main-thread tid is a real
-     * host pid; their secondary tids are private to that emulator instance
-     * and get the kernel's ESRCH. */
-    (void)a3; (void)a4; (void)a5;
+    /* As tkill: guest tids are host tids, so both ids pass through and the
+     * host enforces the tgid/tid pairing. */
+    (void)c; (void)a3; (void)a4; (void)a5;
     s32 tgid = (s32)a0, tid = (s32)a1;
     if (tgid <= 0 || tid <= 0) return (u64)(s64)-EINVAL;
-    pid_t htid = (pid_t)tid;
-    if (tgid == getpid()) {
-        htid = tid_to_host(c->m, tid);
-        if (htid == 0) {   /* self thread: route a traced self-stop via ptrace */
-            if (ptrace_selfstop((int)a2)) return 0;
-            htid = (pid_t)syscall(SYS_gettid);
-        }
+    if (tid == (s32)g_tls.tid && tgid == getpid()) {
+        /* Self thread: route a traced self-stop through ptrace. */
+        if (ptrace_selfstop((int)a2)) return 0;
     } else if (ptrace_signal_stop(tgid, (int)a2) ||
                ptrace_signal_cont(tgid, (int)a2)) {
-        /* Stop signal to another traced process -> cooperative group-stop; SIGCONT
+        /* Stop signal to a traced process -> cooperative group-stop; SIGCONT
          * to one it has put into a listening group-stop -> group-stop end. */
         return 0;
     }
-    return syscall(SYS_tgkill, (pid_t)tgid, htid, (int)a2) < 0 ? host_err() : 0;
+    return syscall(SYS_tgkill, (pid_t)tgid, (pid_t)tid, (int)a2) < 0 ? host_err() : 0;
 }
 
 SYSDEF(rt_sigqueueinfo) {

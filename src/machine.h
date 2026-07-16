@@ -36,8 +36,8 @@ typedef struct {
  * (path.c bindtab_init) rather than in struct Machine, so a runtime mount in one
  * guest process is visible session-wide. Seeded from --bind before the first
  * fork and mutated at runtime by sys_file.c. Slots are lock-free: `active`
- * (0 free, -1 mid-claim, 1 live) is claimed/published with atomics exactly like
- * m->gtid, so the path.c hot-path readers never take a lock — a lock a fork
+ * (0 free, -1 mid-claim, 1 live) is claimed with a CAS through the mid-claim
+ * sentinel, so the path.c hot-path readers never take a lock — a lock a fork
  * could otherwise inherit held by a thread absent in the child. The shared
  * high-water count is a monotonic bound for the reader loops. Slot ~2*PATH_MAX;
  * 64 slots is ~0.5 MB of demand-zero shared memory for the whole session. */
@@ -97,19 +97,10 @@ struct Machine {
     GSigAction sigact[65];    /* index 1..64 */
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
 
-    /* Thread bookkeeping (CLONE_VM). */
-    int next_tid;             /* monotonic tid allocator */
-
-    /* Live secondary threads: the synthetic guest tid handed out by clone
-     * mapped to the host tid of the pthread carrying it, so tid-addressed
-     * syscalls (sched_*, tkill) reach the right host thread instead of
-     * whatever process the synthetic value collides with. Slots are claimed
-     * and released with atomic ops rather than a lock so fork can never
-     * inherit a lock held by a thread that does not exist in the child; the
-     * child just clears the table. guest == 0 free, -1 mid-claim; host == 0
-     * until the thread first runs (sys_proc.c). */
-#define GT_MAX 256
-    struct { s32 guest; s32 host; } gtid[GT_MAX];
+    /* Thread bookkeeping (CLONE_VM) needs no tid table: the guest tid of a
+     * spawned thread IS the host tid of the pthread carrying it (sys_proc.c
+     * clone), the thread analogue of the guest pid == host pid invariant, so
+     * tid-addressed syscalls pass through. */
 
     /* Emulated AF_NETLINK/NETLINK_ROUTE sockets. On Android the host denies a
      * real netlink socket, so socket() hands out an AF_UNIX/SOCK_DGRAM stand-in
