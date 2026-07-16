@@ -71,6 +71,8 @@ SYSDEF(rt_sigqueueinfo);
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
 SYSDEF(gettimeofday); SYSDEF(nanosleep); SYSDEF(setitimer); SYSDEF(getitimer);
 SYSDEF(timerfd_create); SYSDEF(timerfd_settime); SYSDEF(timerfd_gettime);
+SYSDEF(timer_create); SYSDEF(timer_settime); SYSDEF(timer_gettime);
+SYSDEF(timer_getoverrun); SYSDEF(timer_delete);
 
 /* sys_misc.c */
 SYSDEF(getrandom); SYSDEF(getrlimit); SYSDEF(setrlimit); SYSDEF(prlimit64);
@@ -263,6 +265,11 @@ static const struct {
     { G_NR_timerfd_create, sys_timerfd_create, "timerfd_create" },
     { G_NR_timerfd_settime, sys_timerfd_settime, "timerfd_settime" },
     { G_NR_timerfd_gettime, sys_timerfd_gettime, "timerfd_gettime" },
+    { G_NR_timer_create, sys_timer_create, "timer_create" },
+    { G_NR_timer_settime, sys_timer_settime, "timer_settime" },
+    { G_NR_timer_gettime, sys_timer_gettime, "timer_gettime" },
+    { G_NR_timer_getoverrun, sys_timer_getoverrun, "timer_getoverrun" },
+    { G_NR_timer_delete, sys_timer_delete, "timer_delete" },
 
     { G_NR_getrandom, sys_getrandom, "getrandom" },
     { G_NR_getrlimit, sys_getrlimit, "getrlimit" },
@@ -393,9 +400,6 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_shmat, "shmat" }, { G_NR_shmget, "shmget" },
     { G_NR_signalfd4, "signalfd4" }, { G_NR_statmount, "statmount" },
     { G_NR_swapoff, "swapoff" }, { G_NR_swapon, "swapon" }, { G_NR_tee, "tee" },
-    { G_NR_timer_create, "timer_create" }, { G_NR_timer_delete, "timer_delete" },
-    { G_NR_timer_getoverrun, "timer_getoverrun" },
-    { G_NR_timer_gettime, "timer_gettime" }, { G_NR_timer_settime, "timer_settime" },
     { G_NR_unshare, "unshare" }, { G_NR_userfaultfd, "userfaultfd" },
     { G_NR_vhangup, "vhangup" }, { G_NR_vmsplice, "vmsplice" },
 };

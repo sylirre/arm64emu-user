@@ -209,6 +209,22 @@ void sig_deliver_pending(CPU *c);
 /* Would sig_deliver_pending act on this thread's queue right now?
  * (rt_sigsuspend's sleep gate; see signal.c.) */
 int sig_pending_deliverable(struct Machine *m);
+/* rt_sigtimedwait: consume one pending signal from `set` off this thread's
+ * capture ring without invoking its handler; fills the guest siginfo at
+ * info_va when non-zero. timeout_ns < 0 = forever. Returns the signal number
+ * or -EAGAIN (timeout) / -EINTR (another deliverable signal pends). */
+s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns);
+/* Arm the host carrier signal for guest signal 32 or 33 (the guest libc's
+ * internal SIGTIMER/SIGCANCEL, unraisable as host numbers -- the host libc
+ * owns those) and return the host signal to raise instead; the capture
+ * handler translates it back to the guest number (sys_time.c timer_create). */
+int  sig_arm_rt_remap(int guest_sig);
+
+/* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
+ * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval
+ * cannot ride a 32-bit host kernel's 4-byte one); this returns the slot's
+ * stored guest value. Async-signal-safe (plain loads); 1 = live slot. */
+int  ptimer_siginfo(s32 slot, u64 *val);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* Queue a signal into this thread's capture ring for cooperative delivery

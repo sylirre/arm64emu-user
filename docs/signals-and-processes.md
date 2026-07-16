@@ -43,6 +43,49 @@ and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`).
 
+### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
+
+`sig_timedwait` consumes one pending signal from the calling thread's capture
+ring *without* running its handler. The caller keeps the waited signals blocked
+(the POSIX contract), and blocked host-caught signals accumulate in the ring, so
+the ring **is** the pending set to take from — the guest block mask is
+deliberately ignored, exactly as `sigwait` consumes blocked signals. It polls in
+short naps (like `rt_sigsuspend`), returns `-EAGAIN` on timeout, and mirrors the
+kernel's `EINTR` when a *different* deliverable signal pends (the run loop then
+delivers it). The libc timer helper thread lives in this call, so `SIGEV_THREAD`
+timers depend on it.
+
+### POSIX interval timers and the guest-32/33 carrier remap
+
+The `timer_create` family (`sys_time.c`) wraps host libc timers behind a
+per-process slot table: the guest `timer_t` is a slot index, the slot holds the
+opaque host handle **and the guest's 64-bit sigval**. Notification passes
+through — signal numbers are shared, a `SIGEV_THREAD_ID` tid is the host tid,
+and the fired `SI_TIMER` siginfo rides the capture ring like any other
+host-caught signal — but the sigval travels *out of band*: the host timer
+carries only the slot index in its `sival_int`, and the capture handler swaps
+in the slot's stored guest value (`ptimer_siginfo`). An 8-byte guest sigval —
+glibc's `SIGEV_THREAD` helper passes a `struct timer *` at a 39-bit guest VA —
+cannot survive a 32-bit host kernel's 4-byte sigval, and as a bonus the guest's
+`si_timerid` is the guest timer id on every host. `execve` deletes the timers
+(ours is an in-process reload, so the host timers would otherwise fire into the
+new image — the kernel deletes them on exec) and a fork child clears its
+inherited table copy (the host already dropped the timers themselves).
+
+One wrinkle: guest signals **32/33** are the *guest* libc's internal numbers
+(its `SIGTIMER`/`SIGCANCEL` — the glibc/musl `SIGEV_THREAD` helper arms a
+`SIGEV_THREAD_ID` timer on 32), but the *host* libc owns those same numbers, so
+they can never be raised as host signals. A timer armed with guest 32/33 is
+created with a reserved high host RT carrier (`SIGRTMAX-1`/`SIGRTMAX-2`)
+instead, translated back to the guest number when the capture handler queues
+it. The carriers are armed on first use, so a guest that never touches 32/33
+keeps those host numbers; a guest using *both* 32/33 timers *and* the top RT
+numbers directly would collide — a documented corner. `SIGEV_THREAD` itself
+never reaches the syscall level (guest libc implements it in userspace), and is
+rejected with `-EINVAL` like the kernel does — critically so, since letting it
+reach the *host* wrapper would spawn a host helper thread on a junk guest
+function pointer.
+
 ## Job control: mirroring the block mask to the host
 
 This is the non-obvious part, and the source of a real bug.

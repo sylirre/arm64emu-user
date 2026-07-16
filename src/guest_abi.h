@@ -377,6 +377,23 @@ typedef struct { s64 tv_sec; s64 tv_nsec; } GTimespec;
 typedef struct { s64 tv_sec; s64 tv_usec; } GTimeval;
 typedef struct { u64 rlim_cur; u64 rlim_max; } GRlimit;
 
+/* struct sigevent (LP64, 64 bytes total = SIGEV_MAX_SIZE): the sigval union,
+ * signo, notify, then the notify union whose first word is the target tid for
+ * SIGEV_THREAD_ID (the SIGEV_THREAD function/attribute pointers never reach
+ * the syscall level -- guest libc implements that flavor in userspace). */
+typedef struct {
+    u64 sigev_value;          /* union sigval, 8 bytes on LP64 */
+    s32 sigev_signo;
+    s32 sigev_notify;
+    s32 sigev_tid;            /* first word of the notify union */
+    u8  pad[44];
+} GSigevent;
+
+/* sigev_notify values (shared kernel constants). */
+#define G_SIGEV_SIGNAL    0
+#define G_SIGEV_NONE      1
+#define G_SIGEV_THREAD_ID 4
+
 /* struct new_utsname */
 typedef struct {
     char sysname[65];

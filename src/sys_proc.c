@@ -297,6 +297,7 @@ SYSDEF(clone) {
         g_tls.tid = getpid();             /* new process: tid == pid */
         /* Only the forking thread exists here. */
         jit_fork_child();                 /* fork discipline for the JIT state */
+        ptimers_fork_clear();             /* POSIX timers are not inherited */
         /* A plain fork does not re-run load_elf, so publish the child (with the
          * inherited cmdline/exe/cwd/environ and its own fresh starttime) or it
          * would be invisible in the hidden /proc view until it execve'd. */
@@ -452,6 +453,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     }
 
     /* Point of no return: tear down and reload. */
+    ptimers_exec_clear();    /* POSIX timers do not survive execve */
     as_destroy(&m->as);
     as_init(&m->as);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);

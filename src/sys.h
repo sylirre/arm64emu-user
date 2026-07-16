@@ -36,6 +36,13 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
 int oflags_g2h(int g);
 int oflags_h2g(int h);
 
+/* sys_time.c: POSIX interval-timer table maintenance. execve deletes the
+ * host timers (they must not fire into the new image -- our exec is an
+ * in-process reload); a fork child clears its inherited table copy (the
+ * host already dropped the timers themselves). */
+void ptimers_exec_clear(void);
+void ptimers_fork_clear(void);
+
 /* The kernel identity presented to the guest: sys_uname and the synthesized
  * /proc/version must agree, so both build from these. */
 #define GUEST_KREL "6.1.0-arm64chroot"

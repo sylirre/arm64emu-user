@@ -105,8 +105,26 @@ SYSDEF(rt_sigsuspend) {
 }
 
 SYSDEF(rt_sigtimedwait) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return (u64)(s64)-ENOSYS;
+    /* (set, siginfo *, timeout, sigsetsize). Consumes a pending signal from
+     * this thread's capture ring without running its handler (sig_timedwait);
+     * the libc timer helper thread lives in this call (sigwaitinfo on its
+     * SIGTIMER), so SIGEV_THREAD timers depend on it. */
+    (void)a4; (void)a5;
+    if (a3 != 8) return (u64)(s64)-EINVAL;
+    u64 set;
+    if (copy_from_guest(c, &set, a0, 8) < 0) return (u64)(s64)-EFAULT;
+    s64 tmo = -1;
+    if (a2) {
+        GTimespec g;
+        if (copy_from_guest(c, &g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        if (g.tv_sec < 0 || g.tv_nsec < 0 || g.tv_nsec >= 1000000000)
+            return (u64)(s64)-EINVAL;
+        /* Clamp huge waits well below the s64-nanosecond ceiling. */
+        tmo = g.tv_sec > 4000000000LL
+                  ? 4000000000LL * 1000000000LL
+                  : g.tv_sec * 1000000000LL + g.tv_nsec;
+    }
+    return (u64)sig_timedwait(c, set, a1, tmo);
 }
 
 SYSDEF(sigaltstack) {

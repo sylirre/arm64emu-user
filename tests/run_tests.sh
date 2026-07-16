@@ -21,8 +21,9 @@ pass=0 fail=0
 run_diff() {   # run_diff <name> <binary> [args...]
     local name="$1"; shift
     local out_q out_e rc_q rc_e
-    out_q=$("$QEMU" "$@" 2>/dev/null); rc_q=$?
-    out_e=$("$EMU" / "$@" 2>/dev/null); rc_e=$?
+    # timeout: a hanging test must FAIL (rc 124 mismatch), not wedge the suite
+    out_q=$(timeout 60 "$QEMU" "$@" 2>/dev/null); rc_q=$?
+    out_e=$(timeout 60 "$EMU" / "$@" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS $name"
     else
@@ -54,8 +55,8 @@ for cfile in tests/c/*.c; do
         # host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
         cp "$bd" /tmp/t.bin
-        out_q=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        out_q=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" timeout 60 "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" timeout 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else

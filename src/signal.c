@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -53,7 +54,7 @@ typedef struct {
     int code;
     int pid, uid, status;
     u64 addr;
-    long value;
+    s64 value;   /* full guest sigval width, even on a 32-bit host */
 } PendSig;
 
 #define SIGQ_LEN 32
@@ -61,21 +62,69 @@ static __thread PendSig sigq[SIGQ_LEN];
 static __thread volatile sig_atomic_t sigq_head, sigq_tail;
 __thread volatile sig_atomic_t g_sig_npend;
 
+/* Guest rt-signal remap: guest signals 32/33 are the *guest* libc's internal
+ * numbers (its SIGTIMER/SIGCANCEL) but collide with the *host* libc's own
+ * internal handlers, so they can never be raised as host signals. A POSIX
+ * timer the guest arms with signo 32/33 (glibc/musl SIGEV_THREAD helpers do
+ * exactly this) is instead created with a reserved high host RT signal and
+ * translated back to the guest number at capture time. Armed on first use so
+ * a guest that never touches 32/33 keeps the host numbers for itself. */
+#define SIG_REMAP32_HOST (SIGRTMAX - 1)   /* host carrier for guest signal 32 */
+#define SIG_REMAP33_HOST (SIGRTMAX - 2)   /* host carrier for guest signal 33 */
+static int g_sig_remap_armed[2];          /* [0]: 32, [1]: 33 (atomic flags) */
+
+static int sig_remap_to_guest(int sig) {
+    if (sig == SIG_REMAP32_HOST &&
+        __atomic_load_n(&g_sig_remap_armed[0], __ATOMIC_ACQUIRE)) return 32;
+    if (sig == SIG_REMAP33_HOST &&
+        __atomic_load_n(&g_sig_remap_armed[1], __ATOMIC_ACQUIRE)) return 33;
+    return sig;
+}
+
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     (void)uctx;
     int next = (sigq_head + 1) % SIGQ_LEN;
     if (next == sigq_tail) return;   /* queue full: drop (kernel coalesces too) */
     PendSig *p = &sigq[sigq_head];
-    p->signo = sig;
+    p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     p->pid = (int)si->si_pid;
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
     p->addr = (u64)(uintptr_t)si->si_addr;
-    p->value = (long)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
+    p->value = (s64)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
+    if (si->si_code == SI_TIMER) {
+        /* A POSIX-timer signal: the host sigval carries only the emulator's
+         * timer-slot index (the guest's 8-byte sigval cannot ride a 32-bit
+         * host kernel's 4-byte sigval); swap in the slot's stored guest value
+         * and make si_timerid the guest timer id (async-signal-safe: plain
+         * loads). Every SI_TIMER in this process is one of ours. */
+        u64 gv;
+        if (ptimer_siginfo(si->si_value.sival_int, &gv)) {
+            p->value = (s64)gv;
+            p->pid = si->si_value.sival_int;   /* si_timerid slot */
+        }
+    }
     sigq_head = next;
     g_sig_npend = 1;
     jit_signal_interrupt();   /* make generated code exit at its next entry */
+}
+
+/* Arm the carrier for guest signal 32 or 33 and return the host signal number
+ * to raise in its place (sys_time.c timer_create). Installs the capture
+ * handler on the carrier; sig_host_update leaves an armed carrier alone. */
+int sig_arm_rt_remap(int guest_sig) {
+    int idx = (guest_sig == 33);
+    int host = idx ? SIG_REMAP33_HOST : SIG_REMAP32_HOST;
+    if (!__atomic_exchange_n(&g_sig_remap_armed[idx], 1, __ATOMIC_ACQ_REL)) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = host_catcher;
+        sa.sa_flags = SA_SIGINFO;             /* deliberately no SA_RESTART */
+        sigfillset(&sa.sa_mask);
+        sigaction(host, &sa, NULL);
+    }
+    return host;
 }
 
 /* Queue a signal into this thread's own capture ring as if the host had caught
@@ -245,6 +294,12 @@ void sig_host_update(struct Machine *m, int sig) {
     if (sig == PTRACE_KICKSIG) return;           /* owned by the ptrace kick net;
                                                     guest dispositions honored via
                                                     the capture queue (sig_kick_net) */
+    if ((sig == SIG_REMAP32_HOST &&
+         __atomic_load_n(&g_sig_remap_armed[0], __ATOMIC_ACQUIRE)) ||
+        (sig == SIG_REMAP33_HOST &&
+         __atomic_load_n(&g_sig_remap_armed[1], __ATOMIC_ACQUIRE)))
+        return;                                  /* armed 32/33 carrier: keep the
+                                                    capture handler installed */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;
@@ -488,6 +543,73 @@ int sig_pending_deliverable(struct Machine *m) {
         return 1;
     }
     return 0;
+}
+
+/* rt_sigtimedwait: synchronously consume one pending signal from `set` off
+ * this thread's capture ring -- without invoking its handler -- as sigwait/
+ * sigwaitinfo do. The caller keeps these signals *blocked* (the POSIX
+ * contract), and blocked host-caught signals accumulate in the ring, so the
+ * ring is exactly the pending set to take from; the guest block mask is
+ * deliberately ignored (sigwait consumes blocked signals). Polls in short
+ * naps like rt_sigsuspend: a matching signal can land on this thread at any
+ * moment -- e.g. a SIGEV_THREAD_ID timer aimed at a libc timer helper thread
+ * sigwaitinfo()ing its SIGTIMER. timeout_ns < 0 waits forever. Returns the
+ * signal number, -EAGAIN on timeout, or -EINTR when a different deliverable
+ * signal pends (the run loop delivers it once the syscall returns). */
+s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
+    struct Machine *m = c->m;
+    struct timespec dl;
+    if (timeout_ns > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &dl);
+        dl.tv_sec += (time_t)(timeout_ns / 1000000000);
+        dl.tv_nsec += (long)(timeout_ns % 1000000000);
+        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    }
+    for (;;) {
+        for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+            int sig = sigq[t].signo;
+            if (!(set & (1ULL << (sig - 1)))) continue;
+            PendSig p = sigq[t];
+            for (int u = t; u != sigq_tail; ) {   /* remove by shifting */
+                int prev = (u + SIGQ_LEN - 1) % SIGQ_LEN;
+                sigq[u] = sigq[prev];
+                u = prev;
+            }
+            sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
+            if (sigq_tail == sigq_head) g_sig_npend = 0;
+            if (info_va) {
+                u8 si[128];
+                memset(si, 0, sizeof si);
+                s32 *w = (s32 *)si;
+                w[0] = p.signo;
+                w[2] = p.code;
+                /* Union fields as the frame writer lays them out: pid/uid --
+                 * which SI_TIMER's timerid/overrun alias -- at +16/+20, the
+                 * sigval payload at +24. */
+                memcpy(si + 16, &p.pid, 4);
+                memcpy(si + 20, &p.uid, 4);
+                s64 v = (s64)p.value;
+                memcpy(si + 24, &v, 8);
+                if (copy_to_guest(c, info_va, si, sizeof si) < 0)
+                    return -EFAULT;
+            }
+            return p.signo;
+        }
+        /* Nothing from `set`: a caught signal arriving during the wait makes
+         * the kernel return EINTR -- mirror that when the ring holds another
+         * deliverable signal, so the run loop can deliver it. */
+        if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
+        if (timeout_ns == 0) return -EAGAIN;   /* pure poll */
+        if (timeout_ns > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > dl.tv_sec ||
+                (now.tv_sec == dl.tv_sec && now.tv_nsec >= dl.tv_nsec))
+                return -EAGAIN;
+        }
+        struct timespec nap = { 0, 2 * 1000 * 1000 };
+        nanosleep(&nap, NULL);
+    }
 }
 
 void guest_terminate_by_signal(CPU *c, int sig) {

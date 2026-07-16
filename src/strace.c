@@ -158,6 +158,11 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_gettimeofday,   { AT_TIMEVAL_O, AT_PTR }, 0 },
     { G_NR_nanosleep,      { AT_TIMESPEC, AT_PTR }, 0 },
     { G_NR_clock_nanosleep,{ AT_INT, AT_HEX, AT_TIMESPEC, AT_PTR }, 0 },
+    { G_NR_timer_create,   { AT_INT, AT_PTR, AT_PTR }, 0 },
+    { G_NR_timer_settime,  { AT_INT, AT_HEX, AT_PTR, AT_PTR }, 0 },
+    { G_NR_timer_gettime,  { AT_INT, AT_PTR }, 0 },
+    { G_NR_timer_getoverrun, { AT_INT }, 0 },
+    { G_NR_timer_delete,   { AT_INT }, 0 },
     /* resource / misc */
     { G_NR_prlimit64, { AT_INT, AT_INT, AT_RLIMIT, AT_RLIMIT_O }, 0 },
     { G_NR_getrlimit, { AT_INT, AT_RLIMIT_O }, 0 },
