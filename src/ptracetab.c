@@ -43,13 +43,18 @@
 int g_ptrace_active;
 int g_ptrace_syscall_armed;
 int g_ptrace_singlestep;
+/* One-shot: skip the next syscall-exit stop. Set on an auto-attached fork child
+ * so the spurious "exit" of the clone it was born from (which it never entered
+ * at a syscall-entry stop) is not reported and does not desync the tracer's
+ * entry/exit pairing. */
+int g_ptrace_skip_syscall_stop;
 
 /* ---- shared registry ---- */
 #define PTRACE_MAX  256      /* max concurrent tracees in the session */
 #define PT_MBOX     1024     /* mailbox payload cap (>= largest regset, 528) */
 
 /* Link state. */
-enum { PT_ST_RUNNING = 0, PT_ST_STOPPED = 1 };
+enum { PT_ST_RUNNING = 0, PT_ST_STOPPED = 1, PT_ST_EXITED = 2 };
 
 /* Mailbox commands (tracer -> stopped tracee). */
 enum {
@@ -75,6 +80,7 @@ typedef struct {
     u32 stop_sig;        /* WSTOPSIG of the current stop */
     u32 event;           /* PTRACE_EVENT_* of the current stop (0 = none) */
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
+    s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
     /* futex mailbox: tracer bumps cmd_seq to submit, tracee bumps done_seq. */
@@ -109,16 +115,6 @@ void ptrace_init(void) {
     void *p = mmap(NULL, sizeof(PtTable), PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     g_tab = (p == MAP_FAILED) ? NULL : p;   /* degrade to "no ptrace" on failure */
-}
-
-void ptrace_fork_child(void) {
-    /* A plain fork is not a tracee of the parent's tracer (that needs
-     * PTRACE_O_TRACEFORK, handled later). Drop inherited self state; the child
-     * has a fresh pid and therefore no link of its own. */
-    g_self_link = NULL;
-    g_ptrace_active = 0;
-    g_ptrace_syscall_armed = 0;
-    g_ptrace_singlestep = 0;
 }
 
 /* ---- registry helpers ---- */
@@ -379,11 +375,77 @@ int ptrace_selfstop(int sig) {
     return 1;
 }
 
-void ptrace_report_exit(CPU *c) {
+void ptrace_report_exit(CPU *c, int wstatus) {
     (void)c;
-    if (g_self_link) pt_free(g_self_link);
+    PtLink *e = g_self_link;
     g_self_link = NULL;
     g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
+    if (!e) return;
+    /* If our tracer is not our host parent (an auto-attached fork child whose
+     * exit the tracer cannot reap via the host wait), publish a synthetic exit
+     * for the tracer to collect; it frees the link. A direct child's tracer IS
+     * its host parent and reaps it through the host wait, so just free. */
+    if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) > 0 &&
+        __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getppid()) {
+        e->exit_status = wstatus;
+        __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+        fx_wake(&g_tab->global_gen);
+        return;   /* keep the link; the tracer frees it on collect */
+    }
+    pt_free(e);
+}
+
+/* ---- fork/clone event stops (PTRACE_O_TRACEFORK/VFORK/CLONE) ---- */
+int ptrace_self_active(void) { return g_ptrace_active; }
+
+u32 ptrace_self_options(void) {
+    return g_self_link ? __atomic_load_n(&g_self_link->options, __ATOMIC_ACQUIRE) : 0;
+}
+
+/* Parent side: report the fork/clone event stop, carrying the new child's pid
+ * for PTRACE_GETEVENTMSG. */
+void ptrace_report_event(CPU *c, int event, u64 msg) {
+    if (!g_ptrace_active || !g_self_link) return;
+    g_self_link->eventmsg = msg;
+    pt_stop(c, SIGTRAP, event, 0);
+}
+
+/* Child side of a clone/fork. `event` is nonzero when the parent's tracer is
+ * following this creation (PTRACE_O_TRACE{FORK,VFORK,CLONE}); the child then
+ * auto-attaches to the same tracer and reports an initial (SIGSTOP) stop.
+ * Otherwise it runs untraced. Called in the freshly forked child, which has
+ * inherited the parent's g_self_link pointer (valid: the registry is shared at
+ * the same address). */
+void ptrace_fork_child(CPU *c, int event) {
+    PtLink *parent = g_self_link;          /* inherited: the parent's link */
+    g_self_link = NULL;
+    g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
+    if (!event || !parent) return;         /* not followed: a fresh untraced pid */
+
+    s32 tracer = __atomic_load_n(&parent->tracer, __ATOMIC_ACQUIRE);
+    u32 opts = __atomic_load_n(&parent->options, __ATOMIC_ACQUIRE);
+    if (tracer <= 0) return;
+    PtLink *e = pt_claim(getpid());
+    if (!e) return;                        /* registry full: degrade to untraced */
+    __atomic_store_n(&e->options, opts, __ATOMIC_RELAXED);  /* options are inherited */
+    __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+    g_self_link = e;
+    g_ptrace_active = 1;
+    /* Initial attach stop (as a non-SEIZE auto-attached child stops with
+     * SIGSTOP). The tracer sees it, (re)sets options and resumes us. */
+    pt_stop(c, SIGSTOP, 0, 0);
+    /* On resume the tracer has typically armed PTRACE_SYSCALL; skip the spurious
+     * syscall-exit of the clone we were born from (we never entered it). */
+    if (g_ptrace_syscall_armed)
+        g_ptrace_skip_syscall_stop = 1;
 }
 
 /* ---- tracee: PTRACE_TRACEME ---- */
@@ -515,10 +577,18 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
         PtLink *e = &g_tab->links[i];
         if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
-        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED) continue;
-        if (__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE)) continue;
         s32 t = e->tracee;
         if (wpid > 0 && wpid != t) continue;   /* -1/0 => any child of ours */
+        u32 st_state = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
+        /* Synthetic exit of an auto-attached tracee we cannot host-reap. */
+        if (st_state == PT_ST_EXITED) {
+            *status = e->exit_status;
+            *outpid = t;
+            pt_free(e);
+            return 1;
+        }
+        if (st_state != PT_ST_STOPPED) continue;
+        if (__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE)) continue;
         int sig = (int)e->stop_sig;
         int st;
         if (e->event) {

@@ -28,7 +28,7 @@ SYSDEF(exit) {
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
      * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
     if (g_tls.tid != getpid()) { c->stop = true; return 0; }
-    ptrace_report_exit(c);      /* release our tracee link, if traced */
+    ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -37,7 +37,7 @@ SYSDEF(exit) {
 
 SYSDEF(exit_group) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    ptrace_report_exit(c);      /* release our tracee link, if traced */
+    ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -261,7 +261,22 @@ SYSDEF(clone) {
         return (u64)t->tid;
     }
 
-    /* Process clone (fork/vfork shape). */
+    /* Process clone (fork/vfork shape). ptrace: if this process is a tracee
+     * following child creation (PTRACE_O_TRACE{FORK,VFORK,CLONE}), pick the
+     * event, mirroring the kernel: VFORK wins, else a non-SIGCHLD exit signal
+     * is CLONE, else FORK. The child then auto-attaches; the parent reports the
+     * event stop below. */
+    int pt_ev = 0;
+    if (ptrace_self_active()) {
+        u32 o = ptrace_self_options();
+        if (flags & G_CLONE_VFORK)
+            pt_ev = (o & G_PTRACE_O_TRACEVFORK) ? G_PTRACE_EVENT_VFORK : 0;
+        else if ((flags & G_CSIGNAL) != (u64)SIGCHLD)
+            pt_ev = (o & G_PTRACE_O_TRACECLONE) ? G_PTRACE_EVENT_CLONE : 0;
+        else
+            pt_ev = (o & G_PTRACE_O_TRACEFORK) ? G_PTRACE_EVENT_FORK : 0;
+    }
+
     pid_t pid = fork();
     if (pid < 0) return host_err();
     if (pid == 0) {
@@ -270,7 +285,6 @@ SYSDEF(clone) {
          * table describes host threads of the parent. */
         memset(m->gtid, 0, sizeof m->gtid);
         jit_fork_child();                 /* same discipline for the JIT state */
-        ptrace_fork_child();              /* a fork is not traced (no TRACEFORK yet) */
         /* A plain fork does not re-run load_elf, so publish the child (with the
          * inherited cmdline/exe/cwd/environ and its own fresh starttime) or it
          * would be invisible in the hidden /proc view until it execve'd. */
@@ -283,12 +297,19 @@ SYSDEF(clone) {
         g_tls.clear_child_tid = (flags & G_CLONE_CHILD_CLEARTID) ? ctid : 0;
         if (child_stack) *cpu_cur_sp(c) = child_stack;
         if (flags & G_CLONE_SETTLS) c->tpidr[0] = tls;
+        /* Auto-attach to the parent's tracer + initial stop when followed;
+         * otherwise drop the inherited tracee-self state (a fresh untraced pid).
+         * Last, so the child is fully set up before it parks for the tracer. */
+        ptrace_fork_child(c, pt_ev);
         return 0;
     }
     if (flags & G_CLONE_PARENT_SETTID) {
         s32 tid = (s32)pid;
         copy_to_guest(c, ptid, &tid, 4);
     }
+    /* Parent's fork/clone event stop (before "returning" the child pid), so the
+     * tracer learns the new pid via PTRACE_GETEVENTMSG. */
+    if (pt_ev) ptrace_report_event(c, pt_ev, (u64)pid);
     return (u64)pid;
 }
 

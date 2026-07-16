@@ -143,16 +143,29 @@ requests about itself**, the same way it already mediates every other syscall:
   routed through this cooperative stop instead of a real host job-control stop,
   which would freeze the tracee so it could no longer serve its ptrace mailbox.
 - *execve* stop after the new image is loaded but before its first instruction
-  (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer.
+  (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer
+  (a `PTRACE_EVENT_EXEC` event stop under `PTRACE_O_TRACEEXEC`).
+- *fork/clone* event stops (`strace -f`) under `PTRACE_O_TRACE{FORK,VFORK,CLONE}`:
+  when a traced process forks (`sys_proc.c` clone path), the parent reports a
+  `PTRACE_EVENT_{FORK,VFORK,CLONE}` stop carrying the new child's pid for
+  `PTRACE_GETEVENTMSG`, and the new child **auto-attaches to the same tracer**
+  (inheriting its options) and reports an initial `SIGSTOP` stop before its first
+  instruction. The child is a separate host process, so its exit — which the
+  tracer cannot `waitpid` since it is not the child's host parent — is published
+  as a synthetic exit in the registry for the tracer's wait to collect (its real
+  host parent still reaps the zombie). The one exit stop the auto-attached child
+  would otherwise emit for the clone it was born from (which it never entered at
+  a syscall-entry stop) is suppressed so the tracer's entry/exit pairing stays
+  aligned.
 
 **`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
 tracee is a running host process parked in its service loop), so once tracing is
-active `wait4` polls: it multiplexes ptrace-stops (from the registry) with real
-child exits (`waitpid(WNOHANG)`), blocking on a global-generation futex that
-every stop and every guest exit bumps. It synthesizes the status word —
-`WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall stops under
-`PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops. Processes that never trace
-keep the original blocking `wait4` pass-through.
+active `wait4` polls: it multiplexes ptrace-stops and synthetic tracee exits
+(from the registry) with real child exits (`waitpid(WNOHANG)`), blocking on a
+global-generation futex that every stop and every guest exit bumps. It
+synthesizes the status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall
+stops under `PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops. Processes that
+never trace keep the original blocking `wait4` pass-through.
 
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
@@ -161,13 +174,15 @@ exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.
 
-**Implemented (the `strace` + basic-`gdb` surface):** `TRACEME`, `SETOPTIONS`
-(`TRACESYSGOOD`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
+**Implemented (the `strace` / `strace -f` + basic-`gdb` surface):** `TRACEME`,
+`SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`,
+`TRACEEXEC`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
-(writable pages), `GETSIGINFO`, `GETEVENTMSG`, and the syscall/signal/execve
-stops above. **Not yet implemented (planned):** software breakpoints
-(`POKETEXT` of a `BRK` into a read-only code page needs a permission-bypassing
-write plus predecode/JIT invalidation), `ATTACH`/`SEIZE`/`INTERRUPT` of an
-already-running process, the `PTRACE_EVENT_*` fork/clone/exec/exit event stops,
-and per-thread tracing of a multithreaded tracee. Those requests currently
-return `-EIO`/`-ESRCH` rather than misbehaving.
+(writable pages), `GETSIGINFO`, `GETEVENTMSG`, and the syscall / signal / execve
+/ fork-clone stops above. **Not yet implemented (planned):** software
+breakpoints (`POKETEXT` of a `BRK` into a read-only code page needs a
+permission-bypassing write plus predecode/JIT invalidation),
+`ATTACH`/`SEIZE`/`INTERRUPT` of an already-running process, the
+`PTRACE_EVENT_EXIT` (`TRACEEXIT`) pre-exit stop, and per-thread tracing of a
+multithreaded tracee. Those requests currently return `-EIO`/`-ESRCH` rather
+than misbehaving.

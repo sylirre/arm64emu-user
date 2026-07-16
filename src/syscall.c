@@ -467,11 +467,17 @@ void syscall_dispatch(CPU *c) {
     g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
 
     /* ptrace syscall-exit stop: publish the result in x0 so the tracer's
-     * GETREGSET sees it, then let it inspect or override the return value. */
+     * GETREGSET sees it, then let it inspect or override the return value. An
+     * auto-attached fork child skips one exit stop (the clone it was born from,
+     * which it never entered) to keep the tracer's entry/exit pairing aligned. */
     if (UNLIKELY(g_ptrace_syscall_armed)) {
-        c->x[0] = ret;
-        ptrace_report_syscall(c, 1);
-        ret = c->x[0];
+        if (g_ptrace_skip_syscall_stop) {
+            g_ptrace_skip_syscall_stop = 0;
+        } else {
+            c->x[0] = ret;
+            ptrace_report_syscall(c, 1);
+            ret = c->x[0];
+        }
     }
 
     if (m->strace) {

@@ -17,12 +17,20 @@
 extern int g_ptrace_active;         /* this process is a ptrace tracee */
 extern int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PTRACE_SYSCALL) */
 extern int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
+extern int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
 
 /* main(): create the shared link registry (before the first fork). */
 void ptrace_init(void);
-/* clone() fork child: a fork is not a tracee of the parent's tracer unless
- * PTRACE_O_TRACEFORK, so drop any inherited tracee-self state. */
-void ptrace_fork_child(void);
+/* clone() fork child. `event` (0 or a PTRACE_EVENT_FORK/VFORK/CLONE code) says
+ * whether the parent's tracer is following this creation: nonzero auto-attaches
+ * the child to that tracer with an initial stop, zero leaves it untraced. */
+void ptrace_fork_child(CPU *c, int event);
+/* Is the caller a tracee, and what are its inherited PTRACE_O_* options?
+ * (Used by clone to decide whether/which fork event to report.) */
+int  ptrace_self_active(void);
+u32  ptrace_self_options(void);
+/* Parent side of a followed clone: report the event stop, msg = new child pid. */
+void ptrace_report_event(CPU *c, int event, u64 msg);
 
 /* ---- Tracee-side stop reports (call only when g_ptrace_* say we are traced) ---- */
 /* Syscall-entry (is_exit==0) / syscall-exit stop. Parks until the tracer
@@ -40,8 +48,10 @@ void ptrace_report_singlestep(CPU *c);
  * The caller (a signal-send syscall) uses this only when the target is self —
  * a real host stop would freeze the tracee's ptrace service loop. */
 int  ptrace_selfstop(int sig);
-/* Exit: release this process's tracee link. */
-void ptrace_report_exit(CPU *c);
+/* Exit: release this process's tracee link (or, for an auto-attached fork
+ * child, publish a synthetic exit for its tracer). wstatus is the wait-status
+ * word to report: (code & 0xff) << 8 for exit(code), or the signal for a death. */
+void ptrace_report_exit(CPU *c, int wstatus);
 
 /* ---- Guest ptrace(2) entry (tracer side + TRACEME) ---- */
 /* Handle a guest ptrace(request, pid, addr, data); returns the guest x0. */

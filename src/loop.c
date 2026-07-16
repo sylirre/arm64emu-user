@@ -44,7 +44,7 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
                 "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
                 sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
-    ptrace_report_exit(c);               /* release our tracee link, if traced */
+    ptrace_report_exit(c, sig & 0x7f);   /* WIFSIGNALED status for our tracer */
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     ptrace_wake_waiters();               /* wake a parent polling in wait4 */
     struct sigaction sa;
