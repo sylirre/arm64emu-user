@@ -83,6 +83,8 @@ typedef struct {
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
+    u64 fault_addr;      /* siginfo si_addr for fault stops (SIGSEGV/TRAP/...);
+                          * not named si_addr — that is a glibc signal.h macro */
     /* futex mailbox: tracer bumps cmd_seq to submit, tracee bumps done_seq. */
     u32 cmd_seq, done_seq;
     u32 cmd;
@@ -280,7 +282,10 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
             break;
         }
         case PT_CMD_POKE:
-            e->result = copy_to_guest(c, e->addr, &e->arg, 8) < 0 ? -EIO : 0;
+            /* POKETEXT/POKEDATA write regardless of page write-permission (real
+             * ptrace copies-on-write); the code path also patches a read-only
+             * code page for a software breakpoint and invalidates JIT blocks. */
+            e->result = copy_to_guest_code(c, e->addr, &e->arg, 8) < 0 ? -EIO : 0;
             break;
         case PT_CMD_GETREGS: {
             u32 n = pt_build_regset(c, (u32)e->addr, e->data);
@@ -315,8 +320,12 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
     }
 }
 
-/* Publish a stop and park until the tracer resumes us. Returns the inject sig. */
-static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop) {
+/* Publish a stop and park until the tracer resumes us. Returns the inject sig.
+ * si_code/si_addr override the stored siginfo for a fault stop (BRK breakpoint,
+ * SIGSEGV, ...); pass 0/0 for syscall/signal/event stops (si_code is then
+ * event-derived, matching the wait-status high byte). */
+static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
+                   int si_code, u64 fault_addr) {
     PtLink *e = g_self_link;
     if (!e) return stop_sig;
     /* Snapshot the mailbox sequence before publishing the stop: a command the
@@ -328,20 +337,26 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop) {
     e->event = (u32)event;
     e->syscall_stop = (u32)syscall_stop;
     e->si_signo = stop_sig;
-    e->si_code = event ? ((event << 8) | 5 /*SIGTRAP*/) : 0;
+    e->si_code = si_code ? si_code : (event ? ((event << 8) | 5 /*SIGTRAP*/) : 0);
+    e->fault_addr = fault_addr;
     e->si_errno = 0;
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
-    /* Wake the tracer's wait4. */
+    /* Wake the tracer's wait4. A blocking wait4 sleeps on global_gen; but an
+     * async tracer (gdb) waits in an event loop driven by SIGCHLD (self-pipe +
+     * ppoll), so also send the tracer a SIGCHLD, exactly as the kernel does when
+     * a real tracee stops. Without it gdb never reaps the cooperative stop. */
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
+    { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+      if (tr > 0) kill(tr, SIGCHLD); }
     return pt_service_loop(c, e, seen);
 }
 
 void ptrace_report_syscall(CPU *c, int is_exit) {
     if (!g_ptrace_active || !g_self_link) return;
     (void)is_exit;
-    pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */);
+    pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, 0, 0);
 }
 
 void ptrace_report_exec(CPU *c) {
@@ -351,17 +366,27 @@ void ptrace_report_exec(CPU *c) {
      * tracer, so drop any prior syscall/step arming. */
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
-    pt_stop(c, SIGTRAP, event, 0);
+    pt_stop(c, SIGTRAP, event, 0, 0, 0);
 }
 
 int ptrace_report_signal(CPU *c, int sig) {
     if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
-    return pt_stop(c, sig, 0, 0);
+    return pt_stop(c, sig, 0, 0, 0, 0);
+}
+
+/* Synchronous-fault stop (software breakpoint BRK, SIGSEGV/SIGBUS/SIGILL/...):
+ * report the signal to the tracer with precise siginfo (si_code and, for the
+ * fault families, si_addr) before the guest handler/fatal decision. Returns 0
+ * if the tracer suppressed it (resume the guest), else the signal to deliver
+ * (the original, or one the tracer substituted). SIGKILL is never intercepted. */
+int ptrace_report_fault(CPU *c, int sig, int si_code, u64 addr) {
+    if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
+    return pt_stop(c, sig, 0, 0, si_code, addr);
 }
 
 void ptrace_report_singlestep(CPU *c) {
     if (!g_ptrace_active || !g_self_link) return;
-    pt_stop(c, SIGTRAP, 0, 0);
+    pt_stop(c, SIGTRAP, 0, 0, 0, 0);
 }
 
 int ptrace_selfstop(int sig) {
@@ -390,10 +415,12 @@ void ptrace_report_exit(CPU *c, int wstatus) {
      * its host parent and reaps it through the host wait, so just free. */
     if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) > 0 &&
         __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getppid()) {
+        s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
         e->exit_status = wstatus;
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
+        if (tr > 0) kill(tr, SIGCHLD);   /* wake an async tracer's event loop */
         return;   /* keep the link; the tracer frees it on collect */
     }
     pt_free(e);
@@ -411,7 +438,7 @@ u32 ptrace_self_options(void) {
 void ptrace_report_event(CPU *c, int event, u64 msg) {
     if (!g_ptrace_active || !g_self_link) return;
     g_self_link->eventmsg = msg;
-    pt_stop(c, SIGTRAP, event, 0);
+    pt_stop(c, SIGTRAP, event, 0, 0, 0);
 }
 
 /* Child side of a clone/fork. `event` is nonzero when the parent's tracer is
@@ -441,7 +468,7 @@ void ptrace_fork_child(CPU *c, int event) {
     g_ptrace_active = 1;
     /* Initial attach stop (as a non-SEIZE auto-attached child stops with
      * SIGSTOP). The tracer sees it, (re)sets options and resumes us. */
-    pt_stop(c, SIGSTOP, 0, 0);
+    pt_stop(c, SIGSTOP, 0, 0, 0, 0);
     /* On resume the tracer has typically armed PTRACE_SYSCALL; skip the spurious
      * syscall-exit of the clone we were born from (we never entered it). */
     if (g_ptrace_syscall_armed)
@@ -507,6 +534,14 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         w[0] = e->si_signo;
         w[1] = e->si_errno;
         w[2] = e->si_code;
+        /* Fault signals carry si_addr in the _sigfault union, at byte offset 16
+         * on arm64 (after si_signo/si_errno/si_code and pointer alignment pad).
+         * gdb reads it for SIGSEGV/SIGBUS; TRAP_BRKPT carries the BRK PC. */
+        switch (e->si_signo) {
+        case SIGSEGV: case SIGBUS: case SIGILL: case SIGFPE: case SIGTRAP:
+            memcpy(si + 16, &e->fault_addr, 8);
+            break;
+        }
         return copy_to_guest(c, data, si, sizeof si) < 0 ? -EFAULT : 0;
     }
     }

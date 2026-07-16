@@ -474,6 +474,18 @@ void sig_deliver_pending(CPU *c) {
 
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr) {
     struct Machine *m = c->m;
+    /* Under ptrace, a synchronous fault is a signal-delivery stop first: the
+     * tracer (gdb hitting a BRK software breakpoint, or catching a SIGSEGV) sees
+     * it before any guest handler or the fatal default action, and may suppress
+     * it (return 0 -> resume, e.g. after gdb steps over a breakpoint) or
+     * substitute another signal. The caller's `code` already equals the intended
+     * siginfo si_code (BRK->TRAP_BRKPT, SEGV perm->SEGV_ACCERR / else MAPERR,
+     * align->1, undef->1). */
+    if (UNLIKELY(g_ptrace_active)) {
+        int ns = ptrace_report_fault(c, sig, code, addr);
+        if (ns == 0) return;              /* tracer suppressed: resume the guest */
+        sig = ns;                         /* tracer may have substituted it */
+    }
     u64 h = m->sigact[sig].handler;
     if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
         PendSig p;

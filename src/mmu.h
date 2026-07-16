@@ -157,6 +157,11 @@ void  jit_dtlb_reset(void);
  * Return 0, or -EFAULT on an unmapped/forbidden page. */
 long copy_from_guest(CPU *c, void *dst, u64 va, size_t len);
 long copy_to_guest(CPU *c, u64 va, const void *src, size_t len);
+/* Like copy_to_guest but bypasses the software write-permission check to patch
+ * a read-only code page (ptrace POKETEXT of a breakpoint), invalidating any JIT
+ * translations over the range. -EIO on unwritable (MAP_SHARED read-only) host
+ * backing. See mem.c. */
+long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len);
 /* NUL-terminated string copy; returns length (excluding NUL), or -EFAULT /
  * -ENAMETOOLONG if no NUL within max. */
 long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max);

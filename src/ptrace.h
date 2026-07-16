@@ -41,6 +41,10 @@ void ptrace_report_exec(CPU *c);
 /* Signal-delivery stop: the tracer sees WSTOPSIG==sig and may suppress it or
  * substitute another. Returns the signal to actually deliver (0 = suppressed). */
 int  ptrace_report_signal(CPU *c, int sig);
+/* Synchronous-fault stop (BRK breakpoint SIGTRAP, SIGSEGV/SIGBUS/SIGILL/SIGFPE):
+ * like ptrace_report_signal but with precise siginfo (si_code, and si_addr for
+ * the fault families). Returns the signal to deliver (0 = suppressed). */
+int  ptrace_report_fault(CPU *c, int sig, int si_code, u64 addr);
 /* PTRACE_SINGLESTEP: report the SIGTRAP stop after one stepped instruction. */
 void ptrace_report_singlestep(CPU *c);
 /* If this process is traced and `sig` is a stop signal (SIGSTOP/SIGTSTP/...),

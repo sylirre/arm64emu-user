@@ -568,6 +568,39 @@ long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
     return 0;
 }
 
+/* Write into guest memory bypassing the software PTE_W check, for a ptrace
+ * POKETEXT/POKEDATA that patches an instruction (e.g. installs a BRK software
+ * breakpoint) in a read-only code page. The host backing of anon and
+ * MAP_PRIVATE regions is always RW (guest write permission is enforced only in
+ * software), so writing the region's host pointer succeeds even though the PTE
+ * lacks PTE_W. Only a MAP_SHARED read-only mapping has a PROT_READ host backing;
+ * that (nonexistent for executable code) is refused with -EIO rather than
+ * risking a host SIGSEGV. The predecode cache self-invalidates via NEXT's word
+ * re-fetch; the JIT keeps translated blocks by PC, so drop any over the range
+ * (the same self-modifying-code coherence path guest IC IVAU uses). Returns 0,
+ * or -EFAULT (unmapped) / -EIO (unwritable host backing). */
+long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len) {
+    const u8 *s = src;
+    u64 first = va & A64_TBI_MASK, last = first;
+    while (len) {
+        u64 a = va & A64_TBI_MASK;
+        size_t chunk = GUEST_PAGE_SIZE - (a & GUEST_PAGE_MASK);
+        if (chunk > len) chunk = len;
+        as_lock();
+        const Region *r = as_find_region(cpu_as(c), a);
+        if (!r) { as_unlock(); return -EFAULT; }
+        if (r->shared && !(r->prot & PTE_W)) { as_unlock(); return -EIO; }
+        memcpy(r->host + (a - r->start), s, chunk);   /* host backing is RW */
+        as_unlock();
+        s += chunk; va += chunk; len -= chunk;
+        last = a + chunk;
+    }
+    /* Drop stale JIT blocks over the touched cache lines (interpreter needs
+     * none). No-op when nothing here was ever translated. */
+    jit_invalidate_range(first & ~63ULL, ((last + 63) & ~63ULL) - (first & ~63ULL));
+    return 0;
+}
+
 long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
     size_t n = 0;
     while (n < max) {

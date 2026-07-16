@@ -142,6 +142,21 @@ requests about itself**, the same way it already mediates every other syscall:
   execs — is intercepted at the send site (`sys_sig.c`, `ptrace_selfstop`) and
   routed through this cooperative stop instead of a real host job-control stop,
   which would freeze the tracee so it could no longer serve its ptrace mailbox.
+- *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
+  `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
+  dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the
+  tracer *before* any guest handler or the fatal default action, with precise
+  siginfo (`si_code`, and `si_addr` for the fault families). The tracer may
+  suppress it (resume) or substitute another signal. This is what surfaces a
+  **software breakpoint**: gdb `POKETEXT`s a `BRK #0` over an instruction; the
+  `EC_BRK64` it raises stops the tracee with `si_code == TRAP_BRKPT` and the PC
+  at the breakpoint (`cpu_raise_sync` rewinds the PC to the faulting instruction).
+  Writing the `BRK` into a read-only code page uses `copy_to_guest_code`
+  (`src/mem.c`), which bypasses the software write-permission bit (the host
+  backing of anon/`MAP_PRIVATE` code is always RW) and drops any JIT translations
+  over the patched line — the same self-modifying-code coherence path guest
+  `IC IVAU` uses. The predecode interpreter needs no invalidation: its `NEXT`
+  macro re-fetches and re-classifies each instruction word on change.
 - *execve* stop after the new image is loaded but before its first instruction
   (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer
   (a `PTRACE_EVENT_EXEC` event stop under `PTRACE_O_TRACEEXEC`).
@@ -167,6 +182,14 @@ synthesizes the status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for sysc
 stops under `PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops. Processes that
 never trace keep the original blocking `wait4` pass-through.
 
+A tracee entering a stop (and a synthetic exit) also sends its tracer a host
+`SIGCHLD`, exactly as the kernel does when a real tracee stops. A tracer blocked
+in `wait4` is already woken by the global-generation futex, but an *asynchronous*
+tracer — `gdb`, whose event loop sleeps in `ppoll`/`pselect` and only calls
+`waitpid(WNOHANG)` after a `SIGCHLD` handler pokes its self-pipe — would never
+learn of a cooperative stop without it. (The futex is not enough because gdb
+never blocks in `wait4`; strace, which does, works either way.)
+
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
 `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`). `PTRACE_SINGLESTEP` runs
@@ -174,15 +197,15 @@ exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.
 
-**Implemented (the `strace` / `strace -f` + basic-`gdb` surface):** `TRACEME`,
-`SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`,
+**Implemented (the `strace` / `strace -f` + `gdb`-breakpoint surface):**
+`TRACEME`, `SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`,
 `TRACEEXEC`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
-(writable pages), `GETSIGINFO`, `GETEVENTMSG`, and the syscall / signal / execve
-/ fork-clone stops above. **Not yet implemented (planned):** software
-breakpoints (`POKETEXT` of a `BRK` into a read-only code page needs a
-permission-bypassing write plus predecode/JIT invalidation),
-`ATTACH`/`SEIZE`/`INTERRUPT` of an already-running process, the
+(writable *and* read-only code pages — software breakpoints), `GETSIGINFO`
+(including `si_addr` for faults), `GETEVENTMSG`, and the syscall / signal /
+synchronous-fault / execve / fork-clone stops above. Breakpoints work under both
+the interpreter and `--jit`. **Not yet implemented (planned):**
+`ATTACH`/`SEIZE`/`INTERRUPT` of an already-running process (`gdb -p <pid>`), the
 `PTRACE_EVENT_EXIT` (`TRACEEXIT`) pre-exit stop, and per-thread tracing of a
 multithreaded tracee. Those requests currently return `-EIO`/`-ESRCH` rather
 than misbehaving.
