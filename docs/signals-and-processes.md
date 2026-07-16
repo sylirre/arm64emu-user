@@ -97,8 +97,12 @@ One host thread per guest thread over the shared `Machine`/address space:
 - the guest tid **is** the host tid of the pthread carrying the thread — the
   thread analogue of the guest pid == host pid invariant. The tid is known only
   once the new thread runs, so `clone` parks on a startup handshake until
-  `thread_entry` publishes its `gettid()` (writing `CLONE_CHILD_SETTID` first,
-  matching kernel ordering). Tid-addressed syscalls (`tkill`, `tgkill`,
+  `thread_entry` publishes its `gettid()`, writing `CLONE_CHILD_SETTID` *and*
+  `CLONE_PARENT_SETTID` first, matching kernel ordering — the ptid store must
+  never happen creator-side after the handshake, where it could overwrite the
+  `CLONE_CHILD_CLEARTID` exit-clear of a short-lived thread that already ran
+  to completion (glibc points both at `pd->tid`; a late store leaves
+  `pthread_join` waiting forever). Tid-addressed syscalls (`tkill`, `tgkill`,
   `sched_*`, `getpriority`) therefore pass through unmodified, host
   `/proc/<pid>/task` lists exactly the guest tids, and tid-keyed shared state
   (the ptrace registry) cannot collide across processes. The main thread's tid
@@ -128,17 +132,20 @@ directly. The emulator resolves this by having the **tracee service ptrace
 requests about itself**, the same way it already mediates every other syscall:
 
 - A `MAP_SHARED` link registry (created before the first fork, mapped by every
-  guest process at the same address) holds one entry per tracee — keyed by
-  tracee pid — carrying the tracer/tracee relationship, the current stop state,
-  and a small **futex mailbox**.
+  guest process at the same address) holds one entry per traced **task** —
+  keyed by tracee tid, which *is* the host tid (a main thread's tid is its
+  pid) — carrying the tracer/tracee relationship, the current stop state, and
+  a small **futex mailbox**. Tracing is per-thread, as in the kernel: each
+  thread of a multithreaded tracee has its own link and its own thread-local
+  self state, reports its own stops, and services requests about itself.
 - When a tracee reaches a stop point it publishes the stop, wakes the tracer,
   then **parks in a service loop**. There it answers `PEEK`/`POKE`/`GETREGSET`/
   `SETREGSET`/`GETSIGINFO`/`CONT`/`SYSCALL`/`DETACH`/… using its own `CPU` and
   `copy_{to,from}_guest`. A request while the tracee is *running* (not stopped)
   fails `-ESRCH`, exactly as real ptrace requires.
 
-**Stop points** (only active when the process is traced — a near-always-zero
-`g_ptrace_*` int gates the hot paths):
+**Stop points** (only active when the thread is traced — a near-always-zero
+thread-local `g_ptrace_*` int gates the hot paths):
 
 - *syscall-entry / syscall-exit* stops in `syscall_dispatch` (`src/syscall.c`)
   when `PTRACE_SYSCALL`-armed. The tracer may rewrite the syscall number/args at
@@ -150,10 +157,14 @@ requests about itself**, the same way it already mediates every other syscall:
   execs — is intercepted at the send site (`sys_sig.c`, `ptrace_selfstop`) and
   routed through this cooperative stop instead of a real host job-control stop,
   which would freeze the tracee so it could no longer serve its ptrace mailbox.
-  A stop signal sent to *another* process that is a tracee is intercepted the
-  same way (`ptrace_signal_stop`): the send site records the signal on the
-  tracee's registry link and kicks it, and the tracee reports a cooperative
-  group-stop at its next run-loop boundary. The status is encoded faithfully:
+  A stop signal sent to *another* task whose thread group has tracees is
+  intercepted the same way (`ptrace_signal_stop`): the send site records the
+  signal on **every** live link of the group — the kernel group-stops all
+  threads, and each traced one reports its own group-stop — and kicks each;
+  the tracees report cooperative group-stops at their next run-loop boundary.
+  (In a mixed traced/untraced group only the traced threads stop — a
+  simplification; a full `strace -f`/`-p` traces every thread.) The status is
+  encoded faithfully:
   `WSTOPSIG == the stop signal`, and for a `SEIZE`'d tracee with
   `PTRACE_EVENT_STOP` in the high bits (the group-stop encoding a tracer keys on
   to decide to `PTRACE_LISTEN`); a `PTRACE_ATTACH`'d tracee sees a plain
@@ -184,14 +195,30 @@ requests about itself**, the same way it already mediates every other syscall:
   when a traced process forks (`sys_proc.c` clone path), the parent reports a
   `PTRACE_EVENT_{FORK,VFORK,CLONE}` stop carrying the new child's pid for
   `PTRACE_GETEVENTMSG`, and the new child **auto-attaches to the same tracer**
-  (inheriting its options) and reports an initial `SIGSTOP` stop before its first
-  instruction. The child is a separate host process, so its exit — which the
-  tracer cannot `waitpid` since it is not the child's host parent — is published
-  as a synthetic exit in the registry for the tracer's wait to collect (its real
-  host parent still reaps the zombie). The one exit stop the auto-attached child
-  would otherwise emit for the clone it was born from (which it never entered at
-  a syscall-entry stop) is suppressed so the tracer's entry/exit pairing stays
-  aligned.
+  (inheriting its options and attach flavor: the initial stop is `SIGSTOP` for an
+  `ATTACH`-flavored relationship, `PTRACE_EVENT_STOP` for a `SEIZE`'d one, as
+  the kernel reports them). The child is a separate host process, so its exit —
+  which the tracer cannot `waitpid` since it is not the child's host parent — is
+  published as a synthetic exit in the registry for the tracer's wait to collect
+  (its real host parent still reaps the zombie). The one exit stop the
+  auto-attached child would otherwise emit for the clone it was born from (which
+  it never entered at a syscall-entry stop) is suppressed so the tracer's
+  entry/exit pairing stays aligned.
+- *thread creation* (`CLONE_THREAD`) is followed the same way under
+  `PTRACE_O_TRACECLONE`: the creator reports `PTRACE_EVENT_CLONE` with the new
+  tid in `GETEVENTMSG`, and the new thread claims its **own** tracee link
+  *before* the clone startup handshake wake (so the tid is registry-visible by
+  the time the creator can report the event — a tracer's wait on it never sees
+  a not-a-tracee window) and parks in its initial attach stop *after* the wake
+  (so `clone()` in the creator is not blocked on the tracer resuming the
+  child), before any guest code runs. Each thread then reports its own
+  syscall/signal stops on its own link. A thread's `exit(2)` is **always**
+  published as a synthetic exit — a thread death is never a host-waitable
+  event — and `exit_group` (or a terminating signal) fans the death out to
+  every live link of the group (`ptrace_report_exit_group`), since the sibling
+  threads die without running their own exit paths (a parked one dies inside
+  its service loop; the tracer-side mailbox wait also bails to `-ESRCH` when a
+  link flips to exited under it).
 
 **`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
 tracee is a running host process parked in its service loop), so once tracing is
@@ -217,21 +244,30 @@ exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.
 
-**Attaching to a running process (`ATTACH`/`SEIZE`/`INTERRUPT`).** `strace -p`
-and `gdb -p` claim an *already-running* process that never called `TRACEME`. The
-tracer marks itself the tracer in that pid's registry link and must then make the
-running, untraced tracee stop and enter its service loop — without host ptrace.
-It does so with a **reserved-signal kick**: one high real-time signal
-(`PTRACE_KICKSIG`, not `SIGURG`, which Go uses) whose permanent host handler
-(`sig_kick_net`, mirroring the SIGSYS net) recognizes a tracer kick by a magic
-`sigqueue` value and — having no `SA_RESTART` — interrupts any blocked host
-syscall, setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick`
-adopts the pending attach (becomes a tracee; `ATTACH` also reports an initial
-`SIGSTOP`, `SEIZE` attaches silently) or, for `PTRACE_INTERRUPT`, reports the
-`PTRACE_EVENT_STOP`. A guest-directed signal of the same number is forwarded to
-the normal capture queue, so the guest keeps full use of it. `wait4` collects the
-stop from the registry (the tracee is not the tracer's host child), and the
-tracee's stop already sends the tracer a `SIGCHLD` (so gdb's async loop wakes).
+**Attaching to a running task (`ATTACH`/`SEIZE`/`INTERRUPT`).** `strace -p`
+and `gdb -p` claim an *already-running* process that never called `TRACEME` —
+**per thread**: they enumerate `/proc/<pid>/task` (a passthrough listing that is
+exactly the guest tids, since guest tids are host tids and the emulator spawns
+no host threads of its own) and attach each tid. An id that is not a guest pid
+is resolved to its thread group via the host `/proc/<tid>/status` `Tgid:`,
+which must be a live guest process (attaching within one's own thread group is
+`-EPERM`, the kernel rule). The tracer marks itself the tracer in that tid's
+registry link and must then make the running, untraced task stop and enter its
+service loop — without host ptrace. It does so with a **reserved-signal kick**:
+one high real-time signal (`PTRACE_KICKSIG`, not `SIGURG`, which Go uses),
+queued at the *specific thread* with `rt_tgsigqueueinfo` — thread-targeted
+delivery matters, because the permanent host handler (`sig_kick_net`, mirroring
+the SIGSYS net) sets **thread-local** flags, and a process-directed `sigqueue`
+could land on any thread. The handler recognizes a tracer kick by a magic
+`si_value` and — having no `SA_RESTART` — interrupts any blocked host syscall,
+setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick` adopts
+the pending attach on the kicked thread's own link (becomes a tracee; `ATTACH`
+also reports an initial `SIGSTOP`, `SEIZE` attaches silently) or, for
+`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. A guest-directed signal of
+the same number is forwarded to the normal capture queue, so the guest keeps
+full use of it. `wait4` collects the stop from the registry (the tracee is not
+the tracer's host child), and the tracee's stop already sends the tracer a
+`SIGCHLD` (so gdb's async loop wakes).
 
 Because such a tracee is *not* the tracer's host child, the tracer's own host
 `wait4`/`waitid` returns `ECHILD`. The poll loop must not treat that as terminal:
@@ -248,21 +284,25 @@ report a `WIFSIGNALED` status to its tracer, but a bare host `SIG_DFL` kill runs
 guest code, so nothing would update the registry and a sibling tracer's `wait4`
 poll (above) would hang. Two mechanisms close this:
 
-- *catchable signals* — when a process becomes a tracee, `sig_trace_update_all`
-  installs a host catcher for its default-terminate signals that were `SIG_DFL`
-  (`sig_host_update` picks this while `g_ptrace_active`). The signal is then
-  mediated: the tracee reports the signal-delivery-stop, the tracer injects it, and
-  the tracee terminates through `guest_terminate_by_signal` (`src/signal.c`) — which
-  publishes the `WIFSIGNALED` status to the tracer (the same shared exit path the
-  synchronous fatal-fault `force_sig_fault` uses), then restores the host default
-  and re-raises so the *real* parent sees the identical status. The five
-  interpreter-delivered synchronous fault signals are excluded (they still arrive
-  from `pend_exc`).
+- *catchable signals* — when a thread becomes a tracee, `sig_trace_update_all`
+  installs a host catcher for the default-terminate signals that were `SIG_DFL`
+  (`sig_host_update` picks this while *any* thread of the process is traced —
+  `ptrace_traced()`, a process-level count, since dispositions are process-wide).
+  The signal is then mediated: the tracee reports the signal-delivery-stop, the
+  tracer injects it, and the tracee terminates through
+  `guest_terminate_by_signal` (`src/signal.c`) — which publishes the
+  `WIFSIGNALED` status to the tracer for **every** traced thread of the group
+  (`ptrace_report_exit_group`; the signal kills them all), then restores the
+  host default and re-raises so the *real* parent sees the identical status
+  (the same shared exit path the synchronous fatal-fault `force_sig_fault`
+  uses). The five interpreter-delivered synchronous fault signals are excluded
+  (they still arrive from `pend_exc`).
 - *`SIGKILL`* — uncatchable, so it cannot be mediated: the tracee is host-killed
   directly and, if the tracer is a sibling, becomes a zombie its real parent has not
   reaped (so `kill(pid,0)` still succeeds). The tracer's `wait4`/`waitid` poll backs
   this with `ptrace_reap_dead`: it detects a live tracee whose host task is gone or
-  a zombie (`/proc/<pid>/stat` state) and synthesizes `WIFSIGNALED(SIGKILL)`. Since
+  a zombie (`/proc/<tid>/stat` state — per thread, so a SIGKILL'd multithreaded
+  tracee's every link is reaped) and synthesizes `WIFSIGNALED(SIGKILL)`. Since
   every *catchable* fatal signal is mediated and reports its real status, a silent
   death is a `SIGKILL`, so the synthesized signal is accurate.
 
@@ -290,15 +330,21 @@ stays a no-op; a `SIGCONT` racing *before* the `LISTEN` falls through to ordinar
 delivery.)
 
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
-`gdb -p` surface):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`, `SETOPTIONS`
-(`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`, `TRACEEXEC`,
-`TRACEEXIT`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
+`gdb -p` surface, per-thread):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`
+(all per task — a multithreaded tracee's threads attach, stop and report
+individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
+`info threads`), `SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`,
+`TRACECLONE` — including thread creation, `TRACEEXEC`, `TRACEEXIT`),
+`CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints), `GETSIGINFO`
 (including `si_addr` for faults), `GETEVENTMSG`, `LISTEN`, and the syscall /
-signal / group / synchronous-fault / execve / fork-clone / attach / pre-exit stops
-above. Everything works under both the interpreter and `--jit`. **Not yet
-implemented (planned):** per-thread tracing of a multithreaded tracee (the
-ptrace-self state is process-global, so attaching to a multithreaded process tracks
-its main thread). Unimplemented requests return `-EIO`/`-ESRCH` rather than
-misbehaving.
+signal / group / synchronous-fault / execve / fork-clone-thread / attach /
+pre-exit stops above. Everything works under both the interpreter and `--jit`.
+Unimplemented requests return `-EIO`/`-ESRCH` rather than misbehaving.
+Remaining simplifications: in a mixed traced/untraced thread group a group-stop
+stops only the traced threads; a *multithreaded* `execve` of a traced process
+does not fold the sibling threads' links (the kernel kills the siblings and the
+execing thread assumes the pid — multithreaded execve is equally simplified
+untraced); only the exiting thread reports the `PTRACE_EVENT_EXIT` pre-exit
+stop on a group exit.

@@ -137,8 +137,11 @@ SYSDEF(sigaltstack) {
 SYSDEF(kill) {
     /* A traced process stopping itself (kill(getpid(), SIGSTOP), as strace's
      * child does to synchronize) must ptrace-stop cooperatively, not real-stop
-     * at the host. */
-    if ((a0 == (u64)getpid() || a0 == 0) && ptrace_selfstop((int)a1))
+     * at the host. The group fan-out (ptrace_signal_stop) stops every traced
+     * thread, as the kernel's group-stop does; ptrace_selfstop backstops the
+     * calling thread when the registry has no link for it. */
+    if ((a0 == (u64)getpid() || a0 == 0) &&
+        (ptrace_signal_stop((s32)getpid(), (int)a1) || ptrace_selfstop((int)a1)))
         return 0;
     /* A stop signal to *another* process that is a tracee likewise becomes a
      * cooperative group-stop (a tracer stopping its tracee with SIGSTOP before

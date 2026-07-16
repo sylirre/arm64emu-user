@@ -543,7 +543,7 @@ fi
 for pt in tests/ptrace/*.c; do
     [ -e "$pt" ] || continue
     ptbin="${pt%.c}.bin"
-    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" 2>/dev/null; then
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" -lpthread 2>/dev/null; then
         echo "SKIP build $pt"; continue
     fi
     for eng in "" "--jit"; do

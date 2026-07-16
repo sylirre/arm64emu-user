@@ -254,8 +254,10 @@ void sig_host_update(struct Machine *m, int sig) {
          * guest code, so the tracee never reports the signal-delivery-stop nor the
          * WIFSIGNALED death, and a sibling tracer's wait4 poll would hang forever.
          * Caught, the signal is queued and mediated at the run-loop boundary (the
-         * sync fault signals still arrive from the interpreter, so skip those). */
-        if (g_ptrace_active && !is_sync_sig(sig) && sig_default_terminates(sig)) {
+         * sync fault signals still arrive from the interpreter, so skip those).
+         * Dispositions are process-wide, so the catcher stays while *any* thread
+         * of this process is traced (ptrace_traced), not just the calling one. */
+        if (ptrace_traced() && !is_sync_sig(sig) && sig_default_terminates(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -274,9 +276,10 @@ void sig_host_update(struct Machine *m, int sig) {
     sigaction(sig, &sa, NULL);
 }
 
-/* Re-mirror every disposition. Called when a process becomes a ptrace tracee (so
- * default-terminate signals gain a host catcher) or is detached (so they revert to
- * SIG_DFL); sig_host_update reads g_ptrace_active to pick the right disposition. */
+/* Re-mirror every disposition. Called when a thread of this process becomes a
+ * ptrace tracee (so default-terminate signals gain a host catcher) or the last
+ * traced one is detached (so they revert to SIG_DFL); sig_host_update reads
+ * ptrace_traced() to pick the right disposition. */
 void sig_trace_update_all(struct Machine *m) {
     for (int s = 1; s <= 64; s++)
         sig_host_update(m, s);
@@ -488,12 +491,14 @@ int sig_pending_deliverable(struct Machine *m) {
 }
 
 void guest_terminate_by_signal(CPU *c, int sig) {
-    /* Report the WIFSIGNALED death to our tracer (a no-op when untraced): the
-     * pre-exit PTRACE_EVENT_EXIT under TRACEEXIT, then the terminal status word.
-     * Without this a tracer that is not our host parent (strace -p / a followed
-     * child) never learns we died and its wait4 poll hangs. */
+    /* Report the WIFSIGNALED death to the tracer(s) (a no-op when untraced):
+     * the pre-exit PTRACE_EVENT_EXIT under TRACEEXIT, then the terminal status
+     * word -- for every traced thread of this process, since the signal kills
+     * them all without their own exit paths running. Without this a tracer
+     * that is not our host parent (strace -p / a followed child) never learns
+     * we died and its wait4 poll hangs. */
     ptrace_report_exit_stop(c, sig & 0x7f);
-    ptrace_report_exit(c, sig & 0x7f);
+    ptrace_report_exit_group(sig & 0x7f);
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     ptrace_wake_waiters();               /* wake a parent polling in wait4 */
     /* Restore the host default and re-raise so the real parent also sees the same

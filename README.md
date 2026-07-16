@@ -179,7 +179,8 @@ but not remembered).
 - **Threads**
 
   `clone(CLONE_VM)`: one host thread per guest thread over a shared
-  software address space. Exclusives and LSE atomics are SMP-correct (real
+  software address space, with the guest tid being the real host tid (as
+  guest pid is host pid). Exclusives and LSE atomics are SMP-correct (real
   host compare-and-swap) and guest memory barriers map to host fences, so
   pthread mutexes/condvars and lock-free code are correct even on weakly
   ordered ARM hosts.

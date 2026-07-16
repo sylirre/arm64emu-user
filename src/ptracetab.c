@@ -11,7 +11,10 @@
  * Model:
  *   - A MAP_SHARED anonymous registry (created in ptrace_init before the first
  *     fork, so every guest process in the session maps it at the same address)
- *     holds one PtLink per tracee, keyed by tracee pid (== host pid).
+ *     holds one PtLink per traced *task*, keyed by tracee tid (== host tid;
+ *     a main thread's tid is its pid). Tracing is per-thread, as in the
+ *     kernel: each thread of a multithreaded tracee has its own link, its own
+ *     thread-local self state below, and services requests about itself.
  *   - Each link carries the tracer<->tracee relationship, the current stop
  *     state, and a small futex mailbox. When a tracee reaches a stop point
  *     (syscall entry/exit, signal delivery, execve, ...) it publishes the stop,
@@ -31,6 +34,7 @@
 #include <linux/futex.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -41,17 +45,38 @@
 #include "guest_abi.h"
 #include "ptrace.h"
 
-/* ---- process-local tracee-self state (fast gates read by the hot paths) ---- */
-int g_ptrace_active;
-int g_ptrace_syscall_armed;
-int g_ptrace_singlestep;
+/* ---- thread-local tracee-self state (fast gates read by the hot paths) ---- */
+__thread int g_ptrace_active;
+__thread int g_ptrace_syscall_armed;
+__thread int g_ptrace_singlestep;
 /* One-shot: skip the next syscall-exit stop. Set on an auto-attached fork child
  * so the spurious "exit" of the clone it was born from (which it never entered
  * at a syscall-entry stop) is not reported and does not desync the tracer's
  * entry/exit pairing. */
-int g_ptrace_skip_syscall_stop;
+__thread int g_ptrace_skip_syscall_stop;
 /* Set by the reserved-signal kick handler; drained by ptrace_service_kick. */
 __thread volatile sig_atomic_t g_ptrace_kick;
+
+/* Process-level count of traced threads. Signal dispositions are process-wide,
+ * so the default-terminate host catchers (sig_host_update) must stay installed
+ * while *any* thread must report its stops/death, not just the calling one. */
+static int g_ptrace_traced;
+
+int ptrace_traced(void) {
+    return __atomic_load_n(&g_ptrace_traced, __ATOMIC_SEQ_CST) > 0;
+}
+
+/* Adopt/drop bookkeeping around g_ptrace_traced: the counter moves first, then
+ * the process dispositions are re-mirrored so sig_host_update sees the new
+ * traced state (the drop only re-mirrors when the last traced thread is gone). */
+static void pt_traced_inc(struct Machine *m) {
+    __atomic_add_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST);
+    sig_trace_update_all(m);
+}
+static void pt_traced_dec(struct Machine *m) {
+    if (__atomic_sub_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST) == 0)
+        sig_trace_update_all(m);
+}
 
 /* ---- shared registry ---- */
 #define PTRACE_MAX  256      /* max concurrent tracees in the session */
@@ -76,7 +101,9 @@ enum {
 enum { PT_RES_CONT = 0, PT_RES_SYSCALL = 1, PT_RES_SINGLESTEP = 2 };
 
 typedef struct {
-    s32 tracee;          /* 0 = free (CAS-claimed); guest pid == host pid */
+    s32 tracee;          /* 0 = free (CAS-claimed); tracee tid (== host tid;
+                          * a main thread's tid is its pid) */
+    s32 tgid;            /* tracee's thread group (process) id */
     s32 tracer;          /* tracer pid, 0 once detached */
     u32 options;         /* PTRACE_O_* */
     u32 state;           /* PT_ST_* (release/acquire flag for the stop fields) */
@@ -112,7 +139,9 @@ typedef struct {
 } PtTable;
 
 static PtTable *g_tab;            /* MAP_SHARED, or NULL if unavailable */
-static PtLink  *g_self_link;      /* this process's own tracee entry, or NULL */
+/* The calling thread's own tracee entry, or NULL. Thread-local like the rest
+ * of the tracee-self state: every traced thread has its own link. */
+static __thread PtLink *g_self_link;
 
 /* ---- futex helpers (cross-process: no FUTEX_PRIVATE_FLAG) ---- */
 static void fx_wake(volatile u32 *a) {
@@ -146,7 +175,7 @@ static PtLink *pt_find(s32 tracee) {
     return NULL;
 }
 
-static PtLink *pt_claim(s32 tracee) {
+static PtLink *pt_claim(s32 tracee, s32 tgid) {
     if (!g_tab) return NULL;
     PtLink *e = pt_find(tracee);
     if (e) return e;
@@ -155,6 +184,7 @@ static PtLink *pt_claim(s32 tracee) {
         if (__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect, tracee,
                                         false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             e = &g_tab->links[i];
+            e->tgid = tgid;
             e->tracer = 0; e->options = 0; e->state = PT_ST_RUNNING;
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
             e->eventmsg = 0; e->si_signo = e->si_code = e->si_errno = 0;
@@ -252,11 +282,13 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
 /* ---- tracee: service loop + stop core ---- */
 static void pt_self_detach(void) {
     PtLink *e = g_self_link;
+    int was = g_ptrace_active;
     g_self_link = NULL;
     g_ptrace_active = 0;
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
     if (e) { __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE); pt_free(e); }
+    if (was) pt_traced_dec(&g_machine);   /* last one out re-mirrors dispositions */
 }
 
 /* Serve tracer commands while stopped. Returns the signal to inject on resume
@@ -430,14 +462,16 @@ void ptrace_service_kick(CPU *c) {
     g_ptrace_kick = 0;
     if (!g_tab) return;
     if (!g_ptrace_active) {
-        PtLink *e = pt_find((s32)getpid());
+        /* The kick was thread-targeted (rt_tgsigqueueinfo), so the pending
+         * attach to adopt is the one keyed by this thread's own tid. */
+        PtLink *e = pt_find((s32)g_tls.tid);
         if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
             !__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE))
             return;
         __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
         g_self_link = e;
         g_ptrace_active = 1;
-        sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
+        pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
         if (!e->seize) { pt_stop(c, SIGSTOP, 0, 0, 0, 0); return; }  /* ATTACH */
         /* SEIZE: attached without a stop; fall through in case an INTERRUPT
          * kick coalesced with this attach kick into one g_ptrace_kick. */
@@ -474,27 +508,68 @@ int ptrace_selfstop(int sig) {
 void ptrace_report_exit(CPU *c, int wstatus) {
     (void)c;
     PtLink *e = g_self_link;
+    int was = g_ptrace_active;
     g_self_link = NULL;
     g_ptrace_active = 0;
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
     g_ptrace_skip_syscall_stop = 0;
+    if (was) pt_traced_dec(&g_machine);
     if (!e) return;
-    /* If our tracer is not our host parent (an auto-attached fork child whose
-     * exit the tracer cannot reap via the host wait), publish a synthetic exit
-     * for the tracer to collect; it frees the link. A direct child's tracer IS
-     * its host parent and reaps it through the host wait, so just free. */
-    if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) > 0 &&
-        __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getppid()) {
-        s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    /* Publish a synthetic exit for the tracer to collect (it frees the link)
+     * whenever it cannot reap this death through the host wait: always for a
+     * secondary thread (a thread death is never a host-waitable event), and
+     * for a process whose tracer is not its host parent (strace -p, or an
+     * auto-attached fork child). A direct child's tracer IS its host parent
+     * and reaps it through the host wait, so just free. */
+    s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    if (tr > 0 && ((s32)g_tls.tid != (s32)getpid() || tr != (s32)getppid())) {
         e->exit_status = wstatus;
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
-        if (tr > 0) kill(tr, SIGCHLD);   /* wake an async tracer's event loop */
+        kill(tr, SIGCHLD);   /* wake an async tracer's event loop */
         return;   /* keep the link; the tracer frees it on collect */
     }
     pt_free(e);
+}
+
+/* Whole-process death: exit_group(2) or a terminating signal. The sibling
+ * threads die with the process without running their own exit paths (a parked
+ * one dies inside its service loop), so the exiting thread publishes the
+ * synthetic exit for every live tracee link of its thread group. The
+ * host-reap exception mirrors ptrace_report_exit: a main-thread link whose
+ * tracer is the host parent is reaped through the host wait (the process
+ * death IS host-visible), so that link is left for ptrace_note_reaped. */
+void ptrace_report_exit_group(int wstatus) {
+    int was = g_ptrace_active;
+    g_self_link = NULL;
+    g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
+    if (was) pt_traced_dec(&g_machine);
+    if (!g_tab) return;
+    s32 me = (s32)getpid(), ppid = (s32)getppid();
+    int published = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != me) continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
+            continue;                       /* already published */
+        s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+        if (tr <= 0) { pt_free(e); continue; }
+        if (t == me && tr == ppid) continue;   /* host wait reaps this death */
+        e->exit_status = wstatus;
+        __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
+        kill(tr, SIGCHLD);                  /* wake an async tracer's event loop */
+        published = 1;
+    }
+    if (published) {
+        __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+        fx_wake(&g_tab->global_gen);
+    }
 }
 
 /* ---- fork/clone event stops (PTRACE_O_TRACEFORK/VFORK/CLONE) ---- */
@@ -502,6 +577,14 @@ int ptrace_self_active(void) { return g_ptrace_active; }
 
 u32 ptrace_self_options(void) {
     return g_self_link ? __atomic_load_n(&g_self_link->options, __ATOMIC_ACQUIRE) : 0;
+}
+
+s32 ptrace_self_tracer(void) {
+    return g_self_link ? __atomic_load_n(&g_self_link->tracer, __ATOMIC_ACQUIRE) : 0;
+}
+
+u32 ptrace_self_seize(void) {
+    return g_self_link ? g_self_link->seize : 0;
 }
 
 /* Parent side: report the fork/clone event stop, carrying the new child's pid
@@ -520,38 +603,86 @@ void ptrace_report_event(CPU *c, int event, u64 msg) {
  * the same address). */
 void ptrace_fork_child(CPU *c, int event) {
     PtLink *parent = g_self_link;          /* inherited: the parent's link */
+    /* The inherited traced-thread count describes the parent's threads; only
+     * the forking thread exists here, untraced until the adopt below. If the
+     * parent had traced threads, re-mirror the (also inherited) catcher
+     * dispositions back to the untraced state. */
+    int inherited = __atomic_exchange_n(&g_ptrace_traced, 0, __ATOMIC_SEQ_CST);
     g_self_link = NULL;
     g_ptrace_active = 0;
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
     g_ptrace_skip_syscall_stop = 0;
-    if (!event || !parent) return;         /* not followed: a fresh untraced pid */
+    if (!event || !parent) {
+        if (inherited) sig_trace_update_all(c->m);
+        return;                            /* not followed: a fresh untraced pid */
+    }
 
     s32 tracer = __atomic_load_n(&parent->tracer, __ATOMIC_ACQUIRE);
     u32 opts = __atomic_load_n(&parent->options, __ATOMIC_ACQUIRE);
-    if (tracer <= 0) return;
-    PtLink *e = pt_claim(getpid());
-    if (!e) return;                        /* registry full: degrade to untraced */
+    u32 seize = parent->seize;             /* the attach flavor is inherited */
+    if (tracer <= 0) {
+        if (inherited) sig_trace_update_all(c->m);
+        return;
+    }
+    PtLink *e = pt_claim(getpid(), getpid());
+    if (!e) {
+        if (inherited) sig_trace_update_all(c->m);
+        return;                            /* registry full: degrade to untraced */
+    }
     __atomic_store_n(&e->options, opts, __ATOMIC_RELAXED);  /* options are inherited */
+    e->seize = seize;
     __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
     g_ptrace_active = 1;
-    sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
-    /* Initial attach stop (as a non-SEIZE auto-attached child stops with
-     * SIGSTOP). The tracer sees it, (re)sets options and resumes us. */
-    pt_stop(c, SIGSTOP, 0, 0, 0, 0);
+    pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
+    /* Initial attach stop: an auto-attached child of a SEIZE'd tracee stops
+     * with PTRACE_EVENT_STOP, of an ATTACH'd one with SIGSTOP (kernel
+     * behavior). The tracer sees it, (re)sets options and resumes us. */
+    if (seize) pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+    else       pt_stop(c, SIGSTOP, 0, 0, 0, 0);
     /* On resume the tracer has typically armed PTRACE_SYSCALL; skip the spurious
      * syscall-exit of the clone we were born from (we never entered it). */
     if (g_ptrace_syscall_armed)
         g_ptrace_skip_syscall_stop = 1;
 }
 
+/* ---- CLONE_THREAD auto-attach (PTRACE_O_TRACECLONE): the two halves ---- */
+/* Claim half, called on the new host thread *before* the clone startup
+ * handshake wake: once the creator can report PTRACE_EVENT_CLONE the new tid
+ * is already registry-visible, so a tracer's wait4 poll on it never sees a
+ * not-a-tracee window. `tracer` <= 0 (creator untraced or not followed)
+ * leaves the thread untraced. */
+void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize) {
+    if (tracer <= 0 || !g_tab) return;
+    PtLink *e = pt_claim((s32)g_tls.tid, (s32)getpid());
+    if (!e) return;                        /* registry full: degrade to untraced */
+    __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);
+    e->seize = seize;
+    __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+    g_self_link = e;
+    g_ptrace_active = 1;
+    pt_traced_inc(&g_machine);   /* catch default-fatal signals to report them */
+}
+
+/* Stop half, called *after* the handshake wake (so clone() in the creator is
+ * not blocked on the tracer resuming us): park in the initial attach stop
+ * before any guest code runs, exactly like an auto-attached fork child. No
+ * skip_syscall_stop here: a thread starts at the run-loop top, never inside
+ * the clone syscall it was born from. */
+void ptrace_thread_child_stop(CPU *c) {
+    if (!g_ptrace_active || !g_self_link) return;
+    if (g_self_link->seize) pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+    else                    pt_stop(c, SIGSTOP, 0, 0, 0, 0);
+}
+
 /* ---- tracee: PTRACE_TRACEME ---- */
 static long ptrace_traceme(CPU *c) {
     if (!g_tab) return -EPERM;
     if (g_self_link) return -EPERM;   /* already traced */
-    PtLink *e = pt_claim(getpid());
+    PtLink *e = pt_claim((s32)g_tls.tid, (s32)getpid());
     if (!e) return -ENOMEM;
     __atomic_store_n(&e->tracer, (s32)getppid(), __ATOMIC_RELEASE);
     /* Flip the session-wide "someone is tracing" flag so every wait4 switches to
@@ -559,7 +690,7 @@ static long ptrace_traceme(CPU *c) {
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
     g_ptrace_active = 1;
-    sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
+    pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
     return 0;
 }
 
@@ -572,64 +703,118 @@ static void pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
     __atomic_add_fetch(&e->cmd_seq, 1, __ATOMIC_RELEASE);
     fx_wake(&e->cmd_seq);
     while (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d) {
+        /* Tracee gone while we waited -- its slot freed (killed), or its exit
+         * published (a sibling thread's exit_group fan-out flips a parked
+         * thread's link to EXITED without it ever answering): bail so ptrace
+         * doesn't hang. Checked while done_seq is still unbumped, so an answer
+         * that did land is never discarded. */
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0 ||
+            __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
+            e->result = -ESRCH;
+            return;
+        }
         fx_wait(&e->done_seq, d, 500);
-        /* Tracee gone (killed) while we waited: bail so ptrace doesn't hang. */
-        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) { e->result = -ESRCH; return; }
     }
 }
 
-/* Kick a running tracee to a stop point: sigqueue the reserved signal carrying
- * the magic so its sig_kick_net tells it apart from a guest signal. */
-static void pt_send_kick(s32 pid) {
-    union sigval v;
-    v.sival_int = PT_KICK_MAGIC;
-    sigqueue(pid, PTRACE_KICKSIG, v);
+/* Kick a running tracee task to a stop point: queue the reserved signal at the
+ * specific host thread (guest tid == host tid) carrying the magic so its
+ * sig_kick_net tells it apart from a guest signal. Thread-targeted delivery
+ * matters: the kick handler sets *thread-local* flags, and a process-directed
+ * sigqueue could land on any thread of a multithreaded tracee. */
+static void pt_send_kick(s32 tgid, s32 tid) {
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = PTRACE_KICKSIG;
+    si.si_code = SI_QUEUE;
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    si.si_value.sival_int = PT_KICK_MAGIC;
+    syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si);
 }
 
-/* A stop signal aimed at another process that is a ptrace tracee: route it into
- * a cooperative group-stop instead of a real host stop. An uncatchable SIGSTOP
- * delivered to the host would freeze the tracee inside its ptrace service loop,
- * so the follow-up tracer requests (e.g. the DETACH strace issues on ^C after it
- * stops the tracee with SIGSTOP) would deadlock -- and the emulator would never
- * see the signal to report it. We record the signal on the tracee's link and
- * kick it; at its run-loop boundary ptrace_service_kick reports the group-stop.
+/* Thread group of host task `tid` (/proc/<tid>/status Tgid -- guest tids are
+ * host tids). -1 if the task does not exist. Used to attach by thread tid. */
+static s32 pt_tgid_of(s32 tid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)tid);
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    char line[128];
+    s32 tg = -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "Tgid:", 5)) { tg = (s32)strtol(line + 5, NULL, 10); break; }
+    fclose(f);
+    return tg;
+}
+
+/* A stop signal aimed at a task whose thread group has ptrace tracees: route it
+ * into cooperative group-stops instead of a real host stop. An uncatchable
+ * SIGSTOP delivered to the host would freeze the tracees inside their ptrace
+ * service loops, so the follow-up tracer requests (e.g. the DETACH strace
+ * issues on ^C after it stops the tracee with SIGSTOP) would deadlock -- and
+ * the emulator would never see the signal to report it. The kernel group-stops
+ * *all* threads and each traced one reports its own group-stop, so the signal
+ * is recorded and kicked on every live link of the group (`id` may be a pid or
+ * any thread's tid). In a mixed traced/untraced group only the traced threads
+ * stop -- a documented simplification; a full strace -f/-p traces every thread.
  * Returns 1 if routed (the caller must not also host-signal), 0 otherwise. */
-int ptrace_signal_stop(s32 pid, int sig) {
-    if (!g_tab || pid <= 0) return 0;
+int ptrace_signal_stop(s32 id, int sig) {
+    if (!g_tab || id <= 0) return 0;
     if (!pt_is_stopsig(sig)) return 0;
-    PtLink *e = pt_find(pid);
-    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
-    __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
-    pt_send_kick(pid);
-    return 1;
+    /* Resolve to a thread group: an exact link match maps a tid to its group;
+     * otherwise treat `id` as a tgid (its main thread may be untraced). */
+    PtLink *hit = pt_find(id);
+    s32 tgid = hit ? hit->tgid : id;
+    int routed = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != tgid) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
+        __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
+        pt_send_kick(e->tgid, t);
+        routed = 1;
+    }
+    return routed;
 }
 
-/* SIGCONT aimed at a tracee that a tracer has put into a listening group-stop
- * (PTRACE_LISTEN): end the group-stop and notify the tracer with a fresh
- * PTRACE_EVENT_STOP trap. The tracee stays parked in its service loop (its CPU is
- * intact), so the tracer's follow-up GETREGSET/CONT round-trips as usual; we only
- * re-arm the stop fields on the shared link from the sender side and wake the
- * tracer. Returns 1 if consumed (the caller must not also host-signal), else 0 --
- * an ordinary SIGCONT (no listening tracee) falls through to normal delivery. */
-int ptrace_signal_cont(s32 pid, int sig) {
-    if (!g_tab || pid <= 0 || sig != SIGCONT) return 0;
-    PtLink *e = pt_find(pid);
-    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
-    if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) return 0;
-    __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
-    e->stop_sig = SIGTRAP;
-    e->event = G_PTRACE_EVENT_STOP;
-    e->syscall_stop = 0;
-    e->si_signo = SIGTRAP;
-    e->si_code = (G_PTRACE_EVENT_STOP << 8) | SIGTRAP;
-    e->si_errno = 0;
-    /* state is already PT_ST_STOPPED (the tracee never left its service loop). */
-    __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
-    fx_wake(&g_tab->global_gen);
-    { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
-      if (tr > 0) kill(tr, SIGCHLD); }   /* wake an async tracer's event loop */
-    return 1;
+/* SIGCONT aimed at a task whose thread group has tracees a tracer put into a
+ * listening group-stop (PTRACE_LISTEN): end the group-stop and notify each
+ * tracer with a fresh PTRACE_EVENT_STOP trap. The tracees stay parked in their
+ * service loops (their CPUs are intact), so a follow-up GETREGSET/CONT
+ * round-trips as usual; we only re-arm the stop fields on the shared links from
+ * the sender side and wake the tracer(s). Returns 1 if consumed (the caller
+ * must not also host-signal), else 0 -- an ordinary SIGCONT (no listening
+ * tracee in the group) falls through to normal delivery. */
+int ptrace_signal_cont(s32 id, int sig) {
+    if (!g_tab || id <= 0 || sig != SIGCONT) return 0;
+    PtLink *hit = pt_find(id);
+    s32 tgid = hit ? hit->tgid : id;
+    int consumed = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != tgid) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) continue;
+        if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) continue;
+        __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+        e->stop_sig = SIGTRAP;
+        e->event = G_PTRACE_EVENT_STOP;
+        e->syscall_stop = 0;
+        e->si_signo = SIGTRAP;
+        e->si_code = (G_PTRACE_EVENT_STOP << 8) | SIGTRAP;
+        e->si_errno = 0;
+        /* state is already PT_ST_STOPPED (the tracee never left its service loop). */
+        __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+        fx_wake(&g_tab->global_gen);
+        { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+          if (tr > 0) kill(tr, SIGCHLD); }   /* wake an async tracer's event loop */
+        consumed = 1;
+    }
+    return consumed;
 }
 
 /* ---- tracer: guest ptrace(2) dispatch ---- */
@@ -638,12 +823,21 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         return ptrace_traceme(c);
     if (!g_tab) return -EPERM;
 
-    /* Attach to an already-running process: claim its link, mark ourselves the
-     * tracer, and kick it to adopt the attach at its next run-loop boundary. */
+    /* Attach to an already-running task -- a process (pid) or any thread of one
+     * (tid; strace -p / gdb -p enumerate /proc/<pid>/task and attach each):
+     * claim its link, mark ourselves the tracer, and kick that specific thread
+     * to adopt the attach at its next run-loop boundary. */
     if (req == G_PTRACE_ATTACH || req == G_PTRACE_SEIZE) {
         if (pid <= 0 || pid == (s32)getpid()) return -EPERM;
-        if (!proctab_has(pid)) return -ESRCH;   /* not a live guest process */
-        PtLink *e = pt_claim(pid);
+        s32 tgid = pid;
+        if (!proctab_has(pid)) {
+            /* Not a guest pid: maybe a secondary thread's tid (== host tid).
+             * Its thread group must be a live guest process. */
+            tgid = pt_tgid_of(pid);
+            if (tgid <= 0 || !proctab_has(tgid)) return -ESRCH;
+        }
+        if (tgid == (s32)getpid()) return -EPERM;   /* own thread group (kernel rule) */
+        PtLink *e = pt_claim(pid, tgid);
         if (!e) return -ENOMEM;
         s32 zero = 0;
         if (!__atomic_compare_exchange_n(&e->tracer, &zero, (s32)getpid(), false,
@@ -655,7 +849,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
                          __ATOMIC_RELAXED);
         __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);  /* our wait4 polls */
-        pt_send_kick(pid);
+        pt_send_kick(tgid, pid);
         return 0;
     }
 
@@ -668,7 +862,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
             return 0;                            /* already stopped */
         __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
-        pt_send_kick(pid);
+        pt_send_kick(e->tgid, pid);
         return 0;
     }
 
@@ -678,7 +872,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         __atomic_store_n(&e->options, (u32)data & G_PTRACE_O_MASK, __ATOMIC_RELEASE);
         return 0;
     case G_PTRACE_KILL:
-        kill(pid, SIGKILL);
+        kill(e->tgid, SIGKILL);   /* pid may be a thread tid: kill its process */
         return 0;
     case G_PTRACE_GETEVENTMSG: {
         u64 msg = e->eventmsg;

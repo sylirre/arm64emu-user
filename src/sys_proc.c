@@ -26,10 +26,20 @@
 SYSDEF(exit) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
-     * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
-    if (g_tls.tid != getpid()) { c->stop = true; return 0; }
+     * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. A
+     * traced thread first reports its own EVENT_EXIT and WIFEXITED status --
+     * always as a synthetic exit, since a thread death is never host-waitable. */
+    if (g_tls.tid != getpid()) {
+        ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);
+        ptrace_report_exit(c, ((int)a0 & 0xff) << 8);
+        c->stop = true;
+        return 0;
+    }
     ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
-    ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
+    /* Main-thread exit(2) ends the whole process here (a simplification: the
+     * process would linger while other threads run), so report the death for
+     * every traced thread of the group, as exit_group does. */
+    ptrace_report_exit_group(((int)a0 & 0xff) << 8);
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -39,7 +49,11 @@ SYSDEF(exit) {
 SYSDEF(exit_group) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
-    ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
+    /* The whole thread group dies without the sibling threads running their
+     * own exit paths: publish the WIFEXITED status on every traced thread's
+     * link (a parked sibling dies inside its service loop; its tracer would
+     * otherwise poll a stale link forever). */
+    ptrace_report_exit_group(((int)a0 & 0xff) << 8);
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -132,10 +146,16 @@ SYSDEF(uname) {
 typedef struct {
     CPU cpu;
     struct Machine *m;
-    u64 flags, ctid, tls;
+    u64 flags, ptid, ctid, tls;
     u64 sigmask;              /* creator's blocked set, inherited (POSIX) */
     int tid;                  /* real host tid, filled by the thread itself */
     volatile s32 *start_tid;  /* startup handshake word on the creator's stack */
+    /* ptrace thread-follow (PTRACE_O_TRACECLONE): the creator's tracer/options/
+     * SEIZE flavor, snapshotted at clone time for the new thread's auto-attach
+     * (its own thread-local tracee state starts empty). pt_tracer == 0 when the
+     * creator is untraced or thread creation is not followed. */
+    s32 pt_tracer;
+    u32 pt_options, pt_seize;
     pthread_t host;
 } GThread;
 
@@ -160,16 +180,30 @@ static void *thread_entry(void *arg) {
     CPU *c = &t->cpu;
     c->m = t->m;
     if (t->flags & G_CLONE_SETTLS) c->tpidr[0] = t->tls;
-    /* CLONE_CHILD_SETTID: the kernel stores the child tid in the child's
-     * memory before the child runs; write it before the handshake wake so it
-     * is also visible before clone() returns in the creator. */
+    /* CLONE_CHILD_SETTID / CLONE_PARENT_SETTID: the kernel stores the new tid
+     * before the child runs AND before clone returns in the creator; write
+     * both before the handshake wake (the address space is shared, so this
+     * thread's store is the creator's store). Writing ptid *here*, not in the
+     * creator after the handshake, is what keeps a short-lived thread safe:
+     * glibc points both PARENT_SETTID and CHILD_CLEARTID at the same word
+     * (pd->tid), so a late creator-side store could overwrite the exit-time
+     * CLEARTID clear of a thread that ran to completion first -- leaving
+     * pthread_join futex-waiting on a tid that never returns to 0. */
     if (t->flags & G_CLONE_CHILD_SETTID) copy_to_guest(c, t->ctid, &tid, 4);
+    if (t->flags & G_CLONE_PARENT_SETTID) copy_to_guest(c, t->ptid, &tid, 4);
+    /* Followed thread creation (PTRACE_O_TRACECLONE): claim this thread's own
+     * tracee link before the wake -- once the creator can report its
+     * PTRACE_EVENT_CLONE the new tid is already registry-visible -- but park
+     * in the initial attach stop only after it, so the creator's clone() is
+     * not blocked on the tracer resuming us. */
+    ptrace_thread_child_claim(t->pt_tracer, t->pt_options, t->pt_seize);
     /* Publish the real host tid -- it becomes the guest tid the parked
      * clone() returns. The handshake word lives on the creator's stack, which
      * is guaranteed alive (it is blocked on this word) and never touched by
      * this thread after the wake. */
     __atomic_store_n(t->start_tid, tid, __ATOMIC_RELEASE);
     syscall(SYS_futex, (s32 *)t->start_tid, 1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+    ptrace_thread_child_stop(c);
     emu_loop(c);
     /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes
      * joiners. */
@@ -198,9 +232,22 @@ SYSDEF(clone) {
         if (child_stack) *cpu_cur_sp(&t->cpu) = child_stack;
         t->m = m;
         t->flags = flags;
+        t->ptid = ptid;
         t->ctid = ctid;
         t->tls = tls;
         t->sigmask = g_tls.sigmask;
+        /* ptrace thread-follow: a CLONE_THREAD clone is a PTRACE_EVENT_CLONE
+         * (kernel rule; its exit signal is none). When followed, the new
+         * thread auto-attaches to the creator's tracer, inheriting options
+         * and the attach flavor. */
+        int pt_ev = 0;
+        if (ptrace_self_active() &&
+            (ptrace_self_options() & G_PTRACE_O_TRACECLONE)) {
+            pt_ev = G_PTRACE_EVENT_CLONE;
+            t->pt_tracer = ptrace_self_tracer();
+            t->pt_options = ptrace_self_options();
+            t->pt_seize = ptrace_self_seize();
+        }
         /* Startup handshake: the guest tid is the new thread's real host tid
          * (see GThread), known only once it runs, so park here until
          * thread_entry publishes it. Bounded by thread startup; the thread
@@ -217,9 +264,14 @@ SYSDEF(clone) {
         while ((tid = __atomic_load_n(&start_tid, __ATOMIC_ACQUIRE)) == 0)
             syscall(SYS_futex, (s32 *)&start_tid, 0 /*FUTEX_WAIT*/, 0,
                     NULL, NULL, 0);
-        /* t may already be freed (thread ran and exited): don't touch it. */
-        if (flags & G_CLONE_PARENT_SETTID)
-            copy_to_guest(c, ptid, &tid, 4);
+        /* t may already be freed (thread ran and exited): don't touch it.
+         * PARENT_SETTID was written by the thread itself pre-handshake (see
+         * thread_entry) -- a creator-side store here could overwrite the
+         * CLEARTID clear of a thread that already ran to completion. */
+        /* Creator's clone event stop (before "returning" the new tid), so the
+         * tracer learns it via PTRACE_GETEVENTMSG; the new thread's own
+         * initial stop is published independently by ptrace_thread_child_stop. */
+        if (pt_ev) ptrace_report_event(c, pt_ev, (u64)tid);
         return (u64)tid;
     }
 

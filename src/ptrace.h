@@ -6,7 +6,11 @@
  * Guest processes are separate host processes (fork), so a guest tracer cannot
  * reach a guest tracee's CPU/memory directly. Instead each tracee services
  * ptrace requests *about itself* while parked at a stop point, over a shared-
- * memory link registry + futex mailbox. See ptracetab.c for the model. */
+ * memory link registry + futex mailbox. See ptracetab.c for the model.
+ *
+ * Tracing is per-task, as in the kernel: every traced *thread* (guest tid ==
+ * host tid) has its own registry link and its own tracee-self state below, so
+ * a multithreaded tracee reports each thread's stops independently. */
 #ifndef A64_PTRACE_H
 #define A64_PTRACE_H
 
@@ -14,12 +18,12 @@
 
 #include "cpu.h"
 
-/* Fast process-local gates. Zero cost when this process is not a tracee: the
+/* Fast thread-local gates. Zero cost when this thread is not a tracee: the
  * syscall/exec/signal hot paths test these ints before calling anything. */
-extern int g_ptrace_active;         /* this process is a ptrace tracee */
-extern int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PTRACE_SYSCALL) */
-extern int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
-extern int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
+extern __thread int g_ptrace_active;         /* this thread is a ptrace tracee */
+extern __thread int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PTRACE_SYSCALL) */
+extern __thread int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
+extern __thread int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
 /* Set by the reserved-signal kick handler (a tracer's PTRACE_ATTACH/SEIZE/
  * INTERRUPT); serviced at the run-loop boundary by ptrace_service_kick. */
 extern __thread volatile sig_atomic_t g_ptrace_kick;
@@ -37,12 +41,29 @@ void ptrace_init(void);
  * whether the parent's tracer is following this creation: nonzero auto-attaches
  * the child to that tracer with an initial stop, zero leaves it untraced. */
 void ptrace_fork_child(CPU *c, int event);
-/* Is the caller a tracee, and what are its inherited PTRACE_O_* options?
- * (Used by clone to decide whether/which fork event to report.) */
+/* Is the calling thread a tracee, and what are its inherited PTRACE_O_*
+ * options / tracer pid / SEIZE flag? (Used by clone to decide whether/which
+ * fork or clone event to report and what a followed new thread inherits.) */
 int  ptrace_self_active(void);
 u32  ptrace_self_options(void);
+s32  ptrace_self_tracer(void);
+u32  ptrace_self_seize(void);
+/* Is any thread of this process currently a tracee? Gates the process-wide
+ * signal-disposition mirroring (sig_host_update): default-terminate catchers
+ * must stay installed while any thread must report its stops/death. */
+int  ptrace_traced(void);
 /* Parent side of a followed clone: report the event stop, msg = new child pid. */
 void ptrace_report_event(CPU *c, int event, u64 msg);
+/* New CLONE_THREAD guest thread whose creator's tracer follows thread creation
+ * (PTRACE_O_TRACECLONE): the two halves of the kernel's child auto-attach,
+ * called on the new host thread (tracer <= 0 leaves it untraced).
+ * _claim runs *before* the clone startup handshake wake, so by the time the
+ * creator can report PTRACE_EVENT_CLONE the new tid is already registry-visible
+ * (a tracer's wait4 poll on it never sees a not-a-tracee window); _stop parks
+ * in the initial attach stop after the wake, so clone() in the creator is not
+ * blocked on the tracer resuming the child. */
+void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize);
+void ptrace_thread_child_stop(CPU *c);
 
 /* ---- Tracee-side stop reports (call only when g_ptrace_* say we are traced) ---- */
 /* Syscall-entry (is_exit==0) / syscall-exit stop. Parks until the tracer
@@ -64,20 +85,31 @@ void ptrace_report_singlestep(CPU *c);
  * The caller (a signal-send syscall) uses this only when the target is self —
  * a real host stop would freeze the tracee's ptrace service loop. */
 int  ptrace_selfstop(int sig);
-/* As ptrace_selfstop, but for a stop signal sent to *another* process `pid`: if
- * it is a live tracee, record the stop signal and kick it to a cooperative
- * group-stop (returns 1), so a tracer that stops its tracee with SIGSTOP — as
- * strace does before detaching on ^C — does not really host-stop it (which would
- * freeze its service loop and deadlock the follow-up DETACH). 0 = not a tracee. */
-int  ptrace_signal_stop(s32 pid, int sig);
-/* SIGCONT sent to another process `pid`: if it is a live tracee a tracer has put
- * into a listening group-stop (PTRACE_LISTEN), end the group-stop and notify the
- * tracer with a PTRACE_EVENT_STOP, returning 1; else 0 (ordinary SIGCONT). */
-int  ptrace_signal_cont(s32 pid, int sig);
-/* Exit: release this process's tracee link (or, for an auto-attached fork
- * child, publish a synthetic exit for its tracer). wstatus is the wait-status
- * word to report: (code & 0xff) << 8 for exit(code), or the signal for a death. */
+/* As ptrace_selfstop, but for a stop signal sent to another task `id` (a pid or
+ * any thread's tid): if its thread group has live tracees, record the stop
+ * signal and kick every one of them to a cooperative group-stop (returns 1) --
+ * the kernel group-stops all threads and each traced one reports its own stop.
+ * A real host SIGSTOP would instead freeze the tracees' service loops and
+ * deadlock the follow-up requests (e.g. the DETACH strace issues on ^C).
+ * 0 = no tracee in that group. */
+int  ptrace_signal_stop(s32 id, int sig);
+/* SIGCONT sent to another task `id`: if its thread group has tracees a tracer
+ * has put into a listening group-stop (PTRACE_LISTEN), end the group-stop and
+ * notify each tracer with a PTRACE_EVENT_STOP, returning 1; else 0 (ordinary
+ * SIGCONT). */
+int  ptrace_signal_cont(s32 id, int sig);
+/* Exit of the calling thread: release its tracee link (or publish a synthetic
+ * exit for the tracer to collect -- always for a secondary thread, whose death
+ * is never host-waitable, and for a process whose tracer is not its host
+ * parent). wstatus is the wait-status word to report: (code & 0xff) << 8 for
+ * exit(code), or the signal for a death. */
 void ptrace_report_exit(CPU *c, int wstatus);
+/* Whole-process death (exit_group, or a terminating signal): publish a
+ * synthetic exit on every live tracee link of this thread group -- the sibling
+ * threads die with the process without running their own exit paths -- keeping
+ * the host-reap exception for a main-thread link whose tracer is the host
+ * parent. Clears the calling thread's tracee-self state. */
+void ptrace_report_exit_group(int wstatus);
 /* Pre-exit stop (PTRACE_O_TRACEEXIT): a PTRACE_EVENT_EXIT stop reported with the
  * pending exit-status word in GETEVENTMSG, before the process actually exits.
  * No-op unless traced with TRACEEXIT set. */
