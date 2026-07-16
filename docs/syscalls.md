@@ -26,9 +26,11 @@ The `--strace` flag prints one line per syscall in a qemu-compatible format; it 
 the primary bring-up instrument (diff against `qemu-aarch64 -strace`). `--strace-full`
 is a human-readable, strace-style rendering of the same calls: symbolic flags
 (`O_RDONLY|O_CLOEXEC`, `PROT_READ|PROT_WRITE`, `MAP_PRIVATE|MAP_ANONYMOUS`, `AT_FDCWD`,
-signals, `SEEK_*`, `AF_*`, …), quoted strings, `execve` argv/envp arrays, errno-named
-returns (`-1 ENOENT (No such file or directory)`), and `{field=…}` pretty-printing of
-the common structs (`stat`, `timespec`, `timeval`, `rlimit`, `utsname`, `sockaddr`).
+signals, `SEEK_*`, `AF_*`, …), quoted strings, `execve` argv/envp arrays, read/write
+buffer contents (`read(3, "root:x:0:0:root:\n"..., 1024) = 702`, capped at 32 bytes),
+output strings (`getcwd`, `readlinkat`), errno-named returns
+(`-1 ENOENT (No such file or directory)`), and `{field=…}` pretty-printing of the
+common structs (`stat`, `timespec`, `timeval`, `rlimit`, `utsname`, `sockaddr`).
 Plain `--strace` keeps its compact, qemu-diffable column layout.
 
 Both modes label every *known* syscall by name — including the unimplemented ones
@@ -40,9 +42,10 @@ than a bare `?`.
 The decoder lives in `src/strace.c`: a per-syscall argument-type table drives a set of
 small formatters, and input strings/arrays are snapshotted *before* the handler runs so
 `execve` still shows its program path and argv after the address space is replaced.
-Kernel-output structs are only decoded on success (a failed call prints the raw
-pointer, since the buffer was not written). Any argument a syscall's descriptor does
-not cover falls back to hex, so coverage grows one table row at a time.
+Kernel-output structs and buffers are only decoded on success (a failed call prints
+the raw pointer, since the buffer was not written); an output buffer's shown length
+is the call's return value. Any argument a syscall's descriptor does not cover falls
+back to hex, so coverage grows one table row at a time.
 
 ## Struct marshalling: always convert
 

@@ -34,6 +34,9 @@ enum {
     AT_PTR,        /* pointer: NULL or 0x… */
     AT_STR,        /* NUL-terminated string (captured pre-call) */
     AT_STRARRAY,   /* argv/envp: NULL-terminated array of strings (pre-call) */
+    AT_STR_OUT,    /* NUL-terminated string the call writes (getcwd); on success */
+    AT_BUF_IN,     /* input byte buffer, length = the next arg (write/send data) */
+    AT_BUF_OUT,    /* output byte buffer, length = the return value (read/recv) */
     AT_FD,         /* file descriptor: signed decimal */
     AT_DIRFD,      /* dirfd: AT_FDCWD or signed decimal */
     AT_OFLAGS,     /* open()/openat() flags */
@@ -70,17 +73,17 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     /* file & fd */
     { G_NR_openat,    { AT_DIRFD, AT_STR, AT_OFLAGS, AT_MODE }, 0 },
     { G_NR_close,     { AT_FD }, 0 },
-    { G_NR_read,      { AT_FD, AT_PTR, AT_UINT }, 0 },
-    { G_NR_write,     { AT_FD, AT_PTR, AT_UINT }, 0 },
-    { G_NR_pread64,   { AT_FD, AT_PTR, AT_UINT, AT_INT }, 0 },
-    { G_NR_pwrite64,  { AT_FD, AT_PTR, AT_UINT, AT_INT }, 0 },
+    { G_NR_read,      { AT_FD, AT_BUF_OUT, AT_UINT }, 0 },
+    { G_NR_write,     { AT_FD, AT_BUF_IN, AT_UINT }, 0 },
+    { G_NR_pread64,   { AT_FD, AT_BUF_OUT, AT_UINT, AT_INT }, 0 },
+    { G_NR_pwrite64,  { AT_FD, AT_BUF_IN, AT_UINT, AT_INT }, 0 },
     { G_NR_readv,     { AT_FD, AT_PTR, AT_INT }, 0 },
     { G_NR_writev,    { AT_FD, AT_PTR, AT_INT }, 0 },
     { G_NR_lseek,     { AT_FD, AT_INT, AT_WHENCE }, 0 },
     { G_NR_fstat,     { AT_FD, AT_STAT }, 0 },
     { G_NR_newfstatat,{ AT_DIRFD, AT_STR, AT_STAT, AT_ATFLAGS }, 0 },
     { G_NR_statx,     { AT_DIRFD, AT_STR, AT_ATFLAGS, AT_HEX, AT_PTR }, 0 },
-    { G_NR_readlinkat,{ AT_DIRFD, AT_STR, AT_PTR, AT_UINT }, 0 },
+    { G_NR_readlinkat,{ AT_DIRFD, AT_STR, AT_BUF_OUT, AT_UINT }, 0 },
     { G_NR_getdents64,{ AT_FD, AT_PTR, AT_UINT }, 0 },
     { G_NR_unlinkat,  { AT_DIRFD, AT_STR, AT_ATFLAGS }, 0 },
     { G_NR_mkdirat,   { AT_DIRFD, AT_STR, AT_MODE }, 0 },
@@ -107,7 +110,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_chroot,    { AT_STR }, 0 },
     { G_NR_statfs,    { AT_STR, AT_PTR }, 0 },
     { G_NR_fstatfs,   { AT_FD, AT_PTR }, 0 },
-    { G_NR_getcwd,    { AT_PTR, AT_UINT }, 0 },
+    { G_NR_getcwd,    { AT_STR_OUT, AT_UINT }, 0 },
     { G_NR_pipe2,     { AT_PTR, AT_OFLAGS }, 0 },
     { G_NR_mount,     { AT_STR, AT_STR, AT_STR, AT_MSFLAGS, AT_PTR }, 0 },
     { G_NR_umount2,   { AT_STR, AT_UMOUNTFLAGS }, 0 },
@@ -172,8 +175,8 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_accept4,   { AT_FD, AT_SOCKADDR_O, AT_PTR, AT_SOTYPE }, 0 },
     { G_NR_getsockname,{ AT_FD, AT_SOCKADDR_O, AT_PTR }, 0 },
     { G_NR_getpeername,{ AT_FD, AT_SOCKADDR_O, AT_PTR }, 0 },
-    { G_NR_sendto,    { AT_FD, AT_PTR, AT_UINT, AT_HEX, AT_SOCKADDR, AT_UINT }, 0 },
-    { G_NR_recvfrom,  { AT_FD, AT_PTR, AT_UINT, AT_HEX, AT_SOCKADDR_O, AT_PTR }, 0 },
+    { G_NR_sendto,    { AT_FD, AT_BUF_IN, AT_UINT, AT_HEX, AT_SOCKADDR, AT_UINT }, 0 },
+    { G_NR_recvfrom,  { AT_FD, AT_BUF_OUT, AT_UINT, AT_HEX, AT_SOCKADDR_O, AT_PTR }, 0 },
     { G_NR_listen,    { AT_FD, AT_INT }, 0 },
     { G_NR_shutdown,  { AT_FD, AT_INT }, 0 },
 };
@@ -322,15 +325,44 @@ static void sb_printf(SB *s, const char *fmt, ...) {
     if (s->off >= s->cap) s->off = s->cap - 1;  /* vsnprintf truncated */
 }
 
-/* Append src as a C-style quoted literal, escaping ", \\ and non-printables. */
-static void sb_quote(SB *s, const char *src) {
+/* Longest byte-buffer content shown for read/write-style data args (strace -s). */
+#define STRACE_BUF_MAX 32
+
+/* Append len bytes as a C-style quoted literal, escaping ", \\, the common
+ * control chars, and other non-printables as \xHH. NUL bytes are kept (buffers
+ * may embed them), so this is length- rather than NUL-terminated. */
+static void sb_quote_bytes(SB *s, const unsigned char *data, size_t len) {
     sb_puts(s, "\"");
-    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
-        if (*p == '"' || *p == '\\') sb_printf(s, "\\%c", *p);
-        else if (*p >= 0x20 && *p < 0x7f) sb_printf(s, "%c", *p);
-        else sb_printf(s, "\\x%02x", *p);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = data[i];
+        if (ch == '"' || ch == '\\') sb_printf(s, "\\%c", ch);
+        else if (ch == '\n') sb_puts(s, "\\n");
+        else if (ch == '\t') sb_puts(s, "\\t");
+        else if (ch == '\r') sb_puts(s, "\\r");
+        else if (ch >= 0x20 && ch < 0x7f) sb_printf(s, "%c", ch);
+        else sb_printf(s, "\\x%02x", ch);
     }
     sb_puts(s, "\"");
+}
+/* Append a NUL-terminated C string as a quoted literal. */
+static void sb_quote(SB *s, const char *src) {
+    sb_quote_bytes(s, (const unsigned char *)src, strlen(src));
+}
+
+/* Render a guest byte range [va, va+len) as a quoted, capped literal, appending
+ * "..." after the closing quote when the buffer is longer than what we show.
+ * A NULL pointer prints NULL; an unreadable one falls back to its hex address. */
+static void fmt_buf(SB *s, struct CPU *c, u64 va, u64 len) {
+    if (va == 0) { sb_puts(s, "NULL"); return; }
+    u64 show = len < STRACE_BUF_MAX ? len : STRACE_BUF_MAX;
+    if (show == 0) { sb_puts(s, "\"\""); return; }
+    unsigned char tmp[STRACE_BUF_MAX];
+    if (copy_from_guest(c, tmp, va, (size_t)show) < 0) {
+        sb_printf(s, "0x%llx", (unsigned long long)va);
+        return;
+    }
+    sb_quote_bytes(s, tmp, (size_t)show);
+    if (len > show) sb_puts(s, "...");
 }
 
 /* ---- formatters ----------------------------------------------------------- */
@@ -464,9 +496,11 @@ static void fmt_struct(SB *s, struct CPU *c, u8 ty, u64 va, int ok) {
     }
 }
 
-/* Format one argument of the given type. */
-static void fmt_arg(SB *s, struct CPU *c, u8 ty, u64 v, const StraceSnap *snap,
-                    int idx, int ok) {
+/* Format one argument of the given type. args/idx/ret give the buffer types
+ * access to a sibling length arg and the return value. */
+static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
+                    const StraceSnap *snap, int ok, u64 ret) {
+    u64 v = args[idx];
     switch (ty) {
     case AT_INT:   sb_printf(s, "%lld", (long long)(s64)v); break;
     case AT_UINT:  sb_printf(s, "%llu", (unsigned long long)v); break;
@@ -486,6 +520,27 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, u64 v, const StraceSnap *snap,
         if (snap && snap->arr[idx]) sb_puts(s, snap->arr[idx]);
         else if (v == 0) sb_puts(s, "NULL");
         else sb_printf(s, "0x%llx", (unsigned long long)v);
+        break;
+    case AT_STR_OUT:
+        /* NUL-terminated string the call wrote (getcwd), valid on success. */
+        if (v == 0) sb_puts(s, "NULL");
+        else if (!ok) sb_printf(s, "0x%llx", (unsigned long long)v);
+        else {
+            char tmp[STRACE_STR_MAX];
+            if (copy_str_from_guest(c, tmp, v, sizeof tmp) < 0)
+                sb_printf(s, "0x%llx", (unsigned long long)v);
+            else sb_quote(s, tmp);
+        }
+        break;
+    case AT_BUF_IN:
+        /* Input data: valid regardless of success; length is the next arg. */
+        fmt_buf(s, c, v, (idx + 1 < 6) ? args[idx + 1] : 0);
+        break;
+    case AT_BUF_OUT:
+        /* Output data: only the returned byte count was written, on success. */
+        if (v == 0) sb_puts(s, "NULL");
+        else if (!ok) sb_printf(s, "0x%llx", (unsigned long long)v);
+        else fmt_buf(s, c, v, ret);
         break;
     case AT_OFLAGS:      fmt_oflags(s, v); break;
     case AT_MODE:        sb_printf(s, "0%llo", (unsigned long long)v); break;
@@ -565,7 +620,7 @@ void strace_log(struct CPU *c, u64 nr, const char *name, const u64 *args,
             if (nr == G_NR_openat && i == 3 && !(args[2] & (0100 | 020000000)))
                 break;
             if (printed) sb_puts(&s, ", ");
-            fmt_arg(&s, c, t[i], args[i], snap, i, ok);
+            fmt_arg(&s, c, t[i], args, i, snap, ok, ret);
             printed = 1;
         }
     } else {

@@ -126,7 +126,7 @@ Acceptance criteria:
 Command line options:
 
 * `--strace`: log every guest system call in format `PID name(nr,a0..a5) = ret`, also does a full register dump when the guest dies from a fatal signal.
-* `--strace-full`: the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/strace.c`). Plain `--strace` stays byte-identical for qemu-diffing.
+* `--strace-full`: the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, read/write buffer contents and output strings (`getcwd`, `readlinkat`), errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/strace.c`). Plain `--strace` keeps its compact qemu-diffable layout.
 * `--debug`: per-instruction trace in format `<pc>: <insn-word>  [elN nzcv=....]`, disables JIT.
 * `--no-predecode`: disable decoded-instruction cache, use it to decide whether a bug lives in the predecode fast path or the real decoder.
 
