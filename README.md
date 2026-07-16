@@ -134,7 +134,8 @@ All bindings get registered in the guest's `/proc/mounts` and
 `/proc/PID/mountinfo`. The host information about mount points is discarded.
 
 It is possible to use `mount --bind src dst` within guest environment if
-emulator uses `--fake-id`. Remove binding by `umount dst`.
+emulator uses `--fake-id`. Remove binding by `umount dst`. Run time bindings
+are not shared between multiple emulator sessions.
 
 Caveat: the src/dst paths must not contain the colon character (`:`).
 
