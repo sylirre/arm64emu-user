@@ -605,6 +605,7 @@ SYSDEF(wait4) {
         int status;
         struct rusage ru;
         pid_t pid = wait4(wpid, &status, options | WNOHANG, a3 ? &ru : NULL);
+        int werr = errno;
         if (pid > 0) {
             if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
             if (a1) {
@@ -618,8 +619,13 @@ SYSDEF(wait4) {
             }
             return (u64)pid;
         }
-        if (pid < 0) return host_err();      /* ECHILD: no children remain */
-        if (options & WNOHANG) return 0;     /* children exist, none ready yet */
+        /* Host ECHILD is expected when tracing a non-child (PTRACE_ATTACH/SEIZE):
+         * the tracee is another parent's child and its stop/exit reaches us only
+         * through the registry above, not the host wait. Keep polling while a live
+         * tracee remains; a real ECHILD (no children AND no tracees) still returns. */
+        if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee((s32)wpid)))
+            return (u64)(s64)(-werr);
+        if (options & WNOHANG) return 0;     /* nothing ready yet */
         ptrace_tracer_wait(100);             /* sleep until an event or backstop */
         if (g_sig_npend) return (u64)(s64)-EINTR;  /* guest signal: let it deliver */
     }
@@ -677,12 +683,15 @@ SYSDEF(waitid) {
         siginfo_t si;
         memset(&si, 0, sizeof si);
         int r = waitid(idtype, id, &si, options | WNOHANG);
+        int werr = errno;
         if (r == 0 && si.si_pid != 0) {
             if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
-        if (r < 0) return host_err();
+        /* Host ECHILD is not terminal while we trace a live non-child (see wait4). */
+        if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(wpid)))
+            return (u64)(s64)(-werr);
         if (options & WNOHANG) {           /* nothing ready: zeroed siginfo */
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;

@@ -86,6 +86,11 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data);
 int  ptrace_available(void);
 /* Has anyone in the session started tracing? Gates the wait polling path. */
 int  ptrace_any_trace(void);
+/* Does the caller currently trace a live task (optionally a specific wpid>0)?
+ * A tracer attached to a non-child via PTRACE_ATTACH/SEIZE has no host child,
+ * so a host wait4 ECHILD is not terminal while this is true: the tracee's stop
+ * or exit arrives through the registry, not the host wait. */
+int  ptrace_have_tracee(s32 wpid);
 /* Consume one ready ptrace-stop matching wpid (-1 = any). On success fills
  * *status (a WIFSTOPPED wait-status word) and *outpid, returns 1; else 0. */
 int  ptrace_collect(s32 wpid, int *status, s32 *outpid);

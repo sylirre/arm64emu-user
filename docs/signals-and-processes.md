@@ -213,6 +213,16 @@ the normal capture queue, so the guest keeps full use of it. `wait4` collects th
 stop from the registry (the tracee is not the tracer's host child), and the
 tracee's stop already sends the tracer a `SIGCHLD` (so gdb's async loop wakes).
 
+Because such a tracee is *not* the tracer's host child, the tracer's own host
+`wait4`/`waitid` returns `ECHILD`. The poll loop must not treat that as terminal:
+while it still has a live tracee (`ptrace_have_tracee`), it keeps polling the
+registry for the cooperative stop or synthetic exit, and only reports `ECHILD`
+once it has neither a host child nor a live tracee. (This is the `strace -p` /
+`gdb -p` case where tracer and tracee are siblings under a shell; a tracer that
+forked its own tracee never sees the host `ECHILD` because the tracee is its
+child, which is why it went unnoticed until an idle, deeply-blocked target — a
+backgrounded `sleep` — was attached.)
+
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
 exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can

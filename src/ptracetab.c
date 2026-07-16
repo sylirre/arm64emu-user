@@ -737,6 +737,19 @@ int ptrace_any_trace(void) {
     return g_tab && __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE);
 }
 
+int ptrace_have_tracee(s32 wpid) {
+    if (!g_tab) return 0;
+    s32 me = (s32)getpid();
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
+        if (wpid > 0 && wpid != e->tracee) continue;
+        return 1;
+    }
+    return 0;
+}
+
 void ptrace_wake_waiters(void) {
     if (!g_tab) return;
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
