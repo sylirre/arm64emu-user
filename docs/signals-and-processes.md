@@ -197,15 +197,37 @@ exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.
 
-**Implemented (the `strace` / `strace -f` + `gdb`-breakpoint surface):**
-`TRACEME`, `SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`,
-`TRACEEXEC`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
+**Attaching to a running process (`ATTACH`/`SEIZE`/`INTERRUPT`).** `strace -p`
+and `gdb -p` claim an *already-running* process that never called `TRACEME`. The
+tracer marks itself the tracer in that pid's registry link and must then make the
+running, untraced tracee stop and enter its service loop — without host ptrace.
+It does so with a **reserved-signal kick**: one high real-time signal
+(`PTRACE_KICKSIG`, not `SIGURG`, which Go uses) whose permanent host handler
+(`sig_kick_net`, mirroring the SIGSYS net) recognizes a tracer kick by a magic
+`sigqueue` value and — having no `SA_RESTART` — interrupts any blocked host
+syscall, setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick`
+adopts the pending attach (becomes a tracee; `ATTACH` also reports an initial
+`SIGSTOP`, `SEIZE` attaches silently) or, for `PTRACE_INTERRUPT`, reports the
+`PTRACE_EVENT_STOP`. A guest-directed signal of the same number is forwarded to
+the normal capture queue, so the guest keeps full use of it. `wait4` collects the
+stop from the registry (the tracee is not the tracer's host child), and the
+tracee's stop already sends the tracer a `SIGCHLD` (so gdb's async loop wakes).
+
+**Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
+(`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
+exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can
+read final registers/exit code before it is gone.
+
+**Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
+`gdb -p` surface):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`, `SETOPTIONS`
+(`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`, `TRACEEXEC`,
+`TRACEEXIT`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints), `GETSIGINFO`
 (including `si_addr` for faults), `GETEVENTMSG`, and the syscall / signal /
-synchronous-fault / execve / fork-clone stops above. Breakpoints work under both
-the interpreter and `--jit`. **Not yet implemented (planned):**
-`ATTACH`/`SEIZE`/`INTERRUPT` of an already-running process (`gdb -p <pid>`), the
-`PTRACE_EVENT_EXIT` (`TRACEEXIT`) pre-exit stop, and per-thread tracing of a
-multithreaded tracee. Those requests currently return `-EIO`/`-ESRCH` rather
+synchronous-fault / execve / fork-clone / attach / pre-exit stops above.
+Everything works under both the interpreter and `--jit`. **Not yet implemented
+(planned):** `PTRACE_LISTEN`, and per-thread tracing of a multithreaded tracee
+(the ptrace-self state is process-global, so attaching to a multithreaded process
+tracks its main thread). Unimplemented requests return `-EIO`/`-ESRCH` rather
 than misbehaving.

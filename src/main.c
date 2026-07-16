@@ -672,6 +672,9 @@ int main(int argc, char **argv) {
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */
     sig_install_sigsys_net();
+    /* Arm the ptrace attach stop-kick net (reserved RT signal) so a later
+     * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
+    sig_install_kick_net();
 
 #ifndef ANDROID_JNI
     // Suppress seccomp notice on Android JNI component builds.

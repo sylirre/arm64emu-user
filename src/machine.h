@@ -223,6 +223,7 @@ void sig_reset_for_exec(struct Machine *m);
 void sig_sync_host_mask(void);
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
+void sig_install_kick_net(void);
 
 /* elf.c: load `guest_path` (canonical guest path) into the address space and
  * prepare the initial stack. Returns 0 or -errno. */

@@ -168,6 +168,35 @@ void sig_install_sigsys_net(void) {
     sigaction(SIGSYS, &sa, NULL);
 }
 
+/* ---- ptrace attach stop-kick net ----
+ * A tracer that PTRACE_ATTACH/SEIZE/INTERRUPTs a running, untraced tracee has no
+ * host ptrace to stop it with. It instead sigqueue()s PTRACE_KICKSIG carrying
+ * PT_KICK_MAGIC; this handler (no SA_RESTART) interrupts any blocked host syscall
+ * and flags g_ptrace_kick, which ptrace_service_kick drains at the run-loop
+ * boundary to adopt the attach / enter the stop. g_sig_npend is reused as the
+ * fast-path exit lever so no per-instruction check is added. A guest-directed
+ * signal of the same number (any other si_code/value) is forwarded to the normal
+ * capture queue, so the guest keeps full use of the signal. The net owns
+ * PTRACE_KICKSIG for the process lifetime (sig_host_update skips it). */
+static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
+    if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_KICK_MAGIC) {
+        g_ptrace_kick = 1;
+        g_sig_npend = 1;            /* make the run loop exit its fast path */
+        jit_signal_interrupt();
+        return;
+    }
+    host_catcher(sig, si, uctx);    /* a guest-directed signal of this number */
+}
+
+void sig_install_kick_net(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sig_kick_net;
+    sa.sa_flags = SA_SIGINFO;                     /* deliberately no SA_RESTART */
+    sigfillset(&sa.sa_mask);
+    sigaction(PTRACE_KICKSIG, &sa, NULL);
+}
+
 /* Mirror the guest block-state of the terminal job-control signals to the host
  * process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
  * kernel* (tcsetpgrp, background terminal I/O) and would stop our process
@@ -196,6 +225,9 @@ void sig_host_update(struct Machine *m, int sig) {
     if (sig == SIGSYS) return;                   /* owned by the SIGSYS net; guest
                                                     dispositions are honored via
                                                     the capture queue */
+    if (sig == PTRACE_KICKSIG) return;           /* owned by the ptrace kick net;
+                                                    guest dispositions honored via
+                                                    the capture queue (sig_kick_net) */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;

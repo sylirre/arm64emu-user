@@ -10,6 +10,8 @@
 #ifndef A64_PTRACE_H
 #define A64_PTRACE_H
 
+#include <signal.h>
+
 #include "cpu.h"
 
 /* Fast process-local gates. Zero cost when this process is not a tracee: the
@@ -18,6 +20,16 @@ extern int g_ptrace_active;         /* this process is a ptrace tracee */
 extern int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PTRACE_SYSCALL) */
 extern int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
 extern int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
+/* Set by the reserved-signal kick handler (a tracer's PTRACE_ATTACH/SEIZE/
+ * INTERRUPT); serviced at the run-loop boundary by ptrace_service_kick. */
+extern __thread volatile sig_atomic_t g_ptrace_kick;
+
+/* Host signal reserved for the attach stop-kick (a high RT signal the emulator
+ * never uses; NOT SIGURG, which Go uses for preemption). A tracer sends it with
+ * sigqueue() carrying PT_KICK_MAGIC so the handler can tell it apart from a
+ * guest-directed signal of the same number (which it forwards). */
+#define PTRACE_KICKSIG   SIGRTMAX
+#define PT_KICK_MAGIC    0x50544b21   /* "PTK!" */
 
 /* main(): create the shared link registry (before the first fork). */
 void ptrace_init(void);
@@ -56,6 +68,14 @@ int  ptrace_selfstop(int sig);
  * child, publish a synthetic exit for its tracer). wstatus is the wait-status
  * word to report: (code & 0xff) << 8 for exit(code), or the signal for a death. */
 void ptrace_report_exit(CPU *c, int wstatus);
+/* Pre-exit stop (PTRACE_O_TRACEEXIT): a PTRACE_EVENT_EXIT stop reported with the
+ * pending exit-status word in GETEVENTMSG, before the process actually exits.
+ * No-op unless traced with TRACEEXIT set. */
+void ptrace_report_exit_stop(CPU *c, int wstatus);
+/* Run-loop boundary: adopt a pending PTRACE_ATTACH/SEIZE (become a tracee and, for
+ * ATTACH, stop with SIGSTOP) or service a pending PTRACE_INTERRUPT (EVENT_STOP).
+ * Called when g_ptrace_kick is set. */
+void ptrace_service_kick(CPU *c);
 
 /* ---- Guest ptrace(2) entry (tracer side + TRACEME) ---- */
 /* Handle a guest ptrace(request, pid, addr, data); returns the guest x0. */

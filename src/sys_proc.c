@@ -28,6 +28,7 @@ SYSDEF(exit) {
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
      * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
     if (g_tls.tid != getpid()) { c->stop = true; return 0; }
+    ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
     ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
@@ -37,6 +38,7 @@ SYSDEF(exit) {
 
 SYSDEF(exit_group) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
     ptrace_report_exit(c, ((int)a0 & 0xff) << 8);   /* WIFEXITED status */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */

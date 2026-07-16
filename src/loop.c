@@ -44,6 +44,7 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
                 "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
                 sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
+    ptrace_report_exit_stop(c, sig & 0x7f);   /* PTRACE_EVENT_EXIT (TRACEEXIT) */
     ptrace_report_exit(c, sig & 0x7f);   /* WIFSIGNALED status for our tracer */
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     ptrace_wake_waiters();               /* wake a parent polling in wait4 */
@@ -133,6 +134,11 @@ int emu_loop(CPU *c) {
 
         /* Deliver any host-caught guest signal at this safe boundary. */
         if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
+
+        /* Adopt a pending PTRACE_ATTACH/SEIZE or service a PTRACE_INTERRUPT
+         * (the kick signal set g_ptrace_kick and reused g_sig_npend to exit the
+         * fast path above). Near-always-zero, like the signal check. */
+        if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
 
         /* PTRACE_SINGLESTEP: trap after exactly one stepped instruction. Gated
          * on `stepped` so arming single-step from within a stop (which resumes

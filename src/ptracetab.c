@@ -48,6 +48,8 @@ int g_ptrace_singlestep;
  * at a syscall-entry stop) is not reported and does not desync the tracer's
  * entry/exit pairing. */
 int g_ptrace_skip_syscall_stop;
+/* Set by the reserved-signal kick handler; drained by ptrace_service_kick. */
+__thread volatile sig_atomic_t g_ptrace_kick;
 
 /* ---- shared registry ---- */
 #define PTRACE_MAX  256      /* max concurrent tracees in the session */
@@ -80,6 +82,9 @@ typedef struct {
     u32 stop_sig;        /* WSTOPSIG of the current stop */
     u32 event;           /* PTRACE_EVENT_* of the current stop (0 = none) */
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
+    u32 attach_pending;  /* tracer ATTACH/SEIZE'd us: adopt at the next boundary */
+    u32 interrupt_pending; /* tracer PTRACE_INTERRUPT'd us: stop at the next boundary */
+    u32 seize;           /* attached via SEIZE (no initial SIGSTOP; group stops) */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
@@ -389,6 +394,41 @@ void ptrace_report_singlestep(CPU *c) {
     pt_stop(c, SIGTRAP, 0, 0, 0, 0);
 }
 
+void ptrace_report_exit_stop(CPU *c, int wstatus) {
+    if (!g_ptrace_active || !g_self_link) return;
+    if (!(g_self_link->options & G_PTRACE_O_TRACEEXIT)) return;
+    /* PTRACE_EVENT_EXIT: park before actually exiting, exposing the pending
+     * wait-status word via PTRACE_GETEVENTMSG so the tracer can read final
+     * registers/exit code. On resume the caller proceeds to the real exit. */
+    g_self_link->eventmsg = (u64)(u32)wstatus;
+    pt_stop(c, SIGTRAP, G_PTRACE_EVENT_EXIT, 0, 0, 0);
+}
+
+/* Run-loop boundary: a tracer PTRACE_ATTACH/SEIZE/INTERRUPT'd us via the kick
+ * signal. Adopt the pending attach (become a tracee; ATTACH also stops with
+ * SIGSTOP, SEIZE just attaches) or service a pending interrupt (EVENT_STOP). */
+void ptrace_service_kick(CPU *c) {
+    g_ptrace_kick = 0;
+    if (!g_tab) return;
+    if (!g_ptrace_active) {
+        PtLink *e = pt_find((s32)getpid());
+        if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
+            !__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE))
+            return;
+        __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
+        g_self_link = e;
+        g_ptrace_active = 1;
+        if (!e->seize) { pt_stop(c, SIGSTOP, 0, 0, 0, 0); return; }  /* ATTACH */
+        /* SEIZE: attached without a stop; fall through in case an INTERRUPT
+         * kick coalesced with this attach kick into one g_ptrace_kick. */
+    }
+    if (g_self_link &&
+        __atomic_load_n(&g_self_link->interrupt_pending, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_self_link->interrupt_pending, 0, __ATOMIC_RELEASE);
+        pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+    }
+}
+
 int ptrace_selfstop(int sig) {
     if (!g_ptrace_active) return 0;
     if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
@@ -505,15 +545,53 @@ static void pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
     }
 }
 
+/* Kick a running tracee to a stop point: sigqueue the reserved signal carrying
+ * the magic so its sig_kick_net tells it apart from a guest signal. */
+static void pt_send_kick(s32 pid) {
+    union sigval v;
+    v.sival_int = PT_KICK_MAGIC;
+    sigqueue(pid, PTRACE_KICKSIG, v);
+}
+
 /* ---- tracer: guest ptrace(2) dispatch ---- */
 long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     if (req == G_PTRACE_TRACEME)
         return ptrace_traceme();
     if (!g_tab) return -EPERM;
 
+    /* Attach to an already-running process: claim its link, mark ourselves the
+     * tracer, and kick it to adopt the attach at its next run-loop boundary. */
+    if (req == G_PTRACE_ATTACH || req == G_PTRACE_SEIZE) {
+        if (pid <= 0 || pid == (s32)getpid()) return -EPERM;
+        if (!proctab_has(pid)) return -ESRCH;   /* not a live guest process */
+        PtLink *e = pt_claim(pid);
+        if (!e) return -ENOMEM;
+        s32 zero = 0;
+        if (!__atomic_compare_exchange_n(&e->tracer, &zero, (s32)getpid(), false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return -EPERM;                       /* already traced by someone */
+        e->seize = (req == G_PTRACE_SEIZE);
+        __atomic_store_n(&e->options,
+                         e->seize ? ((u32)data & G_PTRACE_O_MASK) : 0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);  /* our wait4 polls */
+        pt_send_kick(pid);
+        return 0;
+    }
+
     PtLink *e = pt_find(pid);
     if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getpid())
         return -ESRCH;
+
+    /* Stop a SEIZE'd (or otherwise running) tracee on demand. */
+    if (req == G_PTRACE_INTERRUPT) {
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
+            return 0;                            /* already stopped */
+        __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
+        pt_send_kick(pid);
+        return 0;
+    }
 
     /* Requests serviceable without a mailbox round-trip. */
     switch (req) {
