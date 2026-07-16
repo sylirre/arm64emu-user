@@ -137,6 +137,11 @@ requests about itself**, the same way it already mediates every other syscall:
   entry (including `-1` to cancel), or the return value at exit.
 - *signal-delivery* stop in `sig_deliver_pending` (`src/signal.c`): the tracer
   sees `WSTOPSIG == sig` and may suppress it (`data = 0`) or substitute another.
+  A traced process that stops *itself* with a stop signal —
+  `kill(getpid(), SIGSTOP)`, as strace's child does to synchronize before it
+  execs — is intercepted at the send site (`sys_sig.c`, `ptrace_selfstop`) and
+  routed through this cooperative stop instead of a real host job-control stop,
+  which would freeze the tracee so it could no longer serve its ptrace mailbox.
 - *execve* stop after the new image is loaded but before its first instruction
   (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer.
 

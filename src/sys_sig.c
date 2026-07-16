@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "sys.h"
+#include "ptrace.h"
 
 #define GSIG_DFL 0
 #define GSIG_IGN 1
@@ -134,6 +135,11 @@ SYSDEF(sigaltstack) {
 }
 
 SYSDEF(kill) {
+    /* A traced process stopping itself (kill(getpid(), SIGSTOP), as strace's
+     * child does to synchronize) must ptrace-stop cooperatively, not real-stop
+     * at the host. */
+    if ((a0 == (u64)getpid() || a0 == 0) && ptrace_selfstop((int)a1))
+        return 0;
     return kill((pid_t)(s32)a0, (int)a1) < 0 ? host_err() : 0;
 }
 
@@ -147,7 +153,10 @@ SYSDEF(tkill) {
     s32 tid = (s32)a0;
     if (tid <= 0) return (u64)(s64)-EINVAL;
     pid_t htid = tid_to_host(c->m, tid);
-    if (htid == 0) htid = (pid_t)syscall(SYS_gettid);
+    if (htid == 0) {   /* self: route a traced self-stop through ptrace */
+        if (ptrace_selfstop((int)a1)) return 0;
+        htid = (pid_t)syscall(SYS_gettid);
+    }
     return syscall(SYS_tkill, htid, (int)a1) < 0 ? host_err() : 0;
 }
 
@@ -162,7 +171,10 @@ SYSDEF(tgkill) {
     pid_t htid = (pid_t)tid;
     if (tgid == getpid()) {
         htid = tid_to_host(c->m, tid);
-        if (htid == 0) htid = (pid_t)syscall(SYS_gettid);
+        if (htid == 0) {   /* self thread: route a traced self-stop via ptrace */
+            if (ptrace_selfstop((int)a2)) return 0;
+            htid = (pid_t)syscall(SYS_gettid);
+        }
     }
     return syscall(SYS_tgkill, (pid_t)tgid, htid, (int)a2) < 0 ? host_err() : 0;
 }

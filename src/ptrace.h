@@ -35,6 +35,11 @@ void ptrace_report_exec(CPU *c);
 int  ptrace_report_signal(CPU *c, int sig);
 /* PTRACE_SINGLESTEP: report the SIGTRAP stop after one stepped instruction. */
 void ptrace_report_singlestep(CPU *c);
+/* If this process is traced and `sig` is a stop signal (SIGSTOP/SIGTSTP/...),
+ * queue it for a cooperative ptrace signal-delivery stop and return 1; else 0.
+ * The caller (a signal-send syscall) uses this only when the target is self —
+ * a real host stop would freeze the tracee's ptrace service loop. */
+int  ptrace_selfstop(int sig);
 /* Exit: release this process's tracee link. */
 void ptrace_report_exit(CPU *c);
 

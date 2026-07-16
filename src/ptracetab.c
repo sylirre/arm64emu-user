@@ -368,6 +368,17 @@ void ptrace_report_singlestep(CPU *c) {
     pt_stop(c, SIGTRAP, 0, 0);
 }
 
+int ptrace_selfstop(int sig) {
+    if (!g_ptrace_active) return 0;
+    if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
+        return 0;
+    /* Queue it for the cooperative signal-delivery stop instead of letting the
+     * host job-control-stop this process (which would freeze our service loop
+     * so the tracer's next request would deadlock). */
+    sig_raise_local(sig);
+    return 1;
+}
+
 void ptrace_report_exit(CPU *c) {
     (void)c;
     if (g_self_link) pt_free(g_self_link);

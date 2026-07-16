@@ -211,6 +211,9 @@ void sig_deliver_pending(CPU *c);
 int sig_pending_deliverable(struct Machine *m);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
+/* Queue a signal into this thread's capture ring for cooperative delivery
+ * (routes a traced process's self-directed stop signal through ptrace). */
+void sig_raise_local(int sig);
 /* rt_sigreturn implementation. */
 void sig_return(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */

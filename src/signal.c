@@ -78,6 +78,23 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     jit_signal_interrupt();   /* make generated code exit at its next entry */
 }
 
+/* Queue a signal into this thread's own capture ring as if the host had caught
+ * it, for cooperative delivery at the next run-loop boundary. Routes a traced
+ * process's self-directed stop signal (SIGSTOP/SIGTSTP/...) through ptrace's
+ * signal-delivery stop instead of a real host job-control stop, which would
+ * freeze the tracee so it could no longer serve its ptrace mailbox. */
+void sig_raise_local(int sig) {
+    int next = (sigq_head + 1) % SIGQ_LEN;
+    if (next == sigq_tail) return;   /* queue full: drop */
+    PendSig *p = &sigq[sigq_head];
+    memset(p, 0, sizeof *p);
+    p->signo = sig;
+    p->pid = (int)getpid();
+    sigq_head = next;
+    g_sig_npend = 1;
+    jit_signal_interrupt();
+}
+
 /* Signals delivered synchronously from the interpreter (never host-caught). */
 static int is_sync_sig(int sig) {
     return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE ||
