@@ -219,8 +219,8 @@ static void help(void) {
         {"-h, --help",  "Show this help and exit."},
         {"-v, --version", "Show version and exit."},
         {"    --strace", "Log guest syscalls to stderr."},
-        {"    --strace-full", "Like --strace, but decode pathname arguments to "
-                        "quoted strings."},
+        {"    --strace-full", "Like --strace, but decode arguments strace-style: "
+                        "symbolic flags, quoted strings, structs, errno returns."},
         {"-d, --debug", "Per-instruction trace. Very verbose, disables JIT."},
         {"-j, --jit",   "Translate hot basic blocks to native code on AArch64 and "
                         "x86-64 hosts. Falls back to the interpreter elsewhere."},

@@ -19,7 +19,7 @@ CORE := src/core/cpu.c src/core/decode.c src/core/exec_fpsimd.c src/core/sysreg.
 # is host-independent and -m32 builds get the interpreter-only stub for free.
 JIT  := src/jit/jit.c src/jit/frontend.c src/jit/backend_x86_64.c src/jit/backend_a64.c
 SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/elf.c src/path.c \
-        src/signal.c src/syscall.c src/sys_file.c src/sys_mm.c src/sys_proc.c \
+        src/signal.c src/syscall.c src/strace.c src/sys_file.c src/sys_mm.c src/sys_proc.c \
         src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/sys_netlink.c \
         src/sys_procfs.c src/proctab.c src/main.c
 

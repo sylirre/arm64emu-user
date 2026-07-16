@@ -24,12 +24,19 @@ probes them and falls back, so ENOSYS is the correct emulated answer, not a stub
 
 The `--strace` flag prints one line per syscall in a qemu-compatible format; it is
 the primary bring-up instrument (diff against `qemu-aarch64 -strace`). `--strace-full`
-is the same trace but decodes pathname arguments (of `openat`, `execve`, the `*at`
-family, `statfs`, the `*xattr` calls, …) into quoted strings — plain `--strace`
-stays byte-identical so it remains diffable. The path-argument positions live in a
-small `path_arg_mask[]` table beside the dispatch table in `src/syscall.c`; each
-string is snapshotted *before* the handler runs so `execve` still shows its program
-path after the address space is replaced.
+is a human-readable, strace-style rendering of the same calls: symbolic flags
+(`O_RDONLY|O_CLOEXEC`, `PROT_READ|PROT_WRITE`, `MAP_PRIVATE|MAP_ANONYMOUS`, `AT_FDCWD`,
+signals, `SEEK_*`, `AF_*`, …), quoted strings, `execve` argv/envp arrays, errno-named
+returns (`-1 ENOENT (No such file or directory)`), and `{field=…}` pretty-printing of
+the common structs (`stat`, `timespec`, `timeval`, `rlimit`, `utsname`, `sockaddr`).
+Plain `--strace` stays byte-identical so it remains diffable.
+
+The decoder lives in `src/strace.c`: a per-syscall argument-type table drives a set of
+small formatters, and input strings/arrays are snapshotted *before* the handler runs so
+`execve` still shows its program path and argv after the address space is replaced.
+Kernel-output structs are only decoded on success (a failed call prints the raw
+pointer, since the buffer was not written). Any argument a syscall's descriptor does
+not cover falls back to hex, so coverage grows one table row at a time.
 
 ## Struct marshalling: always convert
 

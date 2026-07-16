@@ -44,6 +44,7 @@ src/
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver, process-shared bind table (mount/umount), /proc & /dev special cases
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
+  strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads)
@@ -125,6 +126,7 @@ Acceptance criteria:
 Command line options:
 
 * `--strace`: log every guest system call in format `PID name(nr,a0..a5) = ret`, also does a full register dump when the guest dies from a fatal signal.
+* `--strace-full`: the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/strace.c`). Plain `--strace` stays byte-identical for qemu-diffing.
 * `--debug`: per-instruction trace in format `<pc>: <insn-word>  [elN nzcv=....]`, disables JIT.
 * `--no-predecode`: disable decoded-instruction cache, use it to decide whether a bug lives in the predecode fast path or the real decoder.
 

@@ -57,8 +57,8 @@ arm64chroot [options] <rootfs> <program> [args...]
   -h, --help              Show this help (options + environment variables)
   -v, --version           Show version and exit
       --strace            Log guest syscalls to stderr
-      --strace-full       Like --strace, but decode pathname arguments to
-                          quoted strings
+      --strace-full       Like --strace, but decode arguments strace-style
+                          (symbolic flags, quoted strings, structs, errno)
   -d, --debug             Per-instruction trace (very verbose)
   -j, --jit               Translate hot basic blocks to native code (AArch64 /
                           x86-64 hosts; falls back to the interpreter elsewhere)
@@ -260,6 +260,7 @@ src/
   path.c        rootfs containment resolver, process-shared bind table
                 (runtime mount/umount), /proc & /dev special cases
   syscall.c sys_*.c   dispatcher + per-area handlers (~190 syscalls)
+  strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn
