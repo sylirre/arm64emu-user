@@ -536,6 +536,28 @@ else
     echo "SKIP seccomp-mimic (needs LP64 build, host cc, seccomp)"
 fi
 
+# ---- guest ptrace(2): tracer<->tracee syscall/signal stops, GETREGSET,
+# SETREGSET, PEEK/POKE round-trip and signal suppression/injection
+# (self-checking; qemu-user's ptrace emulation is too incomplete to be the
+# differential oracle). Each test prints "OK"; run under both engines. ----
+for pt in tests/ptrace/*.c; do
+    [ -e "$pt" ] || continue
+    ptbin="${pt%.c}.bin"
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" 2>/dev/null; then
+        echo "SKIP build $pt"; continue
+    fi
+    for eng in "" "--jit"; do
+        lbl="ptrace: $(basename "$pt" .c)${eng:+ (jit)}"
+        out=$(timeout 30 "$EMU" $eng / "$ptbin" 2>/dev/null); rc=$?
+        if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
+            pass=$((pass+1)); echo "PASS $lbl"
+        else
+            fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$out')"
+        fi
+    done
+    rm -f "$ptbin"
+done
+
 echo
 echo "== $pass passed, $fail failed =="
 exit $((fail > 0))

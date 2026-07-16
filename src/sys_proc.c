@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <stdlib.h>
@@ -20,20 +21,25 @@
 
 #include "sys.h"
 #include "jit.h"
+#include "ptrace.h"
 
 SYSDEF(exit) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
      * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. */
     if (g_tls.tid != getpid()) { c->stop = true; return 0; }
+    ptrace_report_exit(c);      /* release our tracee link, if traced */
     proctab_unregister((s32)getpid());
+    ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
     _exit((int)a0);
 }
 
 SYSDEF(exit_group) {
-    (void)c; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    ptrace_report_exit(c);      /* release our tracee link, if traced */
     proctab_unregister((s32)getpid());
+    ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
     _exit((int)a0);   /* terminates the whole process (all threads) */
 }
@@ -264,6 +270,7 @@ SYSDEF(clone) {
          * table describes host threads of the parent. */
         memset(m->gtid, 0, sizeof m->gtid);
         jit_fork_child();                 /* same discipline for the JIT state */
+        ptrace_fork_child();              /* a fork is not traced (no TRACEFORK yet) */
         /* A plain fork does not re-run load_elf, so publish the child (with the
          * inherited cmdline/exe/cwd/environ and its own fresh starttime) or it
          * would be invisible in the hidden /proc view until it execve'd. */
@@ -444,6 +451,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             if (fl > 0 && (fl & 1 /*FD_CLOEXEC*/)) close(fd);
         }
     }
+    /* A traced process reports a stop after execve (with the new image live but
+     * before its first instruction), so the tracer can re-arm. No-op on the
+     * initial exec / untraced processes. */
+    ptrace_report_exec(c);
     return 0;   /* execution continues at the new entry */
 }
 
@@ -528,43 +539,134 @@ static void rusage_out(GRusage *g, const struct rusage *h) {
 }
 
 SYSDEF(wait4) {
-    int status;
-    struct rusage ru;
-    pid_t pid = wait4((pid_t)(s32)a0, &status, (int)a2, a3 ? &ru : NULL);
-    if (pid < 0) return host_err();
-    if (a1) {
-        s32 gs = status;
-        if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+    pid_t wpid = (pid_t)(s32)a0;
+    int options = (int)a2;
+
+    /* No registry (ptrace impossible this session): the original blocking
+     * host wait4 pass-through, unchanged. */
+    if (!ptrace_available()) {
+        int status;
+        struct rusage ru;
+        pid_t pid = wait4(wpid, &status, options, a3 ? &ru : NULL);
+        if (pid < 0) return host_err();
+        if (a1) {
+            s32 gs = status;
+            if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+        }
+        if (a3 && pid > 0) {
+            GRusage g;
+            rusage_out(&g, &ru);
+            if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        }
+        return (u64)pid;
     }
-    if (a3 && pid > 0) {
-        GRusage g;
-        rusage_out(&g, &ru);
-        if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+
+    /* Registry present: poll, because a cooperative ptrace-stop is not a
+     * host-visible child state change, and a tracee may register at any moment
+     * (closing the PTRACE_TRACEME/wait race — this loop re-checks every pass).
+     * The blocking primitive is the global-generation futex, bumped by every
+     * stop and every guest exit; a short backstop covers uncooperative deaths
+     * (a host SIGKILL runs no guest code to bump the generation). Normal exits
+     * wake the waiter immediately via ptrace_wake_waiters(), so untraced
+     * fork/wait workloads keep their latency. */
+    for (;;) {
+        int st;
+        s32 rp;
+        if (ptrace_any_trace() && ptrace_collect((s32)wpid, &st, &rp)) {
+            if (a1) {
+                s32 gs = st;
+                if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)(u32)rp;   /* ptrace-stops carry no rusage */
+        }
+        int status;
+        struct rusage ru;
+        pid_t pid = wait4(wpid, &status, options | WNOHANG, a3 ? &ru : NULL);
+        if (pid > 0) {
+            if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
+            if (a1) {
+                s32 gs = status;
+                if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+            }
+            if (a3) {
+                GRusage g;
+                rusage_out(&g, &ru);
+                if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)pid;
+        }
+        if (pid < 0) return host_err();      /* ECHILD: no children remain */
+        if (options & WNOHANG) return 0;     /* children exist, none ready yet */
+        ptrace_tracer_wait(100);             /* sleep until an event or backstop */
+        if (g_sig_npend) return (u64)(s64)-EINTR;  /* guest signal: let it deliver */
     }
-    return (u64)pid;
+}
+
+/* Fill a 128-byte guest siginfo (LP64 _sigchld layout) from a host siginfo. */
+static int waitid_out(CPU *c, u64 infop, const siginfo_t *si) {
+    if (!infop) return 0;
+    u8 gsi[128];
+    memset(gsi, 0, sizeof gsi);
+    s32 *w = (s32 *)gsi;
+    w[0] = si->si_signo;                 /* si_signo @0 */
+    w[2] = si->si_code;                  /* si_code   @8 */
+    w[4] = (s32)si->si_pid;              /* si_pid    @16 */
+    w[5] = (s32)si->si_uid;              /* si_uid    @20 */
+    w[6] = si->si_status;                /* si_status @24 */
+    return copy_to_guest(c, infop, gsi, sizeof gsi) < 0 ? -EFAULT : 0;
 }
 
 SYSDEF(waitid) {
-    siginfo_t si;
-    memset(&si, 0, sizeof si);
-    int r = waitid((idtype_t)a0, (id_t)a1, &si, (int)a3);
-    if (r < 0) return host_err();
-    if (a2) {
-        /* guest siginfo: 128 bytes; fill the wait-relevant fields (LP64). */
-        u8 gsi[128];
-        memset(gsi, 0, sizeof gsi);
-        s32 *w = (s32 *)gsi;
-        w[0] = si.si_signo;
-        w[1] = 0;
-        w[2] = si.si_code;
-        /* _sifields._sigchld: pid, uid, status (offset 16 on LP64) */
-        w[4] = (s32)si.si_pid;
-        w[5] = (s32)si.si_uid;
-        w[6] = si.si_status;
-        if (copy_to_guest(c, a2, gsi, sizeof gsi) < 0) return (u64)(s64)-EFAULT;
-    }
+    idtype_t idtype = (idtype_t)a0;
+    id_t id = (id_t)a1;
+    u64 infop = a2;
+    int options = (int)a3;
     (void)a4; (void)a5;
-    return 0;
+
+    /* No registry: the original host waitid pass-through. */
+    if (!ptrace_available()) {
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        int r = waitid(idtype, id, &si, options);
+        if (r < 0) return host_err();
+        int e = waitid_out(c, infop, &si);
+        return e ? (u64)(s64)e : 0;
+    }
+
+    /* Registry present: poll, like wait4 (a cooperative ptrace-stop is not a
+     * host-visible child state change). A ptrace stop is reported as a
+     * CLD_TRAPPED SIGCHLD siginfo, matching the kernel's waitid view. */
+    s32 wpid = (idtype == P_PID) ? (s32)id : -1;   /* P_ALL/P_PGID: best-effort any */
+    for (;;) {
+        int st;
+        s32 rp;
+        if (ptrace_any_trace() && (options & WSTOPPED) &&
+            ptrace_collect(wpid, &st, &rp)) {
+            siginfo_t si;
+            memset(&si, 0, sizeof si);
+            si.si_signo = SIGCHLD;
+            si.si_code = CLD_TRAPPED;
+            si.si_pid = rp;
+            si.si_status = (st >> 8) & 0xff;   /* WSTOPSIG */
+            int e = waitid_out(c, infop, &si);
+            return e ? (u64)(s64)e : 0;
+        }
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        int r = waitid(idtype, id, &si, options | WNOHANG);
+        if (r == 0 && si.si_pid != 0) {
+            if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
+            int e = waitid_out(c, infop, &si);
+            return e ? (u64)(s64)e : 0;
+        }
+        if (r < 0) return host_err();
+        if (options & WNOHANG) {           /* nothing ready: zeroed siginfo */
+            int e = waitid_out(c, infop, &si);
+            return e ? (u64)(s64)e : 0;
+        }
+        ptrace_tracer_wait(100);
+        if (g_sig_npend) return (u64)(s64)-EINTR;
+    }
 }
 
 SYSDEF(setpgid) { return setpgid((pid_t)(s32)a0, (pid_t)(s32)a1) < 0 ? host_err() : 0; }

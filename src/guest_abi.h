@@ -443,4 +443,73 @@ typedef struct {
 #define G_MNT_EXPIRE      0x4
 #define G_UMOUNT_NOFOLLOW 0x8
 
+/* ---- ptrace(2) ABI (sys_ptrace.c / ptracetab.c) ---- */
+
+/* Requests. arm64 has no legacy PTRACE_GETREGS/GETFPREGS: the register file is
+ * read/written only through GETREGSET/SETREGSET with an NT_* note type. */
+#define G_PTRACE_TRACEME       0
+#define G_PTRACE_PEEKTEXT      1
+#define G_PTRACE_PEEKDATA      2
+#define G_PTRACE_PEEKUSR       3
+#define G_PTRACE_POKETEXT      4
+#define G_PTRACE_POKEDATA      5
+#define G_PTRACE_POKEUSR       6
+#define G_PTRACE_CONT          7
+#define G_PTRACE_KILL          8
+#define G_PTRACE_SINGLESTEP    9
+#define G_PTRACE_ATTACH        16
+#define G_PTRACE_DETACH        17
+#define G_PTRACE_SYSCALL       24
+#define G_PTRACE_SETOPTIONS    0x4200
+#define G_PTRACE_GETEVENTMSG   0x4201
+#define G_PTRACE_GETSIGINFO    0x4202
+#define G_PTRACE_SETSIGINFO    0x4203
+#define G_PTRACE_GETREGSET     0x4204
+#define G_PTRACE_SETREGSET     0x4205
+#define G_PTRACE_SEIZE         0x4206
+#define G_PTRACE_INTERRUPT     0x4207
+#define G_PTRACE_LISTEN        0x4208
+
+/* SETOPTIONS bits. */
+#define G_PTRACE_O_TRACESYSGOOD   0x00000001
+#define G_PTRACE_O_TRACEFORK      0x00000002
+#define G_PTRACE_O_TRACEVFORK     0x00000004
+#define G_PTRACE_O_TRACECLONE     0x00000008
+#define G_PTRACE_O_TRACEEXEC      0x00000010
+#define G_PTRACE_O_TRACEVFORKDONE 0x00000020
+#define G_PTRACE_O_TRACEEXIT      0x00000040
+#define G_PTRACE_O_EXITKILL       0x00000100
+#define G_PTRACE_O_MASK           0x000003ff
+
+/* Event codes reported in status bits [15:8] of a WIFSTOPPED status. */
+#define G_PTRACE_EVENT_FORK        1
+#define G_PTRACE_EVENT_VFORK       2
+#define G_PTRACE_EVENT_CLONE       3
+#define G_PTRACE_EVENT_EXEC        4
+#define G_PTRACE_EVENT_VFORK_DONE  5
+#define G_PTRACE_EVENT_EXIT        6
+#define G_PTRACE_EVENT_STOP        128
+
+/* regset note types (linux/elf.h). */
+#define G_NT_PRSTATUS        1
+#define G_NT_PRFPREG         2
+#define G_NT_ARM_TLS         0x401
+#define G_NT_ARM_SYSTEM_CALL 0x404
+
+/* NT_PRSTATUS payload for arm64: struct user_pt_regs (34 * 8 = 272 bytes). */
+typedef struct {
+    u64 regs[31];
+    u64 sp;
+    u64 pc;
+    u64 pstate;
+} GUserRegs;
+
+/* NT_PRFPREG payload for arm64: struct user_fpsimd_state (528 bytes). */
+typedef struct {
+    V128 vregs[32];
+    u32  fpsr;
+    u32  fpcr;
+    u32  __reserved[2];
+} GUserFpsimd;
+
 #endif /* A64_GUEST_ABI_H */

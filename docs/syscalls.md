@@ -79,8 +79,11 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
 
 ## Rootfs path containment (`src/path.c`)
 
-Because the emulator sees every syscall, containment needs no `ptrace` (unlike
-proot) and no privilege (unlike `chroot(2)`). `path_resolve` walks the guest path
+Because the emulator sees every syscall, containment needs no host `ptrace`
+(unlike proot) and no privilege (unlike `chroot(2)`). (The emulator does
+*emulate* guest `ptrace(2)` so in-rootfs `strace`/`gdb` work — see
+`docs/signals-and-processes.md` — but that is a guest-facing feature, not part of
+containment.) `path_resolve` walks the guest path
 **component by component**, resolving each against `rootfs + sofar`:
 
 - an absolute symlink target restarts the walk at the guest root;

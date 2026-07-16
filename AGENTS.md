@@ -54,7 +54,9 @@ src/
   sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style fallback when host denies netlink)
   sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
   sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, ...)
+  sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)
   proctab.c                          Shared-memory guest-PID registry (cross-process ps/top view)
+  ptracetab.c ptrace.h               Cross-process ptrace(2): shared tracer<->tracee link registry + futex mailbox (tracee services PEEK/POKE/GETREGSET/CONT about itself while parked at a stop)
   signal.c                           Host capture -> guest rt_sigframe / rt_sigreturn
   machine.h thread.h                 Per-process shared Machine state + per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h                        ARM64 syscall numbers + explicit guest struct layouts

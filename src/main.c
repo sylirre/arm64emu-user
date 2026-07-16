@@ -23,6 +23,7 @@
 #include "thread.h"
 #include "jit.h"
 #include "guest_abi.h"
+#include "ptrace.h"
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
@@ -682,6 +683,10 @@ int main(int argc, char **argv) {
      * -shared-proc the registry is keyed by the rootfs so ps/top see the guest
      * processes of other emulator invocations of the same rootfs. */
     proctab_init(m->shared_proc ? m->rootfs : NULL);
+
+    /* ptrace(2) tracer<->tracee link registry: same discipline — created before
+     * the first fork so every guest process in the session maps it. */
+    ptrace_init();
 
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */

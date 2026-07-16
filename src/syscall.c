@@ -10,6 +10,7 @@
 
 #include "sys.h"
 #include "strace.h"
+#include "ptrace.h"
 
 /* sys_file.c */
 SYSDEF(openat); SYSDEF(close); SYSDEF(read); SYSDEF(write);
@@ -86,6 +87,9 @@ SYSDEF(sendmmsg); SYSDEF(recvmmsg);
 
 /* more sys_file.c / sys_misc.c */
 SYSDEF(fadvise64); SYSDEF(keyctl); SYSDEF(add_key); SYSDEF(request_key);
+
+/* sys_ptrace.c */
+SYSDEF(ptrace);
 
 static const struct {
     u16 nr;
@@ -203,6 +207,7 @@ static const struct {
     { G_NR_execveat, sys_execveat, "execveat" },
     { G_NR_wait4, sys_wait4, "wait4" },
     { G_NR_waitid, sys_waitid, "waitid" },
+    { G_NR_ptrace, sys_ptrace, "ptrace" },
     { G_NR_setpgid, sys_setpgid, "setpgid" },
     { G_NR_getpgid, sys_getpgid, "getpgid" },
     { G_NR_setsid, sys_setsid, "setsid" },
@@ -326,7 +331,7 @@ static const u16 quiet_enosys[] = {
     /* clock setting */
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
-    G_NR_ptrace, G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
+    G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
     G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
@@ -372,7 +377,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
     { G_NR_process_mrelease, "process_mrelease" },
     { G_NR_process_vm_readv, "process_vm_readv" },
-    { G_NR_process_vm_writev, "process_vm_writev" }, { G_NR_ptrace, "ptrace" },
+    { G_NR_process_vm_writev, "process_vm_writev" },
     { G_NR_quotactl, "quotactl" }, { G_NR_reboot, "reboot" },
     { G_NR_remap_file_pages, "remap_file_pages" },
     { G_NR_restart_syscall, "restart_syscall" }, { G_NR_rseq, "rseq" },
@@ -408,6 +413,15 @@ void syscall_dispatch(CPU *c) {
     if (!initialized) { table_init(); initialized = 1; }
 
     struct Machine *m = c->m;
+
+    /* ptrace syscall-entry stop: a tracer that issued PTRACE_SYSCALL parks the
+     * tracee here and may rewrite the syscall number or arguments — or set the
+     * number to -1 to cancel the call — before it runs. Read the register file
+     * afterwards so those edits take effect. Gated on a near-always-zero int so
+     * the untraced hot path is unchanged. */
+    if (UNLIKELY(g_ptrace_syscall_armed))
+        ptrace_report_syscall(c, 0);
+
     u64 nr = c->x[8];
     u64 a0 = c->x[0], a1 = c->x[1], a2 = c->x[2],
         a3 = c->x[3], a4 = c->x[4], a5 = c->x[5];
@@ -426,7 +440,9 @@ void syscall_dispatch(CPU *c) {
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;
-    if (fn) {
+    if (nr == (u64)-1) {
+        ret = c->x[0];   /* tracer cancelled the syscall (nr := -1) */
+    } else if (fn) {
         ret = fn(c, a0, a1, a2, a3, a4, a5);
     } else {
         int quiet = 0;
@@ -445,6 +461,14 @@ void syscall_dispatch(CPU *c) {
 
     /* Note EINTR so a pending signal with SA_RESTART can rewind the SVC. */
     g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
+
+    /* ptrace syscall-exit stop: publish the result in x0 so the tracer's
+     * GETREGSET sees it, then let it inspect or override the return value. */
+    if (UNLIKELY(g_ptrace_syscall_armed)) {
+        c->x[0] = ret;
+        ptrace_report_syscall(c, 1);
+        ret = c->x[0];
+    }
 
     if (m->strace) {
         char namebuf[32];

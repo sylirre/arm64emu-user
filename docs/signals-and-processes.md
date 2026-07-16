@@ -107,3 +107,62 @@ One host thread per guest thread over the shared `Machine`/address space:
 `exit_group` terminates the whole process. `exit` from a spawned thread ends just
 that thread (returns from its `emu_loop`); from the main thread it ends the
 process.
+
+## ptrace(2) (`src/ptracetab.c`, `src/sys_ptrace.c`)
+
+The emulator emulates guest `ptrace(2)` so in-rootfs `strace` and `gdb` work,
+**without** using host `ptrace` (denied under Android SELinux/seccomp) and
+without sharing guest RAM.
+
+The obstacle is that a guest process is a separate host process (fork), so a
+guest tracer cannot reach a guest tracee's `CPU` register file or address space
+directly. The emulator resolves this by having the **tracee service ptrace
+requests about itself**, the same way it already mediates every other syscall:
+
+- A `MAP_SHARED` link registry (created before the first fork, mapped by every
+  guest process at the same address) holds one entry per tracee — keyed by
+  tracee pid — carrying the tracer/tracee relationship, the current stop state,
+  and a small **futex mailbox**.
+- When a tracee reaches a stop point it publishes the stop, wakes the tracer,
+  then **parks in a service loop**. There it answers `PEEK`/`POKE`/`GETREGSET`/
+  `SETREGSET`/`GETSIGINFO`/`CONT`/`SYSCALL`/`DETACH`/… using its own `CPU` and
+  `copy_{to,from}_guest`. A request while the tracee is *running* (not stopped)
+  fails `-ESRCH`, exactly as real ptrace requires.
+
+**Stop points** (only active when the process is traced — a near-always-zero
+`g_ptrace_*` int gates the hot paths):
+
+- *syscall-entry / syscall-exit* stops in `syscall_dispatch` (`src/syscall.c`)
+  when `PTRACE_SYSCALL`-armed. The tracer may rewrite the syscall number/args at
+  entry (including `-1` to cancel), or the return value at exit.
+- *signal-delivery* stop in `sig_deliver_pending` (`src/signal.c`): the tracer
+  sees `WSTOPSIG == sig` and may suppress it (`data = 0`) or substitute another.
+- *execve* stop after the new image is loaded but before its first instruction
+  (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer.
+
+**`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
+tracee is a running host process parked in its service loop), so once tracing is
+active `wait4` polls: it multiplexes ptrace-stops (from the registry) with real
+child exits (`waitpid(WNOHANG)`), blocking on a global-generation futex that
+every stop and every guest exit bumps. It synthesizes the status word —
+`WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall stops under
+`PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops. Processes that never trace
+keep the original blocking `wait4` pass-through.
+
+Registers marshal 1:1 between the flat `CPU` struct and arm64
+`user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
+`NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`). `PTRACE_SINGLESTEP` runs
+exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
+JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
+and signal stops work under `--jit` unchanged.
+
+**Implemented (the `strace` + basic-`gdb` surface):** `TRACEME`, `SETOPTIONS`
+(`TRACESYSGOOD`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
+`GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
+(writable pages), `GETSIGINFO`, `GETEVENTMSG`, and the syscall/signal/execve
+stops above. **Not yet implemented (planned):** software breakpoints
+(`POKETEXT` of a `BRK` into a read-only code page needs a permission-bypassing
+write plus predecode/JIT invalidation), `ATTACH`/`SEIZE`/`INTERRUPT` of an
+already-running process, the `PTRACE_EVENT_*` fork/clone/exec/exit event stops,
+and per-thread tracing of a multithreaded tracee. Those requests currently
+return `-EIO`/`-ESRCH` rather than misbehaving.

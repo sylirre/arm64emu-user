@@ -130,6 +130,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_exit,      { AT_INT }, 0 },
     { G_NR_exit_group,{ AT_INT }, 0 },
     { G_NR_clone,     { AT_HEX, AT_PTR, AT_PTR, AT_PTR, AT_PTR }, 0 },
+    { G_NR_ptrace,    { AT_INT, AT_INT, AT_HEX, AT_HEX }, 0 },
     { G_NR_wait4,     { AT_INT, AT_PTR, AT_HEX, AT_PTR }, 0 },
     { G_NR_kill,      { AT_INT, AT_SIG }, 0 },
     { G_NR_tkill,     { AT_INT, AT_SIG }, 0 },

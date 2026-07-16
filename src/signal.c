@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "machine.h"
+#include "ptrace.h"
 #include "guest_abi.h"
 #include "jit.h"
 
@@ -425,6 +426,15 @@ void sig_deliver_pending(CPU *c) {
             sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
         }
         if (sigq_tail == sigq_head) g_sig_npend = 0;
+
+        /* ptrace signal-delivery stop: the tracer sees WSTOPSIG==sig and may
+         * suppress it (return 0) or substitute another signal before it is
+         * dispositioned. SIGKILL is never interceptable. */
+        if (UNLIKELY(g_ptrace_active)) {
+            int ns = ptrace_report_signal(c, sig);
+            if (ns == 0) continue;              /* suppressed by the tracer */
+            if (ns != sig) { sig = ns; p.signo = ns; }
+        }
 
         u64 h = m->sigact[sig].handler;
         if (h == GSIG_IGN) continue;

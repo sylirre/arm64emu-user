@@ -263,6 +263,8 @@ src/
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view)
+  ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex
+                mailbox (tracee serves PEEK/POKE/GETREGSET/CONT while stopped)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn
   thread.h      per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h   arm64 syscall numbers + explicit guest struct layouts

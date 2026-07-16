@@ -21,7 +21,7 @@ JIT  := src/jit/jit.c src/jit/frontend.c src/jit/backend_x86_64.c src/jit/backen
 SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/elf.c src/path.c \
         src/signal.c src/syscall.c src/strace.c src/sys_file.c src/sys_mm.c src/sys_proc.c \
         src/sys_sig.c src/sys_time.c src/sys_misc.c src/sys_net.c src/sys_netlink.c \
-        src/sys_procfs.c src/proctab.c src/main.c
+        src/sys_procfs.c src/sys_ptrace.c src/proctab.c src/ptracetab.c src/main.c
 
 # ---- Incremental build -------------------------------------------------------
 # Each .c compiles to its own .o under build/<variant>/, and the compiler emits a
@@ -122,7 +122,7 @@ test-seccomp: arm64chroot
 clean:
 	rm -rf $(BUILDDIR)
 	rm -f arm64chroot arm64chroot32 arm64chroot_asim
-	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin tests/bench/*.bin
+	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin tests/bench/*.bin tests/ptrace/*.bin
 	rm -f tests/seccomp_emu.sh tests/jit_emu.sh
 
 # Separate from clean: removing the provisioned test rootfs forces a fresh

@@ -14,6 +14,7 @@
 #include "guest_abi.h"
 #include "predecode.h"
 #include "jit.h"
+#include "ptrace.h"
 
 /* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c hook):
  * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
@@ -43,7 +44,9 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
                 "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
                 sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
+    ptrace_report_exit(c);               /* release our tracee link, if traced */
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
+    ptrace_wake_waiters();               /* wake a parent polling in wait4 */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = SIG_DFL;
@@ -60,10 +63,16 @@ int emu_loop(CPU *c) {
     for (;;) {
         if (UNLIKELY(c->stop)) return 0;
 
+        int stepped = 0;
         if (UNLIKELY(g_debug_hooks)) {
             /* Full step: keeps every per-instruction debug facility
              * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */
             cpu_step(c);
+        } else if (UNLIKELY(g_ptrace_singlestep)) {
+            /* PTRACE_SINGLESTEP: exactly one instruction via the interpreter
+             * (never a JIT/predecode chunk), then a SIGTRAP stop below. */
+            cpu_step(c);
+            stepped = 1;
         } else if (UNLIKELY(g_jit)) {
             /* -jit: run translated blocks; same return contract as pd_run. */
             jit_run(c);
@@ -124,5 +133,11 @@ int emu_loop(CPU *c) {
 
         /* Deliver any host-caught guest signal at this safe boundary. */
         if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
+
+        /* PTRACE_SINGLESTEP: trap after exactly one stepped instruction. Gated
+         * on `stepped` so arming single-step from within a stop (which resumes
+         * mid-iteration) does not trap before an instruction has run. */
+        if (UNLIKELY(stepped) && g_ptrace_singlestep && !c->stop)
+            ptrace_report_singlestep(c);
     }
 }
