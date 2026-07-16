@@ -191,6 +191,11 @@ int  emu_loop(CPU *c);
 /* Deliver a fatal-by-default signal for a guest fault (M1: restore host
  * default disposition and re-raise so the exit status is correct). */
 void force_sig_fault(CPU *c, int sig, int code, u64 addr);
+/* Terminate the guest process by a default-fatal signal: report the WIFSIGNALED
+ * death to a tracer, drop the /proc slot, then restore the host default and
+ * re-raise so the real parent sees the same status. Does not return. Shared by
+ * the synchronous fault path (force_sig_fault) and the async delivery path. */
+void guest_terminate_by_signal(CPU *c, int sig);
 
 /* syscall.c */
 void syscall_dispatch(CPU *c);
@@ -204,6 +209,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
 extern __thread volatile sig_atomic_t g_sig_npend;
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
+/* Re-mirror every disposition (call when a process becomes / stops being a ptrace
+ * tracee): a tracee gets host catchers for default-terminate signals so its tracer
+ * sees the signal-delivery-stop and the WIFSIGNALED death. */
+void sig_trace_update_all(struct Machine *m);
 /* Deliver one deliverable queued signal, if any (called from the run loop). */
 void sig_deliver_pending(CPU *c);
 /* Would sig_deliver_pending act on this thread's queue right now?

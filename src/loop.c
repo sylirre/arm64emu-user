@@ -44,20 +44,10 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
                 "arm64chroot: guest fatal signal %d at pc=0x%llx addr=0x%llx\n",
                 sig, (unsigned long long)c->pc, (unsigned long long)addr);
     if (c->m->strace) cpu_dump(c);
-    ptrace_report_exit_stop(c, sig & 0x7f);   /* PTRACE_EVENT_EXIT (TRACEEXIT) */
-    ptrace_report_exit(c, sig & 0x7f);   /* WIFSIGNALED status for our tracer */
-    proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
-    ptrace_wake_waiters();               /* wake a parent polling in wait4 */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = SIG_DFL;
-    sigaction(sig, &sa, NULL);
-    sigset_t ss;
-    sigemptyset(&ss);
-    sigaddset(&ss, sig);
-    sigprocmask(SIG_UNBLOCK, &ss, NULL);
-    raise(sig);
-    _exit(128 + sig);
+    /* Report the WIFSIGNALED death to our tracer, drop the /proc slot, restore the
+     * host default and re-raise so the real parent sees the status. Shared with
+     * the async default-fatal delivery path (sig_deliver_pending). */
+    guest_terminate_by_signal(c, sig);
 }
 
 int emu_loop(CPU *c) {

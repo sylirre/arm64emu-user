@@ -235,6 +235,29 @@ forked its own tracee never sees the host `ECHILD` because the tracee is its
 child, which is why it went unnoticed until an idle, deeply-blocked target — a
 backgrounded `sleep` — was attached.)
 
+**Death of a tracee by signal.** A signal that terminates a traced process must
+report a `WIFSIGNALED` status to its tracer, but a bare host `SIG_DFL` kill runs no
+guest code, so nothing would update the registry and a sibling tracer's `wait4`
+poll (above) would hang. Two mechanisms close this:
+
+- *catchable signals* — when a process becomes a tracee, `sig_trace_update_all`
+  installs a host catcher for its default-terminate signals that were `SIG_DFL`
+  (`sig_host_update` picks this while `g_ptrace_active`). The signal is then
+  mediated: the tracee reports the signal-delivery-stop, the tracer injects it, and
+  the tracee terminates through `guest_terminate_by_signal` (`src/signal.c`) — which
+  publishes the `WIFSIGNALED` status to the tracer (the same shared exit path the
+  synchronous fatal-fault `force_sig_fault` uses), then restores the host default
+  and re-raises so the *real* parent sees the identical status. The five
+  interpreter-delivered synchronous fault signals are excluded (they still arrive
+  from `pend_exc`).
+- *`SIGKILL`* — uncatchable, so it cannot be mediated: the tracee is host-killed
+  directly and, if the tracer is a sibling, becomes a zombie its real parent has not
+  reaped (so `kill(pid,0)` still succeeds). The tracer's `wait4`/`waitid` poll backs
+  this with `ptrace_reap_dead`: it detects a live tracee whose host task is gone or
+  a zombie (`/proc/<pid>/stat` state) and synthesizes `WIFSIGNALED(SIGKILL)`. Since
+  every *catchable* fatal signal is mediated and reports its real status, a silent
+  death is a `SIGKILL`, so the synthesized signal is accurate.
+
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
 exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can

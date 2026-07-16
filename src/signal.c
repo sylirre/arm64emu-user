@@ -101,6 +101,23 @@ static int is_sync_sig(int sig) {
            sig == SIGTRAP;
 }
 
+/* Does `sig`'s default action terminate the process? Excludes the default-ignore
+ * (SIGCHLD/SIGURG/SIGWINCH), default-continue (SIGCONT) and default-stop signals,
+ * plus the uncatchable SIGKILL. Everything else defaults to terminate (with or
+ * without a core dump). Used to decide which SIG_DFL signals a tracee must catch
+ * (to report the death) and which reaching the delivery path must kill+report. */
+static int sig_default_terminates(int sig) {
+    switch (sig) {
+    case SIGCHLD: case SIGURG: case SIGWINCH:                /* ignore */
+    case SIGCONT:                                            /* continue */
+    case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:  /* stop */
+    case SIGKILL:                                            /* uncatchable */
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 /* ---- SIGSYS safety net ----
  *
  * Android 8+ filters every app process with a seccomp whitelist whose action
@@ -232,7 +249,19 @@ void sig_host_update(struct Machine *m, int sig) {
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;
     if (h == GSIG_DFL) {
-        sa.sa_handler = SIG_DFL;
+        /* A ptrace tracee must *catch* its default-terminate signals rather than
+         * let the host default (kill) apply: a bare host SIG_DFL kill runs no
+         * guest code, so the tracee never reports the signal-delivery-stop nor the
+         * WIFSIGNALED death, and a sibling tracer's wait4 poll would hang forever.
+         * Caught, the signal is queued and mediated at the run-loop boundary (the
+         * sync fault signals still arrive from the interpreter, so skip those). */
+        if (g_ptrace_active && !is_sync_sig(sig) && sig_default_terminates(sig)) {
+            sa.sa_sigaction = host_catcher;
+            sa.sa_flags = SA_SIGINFO;
+            sigfillset(&sa.sa_mask);
+        } else {
+            sa.sa_handler = SIG_DFL;
+        }
     } else if (h == GSIG_IGN) {
         sa.sa_handler = SIG_IGN;
     } else if (is_sync_sig(sig)) {
@@ -243,6 +272,14 @@ void sig_host_update(struct Machine *m, int sig) {
         sigfillset(&sa.sa_mask);
     }
     sigaction(sig, &sa, NULL);
+}
+
+/* Re-mirror every disposition. Called when a process becomes a ptrace tracee (so
+ * default-terminate signals gain a host catcher) or is detached (so they revert to
+ * SIG_DFL); sig_host_update reads g_ptrace_active to pick the right disposition. */
+void sig_trace_update_all(struct Machine *m) {
+    for (int s = 1; s <= 64; s++)
+        sig_host_update(m, s);
 }
 
 void sig_reset_for_exec(struct Machine *m) {
@@ -450,6 +487,29 @@ int sig_pending_deliverable(struct Machine *m) {
     return 0;
 }
 
+void guest_terminate_by_signal(CPU *c, int sig) {
+    /* Report the WIFSIGNALED death to our tracer (a no-op when untraced): the
+     * pre-exit PTRACE_EVENT_EXIT under TRACEEXIT, then the terminal status word.
+     * Without this a tracer that is not our host parent (strace -p / a followed
+     * child) never learns we died and its wait4 poll hangs. */
+    ptrace_report_exit_stop(c, sig & 0x7f);
+    ptrace_report_exit(c, sig & 0x7f);
+    proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
+    ptrace_wake_waiters();               /* wake a parent polling in wait4 */
+    /* Restore the host default and re-raise so the real parent also sees the same
+     * WIFSIGNALED status (the guest default action really is terminate). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, NULL);
+    sigset_t ss;
+    sigemptyset(&ss);
+    sigaddset(&ss, sig);
+    sigprocmask(SIG_UNBLOCK, &ss, NULL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
     while (sigq_tail != sigq_head) {
@@ -488,8 +548,14 @@ void sig_deliver_pending(CPU *c) {
         u64 h = m->sigact[sig].handler;
         if (h == GSIG_IGN) continue;
         if (h == GSIG_DFL) {
-            /* Host default disposition applies; only reachable in races
-             * (disposition changed after queueing). Re-raise. */
+            /* A default-terminate signal: kill the process and report the
+             * WIFSIGNALED death to our tracer first (does not return). A tracee
+             * reaches here after the tracer let the signal through the delivery
+             * stop above; an untraced process reaches it only in a rare race (a
+             * handler dropped to SIG_DFL after the signal was queued). */
+            if (sig_default_terminates(sig))
+                guest_terminate_by_signal(c, sig);
+            /* Default-ignore/continue disposition: let the host default apply. */
             struct sigaction sa;
             memset(&sa, 0, sizeof sa);
             sa.sa_handler = SIG_DFL;

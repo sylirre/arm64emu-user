@@ -625,6 +625,16 @@ SYSDEF(wait4) {
          * tracee remains; a real ECHILD (no children AND no tracees) still returns. */
         if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee((s32)wpid)))
             return (u64)(s64)(-werr);
+        /* A non-child tracee killed by an uncatchable SIGKILL vanishes at the host
+         * level with no registry event; detect its dead/zombie process and report
+         * the synthetic WIFSIGNALED(SIGKILL) so we do not poll forever. */
+        if (pid < 0 && werr == ECHILD && ptrace_reap_dead((s32)wpid, &st, &rp)) {
+            if (a1) {
+                s32 gs = st;
+                if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)(u32)rp;
+        }
         if (options & WNOHANG) return 0;     /* nothing ready yet */
         ptrace_tracer_wait(100);             /* sleep until an event or backstop */
         if (g_sig_npend) return (u64)(s64)-EINTR;  /* guest signal: let it deliver */
@@ -692,6 +702,19 @@ SYSDEF(waitid) {
         /* Host ECHILD is not terminal while we trace a live non-child (see wait4). */
         if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(wpid)))
             return (u64)(s64)(-werr);
+        /* Uncatchable SIGKILL of a non-child tracee: report the synthetic death as
+         * a CLD_KILLED SIGCHLD siginfo so waitid does not poll forever (see wait4). */
+        int dst, drp;
+        if (r < 0 && werr == ECHILD && ptrace_reap_dead(wpid, &dst, &drp)) {
+            siginfo_t ki;
+            memset(&ki, 0, sizeof ki);
+            ki.si_signo = SIGCHLD;
+            ki.si_code = CLD_KILLED;
+            ki.si_pid = drp;
+            ki.si_status = dst;        /* SIGKILL */
+            int e = waitid_out(c, infop, &ki);
+            return e ? (u64)(s64)e : 0;
+        }
         if (options & WNOHANG) {           /* nothing ready: zeroed siginfo */
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;

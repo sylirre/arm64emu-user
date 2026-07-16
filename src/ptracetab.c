@@ -26,9 +26,11 @@
  * This needs no host ptrace privilege (important on Android/SELinux/seccomp
  * where host ptrace is denied) and no shared guest RAM. */
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -435,6 +437,7 @@ void ptrace_service_kick(CPU *c) {
         __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
         g_self_link = e;
         g_ptrace_active = 1;
+        sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
         if (!e->seize) { pt_stop(c, SIGSTOP, 0, 0, 0, 0); return; }  /* ATTACH */
         /* SEIZE: attached without a stop; fall through in case an INTERRUPT
          * kick coalesced with this attach kick into one g_ptrace_kick. */
@@ -534,6 +537,7 @@ void ptrace_fork_child(CPU *c, int event) {
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
     g_ptrace_active = 1;
+    sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
     /* Initial attach stop (as a non-SEIZE auto-attached child stops with
      * SIGSTOP). The tracer sees it, (re)sets options and resumes us. */
     pt_stop(c, SIGSTOP, 0, 0, 0, 0);
@@ -544,7 +548,7 @@ void ptrace_fork_child(CPU *c, int event) {
 }
 
 /* ---- tracee: PTRACE_TRACEME ---- */
-static long ptrace_traceme(void) {
+static long ptrace_traceme(CPU *c) {
     if (!g_tab) return -EPERM;
     if (g_self_link) return -EPERM;   /* already traced */
     PtLink *e = pt_claim(getpid());
@@ -555,6 +559,7 @@ static long ptrace_traceme(void) {
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
     g_ptrace_active = 1;
+    sig_trace_update_all(c->m);   /* catch default-fatal signals to report them */
     return 0;
 }
 
@@ -630,7 +635,7 @@ int ptrace_signal_cont(s32 pid, int sig) {
 /* ---- tracer: guest ptrace(2) dispatch ---- */
 long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     if (req == G_PTRACE_TRACEME)
-        return ptrace_traceme();
+        return ptrace_traceme(c);
     if (!g_tab) return -EPERM;
 
     /* Attach to an already-running process: claim its link, mark ourselves the
@@ -851,6 +856,52 @@ int ptrace_have_tracee(s32 wpid) {
         if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
         if (wpid > 0 && wpid != e->tracee) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* Is host task `t` dead to a tracer -- its host process gone or a zombie? A tracee
+ * killed by an uncatchable SIGKILL runs no guest code, so it publishes no exit and
+ * leaves a zombie its real parent has not reaped (kill(t,0) still succeeds); the
+ * /proc state distinguishes a zombie from a live one. */
+static int pt_task_dead(s32 t) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)t);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 1;                       /* gone (already reaped) */
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');               /* comm may hold spaces/parens */
+    if (!rp || !rp[1]) return 0;
+    char st = (rp[1] == ' ') ? rp[2] : rp[1];   /* "...) S ..." */
+    return st == 'Z' || st == 'X' || st == 'x';
+}
+
+/* Backstop for a tracee that vanished at the host level without publishing an exit
+ * -- an uncatchable SIGKILL (every catchable fatal signal is mediated and reports
+ * its real status, so a silent death is a SIGKILL). Report a synthetic
+ * WIFSIGNALED(SIGKILL) so a sibling tracer polling in wait4 does not hang. Only
+ * fires for a non-child tracee; a host-child's death is reaped via the host wait.
+ * Returns 1 and fills status/outpid if such a tracee is found, else 0. */
+int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid) {
+    if (!g_tab) return 0;
+    s32 me = (s32)getpid();
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
+        if (wpid > 0 && wpid != t) continue;
+        /* A stopped/exited tracee is alive-and-parked / handled by ptrace_collect. */
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
+        if (!pt_task_dead(t)) continue;
+        *status = SIGKILL;            /* WIFSIGNALED(SIGKILL) */
+        *outpid = t;
+        pt_free(e);
         return 1;
     }
     return 0;

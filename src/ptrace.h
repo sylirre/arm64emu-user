@@ -104,6 +104,11 @@ int  ptrace_have_tracee(s32 wpid);
 /* Consume one ready ptrace-stop matching wpid (-1 = any). On success fills
  * *status (a WIFSTOPPED wait-status word) and *outpid, returns 1; else 0. */
 int  ptrace_collect(s32 wpid, int *status, s32 *outpid);
+/* Backstop: a non-child tracee killed by an uncatchable SIGKILL vanishes without
+ * a registry event. Detect its dead/zombie host process and report a synthetic
+ * WIFSIGNALED(SIGKILL) so a sibling tracer's wait4 poll does not hang. Fills the
+ * status and outpid out-params and returns 1 if found, else 0. */
+int  ptrace_reap_dead(s32 wpid, int *status, s32 *outpid);
 /* Block up to ms milliseconds for any tracee to change state (stop/exit). */
 void ptrace_tracer_wait(int ms);
 /* Wake every process blocked in the wait4 polling loop (a guest exit, so a
