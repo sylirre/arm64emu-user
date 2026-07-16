@@ -332,6 +332,10 @@ static const u16 quiet_enosys[] = {
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
     G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
+    /* process_vm_readv/writev: strace probes these to read a tracee's memory
+     * and falls back to PTRACE_PEEKDATA on ENOSYS, so a quiet -ENOSYS is the
+     * correct behavior (not yet emulated). */
+    G_NR_process_vm_readv, G_NR_process_vm_writev,
     G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
