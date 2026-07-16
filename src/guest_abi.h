@@ -420,4 +420,27 @@ typedef struct {
 #define G_AT_SYMLINK_FOLLOW    0x400
 #define G_AT_EMPTY_PATH        0x1000
 
+/* mount(2) flags (arch-uniform) and umount2(2) flags, for the bind-mount
+ * emulation in sys_file.c. MS_MGC_VAL is the legacy magic some tools still OR
+ * into the high 16 bits; modern kernels ignore it when MS_MGC_MSK matches. */
+#define G_MS_RDONLY      0x0001
+#define G_MS_NOSUID      0x0002
+#define G_MS_NODEV       0x0004
+#define G_MS_NOEXEC      0x0008
+#define G_MS_REMOUNT     0x0020
+#define G_MS_BIND        0x1000
+#define G_MS_MOVE        0x2000
+#define G_MS_REC         0x4000
+#define G_MS_UNBINDABLE  0x20000    /* (1<<17) */
+#define G_MS_PRIVATE     0x40000    /* (1<<18) */
+#define G_MS_SLAVE       0x80000    /* (1<<19) */
+#define G_MS_SHARED      0x100000   /* (1<<20) */
+#define G_MS_MGC_VAL     0xC0ED0000
+#define G_MS_MGC_MSK     0xFFFF0000
+
+#define G_MNT_FORCE       0x1
+#define G_MNT_DETACH      0x2
+#define G_MNT_EXPIRE      0x4
+#define G_UMOUNT_NOFOLLOW 0x8
+
 #endif /* A64_GUEST_ABI_H */

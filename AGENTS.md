@@ -42,7 +42,7 @@ src/
     backend_a64.c backend_x86_64.c   Register-allocating single-pass emitters
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c                             Rootfs containment resolver, /proc & /dev special cases
+  path.c                             Rootfs containment resolver, process-shared bind table (mount/umount), /proc & /dev special cases
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)

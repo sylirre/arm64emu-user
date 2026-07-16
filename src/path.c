@@ -7,9 +7,11 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -203,42 +205,148 @@ static int join_host(const char *host, const char *rem, char *out) {
     return 0;
 }
 
+/* --- process-shared bind table (machine.h) --------------------------------
+ * Backs both the --bind CLI mounts and the runtime mount(2)/umount2(2) handlers.
+ * It lives in a MAP_SHARED region created before the first fork (bindtab_init),
+ * so a mount done by any guest process is visible session-wide, as a single
+ * shared mount namespace would be — the `mount` command runs in a child, and its
+ * bind must reach the parent shell. Slots are lock-free, mirroring m->gtid:
+ * `active` is CAS'd 0 -> -1 to claim, filled, then published with a store to 1;
+ * a reader gates on observing active == 1, which also orders the guest/host
+ * writes preceding the publish (release/acquire, cross-process via the shared
+ * mapping + atomics). g_nbinds is a monotonic high-water bound. If the mmap
+ * fails, the pointers keep addressing a private static table (per-process). */
+static struct BindTab { int n; struct Bind e[BIND_MAX]; } g_bindtab_fallback;
+static struct Bind *g_binds = g_bindtab_fallback.e;
+static int *g_nbinds = &g_bindtab_fallback.n;
+
+void bindtab_init(void) {
+    void *p = mmap(NULL, sizeof(struct BindTab), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return;   /* keep the private fallback */
+    struct BindTab *t = p;
+    g_binds = t->e;
+    g_nbinds = &t->n;
+}
+
 /* -bind forward map: longest guest-prefix match on the canonical guest path.
  * Fills host_out with the bound host path and returns 1; 0 if no bind applies.
  * Takes precedence over special zones and the rootfs prefix (see path_resolve),
  * so a bound subtree is served from its real host location. */
 static int bind_match(struct Machine *m, const char *canon, char *host_out) {
+    (void)m;
     int best = -1;
     size_t bestlen = 0;
-    for (int i = 0; i < m->n_binds; i++) {
-        size_t gl = strlen(m->binds[i].guest);
-        if (strncmp(canon, m->binds[i].guest, gl)) continue;
+    int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
+        size_t gl = strlen(g_binds[i].guest);
+        if (strncmp(canon, g_binds[i].guest, gl)) continue;
         if (canon[gl] != 0 && canon[gl] != '/') continue;   /* '/' boundary */
         if (best < 0 || gl > bestlen) { best = i; bestlen = gl; }
     }
     if (best < 0) return 0;
-    return join_host(m->binds[best].host, canon + bestlen, host_out) == 0;
+    return join_host(g_binds[best].host, canon + bestlen, host_out) == 0;
 }
 
 /* Reverse of bind_match: a host path back to its guest view. See machine.h. */
 int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out) {
+    (void)m;
     int best = -1;
     size_t bestlen = 0;
-    for (int i = 0; i < m->n_binds; i++) {
-        size_t hl = strlen(m->binds[i].host);
-        if (strncmp(hostpath, m->binds[i].host, hl)) continue;
+    int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
+        size_t hl = strlen(g_binds[i].host);
+        if (strncmp(hostpath, g_binds[i].host, hl)) continue;
         if (hostpath[hl] != 0 && hostpath[hl] != '/') continue;
         if (best < 0 || hl > bestlen) { best = i; bestlen = hl; }
     }
     if (best < 0) return -1;
     if (guest_out) {
-        const char *g = m->binds[best].guest, *rem = hostpath + bestlen;
+        const char *g = g_binds[best].guest, *rem = hostpath + bestlen;
         size_t gl = strlen(g), rl = strlen(rem);
         if (gl + rl + 1 > PATH_MAX) return -1;
         memcpy(guest_out, g, gl);
         memcpy(guest_out + gl, rem, rl + 1);
     }
     return best;
+}
+
+/* Runtime bind-table mutation (machine.h). Lock-free, mirroring m->gtid: a slot
+ * is claimed by CAS'ing active 0 -> -1, filled, then published with a store to
+ * 1; readers (bind_match/bind_of_host above) skip anything not observed as 1. */
+int bind_add(struct Machine *m, const char *guest_canon, const char *host, int ro) {
+    (void)m;
+    if (strlen(guest_canon) + 1 > PATH_MAX || strlen(host) + 1 > PATH_MAX)
+        return -ENAMETOOLONG;
+    for (int i = 0; i < BIND_MAX; i++) {
+        int expect = 0;
+        if (!__atomic_compare_exchange_n(&g_binds[i].active, &expect, -1,
+                                         0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            continue;                       /* slot live or mid-claim */
+        strcpy(g_binds[i].guest, guest_canon);
+        strcpy(g_binds[i].host, host);
+        g_binds[i].ro = ro;
+        __atomic_store_n(&g_binds[i].active, 1, __ATOMIC_SEQ_CST);   /* publish */
+        /* Raise the high-water bound so readers scan this slot (retry against a
+         * concurrent raise; a bound already past i+1 leaves the loop at once). */
+        int cur = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
+        while (i >= cur &&
+               !__atomic_compare_exchange_n(g_nbinds, &cur, i + 1,
+                                            1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            ;
+        return i;
+    }
+    return -ENOMEM;
+}
+
+/* Find the topmost (highest-index) live bind mounted at exactly guest_canon. */
+static int bind_top_at(const char *guest_canon) {
+    int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST), best = -1;
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
+        if (!strcmp(g_binds[i].guest, guest_canon)) best = i;   /* topmost wins */
+    }
+    return best;
+}
+
+int bind_remount(struct Machine *m, const char *guest_canon, int ro) {
+    (void)m;
+    int i = bind_top_at(guest_canon);
+    if (i < 0) return -EINVAL;
+    __atomic_store_n(&g_binds[i].ro, ro, __ATOMIC_SEQ_CST);
+    return 0;
+}
+
+int bind_remove(struct Machine *m, const char *guest_canon) {
+    (void)m;
+    int i = bind_top_at(guest_canon);
+    if (i < 0) return -EINVAL;
+    int expect = 1;                         /* lose a race with a concurrent umount */
+    if (!__atomic_compare_exchange_n(&g_binds[i].active, &expect, 0,
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return -EINVAL;
+    return 0;
+}
+
+/* Read side for consumers outside path.c (host_ro in sys_file.c, put_mounts in
+ * sys_procfs.c). See machine.h. */
+int bind_ro(int i) {
+    if (i < 0 || i >= BIND_MAX) return 0;
+    if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) return 0;
+    return __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+}
+
+int bind_count(void) { return __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST); }
+
+int bind_get(int i, char *guest_out, char *host_out, int *ro_out) {
+    if (i < 0 || i >= BIND_MAX) return 0;
+    if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) return 0;
+    if (guest_out) strcpy(guest_out, g_binds[i].guest);
+    if (host_out)  strcpy(host_out, g_binds[i].host);
+    if (ro_out)    *ro_out = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+    return 1;
 }
 
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,

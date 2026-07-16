@@ -309,6 +309,43 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     unset HOSTLEAKMARK
 fi
 
+# ---- runtime bind mounts (guest mount --bind / umount, self-checking) ----
+# Emulator-only (qemu-aarch64 performs *real* mounts, so it can't be the oracle).
+# The bind table is process-shared, so a bind established by the `mount` child is
+# visible to the parent shell — the whole point of the shared table. Gated on
+# --fake-id (mount needs CAP_SYS_ADMIN); an unprivileged mount must fail EPERM.
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_mount() {   # check_mount <label> <expected> <script>
+        local label="$1" expect="$2" script="$3" got
+        got=$("$EMU" --fake-id "$ALPINE" /bin/busybox sh -c "$script" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS mount: $label"
+        else fail=$((fail+1)); echo "FAIL mount: $label (want '$expect' got '$got')"; fi
+    }
+    check_mount "bind visible cross-process" "hi" \
+        'rm -rf /tmp/mt; mkdir -p /tmp/mt/a /tmp/mt/b; echo hi >/tmp/mt/a/f;
+         mount -o bind /tmp/mt/a /tmp/mt/b; cat /tmp/mt/b/f; rm -rf /tmp/mt'
+    check_mount "bind in mountinfo" "yes" \
+        'rm -rf /tmp/mt; mkdir -p /tmp/mt/a /tmp/mt/b;
+         mount -o bind /tmp/mt/a /tmp/mt/b;
+         grep -q " /tmp/mt/b " /proc/self/mountinfo && echo yes || echo no; rm -rf /tmp/mt'
+    check_mount "remount ro blocks write" "blocked" \
+        'rm -rf /tmp/mt; mkdir -p /tmp/mt/a /tmp/mt/b; echo hi >/tmp/mt/a/f;
+         mount -o bind /tmp/mt/a /tmp/mt/b; mount -o remount,ro,bind /tmp/mt/b;
+         if echo x >/tmp/mt/b/f 2>/dev/null; then echo wrote; else echo blocked; fi;
+         rm -rf /tmp/mt'
+    check_mount "umount removes bind" "gone" \
+        'rm -rf /tmp/mt; mkdir -p /tmp/mt/a /tmp/mt/b; echo hi >/tmp/mt/a/f;
+         mount -o bind /tmp/mt/a /tmp/mt/b; umount /tmp/mt/b;
+         cat /tmp/mt/b/f 2>/dev/null || echo gone; rm -rf /tmp/mt'
+    # Unprivileged (no --fake-id): mount fails EPERM, so /tmp/mt/b stays empty.
+    got=$("$EMU" "$ALPINE" /bin/busybox sh -c \
+        'rm -rf /tmp/mt; mkdir -p /tmp/mt/a /tmp/mt/b; echo hi >/tmp/mt/a/f;
+         mount -o bind /tmp/mt/a /tmp/mt/b 2>/dev/null;
+         cat /tmp/mt/b/f 2>/dev/null || echo eperm; rm -rf /tmp/mt' 2>/dev/null)
+    if [ "$got" = "eperm" ]; then pass=$((pass+1)); echo "PASS mount: unprivileged EPERM"
+    else fail=$((fail+1)); echo "FAIL mount: unprivileged EPERM (got '$got')"; fi
+fi
+
 # ---- cross-session /proc view (--shared-proc): a guest in one emulator invocation
 # is visible to an independent invocation of the same rootfs, and is NOT visible
 # without the flag. Two separate emulator processes, orchestrated from the host. ----

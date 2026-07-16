@@ -22,6 +22,7 @@ SYSDEF(renameat2); SYSDEF(symlinkat); SYSDEF(linkat); SYSDEF(ftruncate);
 SYSDEF(fchmod); SYSDEF(fchmodat); SYSDEF(fchownat); SYSDEF(fchown);
 SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
 SYSDEF(sync); SYSDEF(syncfs); SYSDEF(readahead);
+SYSDEF(mount); SYSDEF(umount2);
 SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
@@ -110,6 +111,8 @@ static const struct {
     { G_NR_faccessat2, sys_faccessat2, "faccessat2" },
     { G_NR_chdir, sys_chdir, "chdir" },
     { G_NR_fchdir, sys_fchdir, "fchdir" },
+    { G_NR_mount, sys_mount, "mount" },
+    { G_NR_umount2, sys_umount2, "umount2" },
     { G_NR_fchmod, sys_fchmod, "fchmod" },
     { G_NR_fchmodat, sys_fchmodat, "fchmodat" },
     { G_NR_fchownat, sys_fchownat, "fchownat" },
@@ -308,7 +311,7 @@ static const struct { u16 nr; u8 mask; } pathdefs[] = {
     { G_NR_utimensat, 0x02 }, { G_NR_statx, 0x02 }, { G_NR_inotify_add_watch, 0x02 },
     { G_NR_execveat, 0x02 },
     { G_NR_statfs, 0x01 }, { G_NR_truncate, 0x01 }, { G_NR_chdir, 0x01 },
-    { G_NR_execve, 0x01 },
+    { G_NR_execve, 0x01 }, { G_NR_mount, 0x03 }, { G_NR_umount2, 0x01 },
     { G_NR_setxattr, 0x01 }, { G_NR_lsetxattr, 0x01 }, { G_NR_getxattr, 0x01 },
     { G_NR_lgetxattr, 0x01 }, { G_NR_listxattr, 0x01 }, { G_NR_llistxattr, 0x01 },
     { G_NR_removexattr, 0x01 }, { G_NR_lremovexattr, 0x01 },
@@ -329,8 +332,9 @@ static const u16 quiet_enosys[] = {
     G_NR_futex_waitv, G_NR_epoll_pwait2, G_NR_fchmodat2, G_NR_pidfd_open,
     G_NR_process_madvise, G_NR_membarrier /* handled, listed for symmetry */,
     G_NR_futex_wake, G_NR_futex_wait, G_NR_futex_requeue,
-    /* mount / namespaces */
-    G_NR_umount2, G_NR_mount, G_NR_chroot, G_NR_unshare, G_NR_setns,
+    /* mount / namespaces (mount/umount2 are emulated for bind mounts —
+     * sys_file.c — so they are handled, not quietly ENOSYS'd) */
+    G_NR_chroot, G_NR_unshare, G_NR_setns,
     G_NR_open_tree, G_NR_move_mount, G_NR_fsopen, G_NR_fsconfig,
     G_NR_fsmount, G_NR_fspick, G_NR_mount_setattr,
     /* privileged / system-global */

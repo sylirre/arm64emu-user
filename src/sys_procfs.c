@@ -122,17 +122,19 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
             dprintf(fd, "%zu 1 0:%zu / %s %s - %s %s %s\n",
                     i + 2, i + 5, pseudo[i].dir, pseudo[i].opts,
                     pseudo[i].type, pseudo[i].src, pseudo[i].sopts);
-        for (int i = 0; i < m->n_binds; i++) {
+        for (int i = 0, nb = bind_count(); i < nb; i++) {
+            char bg[PATH_MAX], bh[PATH_MAX]; int bro;
+            if (!bind_get(i, bg, bh, &bro)) continue;   /* skip freed/mid-claim */
             struct stat bst;
             unsigned bmaj = maj, bmin = min;
-            if (stat(m->binds[i].host, &bst) == 0) {
+            if (stat(bh, &bst) == 0) {
                 bmaj = major(bst.st_dev);
                 bmin = minor(bst.st_dev);
             }
-            const char *o = m->binds[i].ro ? "ro,relatime" : "rw,relatime";
+            const char *o = bro ? "ro,relatime" : "rw,relatime";
             dprintf(fd, "%zu 1 %u:%u / %s %s - %s %s %s\n",
-                    np + 2 + (size_t)i, bmaj, bmin, m->binds[i].guest, o,
-                    fstype, m->binds[i].host, m->binds[i].ro ? "ro" : "rw");
+                    np + 2 + (size_t)i, bmaj, bmin, bg, o,
+                    fstype, bh, bro ? "ro" : "rw");
         }
     } else if (fmt == MNT_MOUNTSTATS) {
         /* mountstats: a device line per mount (no NFS per-op stats, since these
@@ -141,17 +143,22 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
         for (size_t i = 0; i < np; i++)
             dprintf(fd, "device %s mounted on %s with fstype %s\n",
                     pseudo[i].src, pseudo[i].dir, pseudo[i].type);
-        for (int i = 0; i < m->n_binds; i++)
-            dprintf(fd, "device %s mounted on %s with fstype %s\n",
-                    m->binds[i].host, m->binds[i].guest, fstype);
+        for (int i = 0, nb = bind_count(); i < nb; i++) {
+            char bg[PATH_MAX], bh[PATH_MAX];
+            if (!bind_get(i, bg, bh, NULL)) continue;
+            dprintf(fd, "device %s mounted on %s with fstype %s\n", bh, bg, fstype);
+        }
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
         for (size_t i = 0; i < np; i++)
             dprintf(fd, "%s %s %s %s 0 0\n", pseudo[i].src, pseudo[i].dir,
                     pseudo[i].type, pseudo[i].opts);
-        for (int i = 0; i < m->n_binds; i++)
-            dprintf(fd, "%s %s %s %s 0 0\n", m->binds[i].host, m->binds[i].guest,
-                    fstype, m->binds[i].ro ? "ro,relatime" : "rw,relatime");
+        for (int i = 0, nb = bind_count(); i < nb; i++) {
+            char bg[PATH_MAX], bh[PATH_MAX]; int bro;
+            if (!bind_get(i, bg, bh, &bro)) continue;
+            dprintf(fd, "%s %s %s %s 0 0\n", bh, bg,
+                    fstype, bro ? "ro,relatime" : "rw,relatime");
+        }
     }
 }
 

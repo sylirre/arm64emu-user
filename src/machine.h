@@ -32,6 +32,23 @@ typedef struct {
     int ngroups;
 } Cred;
 
+/* One bind-mount table entry. The table lives in a process-shared mmap
+ * (path.c bindtab_init) rather than in struct Machine, so a runtime mount in one
+ * guest process is visible session-wide. Seeded from --bind before the first
+ * fork and mutated at runtime by sys_file.c. Slots are lock-free: `active`
+ * (0 free, -1 mid-claim, 1 live) is claimed/published with atomics exactly like
+ * m->gtid, so the path.c hot-path readers never take a lock — a lock a fork
+ * could otherwise inherit held by a thread absent in the child. The shared
+ * high-water count is a monotonic bound for the reader loops. Slot ~2*PATH_MAX;
+ * 64 slots is ~0.5 MB of demand-zero shared memory for the whole session. */
+#define BIND_MAX 64
+struct Bind {
+    char guest[PATH_MAX];   /* canonical guest mount point, no trailing slash */
+    char host[PATH_MAX];    /* realpath'd host source directory */
+    int ro;                 /* read-only mount (atomic) */
+    int active;             /* 0 free, -1 mid-claim, 1 live (atomic) */
+};
+
 struct Machine {
     CPU cpu;
 
@@ -42,18 +59,12 @@ struct Machine {
     char cwd[PATH_MAX];       /* canonical guest cwd ("/" based) */
     char exec_path[PATH_MAX]; /* canonical guest path of the running exe */
 
-    /* -bind src:dst[:ro]: expose a host directory at a guest mount point,
-     * generalizing path.c's fixed /dev,/proc passthroughs. A resolved guest
-     * path under `guest` maps to `host` + remainder instead of rootfs+path;
-     * `ro` rejects mutating syscalls under it with -EROFS. Set at startup,
-     * then read-only for the process life (fork copies it, like rootfs). */
-#define BIND_MAX 8
-    struct {
-        char guest[PATH_MAX]; /* canonical guest mount point, no trailing slash */
-        char host[PATH_MAX];  /* realpath'd host source directory */
-        int ro;               /* read-only mount */
-    } binds[BIND_MAX];
-    int n_binds;
+    /* The bind-mount table (--bind + runtime mount(2)/umount2(2)) does NOT live
+     * in this per-process struct: it is a process-shared mmap owned by path.c
+     * (struct Bind, bindtab_init), so a mount performed by one guest process —
+     * e.g. the child that `mount --bind` execs — is visible to the whole
+     * session, as a single shared mount namespace would be. See struct Bind
+     * and the bind_* API below. */
 
     /* Exec-time guest argv, NUL-joined — the /proc/self/cmdline content
      * (host /proc shows the emulator's argv). Rebuilt by every load_elf;
@@ -229,6 +240,32 @@ void path_strip_rootfs(const struct Machine *m, char *path);
  * (binds[i].guest + remainder); return -1 if no bind matches. Longest host
  * prefix wins. Used for reverse mapping (path.c) and the :ro check (sys_file). */
 int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out);
+
+/* Create the process-shared bind table. Called once in main() before any --bind
+ * registration and before the first fork, so every guest process maps the same
+ * table. On mmap failure it degrades to a private per-process table (runtime
+ * mounts then stay process-local, but nothing crashes). */
+void bindtab_init(void);
+
+/* Runtime bind-table mutation, backing the guest mount(2)/umount2(2) handlers.
+ * Arguments are already canonical (guest_canon) / resolved (host). Lock-free,
+ * mirroring m->gtid's slot idiom. bind_add returns the slot index, or -ENOMEM
+ * if the table is full. bind_remount flips a live bind's :ro flag; bind_remove
+ * deactivates the highest-index live bind mounted at exactly guest_canon. Both
+ * return 0 on success or -EINVAL when no bind is mounted at that point. (The `m`
+ * parameter is vestigial — the table is shared, not per-Machine — but kept so
+ * call sites read naturally.) */
+int bind_add(struct Machine *m, const char *guest_canon, const char *host, int ro);
+int bind_remount(struct Machine *m, const char *guest_canon, int ro);
+int bind_remove(struct Machine *m, const char *guest_canon);
+
+/* Read side for consumers outside path.c. bind_ro reports whether live slot i is
+ * a read-only mount (host_ro in sys_file.c). bind_count is the high-water slot
+ * bound; bind_get snapshots live slot i's guest/host/ro (put_mounts in
+ * sys_procfs.c) and returns 1, or 0 if the slot is not live. */
+int bind_ro(int i);
+int bind_count(void);
+int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
 
 /* proctab.c: cross-process guest-PID registry in shared memory. Each guest
  * process publishes its NUL-joined argv, guest exe path, cwd and NUL-joined

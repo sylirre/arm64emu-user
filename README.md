@@ -133,6 +133,9 @@ arm64chroot --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
 All bindings get registered in the guest's `/proc/mounts` and
 `/proc/PID/mountinfo`. The host information about mount points is discarded.
 
+It is possible to use `mount --bind src dst` within guest environment if
+emulator uses `--fake-id`. Remove binding by `umount dst`.
+
 Caveat: the src/dst paths must not contain the colon character (`:`).
 
 ### Fake identity
@@ -253,7 +256,8 @@ src/
     backend_a64.c backend_x86_64.c   register-allocating single-pass emitters
     jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c        rootfs containment resolver, /proc & /dev special cases
+  path.c        rootfs containment resolver, process-shared bind table
+                (runtime mount/umount), /proc & /dev special cases
   syscall.c sys_*.c   dispatcher + per-area handlers (~190 syscalls)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view)

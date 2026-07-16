@@ -58,7 +58,7 @@ int oflags_h2g(int h) {
  * host prefix at a '/' boundary; non-bind paths never match. */
 static int host_ro(struct Machine *m, const char *host) {
     int i = bind_of_host(m, host, NULL);
-    return i >= 0 && m->binds[i].ro;
+    return i >= 0 && bind_ro(i);
 }
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
@@ -1243,6 +1243,67 @@ SYSDEF(fchdir) {
     } else strcpy(c->m->cwd, "/");
     proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
     return 0;
+}
+
+/* mount(source=a0, target=a1, fstype=a2, flags=a3, data=a4): bind-mount
+ * emulation over the process-shared bind table (path.c). Real-filesystem mounts need
+ * privilege we do not have, so only bind mounts, per-mount remount (ro/rw), and
+ * mount-propagation changes are honored; anything else fails as it would for an
+ * unprivileged caller. Gated on fake-root, matching the kernel's CAP_SYS_ADMIN
+ * requirement (the --bind CLI stays the unprivileged startup path). Forward path
+ * resolution of a bound subtree is exact; reverse mapping (getcwd/fd readback)
+ * of a source that shares a host inode with another path prefers the bind view,
+ * an inherent limit of prefix-based reverse mapping also present for CLI binds. */
+SYSDEF(mount) {
+    struct Machine *m = c->m;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    unsigned long flags = (unsigned long)a3;
+    if ((flags & G_MS_MGC_MSK) == G_MS_MGC_VAL)      /* strip legacy mount magic */
+        flags &= ~(unsigned long)G_MS_MGC_MSK;
+
+    /* Propagation-only change (e.g. bwrap's MS_REC|MS_PRIVATE on "/"): a no-op
+     * here, but it must succeed. Checked first — it carries no real source and
+     * makes no new mount. */
+    if ((flags & (G_MS_PRIVATE | G_MS_SLAVE | G_MS_SHARED | G_MS_UNBINDABLE)) &&
+        !(flags & (G_MS_BIND | G_MS_REMOUNT | G_MS_MOVE)))
+        return 0;
+
+    if (flags & G_MS_MOVE) return (u64)(s64)-EINVAL;   /* not supported */
+
+    if (flags & G_MS_REMOUNT) {                        /* change ro/rw on a bind */
+        char host[PATH_MAX], canon[PATH_MAX];
+        int r = resolve_at(c, G_AT_FDCWD, a1, 0, host, canon);
+        if (r < 0) return (u64)(s64)r;
+        return (u64)(s64)bind_remount(m, canon, (flags & G_MS_RDONLY) ? 1 : 0);
+    }
+
+    if (flags & G_MS_BIND) {                           /* new bind mount */
+        char shost[PATH_MAX], thost[PATH_MAX], tcanon[PATH_MAX];
+        struct stat st;
+        int r = resolve_at(c, G_AT_FDCWD, a0, 0, shost, NULL);   /* source */
+        if (r < 0) return (u64)(s64)r;
+        if (stat(shost, &st) < 0) return host_err();             /* must exist */
+        r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);     /* mountpoint */
+        if (r < 0) return (u64)(s64)r;
+        if (stat(thost, &st) < 0) return host_err();             /* must exist */
+        r = bind_add(m, tcanon, shost, (flags & G_MS_RDONLY) ? 1 : 0);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
+    return (u64)(s64)-EPERM;   /* a real filesystem type: unprivileged, can't */
+}
+
+/* umount2(target=a0, flags=a1): remove the bind mounted at exactly target.
+ * FORCE/DETACH/EXPIRE are accepted and ignored; UMOUNT_NOFOLLOW leaves a final
+ * symlink unresolved. Gated on fake-root like mount. */
+SYSDEF(umount2) {
+    struct Machine *m = c->m;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    unsigned rf = ((unsigned)a1 & G_UMOUNT_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    char host[PATH_MAX], canon[PATH_MAX];
+    int r = resolve_at(c, G_AT_FDCWD, a0, rf, host, canon);
+    if (r < 0) return (u64)(s64)r;
+    return (u64)(s64)bind_remove(m, canon);
 }
 
 SYSDEF(mkdirat) {

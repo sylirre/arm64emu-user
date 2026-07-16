@@ -371,10 +371,6 @@ static int canon_guest(const char *in, char *out) {
  * the default ":rw") marks it read-only. Host paths may not contain ':'. Fatal
  * on any malformed spec. */
 static void add_bind(struct Machine *m, const char *spec) {
-    if (m->n_binds >= BIND_MAX) {
-        fprintf(stderr, "arm64chroot: too many --bind mounts (max %d)\n", BIND_MAX);
-        exit(2);
-    }
     char buf[2 * PATH_MAX];
     if (strlen(spec) + 1 > sizeof buf) {
         fprintf(stderr, "arm64chroot: --bind '%s': too long\n", spec);
@@ -397,25 +393,33 @@ static void add_bind(struct Machine *m, const char *spec) {
         fprintf(stderr, "arm64chroot: --bind '%s': destination path must be absolute\n", spec);
         exit(2);
     }
-    int k = m->n_binds;
-    if (!realpath(src, m->binds[k].host)) {
+    char host[PATH_MAX], guest[PATH_MAX];
+    if (!realpath(src, host)) {
         fprintf(stderr, "arm64chroot: --bind source path '%s': not found\n", src);
         exit(126);
     }
-    if (!strcmp(m->binds[k].host, "/")) {
+    if (!strcmp(host, "/")) {
         fprintf(stderr, "arm64chroot: --bind '%s': cannot bind host root\n", spec);
         exit(2);
     }
-    if (canon_guest(dst, m->binds[k].guest) < 0) {
+    if (canon_guest(dst, guest) < 0) {
         fprintf(stderr, "arm64chroot: --bind '%s': destination path too long\n", spec);
         exit(2);
     }
-    if (!strcmp(m->binds[k].guest, "/")) {
+    if (!strcmp(guest, "/")) {
         fprintf(stderr, "arm64chroot: --bind '%s': cannot bind over guest root\n", spec);
         exit(2);
     }
-    m->binds[k].ro = ro;
-    m->n_binds++;
+    /* Register into the shared bind table (same path the runtime mount(2) uses). */
+    int r = bind_add(m, guest, host, ro);
+    if (r == -ENOMEM) {
+        fprintf(stderr, "arm64chroot: too many --bind mounts (max %d)\n", BIND_MAX);
+        exit(2);
+    }
+    if (r < 0) {
+        fprintf(stderr, "arm64chroot: --bind '%s': %s\n", spec, strerror(-r));
+        exit(2);
+    }
 }
 
 /* Sandbox diagnosis: report an inherited seccomp filter (Seccomp: 2 in
@@ -499,6 +503,10 @@ int main(int argc, char **argv) {
     int n_extra = 0;
 
     u32 fake_uid = 0, fake_gid = 0;
+
+    /* Create the process-shared bind table before any --bind registration below
+     * and before the first fork, so every guest process maps the same mounts. */
+    bindtab_init();
 
     /* GNU-style options: single-letter short (-j), --word long. Value-taking
      * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg

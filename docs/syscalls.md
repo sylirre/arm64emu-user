@@ -88,6 +88,26 @@ parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
 (enforced in the `sys_file.c` handlers via `host_ro`). Binds are listed in the
 synthesized `/proc/mounts` and `/proc/mountinfo`.
 
+**Runtime `mount(2)` / `umount2(2)`.** The guest can add and drop binds at run
+time, not just via `--bind`: `mount(src, dst, …, MS_BIND, …)` resolves `src` to
+its host path and `dst` to a canonical guest mount point and registers a new
+bind; `MS_REMOUNT` toggles a bind's `:ro`; `umount2(dst)` removes it (`sys_mount`
+/ `sys_umount2`). Only bind mounts are emulated — propagation-only changes
+(`MS_PRIVATE`/`MS_SHARED`/…) are accepted as no-ops, `MS_MOVE` returns `EINVAL`,
+and any real filesystem type returns `EPERM`, as does every call unless the guest
+is fake-root (`--fake-id`, `euid 0`), matching the kernel's `CAP_SYS_ADMIN`
+requirement (the `--bind` CLI stays the unprivileged startup path). The bind
+table is **process-shared** — a `MAP_SHARED` region created before the first fork
+(`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by the
+`mount` command, which runs as a *child* process, is visible to the parent shell
+and the whole session, as a single shared mount namespace would be; the lock-free
+slot claim (an `active` CAS mirroring `m->gtid`) keeps the hot-path readers
+lock-free and fork-safe. The model has no real mounts, so two caveats stand: a
+bind mountpoint is not protected from `rmdir`, and reverse mapping (`getcwd`,
+`/proc/self/fd/N`) of a source that shares a host inode with another path prefers
+the bind view — an inherent limit of prefix-based reverse mapping, already true
+of CLI binds.
+
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
 contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
 `sendmsg` route it through `path_resolve` (`bind` keeps the final component
