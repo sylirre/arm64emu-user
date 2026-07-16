@@ -336,11 +336,69 @@ static const u16 quiet_enosys[] = {
     G_NR_set_mempolicy_home_node,
 };
 
+/* Trace names for known syscalls that have no handler (they resolve to -ENOSYS,
+ * so they are absent from defs[]). Without this the trace would label them "?";
+ * with it a guest probing e.g. rseq/clone3/openat2 shows the real name. This is
+ * display-only — it grants no handler and does not change ENOSYS behavior. The
+ * name is just the G_NR_ suffix; adding a real handler later moves the syscall
+ * into defs[] (which carries its own name), so drop its row here then. */
+static const struct { u16 nr; const char *name; } sysname_extra[] = {
+    { G_NR_acct, "acct" }, { G_NR_adjtimex, "adjtimex" }, { G_NR_bpf, "bpf" },
+    { G_NR_cachestat, "cachestat" }, { G_NR_clock_adjtime, "clock_adjtime" },
+    { G_NR_clock_settime, "clock_settime" }, { G_NR_clone3, "clone3" },
+    { G_NR_close_range, "close_range" }, { G_NR_delete_module, "delete_module" },
+    { G_NR_epoll_pwait2, "epoll_pwait2" }, { G_NR_fanotify_init, "fanotify_init" },
+    { G_NR_fchmodat2, "fchmodat2" }, { G_NR_finit_module, "finit_module" },
+    { G_NR_fsconfig, "fsconfig" }, { G_NR_fsmount, "fsmount" },
+    { G_NR_fsopen, "fsopen" }, { G_NR_fspick, "fspick" },
+    { G_NR_futex_requeue, "futex_requeue" }, { G_NR_futex_wait, "futex_wait" },
+    { G_NR_futex_waitv, "futex_waitv" }, { G_NR_futex_wake, "futex_wake" },
+    { G_NR_get_mempolicy, "get_mempolicy" }, { G_NR_init_module, "init_module" },
+    { G_NR_io_pgetevents, "io_pgetevents" }, { G_NR_io_uring_enter, "io_uring_enter" },
+    { G_NR_io_uring_register, "io_uring_register" }, { G_NR_io_uring_setup, "io_uring_setup" },
+    { G_NR_kcmp, "kcmp" }, { G_NR_kexec_file_load, "kexec_file_load" },
+    { G_NR_kexec_load, "kexec_load" },
+    { G_NR_landlock_create_ruleset, "landlock_create_ruleset" },
+    { G_NR_listmount, "listmount" }, { G_NR_lsm_get_self_attr, "lsm_get_self_attr" },
+    { G_NR_lsm_list_modules, "lsm_list_modules" },
+    { G_NR_lsm_set_self_attr, "lsm_set_self_attr" },
+    { G_NR_map_shadow_stack, "map_shadow_stack" }, { G_NR_mbind, "mbind" },
+    { G_NR_memfd_secret, "memfd_secret" }, { G_NR_mount_setattr, "mount_setattr" },
+    { G_NR_move_mount, "move_mount" }, { G_NR_mq_open, "mq_open" },
+    { G_NR_mseal, "mseal" }, { G_NR_msgget, "msgget" },
+    { G_NR_name_to_handle_at, "name_to_handle_at" }, { G_NR_openat2, "openat2" },
+    { G_NR_open_tree, "open_tree" }, { G_NR_pidfd_getfd, "pidfd_getfd" },
+    { G_NR_pidfd_open, "pidfd_open" }, { G_NR_pidfd_send_signal, "pidfd_send_signal" },
+    { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
+    { G_NR_process_mrelease, "process_mrelease" },
+    { G_NR_process_vm_readv, "process_vm_readv" },
+    { G_NR_process_vm_writev, "process_vm_writev" }, { G_NR_ptrace, "ptrace" },
+    { G_NR_quotactl, "quotactl" }, { G_NR_reboot, "reboot" },
+    { G_NR_remap_file_pages, "remap_file_pages" },
+    { G_NR_restart_syscall, "restart_syscall" }, { G_NR_rseq, "rseq" },
+    { G_NR_sched_getattr, "sched_getattr" }, { G_NR_sched_setattr, "sched_setattr" },
+    { G_NR_seccomp, "seccomp" }, { G_NR_semget, "semget" },
+    { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
+    { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
+    { G_NR_setns, "setns" }, { G_NR_settimeofday, "settimeofday" },
+    { G_NR_shmat, "shmat" }, { G_NR_shmget, "shmget" },
+    { G_NR_signalfd4, "signalfd4" }, { G_NR_statmount, "statmount" },
+    { G_NR_swapoff, "swapoff" }, { G_NR_swapon, "swapon" }, { G_NR_tee, "tee" },
+    { G_NR_timer_create, "timer_create" }, { G_NR_timer_delete, "timer_delete" },
+    { G_NR_timer_getoverrun, "timer_getoverrun" },
+    { G_NR_timer_gettime, "timer_gettime" }, { G_NR_timer_settime, "timer_settime" },
+    { G_NR_unshare, "unshare" }, { G_NR_userfaultfd, "userfaultfd" },
+    { G_NR_vhangup, "vhangup" }, { G_NR_vmsplice, "vmsplice" },
+};
+
 static void table_init(void) {
     for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
         table[defs[i].nr] = defs[i].fn;
         names[defs[i].nr] = defs[i].name;
     }
+    /* Names only (no handler) for the known-but-unimplemented syscalls. */
+    for (size_t i = 0; i < sizeof sysname_extra / sizeof sysname_extra[0]; i++)
+        names[sysname_extra[i].nr] = sysname_extra[i].name;
 }
 
 void syscall_return(CPU *c, u64 ret) { c->x[0] = ret; }
@@ -389,7 +447,16 @@ void syscall_dispatch(CPU *c) {
     g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
 
     if (m->strace) {
-        const char *name = (nr < G_NR_MAX && names[nr]) ? names[nr] : "?";
+        char namebuf[32];
+        const char *name;
+        if (nr < G_NR_MAX && names[nr]) {
+            name = names[nr];
+        } else {
+            /* Unknown number (gap in the defines or nr >= G_NR_MAX): show it
+             * embedded rather than a bare "?". */
+            snprintf(namebuf, sizeof namebuf, "syscall_%llu", (unsigned long long)nr);
+            name = namebuf;
+        }
         if (!m->strace_full) {
             fprintf(stderr, "%d %s(%llu,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx) = %lld\n",
                     getpid(), name, (unsigned long long)nr,

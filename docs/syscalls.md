@@ -29,7 +29,13 @@ is a human-readable, strace-style rendering of the same calls: symbolic flags
 signals, `SEEK_*`, `AF_*`, …), quoted strings, `execve` argv/envp arrays, errno-named
 returns (`-1 ENOENT (No such file or directory)`), and `{field=…}` pretty-printing of
 the common structs (`stat`, `timespec`, `timeval`, `rlimit`, `utsname`, `sockaddr`).
-Plain `--strace` stays byte-identical so it remains diffable.
+Plain `--strace` keeps its compact, qemu-diffable column layout.
+
+Both modes label every *known* syscall by name — including the unimplemented ones
+that resolve to `-ENOSYS` (`rseq`, `clone3`, `openat2`, …), which have no handler in
+`defs[]` but are named via the `sysname_extra[]` table beside it. A number with no
+name at all (a gap in the defines, or `>= G_NR_MAX`) prints `syscall_<nr>` rather
+than a bare `?`.
 
 The decoder lives in `src/strace.c`: a per-syscall argument-type table drives a set of
 small formatters, and input strings/arrays are snapshotted *before* the handler runs so
