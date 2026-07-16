@@ -145,11 +145,15 @@ requests about itself**, the same way it already mediates every other syscall:
   A stop signal sent to *another* process that is a tracee is intercepted the
   same way (`ptrace_signal_stop`): the send site records the signal on the
   tracee's registry link and kicks it, and the tracee reports a cooperative
-  group-stop (`WSTOPSIG == the stop signal`) at its next run-loop boundary. This
-  is the path a tracer takes to stop a running tracee with `SIGSTOP` before
-  detaching — e.g. `strace -p` on `^C`; a real (uncatchable) host `SIGSTOP` would
-  both freeze the tracee's service loop (deadlocking the follow-up `DETACH`) and
-  never reach the emulator to be reported.
+  group-stop at its next run-loop boundary. The status is encoded faithfully:
+  `WSTOPSIG == the stop signal`, and for a `SEIZE`'d tracee with
+  `PTRACE_EVENT_STOP` in the high bits (the group-stop encoding a tracer keys on
+  to decide to `PTRACE_LISTEN`); a `PTRACE_ATTACH`'d tracee sees a plain
+  signal-delivery-stop (no event), as the kernel reports it. This is also the path
+  a tracer takes to stop a running tracee with `SIGSTOP` before detaching — e.g.
+  `strace -p` on `^C`; a real (uncatchable) host `SIGSTOP` would both freeze the
+  tracee's service loop (deadlocking the follow-up `DETACH`) and never reach the
+  emulator to be reported.
 - *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
   `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
   dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the
@@ -236,16 +240,34 @@ backgrounded `sleep` — was attached.)
 exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can
 read final registers/exit code before it is gone.
 
+**Group-stop listening (`PTRACE_LISTEN`).** After a `SEIZE`'d tracee reports a
+group-stop (above), a tracer `LISTEN`s it to let the stop take effect while staying
+notified. The tracee simply stays parked in its service loop; `LISTEN` only sets a
+`listening` flag on the registry link (no resume, no mailbox round-trip). A
+listening tracee counts as *running* to ptrace data ops — `PEEK*`/`GETREGSET`
+return `-ESRCH`, and a resume request (`CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`)
+cancels the listen — matching the kernel. When `SIGCONT` is delivered to a
+listening tracee, the send site (`ptrace_signal_cont`, wired into
+`kill`/`tkill`/`tgkill`) ends the group-stop by re-arming the link as a fresh
+`PTRACE_EVENT_STOP` trap (`WSTOPSIG == SIGTRAP`) and waking the tracer; the tracee,
+still parked with its CPU intact, then services the tracer's follow-up
+`GETREGSET`/`CONT` as usual. `LISTEN` requires a `SEIZE`'d tracee in an
+`EVENT_STOP` (a group-stop or a `PTRACE_INTERRUPT` stop), else `-EIO`. (Niche
+simplifications: the ending `SIGCONT` is consumed into the notification rather than
+also delivered to the guest as a signal; `PTRACE_INTERRUPT` on a listening tracee
+stays a no-op; a `SIGCONT` racing *before* the `LISTEN` falls through to ordinary
+delivery.)
+
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
 `gdb -p` surface):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`, `SETOPTIONS`
 (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`, `TRACECLONE`, `TRACEEXEC`,
 `TRACEEXIT`), `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints), `GETSIGINFO`
-(including `si_addr` for faults), `GETEVENTMSG`, and the syscall / signal /
-synchronous-fault / execve / fork-clone / attach / pre-exit stops above.
-Everything works under both the interpreter and `--jit`. **Not yet implemented
-(planned):** `PTRACE_LISTEN`, and per-thread tracing of a multithreaded tracee
-(the ptrace-self state is process-global, so attaching to a multithreaded process
-tracks its main thread). Unimplemented requests return `-EIO`/`-ESRCH` rather
-than misbehaving.
+(including `si_addr` for faults), `GETEVENTMSG`, `LISTEN`, and the syscall /
+signal / group / synchronous-fault / execve / fork-clone / attach / pre-exit stops
+above. Everything works under both the interpreter and `--jit`. **Not yet
+implemented (planned):** per-thread tracing of a multithreaded tracee (the
+ptrace-self state is process-global, so attaching to a multithreaded process tracks
+its main thread). Unimplemented requests return `-EIO`/`-ESRCH` rather than
+misbehaving.

@@ -70,6 +70,10 @@ int  ptrace_selfstop(int sig);
  * strace does before detaching on ^C — does not really host-stop it (which would
  * freeze its service loop and deadlock the follow-up DETACH). 0 = not a tracee. */
 int  ptrace_signal_stop(s32 pid, int sig);
+/* SIGCONT sent to another process `pid`: if it is a live tracee a tracer has put
+ * into a listening group-stop (PTRACE_LISTEN), end the group-stop and notify the
+ * tracer with a PTRACE_EVENT_STOP, returning 1; else 0 (ordinary SIGCONT). */
+int  ptrace_signal_cont(s32 pid, int sig);
 /* Exit: release this process's tracee link (or, for an auto-attached fork
  * child, publish a synthetic exit for its tracer). wstatus is the wait-status
  * word to report: (code & 0xff) << 8 for exit(code), or the signal for a death. */

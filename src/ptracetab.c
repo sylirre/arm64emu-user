@@ -87,6 +87,8 @@ typedef struct {
     u32 stopsig_pending; /* a stop signal (SIGSTOP/...) was sent to us as a tracee:
                           * report it as a cooperative group-stop, not a host stop */
     u32 seize;           /* attached via SEIZE (no initial SIGSTOP; group stops) */
+    u32 listening;       /* PTRACE_LISTEN: parked in a group/INTERRUPT stop, awaiting
+                          * SIGCONT (group-stop end); "running" to data ptrace ops */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
@@ -120,6 +122,13 @@ static void fx_wait(volatile u32 *a, u32 val, int ms) {
     syscall(SYS_futex, (u32 *)a, FUTEX_WAIT, val, ms >= 0 ? &ts : NULL, NULL, 0);
 }
 
+/* A job-control stop signal: the kernel turns these into a group-stop rather than
+ * a catchable signal, and (for a SEIZE'd tracee) reports the group-stop with
+ * PTRACE_EVENT_STOP. */
+static int pt_is_stopsig(int sig) {
+    return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
 void ptrace_init(void) {
     void *p = mmap(NULL, sizeof(PtTable), PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -148,7 +157,7 @@ static PtLink *pt_claim(s32 tracee) {
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
             e->eventmsg = 0; e->si_signo = e->si_code = e->si_errno = 0;
             e->attach_pending = e->interrupt_pending = 0;
-            e->stopsig_pending = 0; e->seize = 0;
+            e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
             return e;
         }
@@ -380,7 +389,11 @@ void ptrace_report_exec(CPU *c) {
 
 int ptrace_report_signal(CPU *c, int sig) {
     if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
-    return pt_stop(c, sig, 0, 0, 0, 0);
+    /* A SEIZE'd tracee reports a stop signal as a group-stop (PTRACE_EVENT_STOP,
+     * WSTOPSIG == the stop signal); a PTRACE_ATTACH'd tracee sees it as a plain
+     * signal-delivery-stop (event 0), matching the kernel. */
+    int event = (g_self_link->seize && pt_is_stopsig(sig)) ? G_PTRACE_EVENT_STOP : 0;
+    return pt_stop(c, sig, event, 0, 0, 0);
 }
 
 /* Synchronous-fault stop (software breakpoint BRK, SIGSEGV/SIGBUS/SIGILL/...):
@@ -437,15 +450,17 @@ void ptrace_service_kick(CPU *c) {
         u32 ss = __atomic_load_n(&g_self_link->stopsig_pending, __ATOMIC_ACQUIRE);
         if (ss) {
             __atomic_store_n(&g_self_link->stopsig_pending, 0, __ATOMIC_RELEASE);
-            pt_stop(c, (int)ss, 0, 0, 0, 0);
+            /* SEIZE'd: a faithful group-stop (EVENT_STOP); ATTACH'd: a plain
+             * signal-delivery-stop, as the kernel reports it. */
+            int event = g_self_link->seize ? G_PTRACE_EVENT_STOP : 0;
+            pt_stop(c, (int)ss, event, 0, 0, 0);
         }
     }
 }
 
 int ptrace_selfstop(int sig) {
     if (!g_ptrace_active) return 0;
-    if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
-        return 0;
+    if (!pt_is_stopsig(sig)) return 0;
     /* Queue it for the cooperative signal-delivery stop instead of letting the
      * host job-control-stop this process (which would freeze our service loop
      * so the tracer's next request would deadlock). */
@@ -576,12 +591,39 @@ static void pt_send_kick(s32 pid) {
  * Returns 1 if routed (the caller must not also host-signal), 0 otherwise. */
 int ptrace_signal_stop(s32 pid, int sig) {
     if (!g_tab || pid <= 0) return 0;
-    if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU)
-        return 0;
+    if (!pt_is_stopsig(sig)) return 0;
     PtLink *e = pt_find(pid);
     if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
     __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
     pt_send_kick(pid);
+    return 1;
+}
+
+/* SIGCONT aimed at a tracee that a tracer has put into a listening group-stop
+ * (PTRACE_LISTEN): end the group-stop and notify the tracer with a fresh
+ * PTRACE_EVENT_STOP trap. The tracee stays parked in its service loop (its CPU is
+ * intact), so the tracer's follow-up GETREGSET/CONT round-trips as usual; we only
+ * re-arm the stop fields on the shared link from the sender side and wake the
+ * tracer. Returns 1 if consumed (the caller must not also host-signal), else 0 --
+ * an ordinary SIGCONT (no listening tracee) falls through to normal delivery. */
+int ptrace_signal_cont(s32 pid, int sig) {
+    if (!g_tab || pid <= 0 || sig != SIGCONT) return 0;
+    PtLink *e = pt_find(pid);
+    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
+    if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) return 0;
+    __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+    e->stop_sig = SIGTRAP;
+    e->event = G_PTRACE_EVENT_STOP;
+    e->syscall_stop = 0;
+    e->si_signo = SIGTRAP;
+    e->si_code = (G_PTRACE_EVENT_STOP << 8) | SIGTRAP;
+    e->si_errno = 0;
+    /* state is already PT_ST_STOPPED (the tracee never left its service loop). */
+    __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+    fx_wake(&g_tab->global_gen);
+    { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+      if (tr > 0) kill(tr, SIGCHLD); }   /* wake an async tracer's event loop */
     return 1;
 }
 
@@ -660,6 +702,23 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
         return -ESRCH;
 
+    /* A listening tracee (post-LISTEN, parked in a group-stop awaiting SIGCONT) is
+     * stopped but counts as "running" to ptrace data ops: a resume op cancels the
+     * listen and proceeds, LISTEN is idempotent, and everything else gets -ESRCH
+     * (exactly as the kernel treats a listening tracee). */
+    if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) {
+        switch (req) {
+        case G_PTRACE_CONT: case G_PTRACE_SYSCALL:
+        case G_PTRACE_SINGLESTEP: case G_PTRACE_DETACH:
+            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+            break;                      /* fall through to the resume handling */
+        case G_PTRACE_LISTEN:
+            return 0;                   /* already listening */
+        default:
+            return -ESRCH;
+        }
+    }
+
     switch (req) {
     case G_PTRACE_PEEKTEXT:
     case G_PTRACE_PEEKDATA:
@@ -709,6 +768,15 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     case G_PTRACE_DETACH:
         pt_cmd(e, PT_CMD_DETACH, data, 0);
         return 0;
+    case G_PTRACE_LISTEN:
+        /* Only on a SEIZE'd tracee currently in an EVENT_STOP (a group-stop or a
+         * PTRACE_INTERRUPT stop). Keep it parked-but-listening: it does not resume;
+         * a later SIGCONT (ptrace_signal_cont) ends the group-stop with a fresh
+         * EVENT_STOP. No mailbox round-trip -- the tracee stays parked. */
+        if (!e->seize) return -EIO;
+        if (e->event != G_PTRACE_EVENT_STOP) return -EIO;
+        __atomic_store_n(&e->listening, 1, __ATOMIC_RELEASE);
+        return 0;
     default:
         return -EIO;
     }
@@ -737,7 +805,13 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
         int sig = (int)e->stop_sig;
         int st;
         if (e->event) {
-            st = (((e->event << 8) | SIGTRAP) << 8) | 0x7f;
+            /* A group-stop reports WSTOPSIG == the stop signal with EVENT_STOP in
+             * the high bits; every other event (fork/exec/exit, and the SIGTRAP
+             * INTERRUPT/initial-SEIZE EVENT_STOP) reports WSTOPSIG == SIGTRAP. */
+            if (e->event == G_PTRACE_EVENT_STOP && pt_is_stopsig(sig))
+                st = (G_PTRACE_EVENT_STOP << 16) | ((sig & 0xff) << 8) | 0x7f;
+            else
+                st = (((e->event << 8) | SIGTRAP) << 8) | 0x7f;
         } else {
             if (e->syscall_stop && (e->options & G_PTRACE_O_TRACESYSGOOD))
                 sig |= 0x80;
