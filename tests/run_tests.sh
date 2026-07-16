@@ -346,6 +346,38 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     else fail=$((fail+1)); echo "FAIL mount: unprivileged EPERM (got '$got')"; fi
 fi
 
+# ---- guest chroot(2) re-root (self-checking; qemu performs a real chroot and
+# cannot be the oracle). The fixture builds a target subtree in the writable
+# alpine rootfs, chroots in, and checks containment; the end-to-end case runs the
+# `chroot` command with busybox reached through bind mounts. Gated on --fake-id. ----
+if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
+    if "$AGCC" -static -O2 -o "$ALPINE/tmp/chroot_probe.bin" \
+            tests/fixtures/chroot_probe.c 2>/dev/null; then
+        rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
+        got=$("$EMU" --fake-id "$ALPINE" /tmp/chroot_probe.bin 2>/dev/null)
+        expect=$'chroot rc=0\ncwd=/\nread=inside\nescape_dotdot=contained\noutside_visible=no'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS chroot: containment"
+        else fail=$((fail+1)); echo "FAIL chroot: containment (got '$got')"; fi
+        # Unprivileged (no --fake-id): chroot -> EPERM.
+        rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
+        got=$("$EMU" "$ALPINE" /tmp/chroot_probe.bin 2>/dev/null | head -1)
+        if [ "$got" = "chroot rc=-1 err=1" ]; then pass=$((pass+1)); echo "PASS chroot: unprivileged EPERM"
+        else fail=$((fail+1)); echo "FAIL chroot: unprivileged EPERM (got '$got')"; fi
+        rm -f "$ALPINE/tmp/chroot_probe.bin"
+        rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
+    else
+        echo "SKIP build fixtures/chroot_probe"
+    fi
+    # End-to-end `chroot` command: busybox runs from inside the new root, reached
+    # through bind mounts (proves chroot composes with the bind table).
+    got=$("$EMU" --fake-id "$ALPINE" /bin/busybox sh -c \
+        'mkdir -p /nr/bin /nr/lib; mount --bind /bin /nr/bin; mount --bind /lib /nr/lib;
+         chroot /nr /bin/busybox echo ok' 2>/dev/null)
+    if [ "$got" = "ok" ]; then pass=$((pass+1)); echo "PASS chroot: command + bind compose"
+    else fail=$((fail+1)); echo "FAIL chroot: command + bind compose (got '$got')"; fi
+    rm -rf "$ALPINE/nr"
+fi
+
 # ---- cross-session /proc view (--shared-proc): a guest in one emulator invocation
 # is visible to an independent invocation of the same rootfs, and is NOT visible
 # without the flag. Two separate emulator processes, orchestrated from the host. ----

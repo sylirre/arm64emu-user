@@ -601,6 +601,9 @@ int main(int argc, char **argv) {
                        (unsigned)fnv1a32(m->rootfs));
     m->abs_tag_len = (u8)(1 + atn);
 
+    /* Not chrooted initially: the guest root is the rootfs root. */
+    strcpy(m->chroot_base, "/");
+
     /* Guest cwd: the host cwd when it lies inside the rootfs, else "/". */
     strcpy(m->cwd, "/");
     char hcwd[PATH_MAX];

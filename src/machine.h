@@ -56,8 +56,16 @@ struct Machine {
 
     /* Rootfs containment */
     char rootfs[PATH_MAX];    /* realpath'd host prefix, no trailing slash */
-    char cwd[PATH_MAX];       /* canonical guest cwd ("/" based) */
+    char cwd[PATH_MAX];       /* canonical guest cwd ("/" based, namespace-absolute) */
     char exec_path[PATH_MAX]; /* canonical guest path of the running exe */
+
+    /* Guest chroot(2) root: a canonical namespace-absolute guest path that
+     * path_resolve re-roots the walk at (absolute-path seed, ".." clamp, and
+     * absolute-symlink reset all use it). "" or "/" means "not chrooted", the
+     * universal initial state — then resolution is unchanged. cwd stays
+     * namespace-absolute (chroot(2) does not change it); getcwd subtracts this
+     * base for the guest view. Copied by fork, preserved across execve. */
+    char chroot_base[PATH_MAX];
 
     /* The bind-mount table (--bind + runtime mount(2)/umount2(2)) does NOT live
      * in this per-process struct: it is a process-shared mmap owned by path.c

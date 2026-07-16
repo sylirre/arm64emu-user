@@ -355,10 +355,15 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
     char rest[PATH_MAX];       /* components still to process */
     char hostbuf[PATH_MAX];
 
+    /* chroot(2) root: an absolute path and an absolute symlink re-root here (not
+     * at "/"), and ".." cannot climb above it. "/" (the un-chrooted default)
+     * makes every rule below a no-op, so the non-chrooted path is unchanged. */
+    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+
     if (!gpath[0]) return -ENOENT;   /* AT_EMPTY_PATH handled by callers */
 
     if (gpath[0] == '/') {
-        strcpy(canon, "/");
+        strcpy(canon, croot);        /* absolute path is relative to the chroot */
     } else if (dirfd == G_AT_FDCWD) {
         if (strlen(m->cwd) + 1 > sizeof canon) return -ENAMETOOLONG;
         strcpy(canon, m->cwd[0] ? m->cwd : "/");
@@ -385,7 +390,10 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         p = end;
 
         if (!strcmp(comp, ".")) continue;
-        if (!strcmp(comp, "..")) { canon_pop(canon); continue; }
+        if (!strcmp(comp, "..")) {
+            if (strcmp(canon, croot)) canon_pop(canon);   /* clamp at chroot root */
+            continue;
+        }
 
         int r = canon_push(canon, comp);
         if (r < 0) return r;
@@ -415,7 +423,7 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         strcpy(rest, newrest);
         p = rest;
         canon_pop(canon);                 /* the link itself is replaced */
-        if (tgt[0] == '/') { canon[0] = '/'; canon[1] = 0; }
+        if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
     }
 
     if (!bind_match(m, canon, host_out) &&

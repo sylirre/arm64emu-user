@@ -108,6 +108,24 @@ bind mountpoint is not protected from `rmdir`, and reverse mapping (`getcwd`,
 the bind view — an inherent limit of prefix-based reverse mapping, already true
 of CLI binds.
 
+**`chroot(2)`** (`sys_chroot`) re-roots the guest into a subtree. It stores the
+resolved, canonical, namespace-absolute target in `m->chroot_base`, and
+`path_resolve` re-roots the walk there: an absolute path and an absolute symlink
+target start at `chroot_base` (not `/`), and `..` cannot climb above it. `canon`
+stays namespace-absolute, so every downstream consumer (`to_host`, `bind_match`,
+the special zones, the `/proc` synth) is unchanged — and with the default
+`chroot_base == "/"` the rules are no-ops, so an un-chrooted guest resolves
+exactly as before. Only `getcwd` is chroot-aware: it subtracts the base to show
+the in-chroot view (cwd itself stays namespace-absolute, since `chroot(2)` does
+not change it — the classic `chroot(x); chdir("/")` footgun). Gated on fake-root
+(`CAP_SYS_CHROOT`), like `mount`. The model is **faithful**: because the special
+zones and binds match the *namespace* path, `/dev` and `/proc` are not
+auto-provided inside a chroot — the guest bind-mounts them into the new root
+(`mount --bind /dev /newroot/dev`), exactly as on Linux. Nesting composes for
+free: `chroot` resolves its argument through the current root, so a chroot inside
+a chroot lands at the combined namespace path (`bind`/`chroot`/nested-`chroot`
+are all exercised together in the test suite).
+
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
 contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
 `sendmsg` route it through `path_resolve` (`bind` keeps the final component

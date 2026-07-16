@@ -1208,9 +1208,25 @@ SYSDEF(pipe2) {
 }
 
 SYSDEF(getcwd) {
-    size_t l = strlen(c->m->cwd) + 1;
+    struct Machine *m = c->m;
+    /* Report the cwd as the guest sees it: inside a chroot, subtract the chroot
+     * base (m->cwd is namespace-absolute). If cwd lies outside the chroot — only
+     * possible right after chroot(2), before the guest chdir("/")s — report "/". */
+    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+    const char *cwd = m->cwd[0] ? m->cwd : "/";
+    char view[PATH_MAX];
+    if (!strcmp(croot, "/")) {
+        strcpy(view, cwd);
+    } else {
+        size_t cl = strlen(croot);
+        if (!strncmp(cwd, croot, cl) && (cwd[cl] == '/' || cwd[cl] == 0))
+            strcpy(view, cwd[cl] ? cwd + cl : "/");
+        else
+            strcpy(view, "/");
+    }
+    size_t l = strlen(view) + 1;
     if (a1 < l) return (u64)(s64)-ERANGE;
-    if (copy_to_guest(c, a0, c->m->cwd, l) < 0) return (u64)(s64)-EFAULT;
+    if (copy_to_guest(c, a0, view, l) < 0) return (u64)(s64)-EFAULT;
     return l;
 }
 
@@ -1242,6 +1258,25 @@ SYSDEF(fchdir) {
         else strcpy(c->m->cwd, buf + rl);
     } else strcpy(c->m->cwd, "/");
     proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
+    return 0;
+}
+
+/* chroot(path=a0): re-root the guest at `path`. path_resolve resolves it in the
+ * current namespace (honoring any existing chroot, so nesting composes) to a
+ * canonical namespace-absolute path stored in m->chroot_base; subsequent
+ * absolute paths, "..", and absolute symlinks re-root there (path.c). Gated on
+ * fake-root, matching the kernel's CAP_SYS_CHROOT. Per POSIX, cwd is NOT changed
+ * (the classic footgun: programs do chroot(x); chdir("/")). */
+SYSDEF(chroot) {
+    struct Machine *m = c->m;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    char host[PATH_MAX], canon[PATH_MAX];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, canon);
+    if (r < 0) return (u64)(s64)r;
+    struct stat st;
+    if (stat(host, &st) < 0) return host_err();
+    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    strcpy(m->chroot_base, canon);
     return 0;
 }
 
