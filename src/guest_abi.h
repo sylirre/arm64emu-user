@@ -326,6 +326,8 @@
 #define G_HWCAP_SHA2    (1u << 6)
 #define G_HWCAP_CRC32   (1u << 7)
 #define G_HWCAP_ATOMICS (1u << 8)   /* advertised from M6 (LSE implemented) */
+#define G_HWCAP_FPHP    (1u << 9)   /* FEAT_FP16: scalar half-precision arithmetic */
+#define G_HWCAP_ASIMDHP (1u << 10)  /* FEAT_FP16: SIMD half-precision arithmetic */
 #define G_HWCAP_CPUID   (1u << 11)
 #define G_HWCAP_SHA3    (1u << 17)
 #define G_HWCAP_SHA512  (1u << 21)

@@ -700,18 +700,24 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
     }
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }
     if (ftype == 1) {
+        /* Fused: single rounding of n*m+a, matching AArch64 FMADD/FMSUB/FNMADD/
+         * FNMSUB. __builtin_fma inlines to a hardware FMA where the target has
+         * one (AArch64 always; x86 with -mfma) and otherwise calls libm's fma()
+         * (the build links -lm). The JIT frontend routes this family to the
+         * exec_a64 helper, so a host whose backend can only emit an unfused
+         * mul+add still matches the interpreter bit-for-bit. */
         double n = fp_rd_d(c, Rn), m = fp_rd_d(c, Rm), a = fp_rd_d(c, Ra), r;
-        if (!o1 && !o0) r =  a + n * m;           /* FMADD  */
-        else if (!o1)   r =  a - n * m;           /* FMSUB  */
-        else if (o1 && !o0) r = -a - n * m;       /* FNMADD */
-        else            r = -a + n * m;           /* FNMSUB */
+        if (!o1 && !o0) r = __builtin_fma( n, m,  a);   /* FMADD  */
+        else if (!o1)   r = __builtin_fma(-n, m,  a);   /* FMSUB  */
+        else if (o1 && !o0) r = __builtin_fma(-n, m, -a); /* FNMADD */
+        else            r = __builtin_fma( n, m, -a);   /* FNMSUB */
         fp_wr_d(c, Rd, r);
     } else {
         float n = fp_rd_s(c, Rn), m = fp_rd_s(c, Rm), a = fp_rd_s(c, Ra), r;
-        if (!o1 && !o0) r =  a + n * m;
-        else if (!o1)   r =  a - n * m;
-        else if (o1 && !o0) r = -a - n * m;
-        else            r = -a + n * m;
+        if (!o1 && !o0) r = __builtin_fmaf( n, m,  a);
+        else if (!o1)   r = __builtin_fmaf(-n, m,  a);
+        else if (o1 && !o0) r = __builtin_fmaf(-n, m, -a);
+        else            r = __builtin_fmaf( n, m, -a);
         fp_wr_s(c, Rd, r);
     }
 }
@@ -825,8 +831,8 @@ static double fop_d(unsigned op, double n, double m, double d) {
         case FOP_SUB: return n - m;
         case FOP_MUL: return n * m;
         case FOP_DIV: return n / m;
-        case FOP_MLA: return d + n * m;
-        case FOP_MLS: return d - n * m;
+        case FOP_MLA: return __builtin_fma( n, m, d);   /* fused (single rounding) */
+        case FOP_MLS: return __builtin_fma(-n, m, d);
         case FOP_ABD: return __builtin_fabs(n - m);
         case FOP_RECPS:  return 2.0 - n * m;
         case FOP_RSQRTS: return (3.0 - n * m) / 2.0;
@@ -859,8 +865,8 @@ static float fop_s(unsigned op, float n, float m, float d) {
         case FOP_SUB: return n - m;
         case FOP_MUL: return n * m;
         case FOP_DIV: return n / m;
-        case FOP_MLA: return d + n * m;
-        case FOP_MLS: return d - n * m;
+        case FOP_MLA: return __builtin_fmaf( n, m, d);  /* fused (single rounding) */
+        case FOP_MLS: return __builtin_fmaf(-n, m, d);
         case FOP_ABD: return __builtin_fabsf(n - m);
         case FOP_RECPS:  return 2.0f - n * m;
         case FOP_RSQRTS: return (3.0f - n * m) / 2.0f;
@@ -1128,9 +1134,11 @@ static void simd_three_same(CPU *c, u32 insn) {
             case (1 << 5) | 0x0e: { u64 ua=a&emask, ub=b&emask; v = ua > ub ? ua-ub : ub-ua; } break;      /* UABD */
             case (0 << 5) | 0x0f: { s64 d = sx(a,esize) - sx(b,esize); v = velem_get(&c->v[Rd],size,i) + (u64)(d<0?-d:d); } break; /* SABA */
             case (1 << 5) | 0x0f: { u64 ua=a&emask, ub=b&emask; v = velem_get(&c->v[Rd],size,i) + (ua>ub?ua-ub:ub-ua); } break;    /* UABA */
-            /* saturating doubling multiply-high */
-            case (0 << 5) | 0x16: { s64 p = 2*sx(a,esize)*sx(b,esize); v = sat_s(p >> esize, esize); } break;                       /* SQDMULH */
-            case (1 << 5) | 0x16: { s64 p = 2*sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-1)); v = sat_s(p >> esize, esize); } break; /* SQRDMULH */
+            /* saturating doubling multiply-high. Overflow-safe: form a*b (fits
+             * s64 for esize<=32) and shift by esize-1, not 2*a*b (which overflows
+             * s64 at the INT32_MIN*INT32_MIN corner and mis-saturates). */
+            case (0 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize); v = sat_s(p >> (esize-1), esize); } break;                          /* SQDMULH */
+            case (1 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break;   /* SQRDMULH */
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
@@ -2591,8 +2599,8 @@ static void simd_scalar_three_same(CPU *c, u32 insn) {
         case (1 << 5) | 0x10: v = a - b; break;                                        /* SUB */
         case (0 << 5) | 0x11: v = ((a & emask) & (b & emask)) ? emask : 0; break;       /* CMTST */
         case (1 << 5) | 0x11: v = ((a & emask) == (b & emask)) ? emask : 0; break;      /* CMEQ */
-        case (0 << 5) | 0x16: { s64 p = 2*sx(a,esize)*sx(b,esize); v = sat_s(p >> esize, esize); } break;                       /* SQDMULH */
-        case (1 << 5) | 0x16: { s64 p = 2*sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-1)); v = sat_s(p >> esize, esize); } break; /* SQRDMULH */
+        case (0 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize); v = sat_s(p >> (esize-1), esize); } break;                          /* SQDMULH (overflow-safe, see three-same) */
+        case (1 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break;   /* SQRDMULH */
         default: fpsimd_undef(c, insn); return;
     }
     velem_set(&r, size, 0, v & emask); c->v[Rd] = r;
@@ -2647,9 +2655,9 @@ static void simd_scalar_indexed(CPU *c, u32 insn) {
     unsigned esize = 8u << size; u64 emask = (1ULL << esize) - 1;
     u64 a = velem_get(&c->v[Rn], size, 0) & emask, e = velem_get(&c->v[Rm], size, index) & emask;
     if (opc == 0xc || opc == 0xd) {                   /* SQDMULH/SQRDMULH by element */
-        s64 p = 2 * sx(a, esize) * sx(e, esize);
-        if (opc == 0xd) p += (s64)1 << (esize - 1);
-        velem_set(&r, size, 0, sat_s(p >> esize, esize) & emask); c->v[Rd] = r; return;
+        s64 p = sx(a, esize) * sx(e, esize);          /* overflow-safe: a*b then >>(esize-1) */
+        if (opc == 0xd) p += (s64)1 << (esize - 2);
+        velem_set(&r, size, 0, sat_s(p >> (esize - 1), esize) & emask); c->v[Rd] = r; return;
     }
     if (opc == 0xb || opc == 0x3 || opc == 0x7) {     /* SQDMULL/SQDMLAL/SQDMLSL by element */
         s64 pr = (s64)sqdmull_sat(sx(a, esize), sx(e, esize), 2 * esize);

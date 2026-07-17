@@ -229,7 +229,8 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
 
     u64 hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
                 G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
-                G_HWCAP_SHA512 | G_HWCAP_ATOMICS;   /* LSE implemented (decode.c) */
+                G_HWCAP_SHA512 | G_HWCAP_ATOMICS |  /* LSE implemented (decode.c) */
+                G_HWCAP_FPHP | G_HWCAP_ASIMDHP;     /* FEAT_FP16 (exec_fpsimd.c) */
     /* Credentials (fake identity when -fake-id, else the real host ids).
      * AT_SECURE reflects a setuid/setgid transition (do_execve set euid/egid
      * from the file's bits before this reload), telling libc to run guarded. */
