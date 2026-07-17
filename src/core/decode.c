@@ -175,6 +175,7 @@ static void dp_immediate(CPU *c, u32 insn) {
     }
     if (t == 0x25) {                              /* move wide immediate */
         unsigned opc = BITS(30, 29), hw = BITS(22, 21), imm16 = BITS(20, 5);
+        if (!sf && hw >= 2) { undefined(c, insn); return; }  /* 32-bit: hw in {0,1} only */
         unsigned shift = hw * 16;
         u64 r;
         if (opc == 0) r = ~((u64)imm16 << shift);             /* MOVN */
@@ -203,10 +204,14 @@ static void dp_immediate(CPU *c, u32 insn) {
     }
     if (t == 0x27) {                              /* EXTR */
         unsigned Rm = BITS(20, 16), imms = BITS(15, 10);
-        u64 m = reg_x(c, Rn), n = reg_x(c, Rm);  /* Rn=low(Rm field?), see below */
+        /* N (bit22) must equal sf, bit21 must be 0, and the 32-bit form only
+         * allows lsb<32 — otherwise unallocated. Guarding also avoids the host
+         * UB of shifting a u32 by 32-lsb when lsb>=32. */
+        if (BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0 || (!sf && (imms & 0x20))) {
+            undefined(c, insn); return;
+        }
         /* EXTR Rd, Rn, Rm, #lsb : result = (Rn:Rm) >> lsb */
         u64 hi = reg_x(c, Rn), lo = reg_x(c, Rm);
-        (void)m; (void)n;
         unsigned lsb = imms;
         u64 r;
         if (sf) r = lsb ? ((hi << (64 - lsb)) | (lo >> lsb)) : lo;
@@ -649,6 +654,11 @@ static void ldst_register(CPU *c, u32 insn) {
         if (wb == 1) base = base + imm9;            /* post writeback value */
     }
 
+    /* opc==3 with size==3 is unallocated for the plain load/store forms (LSE
+     * atomics reach this function too but return above, so opc here is the
+     * size/sign field). Was executed as a 64-bit signed load truncated to 32. */
+    if (!V && opc == 3 && size == 3) { undefined(c, insn); return; }
+
     bool ok;
     if (V) ok = is_store ? vreg_store(c, Rt, va, bytes) : vreg_load(c, Rt, va, bytes);
     else   ok = is_store ? mem_write(c, va, bytes, reg_x(c, Rt)) : do_load(c, Rt, va, size, opc);
@@ -669,7 +679,10 @@ static void ldst_pair(CPU *c, u32 insn) {
     unsigned scale, esz;
     bool signed_word = false;
     if (V) { scale = opc + 2; esz = 1u << scale; }       /* S/D/Q = 4/8/16 bytes */
-    else { scale = (opc == 2) ? 3 : 2; esz = 1u << scale; signed_word = (opc == 1); }
+    else {
+        if (opc == 3) { undefined(c, insn); return; }    /* unallocated (was run as a 32-bit pair) */
+        scale = (opc == 2) ? 3 : 2; esz = 1u << scale; signed_word = (opc == 1);
+    }
     s64 offset = imm7 << scale;
 
     u64 base = reg_xsp(c, Rn), addr;
