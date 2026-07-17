@@ -299,10 +299,11 @@ SYSDEF(clone) {
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         /* A plain fork does not re-run load_elf, so publish the child (with the
-         * inherited cmdline/exe/cwd/environ and its own fresh starttime) or it
-         * would be invisible in the hidden /proc view until it execve'd. */
+         * inherited cmdline/exe/cwd/environ/auxv and its own fresh starttime) or
+         * it would be invisible in the hidden /proc view until it execve'd. */
         proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
-                         m->exec_path, m->cwd, m->environ, m->environ_len);
+                         m->exec_path, m->cwd, m->environ, m->environ_len,
+                         m->auxv, m->auxv_len);
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);

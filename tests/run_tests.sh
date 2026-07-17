@@ -454,8 +454,9 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 
 # ---- /proc fidelity: guest-view magic links (root/cwd/exe/fd — root must not
 # escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo/
-# loadavg/uptime/version, against a throwaway mini-rootfs (qemu has no rootfs
-# concept). A64_PROCSTAT_FORCE_SYNTH exercises the /proc/stat fallback (on a
+# loadavg/uptime/version/auxv (incl. another guest PID's auxv — the gdb-attach
+# shape), against a throwaway mini-rootfs (qemu has no rootfs concept).
+# A64_PROCSTAT_FORCE_SYNTH exercises the /proc/stat fallback (on a
 # normal Linux host the readable real file would pass through instead). ----
 if "$AGCC" -static -O2 -o tests/fixtures/procfs_fidelity.bin \
         tests/fixtures/procfs_fidelity.c 2>/dev/null; then
@@ -483,7 +484,8 @@ uptime fields=2 up_pos=1
 version_guest=1
 stat ncpu=1 running1=1 btime_ok=1 idle_agree=1
 stat_rewind=1
-uptime_rewind=1'
+uptime_rewind=1
+auxv_foreign entries>10=1 hwcap=1 pagesz=1'
     got=$(A64_PROCSTAT_FORCE_SYNTH=1 "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
     if [ "$got" = "$expect_pf" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_fidelity"
     else

@@ -105,9 +105,9 @@ full, random, urandom, tty, ptmx and the directories pts/ and shm/. Console
 maps to the controlling terminal, stdin/stdout/stderr and fd/* to the
 process's own file descriptors.
 
-Many /proc entries are synthesized: maps, cmdline, comm, mounts, mountinfo,
-loadavg, uptime, version. The /proc/stat is being synthesized only when can't
-be read (Android OS primarily).
+Many /proc entries are synthesized: maps, cmdline, comm, environ, auxv,
+mounts, mountinfo, mountstats, loadavg, uptime, version. The /proc/stat is
+being synthesized only when can't be read (Android OS primarily).
 
 Emulator can't be escaped and guest programs can't see processes running
 on the host.

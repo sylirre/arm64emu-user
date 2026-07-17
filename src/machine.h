@@ -86,9 +86,13 @@ struct Machine {
     char *environ;
     u32 environ_len;
 
-    /* Saved for auxv synthesis and /proc/self */
-    u64 auxv_va;              /* guest VA of auxv block on the initial stack */
-    u64 auxv_len;
+    /* Exec-time guest auxv block (raw u64 tag/value pairs, host byte copy) —
+     * the /proc/self/auxv content (host /proc/self/auxv shows the emulator's
+     * own auxv: the wrong ISA's AT_HWCAP sends gdb chasing pauth/SVE regsets
+     * the ptrace shim doesn't have). Rebuilt by every load_elf; fork's
+     * copy-on-write duplicates it like the rest of the heap. */
+    char *auxv;
+    u32 auxv_len;
     u64 entry, interp_base, phdr_va;
     int phnum;
 
@@ -296,10 +300,11 @@ int bind_count(void);
 int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
 
 /* proctab.c: cross-process guest-PID registry in shared memory. Each guest
- * process publishes its NUL-joined argv, guest exe path, cwd and NUL-joined
- * environ keyed by PID; readers synthesize /proc/<pid>/{cmdline,environ},
- * resolve /proc/<pid>/{exe,cwd} to the guest view, and recognize which numeric
- * /proc entries are guest PIDs (hiding host processes from the guest's view).
+ * process publishes its NUL-joined argv, guest exe path, cwd, NUL-joined
+ * environ and raw auxv block keyed by PID; readers synthesize
+ * /proc/<pid>/{cmdline,environ,auxv}, resolve /proc/<pid>/{exe,cwd} to the
+ * guest view, and recognize which numeric /proc entries are guest PIDs
+ * (hiding host processes from the guest's view).
  * Backed by anonymous shared memory (per-invocation, fork-inherited) by default;
  * with rootfs_key != NULL (-shared-proc) by a named tmpfs file keyed by
  * rootfs+uid, so the registry spans independent emulator invocations of the same
@@ -308,12 +313,14 @@ int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
 #define PROCTAB_CMDLINE  2048    /* per-entry cmdline cap (truncated beyond) */
 #define PROCTAB_ENVIRON  2048    /* per-entry environ cap (truncated beyond) */
 #define PROCTAB_PATH     1024    /* per-entry exe/cwd path cap (truncated beyond) */
+#define PROCTAB_AUXV      512    /* per-entry auxv cap (elf.c emits 320 bytes) */
 
 /* One seqlock-consistent read of a registry entry's mutable payload. Byte
  * counts, not NUL-terminated (callers append a terminator where needed). */
 struct ProcSnap {
     char cmd[PROCTAB_CMDLINE];   u32 cmd_len;
     char env[PROCTAB_ENVIRON];   u32 env_len;
+    char auxv[PROCTAB_AUXV];     u32 auxv_len;
     char exe[PROCTAB_PATH];      u16 exe_len;
     char cwd[PROCTAB_PATH];      u16 cwd_len;
 };
@@ -321,7 +328,8 @@ struct ProcSnap {
 void proctab_init(const char *rootfs_key);                 /* once, in main() */
 void proctab_register(s32 pid, const char *cmd, u32 len,   /* exec / fork */
                       const char *exe, const char *cwd,
-                      const char *env, u32 env_len);
+                      const char *env, u32 env_len,
+                      const char *auxv, u32 auxv_len);
 void proctab_unregister(s32 pid);                          /* exit */
 void proctab_set_cwd(s32 pid, const char *cwd);            /* chdir / fchdir */
 int  proctab_has(s32 pid);                                 /* is a guest PID? */

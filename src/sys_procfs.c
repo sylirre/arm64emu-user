@@ -16,10 +16,13 @@
  * the guest view. The time-varying files (loadavg/uptime/stat) are also
  * regenerated when a read starts at offset 0 (procfs_pre_read): procps
  * opens them once and lseek(0)+rereads every refresh cycle, so an open-time
- * snapshot would freeze top/vmstat. environ and mountstats are synthesized like
- * cmdline and mounts: environ is the guest's own environment (the host file
- * shows the emulator's), and mountstats is the guest mount device list (the host
- * file exposes the real mount namespace). For any guest PID (not just self), the
+ * snapshot would freeze top/vmstat. environ, auxv and mountstats are
+ * synthesized like cmdline and mounts: environ is the guest's own environment
+ * (the host file shows the emulator's), auxv is the guest's exec-time auxv
+ * block (the host file shows the emulator's — the wrong ISA's AT_HWCAP would
+ * send gdb chasing pauth/SVE regsets the ptrace shim doesn't have), and
+ * mountstats is the guest mount device list (the host file exposes the real
+ * mount namespace). For any guest PID (not just self), the
  * exe/cwd/root symlinks resolve to the guest view too, spliced in path.c from
  * this Machine (self) or the shared PID registry (another guest process). Under
  * --fake-id, /proc/<pid>/status is also synthesized: the host file's
@@ -46,7 +49,7 @@
 enum {
     PF_CMDLINE, PF_MAPS, PF_MOUNTS, PF_MOUNTINFO,
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
-    PF_ENVIRON, PF_MOUNTSTATS,
+    PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
 };
 
 /* put_mounts format selector. */
@@ -533,21 +536,28 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 1;
     }
 
-    /* /proc/<pid>/environ of ANOTHER guest process: served from the guest environ
-     * that process published in the registry (self / own-pid use m->environ via
-     * self_tail below). Off the registry (non-guest / raced) it falls through to
-     * the host path's ENOENT rather than leaking the emulator's own environment. */
+    /* /proc/<pid>/{environ,auxv} of ANOTHER guest process: served from the guest
+     * environ/auxv that process published in the registry (self / own-pid use
+     * m->environ / m->auxv via self_tail below). Off the registry (non-guest /
+     * raced) it falls through to the host path's ENOENT rather than leaking the
+     * emulator's own copy (gdb reads the inferior's auxv for AT_HWCAP; the host
+     * file's wrong-ISA value sends it chasing pauth/SVE regsets the ptrace shim
+     * doesn't have). */
     s32 epid;
     const char *etail = proc_num_tail(canon, &epid);
-    if (etail && epid != (s32)getpid() && !strcmp(etail, "environ")) {
+    if (etail && epid != (s32)getpid() &&
+        (!strcmp(etail, "environ") || !strcmp(etail, "auxv"))) {
         if (!proctab_has(epid)) return 0;
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         struct ProcSnap snap;
         if (!proctab_get(epid, &snap)) return 0;
+        const char *buf = snap.env;
+        u32 blen = snap.env_len;
+        if (etail[0] == 'a') { buf = snap.auxv; blen = snap.auxv_len; }
         int fd = synth_memfd();
         if (fd < 0) return 0;
-        if (snap.env_len) { ssize_t w = write(fd, snap.env, snap.env_len); (void)w; }
+        if (blen) { ssize_t w = write(fd, buf, blen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         *ret = fd;
@@ -575,6 +585,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if (tail) {
         if      (!strcmp(tail, "cmdline"))    kind = PF_CMDLINE;
         else if (!strcmp(tail, "environ"))    kind = PF_ENVIRON;
+        else if (!strcmp(tail, "auxv"))       kind = PF_AUXV;
         else if (!strcmp(tail, "maps"))       kind = PF_MAPS;
         else if (!strcmp(tail, "mounts"))     kind = PF_MOUNTS;
         else if (!strcmp(tail, "mountinfo"))  kind = PF_MOUNTINFO;
@@ -596,6 +607,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     }
     if (kind == PF_CMDLINE && !m->cmdline) return 0;
     if (kind == PF_ENVIRON && !m->environ) return 0;
+    if (kind == PF_AUXV    && !m->auxv)    return 0;
     if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
     if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
 
@@ -606,6 +618,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     switch (kind) {
     case PF_CMDLINE:    wr = write(fd, m->cmdline, m->cmdline_len); break;
     case PF_ENVIRON:    wr = write(fd, m->environ, m->environ_len); break;
+    case PF_AUXV:       wr = write(fd, m->auxv, m->auxv_len); break;
     case PF_MAPS:       put_maps(fd, m); break;
     case PF_MOUNTS:     put_mounts(fd, m, MNT_MOUNTS); break;
     case PF_MOUNTINFO:  put_mounts(fd, m, MNT_MOUNTINFO); break;

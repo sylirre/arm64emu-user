@@ -2,15 +2,17 @@
  * run_tests.sh (qemu-user has no rootfs concept, so this cannot be
  * differential): the magic self-links resolve and read back in guest terms —
  * /proc/self/root must NOT escape to the host fs — and maps/cmdline/comm/
- * mounts/mountinfo are synthesized from guest state. Expected output is
+ * mounts/mountinfo/auxv are synthesized from guest state. Expected output is
  * hard-coded in run_tests.sh. */
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -199,5 +201,41 @@ int main(void) {
         close(fd);
     }
     printf("uptime_rewind=%d\n", u1 > 0 && u2 > u1);
+
+    /* /proc/<pid>/auxv of ANOTHER guest process — the gdb-attach shape (gdb
+     * reads the inferior's auxv for AT_HWCAP) — must be the guest auxv from
+     * the shared registry, not the emulator's own host auxv (whose wrong-ISA
+     * AT_HWCAP sends gdb chasing pauth/SVE regsets the ptrace shim doesn't
+     * have). The child's registry entry is published inside its fork return
+     * path, so any guest code running in the child implies it is visible;
+     * the pipe byte orders the parent's read after that. */
+    int ready[2], hold[2];
+    char one = 1;
+    if (pipe(ready) == 0 && pipe(hold) == 0) {
+        pid_t ch = fork();
+        if (ch == 0) {
+            ssize_t w = write(ready[1], &one, 1);
+            ssize_t r = read(hold[0], &one, 1);
+            (void)w; (void)r;
+            _exit(0);
+        }
+        if (read(ready[0], &one, 1) != 1) puts("auxv_foreign sync=FAIL");
+        snprintf(p, sizeof p, "/proc/%d/auxv", (int)ch);
+        unsigned long long pair[2], hw = 0, pg = 0;
+        int ents = 0;
+        fd = open(p, O_RDONLY);
+        while (fd >= 0 && read(fd, pair, 16) == 16 && pair[0] != 0) {
+            if (pair[0] == 16) hw = pair[1];   /* AT_HWCAP */
+            if (pair[0] == 6)  pg = pair[1];   /* AT_PAGESZ */
+            ents++;
+        }
+        if (fd >= 0) close(fd);
+        printf("auxv_foreign entries>10=%d hwcap=%d pagesz=%d\n", ents > 10,
+               hw == getauxval(AT_HWCAP) && hw != 0, pg == getauxval(AT_PAGESZ));
+        ssize_t w = write(hold[1], &one, 1); (void)w;
+        waitpid(ch, NULL, 0);
+    } else {
+        puts("auxv_foreign pipe=FAIL");
+    }
     return 0;
 }

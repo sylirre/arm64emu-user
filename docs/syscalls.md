@@ -201,7 +201,11 @@ family is ungated (it does not depend on the host actually blocking netlink).
   `openat` diverts **synthesized files** (`sys_procfs.c`) to an in-memory guest
   view: `maps` (from the region list, PTE-true protections, `[heap]`/`[stack]`
   labels), `cmdline` (exec-time guest argv), `environ` (exec-time guest
-  environment — the host file shows the emulator's), `mounts`/`mountinfo`/
+  environment — the host file shows the emulator's), `auxv` (the exec-time
+  guest auxv block — the host file shows the emulator's, and the wrong ISA's
+  `AT_HWCAP` would make gdb believe in pauth/SVE and request `NT_ARM_PAC_MASK`
+  regsets the ptrace shim answers with EINVAL: on an AArch64 host that read
+  "unable to fetch pauth registers"), `mounts`/`mountinfo`/
   `mountstats` (the rootfs plus the passthrough zones — host `/proc` shows the
   emulator's mappings, argv, environment and mount namespace, all wrong for the
   guest), and the global `loadavg`/`uptime`/`version` (Android
@@ -233,13 +237,16 @@ family is ungated (it does not depend on the host actually blocking netlink).
   is a separate host process (guest PID == host PID) and one emulator instance
   cannot read another's guest state. A shared-memory PID registry (`proctab.c`,
   a `MAP_SHARED` region set up in `main()` before the first `fork`) carries it:
-  each process publishes its NUL-joined argv, guest exe path, cwd and NUL-joined
-  environ keyed by PID at `load_elf` and in the `fork` child (and refreshes cwd
-  on `chdir`/`fchdir`), with the `/proc/<pid>/stat` starttime as a stale-slot
-  guard against host PID reuse. `procfs_open` then synthesizes
-  `/proc/<pid>/cmdline` and `/proc/<pid>/environ` for any guest PID (otherwise
-  the host files show the `arm64chroot …` invocation and the emulator's
-  environment), and `/proc/<pid>/mounts`/`mountinfo`/`mountstats` for any guest
+  each process publishes its NUL-joined argv, guest exe path, cwd, NUL-joined
+  environ and raw auxv block keyed by PID at `load_elf` and in the `fork` child
+  (and refreshes cwd on `chdir`/`fchdir`), with the `/proc/<pid>/stat` starttime
+  as a stale-slot guard against host PID reuse. `procfs_open` then synthesizes
+  `/proc/<pid>/cmdline`, `/proc/<pid>/environ` and `/proc/<pid>/auxv` for any
+  guest PID (otherwise the host files show the `arm64chroot …` invocation and
+  the emulator's environment and auxv — `gdb` attaching to a guest process
+  reads the *inferior's* auxv for `AT_HWCAP`, so the cross-process copy is the
+  one that keeps it off pauth/SVE), and
+  `/proc/<pid>/mounts`/`mountinfo`/`mountstats` for any guest
   PID from the session's own mount table (the guest view is process-independent,
   so a plain `cat /proc/$$/mountinfo` read by a child no longer leaks the host
   mount namespace); `path_proc_magic` likewise resolves another guest PID's

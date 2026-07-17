@@ -272,11 +272,19 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     copy_to_guest(&m->cpu, va, &argc64, 8); va += 8;
     copy_to_guest(&m->cpu, va, argvp, 8 * ((size_t)argc + 1)); va += 8 * ((u64)argc + 1);
     copy_to_guest(&m->cpu, va, envpp, 8 * ((size_t)envc + 1)); va += 8 * ((u64)envc + 1);
-    m->auxv_va = va;
-    m->auxv_len = sizeof auxv;
     copy_to_guest(&m->cpu, va, auxv, sizeof auxv);
     free(argvp);
     free(envpp);
+
+    /* /proc/self/auxv content: the guest auxv block just laid out (the host
+     * file shows the emulator's own auxv — the wrong ISA's AT_HWCAP). */
+    char *aux = malloc(sizeof auxv);
+    if (aux) {
+        memcpy(aux, auxv, sizeof auxv);
+        free(m->auxv);
+        m->auxv = aux;
+        m->auxv_len = (u32)sizeof auxv;
+    }
 
     m->entry = exe.entry;
     m->interp_base = at_base;
@@ -316,12 +324,14 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         m->environ = env;
         m->environ_len = (u32)el;
     }
-    /* Publish the guest command line, exe path, cwd and environ in the shared PID
-     * registry so other guest processes' ps/top and /proc/<pid>/{cmdline,environ,
-     * exe,cwd} see the guest view (and this process counts as a guest PID for the
-     * hidden /proc view). Covers the initial exec and every execve reload. */
+    /* Publish the guest command line, exe path, cwd, environ and auxv in the
+     * shared PID registry so other guest processes' ps/top and /proc/<pid>/
+     * {cmdline,environ,auxv,exe,cwd} see the guest view (and this process counts
+     * as a guest PID for the hidden /proc view). Covers the initial exec and
+     * every execve reload. */
     proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
-                     m->exec_path, m->cwd, m->environ, m->environ_len);
+                     m->exec_path, m->cwd, m->environ, m->environ_len,
+                     m->auxv, m->auxv_len);
     /* Present the guest program's name as this process's comm, so
      * /proc/<pid>/comm, status Name: and stat field 2 — which pass through to
      * the host — are right for every guest process, and host-side ps shows

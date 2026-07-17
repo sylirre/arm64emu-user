@@ -41,10 +41,12 @@ struct ProcEnt {
     u64 start;                   /* /proc/<pid>/stat starttime (stale guard) */
     u32 len;                     /* cmdline byte length (<= PROCTAB_CMDLINE) */
     u32 env_len;                 /* environ byte length (<= PROCTAB_ENVIRON) */
+    u32 auxv_len;                /* auxv byte length (<= PROCTAB_AUXV) */
     u16 exe_len;                 /* exe path length (<= PROCTAB_PATH) */
     u16 cwd_len;                 /* cwd length (<= PROCTAB_PATH) */
     char cmd[PROCTAB_CMDLINE];   /* NUL-joined guest argv */
     char env[PROCTAB_ENVIRON];   /* NUL-joined guest environ */
+    char auxv[PROCTAB_AUXV];     /* raw guest auxv (u64 tag/value pairs) */
     char exe[PROCTAB_PATH];      /* canonical guest exe path */
     char cwd[PROCTAB_PATH];      /* canonical guest cwd */
 };
@@ -107,14 +109,14 @@ static const char *shared_dir(void) {
 static int proctab_open_shared(const char *rootfs_key, size_t size) {
     const char *dir = shared_dir();
     if (!dir) return 0;
-    /* +64 holds the fixed "/arm64chroot-proctab.v1.<uid>.<hash>" suffix on top of
+    /* +64 holds the fixed "/arm64chroot-proctab.vN.<uid>.<hash>" suffix on top of
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v2 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v3 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
-     * exe/cwd/environ fields to v1's cmdline-only entry.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v2.%u.%08x",
+     * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v3.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;
@@ -146,10 +148,12 @@ void proctab_init(const char *rootfs_key) {
  * the critical section is syscall-free (a tiny, kill-safe window). */
 void proctab_register(s32 pid, const char *cmd, u32 len,
                       const char *exe, const char *cwd,
-                      const char *env, u32 env_len) {
+                      const char *env, u32 env_len,
+                      const char *auxv, u32 auxv_len) {
     if (!g_tab || pid <= 0) return;
     if (len > PROCTAB_CMDLINE) len = PROCTAB_CMDLINE;
     if (env_len > PROCTAB_ENVIRON) env_len = PROCTAB_ENVIRON;
+    if (auxv_len > PROCTAB_AUXV) auxv_len = PROCTAB_AUXV;
     u32 exe_len = exe ? (u32)strlen(exe) : 0;
     if (exe_len > PROCTAB_PATH) exe_len = PROCTAB_PATH;
     u32 cwd_len = cwd ? (u32)strlen(cwd) : 0;
@@ -185,12 +189,14 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
     e->start = start;
     e->len = len;
     e->env_len = env_len;
+    e->auxv_len = auxv_len;
     e->exe_len = (u16)exe_len;
     e->cwd_len = (u16)cwd_len;
-    if (cmd && len)      memcpy(e->cmd, cmd, len);
-    if (env && env_len)  memcpy(e->env, env, env_len);
-    if (exe_len)         memcpy(e->exe, exe, exe_len);
-    if (cwd_len)         memcpy(e->cwd, cwd, cwd_len);
+    if (cmd && len)        memcpy(e->cmd, cmd, len);
+    if (env && env_len)    memcpy(e->env, env, env_len);
+    if (auxv && auxv_len)  memcpy(e->auxv, auxv, auxv_len);
+    if (exe_len)           memcpy(e->exe, exe, exe_len);
+    if (cwd_len)           memcpy(e->cwd, cwd, cwd_len);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED);   /* even: write done */
 }
@@ -236,9 +242,9 @@ int proctab_has(s32 pid) {
     return 0;
 }
 
-/* Snapshot the whole mutable payload (cmdline, environ, exe, cwd) for `pid` via
- * a seqlock read, then confirm the entry's starttime still matches the live
- * process. Returns 1 on a fresh hit, 0 on miss/stale. */
+/* Snapshot the whole mutable payload (cmdline, environ, auxv, exe, cwd) for
+ * `pid` via a seqlock read, then confirm the entry's starttime still matches
+ * the live process. Returns 1 on a fresh hit, 0 on miss/stale. */
 int proctab_get(s32 pid, struct ProcSnap *out) {
     if (!g_tab || pid <= 0) return 0;
     int slot = -1;
@@ -252,18 +258,20 @@ int proctab_get(s32 pid, struct ProcSnap *out) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->pid, __ATOMIC_RELAXED) != pid) return 0;   /* slot recycled */
         u64 start = e->start;
-        u32 cl = e->len;     if (cl > PROCTAB_CMDLINE) cl = PROCTAB_CMDLINE;
-        u32 el = e->env_len; if (el > PROCTAB_ENVIRON) el = PROCTAB_ENVIRON;
-        u32 xl = e->exe_len; if (xl > PROCTAB_PATH)    xl = PROCTAB_PATH;
-        u32 wl = e->cwd_len; if (wl > PROCTAB_PATH)    wl = PROCTAB_PATH;
+        u32 cl = e->len;      if (cl > PROCTAB_CMDLINE) cl = PROCTAB_CMDLINE;
+        u32 el = e->env_len;  if (el > PROCTAB_ENVIRON) el = PROCTAB_ENVIRON;
+        u32 al = e->auxv_len; if (al > PROCTAB_AUXV)    al = PROCTAB_AUXV;
+        u32 xl = e->exe_len;  if (xl > PROCTAB_PATH)    xl = PROCTAB_PATH;
+        u32 wl = e->cwd_len;  if (wl > PROCTAB_PATH)    wl = PROCTAB_PATH;
         memcpy(out->cmd, e->cmd, cl);
         memcpy(out->env, e->env, el);
+        memcpy(out->auxv, e->auxv, al);
         memcpy(out->exe, e->exe, xl);
         memcpy(out->cwd, e->cwd, wl);
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1) {
             if (start != proc_starttime(pid)) return 0;   /* stale (PID reused) */
-            out->cmd_len = cl; out->env_len = el;
+            out->cmd_len = cl; out->env_len = el; out->auxv_len = al;
             out->exe_len = (u16)xl; out->cwd_len = (u16)wl;
             return 1;
         }
