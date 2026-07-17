@@ -472,7 +472,9 @@ static char *short_value(const char *opt, char *rest, char **argv, int argc, int
 
 /* Append a guest -E/--env "VAR=VAL" entry. */
 static void push_env(char ***env, int *n, char *v) {
-    *env = realloc(*env, sizeof(char *) * (size_t)(*n + 1));
+    char **nv = realloc(*env, sizeof(char *) * (size_t)(*n + 1));
+    if (!nv) { perror("arm64chroot: realloc"); exit(127); }
+    *env = nv;
     (*env)[(*n)++] = v;
 }
 
@@ -636,6 +638,7 @@ int main(int argc, char **argv) {
     int gargc = 0;
     while (gargv_in[gargc]) gargc++;
     char **gargv = malloc(sizeof(char *) * (size_t)(gargc + 1));
+    if (!gargv) { perror("arm64chroot: malloc"); exit(127); }
     for (int k = 0; k < gargc; k++) gargv[k] = gargv_in[k];
     gargv[gargc] = NULL;
     if (argv0) gargv[0] = (char *)argv0;
@@ -651,6 +654,7 @@ int main(int argc, char **argv) {
     static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
     int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
     char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + 1));
+    if (!genv) { perror("arm64chroot: malloc"); exit(127); }
     int ge = 0;
     for (int k = 0; k < n_extra; k++) genv[ge++] = extra_env[k];
     for (int k = 0; k < n_keep; k++) {
