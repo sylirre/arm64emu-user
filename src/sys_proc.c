@@ -422,6 +422,13 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             nv[k++] = strdup(pathbuf);   /* script path as seen by the guest */
             for (int i = 1; i < oldc; i++) nv[k++] = strdup(argv[i]);
             nv[k] = NULL;
+            for (int i = 0; i < k; i++)
+                if (!nv[i]) {   /* a NULL hole would silently truncate argv */
+                    for (int j = 0; j < k; j++) free(nv[j]);
+                    free(nv);
+                    free_strvec(argv);
+                    return (u64)(s64)-ENOMEM;
+                }
             free_strvec(argv);          /* free the previous working copy */
             argv = nv;
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
