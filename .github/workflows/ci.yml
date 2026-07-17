@@ -32,6 +32,8 @@ jobs:
       # libc6-dev-arm64-cross   -> /usr/aarch64-linux-gnu glibc: static+dynamic
       #                            linking, and the offline source setup_env.sh
       #                            copies the glibc test rootfs from
+      # gcc-multilib            -> 32-bit libc headers + startup files for the
+      #                            -m32 ILP32-host build exercised by `make test32`
       # qemu-user               -> qemu-aarch64 (the differential oracle)
       # qemu-user-static, proot -> Alpine minirootfs bootstrap + shell-test oracle
       # expect                  -> interactive job-control (PTY) test
@@ -39,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-multilib \
             qemu-user qemu-user-static proot expect
 
       - name: Build
