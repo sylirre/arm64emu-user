@@ -584,37 +584,59 @@ SYSDEF(wait4) {
     pid_t wpid = (pid_t)(s32)a0;
     int options = (int)a2;
 
-    /* No registry (ptrace impossible this session): the original blocking
-     * host wait4 pass-through, unchanged. */
-    if (!ptrace_available()) {
-        int status;
-        struct rusage ru;
-        pid_t pid = wait4(wpid, &status, options, a3 ? &ru : NULL);
-        if (pid < 0) return host_err();
-        if (a1) {
-            s32 gs = status;
-            if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
-        }
-        if (a3 && pid > 0) {
-            GRusage g;
-            rusage_out(&g, &ru);
-            if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        }
-        return (u64)pid;
-    }
-
-    /* Registry present: poll, because a cooperative ptrace-stop is not a
-     * host-visible child state change, and a tracee may register at any moment
-     * (closing the PTRACE_TRACEME/wait race — this loop re-checks every pass).
-     * The blocking primitive is the global-generation futex, bumped by every
-     * stop and every guest exit; a short backstop covers uncooperative deaths
-     * (a host SIGKILL runs no guest code to bump the generation). Normal exits
-     * wake the waiter immediately via ptrace_wake_waiters(), so untraced
-     * fork/wait workloads keep their latency. */
+    /* Two modes, re-evaluated every pass (a kick can flip us between them).
+     *
+     * Fast path -- the caller is not a tracer for wpid (no registry, nobody in
+     * the session traces, or no tracee of ours matches): the real *blocking*
+     * host wait4. The kernel provides the exact wakeup for child deaths, so
+     * untraced fork/wait workloads run at native latency. The cooperative
+     * ptrace events a blocked host wait cannot see are pushed to us as
+     * signals: a child's TRACEME stop wakes us with the no-SA_RESTART wake
+     * kick (pt_wake_tracer, re-sent from the tracee's park loop until
+     * collected), an ATTACH targeting us arrives as the attach kick -- both
+     * EINTR the wait and we re-evaluate from the top.
+     *
+     * Tracer path -- poll, because a cooperative ptrace-stop is not a
+     * host-visible child state change: registry check + host WNOHANG, then a
+     * sleep on the state-change generation (sampled *before* the checks, so a
+     * stop/exit published in between is never a lost wakeup). The backstop
+     * timeout covers uncooperative deaths (a host SIGKILL runs no guest code
+     * to bump the generation). */
     for (;;) {
+        if (!ptrace_available() || !ptrace_any_trace() ||
+            !ptrace_have_tracee((s32)wpid)) {
+            int status;
+            struct rusage ru;
+            pid_t pid = wait4(wpid, &status, options, a3 ? &ru : NULL);
+            if (pid < 0) {
+                if (errno == EINTR) {
+                    if (g_ptrace_kick) ptrace_service_kick(c);
+                    if (g_sig_npend && sig_pending_deliverable(c->m))
+                        return (u64)(s64)-EINTR;   /* guest signal: deliver */
+                    continue;   /* wake kick / undeliverable: re-evaluate mode */
+                }
+                return host_err();
+            }
+            /* Defensive: a link keyed to this pid with us as tracer can only
+             * appear in a race window (TRACEME after the gate check); drop it
+             * so it cannot go stale. No-op otherwise. */
+            if (pid > 0 && ptrace_any_trace()) ptrace_note_reaped((s32)pid);
+            if (a1) {
+                s32 gs = status;
+                if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+            }
+            if (a3 && pid > 0) {
+                GRusage g;
+                rusage_out(&g, &ru);
+                if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)pid;
+        }
+
+        u32 gen = ptrace_wait_gen();   /* before the checks: lost-wakeup guard */
         int st;
         s32 rp;
-        if (ptrace_any_trace() && ptrace_collect((s32)wpid, &st, &rp)) {
+        if (ptrace_collect((s32)wpid, &st, &rp)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -626,7 +648,7 @@ SYSDEF(wait4) {
         pid_t pid = wait4(wpid, &status, options | WNOHANG, a3 ? &ru : NULL);
         int werr = errno;
         if (pid > 0) {
-            if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
+            ptrace_note_reaped((s32)pid);
             if (a1) {
                 s32 gs = status;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -655,8 +677,10 @@ SYSDEF(wait4) {
             return (u64)(u32)rp;
         }
         if (options & WNOHANG) return 0;     /* nothing ready yet */
-        ptrace_tracer_wait(100);             /* sleep until an event or backstop */
-        if (g_sig_npend) return (u64)(s64)-EINTR;  /* guest signal: let it deliver */
+        ptrace_tracer_wait(gen, 100);        /* sleep until an event or backstop */
+        if (g_ptrace_kick) ptrace_service_kick(c);
+        if (g_sig_npend && sig_pending_deliverable(c->m))
+            return (u64)(s64)-EINTR;         /* guest signal: let it deliver */
     }
 }
 
@@ -681,25 +705,37 @@ SYSDEF(waitid) {
     int options = (int)a3;
     (void)a4; (void)a5;
 
-    /* No registry: the original host waitid pass-through. */
-    if (!ptrace_available()) {
-        siginfo_t si;
-        memset(&si, 0, sizeof si);
-        int r = waitid(idtype, id, &si, options);
-        if (r < 0) return host_err();
-        int e = waitid_out(c, infop, &si);
-        return e ? (u64)(s64)e : 0;
-    }
-
-    /* Registry present: poll, like wait4 (a cooperative ptrace-stop is not a
-     * host-visible child state change). A ptrace stop is reported as a
-     * CLD_TRAPPED SIGCHLD siginfo, matching the kernel's waitid view. */
+    /* Same two modes as wait4: a real blocking host waitid unless the caller
+     * is a tracer for the waited id, else the registry poll (a ptrace stop is
+     * reported as a CLD_TRAPPED SIGCHLD siginfo, matching the kernel's waitid
+     * view). See sys_wait4 for the full rationale. */
     s32 wpid = (idtype == P_PID) ? (s32)id : -1;   /* P_ALL/P_PGID: best-effort any */
     for (;;) {
+        if (!ptrace_available() || !ptrace_any_trace() ||
+            !ptrace_have_tracee(wpid)) {
+            siginfo_t si;
+            memset(&si, 0, sizeof si);
+            int r = waitid(idtype, id, &si, options);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    if (g_ptrace_kick) ptrace_service_kick(c);
+                    if (g_sig_npend && sig_pending_deliverable(c->m))
+                        return (u64)(s64)-EINTR;   /* guest signal: deliver */
+                    continue;   /* wake kick / undeliverable: re-evaluate mode */
+                }
+                return host_err();
+            }
+            /* Defensive: see the matching wait4 comment. */
+            if (si.si_pid != 0 && ptrace_any_trace())
+                ptrace_note_reaped((s32)si.si_pid);
+            int e = waitid_out(c, infop, &si);
+            return e ? (u64)(s64)e : 0;
+        }
+
+        u32 gen = ptrace_wait_gen();   /* before the checks: lost-wakeup guard */
         int st;
         s32 rp;
-        if (ptrace_any_trace() && (options & WSTOPPED) &&
-            ptrace_collect(wpid, &st, &rp)) {
+        if ((options & WSTOPPED) && ptrace_collect(wpid, &st, &rp)) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             si.si_signo = SIGCHLD;
@@ -714,7 +750,7 @@ SYSDEF(waitid) {
         int r = waitid(idtype, id, &si, options | WNOHANG);
         int werr = errno;
         if (r == 0 && si.si_pid != 0) {
-            if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
+            ptrace_note_reaped((s32)si.si_pid);
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
@@ -738,8 +774,10 @@ SYSDEF(waitid) {
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
-        ptrace_tracer_wait(100);
-        if (g_sig_npend) return (u64)(s64)-EINTR;
+        ptrace_tracer_wait(gen, 100);
+        if (g_ptrace_kick) ptrace_service_kick(c);
+        if (g_sig_npend && sig_pending_deliverable(c->m))
+            return (u64)(s64)-EINTR;
     }
 }
 

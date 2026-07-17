@@ -160,6 +160,28 @@ static int pt_is_stopsig(int sig) {
     return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
 }
 
+/* Wake tracer `tr` after publishing an event (a stop or a synthetic exit).
+ * Two channels, because the tracer may be waiting either way:
+ *  - SIGCHLD, exactly as the kernel raises on a tracee state change: an async
+ *    tracer (gdb) waits in an event loop driven by its own SIGCHLD handler.
+ *  - The reserved kick signal carrying PT_WAKE_MAGIC: its handler (sig_kick_net,
+ *    installed in every emulator process, no SA_RESTART) is a pure no-op whose
+ *    EINTR knocks a tracer out of a *blocking* host wait4/waitid so it re-checks
+ *    the registry. This works regardless of the tracer's SIGCHLD disposition
+ *    (SIG_DFL SIGCHLD is discarded by the host without interrupting anything). */
+static void pt_wake_tracer(s32 tr) {
+    if (tr <= 0) return;
+    kill(tr, SIGCHLD);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = PTRACE_KICKSIG;
+    si.si_code = SI_QUEUE;
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    si.si_value.sival_int = PT_WAKE_MAGIC;
+    syscall(SYS_rt_sigqueueinfo, (pid_t)tr, PTRACE_KICKSIG, &si);
+}
+
 void ptrace_init(void) {
     void *p = mmap(NULL, sizeof(PtTable), PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -308,6 +330,12 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
                 pt_self_detach();
                 return 0;
             }
+            /* Our stop still unreaped after 500ms: the publish-time wake may
+             * have raced the tracer's blocking wait entry (or landed on the
+             * wrong thread of a multithreaded tracer). Re-kick until the stop
+             * is collected; a no-op for a tracer already handling us. */
+            if (!__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE))
+                pt_wake_tracer(tr);
         }
         seen = __atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE);
         int leave = 0;
@@ -394,14 +422,12 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
     e->si_errno = 0;
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
-    /* Wake the tracer's wait4. A blocking wait4 sleeps on global_gen; but an
-     * async tracer (gdb) waits in an event loop driven by SIGCHLD (self-pipe +
-     * ppoll), so also send the tracer a SIGCHLD, exactly as the kernel does when
-     * a real tracee stops. Without it gdb never reaps the cooperative stop. */
+    /* Wake the tracer's wait4/waitid: the poll-mode futex, plus the SIGCHLD +
+     * wake-kick pair (pt_wake_tracer) that knocks a tracer out of a blocking
+     * host wait or a gdb-style SIGCHLD event loop. */
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
-    { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
-      if (tr > 0) kill(tr, SIGCHLD); }
+    pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
     return pt_service_loop(c, e, seen);
 }
 
@@ -528,7 +554,7 @@ void ptrace_report_exit(CPU *c, int wstatus) {
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
-        kill(tr, SIGCHLD);   /* wake an async tracer's event loop */
+        pt_wake_tracer(tr);   /* SIGCHLD event loop + blocked-wait kick */
         return;   /* keep the link; the tracer frees it on collect */
     }
     pt_free(e);
@@ -550,6 +576,9 @@ void ptrace_report_exit_group(int wstatus) {
     g_ptrace_skip_syscall_stop = 0;
     if (was) pt_traced_dec(&g_machine);
     if (!g_tab) return;
+    /* Links exist only once someone traces; skip the scan in the common
+     * untraced exit. */
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
     s32 me = (s32)getpid(), ppid = (s32)getppid();
     int published = 0;
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -563,7 +592,7 @@ void ptrace_report_exit_group(int wstatus) {
         if (t == me && tr == ppid) continue;   /* host wait reaps this death */
         e->exit_status = wstatus;
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
-        kill(tr, SIGCHLD);                  /* wake an async tracer's event loop */
+        pt_wake_tracer(tr);                 /* SIGCHLD loop + blocked-wait kick */
         published = 1;
     }
     if (published) {
@@ -1024,10 +1053,16 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
     return 0;
 }
 
-void ptrace_tracer_wait(int ms) {
+u32 ptrace_wait_gen(void) {
+    return g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
+}
+
+void ptrace_tracer_wait(u32 gen, int ms) {
     if (!g_tab) return;
-    u32 g = __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE);
-    fx_wait(&g_tab->global_gen, g, ms);
+    /* `gen` was sampled by the caller before it checked the registry and the
+     * host WNOHANG wait, so a state change published in between mismatches
+     * here and FUTEX_WAIT returns immediately (no lost wakeup). */
+    fx_wait(&g_tab->global_gen, gen, ms);
 }
 
 void ptrace_note_reaped(s32 pid) {
@@ -1103,6 +1138,10 @@ int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid) {
 
 void ptrace_wake_waiters(void) {
     if (!g_tab) return;
+    /* Poll-mode waiters exist only in tracing sessions (an untraced parent
+     * blocks in the real host wait, which the kernel wakes itself); skip the
+     * bump + futex syscall on the common untraced exit. */
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
 }

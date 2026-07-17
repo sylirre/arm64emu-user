@@ -251,6 +251,10 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         jit_signal_interrupt();
         return;
     }
+    if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_WAKE_MAGIC)
+        return;   /* tracee->tracer wake: the EINTR on a blocked host
+                     wait4/waitid is the whole effect; no flags, invisible
+                     to the guest */
     host_catcher(sig, si, uctx);    /* a guest-directed signal of this number */
 }
 

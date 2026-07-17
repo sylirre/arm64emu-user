@@ -31,9 +31,13 @@ extern __thread volatile sig_atomic_t g_ptrace_kick;
 /* Host signal reserved for the attach stop-kick (a high RT signal the emulator
  * never uses; NOT SIGURG, which Go uses for preemption). A tracer sends it with
  * sigqueue() carrying PT_KICK_MAGIC so the handler can tell it apart from a
- * guest-directed signal of the same number (which it forwards). */
+ * guest-directed signal of the same number (which it forwards). PT_WAKE_MAGIC
+ * is the tracee->tracer wake: its handler is a pure no-op whose only purpose is
+ * the EINTR it inflicts on a tracer blocked in a host wait4/waitid, making it
+ * re-check the registry (sig_kick_net owns the signal in every process). */
 #define PTRACE_KICKSIG   SIGRTMAX
 #define PT_KICK_MAGIC    0x50544b21   /* "PTK!" */
+#define PT_WAKE_MAGIC    0x50545721   /* "PTW!" */
 
 /* main(): create the shared link registry (before the first fork). */
 void ptrace_init(void);
@@ -141,8 +145,13 @@ int  ptrace_collect(s32 wpid, int *status, s32 *outpid);
  * WIFSIGNALED(SIGKILL) so a sibling tracer's wait4 poll does not hang. Fills the
  * status and outpid out-params and returns 1 if found, else 0. */
 int  ptrace_reap_dead(s32 wpid, int *status, s32 *outpid);
-/* Block up to ms milliseconds for any tracee to change state (stop/exit). */
-void ptrace_tracer_wait(int ms);
+/* Sample the state-change generation. Take it *before* checking the registry
+ * and the host WNOHANG wait, then sleep with ptrace_tracer_wait(gen, ms): a
+ * stop/exit published in between bumps the generation and the sleep returns
+ * immediately instead of eating the full backstop (lost-wakeup guard). */
+u32  ptrace_wait_gen(void);
+/* Block up to ms milliseconds for a tracee state change past `gen`. */
+void ptrace_tracer_wait(u32 gen, int ms);
 /* Wake every process blocked in the wait4 polling loop (a guest exit, so a
  * parent waiting on a child that isn't a host-visible stop re-checks). */
 void ptrace_wake_waiters(void);

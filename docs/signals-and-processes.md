@@ -264,21 +264,43 @@ thread-local `g_ptrace_*` int gates the hot paths):
   link flips to exited under it).
 
 **`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
-tracee is a running host process parked in its service loop), so once tracing is
-active `wait4` polls: it multiplexes ptrace-stops and synthetic tracee exits
+tracee is a running host process parked in its service loop), so a **tracer's**
+`wait4`/`waitid` polls: it multiplexes ptrace-stops and synthetic tracee exits
 (from the registry) with real child exits (`waitpid(WNOHANG)`), blocking on a
-global-generation futex that every stop and every guest exit bumps. It
-synthesizes the status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall
-stops under `PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops. Processes that
-never trace keep the original blocking `wait4` pass-through.
+global-generation futex that every stop and every guest exit in a tracing
+session bumps — the generation is sampled *before* the registry and `WNOHANG`
+checks, so a state change published in between mismatches the `FUTEX_WAIT` and
+is never a lost wakeup (a short backstop timeout still covers uncooperative
+deaths, which run no guest code to bump the generation). It synthesizes the
+status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall stops under
+`PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops.
 
-A tracee entering a stop (and a synthetic exit) also sends its tracer a host
-`SIGCHLD`, exactly as the kernel does when a real tracee stops. A tracer blocked
-in `wait4` is already woken by the global-generation futex, but an *asynchronous*
-tracer — `gdb`, whose event loop sleeps in `ppoll`/`pselect` and only calls
-`waitpid(WNOHANG)` after a `SIGCHLD` handler pokes its self-pipe — would never
-learn of a cooperative stop without it. (The futex is not enough because gdb
-never blocks in `wait4`; strace, which does, works either way.)
+Everyone else — no registry, nobody tracing in the session (`any_trace`), or no
+live tracee of the caller matching the waited id (`ptrace_have_tracee`) — keeps
+the original genuinely **blocking** host `wait4`/`waitid`: the kernel provides
+the exact wakeup for child deaths, so untraced fork/wait workloads (shells,
+`posix_spawn` storms, build systems) run at native latency instead of paying a
+poll backstop per reaped child. The mode is re-evaluated on every pass, because
+a blocked non-tracer can *become* a tracer under its own wait: a forked child
+may call `TRACEME` and enter its first cooperative stop while the parent is
+already inside the blocking host wait, which cannot see it.
+
+That is why a tracee entering a stop (and publishing a synthetic exit) wakes
+its tracer through `pt_wake_tracer`, on two channels at once:
+
+- a host `SIGCHLD`, exactly as the kernel raises on a tracee state change — an
+  *asynchronous* tracer (`gdb`, whose event loop sleeps in `ppoll`/`pselect`
+  and only calls `waitpid(WNOHANG)` after a `SIGCHLD` handler pokes its
+  self-pipe) would never learn of a cooperative stop without it;
+- the reserved kick signal carrying `PT_WAKE_MAGIC` — its permanent handler
+  (`sig_kick_net`, no `SA_RESTART`) is a deliberate no-op whose `EINTR` knocks
+  a tracer out of a *blocking* host wait regardless of its `SIGCHLD`
+  disposition (a `SIG_DFL` `SIGCHLD` is discarded by the host kernel without
+  interrupting anything); the woken wait re-evaluates its mode, finds the new
+  tracee, and collects the stop from the registry. Since the kick could race
+  the tracer right before it blocks (or land on the wrong thread of a
+  multithreaded tracer), the parked tracee re-sends it on each 500 ms pass of
+  its service loop until the stop is collected.
 
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
