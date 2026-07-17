@@ -30,21 +30,20 @@ Below is a comparison between native execution, proot, arm64chroot interpreter
 and JIT. The host is Intel i7-8665U and used benchmark program is
 [byte-unixbench](https://github.com/kdlucas/byte-unixbench).
 
-Benchmark configuration: `./Run -i 2 arithmetic dhry syscall context1 spawn`
+Benchmark configuration: `./Run -c 1 -i 2 arithmetic dhry syscall context1 spawn`
 
-The final index of single core tests taken into account. Higher score means
-the faster execution.
+Higher final index means the faster execution.
 
 | Setup                  | Benchmark Score |
 |------------------------|-----------------|
-| native                 | 1143.4          |
-| proot                  | 291.9           |
-| QEMU user              | 103.4           |
-| **This (interpreter)** | 93.4            |
-| **This (JIT)**         | 245.6           |
+| native                 | 1163.6          |
+| proot                  | 270.7           |
+| QEMU user              | 100.6           |
+| **This (interpreter)** | 94.2            |
+| **This (JIT)**         | 248.1           |
 
-Here we see that `arm64choot` in JIT mode outperforms `qemu-aarch64` (chroot
-with binfmt_misc).
+*Here we see that arm64choot in JIT mode outperforms qemu-aarch64 (chroot
+with binfmt_misc).*
 
 ## Usage
 
@@ -173,8 +172,6 @@ but not remembered).
   Advanced-SIMD, CRC32, crypto (AES/SHA1/SHA2/SHA512/SHA3/PMULL),
   ARMv8.1 LSE atomics (CAS/CASP/SWP/LDADD/…), exclusives, and FPCR
   rounding modes.
-
-  HWCAP advertises FP/ASIMD/AES/PMULL/SHA*/CRC32/ATOMICS.
 
 - **Threads**
 
