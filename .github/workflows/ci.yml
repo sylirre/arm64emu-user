@@ -48,5 +48,14 @@ jobs:
       # run_tests.sh auto-provisions the Alpine + glibc test rootfs from scratch
       # into tests/.cache (one-time Alpine fetch from the CDN); no hand-staged
       # $HOME rootfs is required.
-      - name: Test suite
+      - name: Interpreter (64-bit host)
         run: make test
+
+      - name: Interpreter (64-bit, Android seccomp)
+        run: make test-seccomp
+
+      - name: Interpreter (32-bit host)
+        run: make test32
+
+      - name: JIT (64-bit host)
+        run: make test-jit
