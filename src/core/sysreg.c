@@ -58,7 +58,7 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,0,0,0,6): v = 0; break;                   /* REVIDR_EL1 */
         case KEY(3,3,0,0,1): v = 0x8444c004; break;          /* CTR_EL0 */
         case KEY(3,3,0,0,7): v = 4; break;                   /* DCZID_EL0: BS=4 (64B), DZP=0 */
-        case KEY(3,0,0,4,0): v = 0x22; break;                /* ID_AA64PFR0_EL1 (matches QEMU cortex-a57) */
+        case KEY(3,0,0,4,0): v = 0x110022; break;            /* ID_AA64PFR0_EL1: EL0/EL1=AArch64+32, FP[19:16]=1 & AdvSIMD[23:20]=1 (FEAT_FP16, half-precision arith implemented in exec_fpsimd.c) */
         case KEY(3,0,0,4,1): v = 0; break;                   /* ID_AA64PFR1_EL1 */
         case KEY(3,0,0,5,0): v = 0x10305106; break;          /* ID_AA64DFR0_EL1 (QEMU cortex-a57) */
         case KEY(3,0,0,5,1): v = 0; break;                   /* ID_AA64DFR1_EL1 */
