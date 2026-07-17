@@ -516,6 +516,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                     default: r = f_trunc(v); break;  /* Z: toward zero */
                 }
             }
+            if (r != r) r = 0.0;       /* NaN -> 0 (FPToFixed), not INT_MIN */
             if ((opcode & 1) == 0) {   /* signed */
                 if (x64) { s64 m = (r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r; set_x(c, Rd, (u64)m); }
                 else     { s32 m = (r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r; set_x(c, Rd, (u64)(u32)m); }
@@ -552,6 +553,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         }
         if (rmode == 3 && (opcode == 0 || opcode == 1)) {       /* FCVTZS / FCVTZU: fp -> fixed */
             double r = f_trunc((dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn)) * pow2);
+            if (r != r) r = 0.0;       /* NaN -> 0 (FPToFixed), not INT_MIN */
             if (opcode == 0) {   /* signed */
                 if (x64) { s64 m = (r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r; set_x(c, Rd, (u64)m); }
                 else     { s32 m = (r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r; set_x(c, Rd, (u64)(u32)m); }
@@ -1410,6 +1412,7 @@ static void simd_across(CPU *c, u32 insn) {
 /* FP -> integer lane convert with saturation (shared clamp logic). x64 selects
  * 64-bit (.2d) vs 32-bit (.4s) result width; is_signed picks the signed form. */
 static u64 fcvt_to_int(double r, int is_signed, int x64) {
+    if (r != r) return 0;              /* NaN -> 0 (FPToFixed), not INT_MIN */
     if (is_signed) {
         if (x64) { s64 m = (r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r; return (u64)m; }
         s32 m = (r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r; return (u64)(u32)m;
@@ -1421,6 +1424,7 @@ static u64 fcvt_to_int(double r, int is_signed, int x64) {
 /* 16-bit saturating fp->int, for the FP16 vector converts (int result sits in a
  * half-width lane). Mirrors fcvt_to_int's clamp at the .8h element width. */
 static u16 fcvt_to_int16(double r, int is_signed) {
+    if (r != r) return 0;              /* NaN -> 0 (FPToFixed), not INT_MIN */
     if (is_signed) { s32 m = (r >= 32767.0) ? 32767 : (r <= -32768.0) ? -32768 : (s32)r; return (u16)(s16)m; }
     if (r < 0) r = 0;
     return (r >= 65535.0) ? 0xffffu : (u16)r;
@@ -1876,6 +1880,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         if      (opcode == 0x1a) r = o2 ? f_ceil(v)  : f_round(v);   /* P : N  */
         else if (opcode == 0x1b) r = o2 ? f_trunc(v) : f_floor(v);   /* Z : M  */
         else                     r = f_round(v);                    /* A      */
+        if (r != r) r = 0.0;     /* NaN -> 0 (FPToFixed), not INT_MIN */
         u64 out;
         if (U == 0) {            /* signed, with saturation (same clamps as SCVTF block) */
             if (dbl) out = (u64)((r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r);
