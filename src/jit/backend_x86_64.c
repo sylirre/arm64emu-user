@@ -2631,7 +2631,8 @@ static void emit_vop(BE *be, const IROp *o) {
         }
         case VC_CVTFI: {
             /* FCVTZS/FCVTZU: replicate the interpreter's expressions —
-             * saturation compares (NaN falls through both) around cvtt;
+             * a NaN gate up front (FPToFixed -> 0, like the C code's
+             * `if (r != r) r = 0`), then the saturation compares around cvtt;
              * the S source is widened to double first, like the C code. */
             int dbl = ((insn >> 22) & 3) == 1;
             unsigned sf = insn >> 31, uns = ((insn >> 16) & 7) & 1;
@@ -2639,6 +2640,8 @@ static void emit_vop(BE *be, const IROp *o) {
             materialize_flags(be);
             sse_mem(e, dbl ? 0xF2 : 0xF3, 0x10, 0, OFF_V(rn));
             if (!dbl) sse_rr(e, 0xF3, 0x5A, 0, 0);       /* cvtss2sd */
+            sse_rr(e, 0x66, 0x2E, 0, 0);                 /* ucomisd r,r: PF if NaN */
+            u8 *jnan = jcc_fwd(e, CC_P);
             if (!uns) {
                 mov_ri(e, 1, RAX, sf ? 0x43E0000000000000ULL     /* 2^63 */
                                      : 0x41DFFFFFFFC00000ULL);   /* 2^31-1 */
@@ -2692,6 +2695,10 @@ static void emit_vop(BE *be, const IROp *o) {
                 mov_ri(e, 1, RAX, sf ? ~0ULL : 0xFFFFFFFFULL);
                 fwd_here(e, j1); fwd_here(e, j2);
             }
+            u8 *jdone = jmp_fwd(e);
+            fwd_here(e, jnan);
+            mov_ri(e, 0, RAX, 0);                        /* NaN -> 0 (FPToFixed) */
+            fwd_here(e, jdone);
             int hd = ra_def(be, o->dst);
             mov_rr(e, 1, hd, RAX);
             break;

@@ -165,9 +165,11 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   family (computed unfused on both hosts, matching the interpreter),
   FSQRT/FABS/FNEG/FMOV(+imm, +gpr), FMAX/FMIN(NM) (x86-64: `maxsd` *is* the
   interpreter's ternary), FCMP/FCMPE, FCCMP/FCCMPE, FCSEL, and the
-  conversions SCVTF/UCVTF, FCVTZS/FCVTZU and FCVT S↔D. The rounding-variant
-  conversions (FCVTNS/…), fixed-point forms and everything saturating stay
-  helpers.
+  conversions SCVTF/UCVTF, FCVTZS/FCVTZU and FCVT S↔D. On x86-64 FCVTZS/FCVTZU
+  NaN-gate to 0 before the saturation clamps, matching the interpreter's
+  architectural `FPToFixed(NaN) = 0` (the a64 backend replays the native
+  convert, which already returns 0). The rounding-variant conversions
+  (FCVTNS/…), fixed-point forms and everything saturating stay helpers.
 - **half-precision (FP16)**: the FCVT half↔single/double converts (and
   FCVTL/FCVTN) inline on the base ISA, always. The half arithmetic surface —
   scalar and vector FADD/FSUB/FMUL/FDIV, the FMULX/FRECPE/FRSQRTE estimates, the
