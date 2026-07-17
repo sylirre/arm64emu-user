@@ -270,7 +270,11 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
              * self-counting; the mask compares are exact as-is. */
             unsigned key = (U << 6) | (((insn >> 23) & 1) << 5) | opc;
             switch (key) {
-                case 0x19: case 0x39:            /* FMLA / FMLS */
+                /* FMLA/FMLS (0x19/0x39) deliberately stay on the exec_a64
+                 * helper: the interpreter fuses them (single rounding via
+                 * __builtin_fma), but the inline emit here is an unfused
+                 * mul+add, so translating them would diverge from the
+                 * interpreter. The helper re-runs the fused reference. */
                 case 0x1a: case 0x3a:            /* FADD / FSUB */
                 case 0x5b: case 0x5f: case 0x7a: /* FMUL / FDIV / FABD */
                     vclass = VC_VF3S; break;
@@ -437,12 +441,13 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
         }
     } else if ((insn & 0xFF000000u) == 0x1F000000u) {
         /* scalar FP data-processing 3-source: FMADD/FMSUB/FNMADD/FNMSUB.
-         * exec_fp_dp3 computes a +- n*m in host C (uncontracted mul+add on
-         * SSE2; contracted to fmadd on the a64 cross build — both match the
-         * same-host interpreter binary). */
+         * exec_fp_dp3 now fuses (single rounding via __builtin_fma), so the
+         * single/double family stays on the exec_a64 helper — the inline emit
+         * would be an unfused mul+add and diverge. Half (ftype==3) is computed
+         * in double from an exact half product, so its inline matches the
+         * interpreter bit-for-bit and stays native. */
         unsigned ftype = (insn >> 22) & 3;
-        if (ftype == 0 || ftype == 1) vclass = VC_F3;
-        else if (ftype == 3) vclass = VC_H3;     /* half FMADD family */
+        if (ftype == 3) vclass = VC_H3;          /* half FMADD family */
     } else if ((insn & 0x7F000000u) == 0x1E000000u) {
         /* scalar FP */
         unsigned ftype = (insn >> 22) & 3, o2 = (insn >> 10) & 3;
