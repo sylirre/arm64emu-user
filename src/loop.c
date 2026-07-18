@@ -115,6 +115,38 @@ int emu_loop(CPU *c) {
                 case EC_BRK64:
                     sig_deliver_fault(c, SIGTRAP, 1, c->pc);
                     break;
+                case EC_MOP: {
+                    /* FEAT_MOPS main/epilogue state mismatch (wrong option, or
+                     * an epilogue facing >= a page). Play the kernel's
+                     * do_el0_mops: put the registers back in prologue input
+                     * format (Arm ARM rules CNTMJ/MWFQH, mirroring Linux
+                     * arm64_mops_reset_regs) and restart at the prologue —
+                     * P/M/E are architecturally consecutive for this reason.
+                     * c->pc still points at the trapping M/E instruction. */
+                    bool wrong_option = (esr >> 17) & 1, option_a = (esr >> 16) & 1;
+                    unsigned dreg = (esr >> 10) & 0x1f, sreg = (esr >> 5) & 0x1f;
+                    unsigned nreg = esr & 0x1f;
+                    u64 dst = reg_x(c, dreg), src = reg_x(c, sreg);
+                    u64 size = reg_x(c, nreg);
+                    if ((esr >> 24) & 1) {                             /* SET* */
+                        if (option_a ^ wrong_option) {
+                            dst += size; size = 0 - size;
+                        }
+                    } else {                                           /* CPY* */
+                        if (!(option_a ^ wrong_option)) {
+                            /* Format is from Option B; N set = backward */
+                            if (c->nzcv & PS_N) { dst -= size; src -= size; }
+                        } else if (size >> 63) {
+                            /* Format is from Option A; negative = forward */
+                            dst += size; src += size; size = 0 - size;
+                        }
+                    }
+                    set_x(c, dreg, dst);
+                    set_x(c, sreg, src);
+                    set_x(c, nreg, size);
+                    c->pc -= ((esr >> 18) & 1) ? 8 : 4;
+                    break;
+                }
                 case EC_UNKNOWN:
                 default:
                     sig_deliver_fault(c, SIGILL, 1, c->pc);

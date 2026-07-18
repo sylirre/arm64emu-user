@@ -283,15 +283,43 @@ static void dp_register(CPU *c, u32 insn) {
     }
     if (op24 == 0x1a) {
         unsigned op21 = BITS(28, 21);
-        if (op21 == 0xd0) {                        /* add/sub with carry */
-            bool op = BIT(30), S = BIT(29);
-            u32 fl;
-            int cin = (c->nzcv & PS_C) ? 1 : 0;
-            u64 m = reg_x(c, Rm), n = reg_x(c, Rn);
-            u64 r = op ? add_with_carry(n, ~m, cin, sf, &fl)
-                       : add_with_carry(n, m, cin, sf, &fl);
-            if (S) c->nzcv = fl;
-            set_x_sz(c, Rd, sf, r);
+        if (op21 == 0xd0) {
+            if (BITS(15, 10) == 0) {               /* add/sub with carry */
+                bool op = BIT(30), S = BIT(29);
+                u32 fl;
+                int cin = (c->nzcv & PS_C) ? 1 : 0;
+                u64 m = reg_x(c, Rm), n = reg_x(c, Rn);
+                u64 r = op ? add_with_carry(n, ~m, cin, sf, &fl)
+                           : add_with_carry(n, m, cin, sf, &fl);
+                if (S) c->nzcv = fl;
+                set_x_sz(c, Rd, sf, r);
+                return;
+            }
+            /* RMIF (FEAT_FLAGM): rotate Xn right by imm6, move tmp<3:0> into
+             * the NZCV bits selected by mask (bit3=N .. bit0=V). */
+            if (BIT(31) && !BIT(30) && BIT(29) && BITS(14, 10) == 1 && BIT(4) == 0) {
+                unsigned imm6 = BITS(20, 15), mask = BITS(3, 0);
+                u64 t = reg_x(c, Rn);
+                if (imm6) t = (t >> imm6) | (t << (64 - imm6));
+                unsigned nib = (((c->nzcv >> 28) & 0xf) & ~mask) | ((unsigned)t & mask);
+                c->nzcv = nib << 28;
+                return;
+            }
+            /* SETF8/SETF16 (FEAT_FLAGM): narrowing-overflow flags from the low
+             * 8/16 bits of Wn (register in the Rn field): N=sign, Z=zero,
+             * V=bit msb+1 EOR msb; C is unchanged. */
+            if (!BIT(31) && !BIT(30) && BIT(29) && BITS(20, 16) == 0 &&
+                (BITS(15, 10) == 0x02 || BITS(15, 10) == 0x12) && BITS(4, 0) == 0x0d) {
+                unsigned msb = BIT(14) ? 15 : 7;
+                u64 w = reg_x(c, Rn);
+                u32 f = c->nzcv & PS_C;
+                if ((w >> msb) & 1) f |= PS_N;
+                if ((w & ((2ULL << msb) - 1)) == 0) f |= PS_Z;
+                if (((w >> (msb + 1)) ^ (w >> msb)) & 1) f |= PS_V;
+                c->nzcv = f;
+                return;
+            }
+            undefined(c, insn);
             return;
         }
         if (op21 == 0xd2) {                        /* conditional compare */
@@ -614,6 +642,239 @@ static void ldst_casp(CPU *c, u32 insn) {
     }
 }
 /* ============ end LSE atomics ============ */
+
+/* FEAT_LRCPC2: LDAPUR/STLUR, load-acquire RCpc / store-release with an
+ * unscaled 9-bit immediate. The acquire/release ordering piggybacks on the
+ * host's ordinary load/store ordering (same as LDAR/LDAPR here); the access
+ * is an ordinary unscaled load/store. No writeback, no SIMD&FP forms. */
+static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
+    unsigned size = BITS(31, 30), opc = BITS(23, 22);
+    unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
+    /* The opc==2/size==3 slot is unallocated here (no PRFM in this space) and
+     * must not reach do_load, which would treat it as a prefetch no-op. */
+    if ((opc == 2 && size == 3) || (opc == 3 && size >= 2)) {
+        undefined(c, insn);
+        return;
+    }
+    u64 va = reg_xsp(c, Rn) + (u64)(s64)sign_extend(BITS(20, 12), 9);
+    if (opc == 0) mem_write(c, va, 1u << size, reg_x(c, Rt));   /* STLUR */
+    else do_load(c, Rt, va, size, opc);                         /* LDAPUR* */
+}
+
+/* ---------------- FEAT_MOPS: Memory Copy and Memory Set ----------------
+ * CPYFx (memcpy, forced forward), CPYx (memmove) and SETx, in the "Option A"
+ * register format, matching qemu's implementation choice (and the emulator
+ * twin of this core) step for step so the guest-visible intermediate state is
+ * differentially testable: the prologue performs up to the next page boundary
+ * and only then rewrites Xd[,Xs] to the final address and Xn to -(bytes
+ * remaining), writing NZCV=0000 to advertise Option A; M does the whole-page
+ * middle; E does the sub-page tail and raises the EC 0x27 mismatch exception
+ * if it finds a page or more still to do. M/E executed with PSTATE.C set (an
+ * Option B state) raise EC 0x27 with the wrong-option bit; loop.c plays the
+ * kernel's role for those (arm64_mops_reset_regs + restart at the prologue).
+ * Restartability across data aborts: P keeps the registers in input format
+ * until it completes, M/E fold progress into Xn after every bounded step, so
+ * re-executing the faulting instruction always resumes correctly. A step
+ * never crosses a page on either address, which makes each step fault-atomic
+ * (permissions are page-granular). The unprivileged T forms behave like the
+ * plain ones, as they architecturally do at EL0. */
+
+static u64 mops_page_limit(u64 addr)     { return ((addr + 0x1000) & ~0xfffULL) - addr; }
+static u64 mops_page_limit_rev(u64 addr) { return (addr & 0xfffULL) + 1; }
+
+/* ISS for EC_MOP (same layout qemu's syn_mop builds, = ESR_ELx for EC 0x27):
+ * isSET[24] | options[22:19] | fromEpilogue[18] | wrongOption[17] |
+ * OptionA[16] | destreg[14:10] | srcreg[9:5] | sizereg[4:0]. */
+static u32 mops_iss(u32 insn, bool wrong_option) {
+    bool is_set = BITS(23, 22) == 3;
+    unsigned options = is_set ? BITS(13, 12) : BITS(15, 12);
+    unsigned epilogue = is_set ? (BITS(15, 14) == 2) : (BITS(23, 22) == 2);
+    return ((u32)is_set << 24) | (options << 19) | (epilogue << 18)
+         | ((u32)wrong_option << 17) | (1u << 16)
+         | (BITS(4, 0) << 10) | (BITS(20, 16) << 5) | BITS(9, 5);
+}
+
+/* At EL0 the family is gated by SCTLR_EL1.MSCEn (UNDEF when clear); the
+ * kernel-role init sets it, as Linux does when it advertises HWCAP2_MOPS. */
+static bool mops_enabled_ok(CPU *c, u32 insn) {
+    if (c->el == 0 && !((c->sctlr[1] >> 33) & 1)) { undefined(c, insn); return false; }
+    return true;
+}
+
+/* One bounded memset step: at most to the next page boundary. Fast path is
+ * the translated host pointer (same coherence as ordinary stores: translated
+ * code relies on IC IVAU); on a miss, a single byte through the faulting
+ * slow path. Returns bytes done; 0 means a fault was raised. */
+static u64 mops_set_step(CPU *c, u64 toaddr, u64 setsize, u8 data) {
+    u64 n = mops_page_limit(toaddr);
+    if (n > setsize) n = setsize;
+    void *hp = mem_host_ptr(c, toaddr, (unsigned)n, ACC_WRITE);
+    if (hp) { memset(hp, data, (size_t)n); return n; }
+    return mem_write(c, toaddr, 1, data) ? 1 : 0;
+}
+
+/* One bounded copy step. rev=true means toaddr/fromaddr point at the *last*
+ * byte and the step works downwards. memmove makes any same-chunk overlap
+ * safe. */
+static u64 mops_copy_step(CPU *c, u64 toaddr, u64 fromaddr, u64 copysize,
+                          bool rev) {
+    u64 n = rev ? mops_page_limit_rev(toaddr) : mops_page_limit(toaddr);
+    u64 m = rev ? mops_page_limit_rev(fromaddr) : mops_page_limit(fromaddr);
+    if (m < n) n = m;
+    if (n > copysize) n = copysize;
+    void *w = mem_host_ptr(c, rev ? toaddr - (n - 1) : toaddr,
+                           (unsigned)n, ACC_WRITE);
+    void *r = mem_host_ptr(c, rev ? fromaddr - (n - 1) : fromaddr,
+                           (unsigned)n, ACC_READ);
+    if (w && r) { memmove(w, r, (size_t)n); return n; }
+    u64 byte;
+    if (!mem_read(c, fromaddr, 1, &byte)) return 0;
+    return mem_write(c, toaddr, 1, byte) ? 1 : 0;
+}
+
+static void mops_set(CPU *c, u32 insn, unsigned stage) {
+    unsigned Rd = BITS(4, 0), Rn = BITS(9, 5), Rs = BITS(20, 16);
+    u8 data = (u8)reg_x(c, Rs);               /* Rs may be XZR */
+    if (stage == 0) {                                               /* SETP */
+        u64 toaddr = reg_x(c, Rd), setsize = reg_x(c, Rn);
+        if (setsize > 0x7fffffffffffffffULL) setsize = 0x7fffffffffffffffULL;
+        u64 stagesetsize = mops_page_limit(toaddr);
+        if (stagesetsize > setsize) stagesetsize = setsize;
+        while (stagesetsize) {
+            set_x(c, Rd, toaddr);             /* input format until completion */
+            set_x(c, Rn, setsize);
+            u64 step = mops_set_step(c, toaddr, stagesetsize, data);
+            if (!step) return;
+            toaddr += step; setsize -= step; stagesetsize -= step;
+        }
+        set_x(c, Rd, toaddr + setsize);
+        set_x(c, Rn, 0 - setsize);
+        c->nzcv = 0;                          /* NZCV=0000: Option A */
+        return;
+    }
+    u64 xn = reg_x(c, Rn);                                   /* SETM / SETE */
+    if (xn == 0) return;                      /* nothing left: NOP, no checks */
+    if (c->nzcv & PS_C) {
+        cpu_raise_sync(c, esr_make(EC_MOP, mops_iss(insn, true)), 0);
+        return;
+    }
+    u64 toaddr = reg_x(c, Rd) + xn, setsize = 0 - xn;
+    if (stage == 2 && setsize >= 0x1000) {    /* SETE takes only the tail */
+        cpu_raise_sync(c, esr_make(EC_MOP, mops_iss(insn, false)), 0);
+        return;
+    }
+    u64 stagesetsize = (stage == 1) ? (setsize & ~0xfffULL) : setsize;
+    while (stagesetsize) {
+        u64 step = mops_set_step(c, toaddr, setsize, data);
+        if (!step) return;
+        toaddr += step; setsize -= step;
+        stagesetsize = (step >= stagesetsize) ? 0 : stagesetsize - step;
+        set_x(c, Rn, 0 - setsize);
+    }
+}
+
+static void mops_cpy(CPU *c, u32 insn, unsigned stage, bool move) {
+    unsigned Rd = BITS(4, 0), Rn = BITS(9, 5), Rs = BITS(20, 16);
+    if (stage == 0) {                                            /* CPY[F]P */
+        bool fwd = true;
+        u64 toaddr = reg_x(c, Rd), fromaddr = reg_x(c, Rs), copysize = reg_x(c, Rn);
+        if (move) {
+            /* Direction: backward only when the source starts below an
+             * overlapping destination; non-overlap is IMPDEF-forward. */
+            if (copysize > 0x007fffffffffffffULL) copysize = 0x007fffffffffffffULL;
+            u64 fs = fromaddr & 0xffffffffffffffULL, ts = toaddr & 0xffffffffffffffULL;
+            u64 fe = (fromaddr + copysize) & 0xffffffffffffffULL;
+            if (fs < ts && fe > ts) fwd = false;
+        } else if (copysize > 0x7fffffffffffffffULL) {
+            copysize = 0x7fffffffffffffffULL;
+        }
+        if (fwd) {
+            u64 stagecopysize = mops_page_limit(toaddr), m = mops_page_limit(fromaddr);
+            if (m < stagecopysize) stagecopysize = m;
+            if (stagecopysize > copysize) stagecopysize = copysize;
+            while (stagecopysize) {
+                set_x(c, Rd, toaddr);         /* input format until completion */
+                set_x(c, Rs, fromaddr);
+                set_x(c, Rn, copysize);
+                u64 step = mops_copy_step(c, toaddr, fromaddr, stagecopysize,
+                                          false);
+                if (!step) return;
+                toaddr += step; fromaddr += step; copysize -= step; stagecopysize -= step;
+            }
+            set_x(c, Rd, toaddr + copysize);
+            set_x(c, Rs, fromaddr + copysize);
+            set_x(c, Rn, 0 - copysize);
+        } else {
+            /* Backward: work from the last byte down. The completed-P register
+             * format is the same as the input format (Xn stays positive, which
+             * is how M/E recognise the direction). */
+            u64 t = toaddr + copysize - 1, f = fromaddr + copysize - 1;
+            u64 stagecopysize = mops_page_limit_rev(t), m = mops_page_limit_rev(f);
+            if (m < stagecopysize) stagecopysize = m;
+            if (stagecopysize > copysize) stagecopysize = copysize;
+            while (stagecopysize) {
+                set_x(c, Rn, copysize);
+                u64 step = mops_copy_step(c, t, f, stagecopysize, true);
+                if (!step) return;
+                copysize -= step; stagecopysize -= step; t -= step; f -= step;
+            }
+            set_x(c, Rn, copysize);
+        }
+        c->nzcv = 0;                          /* NZCV=0000: Option A */
+        return;
+    }
+    u64 xn = reg_x(c, Rn);                              /* CPY[F]M / CPY[F]E */
+    if (xn == 0) return;
+    if (c->nzcv & PS_C) {
+        cpu_raise_sync(c, esr_make(EC_MOP, mops_iss(insn, true)), 0);
+        return;
+    }
+    bool fwd = !move || (s64)xn < 0;
+    u64 toaddr, fromaddr, copysize;
+    if (fwd) {
+        toaddr = reg_x(c, Rd) + xn; fromaddr = reg_x(c, Rs) + xn; copysize = 0 - xn;
+    } else {
+        copysize = xn;
+        toaddr = reg_x(c, Rd) + copysize - 1; fromaddr = reg_x(c, Rs) + copysize - 1;
+    }
+    if (stage == 2 && copysize >= 0x1000) {   /* CPY[F]E takes only the tail */
+        cpu_raise_sync(c, esr_make(EC_MOP, mops_iss(insn, false)), 0);
+        return;
+    }
+    /* M runs while a full page remains; E runs to zero. */
+    while (stage == 1 ? copysize >= 0x1000 : copysize > 0) {
+        u64 step = mops_copy_step(c, toaddr, fromaddr, copysize, !fwd);
+        if (!step) return;
+        if (fwd) { toaddr += step; fromaddr += step; }
+        else     { toaddr -= step; fromaddr -= step; }
+        copysize -= step;
+        set_x(c, Rn, fwd ? 0 - copysize : copysize);
+    }
+}
+
+static void mops(CPU *c, u32 insn) {
+    unsigned op1 = BITS(23, 22);              /* CPY stage; 11 = SET family */
+    unsigned Rd = BITS(4, 0), Rn = BITS(9, 5), Rs = BITS(20, 16);
+    if (BITS(31, 30) != 0) { undefined(c, insn); return; }
+    if (op1 == 3) {
+        unsigned stage = BITS(15, 14);        /* 0 P, 1 M, 2 E; 3 unallocated */
+        /* bit26 set = SETG* (MTE tag-setting): not implemented, UNDEF.
+         * Rd==Rn, Rd==Rs, Rn==Rs, Rd/Rn==31 are CONSTRAINED UNPREDICTABLE;
+         * UNDEF like qemu (Rs==31 is a valid XZR value operand). */
+        if (BIT(26) || stage == 3 ||
+            Rs == Rn || Rs == Rd || Rn == Rd || Rd == 31 || Rn == 31) {
+            undefined(c, insn); return;
+        }
+        if (!mops_enabled_ok(c, insn)) return;
+        mops_set(c, insn, stage);
+    } else {
+        if (Rs == Rn || Rs == Rd || Rn == Rd || Rd == 31 || Rs == 31 || Rn == 31) {
+            undefined(c, insn); return;
+        }
+        if (!mops_enabled_ok(c, insn)) return;
+        mops_cpy(c, insn, op1, BIT(26));
+    }
+}
 
 static void ldst_register(CPU *c, u32 insn) {
     unsigned size = BITS(31, 30), opc = BITS(23, 22);
@@ -992,6 +1253,13 @@ static void loads_stores(CPU *c, u32 insn) {
         ldst_vector_single(c, insn); return;   /* AdvSIMD load/store single structure */
     }
     if (b2927 == 0x3 && BITS(25, 24) == 0) { ldst_literal(c, insn); return; }
+    if (b2927 == 0x3 && BIT(26) == 0 && BITS(25, 24) == 1 && BIT(21) == 0 &&
+        BITS(11, 10) == 0) {
+        ldst_rcpc_unscaled(c, insn); return;   /* FEAT_LRCPC2 LDAPUR/STLUR */
+    }
+    if (b2927 == 0x3 && BITS(25, 24) == 1 && BIT(21) == 0 && BITS(11, 10) == 1) {
+        mops(c, insn); return;                 /* FEAT_MOPS CPYx/SETx (size==0 checked inside) */
+    }
     if (b2927 == 0x5) { ldst_pair(c, insn); return; }
     if (b2927 == 0x7) { ldst_register(c, insn); return; }
     undefined(c, insn);

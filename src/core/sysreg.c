@@ -11,6 +11,11 @@
 u64 gt_count(CPU *c, bool virt);
 void timer_update(struct Machine *m) __attribute__((weak));
 
+/* FPSR flag folding (exec_fpsimd.c). FP exception flags accumulate lazily in
+ * the host FP status word / a soft mask and are folded into c->fpsr only when
+ * the guest actually looks. Weak so a build without the FP/SIMD unit links. */
+void fpsr_sync(CPU *c) __attribute__((weak));
+
 static u64 timer_count(CPU *c, bool virt) {
     return gt_count(c, virt);
 }
@@ -22,6 +27,15 @@ static void msr_immediate(CPU *c, u32 insn) {
     unsigned op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7, crm = (insn >> 8) & 0xf;
     if (op1 == 0 && op2 == 5) {                 /* SPSel */
         c->sp_sel = crm & 1;
+    } else if (op1 == 0 && crm == 0 && op2 == 0) {  /* CFINV (FEAT_FLAGM) */
+        c->nzcv ^= PS_C;
+    } else if (op1 == 0 && crm == 0 && op2 == 1) {  /* XAFLAG (FEAT_FLAGM2): undo AXFLAG */
+        unsigned zf = !!(c->nzcv & PS_Z), cf = !!(c->nzcv & PS_C);
+        c->nzcv = ((!cf && !zf) ? PS_N : 0) | ((zf && cf) ? PS_Z : 0) |
+                  ((cf || zf)  ? PS_C : 0) | ((!cf && zf) ? PS_V : 0);
+    } else if (op1 == 0 && crm == 0 && op2 == 2) {  /* AXFLAG (FEAT_FLAGM2): x86-style CF/ZF */
+        unsigned zf = !!(c->nzcv & PS_Z), cf = !!(c->nzcv & PS_C), vf = !!(c->nzcv & PS_V);
+        c->nzcv = ((zf || vf) ? PS_Z : 0) | ((cf && !vf) ? PS_C : 0);
     } else if (op1 == 3 && op2 == 6) {          /* DAIFSet */
         c->daif |= (u32)(crm & 0xf) << 6;
     } else if (op1 == 3 && op2 == 7) {          /* DAIFClr */
@@ -96,7 +110,10 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,3,4,2,0): v = c->nzcv & 0xf0000000; break;/* NZCV */
         case KEY(3,3,4,2,1): v = c->daif & (PS_D|PS_A|PS_I|PS_F); break; /* DAIF */
         case KEY(3,3,4,4,0): v = c->fpcr; break;             /* FPCR */
-        case KEY(3,3,4,4,1): v = c->fpsr; break;             /* FPSR */
+        case KEY(3,3,4,4,1):                                 /* FPSR */
+            if (fpsr_sync) fpsr_sync(c);                     /* fold pending flags */
+            v = c->fpsr;
+            break;
         case KEY(3,0,4,0,0): v = c->spsr[1]; break;          /* SPSR_EL1 */
         case KEY(3,0,4,0,1): v = c->elr[1]; break;           /* ELR_EL1 */
         case KEY(3,0,4,1,0): v = c->sp_el[0]; break;         /* SP_EL0 */
@@ -155,7 +172,10 @@ static void do_msr(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,3,4,2,0): c->nzcv = (u32)(v & 0xf0000000); break;   /* NZCV */
         case KEY(3,3,4,2,1): c->daif = (u32)(v & (PS_D|PS_A|PS_I|PS_F)); break; /* DAIF */
         case KEY(3,3,4,4,0): c->fpcr = (u32)v; break;                  /* FPCR */
-        case KEY(3,3,4,4,1): c->fpsr = (u32)v; break;                  /* FPSR */
+        case KEY(3,3,4,4,1):                                           /* FPSR */
+            if (fpsr_sync) fpsr_sync(c);   /* discard pending host/soft flags */
+            c->fpsr = (u32)v;
+            break;
         case KEY(3,0,4,0,0): c->spsr[1] = v; break;                    /* SPSR_EL1 */
         case KEY(3,0,4,0,1): c->elr[1] = v; break;                     /* ELR_EL1 */
         case KEY(3,0,4,1,0): c->sp_el[0] = v; break;                   /* SP_EL0 */
@@ -199,7 +219,10 @@ void sysreg_exec(CPU *c, u32 insn) {
 }
 
 void sysreg_init(CPU *c) {
-    c->sctlr[1] = 0x00C50838;   /* RES1 bits set, MMU/caches off */
+    c->sctlr[1] = 0x00C50838ULL | (1ULL << 33);   /* RES1 bits set, MMU/caches
+                                 * off; MSCEn set — the kernel role enables EL0
+                                 * MOPS when it advertises HWCAP2_MOPS */
     c->cpacr_el1 = 0;
     c->mdscr_el1 = 0;
+    if (fpsr_sync) { fpsr_sync(c); c->fpsr = 0; }  /* drop pre-reset FP flags */
 }
