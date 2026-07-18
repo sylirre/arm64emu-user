@@ -33,6 +33,7 @@
  * or a block's helper tail (never while another translation could reuse the
  * memory under a block still on this thread's native call stack). */
 #include <fcntl.h>
+#include <fenv.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -199,10 +200,16 @@ static void jstat_dump(void) {
         qsort(g_jstat, JSTAT_SLOTS, sizeof *g_jstat, jstat_cmp);
         dprintf(fd, "[jit-stats pid %d] %llu helper insns",
                 (int)getpid(), (unsigned long long)total);
-        if (g_jstat_icount)
+        if (g_jstat_icount) {
+            /* The percentage math is the one host-FP use outside guest FP:
+             * fence it so the sticky FPSR flag accumulation never sees it. */
+            fexcept_t saved;
+            fegetexceptflag(&saved, FE_ALL_EXCEPT);
             dprintf(fd, " / %llu executed (%.2f%%)",
                     (unsigned long long)g_jstat_icount,
                     100.0 * (double)total / (double)g_jstat_icount);
+            fesetexceptflag(&saved, FE_ALL_EXCEPT);
+        }
         dprintf(fd, "\n");
         for (u32 i = 0; i < 32 && g_jstat[i].count; i++)
             dprintf(fd, "[jit-stats]  %12llu  %08x  %s\n",

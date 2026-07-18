@@ -362,8 +362,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 vclass = VC_VHCM; break;         /* FCMEQ/GE/GT, FACGE/GT */
             case 0x03: vclass = VC_VHMULX; break;/* FMULX (a64 only) */
             default: break;                      /* FRECPS/FRSQRTS: helper
-                                                  * (interp omits ARM's 0*inf
-                                                  * special case -> needs double) */
+                                                  * (fused step + 0*inf special
+                                                  * case live in fop_d/fop_s) */
         }
     } else if ((insn & 0x9F7E0C00u) == 0x0E780800u) {
         /* AdvSIMD two-reg misc, FP16 page (bit22=1, bits[21:17]=11100,
@@ -490,6 +490,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             }
             if (o2 == 0 && ((insn >> 13) & 1) == 1 &&
                 ((insn >> 12) & 1) == 0) {                   /* FCMP/FCMPE */
+                if (insn & 0x10) return 0;   /* FCMPE: any-NaN IOC -> helper */
                 vclass = VC_FCMP;
                 aux_extra = VF_SETF;
             } else if (o2 == 0 && ((insn >> 14) & 1) == 1) { /* 1-source */
@@ -507,6 +508,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 vclass = VC_FCSEL;
                 aux_extra = VF_READF;
             } else if (o2 == 1) {                            /* FCCMP(E) */
+                if (insn & 0x10) return 0;   /* FCCMPE: any-NaN IOC -> helper */
                 vclass = VC_FCCMP;
                 aux_extra = VF_READF | VF_SETF;
             }
@@ -524,6 +526,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             }
             if (o2 == 0 && ((insn >> 13) & 1) == 1 &&
                 ((insn >> 12) & 1) == 0) {                   /* FCMP/FCMPE */
+                if (insn & 0x10) return 0;   /* FCMPE: any-NaN IOC -> helper */
                 vclass = VC_FCMP;
                 aux_extra = VF_SETF;
             } else if (o2 == 0 && ((insn >> 14) & 1) == 1) { /* 1-source */
@@ -538,6 +541,7 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 vclass = VC_FCSEL;
                 aux_extra = VF_READF;
             } else if (o2 == 1) {                            /* FCCMP(E) */
+                if (insn & 0x10) return 0;   /* FCCMPE: any-NaN IOC -> helper */
                 vclass = VC_FCCMP;
                 aux_extra = VF_READF | VF_SETF;
             }

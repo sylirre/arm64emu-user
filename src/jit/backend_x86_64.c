@@ -1266,8 +1266,16 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         case VC_BITW: case VC_ADDSUB: case VC_MOVI: case VC_COPY:
         case VC_F1: case VC_F3:
         case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
-        case VC_CVTIF: case VC_CVTFI: case VC_FCVT:
+        case VC_CVTIF: case VC_FCVT:
             return 1;
+        case VC_CVTFI:
+            /* FCVTZS/FCVTZU inline branches AROUND cvttsd2si on the NaN and
+             * saturation paths (and loads 0 for small-negative unsigned), so
+             * the host invalid/inexact flags the FPSR accumulation relies on
+             * never fire there. The interpreter helper raises them by hand;
+             * the a64 backend's native fcvtzs is architecturally exact and
+             * keeps its inline. */
+            return 0;
         case VC_FCMP: case VC_FCCMP:             /* half needs F16C to widen */
             return (((insn >> 22) & 3) == 3) ? cpu_has_f16c() : 1;
         case VC_FCVTH:                           /* FP16 converts: need F16C */
