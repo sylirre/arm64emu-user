@@ -32,8 +32,6 @@ jobs:
       # libc6-dev-arm64-cross   -> /usr/aarch64-linux-gnu glibc: static+dynamic
       #                            linking, and the offline source setup_env.sh
       #                            copies the glibc test rootfs from
-      # gcc-multilib            -> 32-bit libc headers + startup files for the
-      #                            -m32 ILP32-host build exercised by `make test32`
       # qemu-user               -> qemu-aarch64 (the differential oracle)
       # qemu-user-static, proot -> Alpine minirootfs bootstrap + shell-test oracle
       # expect                  -> interactive job-control (PTY) test
@@ -41,8 +39,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-multilib \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
             qemu-user qemu-user-static proot expect
+
+      # 32-bit (-m32) multilib bits for the ILP32-host build exercised by
+      # `make test32`. The gcc-multilib metapackage can't be used here: it
+      # Conflicts with every versioned cross gcc (incl. gcc-*-aarch64-linux-gnu
+      # installed above), so apt reports "held broken packages". Install the
+      # underlying 32-bit dev libs directly instead — they carry no such
+      # conflict and coexist with the cross toolchain:
+      #   libc6-dev-i386    -> 32-bit libc headers (bits/libc-header-start.h)
+      #                        + crt1/crti/crtn and the 32-bit libc
+      #   lib32gcc-<v>-dev  -> 32-bit crtbegin/crtend + libgcc.a for the host
+      #                        gcc; version-matched to the runner's default gcc
+      #                        so a future ubuntu-latest gcc bump keeps working
+      - name: Install 32-bit multilib libraries (for make test32)
+        run: |
+          gccv=$(gcc -dumpversion | cut -d. -f1)
+          sudo apt-get install -y --no-install-recommends \
+            libc6-dev-i386 "lib32gcc-${gccv}-dev"
 
       - name: Build
         run: make
