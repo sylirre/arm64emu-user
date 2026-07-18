@@ -230,7 +230,12 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     u64 hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
                 G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
                 G_HWCAP_SHA512 | G_HWCAP_ATOMICS |  /* LSE implemented (decode.c) */
-                G_HWCAP_FPHP | G_HWCAP_ASIMDHP;     /* FEAT_FP16 (exec_fpsimd.c) */
+                G_HWCAP_FPHP | G_HWCAP_ASIMDHP |    /* FEAT_FP16 (exec_fpsimd.c) */
+                G_HWCAP_ASIMDRDM | G_HWCAP_JSCVT | G_HWCAP_FCMA |
+                G_HWCAP_LRCPC | G_HWCAP_ILRCPC |    /* LDAPR + LDAPUR/STLUR */
+                G_HWCAP_ASIMDDP | G_HWCAP_ASIMDFHM | G_HWCAP_FLAGM;
+    u64 hwcap2 = G_HWCAP2_FLAGM2 |
+                 G_HWCAP2_MOPS;                     /* CPYx/SETx (decode.c) */
     /* Credentials (fake identity when -fake-id, else the real host ids).
      * AT_SECURE reflects a setuid/setgid transition (do_execve set euid/egid
      * from the file's bits before this reload), telling libc to run guarded. */
@@ -254,7 +259,7 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         { G_AT_SECURE,  at_secure },
         { G_AT_RANDOM,  rnd_va },
         { G_AT_HWCAP,   hwcap },
-        { G_AT_HWCAP2,  0 },
+        { G_AT_HWCAP2,  hwcap2 },
         { G_AT_CLKTCK,  100 },
         { G_AT_PLATFORM, plat_va },
         { G_AT_EXECFN,  execfn_va },

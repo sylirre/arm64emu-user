@@ -329,8 +329,18 @@
 #define G_HWCAP_FPHP    (1u << 9)   /* FEAT_FP16: scalar half-precision arithmetic */
 #define G_HWCAP_ASIMDHP (1u << 10)  /* FEAT_FP16: SIMD half-precision arithmetic */
 #define G_HWCAP_CPUID   (1u << 11)
+#define G_HWCAP_ASIMDRDM (1u << 12) /* FEAT_RDM: SQRDMLAH/SQRDMLSH */
+#define G_HWCAP_JSCVT   (1u << 13)  /* FEAT_JSCVT: FJCVTZS */
+#define G_HWCAP_FCMA    (1u << 14)  /* FEAT_FCMA: FCMLA/FCADD */
+#define G_HWCAP_LRCPC   (1u << 15)  /* FEAT_LRCPC: LDAPR */
 #define G_HWCAP_SHA3    (1u << 17)
+#define G_HWCAP_ASIMDDP (1u << 20)  /* FEAT_DotProd: SDOT/UDOT */
 #define G_HWCAP_SHA512  (1u << 21)
+#define G_HWCAP_ASIMDFHM (1u << 23) /* FEAT_FHM: FMLAL/FMLSL */
+#define G_HWCAP_ILRCPC  (1u << 26)  /* FEAT_LRCPC2: LDAPUR/STLUR */
+#define G_HWCAP_FLAGM   (1u << 27)  /* FEAT_FLAGM: CFINV/RMIF/SETF8/16 */
+#define G_HWCAP2_FLAGM2 (1u << 7)   /* FEAT_FLAGM2: AXFLAG/XAFLAG */
+#define G_HWCAP2_MOPS   (1ULL << 43) /* FEAT_MOPS: CPYx/CPYFx/SETx */
 
 /* ---- guest struct layouts (arm64 LP64) ---- */
 
