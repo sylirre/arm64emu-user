@@ -37,6 +37,9 @@ jobs:
       # expect                  -> interactive job-control (PTY) test
       - name: Install cross toolchain, qemu oracle and rootfs bootstrap tools
         run: |
+          # Enable i386 before the update so the i386 package index is fetched;
+          # the -m32 test32 build needs the i386 kernel headers (see next step).
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
@@ -46,18 +49,23 @@ jobs:
       # `make test32`. The gcc-multilib metapackage can't be used here: it
       # Conflicts with every versioned cross gcc (incl. gcc-*-aarch64-linux-gnu
       # installed above), so apt reports "held broken packages". Install the
-      # underlying 32-bit dev libs directly instead — they carry no such
-      # conflict and coexist with the cross toolchain:
-      #   libc6-dev-i386    -> 32-bit libc headers (bits/libc-header-start.h)
-      #                        + crt1/crti/crtn and the 32-bit libc
-      #   lib32gcc-<v>-dev  -> 32-bit crtbegin/crtend + libgcc.a for the host
-      #                        gcc; version-matched to the runner's default gcc
-      #                        so a future ubuntu-latest gcc bump keeps working
+      # underlying 32-bit dev packages directly instead — they carry no such
+      # conflict and coexist with the cross toolchain. All three are needed
+      # because -m32 uses the i386 include/library search paths, not the
+      # amd64 ones the native build already has:
+      #   libc6-dev-i386     -> 32-bit libc headers (bits/libc-header-start.h)
+      #                         + crt1/crti/crtn and the 32-bit libc
+      #   linux-libc-dev:i386 -> 32-bit kernel headers (asm/unistd.h, pulled in
+      #                         via <sys/syscall.h>); co-installs with the amd64
+      #                         one (linux-libc-dev is Multi-Arch: same)
+      #   lib32gcc-<v>-dev   -> 32-bit crtbegin/crtend + libgcc.a for the host
+      #                         gcc; version-matched to the runner's default gcc
+      #                         so a future ubuntu-latest gcc bump keeps working
       - name: Install 32-bit multilib libraries (for make test32)
         run: |
           gccv=$(gcc -dumpversion | cut -d. -f1)
           sudo apt-get install -y --no-install-recommends \
-            libc6-dev-i386 "lib32gcc-${gccv}-dev"
+            libc6-dev-i386 linux-libc-dev:i386 "lib32gcc-${gccv}-dev"
 
       - name: Build
         run: make
