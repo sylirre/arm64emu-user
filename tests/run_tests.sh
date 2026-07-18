@@ -35,7 +35,10 @@ run_diff() {   # run_diff <name> <binary> [args...]
 # ---- assembly tests (static, nostdlib) ----
 for s in tests/asm/*.S; do
     b="${s%.S}.bin"
-    "$AGCC" -march=armv8.1-a -static -nostdlib -o "$b" "$s" || { echo "FAIL build $s"; fail=$((fail+1)); continue; }
+    # -DUSERMODE selects the Linux-exit variant of the dual-mode m19-m22
+    # batteries shared with the ARM64_Emulator repo (their .arch directives
+    # override -march per file); the other tests ignore the define.
+    "$AGCC" -march=armv8.1-a -DUSERMODE -static -nostdlib -o "$b" "$s" 2>/dev/null || { echo "FAIL build $s"; fail=$((fail+1)); continue; }
     run_diff "asm/$(basename "$s" .S)" "$b"
 done
 
