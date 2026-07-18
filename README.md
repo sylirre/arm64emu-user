@@ -169,9 +169,12 @@ but not remembered).
 - **Full AArch64 user ISA**
 
   Integer, branches, the complete load/store family, scalar FP,
-  Advanced-SIMD, CRC32, crypto (AES/SHA1/SHA2/SHA512/SHA3/PMULL),
-  ARMv8.1 LSE atomics (CAS/CASP/SWP/LDADD/…), exclusives, and FPCR
-  rounding modes.
+  Advanced-SIMD (incl. FP16), CRC32, crypto (AES/SHA1/SHA2/SHA512/SHA3/
+  PMULL), ARMv8.1 LSE atomics (CAS/CASP/SWP/LDADD/…), exclusives, FPCR
+  rounding modes and live FPSR exception/QC flags, plus the v8.1-8.8
+  ecosystem extensions guests probe for: RDM, DotProd, FCMA, JSCVT, FHM,
+  LRCPC/LRCPC2, FLAGM/FLAGM2 and MOPS (`memcpy`/`memset` instructions,
+  with the kernel-side EC 0x27 restart contract).
 
 - **Threads**
 
