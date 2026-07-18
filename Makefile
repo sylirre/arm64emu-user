@@ -30,7 +30,12 @@ SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/
 # Variants that differ in compile flags (m32, asim) get their own object tree so
 # their objects never collide with the native ones.
 BUILDDIR  := build
-M32FLAGS  := -m32
+# -mfpmath=sse: the i386 x87 default computes guest FP in 80-bit excess
+# precision and, worse, transits every by-value double over FLD/FSTP, where an
+# sNaN load signals invalid — poisoning the lazily accumulated FPSR flags
+# (tests/asm/m22_fpsr). SSE math makes the FP core behave exactly like the
+# 64-bit build; every host that can run this is an x86-64 with SSE2.
+M32FLAGS  := -m32 -msse2 -mfpmath=sse
 ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS
 DEPFLAGS   = -MMD -MP
 
