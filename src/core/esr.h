@@ -21,6 +21,7 @@
 #define EC_DABORT_LOWER 0x24
 #define EC_DABORT_SAME  0x25
 #define EC_SP_ALIGN     0x26
+#define EC_MOP          0x27   /* FEAT_MOPS memory copy/set state mismatch */
 #define EC_BRK64        0x3C
 
 /* Data/Instruction fault status codes (DFSC/IFSC, ISS bits [5:0]). */
