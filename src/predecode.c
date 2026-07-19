@@ -285,6 +285,7 @@ static void fill_ldst(PDEnt *e, u32 insn) {
             u64 imm9 = (u64)(s64)sign_extend(BITS(20, 12), 9);
             if (mode == 0 || mode == 2) {            /* LDUR/STUR (+unpriv): plain */
                 if (V) {
+                    if (mode == 2) return;           /* no SIMD&FP unpriv form: UNDEF */
                     if (opc & 2) {
                         if (size != 0) return;
                         e->op = (opc & 1) ? PD_LDRQ : PD_STRQ;
@@ -353,6 +354,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
     if (op24 == 0x0b) {                              /* add/sub register */
         bool op = BIT(30), S = BIT(29);
         if (BIT(21)) {                               /* extended register */
+            if (BITS(12, 10) > 4) return;            /* shift amount 5-7: unallocated */
             static const u8 ids[2][2][2] = {         /* [op][S][sf] */
                 { { PD_ADDX32, PD_ADDX64 }, { PD_ADDSX32, PD_ADDSX64 } },
                 { { PD_SUBX32, PD_SUBX64 }, { PD_SUBSX32, PD_SUBSX64 } },
