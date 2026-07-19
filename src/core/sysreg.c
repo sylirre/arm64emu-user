@@ -79,7 +79,7 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,0,0,6,0): v = 0x21100110212120ULL; break; /* ID_AA64ISAR0_EL1: AES=2,SHA1=1,SHA2=2(+SHA512),CRC32=1,Atomic=2(LSE),RDM=1,SHA3=1,DP=1,FHM=1,TS=2(FLAGM2) */
         case KEY(3,0,0,6,1): v = 0x211000; break;            /* ID_AA64ISAR1_EL1: JSCVT=1,FCMA=1,LRCPC=2(LDAPUR/STLUR) */
         case KEY(3,0,0,6,2): v = 0x10000; break;             /* ID_AA64ISAR2_EL1: MOPS=1 (CPYx/SETx) */
-        case KEY(3,0,0,7,0): v = 0x1124; break;              /* ID_AA64MMFR0_EL1 (matches QEMU cortex-a57) */
+        case KEY(3,0,0,7,0): v = 0x0F001124; break;          /* ID_AA64MMFR0_EL1: TGran64=0xF (64K unimplemented), else QEMU cortex-a57 */
         case KEY(3,0,0,7,1): v = 0; break;                   /* ID_AA64MMFR1_EL1 */
         case KEY(3,0,0,7,2): v = 0; break;                   /* ID_AA64MMFR2_EL1 */
         /* CRm=4..7 other ID slots read as 0 (handled by default) */
@@ -123,13 +123,13 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,3,14,0,0): v = c->cntfrq; break;          /* CNTFRQ_EL0 */
         case KEY(3,3,14,0,1): v = timer_count(c, false); break; /* CNTPCT_EL0 */
         case KEY(3,3,14,0,2): v = timer_count(c, true); break;  /* CNTVCT_EL0 */
-        case KEY(3,3,14,2,0): v = (u64)(s64)(c->cntp_cval - timer_count(c, false)); break; /* CNTP_TVAL */
+        case KEY(3,3,14,2,0): v = (u64)(s32)(c->cntp_cval - timer_count(c, false)); break; /* CNTP_TVAL: signed 32-bit view */
         case KEY(3,3,14,2,1):                                /* CNTP_CTL_EL0 (+ISTATUS) */
             v = c->cntp_ctl & 3;
             if ((c->cntp_ctl & 1) && timer_count(c, false) >= c->cntp_cval) v |= 4;
             break;
         case KEY(3,3,14,2,2): v = c->cntp_cval; break;       /* CNTP_CVAL_EL0 */
-        case KEY(3,3,14,3,0): v = (u64)(s64)(c->cntv_cval - timer_count(c, true)); break;  /* CNTV_TVAL */
+        case KEY(3,3,14,3,0): v = (u64)(s32)(c->cntv_cval - timer_count(c, true)); break;  /* CNTV_TVAL: signed 32-bit view */
         case KEY(3,3,14,3,1):                                /* CNTV_CTL_EL0 (+ISTATUS) */
             v = c->cntv_ctl & 3;
             if ((c->cntv_ctl & 1) && timer_count(c, true) >= c->cntv_cval) v |= 4;
