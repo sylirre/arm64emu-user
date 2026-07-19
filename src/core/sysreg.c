@@ -5,6 +5,7 @@
 #include "sysreg.h"
 #include "mmu.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Generic-timer hooks. gt_count is provided by loop.c; timer_update's provider
  * (timer.c, M3) was never added, so it stays weak and is NULL-checked. */
@@ -53,6 +54,11 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
     if (CRn == 7) {
         if (CRm == 4 && op2 == 1) {                      /* DC ZVA: zero 64 bytes */
             u64 base = reg_x(c, Rt) & ~63ULL;
+            /* One translation covers the line (64-aligned: never crosses a
+             * page): writable hit -> host memset (#11). Miss/deny falls back
+             * to the 8x mem_write loop, which raises the fault identically. */
+            void *hp = mem_host_ptr(c, base, 64, ACC_WRITE);
+            if (hp) { memset(hp, 0, 64); return; }
             for (unsigned i = 0; i < 64; i += 8)
                 if (!mem_write(c, base + i, 8, 0)) return;
             return;
