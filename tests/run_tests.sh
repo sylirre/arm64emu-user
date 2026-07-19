@@ -226,6 +226,36 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     rm -rf "$BSRC" "$BSRC2"
 fi
 
+# ---- /dev node listing + --no-dev / --no-proc (self-checking; qemu has no
+# passthrough or synthesis concept). The passthrough /dev nodes now show up in
+# `ls /dev` (getdents dev_inject_dents); --no-dev / --no-proc disable each
+# built-in, leaving only the rootfs (or an explicit --bind). Uses the Alpine
+# rootfs, which ships a /dev directory (with a placeholder `null`) and an empty
+# /proc, both listable. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_devproc() {   # check_devproc <label> <expected> <emu args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS devproc: $label"
+        else fail=$((fail+1)); echo "FAIL devproc: $label (want '$expect' got '$got')"; fi
+    }
+    # Synthesized node appears in `ls /dev`; the physical rootfs `null` is not duped.
+    check_devproc "dev node listed"     "zero"  "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -x zero'
+    check_devproc "dev null no dup"     "1"     "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -c "^null$"'
+    # --no-dev: passthrough off, /dev is the rootfs only (no `zero`, node absent).
+    check_devproc "no-dev hides node"   ""      --no-dev "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -x zero'
+    check_devproc "no-dev node gone"    "no"    --no-dev "$ALPINE" /bin/busybox sh -c '[ -e /dev/zero ] && echo yes || echo no'
+    # --no-dev + bind the real host /dev repopulates it (listed natively).
+    check_devproc "no-dev bind /dev"    "zero"  --no-dev --bind /dev:/dev "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -x zero'
+    # /proc: default passthrough shows `self`; --no-proc serves the empty rootfs.
+    check_devproc "proc self default"   "self"  "$ALPINE" /bin/busybox sh -c 'ls /proc | grep -x self'
+    check_devproc "no-proc hides self"  ""      --no-proc "$ALPINE" /bin/busybox sh -c 'ls /proc | grep -x self'
+    check_devproc "no-proc no synth"    "0"     --no-proc "$ALPINE" /bin/busybox sh -c 'cat /proc/version 2>/dev/null | wc -l'
+    # --no-proc + bind the real host /proc gives the real view.
+    check_devproc "no-proc bind /proc"  "Linux" --no-proc --bind /proc:/proc "$ALPINE" /bin/busybox sh -c 'head -c5 /proc/version'
+fi
+
 # ---- -w/--work-dir initial working directory (self-checking; qemu-user has no
 # equivalent). Exercises absolute/relative guest paths, the long form, combining
 # with --bind, and the fatal-on-invalid-path behavior. ----

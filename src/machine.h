@@ -151,6 +151,11 @@ struct Machine {
     u8 shared_proc;           /* -shared-proc: back the guest-PID registry with a
                                * named, per-rootfs shared file so ps/top see the
                                * guest processes of other emulator invocations */
+    u8 no_dev;                /* --no-dev: disable the built-in /dev device-node
+                               * passthrough; /dev is served from the rootfs (or
+                               * a --bind) only, with no node synthesis */
+    u8 no_proc;               /* --no-proc: disable the synthesized /proc; /proc
+                               * is served from the rootfs (or a --bind) only */
     u8 share_abstract;        /* --share-abstract-sockets: opt out of per-rootfs
                                * abstract-socket isolation, sharing the host's
                                * global abstract namespace (default: isolate) */
@@ -271,6 +276,21 @@ void path_strip_rootfs(const struct Machine *m, char *path);
  * bind-reverse / rootfs-strip). Writes to `out` (>= PATH_MAX) and returns 0, or
  * a negative errno. Used by getdents64 to identify the directory being listed. */
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out);
+
+/* Map an fd's host path (as read from /proc/self/fd) to its guest path via the
+ * same bind-reverse / rootfs-strip dirfd_guest_path uses, but without the
+ * readlink — for callers that already hold the host path. When `via_bind` is
+ * non-NULL it reports whether the path resolved through a -bind. Writes `out`
+ * (>= PATH_MAX) and returns 0, or a negative errno. */
+int host_fd_guest_path(struct Machine *m, const char *hostpath, char *out,
+                       int *via_bind);
+
+/* The passthrough /dev nodes special_host_path grants (getdents64 lists them,
+ * since they have no physical dirent in rootfs/dev). dev_node_count is the entry
+ * count; dev_node_get yields entry i's guest basename and the host path to stat
+ * for its type/existence, or 0 if i is out of range. */
+int dev_node_count(void);
+int dev_node_get(int i, const char **name, const char **host);
 
 /* If `hostpath` lies under a -bind host prefix (at a '/' boundary), return the
  * bind index and, when `guest_out` is non-NULL, write the guest-side path

@@ -93,9 +93,10 @@ static const char *rootfs_fstype(const struct Machine *m) {
 }
 
 /* The guest mount table: the rootfs plus the passthrough zones path.c binds
- * (/proc, /dev/pts, /dev/shm). Fixed mount IDs; the root's major:minor is
- * real so tools cross-referencing stat().st_dev find it. `fmt` selects the
- * /proc/<pid>/{mounts,mountinfo,mountstats} rendering (MNT_* above). */
+ * (/proc, /dev/pts, /dev/shm). The devpts and shm rows are omitted under
+ * --no-dev, when that passthrough is disabled. Fixed mount IDs; the root's
+ * major:minor is real so tools cross-referencing stat().st_dev find it. `fmt`
+ * selects the /proc/<pid>/{mounts,mountinfo,mountstats} rendering (MNT_* above). */
 static void put_mounts(int fd, struct Machine *m, int fmt) {
     const char *fstype = rootfs_fstype(m);
     unsigned maj = 0, min = 0;
@@ -121,10 +122,12 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
     if (fmt == MNT_MOUNTINFO) {
         dprintf(fd, "1 1 %u:%u / / rw,relatime - %s /dev/root rw\n",
                 maj, min, fstype);
-        for (size_t i = 0; i < np; i++)
+        for (size_t i = 0; i < np; i++) {
+            if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
             dprintf(fd, "%zu 1 0:%zu / %s %s - %s %s %s\n",
                     i + 2, i + 5, pseudo[i].dir, pseudo[i].opts,
                     pseudo[i].type, pseudo[i].src, pseudo[i].sopts);
+        }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
             char bg[PATH_MAX], bh[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;   /* skip freed/mid-claim */
@@ -143,9 +146,11 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
         /* mountstats: a device line per mount (no NFS per-op stats, since these
          * are all local filesystems). */
         dprintf(fd, "device /dev/root mounted on / with fstype %s\n", fstype);
-        for (size_t i = 0; i < np; i++)
+        for (size_t i = 0; i < np; i++) {
+            if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
             dprintf(fd, "device %s mounted on %s with fstype %s\n",
                     pseudo[i].src, pseudo[i].dir, pseudo[i].type);
+        }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
             char bg[PATH_MAX], bh[PATH_MAX];
             if (!bind_get(i, bg, bh, NULL)) continue;
@@ -153,9 +158,11 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
         }
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
-        for (size_t i = 0; i < np; i++)
+        for (size_t i = 0; i < np; i++) {
+            if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
             dprintf(fd, "%s %s %s %s 0 0\n", pseudo[i].src, pseudo[i].dir,
                     pseudo[i].type, pseudo[i].opts);
+        }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
             char bg[PATH_MAX], bh[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;
@@ -491,6 +498,8 @@ static int proc_other_cmdline(const char *canon, s32 *pid) {
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     struct Machine *m = c->m;
     int kind;
+
+    if (m->no_proc) return 0;   /* --no-proc: no synthesized /proc files */
 
     /* /proc/<pid>/cmdline of ANOTHER guest process: served from the shared PID
      * registry (self / own-pid keep using m->cmdline via self_tail below). A

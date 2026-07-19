@@ -66,6 +66,10 @@ arm64chroot [options] <rootfs> <program> [args...]
                           forbids link() (Android/SELinux -> EXDEV)
       --shared-proc       Key the shared guest-PID registry by rootfs so `ps`/`top`
                           see guest processes across emulator invocations
+      --no-dev            Disable the built-in /dev device-node passthrough; /dev
+                          is served from the rootfs only (bind your own if needed)
+      --no-proc           Disable the synthesized /proc; /proc is served from the
+                          rootfs only (bind your own for a real host view)
   -b, --bind SRC:DST[:ro] Expose host directory `src` at guest path `dst`
                           (repeatable); append `:ro` for a read-only mount. Host
                           paths may not contain ':'.
@@ -102,11 +106,16 @@ Basic usage example with Alpine Linux rootfs:
 The program automatically whitelists access to certain /dev nodes: null, zero,
 full, random, urandom, tty, ptmx and the directories pts/ and shm/. Console
 maps to the controlling terminal, stdin/stdout/stderr and fd/* to the
-process's own file descriptors.
+process's own file descriptors. These nodes also show up in a listing of /dev
+(synthesized on the fly, since they are not physically present in the rootfs).
+Pass `--no-dev` to disable this passthrough entirely; /dev is then served from
+the rootfs only, so bind your own (e.g. `--bind /dev:/dev`) if you need it.
 
 Many /proc entries are synthesized: maps, cmdline, comm, environ, auxv,
 mounts, mountinfo, mountstats, loadavg, uptime, version. The /proc/stat is
-being synthesized only when can't be read (Android OS primarily).
+being synthesized only when can't be read (Android OS primarily). Pass
+`--no-proc` to disable the synthesis entirely; /proc is then served from the
+rootfs only (bind your own, e.g. `--bind /proc:/proc`, for the real host view).
 
 Emulator can't be escaped and guest programs can't see processes running
 on the host.

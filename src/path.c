@@ -45,10 +45,36 @@ static int to_host(const struct Machine *m, const char *canon, char *host_out) {
     return 0;
 }
 
+/* Map a host path (an open fd's /proc/self/fd target) to its guest path: prefer
+ * the -bind reverse map, else strip the rootfs prefix, else keep it verbatim (a
+ * passthrough fd such as host /dev or /proc). When `via_bind` is non-NULL it is
+ * set to 1 iff a -bind matched. Falls back to the host path for anything outside
+ * the rootfs (shouldn't happen for dirfds we opened). */
+int host_fd_guest_path(struct Machine *m, const char *hostpath, char *out,
+                       int *via_bind) {
+    if (via_bind) *via_bind = 0;
+    if (bind_of_host(m, hostpath, out) >= 0) {   /* fd inside a -bind */
+        if (via_bind) *via_bind = 1;
+        return 0;
+    }
+    size_t rl = strlen(m->rootfs);
+    if (strncmp(hostpath, m->rootfs, rl) == 0 &&
+        (hostpath[rl] == '/' || hostpath[rl] == 0)) {
+        if (hostpath[rl] == 0) strcpy(out, "/");
+        else {
+            if (strlen(hostpath + rl) + 1 > PATH_MAX) return -ENAMETOOLONG;
+            strcpy(out, hostpath + rl);
+        }
+        return 0;
+    }
+    if (strlen(hostpath) + 1 > PATH_MAX) return -ENAMETOOLONG;
+    strcpy(out, hostpath);   /* passthrough fd (e.g. /dev, /proc): keep host path */
+    return 0;
+}
+
 /* Canonical guest path of an open guest dirfd (guest fd == host fd): read the
- * host /proc/self/fd link and strip the rootfs prefix. Falls back to "/" for
- * paths outside the rootfs (shouldn't happen for dirfds we opened). Exported
- * for getdents64 (sys_file.c), which uses it to know which guest directory a
+ * host /proc/self/fd link, then map it via host_fd_guest_path. Exported for
+ * getdents64 (sys_file.c), which uses it to know which guest directory a
  * listing fd names so it can splice in virtual bind mount points. */
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     char link[64], buf[PATH_MAX];
@@ -56,19 +82,7 @@ int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     ssize_t n = readlink(link, buf, sizeof buf - 1);
     if (n < 0) return -EBADF;
     buf[n] = 0;
-    if (bind_of_host(m, buf, out) >= 0) return 0;   /* dirfd inside a -bind */
-    size_t rl = strlen(m->rootfs);
-    if (strncmp(buf, m->rootfs, rl) == 0 && (buf[rl] == '/' || buf[rl] == 0)) {
-        if (buf[rl] == 0) strcpy(out, "/");
-        else {
-            if (strlen(buf + rl) + 1 > PATH_MAX) return -ENAMETOOLONG;
-            strcpy(out, buf + rl);
-        }
-        return 0;
-    }
-    if (strlen(buf) + 1 > PATH_MAX) return -ENAMETOOLONG;
-    strcpy(out, buf);   /* passthrough fd (e.g. /dev, /proc): keep host path */
-    return 0;
+    return host_fd_guest_path(m, buf, out, NULL);
 }
 
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
@@ -81,6 +95,7 @@ int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
  * not magic, so the host-path resolution / hidden-PID ENOENT stands. Writes the
  * guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
+    if (m->no_proc) return 0;   /* --no-proc: no /proc emulation at all */
     if (strncmp(canon, "/proc/", 6)) return 0;
     const char *rest = canon + 6;
 
@@ -148,7 +163,9 @@ void path_strip_rootfs(const struct Machine *m, char *path) {
  *    here on a following resolution — the walk splices them out).
  * Returns 1 if host_out was filled, 0 to fall through to rootfs prefixing. */
 static int special_host_path(struct Machine *m, const char *canon, char *host_out) {
-    if (!strncmp(canon, "/dev/", 5) || !strcmp(canon, "/dev")) {
+    if (!m->no_dev && (!strncmp(canon, "/dev/", 5) || !strcmp(canon, "/dev"))) {
+        /* Whitelist of passthrough device nodes. Keep in sync with dev_nodes[]
+         * below, which drives the getdents64 /dev listing synthesis. */
         static const char *devok[] = {
             "/dev/null", "/dev/zero", "/dev/full", "/dev/random",
             "/dev/urandom", "/dev/tty", "/dev/ptmx",
@@ -174,7 +191,8 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         if (!strcmp(canon, "/dev/stderr")) { strcpy(host_out, "/proc/self/fd/2"); return 1; }
         return 0;   /* everything else: rootfs/dev (usually ENOENT) */
     }
-    if (!strncmp(canon, "/proc", 5) && (canon[5] == 0 || canon[5] == '/')) {
+    if (!m->no_proc && !strncmp(canon, "/proc", 5) &&
+        (canon[5] == 0 || canon[5] == '/')) {
         /* Hidden-process view: a numeric /proc/<pid> that is not a guest PID
          * appears not to exist — fall through to rootfs prefixing (ENOENT).
          * Guest PIDs and every non-numeric name (self, sys, net, version, …)
@@ -195,6 +213,34 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
         return 1;
     }
     return 0;
+}
+
+/* The passthrough /dev nodes the whitelist in special_host_path grants access
+ * to, as (guest basename, host path to stat) pairs. This is the listing source
+ * of truth: getdents64 (dev_inject_dents in sys_file.c) splices these into a
+ * listing of guest /dev, since none of them has a physical dirent in the rootfs
+ * /dev. Keep in sync with the special_host_path whitelist above. The host path
+ * is what we lstat for the node's d_type / existence: `console` presents the
+ * controlling terminal, and `fd`/`std*` present the process's own descriptors,
+ * exactly as special_host_path resolves them. */
+static const struct { const char *name, *host; } dev_nodes[] = {
+    { "null",    "/dev/null"       }, { "zero",    "/dev/zero"    },
+    { "full",    "/dev/full"       }, { "random",  "/dev/random"  },
+    { "urandom", "/dev/urandom"    }, { "tty",     "/dev/tty"     },
+    { "ptmx",    "/dev/ptmx"       }, { "console", "/dev/tty"     },
+    { "pts",     "/dev/pts"        }, { "shm",     "/dev/shm"     },
+    { "fd",      "/proc/self/fd"   },
+    { "stdin",   "/proc/self/fd/0" }, { "stdout",  "/proc/self/fd/1" },
+    { "stderr",  "/proc/self/fd/2" },
+};
+
+int dev_node_count(void) { return (int)(sizeof dev_nodes / sizeof dev_nodes[0]); }
+
+int dev_node_get(int i, const char **name, const char **host) {
+    if (i < 0 || i >= dev_node_count()) return 0;
+    if (name) *name = dev_nodes[i].name;
+    if (host) *host = dev_nodes[i].host;
+    return 1;
 }
 
 /* host = bind.host + rem, where rem is "" or "/...". bind.host is realpath'd and

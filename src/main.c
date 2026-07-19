@@ -229,8 +229,10 @@ static void help(void) {
                         "(diagnostic, slower)."},
         {"-l, --link2symlink", "Emulate hardlinks with tracked symlinks where "
                         "the host forbids link() (Android OS)."},
-        {"    --shared-proc", "Share /proc between multiple emulator sessions "
-                        "within same rootfs."},
+        {"    --shared-proc", "Share synthesized /proc view between multiple "
+                        "emulator sessions within same rootfs."},
+        {"    --no-dev", "Disable the synthesized /dev."},
+        {"    --no-proc", "Disable the synthesized /proc."},
         {"-b, --bind SRC:DST[:ro]", "Expose host directory SRC at guest path "
                         "DST (repeatable). Append :ro for a read-only mount. "
                         "Host paths may not contain ':'."},
@@ -285,13 +287,12 @@ static void help(void) {
         "isolated chroot-like environments. Implements a full user ISA "
         "including FP, ASIMD, AES, PMULL, SHA*, CRC32, atomics. Supports "
         "~190 system calls which should be enough for most of workloads.\n\n"
-        "The guest environment has access to specific device nodes such as "
-        "/dev/null, zero, full, urandom, tty and directories such as "
-        "/dev/pts and shm. No need to manually create them or bind-mount "
-        "the whole host /dev file system inside chroot environment.\n\n"
-        "Because guest programs are not executed as native processes, the "
-        "visible /proc layout is synthesized.\n\n"
-        "Can execute programs on file systems mounted with 'noexec'.",
+        "Directory layout for /dev expose a minimal set of device nodes "
+        "needed for correct functioning of guest programs. The /proc is "
+        "almost entirely synthesized to provide process data correct "
+        "from the view point of emulator.\n\n"
+        "This utility can execute programs on file systems mounted with "
+        "'noexec' option or where execution is not allowed by SELinux.",
     w, 2, 0);
 
     help_section(f, "ARGUMENTS");
@@ -535,6 +536,8 @@ int main(int argc, char **argv)
             else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_predecode = 0; }
             else if (!strcmp(n, "link2symlink")) { if (val) opt_no_value(arg); m->link2symlink = 1; }
             else if (!strcmp(n, "shared-proc"))  { if (val) opt_no_value(arg); m->shared_proc = 1; }
+            else if (!strcmp(n, "no-dev"))       { if (val) opt_no_value(arg); m->no_dev = 1; }
+            else if (!strcmp(n, "no-proc"))      { if (val) opt_no_value(arg); m->no_proc = 1; }
             else if (!strcmp(n, "share-abstract-sockets")) { if (val) opt_no_value(arg); m->share_abstract = 1; }
             else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));

@@ -858,35 +858,89 @@ static size_t bind_inject_dents(struct Machine *m, int dirfd, const char *dir,
     return used;
 }
 
+/* Splice the passthrough /dev device nodes (path.c's dev_nodes[] whitelist)
+ * into a listing of guest /dev. Like bind mount points, these nodes have no
+ * physical dirent in the rootfs /dev — special_host_path grants access by name
+ * only — so a plain getdents never lists them. For each whitelist entry we
+ * lstat its host target for a real d_ino/d_type, skipping it when the node is
+ * absent on this host or already present as a real dirent (dedup, e.g. a rootfs
+ * that ships a real "null"). Records are 8-byte aligned, same builder as
+ * bind_inject_dents; entry names are unique so no cross-record dedup is needed.
+ * The caller suppresses this under --no-dev and when /dev is served by a -bind
+ * (that directory's own contents are authoritative). Returns the new length. */
+static size_t dev_inject_dents(int dirfd, u8 *buf, size_t used, size_t cap) {
+    int nd = dev_node_count();
+    for (int i = 0; i < nd; i++) {
+        const char *name, *host;
+        if (!dev_node_get(i, &name, &host)) continue;
+        struct stat hst;
+        if (lstat(host, &hst) != 0) continue;   /* not available on this host */
+        struct stat pst;
+        if (fstatat(dirfd, name, &pst, AT_SYMLINK_NOFOLLOW) == 0) continue;   /* already listed */
+        u64 ino = (u64)hst.st_ino;
+        u8 type = (u8)((hst.st_mode >> 12) & 0xf);   /* S_IFMT>>12 == DT_* */
+        size_t namelen = strlen(name);
+        size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+        if (used + reclen > cap) continue;
+        u8 *rec = buf + used;
+        memset(rec, 0, reclen);
+        memcpy(rec + 0, &ino, 8);
+        s64 off = (s64)0x7ffffffe00000000LL + i;      /* opaque high cookie */
+        memcpy(rec + 8, &off, 8);
+        u16 rl = (u16)reclen; memcpy(rec + 16, &rl, 2);
+        rec[18] = type;
+        memcpy(rec + 19, name, namelen + 1);
+        used += reclen;
+    }
+    return used;
+}
+
 SYSDEF(getdents64) {
     /* linux_dirent64 layout is a fixed kernel ABI, identical for guest and
      * host. Two filters may apply: hide ".l2s.*" backing files (-link2symlink),
      * and hide non-guest PIDs from the top-level /proc (pid-namespace view).
      * Names sit at record offset +19 (8 d_ino + 8 d_off + 2 d_reclen + 1
-     * d_type). We also append synthetic records for virtual bind mount points
-     * (bind_inject_dents). Otherwise the raw buffer passes straight through. */
+     * d_type). We also append synthetic records for entries with no physical
+     * dirent in the rootfs: the passthrough /dev device nodes (dev_inject_dents)
+     * and virtual bind mount points (bind_inject_dents). Otherwise the raw
+     * buffer passes straight through. */
     size_t len = (size_t)a2;
     if (len > (1u << 20)) len = 1u << 20;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
 
-    /* Bind mount points have no physical dirent, so we splice them into the
-     * listing of their parent (bind_inject_dents), but only on the first read
-     * of the fd (offset 0): a real directory always yields "."/".." so the
-     * cursor then advances and later reads see a non-zero offset and skip
-     * injection — this makes it fire once and rules out a re-inject loop. The
-     * offset must be sampled before any host getdents64 below. */
-    int have_binds = bind_count() > 0;
-    off_t pos0 = have_binds ? lseek((int)a0, 0, SEEK_CUR) : -1;
-
-    /* Is this fd the top-level /proc? (guest fd == host fd on the passthrough) */
-    int is_proc = 0;
+    /* Identify the fd's directory once, from a single readlink of its host path
+     * (guest fd == host fd): its guest path `gdir`, whether it resolved through
+     * a -bind (`via_bind`), and whether it is the host /proc passthrough (which
+     * takes the PID-namespace filter, unless --no-proc disabled /proc). */
+    char gdir[PATH_MAX];
+    int have_gdir = 0, via_bind = 0, is_proc = 0;
     {
-        char link[64], tgt[PATH_MAX];
+        char link[64], hpath[PATH_MAX];
         snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
-        ssize_t ln = readlink(link, tgt, sizeof tgt - 1);
-        if (ln > 0) { tgt[ln] = 0; is_proc = !strcmp(tgt, "/proc"); }
+        ssize_t ln = readlink(link, hpath, sizeof hpath - 1);
+        if (ln > 0) {
+            hpath[ln] = 0;
+            is_proc = !c->m->no_proc && !strcmp(hpath, "/proc");
+            have_gdir = host_fd_guest_path(c->m, hpath, gdir, &via_bind) == 0;
+        }
     }
+
+    /* Synthetic entries have no physical dirent, so we splice them into the
+     * listing of their directory, but only on its first read (offset 0): a real
+     * directory always yields "."/".." so the cursor then advances and later
+     * reads see a non-zero offset and skip injection — this fires once and rules
+     * out a re-inject loop. /dev nodes go in when this fd is guest /dev served by
+     * the built-in passthrough (not --no-dev, and not a -bind, whose own
+     * contents are authoritative). Bind mount points go into their parent
+     * listing (bind_inject_dents filters to those whose parent is gdir). The
+     * offset must be sampled before any host getdents64 below. */
+    int inject_dev = have_gdir && !via_bind && !c->m->no_dev &&
+                     !strcmp(gdir, "/dev");
+    int inject_binds = have_gdir && bind_count() > 0;
+    int want_inject = inject_dev || inject_binds;
+    off_t pos0 = want_inject ? lseek((int)a0, 0, SEEK_CUR) : -1;
+
     int l2s = 0;
 #ifdef L2S_ENABLED
     l2s = c->m->link2symlink;
@@ -921,10 +975,11 @@ SYSDEF(getdents64) {
         n = syscall(SYS_getdents64, (int)a0, buf, len);
     }
     if (n < 0) { free(buf); return host_err(); }
-    if (have_binds && pos0 == 0 && n > 0) {
-        char dir[PATH_MAX];
-        if (dirfd_guest_path(c->m, (int)a0, dir) == 0)
-            n = (long)bind_inject_dents(c->m, (int)a0, dir, buf, (size_t)n, len);
+    if (want_inject && pos0 == 0 && n > 0) {
+        if (inject_dev)
+            n = (long)dev_inject_dents((int)a0, buf, (size_t)n, len);
+        if (inject_binds)
+            n = (long)bind_inject_dents(c->m, (int)a0, gdir, buf, (size_t)n, len);
     }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);

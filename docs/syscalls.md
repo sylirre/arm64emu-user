@@ -193,9 +193,18 @@ family is ungated (it does not depend on the host actually blocking netlink).
 **Special zones** are checked on the canonical guest path before prefixing:
 
 - `/dev`: a whitelist passes through to host devices (`null`, `zero`, `full`,
-  `random`, `urandom`, `tty`, `ptmx`, `pts/*`, `shm/*`, `fd/*`); everything else
-  resolves into `rootfs/dev` (usually ENOENT).
+  `random`, `urandom`, `tty`, `ptmx`, `console`, `pts/*`, `shm/*`, `fd/*`,
+  `std{in,out,err}`); everything else resolves into `rootfs/dev` (usually
+  ENOENT). None of these has a physical dirent, so `getdents64`
+  (`dev_inject_dents` in `sys_file.c`, driven by the `dev_nodes[]` table beside
+  the whitelist in `path.c`) splices them into a listing of guest `/dev` — each
+  `lstat`'d for a real `d_type`, deduped against a physical dirent (a rootfs
+  that ships e.g. a real `null`). `--no-dev` disables this whole zone: `/dev` is
+  then served from the rootfs (or a `--bind`) only.
 - `/proc`: passes through to host `/proc`, with two guest-view exceptions.
+  `--no-proc` disables the whole zone — the passthrough, the magic links, and
+  the synthesized files below — so `/proc` is served from the rootfs (or a
+  `--bind /proc:/proc` for the real host view) only.
   The **magic links** — `exe`, `cwd`, `root` — are spliced to their guest
   targets during the walk (`path_proc_magic`), so `stat /proc/self/exe` reaches
   the guest binary and `/proc/self/root/…` resolves inside the rootfs instead of
