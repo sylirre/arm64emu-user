@@ -1433,7 +1433,7 @@ static int vop_cached(const IROp *o) {
 /* One IRO_VOP. xmm0-4 and rax/rcx are scratch; operands come from the
  * V-register cache (vop_src) for the cached classes. Only FCMP touches
  * guest flags. */
-static void emit_vop(BE *be, const IROp *o) {
+static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
     Emit *e = be->e;
     u32 insn = (u32)o->imm;
     unsigned rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
@@ -2226,7 +2226,11 @@ static void emit_vop(BE *be, const IROp *o) {
             if (half) alu_ri32(e, 0, 4, RAX, 0xffff);   /* Hd = low 16 bits */
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
-            /* loads/cmov preserve EFLAGS: be->fl stays whatever it was */
+            /* loads/cmov preserve EFLAGS, but the next op may clobber
+             * them: keep host flags only for a following consumer, else
+             * store NZCV now (same discipline as the integer CSEL). */
+            if (be->fl != FL_MEM && flags_next_use(ir, i) == FLAGS_UNKNOWN)
+                materialize_flags(be);
             break;
         }
         case VC_VF3S: {
@@ -3706,7 +3710,7 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             emit_atomic(be, ir, i);
             break;
         case IRO_VOP:
-            emit_vop(be, o);
+            emit_vop(be, ir, i, o);
             break;
         case IRO_CALL1:
             emit_call1(be, o);
