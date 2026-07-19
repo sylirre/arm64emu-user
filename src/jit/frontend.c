@@ -243,6 +243,22 @@ static u64 fe_expand_imm(unsigned op, unsigned cmode, unsigned imm8) {
     }
 }
 
+/* Mirrors exec_fpsimd.c's simd_copy_enc_valid: true iff an AdvSIMD-copy
+ * encoding is allocated. Keep in sync with the interpreter's copy so reserved
+ * encodings are left GENERIC here and UNDEF identically in the interpreter. */
+static bool fe_simd_copy_valid(unsigned op, unsigned imm4, unsigned imm5, unsigned Q) {
+    if ((imm5 & 0xf) == 0) return false;            /* no allocated element size */
+    unsigned size = (imm5 & 1) ? 0 : (imm5 & 2) ? 1 : (imm5 & 4) ? 2 : 3;
+    if (op) return true;                            /* INS (element): any size */
+    switch (imm4) {
+        case 0x0: case 0x1: return !(size == 3 && !Q);   /* DUP: .d needs Q */
+        case 0x3: return true;                           /* INS (general) */
+        case 0x5: return size <= (Q ? 2u : 1u);          /* SMOV */
+        case 0x7: return Q ? (size == 3) : (size <= 2);  /* UMOV */
+        default: return false;
+    }
+}
+
 static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
     unsigned rd = insn & 31, rn = (insn >> 5) & 31;
     u32 vclass = ~0u;
@@ -423,12 +439,16 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                  (opc == 0x14 && immh <= 7))           /* S/USHLL(2): widen */
             vclass = VC_SHIFTI;
     } else if ((insn & 0x9FE08400u) == 0x0E000400u) {
-        /* AdvSIMD copy (28:21 = 01110000, bit15 = 0, bit10 = 1); the
-         * interpreter's simd_copy semantics are mirrored exactly, including
-         * its permissive treatment of reserved imm5/Q combinations. */
+        /* AdvSIMD copy (28:21 = 01110000, bit15 = 0, bit10 = 1). Only allocated
+         * encodings are inlined; reserved imm5/imm4/Q combinations are left
+         * GENERIC so the interpreter's simd_copy raises UNDEF, keeping the
+         * engines in agreement (see fe_simd_copy_valid). */
         unsigned op = (insn >> 29) & 1;
         unsigned imm4 = (insn >> 11) & 0xf;
-        if (op == 1) {                           /* INS (element) */
+        unsigned imm5 = (insn >> 16) & 0x1f, Q = (insn >> 30) & 1;
+        if (!fe_simd_copy_valid(op, imm4, imm5, Q)) {
+            /* leave vclass = ~0u (GENERIC) */
+        } else if (op == 1) {                    /* INS (element) */
             vclass = VC_COPY;
         } else if (imm4 == 0x0) {                /* DUP (element) */
             vclass = VC_COPY;
