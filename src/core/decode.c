@@ -25,26 +25,30 @@ static void __attribute__((cold)) undefined(CPU *c, u32 insn) {
 
 static u64 add_with_carry(u64 x, u64 y, int cin, bool is64, u32 *flags) {
     u64 res;
-    u32 N, Z, C, V;
     if (is64) {
         u64 t = x + y;
         res = t + (unsigned)cin;
-        C = (t < x) | (res < t);
-        /* signed overflow: operands same sign, result differs */
-        V = (u32)((~(x ^ y) & (x ^ res)) >> 63);
-        N = (u32)(res >> 63);
-        Z = (res == 0);
+        if (flags) {                     /* #9: skip NZCV math when discarded */
+            u32 C = (t < x) | (res < t);
+            /* signed overflow: operands same sign, result differs */
+            u32 V = (u32)((~(x ^ y) & (x ^ res)) >> 63);
+            u32 N = (u32)(res >> 63);
+            u32 Z = (res == 0);
+            *flags = (N ? PS_N : 0) | (Z ? PS_Z : 0) | (C ? PS_C : 0) | (V ? PS_V : 0);
+        }
     } else {
         u32 xx = (u32)x, yy = (u32)y;
         u64 u = (u64)xx + (u64)yy + (unsigned)cin;
         res = (u32)u;
-        C = (u32)((u >> 32) & 1);
-        s64 s = (s64)(s32)xx + (s64)(s32)yy + cin;
-        V = ((s64)(s32)(u32)res != s);
-        N = (u32)((u32)res >> 31);
-        Z = ((u32)res == 0);
+        if (flags) {                     /* #9: skip NZCV math when discarded */
+            u32 C = (u32)((u >> 32) & 1);
+            s64 s = (s64)(s32)xx + (s64)(s32)yy + cin;
+            u32 V = ((s64)(s32)(u32)res != s);
+            u32 N = (u32)((u32)res >> 31);
+            u32 Z = ((u32)res == 0);
+            *flags = (N ? PS_N : 0) | (Z ? PS_Z : 0) | (C ? PS_C : 0) | (V ? PS_V : 0);
+        }
     }
-    if (flags) *flags = (N ? PS_N : 0) | (Z ? PS_Z : 0) | (C ? PS_C : 0) | (V ? PS_V : 0);
     return res;
 }
 
@@ -70,13 +74,38 @@ static u64 shift_reg(u64 v, unsigned type, unsigned amount, bool is64) {
 
 /* ARMv8 CRC32/CRC32C: bit-reflected CRC over `bytes` low bytes of `data`,
  * accumulator `acc`. poly is the reflected polynomial (0xEDB88320 for CRC32,
- * 0x82F63B78 for CRC32C). Matches the hardware instruction the kernel uses. */
-static u32 crc32_step(u32 acc, u64 data, unsigned bytes, u32 poly) {
-    for (unsigned i = 0; i < bytes; i++) {
-        acc ^= (u32)((data >> (8 * i)) & 0xff);
+ * 0x82F63B78 for CRC32C). Matches the hardware instruction the kernel uses.
+ * Slicing-by-8 (lazily built 8x256 tables per polynomial): CRC32X consumes
+ * its 8 bytes in one combined lookup instead of 64 bit-steps — ext4/btrfs
+ * metadata checksumming leans on this, and the JIT leaves CRC32 to this
+ * helper (predecode marks the family GENERIC), so it is an all-tier win. */
+static void crc32_tab_init(u32 t[8][256], u32 poly) {
+    for (unsigned i = 0; i < 256; i++) {
+        u32 c = i;
         for (int k = 0; k < 8; k++)
-            acc = (acc >> 1) ^ (poly & (u32)(-(s32)(acc & 1)));
+            c = (c >> 1) ^ (poly & (u32)(-(s32)(c & 1)));
+        t[0][i] = c;
     }
+    for (unsigned i = 0; i < 256; i++)
+        for (unsigned j = 1; j < 8; j++)
+            t[j][i] = (t[j - 1][i] >> 8) ^ t[0][t[j - 1][i] & 0xff];
+}
+
+static u32 crc32_step(u32 acc, u64 data, unsigned bytes, u32 poly) {
+    static u32 tab[2][8][256];
+    unsigned p = (poly == 0x82F63B78u);
+    if (tab[p][0][1] == 0) crc32_tab_init(tab[p], poly);
+    const u32 (*t)[256] = tab[p];
+    if (bytes == 8) {
+        acc ^= (u32)data;
+        u32 hi = (u32)(data >> 32);
+        return t[7][acc & 0xff] ^ t[6][(acc >> 8) & 0xff] ^
+               t[5][(acc >> 16) & 0xff] ^ t[4][acc >> 24] ^
+               t[3][hi & 0xff] ^ t[2][(hi >> 8) & 0xff] ^
+               t[1][(hi >> 16) & 0xff] ^ t[0][hi >> 24];
+    }
+    for (unsigned i = 0; i < bytes; i++)
+        acc = (acc >> 8) ^ t[0][(acc ^ (u32)(data >> (8 * i))) & 0xff];
     return acc;
 }
 
@@ -101,14 +130,14 @@ static u64 ror_within(u64 v, unsigned r, unsigned width) {
     return r ? ((v >> r) | (v << (width - r))) & 0xffffffffULL : v;
 }
 
-static bool decode_bitmasks(unsigned immN, unsigned imms, unsigned immr,
-                            bool is64, u64 *wmask, u64 *tmask) {
-    unsigned width = is64 ? 64 : 32;
+/* 64-bit-form computation (the replication fills all 64 bits; a 32-bit
+ * caller truncates — valid because immN==0 bounds esize to <=32 there). */
+static bool decode_bitmasks_slow(unsigned immN, unsigned imms, unsigned immr,
+                                 u64 *wmask, u64 *tmask) {
     u32 nimms = ((immN & 1) << 6) | ((~imms) & 0x3f);
     if (nimms == 0) return false;
     int len = 31 - __builtin_clz(nimms);
     if (len < 1) return false;
-    if ((1u << len) > width) return false;
     unsigned levels = (1u << len) - 1;
     unsigned S = imms & levels;
     unsigned R = immr & levels;
@@ -122,6 +151,30 @@ static bool decode_bitmasks(unsigned immN, unsigned imms, unsigned immr,
     u64 w = r ? (((welem >> r) | (welem << (esize - r))) & emask) : welem;
     u64 wm = 0, tm = 0;
     for (unsigned i = 0; i < 64; i += esize) { wm |= w << i; tm |= telem << i; }
+    *wmask = wm;
+    *tmask = tm;
+    return true;
+}
+
+/* Memoized front (#10): every logical-immediate and every UBFM/SBFM/BFM
+ * (i.e. all LSL/LSR/ASR/UBFX/... aliases) funnels through here, and the
+ * clz+rotate+replicate computation depends only on the 13-bit
+ * immN:immr:imms key. The 32-bit view is the truncated 64-bit result;
+ * immN==1 is the one 64-bit-only encoding (esize 64 > 32). Speeds the
+ * portable interpreter and the exec_a64 helper fallback; pd_bitmasks in
+ * predecode.c is left alone (already computed once at predecode-fill time). */
+static bool decode_bitmasks(unsigned immN, unsigned imms, unsigned immr,
+                            bool is64, u64 *wmask, u64 *tmask) {
+    static struct { u64 w, t; u8 state; } memo[1u << 13];   /* 0 unfilled/1 ok/2 bad */
+    unsigned key = ((immN & 1) << 12) | ((immr & 0x3f) << 6) | (imms & 0x3f);
+    if (memo[key].state == 0) {
+        u64 w = 0, t = 0;
+        memo[key].state = decode_bitmasks_slow(immN, imms, immr, &w, &t) ? 1 : 2;
+        memo[key].w = w; memo[key].t = t;
+    }
+    if (memo[key].state == 2) return false;
+    if (!is64 && immN) return false;
+    u64 wm = memo[key].w, tm = memo[key].t;
     if (!is64) { wm = (u32)wm; tm = (u32)tm; }
     if (wmask) *wmask = wm;
     if (tmask) *tmask = tm;
@@ -151,8 +204,9 @@ static void dp_immediate(CPU *c, u32 insn) {
         if (sh) imm <<= 12;
         u64 n = reg_xsp(c, Rn);
         u32 fl;
-        u64 r = op ? add_with_carry(n, ~imm, 1, sf, &fl)
-                   : add_with_carry(n, imm, 0, sf, &fl);
+        u32 *flp = S ? &fl : NULL;         /* #9: skip NZCV math when discarded */
+        u64 r = op ? add_with_carry(n, ~imm, 1, sf, flp)
+                   : add_with_carry(n, imm, 0, sf, flp);
         if (S) { c->nzcv = fl; set_x_sz(c, Rd, sf, r); }
         else set_xsp(c, Rd, sf ? r : (u32)r);
         return;
@@ -261,8 +315,9 @@ static void dp_register(CPU *c, u32 insn) {
             op2 = shift_reg(reg_x(c, Rm), shift, imm6, sf);
             n = reg_x(c, Rn);
         }
-        u64 r = op ? add_with_carry(n, ~op2, 1, sf, &fl)
-                   : add_with_carry(n, op2, 0, sf, &fl);
+        u32 *flp = S ? &fl : NULL;             /* #9: skip NZCV math when discarded */
+        u64 r = op ? add_with_carry(n, ~op2, 1, sf, flp)
+                   : add_with_carry(n, op2, 0, sf, flp);
         if (S) { c->nzcv = fl; set_x_sz(c, Rd, sf, r); }
         else if (ext) set_xsp(c, Rd, sf ? r : (u32)r);
         else set_x_sz(c, Rd, sf, r);
@@ -294,10 +349,11 @@ static void dp_register(CPU *c, u32 insn) {
             if (BITS(15, 10) == 0) {               /* add/sub with carry */
                 bool op = BIT(30), S = BIT(29);
                 u32 fl;
+                u32 *flp = S ? &fl : NULL;    /* #9: skip NZCV math when discarded */
                 int cin = (c->nzcv & PS_C) ? 1 : 0;
                 u64 m = reg_x(c, Rm), n = reg_x(c, Rn);
-                u64 r = op ? add_with_carry(n, ~m, cin, sf, &fl)
-                           : add_with_carry(n, m, cin, sf, &fl);
+                u64 r = op ? add_with_carry(n, ~m, cin, sf, flp)
+                           : add_with_carry(n, m, cin, sf, flp);
                 if (S) c->nzcv = fl;
                 set_x_sz(c, Rd, sf, r);
                 return;
@@ -974,15 +1030,26 @@ static void ldst_pair(CPU *c, u32 insn) {
                     : (vreg_store(c, Rt, addr, esz) && vreg_store(c, Rt2, addr + esz, esz));
         if (!ok) return;   /* faulted: skip writeback (instruction re-executes) */
     } else if (L) {
-        u64 a, b;
-        if (!mem_read(c, addr, esz, &a)) return;
-        if (!mem_read(c, addr + esz, esz, &b)) return;
-        if (signed_word) { set_x(c, Rt, sign_extend(a, 32)); set_x(c, Rt2, sign_extend(b, 32)); }
-        else if (esz == 4) { set_x(c, Rt, (u32)a); set_x(c, Rt2, (u32)b); }
-        else { set_x(c, Rt, a); set_x(c, Rt2, b); }
+        if (esz == 8) {                    /* LDP Xt: one 16-byte access (#12) */
+            V128 v;
+            if (!mem_read128(c, addr, &v)) return;
+            set_x(c, Rt, v.d[0]); set_x(c, Rt2, v.d[1]);
+        } else {
+            u64 a, b;
+            if (!mem_read(c, addr, esz, &a)) return;
+            if (!mem_read(c, addr + esz, esz, &b)) return;
+            if (signed_word) { set_x(c, Rt, sign_extend(a, 32)); set_x(c, Rt2, sign_extend(b, 32)); }
+            else { set_x(c, Rt, (u32)a); set_x(c, Rt2, (u32)b); }
+        }
     } else {
-        if (!mem_write(c, addr, esz, reg_x(c, Rt))) return;
-        if (!mem_write(c, addr + esz, esz, reg_x(c, Rt2))) return;
+        if (esz == 8) {                    /* STP Xt: one 16-byte access (#12) */
+            V128 v;
+            v.d[0] = reg_x(c, Rt); v.d[1] = reg_x(c, Rt2);
+            if (!mem_write128(c, addr, &v)) return;
+        } else {
+            if (!mem_write(c, addr, esz, reg_x(c, Rt))) return;
+            if (!mem_write(c, addr + esz, esz, reg_x(c, Rt2))) return;
+        }
     }
     if (wb) set_xsp(c, Rn, wbval);
 }
@@ -1259,6 +1326,13 @@ static void ldst_vector_single(CPU *c, u32 insn) {
 
 static void loads_stores(CPU *c, u32 insn) {
     unsigned b2927 = BITS(29, 27);
+    /* Ordered by dynamic frequency (#15): the register forms and pairs are
+     * far hotter than exclusives/vector-structure/MOPS. The tests key on
+     * disjoint b2927 values (and disjoint subfields within 0x1/0x3), so
+     * reordering cannot change which handler wins. */
+    if (b2927 == 0x7) { ldst_register(c, insn); return; }
+    if (b2927 == 0x5) { ldst_pair(c, insn); return; }
+    if (b2927 == 0x3 && BITS(25, 24) == 0) { ldst_literal(c, insn); return; }
     if (b2927 == 0x1 && BITS(26, 24) == 0) { ldst_exclusive(c, insn); return; }
     if (b2927 == 0x1 && BIT(26) == 1 && BIT(25) == 0 && BIT(24) == 0) {
         ldst_vector_multi(c, insn); return;    /* AdvSIMD load/store multiple structures */
@@ -1266,7 +1340,6 @@ static void loads_stores(CPU *c, u32 insn) {
     if (b2927 == 0x1 && BIT(26) == 1 && BIT(25) == 0 && BIT(24) == 1) {
         ldst_vector_single(c, insn); return;   /* AdvSIMD load/store single structure */
     }
-    if (b2927 == 0x3 && BITS(25, 24) == 0) { ldst_literal(c, insn); return; }
     if (b2927 == 0x3 && BIT(26) == 0 && BITS(25, 24) == 1 && BIT(21) == 0 &&
         BITS(11, 10) == 0) {
         ldst_rcpc_unscaled(c, insn); return;   /* FEAT_LRCPC2 LDAPUR/STLUR */
@@ -1274,8 +1347,6 @@ static void loads_stores(CPU *c, u32 insn) {
     if (b2927 == 0x3 && BITS(25, 24) == 1 && BIT(21) == 0 && BITS(11, 10) == 1) {
         mops(c, insn); return;                 /* FEAT_MOPS CPYx/SETx (size==0 checked inside) */
     }
-    if (b2927 == 0x5) { ldst_pair(c, insn); return; }
-    if (b2927 == 0x7) { ldst_register(c, insn); return; }
     undefined(c, insn);
 }
 
