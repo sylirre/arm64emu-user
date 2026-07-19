@@ -564,7 +564,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), sz = 1u << MDESC_SZLOG(desc);
     u64 v;
-    if (!mem_read(c, va, sz, &v)) return 1;
+    if (!mem_read(c, va, sz, &v)) { c->icount++; return 1; }
     if (MDESC_SIGN(desc)) {
         unsigned b = sz * 8;
         v = (u64)((s64)(v << (64 - b)) >> (64 - b));
@@ -577,7 +577,11 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
 
 u32 jit_st(CPU *c, u64 va, u64 val, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
-    return mem_write(c, va, 1u << MDESC_SZLOG(desc), val) ? 0 : 1;
+    if (!mem_write(c, va, 1u << MDESC_SZLOG(desc), val)) {
+        c->icount++;
+        return 1;
+    }
+    return 0;
 }
 
 u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
@@ -585,11 +589,11 @@ u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
         V128 v;
-        if (!mem_read128(c, va, &v)) return 1;
+        if (!mem_read128(c, va, &v)) { c->icount++; return 1; }
         c->v[rt] = v;
     } else {
         u64 t;
-        if (!mem_read(c, va, bytes, &t)) return 1;  /* zero-extended */
+        if (!mem_read(c, va, bytes, &t)) { c->icount++; return 1; }  /* zero-extended */
         c->v[rt].d[0] = t;
         c->v[rt].d[1] = 0;
     }
@@ -599,9 +603,12 @@ u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
 u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
-    if (bytes == 16)
-        return mem_write128(c, va, &c->v[rt]) ? 0 : 1;
-    return mem_write(c, va, bytes, c->v[rt].d[0]) ? 0 : 1;
+    if (bytes == 16) {
+        if (!mem_write128(c, va, &c->v[rt])) { c->icount++; return 1; }
+        return 0;
+    }
+    if (!mem_write(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
+    return 0;
 }
 
 /* IC IVAU, Xt: architecturally required before executing written code

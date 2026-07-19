@@ -827,6 +827,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
 
     switch (e->op) {
         case PD_NOP:
+            ir->ninsns++;                   /* retired: must count */
             return FE_CONT;                 /* hints/PRFM: no effect */
 
         /* ---- branches (terminal) ---- */
