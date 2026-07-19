@@ -132,6 +132,12 @@ arm64chroot --bind /etc/ssl:/etc/ssl:ro ./rootfs /bin/sh  # read-only
 All bindings get registered in the guest's `/proc/mounts` and
 `/proc/PID/mountinfo`. The host information about mount points is discarded.
 
+The mount point also shows up in a listing of its parent directory — `ls /`
+displays a `--bind $HOME:/host` even though `/host` is virtual and does not
+exist in the rootfs. This is synthesized on the fly, so the destination need
+not be created beforehand. (A destination whose *parent* directory is itself
+absent from the rootfs stays reachable by name but cannot be listed.)
+
 It is possible to use `mount --bind src dst` within guest environment if
 emulator uses `--fake-id`. Remove binding by `umount dst`. Run time bindings
 are not shared between multiple emulator sessions.

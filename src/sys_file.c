@@ -793,16 +793,91 @@ static int proc_keep_name(const char *name) {
     return pid == (long)getpid() || proctab_has((s32)pid);
 }
 
+/* Splice virtual bind mount points into a directory listing. A --bind (or
+ * runtime mount --bind) destination is a pure path-resolution overlay
+ * (path.c bind_match) with no physical dirent in the rootfs, so a plain
+ * getdents64 on the parent never lists it — e.g. `ls /` would not show a
+ * `--bind X:/host`. We append a synthetic linux_dirent64 for every live bind
+ * whose mount point is a direct child of the directory open on `dirfd` (its
+ * canonical guest path is `dir`), so listings match real mount semantics and
+ * the /proc/mounts view (which already reports binds). `buf` holds `used`
+ * bytes of real entries within capacity `cap`; returns the new length. Records
+ * are 8-byte aligned; a mount point already present as a real dirent (a bind
+ * overlaying an existing directory) or one that would overflow `cap` is
+ * skipped, as is a basename already emitted (stacked binds share a point). */
+static size_t bind_inject_dents(struct Machine *m, int dirfd, const char *dir,
+                                u8 *buf, size_t used, size_t cap) {
+    int nb = bind_count();
+    for (int i = 0; i < nb; i++) {
+        char guest[PATH_MAX], host[PATH_MAX];
+        if (!bind_get(i, guest, host, NULL)) continue;
+        /* Split the mount point into parent + basename; inject only when the
+         * parent is exactly the directory being listed. Guest paths are
+         * canonical and absolute with no trailing slash (add_bind/bind_add). */
+        char *slash = strrchr(guest, '/');
+        if (!slash || !slash[1]) continue;
+        const char *base = slash + 1;
+        char parent[PATH_MAX];
+        size_t plen = (size_t)(slash - guest);
+        if (plen == 0) { parent[0] = '/'; parent[1] = 0; }   /* child of "/" */
+        else { memcpy(parent, guest, plen); parent[plen] = 0; }
+        if (strcmp(parent, dir) != 0) continue;
+        /* Physically present already? getdents returned it — skip (no dup). */
+        struct stat st;
+        if (fstatat(dirfd, base, &st, AT_SYMLINK_NOFOLLOW) == 0) continue;
+        /* De-dup stacked binds mounted at the same point (same basename). */
+        int dup = 0;
+        for (size_t o = 0; o + 19 <= used; ) {
+            u16 rl; memcpy(&rl, buf + o + 16, 2);
+            if (rl == 0) break;
+            if (!strcmp((char *)buf + o + 19, base)) { dup = 1; break; }
+            o += rl;
+        }
+        if (dup) continue;
+        /* Real ino + d_type from the bind source (a source may be a file, not a
+         * directory); fall back to a synthetic non-zero ino + DT_DIR. */
+        u64 ino = 0; u8 type = DT_DIR;
+        if (stat(host, &st) == 0) {
+            ino = (u64)st.st_ino;
+            type = (u8)((st.st_mode >> 12) & 0xf);   /* S_IFMT>>12 == DT_* */
+        }
+        if (!ino) ino = 0xffffffffu - (u64)i;
+        size_t namelen = strlen(base);
+        size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+        if (used + reclen > cap) continue;
+        u8 *rec = buf + used;
+        memset(rec, 0, reclen);
+        memcpy(rec + 0, &ino, 8);
+        s64 off = (s64)0x7fffffff00000000LL + i;      /* opaque high cookie */
+        memcpy(rec + 8, &off, 8);
+        u16 rl = (u16)reclen; memcpy(rec + 16, &rl, 2);
+        rec[18] = type;
+        memcpy(rec + 19, base, namelen + 1);
+        used += reclen;
+    }
+    return used;
+}
+
 SYSDEF(getdents64) {
     /* linux_dirent64 layout is a fixed kernel ABI, identical for guest and
      * host. Two filters may apply: hide ".l2s.*" backing files (-link2symlink),
      * and hide non-guest PIDs from the top-level /proc (pid-namespace view).
      * Names sit at record offset +19 (8 d_ino + 8 d_off + 2 d_reclen + 1
-     * d_type). Otherwise the raw buffer passes straight through. */
+     * d_type). We also append synthetic records for virtual bind mount points
+     * (bind_inject_dents). Otherwise the raw buffer passes straight through. */
     size_t len = (size_t)a2;
     if (len > (1u << 20)) len = 1u << 20;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
+
+    /* Bind mount points have no physical dirent, so we splice them into the
+     * listing of their parent (bind_inject_dents), but only on the first read
+     * of the fd (offset 0): a real directory always yields "."/".." so the
+     * cursor then advances and later reads see a non-zero offset and skip
+     * injection — this makes it fire once and rules out a re-inject loop. The
+     * offset must be sampled before any host getdents64 below. */
+    int have_binds = bind_count() > 0;
+    off_t pos0 = have_binds ? lseek((int)a0, 0, SEEK_CUR) : -1;
 
     /* Is this fd the top-level /proc? (guest fd == host fd on the passthrough) */
     int is_proc = 0;
@@ -846,6 +921,11 @@ SYSDEF(getdents64) {
         n = syscall(SYS_getdents64, (int)a0, buf, len);
     }
     if (n < 0) { free(buf); return host_err(); }
+    if (have_binds && pos0 == 0 && n > 0) {
+        char dir[PATH_MAX];
+        if (dirfd_guest_path(c->m, (int)a0, dir) == 0)
+            n = (long)bind_inject_dents(c->m, (int)a0, dir, buf, (size_t)n, len);
+    }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     return (u64)n;

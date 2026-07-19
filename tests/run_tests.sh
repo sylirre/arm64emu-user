@@ -184,8 +184,9 @@ fi
 
 # ---- --bind mounts (self-checking; qemu has no bind-mount concept). Exercises
 # forward mapping, symlink containment inside a bind, reverse mapping (cwd),
-# dst canonicalization, longest-prefix nesting, :ro enforcement, and the
-# synthesized /proc/mounts row. ----
+# dst canonicalization, longest-prefix nesting, :ro enforcement, the synthesized
+# /proc/mounts row, and getdents visibility of the (virtual) mount point in its
+# parent directory listing. ----
 if [ -x "$ALPINE/bin/busybox" ]; then
     check_bind() {   # check_bind <label> <expected> <emu args...>
         local label="$1" expect="$2"; shift 2
@@ -215,6 +216,13 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     check_bind "ro write blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'echo x > /mnt/ro/x 2>/dev/null; test -e /mnt/ro/x && echo created || echo blocked'
     check_bind "ro mkdir blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'mkdir /mnt/ro/d 2>/dev/null; test -d /mnt/ro/d && echo created || echo blocked'
     check_bind "mounts row (ro)"       "ro,relatime" --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'awk "\$2==\"/mnt/ro\"{print \$4}" /proc/mounts'
+    # Virtual mount point shows up in its parent's listing (getdents synthesis).
+    # The point must be a child of a *listable* directory, so bind at /hostdir
+    # (child of "/") rather than the /mnt/x above (/mnt is absent in the rootfs).
+    check_bind "point listed in parent" "hostdir"   --bind "$BSRC:/hostdir" "$ALPINE" /bin/busybox sh -c 'ls / | grep -x hostdir'
+    check_bind "point listed as dir"    "d"         --bind "$BSRC:/hostdir" "$ALPINE" /bin/busybox sh -c 'ls -ld /hostdir | cut -c1'
+    check_bind "nested point in parent"  "sub"      --bind "$BSRC:/hostdir" --bind "$BSRC2:/hostdir/sub" "$ALPINE" /bin/busybox sh -c 'ls /hostdir | grep -x sub'
+    check_bind "overlay dir no dup"     "1"         --bind "$BSRC:/etc" "$ALPINE" /bin/busybox sh -c 'ls / | grep -c "^etc$"'
     rm -rf "$BSRC" "$BSRC2"
 fi
 

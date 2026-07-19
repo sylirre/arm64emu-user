@@ -47,8 +47,10 @@ static int to_host(const struct Machine *m, const char *canon, char *host_out) {
 
 /* Canonical guest path of an open guest dirfd (guest fd == host fd): read the
  * host /proc/self/fd link and strip the rootfs prefix. Falls back to "/" for
- * paths outside the rootfs (shouldn't happen for dirfds we opened). */
-static int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
+ * paths outside the rootfs (shouldn't happen for dirfds we opened). Exported
+ * for getdents64 (sys_file.c), which uses it to know which guest directory a
+ * listing fd names so it can splice in virtual bind mount points. */
+int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     char link[64], buf[PATH_MAX];
     snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
     ssize_t n = readlink(link, buf, sizeof buf - 1);

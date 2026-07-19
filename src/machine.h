@@ -267,6 +267,11 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
  * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path);
 
+/* Canonical guest path of an open guest dirfd (readlink /proc/self/fd/N, then
+ * bind-reverse / rootfs-strip). Writes to `out` (>= PATH_MAX) and returns 0, or
+ * a negative errno. Used by getdents64 to identify the directory being listed. */
+int dirfd_guest_path(struct Machine *m, int dirfd, char *out);
+
 /* If `hostpath` lies under a -bind host prefix (at a '/' boundary), return the
  * bind index and, when `guest_out` is non-NULL, write the guest-side path
  * (binds[i].guest + remainder); return -1 if no bind matches. Longest host

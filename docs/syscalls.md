@@ -105,7 +105,13 @@ its real host location — symlinks and all — and reverse lookups (`dirfd`,
 re-root to the guest root and `..` climbs into the rootfs, never to the host
 parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
 (enforced in the `sys_file.c` handlers via `host_ro`). Binds are listed in the
-synthesized `/proc/mounts` and `/proc/mountinfo`.
+synthesized `/proc/mounts` and `/proc/mountinfo`. A bind destination is a pure
+resolution overlay with no physical dirent in the rootfs, so `getdents64`
+(`bind_inject_dents` in `sys_file.c`) splices the mount point into a listing of
+its parent directory (`ls /` shows a `--bind …:/host`). It fires only on the
+first read of the listing fd (offset 0) and only for a destination whose parent
+is itself listable; a destination under a rootfs directory that does not exist
+stays reachable by name but unlisted.
 
 **Runtime `mount(2)` / `umount2(2)`.** The guest can add and drop binds at run
 time, not just via `--bind`: `mount(src, dst, …, MS_BIND, …)` resolves `src` to
