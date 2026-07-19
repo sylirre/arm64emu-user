@@ -442,6 +442,29 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
     return (u8 *)(pte & ~(uintptr_t)PTE_FLAGS) + (va & GUEST_PAGE_MASK);
 }
 
+/* Host and guest are both little-endian, so a copy preserves byte order.
+ * Fixed-size copies for the power-of-two access sizes (#3): the compiler
+ * turns each into a single load/store; odd sizes (page-split fragments from
+ * the callers below) keep the runtime-size memcpy. */
+static inline u64 ld_le(const u8 *p, unsigned size) {
+    switch (size) {
+        case 1: return *p;
+        case 2: { u16 v; memcpy(&v, p, 2); return v; }
+        case 4: { u32 v; memcpy(&v, p, 4); return v; }
+        case 8: { u64 v; memcpy(&v, p, 8); return v; }
+        default: { u64 v = 0; memcpy(&v, p, size); return v; }
+    }
+}
+static inline void st_le(u8 *p, unsigned size, u64 v) {
+    switch (size) {
+        case 1: *p = (u8)v; break;
+        case 2: { u16 x = (u16)v; memcpy(p, &x, 2); break; }
+        case 4: { u32 x = (u32)v; memcpy(p, &x, 4); break; }
+        case 8: memcpy(p, &v, 8); break;
+        default: memcpy(p, &v, size); break;
+    }
+}
+
 bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
     /* Split accesses that cross a page boundary (unaligned in-page accesses
      * are plain memcpy — EL0 Linux semantics, SCTLR.A clear). */
@@ -456,9 +479,7 @@ bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
     bool perm;
     u8 *p = translate(c, va, PTE_R, &perm);
     if (!p) { raise_dabort(c, va, false, perm); return false; }
-    u64 v = 0;
-    memcpy(&v, p, size);
-    *out = v;
+    *out = ld_le(p, size);
     return true;
 }
 
@@ -471,7 +492,7 @@ bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
     bool perm;
     u8 *p = translate(c, va, PTE_W, &perm);
     if (!p) { raise_dabort(c, va, true, perm); return false; }
-    memcpy(p, &val, size);
+    st_le(p, size, val);
     return true;
 }
 
@@ -507,9 +528,7 @@ bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out) {
     bool perm;
     u8 *p = translate(c, va, PTE_R, &perm);
     if (!p) return false;
-    u64 v = 0;
-    memcpy(&v, p, size);
-    *out = v;
+    *out = ld_le(p, size);
     return true;
 }
 
