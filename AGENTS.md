@@ -78,6 +78,7 @@ General:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`./docs/`).
 * Keep in sync the file structure in design section of README.md and structure section of AGENTS.md.
+* New implemented syscalls must also be defined in ./src/strace.c argdefs, so they can be decoded by `--strace-full`.
 * Ensure that code comments are up-to-date after made changes.
 * Compiler warnings or errors must be resolved.
 * Do not give up chasing bugs. You know the code better than anyone.
