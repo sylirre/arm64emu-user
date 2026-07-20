@@ -316,7 +316,7 @@ static int codemap_test(u64 pc) {
 /* ---- code cache ---- */
 
 static size_t jit_cache_size(void) {
-    const char *s = getenv("A64CHROOT_JIT_MB");
+    const char *s = getenv("A64_JIT_MB");
     long mb = s ? atol(s) : 32;
     if (mb < 1) mb = 1;
     if (mb > 128) mb = 128;   /* AArch64 B imm26 (+-128 MiB) must span the cache */

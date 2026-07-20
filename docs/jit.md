@@ -32,7 +32,7 @@ Real workloads land near the top of that range once translation warms up:
 natively** (`A64_JIT_STATS`, below).
 
 Run `tests/bench/run_bench.sh ./arm64chroot` to reproduce (also times
-`qemu-aarch64` for scale). `A64CHROOT_JIT_MB=N` sets the per-thread code-cache
+`qemu-aarch64` for scale). `A64_JIT_MB=N` sets the per-thread code-cache
 size (default 32, max 128).
 
 ## Architecture
@@ -234,7 +234,7 @@ edge-pool, or cache overflow flushes all translations at once (`jit_flush_all`),
 which `qemu-user` does for the same reason — partial reclaim would need cache
 compaction or region invalidation plus unpatching every incoming chain edge,
 disproportionate to a flush that, at the 32 MiB default per-thread cache
-(`A64CHROOT_JIT_MB`, up to 128), is rare and cheap to re-warm.
+(`A64_JIT_MB`, up to 128), is rare and cheap to re-warm.
 
 **Plain stores to code are not instrumented.** A guest that rewrites code and
 skips `IC IVAU` is architecturally undefined on this CPU (as on real hardware);

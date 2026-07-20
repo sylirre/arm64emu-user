@@ -153,7 +153,7 @@ Behavior fallbacks:
 
 Tuning:
 
-* `A64CHROOT_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
+* `A64_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
 * `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the --shared-proc *fallback* registry file, used only when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux).
 
 Note: `src/core/cpu.c` / `cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/AEPROF (hot-PC profiler), g_ring/AERING (recent-step ring buffer), g_tpc/AETPC (dump state at a target PC), and g_cov/AECOV (coverage-divergence finder) — carried over from the [ARM64EMU_System](https://github.com/sylirre/arm64emu-system) core. This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.

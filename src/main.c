@@ -249,7 +249,7 @@ static void help(void) {
         {"    --",      "Stop option parsing."},
     };
     static const struct help_def env_tune[] = {
-        {"A64CHROOT_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
+        {"A64_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
                         "32, clamped to 1-128."},
         {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these holds the "
                         "--shared-proc fallback registry file. Used only when "
