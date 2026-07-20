@@ -19,7 +19,7 @@ SYSDEF(preadv); SYSDEF(pwritev); SYSDEF(preadv2); SYSDEF(pwritev2);
 SYSDEF(lseek); SYSDEF(fstat); SYSDEF(newfstatat); SYSDEF(faccessat);
 SYSDEF(readlinkat); SYSDEF(getdents64); SYSDEF(ioctl); SYSDEF(fcntl);
 SYSDEF(dup); SYSDEF(dup3); SYSDEF(pipe2); SYSDEF(getcwd); SYSDEF(chdir);
-SYSDEF(fchdir); SYSDEF(chroot); SYSDEF(mkdirat); SYSDEF(unlinkat); SYSDEF(renameat);
+SYSDEF(fchdir); SYSDEF(chroot); SYSDEF(mknodat); SYSDEF(mkdirat); SYSDEF(unlinkat); SYSDEF(renameat);
 SYSDEF(renameat2); SYSDEF(symlinkat); SYSDEF(linkat); SYSDEF(ftruncate);
 SYSDEF(fchmod); SYSDEF(fchmodat); SYSDEF(fchownat); SYSDEF(fchown);
 SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
@@ -103,6 +103,7 @@ static const struct {
     { G_NR_dup3, sys_dup3, "dup3" },
     { G_NR_fcntl, sys_fcntl, "fcntl" },
     { G_NR_ioctl, sys_ioctl, "ioctl" },
+    { G_NR_mknodat, sys_mknodat, "mknodat" },
     { G_NR_mkdirat, sys_mkdirat, "mkdirat" },
     { G_NR_unlinkat, sys_unlinkat, "unlinkat" },
     { G_NR_symlinkat, sys_symlinkat, "symlinkat" },

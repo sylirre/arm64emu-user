@@ -86,6 +86,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_readlinkat,{ AT_DIRFD, AT_STR, AT_BUF_OUT, AT_UINT }, 0 },
     { G_NR_getdents64,{ AT_FD, AT_PTR, AT_UINT }, 0 },
     { G_NR_unlinkat,  { AT_DIRFD, AT_STR, AT_ATFLAGS }, 0 },
+    { G_NR_mknodat,   { AT_DIRFD, AT_STR, AT_MODE, AT_HEX }, 0 },
     { G_NR_mkdirat,   { AT_DIRFD, AT_STR, AT_MODE }, 0 },
     { G_NR_renameat,  { AT_DIRFD, AT_STR, AT_DIRFD, AT_STR }, 0 },
     { G_NR_renameat2, { AT_DIRFD, AT_STR, AT_DIRFD, AT_STR, AT_HEX }, 0 },

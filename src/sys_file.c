@@ -1476,6 +1476,20 @@ SYSDEF(umount2) {
     return (u64)(s64)bind_remove(m, canon);
 }
 
+SYSDEF(mknodat) {
+    char host[PATH_MAX];
+    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
+    if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
+    /* Pass the guest-supplied dev straight to the raw host syscall: it is
+     * already in the kernel's major:minor encoding, and glibc's mknod()
+     * wrapper would re-encode it. Unprivileged callers (this emulator) can
+     * make S_IFIFO/S_IFSOCK/S_IFREG nodes -- so mkfifo(3) works; device
+     * nodes fail with EPERM, exactly as on a real unprivileged host. */
+    return syscall(SYS_mknodat, AT_FDCWD, host, (unsigned)a2, (unsigned)a3) < 0
+               ? host_err() : 0;
+}
+
 SYSDEF(mkdirat) {
     char host[PATH_MAX];
     int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);

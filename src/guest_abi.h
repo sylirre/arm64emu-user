@@ -34,6 +34,7 @@
 #define G_NR_inotify_add_watch 27
 #define G_NR_inotify_rm_watch  28
 #define G_NR_ioctl             29
+#define G_NR_mknodat           33
 #define G_NR_mkdirat           34
 #define G_NR_unlinkat          35
 #define G_NR_symlinkat         36
