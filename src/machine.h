@@ -131,6 +131,16 @@ struct Machine {
     } pf_fds[PF_MAX_FDS];
     int pf_fds_count;
 
+    /* System V shared-memory attachments held by this process (shmat). The
+     * segments themselves live in the IPC broker daemon (proctab.c); this is
+     * only the per-process attach list, so shmdt(addr) can find the shmid,
+     * fork can re-register inherited attaches (nattch++), and execve/exit can
+     * detach them all (nattch--). Thread-shared (one address space), and the
+     * host fork() copies it — the child then bumps each segment's count. */
+#define SHM_ATT_MAX 128
+    struct ShmAtt { s32 shmid; u64 va; u64 size; } shm_att[SHM_ATT_MAX];
+    int shm_att_count;
+
     /* /proc/stat busy-CPU estimate: integral of the sysinfo() load average
      * over time (sys_procfs.c stat_estimate). Monotonic within a process,
      * which is what delta-computing readers (top, vmstat) require. */
@@ -162,6 +172,14 @@ struct Machine {
     char abs_tag[16];         /* per-rootfs prefix spliced into guest abstract
                                * AF_UNIX names for isolation (see sys_net.c) */
     u8 abs_tag_len;           /* bytes of abs_tag in use */
+
+    /* Per-invocation nonce keying the IPC broker's abstract-socket rendezvous
+     * when --shared-proc is off: seeded once in main() and fork-inherited, so
+     * every process of one launch shares an shm namespace scoped to that launch's
+     * process tree, while separate invocations stay isolated. Under --shared-proc
+     * the broker is keyed per-rootfs instead (like proctab), spanning invocations.
+     * See shmbroker_* in proctab.c. */
+    u64 shm_session;
 };
 
 /* The singleton task of this process (fork copies it naturally). */
@@ -362,5 +380,32 @@ void proctab_set_cwd(s32 pid, const char *cwd);            /* chdir / fchdir */
 int  proctab_has(s32 pid);                                 /* is a guest PID? */
 int  proctab_cmdline(s32 pid, char *out, u32 *len);        /* guest cmdline */
 int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap */
+
+/* proctab.c: System V shared-memory broker (client side). The unified IPC
+ * daemon (an extension of the proctab broker) is the authoritative registry:
+ * it owns every segment's backing fd (an anonymous memfd, or a file in a
+ * writable dir when memfd_create is unavailable) and hands it out over
+ * SCM_RIGHTS. A client holds no persistent segment fd — it maps the fd it is
+ * handed and closes it — so nothing leaks into the guest fd space (host fd ==
+ * guest fd here). This needs no host shmget/shmat and no /dev/shm, so it works
+ * under Android SELinux/seccomp. sys_ipc.c drives these; see proctab.c. */
+struct ShmStat {              /* shmctl(IPC_STAT) payload, host-native fields */
+    u64 size, nattch;
+    u32 mode, uid, gid, cuid, cgid;
+    s32 cpid, lpid;
+    s64 atime, dtime, ctime;
+};
+/* shmget: find-or-create the segment for key/size/shmflg; shmid (>0) or -errno. */
+s32  shmbroker_get(struct Machine *m, s32 key, u64 size, s32 shmflg);
+/* shmat: hand back a mappable host fd for shmid (caller mmaps then closes it)
+ * and increment nattch; fills *size_out. Returns the fd (>=0) or -errno. */
+int  shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out);
+/* Decrement nattch for one attachment of shmid (shmdt / detach on exec+exit). */
+void shmbroker_dt(struct Machine *m, s32 shmid);
+/* Increment nattch for one inherited attachment of shmid (fork child). */
+void shmbroker_fork(struct Machine *m, s32 shmid);
+/* shmctl: cmd IPC_STAT (fills *st), IPC_SET (reads mode/uid/gid from *st),
+ * IPC_RMID. Returns 0 or -errno. */
+s32  shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st);
 
 #endif /* A64_MACHINE_H */

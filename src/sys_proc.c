@@ -40,6 +40,7 @@ SYSDEF(exit) {
      * process would linger while other threads run), so report the death for
      * every traced thread of the group, as exit_group does. */
     ptrace_report_exit_group(((int)a0 & 0xff) << 8);
+    shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -54,6 +55,7 @@ SYSDEF(exit_group) {
      * link (a parked sibling dies inside its service loop; its tracer would
      * otherwise poll a stale link forever). */
     ptrace_report_exit_group(((int)a0 & 0xff) << 8);
+    shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -304,6 +306,7 @@ SYSDEF(clone) {
         proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
                          m->exec_path, m->cwd, m->environ, m->environ_len,
                          m->auxv, m->auxv_len);
+        shm_fork_reattach(m);             /* re-count inherited shm attaches */
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);
@@ -461,6 +464,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     }
 
     /* Point of no return: tear down and reload. */
+    shm_detach_all(m);       /* System V shm attaches do not survive execve */
     ptimers_exec_clear();    /* POSIX timers do not survive execve */
     as_destroy(&m->as);
     as_init(&m->as);

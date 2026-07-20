@@ -278,7 +278,8 @@ src/
   syscall.c sys_*.c   dispatcher + per-area handlers (~190 syscalls)
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
-  proctab.c     shared-memory guest-PID registry (cross-process ps/top view)
+  proctab.c     shared-memory guest-PID registry (cross-process ps/top view) +
+                unified IPC broker: portable memfd-backed System V shared memory
   ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex
                 mailbox (tracee serves PEEK/POKE/GETREGSET/CONT while stopped)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn

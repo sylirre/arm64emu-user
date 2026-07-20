@@ -183,7 +183,9 @@
 #define G_NR_msgget            186
 #define G_NR_semget            190
 #define G_NR_shmget            194
+#define G_NR_shmctl            195
 #define G_NR_shmat             196
+#define G_NR_shmdt             197
 #define G_NR_socket            198
 #define G_NR_socketpair        199
 #define G_NR_bind              200
@@ -541,5 +543,60 @@ typedef struct {
     u32  fpcr;
     u32  __reserved[2];
 } GUserFpsimd;
+
+/* ---- System V IPC (shared memory) ---- */
+
+/* shmget() shmflg: the low 9 bits are the permission mode; these are the
+ * control flags above them (asm-generic == every arch). */
+#define G_IPC_CREAT   01000     /* create if key nonexistent */
+#define G_IPC_EXCL    02000     /* fail if key exists */
+#define G_IPC_NOWAIT  04000     /* return error on wait */
+#define G_IPC_PRIVATE 0         /* private key: always a fresh segment */
+
+/* shmctl() cmd. IPC_RMID/SET/STAT are the generic ops; SHM_* are shm-specific. */
+#define G_IPC_RMID    0
+#define G_IPC_SET     1
+#define G_IPC_STAT    2
+#define G_IPC_INFO    3
+#define G_SHM_LOCK    11
+#define G_SHM_UNLOCK  12
+#define G_SHM_STAT    13
+#define G_SHM_INFO    14
+#define G_SHM_STAT_ANY 15
+
+/* shmat() shmflg. */
+#define G_SHM_RDONLY  010000    /* attach read-only */
+#define G_SHM_RND     020000    /* round attach address down to SHMLBA */
+#define G_SHM_REMAP   040000    /* take over an existing mapping at the address */
+#define G_SHM_EXEC    0100000   /* execute permission on the segment */
+
+/* SHMLBA (attach-address low-boundary): one guest page here. */
+#define G_SHMLBA      4096
+
+/* asm-generic struct ipc64_perm (48 bytes). Fixed-width fields with explicit
+ * padding place every 8-byte member at an 8-aligned offset, so the layout is
+ * identical whether the host aligns u64 to 4 (i386) or 8 (arm64) — see GStat. */
+typedef struct {
+    s32 key;
+    u32 uid, gid, cuid, cgid;
+    u32 mode;
+    u16 seq;
+    u16 __pad2;
+    u32 __pad3;               /* aligns __unused1 to offset 32 */
+    u64 __unused1, __unused2;
+} GIpc64Perm;
+
+/* asm-generic struct shmid64_ds for arm64 (LP64: shm_[adc]time are 8 bytes). */
+typedef struct {
+    GIpc64Perm shm_perm;      /* @0  operation permission struct */
+    u64 shm_segsz;            /* @48 size of segment in bytes */
+    s64 shm_atime;            /* @56 last attach time */
+    s64 shm_dtime;            /* @64 last detach time */
+    s64 shm_ctime;            /* @72 last change time */
+    s32 shm_cpid;             /* @80 pid of creator */
+    s32 shm_lpid;             /* @84 pid of last shmat/shmdt */
+    u64 shm_nattch;           /* @88 number of current attaches */
+    u64 __unused4, __unused5; /* @96 */
+} GShmid64Ds;                 /* 112 bytes */
 
 #endif /* A64_GUEST_ABI_H */

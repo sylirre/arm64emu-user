@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "machine.h"
@@ -251,9 +252,10 @@ static void help(void) {
     static const struct help_def env_tune[] = {
         {"A64_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
                         "32, clamped to 1-128."},
-        {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these holds the "
-                        "--shared-proc fallback registry file. Used only when "
-                        "the memfd_create and /dev/shm are not available."},
+        {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these (or /dev/shm) holds "
+                        "the --shared-proc fallback registry file and System V "
+                        "shm segment files, used only when memfd_create is "
+                        "unavailable."},
     };
     static const struct help_def env_diag[] = {
         {"A64_JIT_STATS", "Rank instruction words still run via the exec_a64 "
@@ -270,6 +272,9 @@ static void help(void) {
         {"A64_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
         {"A64_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
         {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
+        {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
+                        "instead of an anonymous memfd (exercises the fallback "
+                        "tier)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",
@@ -607,6 +612,17 @@ int main(int argc, char **argv)
     int atn = snprintf(m->abs_tag + 1, sizeof m->abs_tag - 1, "a64%08x",
                        (unsigned)fnv1a32(m->rootfs));
     m->abs_tag_len = (u8)(1 + atn);
+
+    /* Per-invocation nonce keying the System V shm broker's rendezvous when
+     * --shared-proc is off (machine.h / proctab.c). The root pid makes it unique
+     * among live invocations; mixing in the start time keeps a pid reused within
+     * a dying daemon's grace window from rejoining the old namespace. Seeded once
+     * here in the root process and fork-inherited, so one launch's whole process
+     * tree shares one shm namespace while separate launches stay isolated. */
+    struct timespec sts;
+    clock_gettime(CLOCK_REALTIME, &sts);
+    m->shm_session = ((u64)getpid() << 32) ^
+                     ((u64)sts.tv_sec * 1000000000ull + (u64)sts.tv_nsec);
 
     /* Not chrooted initially: the guest root is the rootfs root. */
     strcpy(m->chroot_base, "/");

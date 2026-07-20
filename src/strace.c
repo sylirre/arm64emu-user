@@ -166,6 +166,12 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_mlock2,    { AT_PTR, AT_UINT, AT_HEX }, 0 },
     { G_NR_mlockall,  { AT_HEX }, 0 },
     { G_NR_munlockall,{ AT_NONE }, 0 },
+    /* System V shared memory: key/shmflg carry mode + IPC_ flag bits (hex);
+     * shmat returns the attach address (hex); shmctl cmd is an IPC/SHM op. */
+    { G_NR_shmget,    { AT_HEX, AT_UINT, AT_HEX }, 0 },
+    { G_NR_shmat,     { AT_INT, AT_PTR, AT_HEX }, AT_HEX },
+    { G_NR_shmdt,     { AT_PTR }, 0 },
+    { G_NR_shmctl,    { AT_INT, AT_INT, AT_PTR }, 0 },
     /* process */
     { G_NR_execve,    { AT_STR, AT_STRARRAY, AT_STRARRAY }, 0 },
     { G_NR_execveat,  { AT_DIRFD, AT_STR, AT_STRARRAY, AT_STRARRAY, AT_ATFLAGS }, 0 },

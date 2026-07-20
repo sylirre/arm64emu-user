@@ -64,6 +64,12 @@ void procfs_unmark_fd(struct Machine *m, int fd);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
+/* sys_ipc.c: System V shm attachment bookkeeping across fork/exec/exit.
+ * shm_fork_reattach re-counts every attachment the child inherited (nattch++);
+ * shm_detach_all drops them all and clears the list (execve/exit). */
+void shm_fork_reattach(struct Machine *m);
+void shm_detach_all(struct Machine *m);
+
 /* Fill in x0 (return value) after a handler runs. */
 void syscall_return(CPU *c, u64 ret);
 

@@ -14,8 +14,8 @@ AArch64 Linux syscall convention: `x8` = number, `x0..x5` = arguments, result in
 typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 ```
 
-Handlers are grouped by area: `sys_file.c`, `sys_mm.c`, `sys_proc.c`, `sys_sig.c`,
-`sys_time.c`, `sys_net.c`, `sys_misc.c`. An unregistered number returns `-ENOSYS`
+Handlers are grouped by area: `sys_file.c`, `sys_mm.c`, `sys_ipc.c`, `sys_proc.c`,
+`sys_sig.c`, `sys_time.c`, `sys_net.c`, `sys_misc.c`. An unregistered number returns `-ENOSYS`
 with a one-shot stderr warning naming it — invaluable during bring-up.
 
 **Designed-ENOSYS set.** Some numbers (`rseq`, `clone3`, `openat2`,
@@ -273,6 +273,40 @@ family is ungated (it does not depend on the host actually blocking netlink).
   namespace. Limits: beyond the registry cap extra guest processes fall back to
   the emulator cmdline and are hidden, and `stat`/`status` memory/state fields
   still describe the emulator process.
+
+## System V shared memory (`src/sys_ipc.c`)
+
+`shmget`/`shmat`/`shmdt`/`shmctl` are emulated **without** the host's SysV IPC
+syscalls (SELinux/seccomp deny them on Android) and without `/dev/shm`. The
+unified IPC broker — an extension of the proctab broker (`src/proctab.c`) — is
+the authoritative registry: a detached per-rootfs (or, without `--shared-proc`,
+per-invocation) daemon owns every segment's backing and hands it to attachers
+over `SCM_RIGHTS`.
+
+- **Backing.** Each segment is an anonymous `memfd` (the normal, Android-safe
+  path), or a file in the first writable dir (`/dev/shm`, `$XDG_RUNTIME_DIR`,
+  `$TMPDIR`, `/data/local/tmp`, …) when `memfd_create` is unavailable; if neither
+  is possible `shmget` fails loud with `-ENOSPC` rather than handing back
+  non-shared memory. `A64_SHM_FORCE_FILE` forces the file tier for testing.
+- **Attach.** `shmat` receives the backing fd, maps it `MAP_SHARED` into the
+  guest address space with `guest_map_file` (so stores are visible to every
+  attached process), then closes the fd — a process holds a segment only as a
+  mapping, never a persistent fd (host fd == guest fd here). `fork` inherits the
+  mapping and it stays shared; `execve` and exit detach. A per-process attach
+  list in `struct Machine` lets `shmdt(addr)` resolve the shmid and keeps the
+  broker's `nattch` correct across fork/exec/exit.
+- **Lifetime.** The broker tracks `nattch` and per-attacher liveness, reclaiming
+  attaches left by a `SIGKILL`'d process and freeing an `IPC_RMID`'d segment at
+  the last detach. A created segment persists across its creator's exit while any
+  process of the namespace is alive; the daemon and any leftover segments are
+  garbage-collected once the whole rootfs/session goes idle — a deliberate,
+  bounded deviation from kernel-persistent SysV segments, appropriate for a
+  sandbox.
+
+Permission checks use the guest's effective creds carried in each request
+(advisory in a single-user sandbox, like `--fake-id`). `shmctl` supports
+`IPC_STAT`/`IPC_SET`/`IPC_RMID`; the `SHM_STAT`/`SHM_INFO` listing path used by
+`ipcs` is not yet served.
 
 ## `execve`
 

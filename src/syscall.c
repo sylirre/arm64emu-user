@@ -40,6 +40,7 @@ SYSDEF(removexattr); SYSDEF(lremovexattr); SYSDEF(fremovexattr);
 SYSDEF(brk); SYSDEF(mmap); SYSDEF(munmap); SYSDEF(mprotect);
 SYSDEF(madvise); SYSDEF(mremap); SYSDEF(msync); SYSDEF(mincore);
 SYSDEF(mlock); SYSDEF(mlock2); SYSDEF(munlock); SYSDEF(mlockall);
+SYSDEF(shmget); SYSDEF(shmat); SYSDEF(shmdt); SYSDEF(shmctl);
 SYSDEF(munlockall);
 
 /* sys_proc.c */
@@ -187,6 +188,11 @@ static const struct {
     { G_NR_mremap, sys_mremap, "mremap" },
     { G_NR_msync, sys_msync, "msync" },
     { G_NR_mincore, sys_mincore, "mincore" },
+    /* System V shared memory (sys_ipc.c) */
+    { G_NR_shmget, sys_shmget, "shmget" },
+    { G_NR_shmat, sys_shmat, "shmat" },
+    { G_NR_shmdt, sys_shmdt, "shmdt" },
+    { G_NR_shmctl, sys_shmctl, "shmctl" },
     { G_NR_mlock, sys_mlock, "mlock" },
     { G_NR_mlock2, sys_mlock2, "mlock2" },
     { G_NR_munlock, sys_munlock, "munlock" },
@@ -395,7 +401,6 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
     { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
     { G_NR_setns, "setns" }, { G_NR_settimeofday, "settimeofday" },
-    { G_NR_shmat, "shmat" }, { G_NR_shmget, "shmget" },
     { G_NR_signalfd4, "signalfd4" }, { G_NR_statmount, "statmount" },
     { G_NR_swapoff, "swapoff" }, { G_NR_swapon, "swapon" }, { G_NR_tee, "tee" },
     { G_NR_unshare, "unshare" }, { G_NR_userfaultfd, "userfaultfd" },
