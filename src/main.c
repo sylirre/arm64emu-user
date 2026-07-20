@@ -251,10 +251,9 @@ static void help(void) {
     static const struct help_def env_tune[] = {
         {"A64CHROOT_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
                         "32, clamped to 1-128."},
-        {"XDG_RUNTIME_DIR, TMPDIR, PREFIX", "First writable of these holds the "
-                        "--shared-proc fallback registry file, used only when "
-                        "the diskless broker (memfd) is unavailable and /dev/shm "
-                        "is not writable. PREFIX is tried as $PREFIX/tmp (Termux)."},
+        {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these holds the "
+                        "--shared-proc fallback registry file. Used only when "
+                        "the memfd_create and /dev/shm are not available."},
     };
     static const struct help_def env_diag[] = {
         {"A64_JIT_STATS", "Rank instruction words still run via the exec_a64 "
