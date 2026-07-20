@@ -351,6 +351,36 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     unset HOSTLEAKMARK
 fi
 
+# ---- diskless shared-proc cross-invocation (broker backing) ----
+# --shared-proc backs the guest-PID registry with a per-rootfs broker (a memfd
+# served over an abstract socket -- no file) so an *independent* emulator
+# invocation of the same rootfs sees the first's guest processes. Emulator-only
+# (qemu has no cross-process guest view). Session A publishes a forked child's
+# guest PID (== host PID) to a rootfs file and waits; session B must then read
+# that PID's guest cmdline from its own synthesized /proc -- which only works if
+# the registry is shared across the two invocations.
+if [ -x "$ALPINE/bin/busybox" ]; then
+    rm -f "$ALPINE/tmp/apid"
+    timeout 60 "$EMU" --shared-proc "$ALPINE" /bin/busybox sh -c \
+        'sleep 30 & echo $! > /tmp/apid; wait' &
+    sp_bg=$!
+    apid=""; n=0
+    while [ "$n" -lt 50 ]; do
+        if [ -s "$ALPINE/tmp/apid" ]; then apid=$(cat "$ALPINE/tmp/apid" 2>/dev/null); break; fi
+        sleep 0.1; n=$((n+1))
+    done
+    sleep 0.3   # let the forked child register itself in the broker
+    got=$("$EMU" --shared-proc -E APID="${apid:-0}" "$ALPINE" /bin/busybox sh -c \
+        'tr "\0" " " < /proc/$APID/cmdline | sed "s/ $//"' 2>/dev/null)
+    if [ "$got" = "sleep 30" ]; then
+        pass=$((pass+1)); echo "PASS shared-proc: cross-invocation cmdline via broker"
+    else
+        fail=$((fail+1)); echo "FAIL shared-proc: cross-invocation cmdline via broker (want 'sleep 30' got '$got')"
+    fi
+    kill "$sp_bg" 2>/dev/null; wait "$sp_bg" 2>/dev/null
+    rm -f "$ALPINE/tmp/apid"
+fi
+
 # ---- runtime bind mounts (guest mount --bind / umount, self-checking) ----
 # Emulator-only (qemu-aarch64 performs *real* mounts, so it can't be the oracle).
 # The bind table is process-shared, so a bind established by the `mount` child is

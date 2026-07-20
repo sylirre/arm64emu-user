@@ -331,9 +331,11 @@ int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
  * guest view, and recognize which numeric /proc entries are guest PIDs
  * (hiding host processes from the guest's view).
  * Backed by anonymous shared memory (per-invocation, fork-inherited) by default;
- * with rootfs_key != NULL (-shared-proc) by a named tmpfs file keyed by
- * rootfs+uid, so the registry spans independent emulator invocations of the same
- * rootfs. */
+ * with rootfs_key != NULL (-shared-proc) the registry spans independent emulator
+ * invocations of the same rootfs, backed diskless by a per-rootfs broker daemon
+ * that serves a shared memfd over an abstract socket (proctab_open_broker),
+ * falling back to a named file keyed by rootfs+uid where memfd/abstract sockets
+ * are unavailable, then to the anonymous region. See proctab.c. */
 #define PROCTAB_MAX      4096    /* max concurrent guest processes in the view */
 #define PROCTAB_CMDLINE  2048    /* per-entry cmdline cap (truncated beyond) */
 #define PROCTAB_ENVIRON  2048    /* per-entry environ cap (truncated beyond) */
