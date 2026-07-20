@@ -279,8 +279,8 @@ static void help(void) {
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",
         "arm64chroot --jit --fake-id ./rootfs /bin/bash -l",
-        "arm64chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro "
-            "./rootfs /bin/su -l",
+        ("arm64chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro "
+            "./rootfs /bin/su -l"),
     };
 
     help_section(f, "USAGE");
