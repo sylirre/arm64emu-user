@@ -103,9 +103,25 @@ SYSDEF(shmdt) {
     return 0;
 }
 
+/* Marshal a broker ShmStat into a guest shmid64_ds. Returns 0 or -EFAULT. */
+static u64 shm_write_ds(CPU *c, u64 buf_va, const struct ShmStat *st) {
+    GShmid64Ds ds;
+    memset(&ds, 0, sizeof ds);
+    ds.shm_perm.key = st->key;
+    ds.shm_perm.uid = st->uid;   ds.shm_perm.gid = st->gid;
+    ds.shm_perm.cuid = st->cuid; ds.shm_perm.cgid = st->cgid;
+    ds.shm_perm.mode = st->mode;
+    ds.shm_segsz = st->size;
+    ds.shm_atime = st->atime;    ds.shm_dtime = st->dtime;
+    ds.shm_ctime = st->ctime;
+    ds.shm_cpid = st->cpid;      ds.shm_lpid = st->lpid;
+    ds.shm_nattch = st->nattch;
+    return copy_to_guest(c, buf_va, &ds, sizeof ds) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
 SYSDEF(shmctl) {
     (void)a3; (void)a4; (void)a5;
-    s32 shmid = (s32)a0;
+    s32 shmid = (s32)a0;   /* a segment id, or a kernel array index for SHM_STAT */
     int cmd = (int)a1 & ~0x100 /* strip IPC_64: arm64 always uses the 64-bit ds */;
     u64 buf_va = a2;
     struct Machine *m = c->m;
@@ -121,20 +137,35 @@ SYSDEF(shmctl) {
     }
 
     s32 r = shmbroker_ctl(m, shmid, cmd, &st);
+
+    /* The ipcs enumeration commands deliver a struct and return a max index /
+     * shmid; SHM_INFO/IPC_INFO return -1 (no segments) without it being an
+     * error, so they write their struct before the sign check below. */
+    if (cmd == G_SHM_INFO) {
+        GShmInfo si;
+        memset(&si, 0, sizeof si);
+        si.used_ids = st.info_used;
+        si.shm_tot = st.info_tot;
+        si.shm_rss = st.info_tot;   /* no separate RSS accounting: report total */
+        if (copy_to_guest(c, buf_va, &si, sizeof si) < 0) return (u64)(s64)-EFAULT;
+        return (u64)(s64)r;
+    }
+    if (cmd == G_IPC_INFO) {
+        GShmInfo64 li;
+        memset(&li, 0, sizeof li);
+        li.shmmax = 0x7fffffffffffffffULL;   /* effectively host-RAM bounded */
+        li.shmmin = 1;
+        li.shmmni = li.shmseg = 1024;         /* SHM_SEG_MAX in the broker */
+        li.shmall = 0x7fffffffffffffffULL >> 12;
+        if (copy_to_guest(c, buf_va, &li, sizeof li) < 0) return (u64)(s64)-EFAULT;
+        return (u64)(s64)r;
+    }
+
     if (r < 0) return (u64)(s64)r;
 
-    if (cmd == G_IPC_STAT) {
-        GShmid64Ds ds;
-        memset(&ds, 0, sizeof ds);
-        ds.shm_perm.uid = st.uid;   ds.shm_perm.gid = st.gid;
-        ds.shm_perm.cuid = st.cuid; ds.shm_perm.cgid = st.cgid;
-        ds.shm_perm.mode = st.mode;
-        ds.shm_segsz = st.size;
-        ds.shm_atime = st.atime;    ds.shm_dtime = st.dtime;
-        ds.shm_ctime = st.ctime;
-        ds.shm_cpid = st.cpid;      ds.shm_lpid = st.lpid;
-        ds.shm_nattch = st.nattch;
-        if (copy_to_guest(c, buf_va, &ds, sizeof ds) < 0) return (u64)(s64)-EFAULT;
+    if (cmd == G_IPC_STAT || cmd == G_SHM_STAT || cmd == G_SHM_STAT_ANY) {
+        u64 e = shm_write_ds(c, buf_va, &st);
+        if (e) return e;
     }
     return (u64)(s64)r;
 }

@@ -389,11 +389,14 @@ int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap 
  * handed and closes it — so nothing leaks into the guest fd space (host fd ==
  * guest fd here). This needs no host shmget/shmat and no /dev/shm, so it works
  * under Android SELinux/seccomp. sys_ipc.c drives these; see proctab.c. */
-struct ShmStat {              /* shmctl(IPC_STAT) payload, host-native fields */
+struct ShmStat {              /* shmctl STAT/INFO payload, host-native fields */
+    s32 key;                  /* shm_perm.key (IPC_STAT / SHM_STAT) */
     u64 size, nattch;
     u32 mode, uid, gid, cuid, cgid;
     s32 cpid, lpid;
     s64 atime, dtime, ctime;
+    s32 info_used;            /* SHM_INFO: used_ids */
+    u64 info_tot;             /* SHM_INFO: total pages */
 };
 /* shmget: find-or-create the segment for key/size/shmflg; shmid (>0) or -errno. */
 s32  shmbroker_get(struct Machine *m, s32 key, u64 size, s32 shmflg);

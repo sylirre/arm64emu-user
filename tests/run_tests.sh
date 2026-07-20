@@ -71,21 +71,22 @@ done
 rm -f /tmp/t.bin
 
 # ---- System V shm: file-backed fallback tier ----
-# shm_sysv already ran memfd-backed vs the qemu oracle in the C loop above.
-# Re-run the static binary with A64_SHM_FORCE_FILE=1 so the broker backs each
-# segment with a file instead of an anonymous memfd, and confirm the guest sees
-# identical semantics (the backing choice is transparent to the guest).
-SHMBIN="tests/c/shm_sysv_static.bin"
-if [ -x "$SHMBIN" ]; then
+# The shm tests already ran memfd-backed vs the qemu oracle in the C loop above.
+# Re-run them with A64_SHM_FORCE_FILE=1 so the broker backs each segment with a
+# file instead of an anonymous memfd, and confirm the guest sees identical
+# semantics (the backing choice is transparent to the guest).
+for base in shm_sysv shm_stat; do
+    SHMBIN="tests/c/${base}_static.bin"
+    [ -x "$SHMBIN" ] || continue
     out_q=$(timeout 60 "$QEMU" "$SHMBIN" 2>/dev/null); rc_q=$?
     out_e=$(A64_SHM_FORCE_FILE=1 timeout 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
-        pass=$((pass+1)); echo "PASS c/shm_sysv(file-tier)"
+        pass=$((pass+1)); echo "PASS c/${base}(file-tier)"
     else
-        fail=$((fail+1)); echo "FAIL c/shm_sysv(file-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        fail=$((fail+1)); echo "FAIL c/${base}(file-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
         diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
     fi
-fi
+done
 
 # ---- Alpine rootfs shell tests (if present) ----
 ALPINE="$A64_TEST_ROOT/alpine"

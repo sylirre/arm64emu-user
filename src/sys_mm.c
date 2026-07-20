@@ -4,11 +4,23 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #include "sys.h"
 
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK)
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
+
+/* Anonymous memfd backing a MAP_SHARED|MAP_ANONYMOUS region. Bionic declares the
+ * wrapper only on newer API levels; the raw syscall is on the Android allow-list
+ * (as in proctab.c). */
+static int anon_memfd(void) {
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    return (int)syscall(SYS_memfd_create, "a64shared", 1 /* MFD_CLOEXEC */);
+#else
+    return memfd_create("a64shared", MFD_CLOEXEC);
+#endif
+}
 
 /* Guest mmap flag values (asm-generic == x86 for these). */
 #define G_MAP_SHARED    0x01
@@ -91,7 +103,24 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 
     int r;
     if (flags & G_MAP_ANONYMOUS) {
-        r = guest_map_anon(as, addr, len, pte);
+        if (flags & G_MAP_SHARED) {
+            /* MAP_SHARED|MAP_ANONYMOUS: a nameless region that fork() keeps
+             * shared. guest_map_anon uses MAP_PRIVATE host backing, which fork
+             * would copy-on-write apart, so back it with an anonymous memfd
+             * mapped MAP_SHARED instead. The mapping keeps the memory alive after
+             * the fd closes, and the host fork() inherits the sharing — matching
+             * how shmat segments (sys_ipc.c) are shared. */
+            int fd = anon_memfd();
+            if (fd < 0) return host_err();
+            long ps = sysconf(_SC_PAGESIZE);
+            if (ps < 4096) ps = 4096;
+            u64 back = (len + (u64)ps - 1) & ~((u64)ps - 1);
+            if (ftruncate(fd, (off_t)back) != 0) { close(fd); return host_err(); }
+            r = guest_map_file(as, addr, len, pte, fd, 0, 1, NULL);
+            close(fd);
+        } else {
+            r = guest_map_anon(as, addr, len, pte);
+        }
     } else {
         if (off & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
         r = guest_map_file(as, addr, len, pte, fd, off,

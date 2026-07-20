@@ -280,11 +280,14 @@ struct BReq {
 };
 
 struct BResp {
-    s32 ret;                  /* shmid / 0 / -errno */
+    s32 ret;                  /* shmid / 0 / SHM_INFO max index / -errno */
+    s32 key;                  /* shm_perm.key (IPC_STAT / SHM_STAT) */
     u64 size, nattch;
     u32 mode, uid, gid, cuid, cgid;
     s32 cpid, lpid;
     s64 atime, dtime, ctime;
+    s32 info_used;            /* SHM_INFO: used_ids */
+    u64 info_tot;             /* SHM_INFO: total pages over all segments */
     /* on REQ_SHMAT success a backing fd rides alongside via SCM_RIGHTS */
 };
 
@@ -466,16 +469,49 @@ static s32 shm_do_fork(struct BReq *q) {
     return 0;
 }
 
+static void shm_fill_stat(struct BResp *r, const struct Seg *s) {
+    r->key = s->key;
+    r->size = s->size; r->nattch = s->nattch; r->mode = s->mode;
+    r->uid = s->uid; r->gid = s->gid; r->cuid = s->cuid; r->cgid = s->cgid;
+    r->cpid = s->cpid; r->lpid = s->lpid;
+    r->atime = s->atime; r->dtime = s->dtime; r->ctime = s->ctime;
+}
+
 static s32 shm_do_ctl(struct BReq *q, struct BResp *r) {
+    /* Index-based / global commands used by ipcs. SHM_STAT/SHM_STAT_ANY take a
+     * kernel-array index (not a shmid) in q->shmid and return the shmid; SHM_INFO
+     * and IPC_INFO return the highest used index (or -1) plus aggregate stats. */
+    switch (q->arg) {
+    case G_SHM_INFO:
+    case G_IPC_INFO: {
+        int used = 0; s32 maxidx = -1; u64 tot = 0;
+        for (int i = 0; i < SHM_SEG_MAX; i++)
+            if (g_seg[i].used) {
+                used++; maxidx = i;
+                tot += (g_seg[i].size + 4095) / 4096;   /* pages */
+            }
+        r->info_used = used;
+        r->info_tot = tot;
+        return maxidx;   /* -1 when none, matching the kernel */
+    }
+    case G_SHM_STAT:
+    case G_SHM_STAT_ANY: {
+        s32 idx = q->shmid;
+        if (idx < 0 || idx >= SHM_SEG_MAX || !g_seg[idx].used) return -EINVAL;
+        struct Seg *s = &g_seg[idx];
+        if (q->arg == G_SHM_STAT && !shm_permitted(s, q->uid, q->gid, 0))
+            return -EACCES;
+        shm_fill_stat(r, s);
+        return s->shmid;   /* the id the caller displays */
+    }
+    }
+
     struct Seg *s = shm_find(q->shmid);
     if (!s) return -EINVAL;
     switch (q->arg) {
     case G_IPC_STAT:
         if (!shm_permitted(s, q->uid, q->gid, 0)) return -EACCES;
-        r->size = s->size; r->nattch = s->nattch; r->mode = s->mode;
-        r->uid = s->uid; r->gid = s->gid; r->cuid = s->cuid; r->cgid = s->cgid;
-        r->cpid = s->cpid; r->lpid = s->lpid;
-        r->atime = s->atime; r->dtime = s->dtime; r->ctime = s->ctime;
+        shm_fill_stat(r, s);
         return 0;
     case G_IPC_SET:
         if (!shm_owner(s, q->uid)) return -EPERM;
@@ -961,8 +997,15 @@ s32 shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st) {
     }
     struct BResp r;
     if (shm_rpc(m, &q, &r, NULL) < 0) return -EINVAL;
+    /* SHM_INFO/IPC_INFO: r.ret is a max index (-1 == none, not an error) and the
+     * aggregate is valid either way, so deliver it without the sign check. */
+    if (cmd == G_SHM_INFO || cmd == G_IPC_INFO) {
+        if (st) { st->info_used = r.info_used; st->info_tot = r.info_tot; }
+        return r.ret;
+    }
     if (r.ret < 0) return r.ret;
-    if (cmd == G_IPC_STAT && st) {
+    if (st && (cmd == G_IPC_STAT || cmd == G_SHM_STAT || cmd == G_SHM_STAT_ANY)) {
+        st->key = r.key;
         st->size = r.size; st->nattch = r.nattch; st->mode = r.mode;
         st->uid = r.uid; st->gid = r.gid; st->cuid = r.cuid; st->cgid = r.cgid;
         st->cpid = r.cpid; st->lpid = r.lpid;

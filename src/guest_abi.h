@@ -599,4 +599,21 @@ typedef struct {
     u64 __unused4, __unused5; /* @96 */
 } GShmid64Ds;                 /* 112 bytes */
 
+/* struct shm_info (SHM_INFO output), asm-generic LP64 (48 bytes). */
+typedef struct {
+    s32 used_ids;
+    s32 __pad;                /* aligns shm_tot to offset 8 */
+    u64 shm_tot;              /* total allocated shm pages */
+    u64 shm_rss;              /* resident pages (approximated as shm_tot here) */
+    u64 shm_swp;              /* swapped pages (0) */
+    u64 swap_attempts;        /* deprecated (0) */
+    u64 swap_successes;       /* deprecated (0) */
+} GShmInfo;
+
+/* struct shminfo64 (IPC_INFO output), asm-generic LP64 (72 bytes). */
+typedef struct {
+    u64 shmmax, shmmin, shmmni, shmseg, shmall;
+    u64 __unused1, __unused2, __unused3, __unused4;
+} GShmInfo64;
+
 #endif /* A64_GUEST_ABI_H */

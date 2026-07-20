@@ -305,8 +305,16 @@ over `SCM_RIGHTS`.
 
 Permission checks use the guest's effective creds carried in each request
 (advisory in a single-user sandbox, like `--fake-id`). `shmctl` supports
-`IPC_STAT`/`IPC_SET`/`IPC_RMID`; the `SHM_STAT`/`SHM_INFO` listing path used by
-`ipcs` is not yet served.
+`IPC_STAT`/`IPC_SET`/`IPC_RMID` plus the `SHM_STAT`/`SHM_STAT_ANY`/`SHM_INFO`/
+`IPC_INFO` enumeration path `ipcs(1)` uses — `SHM_INFO` reports the highest used
+index (and aggregate page total), and `SHM_STAT` maps an index to a segment, so
+`ipcs -m` lists the guest's segments (not the host's). Note that with an isolated
+per-invocation namespace, the segment ids and totals are the guest's own.
+
+Related: `mmap(MAP_SHARED | MAP_ANONYMOUS)` is backed the same way — an anonymous
+`memfd` mapped `MAP_SHARED` (`sys_mm.c`) — so a nameless shared region stays
+shared across `fork()`, where it was previously mis-backed by `MAP_PRIVATE`
+memory that `fork()` copied apart.
 
 ## `execve`
 
