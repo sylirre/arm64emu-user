@@ -587,6 +587,40 @@ long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
     return 0;
 }
 
+/* process_vm_readv/writev partial semantics: copy up to len bytes and return the
+ * count transferred (0..len) before the first unmapped/forbidden page — never
+ * negative. copy_from/to_guest are all-or-nothing; these stop at the first bad
+ * page so the caller can report how many bytes actually crossed. */
+size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
+    u8 *d = dst;
+    size_t done = 0;
+    while (len) {
+        size_t chunk = GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK);
+        if (chunk > len) chunk = len;
+        bool perm;
+        u8 *p = translate(c, va, PTE_R, &perm);
+        if (!p) break;
+        memcpy(d, p, chunk);
+        d += chunk; va += chunk; len -= chunk; done += chunk;
+    }
+    return done;
+}
+
+size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
+    const u8 *s = src;
+    size_t done = 0;
+    while (len) {
+        size_t chunk = GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK);
+        if (chunk > len) chunk = len;
+        bool perm;
+        u8 *p = translate(c, va, PTE_W, &perm);
+        if (!p) break;
+        memcpy(p, s, chunk);
+        s += chunk; va += chunk; len -= chunk; done += chunk;
+    }
+    return done;
+}
+
 /* Write into guest memory bypassing the software PTE_W check, for a ptrace
  * POKETEXT/POKEDATA that patches an instruction (e.g. installs a BRK software
  * breakpoint) in a read-only code page. The host backing of anon and

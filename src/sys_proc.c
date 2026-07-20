@@ -1108,3 +1108,76 @@ SYSDEF(times) {
     if (a0 && copy_to_guest(c, a0, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
     return (u64)r;
 }
+
+/* process_vm_readv/writev (pid, local_iov, liovcnt, remote_iov, riovcnt, flags):
+ * copy between the caller's own memory (local_iov) and a remote process's memory
+ * (remote_iov), treating each side as a flattened byte stream. The remote must be
+ * the calling process itself or one of its *stopped* tracees — the only cross-
+ * process guest memory the emulator can reach (guest processes are separate host
+ * processes with private COW address spaces; a stopped tracee answers over the
+ * ptrace mailbox, see ptrace_vm_block). A running same-uid peer's memory is not
+ * reachable and yields -ESRCH. proot/strace use these to read a tracee's
+ * argv/paths in bulk instead of word-by-word PTRACE_PEEKDATA. flags must be 0. */
+static u64 do_process_vm(CPU *c, int is_write, u64 pid, u64 liov, u64 liovcnt,
+                         u64 riov, u64 riovcnt) {
+    if (liovcnt > 1024 || riovcnt > 1024) return (u64)(s64)-EINVAL;
+    if (liovcnt == 0 || riovcnt == 0) return 0;
+    int is_self = ((s32)pid == (s32)getpid());
+
+    GIovec *lv = malloc(sizeof(GIovec) * (size_t)liovcnt);
+    GIovec *rv = malloc(sizeof(GIovec) * (size_t)riovcnt);
+    if (!lv || !rv) { free(lv); free(rv); return (u64)(s64)-ENOMEM; }
+    if (copy_from_guest(c, lv, liov, sizeof(GIovec) * (size_t)liovcnt) < 0 ||
+        copy_from_guest(c, rv, riov, sizeof(GIovec) * (size_t)riovcnt) < 0) {
+        free(lv); free(rv); return (u64)(s64)-EFAULT;
+    }
+
+    u8 bounce[1024];
+    size_t li = 0, ri = 0, total = 0;
+    u64 loff = 0, roff = 0;
+    int err = 0;
+    while (li < liovcnt && ri < riovcnt) {
+        u64 lrem = lv[li].iov_len - loff;
+        u64 rrem = rv[ri].iov_len - roff;
+        if (lrem == 0) { li++; loff = 0; continue; }
+        if (rrem == 0) { ri++; roff = 0; continue; }
+        size_t chunk = sizeof bounce;
+        if (lrem < chunk) chunk = (size_t)lrem;
+        if (rrem < chunk) chunk = (size_t)rrem;
+        u64 lva = lv[li].iov_base + loff;
+        u64 rva = rv[ri].iov_base + roff;
+        size_t moved;
+        if (!is_write) {
+            /* remote (tracee/self) -> bounce -> local (caller) */
+            long rn = is_self ? (long)copy_from_guest_partial(c, bounce, rva, chunk)
+                              : ptrace_vm_block((s32)pid, rva, bounce, chunk, 0);
+            if (rn < 0) { err = (int)-rn; break; }
+            moved = copy_to_guest_partial(c, lva, bounce, (size_t)rn);
+            total += moved;
+            if (moved < (size_t)rn || (size_t)rn < chunk) { err = EFAULT; break; }
+        } else {
+            /* local (caller) -> bounce -> remote (tracee/self) */
+            size_t rn = copy_from_guest_partial(c, bounce, lva, chunk);
+            long wn = is_self ? (long)copy_to_guest_partial(c, rva, bounce, rn)
+                              : ptrace_vm_block((s32)pid, rva, bounce, rn, 1);
+            if (wn < 0) { err = (int)-wn; break; }
+            moved = (size_t)wn;
+            total += moved;
+            if (moved < rn || rn < chunk) { err = EFAULT; break; }
+        }
+        loff += moved; roff += moved;
+    }
+    free(lv); free(rv);
+    if (total == 0 && err) return (u64)(s64)-err;
+    return (u64)total;
+}
+
+SYSDEF(process_vm_readv) {
+    if (a5) return (u64)(s64)-EINVAL;   /* flags must be 0 */
+    return do_process_vm(c, 0, a0, a1, a2, a3, a4);
+}
+
+SYSDEF(process_vm_writev) {
+    if (a5) return (u64)(s64)-EINVAL;   /* flags must be 0 */
+    return do_process_vm(c, 1, a0, a1, a2, a3, a4);
+}

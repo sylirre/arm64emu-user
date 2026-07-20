@@ -127,6 +127,13 @@ void ptrace_service_kick(CPU *c);
 /* Handle a guest ptrace(request, pid, addr, data); returns the guest x0. */
 long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data);
 
+/* process_vm_readv/writev remote side: copy up to len bytes between host buffer
+ * `buf` and a STOPPED tracee `pid`'s guest memory at guest VA `rva` (write != 0:
+ * host -> tracee, else tracee -> host). Returns bytes transferred (0..len, short
+ * on a tracee-side fault) or a negative errno when `pid` is not a stopped tracee
+ * of the caller (the only cross-process memory the mailbox can reach). */
+long ptrace_vm_block(s32 pid, u64 rva, u8 *buf, size_t len, int write);
+
 /* ---- wait4/waitid tracer integration ---- */
 /* Is the shared registry mapped at all (ptrace usable this session)? */
 int  ptrace_available(void);

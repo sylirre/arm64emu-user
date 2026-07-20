@@ -91,6 +91,8 @@ enum {
     PT_CMD_PEEK,        /* addr -> 8-byte word in data[] */
     PT_CMD_PEEKUSR,     /* addr = user-area offset -> word */
     PT_CMD_POKE,        /* addr, arg = value */
+    PT_CMD_READ,        /* addr, arg = len (<= PT_MBOX): guest mem -> data[]; result = bytes */
+    PT_CMD_WRITE,       /* addr, arg = len (<= PT_MBOX): data[] -> guest mem; result = bytes */
     PT_CMD_GETREGS,     /* addr = NT_* which -> regset in data[] */
     PT_CMD_SETREGS,     /* addr = NT_* which, rlen bytes in data[] */
     PT_CMD_RESUME,      /* addr = inject sig, arg = PT_RES_* submode */
@@ -367,6 +369,23 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
              * code page for a software breakpoint and invalidates JIT blocks. */
             e->result = copy_to_guest_code(c, e->addr, &e->arg, 8) < 0 ? -EIO : 0;
             break;
+        case PT_CMD_READ: {
+            /* process_vm_readv remote side: copy up to arg bytes of our own guest
+             * memory into the mailbox; result = bytes crossed (short on a fault). */
+            u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            e->rlen = (u32)copy_from_guest_partial(c, e->data, e->addr, n);
+            e->result = (s64)e->rlen;
+            break;
+        }
+        case PT_CMD_WRITE: {
+            /* process_vm_writev remote side: copy up to arg mailbox bytes into our
+             * own guest memory (honoring write permission); result = bytes crossed.
+             * Unlike POKE this is an ordinary write, so a read-only page faults. */
+            u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            e->rlen = (u32)copy_to_guest_partial(c, e->addr, e->data, n);
+            e->result = (s64)e->rlen;
+            break;
+        }
         case PT_CMD_GETREGS: {
             u32 n = pt_build_regset(c, (u32)e->addr, e->data);
             e->rlen = n;
@@ -844,6 +863,39 @@ int ptrace_signal_cont(s32 id, int sig) {
         consumed = 1;
     }
     return consumed;
+}
+
+/* process_vm_readv/writev remote side: transfer up to len bytes between the host
+ * buffer `buf` and a STOPPED tracee `pid`'s guest memory at guest VA `rva`.
+ * write != 0 sends host -> tracee, else tracee -> host. Returns the byte count
+ * transferred (0..len; short if the tracee memory faults partway), or a negative
+ * errno if `pid` is not a stopped tracee of the caller. Chunks through the
+ * fixed-size mailbox; the tracee stays parked in its service loop across chunks
+ * (each PT_CMD_READ/WRITE is answered without resuming it). */
+long ptrace_vm_block(s32 pid, u64 rva, u8 *buf, size_t len, int write) {
+    if (!g_tab) return -EPERM;
+    PtLink *e = pt_find(pid);
+    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getpid())
+        return -ESRCH;
+    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
+        return -ESRCH;                       /* only a parked tracee can answer */
+    size_t done = 0;
+    while (done < len) {
+        size_t chunk = len - done;
+        if (chunk > PT_MBOX) chunk = PT_MBOX;
+        if (write) {
+            memcpy(e->data, buf + done, chunk);
+            pt_cmd(e, PT_CMD_WRITE, rva + done, chunk);
+        } else {
+            pt_cmd(e, PT_CMD_READ, rva + done, chunk);
+        }
+        if (e->result < 0) return done ? (long)done : (long)e->result;
+        size_t got = (size_t)e->result;      /* bytes the tracee actually crossed */
+        if (!write && got) memcpy(buf + done, e->data, got);
+        done += got;
+        if (got < chunk) break;              /* tracee-side page fault: stop short */
+    }
+    return (long)done;
 }
 
 /* ---- tracer: guest ptrace(2) dispatch ---- */

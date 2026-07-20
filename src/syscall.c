@@ -60,6 +60,7 @@ SYSDEF(sched_getaffinity); SYSDEF(sched_setaffinity);
 SYSDEF(sched_get_priority_max); SYSDEF(sched_get_priority_min);
 SYSDEF(sched_rr_get_interval);
 SYSDEF(getrusage); SYSDEF(times); SYSDEF(waitid);
+SYSDEF(process_vm_readv); SYSDEF(process_vm_writev);
 
 /* sys_sig.c */
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
@@ -211,6 +212,8 @@ static const struct {
     { G_NR_wait4, sys_wait4, "wait4" },
     { G_NR_waitid, sys_waitid, "waitid" },
     { G_NR_ptrace, sys_ptrace, "ptrace" },
+    { G_NR_process_vm_readv, sys_process_vm_readv, "process_vm_readv" },
+    { G_NR_process_vm_writev, sys_process_vm_writev, "process_vm_writev" },
     { G_NR_setpgid, sys_setpgid, "setpgid" },
     { G_NR_getpgid, sys_getpgid, "getpgid" },
     { G_NR_setsid, sys_setsid, "setsid" },
@@ -340,10 +343,6 @@ static const u16 quiet_enosys[] = {
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
     G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
-    /* process_vm_readv/writev: strace probes these to read a tracee's memory
-     * and falls back to PTRACE_PEEKDATA on ENOSYS, so a quiet -ENOSYS is the
-     * correct behavior (not yet emulated). */
-    G_NR_process_vm_readv, G_NR_process_vm_writev,
     G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
@@ -388,8 +387,6 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_pidfd_open, "pidfd_open" }, { G_NR_pidfd_send_signal, "pidfd_send_signal" },
     { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
     { G_NR_process_mrelease, "process_mrelease" },
-    { G_NR_process_vm_readv, "process_vm_readv" },
-    { G_NR_process_vm_writev, "process_vm_writev" },
     { G_NR_quotactl, "quotactl" }, { G_NR_reboot, "reboot" },
     { G_NR_remap_file_pages, "remap_file_pages" },
     { G_NR_restart_syscall, "restart_syscall" }, { G_NR_rseq, "rseq" },

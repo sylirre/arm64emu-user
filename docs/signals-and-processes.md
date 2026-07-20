@@ -186,6 +186,16 @@ requests about itself**, the same way it already mediates every other syscall:
   `SETREGSET`/`GETSIGINFO`/`CONT`/`SYSCALL`/`DETACH`/… using its own `CPU` and
   `copy_{to,from}_guest`. A request while the tracee is *running* (not stopped)
   fails `-ESRCH`, exactly as real ptrace requires.
+- The same mailbox carries bulk `READ`/`WRITE` commands (`copy_{from,to}_`
+  `guest_partial`, chunked to the mailbox size) that back **`process_vm_readv`/
+  `process_vm_writev`** (`ptrace_vm_block`): a tracer reads or writes a stopped
+  tracee's memory in one range instead of word-by-word `PTRACE_PEEKDATA`, which
+  is how strace/proot pull a tracee's argv and paths. The remote must be the
+  caller itself or one of its stopped tracees — the only cross-process guest
+  memory the mailbox can reach, since guest processes are separate host
+  processes with private copy-on-write address spaces; any other target is
+  `-ESRCH`. A partial transfer stops at the first unmapped remote page and
+  returns the byte count, matching the kernel.
 
 **Stop points** (only active when the thread is traced — a near-always-zero
 thread-local `g_ptrace_*` int gates the hot paths):
