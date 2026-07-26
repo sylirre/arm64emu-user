@@ -75,14 +75,27 @@ void tlb_flush_all(void);
 #define PTE_X 4u
 #define PTE_FLAGS 7u
 
+/* One host mmap allocation. Several Regions can reference it after munmap/
+ * mremap trims or splits a mapping; the allocation is released only when the
+ * last one goes away. Slice-wise release is impossible in general: on hosts
+ * with pages larger than the guest's 4 KB an interior slice can't be munmapped
+ * independently, and a trimmed fragment's host pointer (4 KB-aligned only)
+ * need not even be a valid munmap address there. */
+typedef struct HostMap {
+    u8    *base;              /* mmap base (host-page aligned) */
+    size_t len;               /* mmap length */
+    int    refs;              /* Regions referencing this allocation */
+} HostMap;
+
 typedef struct Region {
     u64  start, end;          /* guest range [start, end), page aligned */
     u32  prot;                /* PTE_R/W/X */
     u32  shared;              /* MAP_SHARED file mapping (host prot mirrors) */
-    u32  map_pad;             /* host bytes before `host` in the real mmap: nonzero
-                               * only for a MAP_SHARED mapping whose 4 KB-aligned file
-                               * offset isn't host-page aligned (host page > 4 KB) */
-    u8  *host;                /* host address backing `start` */
+    u8  *host;                /* host address backing `start`: hmap->base plus a
+                               * pad for a MAP_SHARED mapping whose 4 KB-aligned
+                               * file offset isn't host-page aligned (host page
+                               * > 4 KB), plus whatever head trims consumed */
+    HostMap *hmap;            /* refcounted host allocation backing this region */
     char *path;               /* strdup'd guest path for /proc/self/maps, or NULL */
     u64  file_off;            /* file offset at `start` (file-backed only) */
 } Region;
@@ -99,7 +112,7 @@ typedef struct AddrSpace {
     uintptr_t **l1;           /* [1 << (47-26)] L1 entries -> L2[1 << 14] */
     Region *regions;          /* sorted by start */
     int nregions, cap_regions;
-    RetiredMap *retired;      /* quarantined host backing (see region_punch) */
+    RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
     int nretired, cap_retired;
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */

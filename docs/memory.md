@@ -27,10 +27,10 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
   - On a 32-bit host an L2 entry is 4 bytes — this is *why* a 47-bit guest space
     works there: the leaf stores a host pointer, never a guest address.
 - **Region list**: a sorted array of `{guest range, prot, shared, host_base,
-  path, file offset}`. It backs `munmap`/`mremap` splitting, `mprotect`
-  bookkeeping, `/proc/self/maps` synthesis, and address-space teardown at
-  `execve`/exit. The page table is the fast lookup; the region list is the
-  authoritative record.
+  refcounted host allocation, path, file offset}`. It backs `munmap`/`mremap`
+  splitting, `mprotect` bookkeeping, `/proc/self/maps` synthesis, and
+  address-space teardown at `execve`/exit. The page table is the fast lookup;
+  the region list is the authoritative record.
 
 ## The `mem_*` seam
 
@@ -76,9 +76,16 @@ flag bits. `MAP_SHARED` file mappings are the exception — they use a real host
 `mmap` so stores reach the file, and the host protection mirrors the guest write
 bit.
 
-Host pages larger than 4 KB (64 K arm64 kernels) are detected at startup:
-anonymous maps over-allocate and slice; a file `MAP_PRIVATE` whose offset is not
-host-page-aligned falls back to `pread` into anonymous backing.
+Host pages larger than 4 KB (16 K Android, 64 K arm64 kernels) are detected at
+startup: anonymous maps over-allocate and slice; a file `MAP_PRIVATE` whose
+offset is not host-page-aligned falls back to `pread` into anonymous backing; a
+`MAP_SHARED` one is mapped from the nearest host-page-aligned offset with the
+region's host pointer advanced past the pad, so write-back still reaches the
+file. Host backing is refcounted per original `mmap` (`HostMap` in `mmu.h`):
+`munmap`/`mremap` trims and splits share the allocation, and the last region
+referencing it retires the whole thing at once — an interior slice can't be
+munmapped independently when host pages exceed the guest's 4 KB, and a trimmed
+fragment's host pointer need not be host-page aligned.
 
 An `mmap` **address hint** without `MAP_FIXED` is treated the way Linux treats it —
 as advisory, not ignored: if `[hint, hint+len)` lies in range and is free the hint

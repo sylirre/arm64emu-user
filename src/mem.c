@@ -167,9 +167,12 @@ const Region *as_find_region(AddrSpace *as, u64 va) {
 }
 
 /* Host page size handling: host backing is allocated with mmap and is at least
- * guest-page aligned. When the host page is 4 KB (the common case on all four
- * target hosts) sub-region munmap releases host memory eagerly; on larger host
- * pages the backing is only released when a whole region goes away. */
+ * guest-page aligned. Each allocation is refcounted (HostMap) and retired whole
+ * once no region references it — a punched slice is never released on its own,
+ * because on hosts with pages larger than the guest's 4 KB (16 K Android, 64 K
+ * arm64 kernels) it can't be munmapped independently, and a trimmed fragment's
+ * host pointer need not be host-page aligned. Actual munmap timing is unchanged
+ * either way: retired backing is quarantined until as_destroy (execve/exit). */
 static long g_host_pagesz;
 
 static u8 *host_alloc(u64 len, int prot) {
@@ -195,28 +198,40 @@ static void as_retire(AddrSpace *as, void *addr, size_t len) {
     as->nretired++;
 }
 
+static HostMap *hmap_new(u8 *base, size_t len) {
+    HostMap *hm = malloc(sizeof *hm);
+    if (!hm) { perror("arm64chroot: malloc"); exit(127); }
+    hm->base = base;
+    hm->len = len;
+    hm->refs = 1;
+    return hm;
+}
+
+/* Drop one region's reference; the last one retires the whole allocation with
+ * its original base and length, whatever trims did to the region since. */
+static void hmap_unref(AddrSpace *as, HostMap *hm) {
+    if (--hm->refs == 0) {
+        as_retire(as, hm->base, hm->len);
+        free(hm);
+    }
+}
+
 /* Remove the guest range [addr, addr+len) from every overlapping region,
- * splitting as needed, retiring host backing when precisely possible. */
+ * splitting as needed. Backing is never released here slice-wise: fragments
+ * keep a reference to their HostMap, and the last one to go retires the whole
+ * allocation (see hmap_unref). */
 static void region_punch(AddrSpace *as, u64 addr, u64 end) {
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
         if (r->end <= addr || r->start >= end) continue;
         u64 cut_lo = addr > r->start ? addr : r->start;
         u64 cut_hi = end < r->end ? end : r->end;
-        int whole_region = (cut_lo == r->start && cut_hi == r->end);
-        if (whole_region)
-            as_retire(as, r->host - r->map_pad, (cut_hi - cut_lo) + r->map_pad);
-        else if (g_host_pagesz == (long)GUEST_PAGE_SIZE)
-            as_retire(as, r->host + (cut_lo - r->start), cut_hi - cut_lo);
-        if (whole_region) {
+        if (cut_lo == r->start && cut_hi == r->end) {   /* whole region */
+            hmap_unref(as, r->hmap);
             region_delete(as, i);
             i--;
             continue;
         }
-        /* Surviving fragment: its map_pad no longer spans a whole mmap, so drop it.
-         * The underlying host mapping is then retained until whole-region teardown
-         * (same policy as sub-region munmap on >4 KB hosts). */
-        r->map_pad = 0;
         if (cut_lo == r->start) {              /* trim head */
             r->host += cut_hi - r->start;
             r->file_off += cut_hi - r->start;
@@ -229,6 +244,7 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
             tail.host = r->host + (cut_hi - r->start);
             tail.file_off = r->file_off + (cut_hi - r->start);
             tail.path = r->path ? strdup(r->path) : NULL;
+            tail.hmap->refs++;                 /* fragment shares the allocation */
             r->end = cut_lo;
             region_insert(as, tail);
             /* r may have moved after insert; restart scanning this range */
@@ -249,7 +265,8 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     if (!host) return -ENOMEM;
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = 0, .host = host, .path = NULL, .file_off = 0 };
+                 .shared = 0, .host = host, .hmap = hmap_new(host, len),
+                 .path = NULL, .file_off = 0 };
     region_insert(as, r);
     pte_set_range(as, addr, len, host, prot);
     return 0;
@@ -298,7 +315,8 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     }
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = (u32)shared, .host = host, .map_pad = (u32)pad,
+                 .shared = (u32)shared, .host = host,
+                 .hmap = hmap_new(host - pad, len + pad),
                  .path = path ? strdup(path) : NULL, .file_off = off };
     region_insert(as, r);
     pte_set_range(as, addr, len, host, prot);
@@ -376,9 +394,10 @@ u64 as_find_free_impl(AddrSpace *as, u64 len) {
 }
 
 void as_destroy(AddrSpace *as) {
+    /* Unref every region; each allocation lands on the retired list exactly
+     * once (at its last reference) and is munmapped in the drain below. */
     for (int i = 0; i < as->nregions; i++) {
-        munmap(as->regions[i].host - as->regions[i].map_pad,
-               (as->regions[i].end - as->regions[i].start) + as->regions[i].map_pad);
+        hmap_unref(as, as->regions[i].hmap);
         free(as->regions[i].path);
     }
     free(as->regions);
