@@ -275,11 +275,12 @@ src/
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c        rootfs containment resolver, process-shared bind table
                 (runtime mount/umount), /proc & /dev special cases
-  syscall.c sys_*.c   dispatcher + per-area handlers (~190 syscalls)
+  syscall.c sys_*.c   dispatcher + per-area handlers (~220 syscalls)
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view) +
-                unified IPC broker: portable memfd-backed System V shared memory
+                unified IPC broker: portable System V IPC — memfd-backed shared
+                memory, semaphores (blocking semop, SEM_UNDO), message queues
   ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex
                 mailbox (tracee serves PEEK/POKE/GETREGSET/CONT while stopped)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn

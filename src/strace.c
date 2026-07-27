@@ -172,6 +172,16 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_shmat,     { AT_INT, AT_PTR, AT_HEX }, AT_HEX },
     { G_NR_shmdt,     { AT_PTR }, 0 },
     { G_NR_shmctl,    { AT_INT, AT_INT, AT_PTR }, 0 },
+    /* System V semaphores & message queues: keys and flag words hex (mode +
+     * IPC_/SEM_/MSG_ bits), ids/counts/cmds decimal, buffers raw pointers. */
+    { G_NR_semget,    { AT_HEX, AT_INT, AT_HEX }, 0 },
+    { G_NR_semop,     { AT_INT, AT_PTR, AT_UINT }, 0 },
+    { G_NR_semtimedop,{ AT_INT, AT_PTR, AT_UINT, AT_TIMESPEC }, 0 },
+    { G_NR_semctl,    { AT_INT, AT_INT, AT_INT, AT_HEX }, 0 },
+    { G_NR_msgget,    { AT_HEX, AT_HEX }, 0 },
+    { G_NR_msgsnd,    { AT_INT, AT_PTR, AT_UINT, AT_HEX }, 0 },
+    { G_NR_msgrcv,    { AT_INT, AT_PTR, AT_UINT, AT_INT, AT_HEX }, 0 },
+    { G_NR_msgctl,    { AT_INT, AT_INT, AT_PTR }, 0 },
     /* process */
     { G_NR_execve,    { AT_STR, AT_STRARRAY, AT_STRARRAY }, 0 },
     { G_NR_execveat,  { AT_DIRFD, AT_STR, AT_STRARRAY, AT_STRARRAY, AT_ATFLAGS }, 0 },

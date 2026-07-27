@@ -180,6 +180,22 @@ struct Machine {
      * the broker is keyed per-rootfs instead (like proctab), spanning invocations.
      * See shmbroker_* in proctab.c. */
     u64 shm_session;
+
+    /* In-flight blocking-IPC sockets (a semop/msgsnd/msgrcv sleeping in the
+     * broker holds its CLOEXEC connection open for the wait). A fork by a
+     * sibling thread duplicates such an fd into the child, where it is a
+     * stray: guest-visible, and muting the broker's waiter-death POLLHUP.
+     * ipc_fork_child closes every registered fd right after fork; execve only
+     * clears the table (its CLOEXEC walk already closed the fds). Slots hold
+     * fd+1 (0 = free) and are claimed/released with atomics — a lock here
+     * could be fork-inherited in a held state. */
+#define IPC_WAIT_FDS 64
+    s32 ipc_wait_fd[IPC_WAIT_FDS];
+
+    u8 sem_undo_used;         /* this process may hold SEM_UNDO adjustments:
+                               * apply them (REQ_SEMEXIT) at process exit.
+                               * Survives execve (undo lists do too); cleared
+                               * in fork children (fresh pid, empty list). */
 };
 
 /* The singleton task of this process (fork copies it naturally). */
@@ -410,5 +426,67 @@ void shmbroker_fork(struct Machine *m, s32 shmid);
 /* shmctl: cmd IPC_STAT (fills *st), IPC_SET (reads mode/uid/gid from *st),
  * IPC_RMID. Returns 0 or -errno. */
 s32  shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st);
+
+/* System V semaphores and message queues live entirely in the broker daemon:
+ * every operation below is one request/response exchange; the blocking ones
+ * (semop, msgsnd, msgrcv) park their connection in the daemon until granted,
+ * timed out or interrupted by a deliverable guest signal. sys_ipc.c drives
+ * these; see the client section at the end of proctab.c. */
+struct SemStat {              /* semctl STAT/INFO payload, host-native fields */
+    s32 key;
+    u64 nsems;
+    u32 mode, uid, gid, cuid, cgid;
+    s64 otime, ctime;
+    s32 info_used;            /* SEM_INFO: existing sets */
+    u64 info_tot;             /* SEM_INFO: existing semaphores over all sets */
+};
+struct MsgStat {              /* msgctl STAT/INFO payload, host-native fields */
+    s32 key;
+    u64 qbytes, qnum, cbytes;
+    u32 mode, uid, gid, cuid, cgid;
+    s32 lspid, lrpid;
+    s64 stime, rtime, ctime;
+    s32 info_used;            /* MSG_INFO: existing queues */
+    u64 info_tot;             /* MSG_INFO: messages over all queues */
+    u64 info_bytes;           /* MSG_INFO: bytes over all queues */
+};
+/* semget: find-or-create the set for key/nsems/semflg; semid (>0) or -errno. */
+s32  sembroker_get(struct Machine *m, s32 key, u64 nsems, s32 semflg);
+/* semop/semtimedop: `sops` is the guest sembuf vector (nsops * 6 bytes,
+ * GSembuf layout — void here because machine.h stays guest_abi-free);
+ * timeout_ns relative, -1 = untimed. Blocks; -EINTR on a deliverable guest
+ * signal (sem ops are never restarted). Sets m->sem_undo_used on SEM_UNDO. */
+s32  sembroker_op(struct Machine *m, s32 semid, const void *sops, u32 nsops,
+                  s64 timeout_ns);
+/* semctl for everything except GETALL/SETALL: `semnum`/`val` as the cmd needs;
+ * STAT cmds fill *st, IPC_SET reads mode/uid/gid from *st, SEM_INFO/IPC_INFO
+ * fill the info fields and return the max index (-1 = none). */
+s32  sembroker_ctl(struct Machine *m, s32 semid, s32 semnum, s32 cmd, s32 val,
+                   struct SemStat *st);
+/* semctl GETALL: fills up to `cap` u16 values; returns nsems or -errno. */
+s32  sembroker_getall(struct Machine *m, s32 semid, u16 *vals, u32 cap);
+/* semctl SETALL: writes all nsems values. Returns 0 or -errno. */
+s32  sembroker_setall(struct Machine *m, s32 semid, const u16 *vals, u32 nsems);
+/* The set's nsems with no permission check (sizes a SETALL copy). */
+s32  sembroker_nsems(struct Machine *m, s32 semid);
+/* Process exit: apply this pid's SEM_UNDO adjustments (no-op unless
+ * m->sem_undo_used). Not called on execve — undo lists survive exec. */
+void sembroker_exit(struct Machine *m);
+/* msgget: find-or-create the queue for key/msgflg; msqid (>0) or -errno. */
+s32  msgbroker_get(struct Machine *m, s32 key, s32 msgflg);
+/* msgsnd: enqueue (blocking when full unless IPC_NOWAIT). 0 or -errno. */
+s32  msgbroker_snd(struct Machine *m, s32 msqid, s64 mtype, const void *data,
+                   u64 sz, s32 msgflg);
+/* msgrcv: dequeue per msgtyp/msgflg into buf (<= sz bytes); *mtype_out gets
+ * the message type. Returns the byte count or -errno. */
+s64  msgbroker_rcv(struct Machine *m, s32 msqid, s64 msgtyp, void *buf, u64 sz,
+                   s32 msgflg, s64 *mtype_out);
+/* msgctl: STAT cmds fill *st; IPC_SET reads mode/uid/gid/qbytes from *st;
+ * MSG_INFO/IPC_INFO fill the info fields and return the max index. */
+s32  msgbroker_ctl(struct Machine *m, s32 msqid, s32 cmd, struct MsgStat *st);
+/* Fork child: close stray in-flight IPC sockets, reset sem_undo_used. */
+void ipc_fork_child(struct Machine *m);
+/* execve: forget the (already-closed) in-flight sockets. */
+void ipc_exec_clear(struct Machine *m);
 
 #endif /* A64_MACHINE_H */

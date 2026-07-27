@@ -47,7 +47,7 @@ src/
   strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
-  sys_ipc.c                          System V shared memory (shmget/shmat/shmdt/shmctl) over the portable IPC broker; maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
+  sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads)
   sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions)
   sys_time.c                         Time / clock / timerfd syscalls
@@ -56,7 +56,7 @@ src/
   sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
   sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)
-  proctab.c                          Shared-memory guest-PID registry (cross-process ps/top view) + unified IPC broker daemon backing System V shm: owns per-segment memfd/file backings, hands them out over SCM_RIGHTS, self-cleans on idle
+  proctab.c                          Shared-memory guest-PID registry (cross-process ps/top view) + unified IPC broker daemon backing System V IPC: owns shm memfd/file backings (handed out over SCM_RIGHTS) and all semaphore/message-queue state, parks blocking semop/msgsnd/msgrcv waiters, applies SEM_UNDO at process death, self-cleans on idle
   ptracetab.c ptrace.h               Cross-process ptrace(2): shared tracer<->tracee link registry + futex mailbox (tracee services PEEK/POKE/GETREGSET/CONT about itself while parked at a stop)
   signal.c                           Host capture -> guest rt_sigframe / rt_sigreturn
   machine.h thread.h                 Per-process shared Machine state + per-thread state (CPU is per-thread; Machine is shared)

@@ -41,6 +41,8 @@ SYSDEF(brk); SYSDEF(mmap); SYSDEF(munmap); SYSDEF(mprotect);
 SYSDEF(madvise); SYSDEF(mremap); SYSDEF(msync); SYSDEF(mincore);
 SYSDEF(mlock); SYSDEF(mlock2); SYSDEF(munlock); SYSDEF(mlockall);
 SYSDEF(shmget); SYSDEF(shmat); SYSDEF(shmdt); SYSDEF(shmctl);
+SYSDEF(semget); SYSDEF(semop); SYSDEF(semtimedop); SYSDEF(semctl);
+SYSDEF(msgget); SYSDEF(msgsnd); SYSDEF(msgrcv); SYSDEF(msgctl);
 SYSDEF(munlockall);
 
 /* sys_proc.c */
@@ -193,6 +195,14 @@ static const struct {
     { G_NR_shmat, sys_shmat, "shmat" },
     { G_NR_shmdt, sys_shmdt, "shmdt" },
     { G_NR_shmctl, sys_shmctl, "shmctl" },
+    { G_NR_semget, sys_semget, "semget" },
+    { G_NR_semop, sys_semop, "semop" },
+    { G_NR_semtimedop, sys_semtimedop, "semtimedop" },
+    { G_NR_semctl, sys_semctl, "semctl" },
+    { G_NR_msgget, sys_msgget, "msgget" },
+    { G_NR_msgsnd, sys_msgsnd, "msgsnd" },
+    { G_NR_msgrcv, sys_msgrcv, "msgrcv" },
+    { G_NR_msgctl, sys_msgctl, "msgctl" },
     { G_NR_mlock, sys_mlock, "mlock" },
     { G_NR_mlock2, sys_mlock2, "mlock2" },
     { G_NR_munlock, sys_munlock, "munlock" },
@@ -387,7 +397,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_map_shadow_stack, "map_shadow_stack" }, { G_NR_mbind, "mbind" },
     { G_NR_memfd_secret, "memfd_secret" }, { G_NR_mount_setattr, "mount_setattr" },
     { G_NR_move_mount, "move_mount" }, { G_NR_mq_open, "mq_open" },
-    { G_NR_mseal, "mseal" }, { G_NR_msgget, "msgget" },
+    { G_NR_mseal, "mseal" },
     { G_NR_name_to_handle_at, "name_to_handle_at" }, { G_NR_openat2, "openat2" },
     { G_NR_open_tree, "open_tree" }, { G_NR_pidfd_getfd, "pidfd_getfd" },
     { G_NR_pidfd_open, "pidfd_open" }, { G_NR_pidfd_send_signal, "pidfd_send_signal" },
@@ -397,7 +407,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_remap_file_pages, "remap_file_pages" },
     { G_NR_restart_syscall, "restart_syscall" }, { G_NR_rseq, "rseq" },
     { G_NR_sched_getattr, "sched_getattr" }, { G_NR_sched_setattr, "sched_setattr" },
-    { G_NR_seccomp, "seccomp" }, { G_NR_semget, "semget" },
+    { G_NR_seccomp, "seccomp" },
     { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
     { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
     { G_NR_setns, "setns" }, { G_NR_settimeofday, "settimeofday" },

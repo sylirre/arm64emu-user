@@ -48,12 +48,15 @@ unfiltered:
   `getifaddrs()`/`ip` keep working. The read-only `SIOCGIF*` interface-query
   ioctls (`ifconfig`/net-tools) are likewise answered in-process from the host
   interface table, so they work even where the socket ioctls return EACCES.
-* **System V shared memory** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
+* **System V IPC** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
   `shmdt`/`shmctl` run over an in-process broker backed by an anonymous `memfd`
   (on the Oreo allow-list) passed between processes over `SCM_RIGHTS` on an
   abstract socket — no host SysV IPC syscalls (never whitelisted) and no
   `/dev/shm` (Android has no ownerless tmpfs an app may write). It falls back to
-  a file in an app-writable dir when `memfd_create` is unavailable. See
+  a file in an app-writable dir when `memfd_create` is unavailable. Semaphores
+  (`semget`/`semop`/`semtimedop`/`semctl`, incl. blocking waits and `SEM_UNDO`)
+  and message queues (`msgget`/`msgsnd`/`msgrcv`/`msgctl`) live in the same
+  broker daemon and need nothing beyond the socket. See
   [syscalls.md](syscalls.md).
 * **Startup notice**: at startup the emulator reads `Seccomp:` from
   `/proc/self/status` and, if a filter is active (mode 2), prints one line:

@@ -181,7 +181,13 @@
 #define G_NR_sysinfo           179
 #define G_NR_mq_open           180
 #define G_NR_msgget            186
+#define G_NR_msgctl            187
+#define G_NR_msgrcv            188
+#define G_NR_msgsnd            189
 #define G_NR_semget            190
+#define G_NR_semctl            191
+#define G_NR_semtimedop        192
+#define G_NR_semop             193
 #define G_NR_shmget            194
 #define G_NR_shmctl            195
 #define G_NR_shmat             196
@@ -615,5 +621,97 @@ typedef struct {
     u64 shmmax, shmmin, shmmni, shmseg, shmall;
     u64 __unused1, __unused2, __unused3, __unused4;
 } GShmInfo64;
+
+/* ---- System V IPC (semaphores) ---- */
+
+/* semctl() cmd (semaphore-specific ops; IPC_RMID/SET/STAT/INFO above). */
+#define G_GETPID      11        /* sempid of last modifier */
+#define G_GETVAL      12
+#define G_GETALL      13
+#define G_GETNCNT     14        /* # waiters for the value to increase */
+#define G_GETZCNT     15        /* # waiters for the value to become zero */
+#define G_SETVAL      16
+#define G_SETALL      17
+#define G_SEM_STAT    18        /* by kernel-array index (ipcs) */
+#define G_SEM_INFO    19
+#define G_SEM_STAT_ANY 20
+
+/* semop() sem_flg (IPC_NOWAIT above). */
+#define G_SEM_UNDO    0x1000    /* roll the op back when the process exits */
+
+/* Enforced limits, reported via IPC_INFO/SEM_INFO. SEMVMX/SEMAEM are the
+ * kernel's hard ABI bounds; the others are this implementation's caps (the
+ * broker allocates per-set state dynamically, so SEMMSL costs nothing when
+ * unused). */
+#define G_SEMVMX      32767     /* max semaphore value */
+#define G_SEMAEM      32767     /* max |semadj| (undo adjustment) */
+#define G_SEMMSL      32000     /* max semaphores per set (kernel default) */
+#define G_SEMMNI      1024      /* max sets (SEM_SET_MAX in the broker) */
+#define G_SEMOPM      500       /* max sops per semop (kernel default) */
+
+/* struct sembuf (asm-generic, 6 bytes, naturally packed: three 2-byte fields). */
+typedef struct {
+    u16 sem_num;
+    s16 sem_op;
+    s16 sem_flg;
+} GSembuf;
+
+/* asm-generic struct semid64_ds for arm64 (LP64). */
+typedef struct {
+    GIpc64Perm sem_perm;      /* @0  operation permission struct */
+    s64 sem_otime;            /* @48 last semop time */
+    s64 sem_ctime;            /* @56 last change time */
+    u64 sem_nsems;            /* @64 number of semaphores in the set */
+    u64 __unused3, __unused4; /* @72 */
+} GSemid64Ds;                 /* 88 bytes */
+
+/* struct seminfo (IPC_INFO/SEM_INFO output), ten native ints (40 bytes).
+ * SEM_INFO repurposes semusz = # of existing sets, semaem = # of existing
+ * semaphores over all sets. */
+typedef struct {
+    s32 semmap, semmni, semmns, semmnu, semmsl, semopm;
+    s32 semume, semusz, semvmx, semaem;
+} GSemInfo;
+
+/* ---- System V IPC (message queues) ---- */
+
+/* msgctl() cmd (queue-specific ops; IPC_RMID/SET/STAT/INFO above). */
+#define G_MSG_STAT    11        /* by kernel-array index (ipcs) */
+#define G_MSG_INFO    12
+#define G_MSG_STAT_ANY 13
+
+/* msgsnd()/msgrcv() msgflg (IPC_NOWAIT above). */
+#define G_MSG_NOERROR 010000    /* truncate an oversized message silently */
+#define G_MSG_EXCEPT  020000    /* msgtyp > 0: receive any type != msgtyp */
+#define G_MSG_COPY    040000    /* checkpoint/restore peek: not supported */
+
+/* Enforced limits (the kernel defaults), reported via IPC_INFO/MSG_INFO. */
+#define G_MSGMAX      8192      /* max bytes per message */
+#define G_MSGMNB      16384     /* default max bytes per queue (msg_qbytes) */
+#define G_MSGMNI      1024      /* max queues (MSG_QUEUE_MAX in the broker) */
+
+/* asm-generic struct msqid64_ds for arm64 (LP64). */
+typedef struct {
+    GIpc64Perm msg_perm;      /* @0   operation permission struct */
+    s64 msg_stime;            /* @48  last msgsnd time */
+    s64 msg_rtime;            /* @56  last msgrcv time */
+    s64 msg_ctime;            /* @64  last change time */
+    u64 msg_cbytes;           /* @72  bytes currently on the queue */
+    u64 msg_qnum;             /* @80  messages currently on the queue */
+    u64 msg_qbytes;           /* @88  max bytes allowed on the queue */
+    s32 msg_lspid;            /* @96  pid of last msgsnd */
+    s32 msg_lrpid;            /* @100 pid of last msgrcv */
+    u64 __unused4, __unused5; /* @104 */
+} GMsqid64Ds;                 /* 120 bytes */
+
+/* struct msginfo (IPC_INFO/MSG_INFO output), 7 ints + a short (32 bytes with
+ * tail padding, which the kernel zeroes — so an explicit pad field here).
+ * MSG_INFO repurposes msgpool = # of existing queues, msgmap = # of messages
+ * over all queues, msgtql = bytes over all queues. */
+typedef struct {
+    s32 msgpool, msgmap, msgmax, msgmnb, msgmni, msgssz, msgtql;
+    u16 msgseg;
+    u16 __pad;
+} GMsgInfo;
 
 #endif /* A64_GUEST_ABI_H */

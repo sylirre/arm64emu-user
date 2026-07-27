@@ -274,14 +274,17 @@ family is ungated (it does not depend on the host actually blocking netlink).
   the emulator cmdline and are hidden, and `stat`/`status` memory/state fields
   still describe the emulator process.
 
-## System V shared memory (`src/sys_ipc.c`)
+## System V IPC (`src/sys_ipc.c`)
 
-`shmget`/`shmat`/`shmdt`/`shmctl` are emulated **without** the host's SysV IPC
-syscalls (SELinux/seccomp deny them on Android) and without `/dev/shm`. The
+`shmget`/`shmat`/`shmdt`/`shmctl`, `semget`/`semop`/`semtimedop`/`semctl` and
+`msgget`/`msgsnd`/`msgrcv`/`msgctl` are emulated **without** the host's SysV
+IPC syscalls (SELinux/seccomp deny them on Android) and without `/dev/shm`. The
 unified IPC broker — an extension of the proctab broker (`src/proctab.c`) — is
 the authoritative registry: a detached per-rootfs (or, without `--shared-proc`,
-per-invocation) daemon owns every segment's backing and hands it to attachers
-over `SCM_RIGHTS`.
+per-invocation) daemon owns every shm segment's backing (handed to attachers
+over `SCM_RIGHTS`) and all semaphore/message-queue state.
+
+### Shared memory
 
 - **Backing.** Each segment is an anonymous `memfd` (the normal, Android-safe
   path), or a file in the first writable dir (`/dev/shm`, `$XDG_RUNTIME_DIR`,
@@ -315,6 +318,52 @@ Related: `mmap(MAP_SHARED | MAP_ANONYMOUS)` is backed the same way — an anonym
 `memfd` mapped `MAP_SHARED` (`sys_mm.c`) — so a nameless shared region stays
 shared across `fork()`, where it was previously mis-backed by `MAP_PRIVATE`
 memory that `fork()` copied apart.
+
+### Semaphores and message queues
+
+Unlike shm (whose payload lives in a kernel-backed `memfd` mapping), semaphore
+sets and message queues live entirely in the daemon: every operation is one
+request/response exchange over the rendezvous socket, so all mutation is
+single-threaded in the broker, a multi-op `semop` is trivially atomic, and a
+crashing guest can never corrupt IPC state.
+
+- **Blocking.** A `semop`/`msgsnd`/`msgrcv` that must sleep is *parked*: the
+  daemon keeps the connection open and replies when the operation completes,
+  the `semtimedop` deadline expires (`EAGAIN` — deadlines bound the daemon's
+  poll timeout, so they fire on time), or the object is removed (`EIDRM`). A
+  parked waiter's death is a `POLLHUP`. The client's wait polls in 100 ms
+  slices, watching the thread's signal-capture ring: a deliverable guest
+  signal sends `REQ_CANCEL` down the same connection and the *next* message is
+  definitive — the grant if the daemon won the race, else the cancel-ack →
+  `EINTR` (SysV IPC waits are never restarted, matching the kernel; a
+  guest-masked arrival keeps waiting).
+- **SEM_UNDO.** Per-(pid, set) adjustment vectors live in the daemon, applied
+  on clean exit via `sembroker_exit` in `exit`/`exit_group`/fatal-signal death
+  — not `execve` (undo lists survive exec); fork children start clean; threads
+  share the pid, giving `CLONE_SYSVSEM` semantics for free. A `SIGKILL`'d
+  holder is caught by the broker's ~1 s liveness-reclaim tick, which also
+  wakes any waiter the applied undo unblocks. `SETVAL`/`SETALL` clear the
+  affected adjustments in every process's list (kernel rule).
+- **Fidelity.** Values clamp at `SEMVMX` (32767) with `ERANGE`; `semop`
+  vectors apply all-or-nothing with prefix rollback; `sempid`, `sem_otime` and
+  `GETNCNT`/`GETZCNT` (counted from the parked-waiter queue) behave as the
+  kernel's; message selection implements msgtyp 0 / positive / negative /
+  `MSG_EXCEPT`, `E2BIG` vs `MSG_NOERROR` truncation, and pipelined handoff to
+  a parked receiver; `ipcs -s`/`-q` work via the `SEM_STAT`/`SEM_INFO`/
+  `MSG_STAT`/`MSG_INFO` enumeration commands. Limits are the kernel defaults
+  (`SEMMSL` 32000, `SEMOPM` 500, `MSGMAX` 8192, `MSGMNB` 16384; 1024 sets and
+  queues). `MSG_COPY` is not supported (`ENOSYS`, as on kernels without
+  checkpoint/restore).
+- **Caps.** Parked waiters are bounded (512 per broker): past that a blocking
+  op fails loud (`EAGAIN`/`ENOMSG`) instead of sleeping. A blocking client
+  holds its (CLOEXEC) connection for the wait's duration; the fd is registered
+  per-process so a concurrent `fork` by a sibling thread closes the duplicate
+  in the child — otherwise it would linger guest-visible and mute the daemon's
+  waiter-death `POLLHUP`.
+- **Lifetime.** Sets and queues anchor the daemon the way shm segments do
+  (creator or last toucher alive, parked waiters, or live undo holders); once
+  the whole rootfs/session goes idle, everything is garbage-collected — the
+  same bounded deviation from kernel-persistent SysV objects that shm has.
 
 ## `execve`
 
