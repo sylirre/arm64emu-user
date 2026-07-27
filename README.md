@@ -153,6 +153,24 @@ are not shared between multiple emulator sessions.
 
 Caveat: the src/dst paths must not contain the colon character (`:`).
 
+### Sandboxes (bubblewrap, flatpak)
+
+Guest sandbox helpers run unmodified under `--fake-id`. `mount -t tmpfs` is
+backed by a fresh empty host directory bound at the mountpoint, `mount -t proc`
+and `-t devpts` bind the corresponding passthrough zone, `pivot_root(2)`
+re-roots like `chroot(2)` while exposing the old root at `put_old`, and a guest
+that unshares a mount namespace gets a private copy of the bind table, so its
+mounts stay its own:
+
+```sh
+arm64chroot --fake-id ./rootfs \
+    bwrap --unshare-all --bind / / --proc /proc --dev /dev /bin/sh
+```
+
+This is emulation, not containment — the sandbox is a rearranged view of the
+same rootfs, and the namespaces it thinks it created do not exist. It is enough
+for helpers that only check whether their setup calls succeeded.
+
 ### Fake identity
 
 Option `--fake-id` emulates specific UID and GID in guest environment, by
@@ -273,11 +291,13 @@ src/
     backend_a64.c backend_x86_64.c   register-allocating single-pass emitters
     jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c        rootfs containment resolver, process-shared bind table
-                (runtime mount/umount), /proc & /dev special cases
-  syscall.c sys_*.c   dispatcher + per-area handlers (~220 syscalls)
+  path.c        rootfs containment resolver, bind table (runtime mount/umount/
+                pivot_root; process-shared, private per faked mount namespace),
+                tmpfs backing dirs, /proc & /dev special cases
+  syscall.c sys_*.c   dispatcher + per-area handlers (~225 syscalls)
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
-  sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, ...)
+  sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, the
+                writable id maps of a faked user namespace, ...)
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view) +
                 unified IPC broker: portable System V IPC — memfd-backed shared
                 memory, semaphores (blocking semop, SEM_UNDO), message queues

@@ -523,6 +523,34 @@ if [ -x "$ALPINE/bin/bash" ] && command -v expect >/dev/null; then
     else fail=$((fail+1)); echo "FAIL jobctl: external cmd under bash ($jc)"; fi
 fi
 
+# ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps,
+# a private mount namespace, and pivot_root (bubblewrap's stack-then-detach
+# idiom included). Self-checking: qemu hands all of these to the real kernel,
+# which refuses them unprivileged, so it cannot be the oracle. Gated on
+# --fake-id, like the mount and chroot emulation itself. ----
+if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
+    if "$AGCC" -static -O2 -o "$ALPINE/tmp/sandbox_probe.bin" \
+            tests/fixtures/sandbox_probe.c 2>/dev/null; then
+        rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
+        got=$("$EMU" --fake-id "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null)
+        expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\nouter_root=1'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS sandbox: mount/userns/pivot_root"
+        else
+            fail=$((fail+1)); echo "FAIL sandbox: mount/userns/pivot_root"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        # Unprivileged (no --fake-id): the mount family stays refused.
+        rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
+        got=$("$EMU" "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null | head -1)
+        if [ "$got" = "tmpfs=-1" ]; then pass=$((pass+1)); echo "PASS sandbox: unprivileged EPERM"
+        else fail=$((fail+1)); echo "FAIL sandbox: unprivileged EPERM (got '$got')"; fi
+        rm -f "$ALPINE/tmp/sandbox_probe.bin"
+        rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
+    else
+        echo "SKIP build fixtures/sandbox_probe"
+    fi
+fi
+
 # ---- self-checking fixtures for syscalls qemu-user cannot model (it
 # returns ENOSYS for set/get_robust_list and mlock2) ----
 check_fixture() {   # check_fixture <name> <expected>

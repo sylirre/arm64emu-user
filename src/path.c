@@ -4,14 +4,17 @@
  * prefix, component by component, so absolute symlinks inside the rootfs
  * resolve against the *guest* root and `..` never escapes it (proot's
  * algorithm, without ptrace — every syscall already passes through us). */
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -85,6 +88,13 @@ int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     return host_fd_guest_path(m, buf, out, NULL);
 }
 
+/* Is this a path in the host /proc zone? Such a path doubles as the canonical
+ * guest spelling of the same file -- the zone passes through verbatim -- which
+ * is what lets /proc keep working when a mount gives it another name. */
+int proc_zone_path(const char *host) {
+    return !strncmp(host, "/proc", 5) && (host[5] == 0 || host[5] == '/');
+}
+
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
  * state (our binary, the host cwd, the host root). Following or reading them raw
  * would leak host paths, and root/… would escape the rootfs entirely, so the
@@ -154,6 +164,22 @@ void path_strip_rootfs(const struct Machine *m, char *path) {
     if (path[rl] == 0) { strcpy(path, "/"); return; }
     if (path[rl] != '/') return;
     memmove(path, path + rl, strlen(path + rl) + 1);
+}
+
+/* A namespace-absolute guest path as the guest itself sees it: inside a chroot,
+ * or after a pivot_root, the root base has to come off before the path is
+ * handed back (getcwd, readlink targets, the mount table). A path outside the
+ * base has no name in that view at all; "/" is the closest honest answer, and
+ * the same one the kernel gives for an unreachable cwd. */
+void path_chroot_view(const struct Machine *m, const char *canon, char *out) {
+    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+    const char *p = canon && canon[0] ? canon : "/";
+    if (!strcmp(croot, "/")) { strcpy(out, p); return; }
+    size_t cl = strlen(croot);
+    if (!strncmp(p, croot, cl) && (p[cl] == '/' || p[cl] == 0))
+        strcpy(out, p[cl] ? p + cl : "/");
+    else
+        strcpy(out, "/");
 }
 
 /* Special path zones, applied to the *canonical* guest path:
@@ -264,9 +290,14 @@ static int join_host(const char *host, const char *rem, char *out) {
  * writes preceding the publish (release/acquire, cross-process via the shared
  * mapping + atomics). g_nbinds is a monotonic high-water bound. If the mmap
  * fails, the pointers keep addressing a private static table (per-process). */
-static struct BindTab { int n; struct Bind e[BIND_MAX]; } g_bindtab_fallback;
+static struct BindTab {
+    int n;
+    unsigned nextseq;       /* stack position handed to the next mount */
+    struct Bind e[BIND_MAX];
+} g_bindtab_fallback;
 static struct Bind *g_binds = g_bindtab_fallback.e;
 static int *g_nbinds = &g_bindtab_fallback.n;
+static unsigned *g_bindseq = &g_bindtab_fallback.nextseq;
 
 void bindtab_init(void) {
     void *p = mmap(NULL, sizeof(struct BindTab), PROT_READ | PROT_WRITE,
@@ -275,6 +306,153 @@ void bindtab_init(void) {
     struct BindTab *t = p;
     g_binds = t->e;
     g_nbinds = &t->n;
+    g_bindseq = &t->nextseq;
+}
+
+/* A guest that asked for a mount namespace of its own (clone/unshare with
+ * CLONE_NEWNS) gets a private copy of the table, in a fresh shared region: its
+ * own fork children keep sharing it -- a fork does not leave the namespace --
+ * while its mounts, and the re-rooting bubblewrap does with them, stay
+ * invisible to the rest of the session. Session-wide sharing is otherwise the
+ * right default (the `mount` command runs as a child of the shell that must
+ * see the result), so this is the one place it is broken.
+ *
+ * The previous region is deliberately left mapped: sibling threads may be
+ * reading it through g_binds right now, and it is demand-zero pages of a
+ * process that unshares at most a handful of times. */
+void bindtab_unshare(void) {
+    void *p = mmap(NULL, sizeof(struct BindTab), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return;   /* keep sharing rather than fail the guest */
+    struct BindTab *t = p;
+    int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
+    if (n > BIND_MAX) n = BIND_MAX;
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
+        strcpy(t->e[i].guest, g_binds[i].guest);
+        strcpy(t->e[i].host, g_binds[i].host);
+        t->e[i].ro = g_binds[i].ro;
+        t->e[i].seq = g_binds[i].seq;
+        t->e[i].active = 1;   /* private region: no other reader yet */
+    }
+    t->n = n;
+    t->nextseq = __atomic_load_n(g_bindseq, __ATOMIC_SEQ_CST);
+    g_binds = t->e;
+    g_nbinds = &t->n;
+    g_bindseq = &t->nextseq;
+}
+
+/* --- tmpfs backing directories --------------------------------------------
+ * An unprivileged process cannot mount a real tmpfs, but what a guest wants
+ * from one is an empty, writable tree that hides whatever the mountpoint held
+ * -- and a bind of a fresh host directory provides exactly that, with the
+ * original reappearing on umount. bubblewrap builds its whole sandbox scaffold
+ * in such a tmpfs, so this is what makes it (and flatpak-style helpers) run.
+ *
+ * The directories live under one per-invocation session directory, so a single
+ * sweep at the end of the session removes them all; a session killed before it
+ * could clean up is swept by the next invocation that finds its root pid gone.
+ * Backing store choice mirrors the IPC broker's fallback (proctab.c): real
+ * tmpfs where the host has an ownerless one, app-writable dirs on Android. */
+static const char *tmpfs_base(void) {
+    const char *e;
+    if (access("/dev/shm", W_OK) == 0) return "/dev/shm";
+    if ((e = getenv("XDG_RUNTIME_DIR")) && *e && access(e, W_OK) == 0) return e;
+    if ((e = getenv("TMPDIR")) && *e && access(e, W_OK) == 0) return e;
+    if (access("/data/local/tmp", W_OK) == 0) return "/data/local/tmp";
+    if (access("/tmp", W_OK) == 0) return "/tmp";
+    return NULL;
+}
+
+/* "<base>/arm64chroot-tmpfs.<uid>.<root pid>": the root pid (high half of the
+ * session nonce, seeded in main and fork-inherited) both scopes the directory
+ * to this invocation and lets a later run test whether it is still alive. */
+static int tmpfs_session_path(const struct Machine *m, char *out) {
+    const char *base = tmpfs_base();
+    if (!base) return -EACCES;
+    int n = snprintf(out, PATH_MAX, "%s/arm64chroot-tmpfs.%u.%u",
+                     base, (unsigned)getuid(),
+                     (unsigned)(m->shm_session >> 32));
+    return (n > 0 && n < PATH_MAX) ? 0 : -ENAMETOOLONG;
+}
+
+/* Recursively delete `path`. Only ever called on a directory this emulator
+ * created under tmpfs_base(); the caller checks the prefix, and symlinks are
+ * removed as links (no descent), so nothing outside the tree can be reached. */
+static void rm_rf(const char *path, int depth) {
+    if (depth > 32) return;
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char sub[PATH_MAX];
+            if (snprintf(sub, sizeof sub, "%s/%s", path, de->d_name) >= (int)sizeof sub)
+                continue;
+            struct stat st;
+            if (lstat(sub, &st) == 0 && S_ISDIR(st.st_mode)) rm_rf(sub, depth + 1);
+            else unlink(sub);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+
+/* Fresh empty directory to back one tmpfs mount. */
+int tmpfs_dir_new(struct Machine *m, char *host_out) {
+    char sess[PATH_MAX];
+    int r = tmpfs_session_path(m, sess);
+    if (r < 0) return r;
+    if (mkdir(sess, 0700) != 0 && errno != EEXIST) return -errno;
+    /* The counter only has to be unique within this process; mkdir resolves a
+     * collision with a sibling process by failing, and we retry. */
+    static int seq;
+    for (int tries = 0; tries < 4096; tries++) {
+        int n = snprintf(host_out, PATH_MAX, "%s/%d.%d", sess, (int)getpid(), seq++);
+        if (n <= 0 || n >= PATH_MAX) return -ENAMETOOLONG;
+        if (mkdir(host_out, 0755) == 0) return 0;
+        if (errno != EEXIST) return -errno;
+    }
+    return -ENOSPC;
+}
+
+/* Remove this invocation's tmpfs directories. Called from the exit paths of the
+ * session's root process only -- the one whose pid names the directory -- so a
+ * sandbox that outlives a child keeps its mounts. */
+void tmpfs_session_cleanup(struct Machine *m) {
+    if ((u32)getpid() != (u32)(m->shm_session >> 32)) return;
+    char sess[PATH_MAX];
+    if (tmpfs_session_path(m, sess) < 0) return;
+    rm_rf(sess, 0);
+}
+
+/* Sweep session directories left behind by invocations that died without
+ * cleaning up (SIGKILL, emulator crash). A pid that has been reused by a live
+ * process is left alone: the cost is one stale tree, the alternative is
+ * deleting a running session's mounts. */
+void tmpfs_sweep_stale(void) {
+    const char *base = tmpfs_base();
+    if (!base) return;
+    DIR *d = opendir(base);
+    if (!d) return;
+    char pre[64];
+    int pl = snprintf(pre, sizeof pre, "arm64chroot-tmpfs.%u.", (unsigned)getuid());
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (pl <= 0 || strncmp(de->d_name, pre, (size_t)pl)) continue;
+        const char *ps = de->d_name + pl;
+        long pid = 0;
+        for (const char *p = ps; *p; p++) {
+            if (*p < '0' || *p > '9') { pid = 0; break; }
+            pid = pid * 10 + (*p - '0');
+        }
+        if (pid <= 0 || pid == (long)getpid()) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;   /* still alive */
+        char sub[PATH_MAX];
+        if (snprintf(sub, sizeof sub, "%s/%s", base, de->d_name) < (int)sizeof sub)
+            rm_rf(sub, 0);
+    }
+    closedir(d);
 }
 
 /* -bind forward map: longest guest-prefix match on the canonical guest path.
@@ -285,13 +463,20 @@ static int bind_match(struct Machine *m, const char *canon, char *host_out) {
     (void)m;
     int best = -1;
     size_t bestlen = 0;
+    unsigned bestseq = 0;
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     for (int i = 0; i < n; i++) {
         if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
         size_t gl = strlen(g_binds[i].guest);
         if (strncmp(canon, g_binds[i].guest, gl)) continue;
         if (canon[gl] != 0 && canon[gl] != '/') continue;   /* '/' boundary */
-        if (best < 0 || gl > bestlen) { best = i; bestlen = gl; }
+        /* Longest prefix wins; on a tie the *topmost* (latest) mount does, as
+         * on a real mount stack -- pivot_root's second step deliberately mounts
+         * the old root over the new one and then detaches it again. */
+        if (best < 0 || gl > bestlen ||
+            (gl == bestlen && g_binds[i].seq > bestseq)) {
+            best = i; bestlen = gl; bestseq = g_binds[i].seq;
+        }
     }
     if (best < 0) return 0;
     return join_host(g_binds[best].host, canon + bestlen, host_out) == 0;
@@ -302,13 +487,19 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
     (void)m;
     int best = -1;
     size_t bestlen = 0;
+    unsigned bestseq = 0;
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     for (int i = 0; i < n; i++) {
         if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
         size_t hl = strlen(g_binds[i].host);
         if (strncmp(hostpath, g_binds[i].host, hl)) continue;
         if (hostpath[hl] != 0 && hostpath[hl] != '/') continue;
-        if (best < 0 || hl > bestlen) { best = i; bestlen = hl; }
+        /* Topmost on a tie, as in bind_match: an fd held across a pivot_root
+         * names the mount now covering that host directory. */
+        if (best < 0 || hl > bestlen ||
+            (hl == bestlen && g_binds[i].seq > bestseq)) {
+            best = i; bestlen = hl; bestseq = g_binds[i].seq;
+        }
     }
     if (best < 0) return -1;
     if (guest_out) {
@@ -336,6 +527,7 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host, int r
         strcpy(g_binds[i].guest, guest_canon);
         strcpy(g_binds[i].host, host);
         g_binds[i].ro = ro;
+        g_binds[i].seq = __atomic_fetch_add(g_bindseq, 1, __ATOMIC_SEQ_CST) + 1;
         __atomic_store_n(&g_binds[i].active, 1, __ATOMIC_SEQ_CST);   /* publish */
         /* Raise the high-water bound so readers scan this slot (retry against a
          * concurrent raise; a bound already past i+1 leaves the loop at once). */
@@ -349,12 +541,15 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host, int r
     return -ENOMEM;
 }
 
-/* Find the topmost (highest-index) live bind mounted at exactly guest_canon. */
+/* Find the topmost live bind mounted at exactly guest_canon (highest stack
+ * position -- not slot index, which a freed-and-reused slot would scramble). */
 static int bind_top_at(const char *guest_canon) {
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST), best = -1;
+    unsigned bestseq = 0;
     for (int i = 0; i < n; i++) {
         if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
-        if (!strcmp(g_binds[i].guest, guest_canon)) best = i;   /* topmost wins */
+        if (strcmp(g_binds[i].guest, guest_canon)) continue;
+        if (best < 0 || g_binds[i].seq > bestseq) { best = i; bestseq = g_binds[i].seq; }
     }
     return best;
 }
@@ -377,6 +572,33 @@ int bind_remove(struct Machine *m, const char *guest_canon) {
         return -EINVAL;
     return 0;
 }
+
+/* Canonical guest path -> host path: a bind wins, then the special zones, then
+ * the rootfs prefix. A bind whose target lands back inside the rootfs is
+ * re-checked against the zones with its *rootfs-relative* path: after a
+ * pivot_root the guest reaches its old root through such a bind (bubblewrap
+ * looks at /oldroot/proc/self/fd/N), and /proc has to stay /proc wherever the
+ * tree it belongs to is mounted -- the rootfs's own /proc is an empty
+ * mountpoint directory, so nothing is shadowed by this. */
+static int canon_to_host(struct Machine *m, const char *canon, char *host_out) {
+    if (bind_match(m, canon, host_out)) {
+        size_t rl = strlen(m->rootfs);
+        if (rl && !strncmp(host_out, m->rootfs, rl) &&
+            (host_out[rl] == '/' || host_out[rl] == 0)) {
+            char rel[PATH_MAX], zone[PATH_MAX];
+            const char *tail = host_out[rl] ? host_out + rl : "/";
+            if (strlen(tail) < PATH_MAX) {
+                strcpy(rel, tail);
+                if (special_host_path(m, rel, zone)) strcpy(host_out, zone);
+            }
+        }
+        return 0;
+    }
+    if (special_host_path(m, canon, host_out)) return 0;
+    return to_host(m, canon, host_out);
+}
+
+
 
 /* Read side for consumers outside path.c (host_ro in sys_file.c, put_mounts in
  * sys_procfs.c). See machine.h. */
@@ -450,13 +672,17 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (last && (flags & PATH_NOFOLLOW_LAST)) continue;
         char tgt[PATH_MAX];
         ssize_t tn;
-        if (path_proc_magic(m, canon, tgt)) {   /* /proc self-link: guest target */
+        r = canon_to_host(m, canon, hostbuf);
+        if (r < 0) return r;
+        /* /proc self-link: splice in the guest target. The zone can be reached
+         * under another name -- a sandbox that bound or pivot_root'd the rootfs
+         * elsewhere asks for /newroot/proc/self/exe -- and the host path a
+         * passthrough resolves to *is* the canonical spelling, so check both;
+         * otherwise the walk follows the host link and leaks emulator state. */
+        if (path_proc_magic(m, canon, tgt) ||
+            (proc_zone_path(hostbuf) && path_proc_magic(m, hostbuf, tgt))) {
             tn = (ssize_t)strlen(tgt);
         } else {
-            if (!bind_match(m, canon, hostbuf)) {   /* -bind subtree, else rootfs */
-                r = to_host(m, canon, hostbuf);
-                if (r < 0) return r;
-            }
             tn = readlink(hostbuf, tgt, sizeof tgt - 1);
             if (tn < 0) continue;         /* not a symlink (or missing) */
             tgt[tn] = 0;
@@ -474,11 +700,8 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
     }
 
-    if (!bind_match(m, canon, host_out) &&
-        !special_host_path(m, canon, host_out)) {   /* -bind > /dev,/proc > rootfs */
-        int r = to_host(m, canon, host_out);
-        if (r < 0) return r;
-    }
+    int r = canon_to_host(m, canon, host_out);   /* -bind > /dev,/proc > rootfs */
+    if (r < 0) return r;
     if (canon_out) strcpy(canon_out, canon);
     return 0;
 }

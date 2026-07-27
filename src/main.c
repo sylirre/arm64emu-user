@@ -253,9 +253,9 @@ static void help(void) {
         {"A64_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
                         "32, clamped to 1-128."},
         {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these (or /dev/shm) holds "
+                        "the backing directories of emulated tmpfs mounts, plus "
                         "the --shared-proc fallback registry file and System V "
-                        "shm segment files, used only when memfd_create is "
-                        "unavailable."},
+                        "shm segment files when memfd_create is unavailable."},
     };
     static const struct help_def env_diag[] = {
         {"A64_JIT_STATS", "Rank instruction words still run via the exec_a64 "
@@ -709,6 +709,11 @@ int main(int argc, char **argv)
      * -shared-proc the registry is keyed by the rootfs so ps/top see the guest
      * processes of other emulator invocations of the same rootfs. */
     proctab_init(m->shared_proc ? m->rootfs : NULL);
+
+    /* Backing directories of emulated tmpfs mounts (path.c) are removed when
+     * this invocation ends; sweep what invocations killed before they could do
+     * that left behind, so they cannot pile up. */
+    tmpfs_sweep_stale();
 
     /* ptrace(2) tracer<->tracee link registry: same discipline — created before
      * the first fork so every guest process in the session maps it. */

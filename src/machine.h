@@ -40,13 +40,21 @@ typedef struct {
  * sentinel, so the path.c hot-path readers never take a lock — a lock a fork
  * could otherwise inherit held by a thread absent in the child. The shared
  * high-water count is a monotonic bound for the reader loops. Slot ~2*PATH_MAX;
- * 64 slots is ~0.5 MB of demand-zero shared memory for the whole session. */
+ * 64 slots is ~0.5 MB of demand-zero shared memory for the whole session.
+ * A process that fakes a mount namespace of its own (CLONE_NEWNS) moves to a
+ * private copy of the table (bindtab_unshare), which its fork children keep
+ * sharing -- that is the one exception to session-wide visibility. */
 #define BIND_MAX 64
 struct Bind {
     char guest[PATH_MAX];   /* canonical guest mount point, no trailing slash */
     char host[PATH_MAX];    /* realpath'd host source directory */
     int ro;                 /* read-only mount (atomic) */
     int active;             /* 0 free, -1 mid-claim, 1 live (atomic) */
+    unsigned seq;           /* mount order: the stack position. Slot indices
+                             * cannot serve -- a freed slot is reused by the
+                             * next mount -- and two mounts at one point must
+                             * resolve to the topmost, which is what makes
+                             * pivot_root's stack-then-detach idiom work. */
 };
 
 struct Machine {
@@ -67,11 +75,12 @@ struct Machine {
      * base for the guest view. Copied by fork, preserved across execve. */
     char chroot_base[PATH_MAX];
 
-    /* The bind-mount table (--bind + runtime mount(2)/umount2(2)) does NOT live
-     * in this per-process struct: it is a process-shared mmap owned by path.c
-     * (struct Bind, bindtab_init), so a mount performed by one guest process —
-     * e.g. the child that `mount --bind` execs — is visible to the whole
-     * session, as a single shared mount namespace would be. See struct Bind
+    /* The bind-mount table (--bind + runtime mount(2)/umount2(2)/pivot_root(2))
+     * does NOT live in this per-process struct: it is a process-shared mmap
+     * owned by path.c (struct Bind, bindtab_init), so a mount performed by one
+     * guest process — e.g. the child that `mount --bind` execs — is visible to
+     * the whole session, as a single shared mount namespace would be; a faked
+     * CLONE_NEWNS gives that process a private copy instead. See struct Bind
      * and the bind_* API below. */
 
     /* Exec-time guest argv, NUL-joined — the /proc/self/cmdline content
@@ -144,6 +153,39 @@ struct Machine {
      * One-way latch, fork-inherited with the rest of Machine, kept across
      * execve exactly like the kernel's. */
     u8 no_new_privs;
+
+    /* Faked user namespace: a guest that asked for one (clone/unshare with
+     * CLONE_NEWUSER) got a plain process, but it now expects to write its id
+     * maps once and read back what it wrote -- bubblewrap dies on the spot if
+     * the write is refused, which is what the host says about the initial
+     * namespace's fixed map. The maps are recorded and reported (sys_procfs.c)
+     * but change no id the guest sees; --fake-id is how a guest becomes root
+     * here. Inherited by fork, like the namespace fiction itself. */
+    u8 fake_userns;
+    u8 uid_map_set, gid_map_set;   /* written once already (kernel's rule) */
+    u8 setgroups_set, setgroups_deny;
+#define IDMAP_MAX 256
+    char uid_map[IDMAP_MAX];       /* kernel-formatted text, "" until written */
+    char gid_map[IDMAP_MAX];
+
+    /* signalfd(2) descriptors held by this process. A host signalfd cannot
+     * serve the guest: the emulator catches signals itself, so none is ever
+     * left pending host-side and the fd would stay silent forever. Each guest
+     * signalfd is instead a host eventfd used purely as a readiness flag --
+     * armed while the capture ring holds a signal this fd's mask covers, so
+     * poll/select/epoll need no special case -- with read(2) intercepted and
+     * answered from the ring (sys_sig.c). Copied by fork like the fds are; a
+     * parent and child then share one eventfd but have separate rings, so each
+     * can briefly see the other's readiness -- a spurious poll wake followed by
+     * EAGAIN, which the next sync corrects. */
+#define SFD_MAX_FDS 8
+    struct { int fd; u64 mask; u64 ino; u8 armed; } sfd_fds[SFD_MAX_FDS];
+    int sfd_fds_count;
+    u64 sfd_mask;             /* union of the masks above: sig_host_update
+                               * forces the capture handler on for these, or a
+                               * SIG_DFL signal would never be queued at all
+                               * (SIGCHLD, the usual signalfd subject, is
+                               * default-ignore and would just vanish) */
 
     /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
@@ -284,6 +326,8 @@ int sig_pending_deliverable(struct Machine *m);
  * info_va when non-zero. timeout_ns < 0 = forever. Returns the signal number
  * or -EAGAIN (timeout) / -EINTR (another deliverable signal pends). */
 s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns);
+/* signalfd's view of the same ring (declared with the rest of the signalfd
+ * plumbing in sys.h, which has the guest struct): sig_fd_pending / sig_fd_take. */
 /* Arm the host carrier signal for guest signal 32 or 33 (the guest libc's
  * internal SIGTIMER/SIGCANCEL, unraisable as host numbers -- the host libc
  * owns those) and return the host signal to raise instead; the capture
@@ -329,6 +373,16 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
  * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
 
+/* A namespace-absolute guest path as the guest sees it: subtract the chroot /
+ * pivot_root base. out >= PATH_MAX. */
+void path_chroot_view(const struct Machine *m, const char *canon, char *out);
+
+/* Does this host path lie in the /proc zone? A path that resolves there is
+ * also the canonical guest spelling of the same file, which is how the
+ * synthesized /proc files and magic links keep working for a guest that
+ * reaches /proc under another name (a bound or pivot_root'd rootfs). */
+int proc_zone_path(const char *host);
+
 /* Strip the rootfs prefix from a host path in place (guest view of e.g. a
  * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path);
@@ -364,6 +418,21 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
  * table. On mmap failure it degrades to a private per-process table (runtime
  * mounts then stay process-local, but nothing crashes). */
 void bindtab_init(void);
+
+/* Move this process onto a private copy of the table (a faked CLONE_NEWNS):
+ * its own fork children keep sharing the copy, the rest of the session keeps
+ * the original. Degrades to staying shared if the mapping cannot be made. */
+void bindtab_unshare(void);
+
+/* tmpfs emulation (path.c): a mount(2) of type tmpfs is backed by a fresh
+ * empty host directory bound at the mountpoint. tmpfs_dir_new creates one
+ * (host_out >= PATH_MAX) and returns 0 or -errno; tmpfs_session_cleanup drops
+ * this invocation's directories and is a no-op anywhere but the session's root
+ * process; tmpfs_sweep_stale (main, at startup) removes what invocations that
+ * died without cleaning up left behind. */
+int  tmpfs_dir_new(struct Machine *m, char *host_out);
+void tmpfs_session_cleanup(struct Machine *m);
+void tmpfs_sweep_stale(void);
 
 /* Runtime bind-table mutation, backing the guest mount(2)/umount2(2) handlers.
  * Arguments are already canonical (guest_canon) / resolved (host). Lock-free,

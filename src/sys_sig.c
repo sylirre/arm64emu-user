@@ -4,8 +4,11 @@
  * the task and mirrored onto the host coarsely: SIG_IGN/SIG_DFL pass through
  * so process-fatal semantics (pipelines, Ctrl-C on the group) behave; guest
  * handler invocation arrives with the sigframe machinery in M5. */
+#include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -208,6 +211,168 @@ SYSDEF(tgkill) {
         return 0;
     }
     return syscall(SYS_tgkill, (pid_t)tgid, (pid_t)tid, (int)a2) < 0 ? host_err() : 0;
+}
+
+/* ---- signalfd(2) ----
+ *
+ * The host's own signalfd is useless to a guest here: a signalfd only ever
+ * reports signals left *pending* on the host, and the emulator catches every
+ * signal it cares about into its capture ring (signal.c) precisely so it can
+ * decide delivery itself -- nothing stays pending, so a host signalfd would
+ * never become readable. The fd handed to the guest is therefore an eventfd
+ * carrying nothing but readiness: it is armed (counter 1) exactly while the
+ * ring holds a signal the fd's mask covers, which is what makes poll/select/
+ * epoll work with no special case anywhere. read(2) on it is intercepted and
+ * answered from the ring.
+ *
+ * The ring is per-thread, the fd is per-process: a signal queued on thread A
+ * arms the fd, but only A's own read can consume it. Every real signalfd user
+ * blocks the signal and reads it on one thread, which is exactly this case. */
+
+static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Slot of a live signalfd, or -1. A slot whose fd number was reused behind our
+ * back (dup2 onto it, execve's CLOEXEC sweep) is detected by the recorded
+ * eventfd inode and dropped, so an innocent fd is never intercepted. */
+static int sfd_slot(struct Machine *m, int fd) {
+    for (int i = 0; i < m->sfd_fds_count; i++) {
+        if (m->sfd_fds[i].fd != fd) continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->sfd_fds[i].ino) {
+            m->sfd_fds[i] = m->sfd_fds[--m->sfd_fds_count];
+            return -1;
+        }
+        return i;
+    }
+    return -1;
+}
+
+/* Recompute the union of the live masks and re-mirror every disposition it
+ * newly covers: a signal nobody handles must still be caught and queued for a
+ * signalfd to see it (sig_host_update reads m->sfd_mask). */
+static void sfd_remask(struct Machine *m) {
+    u64 u = 0;
+    for (int i = 0; i < m->sfd_fds_count; i++) u |= m->sfd_fds[i].mask;
+    u64 added = u & ~m->sfd_mask;
+    u64 dropped = m->sfd_mask & ~u;
+    m->sfd_mask = u;
+    for (int s = 1; s <= 64; s++)
+        if ((added | dropped) & (1ULL << (s - 1))) sig_host_update(m, s);
+}
+
+int sigfd_tracked(struct Machine *m, int fd) {
+    if (!m->sfd_fds_count || fd < 0) return 0;   /* unlocked fast path */
+    pthread_mutex_lock(&sfd_lock);
+    int r = sfd_slot(m, fd) >= 0;
+    pthread_mutex_unlock(&sfd_lock);
+    return r;
+}
+
+void sigfd_unmark_fd(struct Machine *m, int fd) {
+    if (!m->sfd_fds_count) return;
+    pthread_mutex_lock(&sfd_lock);
+    for (int i = 0; i < m->sfd_fds_count; i++)
+        if (m->sfd_fds[i].fd == fd) {
+            m->sfd_fds[i] = m->sfd_fds[--m->sfd_fds_count];
+            sfd_remask(m);
+            break;
+        }
+    pthread_mutex_unlock(&sfd_lock);
+}
+
+/* Re-level every signalfd against the ring: arm the eventfd of one whose mask
+ * now matches something queued, disarm one whose signals have been consumed.
+ * The counter is only ever 0 or 1, so the writes and drains cannot block. */
+void sigfd_sync(struct Machine *m) {
+    if (!m->sfd_fds_count) return;   /* unlocked fast path */
+    pthread_mutex_lock(&sfd_lock);
+    for (int i = 0; i < m->sfd_fds_count; i++) {
+        int want = sig_fd_pending(m->sfd_fds[i].mask);
+        u64 one = 1;
+        if (want && !m->sfd_fds[i].armed) {
+            if (write(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 1;
+        } else if (!want && m->sfd_fds[i].armed) {
+            if (read(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 0;
+        }
+    }
+    pthread_mutex_unlock(&sfd_lock);
+}
+
+/* read(2) on a signalfd: fill `out` with as many signalfd_siginfo records as
+ * fit and are queued. Blocks (in short naps, like rt_sigtimedwait) unless the
+ * fd is non-blocking, and gives up with EINTR when another signal becomes
+ * deliverable, so the run loop can run its handler. */
+s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
+    struct Machine *m = c->m;
+    if (len < sizeof(GSignalfdSiginfo)) return -EINVAL;
+    size_t want = len / sizeof(GSignalfdSiginfo);
+    int fl = fcntl(fd, F_GETFL);
+    int nonblock = fl >= 0 && (fl & O_NONBLOCK);
+    for (;;) {
+        pthread_mutex_lock(&sfd_lock);
+        int i = sfd_slot(m, fd);
+        u64 mask = i >= 0 ? m->sfd_fds[i].mask : 0;
+        pthread_mutex_unlock(&sfd_lock);
+        if (i < 0) return -EBADF;   /* raced with a close: no longer ours */
+        size_t n = 0;
+        while (n < want &&
+               sig_fd_take(mask, (GSignalfdSiginfo *)(out + n * sizeof(GSignalfdSiginfo))))
+            n++;
+        if (n) {
+            sigfd_sync(m);   /* re-level: the ring may have run dry */
+            return (s64)(n * sizeof(GSignalfdSiginfo));
+        }
+        sigfd_sync(m);
+        if (nonblock) return -EAGAIN;
+        if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
+        struct timespec nap = { 0, 2 * 1000 * 1000 };
+        nanosleep(&nap, NULL);
+    }
+}
+
+SYSDEF(signalfd4) {
+    /* (fd, mask, sigsetsize, flags): fd < 0 creates one, fd >= 0 replaces the
+     * mask of an existing signalfd. SIGKILL/SIGSTOP are silently dropped from
+     * the mask, as the kernel does. */
+    (void)a4; (void)a5;
+    struct Machine *m = c->m;
+    if (a2 != 8) return (u64)(s64)-EINVAL;
+    if (a3 & ~(u64)(G_SFD_CLOEXEC | G_SFD_NONBLOCK)) return (u64)(s64)-EINVAL;
+    u64 mask;
+    if (copy_from_guest(c, &mask, a1, 8) < 0) return (u64)(s64)-EFAULT;
+    mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    int fd = (int)(s32)a0;
+    if (fd >= 0) {
+        pthread_mutex_lock(&sfd_lock);
+        int i = sfd_slot(m, fd);
+        if (i >= 0) { m->sfd_fds[i].mask = mask; sfd_remask(m); }
+        pthread_mutex_unlock(&sfd_lock);
+        if (i < 0) return (u64)(s64)-EINVAL;
+        sigfd_sync(m);
+        return (u64)(s32)fd;
+    }
+    int eflags = EFD_CLOEXEC * 0;
+    if (a3 & G_SFD_CLOEXEC)  eflags |= EFD_CLOEXEC;
+    if (a3 & G_SFD_NONBLOCK) eflags |= EFD_NONBLOCK;
+    int nfd = eventfd(0, eflags);
+    if (nfd < 0) return host_err();
+    struct stat st;
+    if (fstat(nfd, &st) != 0) { close(nfd); return host_err(); }
+    pthread_mutex_lock(&sfd_lock);
+    if (m->sfd_fds_count >= SFD_MAX_FDS) {
+        pthread_mutex_unlock(&sfd_lock);
+        close(nfd);
+        return (u64)(s64)-EMFILE;   /* table full: better than a silent lie */
+    }
+    m->sfd_fds[m->sfd_fds_count].fd = nfd;
+    m->sfd_fds[m->sfd_fds_count].mask = mask;
+    m->sfd_fds[m->sfd_fds_count].armed = 0;
+    m->sfd_fds[m->sfd_fds_count].ino = (u64)st.st_ino;
+    m->sfd_fds_count++;
+    sfd_remask(m);
+    pthread_mutex_unlock(&sfd_lock);
+    sigfd_sync(m);   /* a matching signal may already be queued */
+    return (u64)(s32)nfd;
 }
 
 SYSDEF(rt_sigqueueinfo) {

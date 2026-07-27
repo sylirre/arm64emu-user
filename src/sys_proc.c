@@ -50,6 +50,7 @@ SYSDEF(exit) {
     ptrace_report_exit_group(((int)a0 & 0xff) << 8);
     shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
     sembroker_exit(c->m);       /* apply this process's SEM_UNDO adjustments */
+    tmpfs_session_cleanup(c->m);/* session root only: drop emulated tmpfs trees */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -66,6 +67,7 @@ SYSDEF(exit_group) {
     ptrace_report_exit_group(((int)a0 & 0xff) << 8);
     shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
     sembroker_exit(c->m);       /* apply this process's SEM_UNDO adjustments */
+    tmpfs_session_cleanup(c->m);/* session root only: drop emulated tmpfs trees */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
@@ -149,6 +151,8 @@ SYSDEF(uname) {
 /* Namespace flags: unsupported in a user-mode chroot, so they are ignored
  * rather than failed (sandbox helpers only check the return value). Only
  * CLONE_NEWNET has a consequence — see m->fake_netns. */
+#define G_CLONE_NEWNS   0x00020000
+#define G_CLONE_NEWUSER 0x10000000
 #define G_CLONE_NEWNET  0x40000000
 
 /* A spawned guest thread: its own CPU, sharing the Machine (address space,
@@ -322,7 +326,20 @@ SYSDEF(clone) {
          * remember that, so rtnetlink's refusals become acks. The inherited
          * netlink fd tables come along with the fork; a reply pending on one
          * belongs to whoever sent the request, so it does not carry over. */
+        /* A mount namespace of its own means its mounts -- and the re-rooting
+         * bubblewrap performs with them -- must not reach the rest of the
+         * session, so the child moves onto a private copy of the bind table. */
+        if (flags & G_CLONE_NEWNS) bindtab_unshare();
         if (flags & G_CLONE_NEWNET) m->fake_netns = 1;
+        /* Same for CLONE_NEWUSER: the child now expects to write the id maps
+         * of "its" namespace once (sys_procfs.c), which the host would refuse
+         * for the initial one. A fresh namespace starts with empty maps. */
+        if (flags & G_CLONE_NEWUSER) {
+            m->fake_userns = 1;
+            m->uid_map_set = m->gid_map_set = m->setgroups_set = 0;
+            m->setgroups_deny = 0;
+            m->uid_map[0] = m->gid_map[0] = 0;
+        }
         m->nl_ack_pending = 0;
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
@@ -831,7 +848,14 @@ SYSDEF(getsid)  { pid_t r = getsid((pid_t)(s32)a0); return r < 0 ? host_err() : 
  * remember it for the rtnetlink ack emulation (sys_netlink.c). */
 SYSDEF(unshare) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (a0 & G_CLONE_NEWNS) bindtab_unshare();
     if (a0 & G_CLONE_NEWNET) c->m->fake_netns = 1;
+    if (a0 & G_CLONE_NEWUSER) {
+        c->m->fake_userns = 1;
+        c->m->uid_map_set = c->m->gid_map_set = c->m->setgroups_set = 0;
+        c->m->setgroups_deny = 0;
+        c->m->uid_map[0] = c->m->gid_map[0] = 0;
+    }
     return 0;
 }
 SYSDEF(setns) {

@@ -42,19 +42,19 @@ src/
     backend_a64.c backend_x86_64.c   Register-allocating single-pass emitters
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c                             Rootfs containment resolver, process-shared bind table (mount/umount), /proc & /dev special cases
+  path.c                             Rootfs containment resolver, bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
   strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads)
-  sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions)
+  sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions, signalfd over the capture ring)
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)
   sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style): AF_UNIX fallback when the host denies netlink (probed incl. a write, per-message-type LSM policies), plus rtnetlink-refusal-to-ack rewriting for a guest whose CLONE_NEWNET was faked
   sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
-  sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, ...)
+  sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, writable uid_map/gid_map/setgroups of a faked user namespace, ...)
   sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)
   proctab.c                          Shared-memory guest-PID registry (cross-process ps/top view) + unified IPC broker daemon backing System V IPC: owns shm memfd/file backings (handed out over SCM_RIGHTS) and all semaphore/message-queue state, parks blocking semop/msgsnd/msgrcv waiters, applies SEM_UNDO at process death, self-cleans on idle
   ptracetab.c ptrace.h               Cross-process ptrace(2): shared tracer<->tracee link registry + futex mailbox (tracee services PEEK/POKE/GETREGSET/CONT about itself while parked at a stop)
@@ -156,6 +156,6 @@ Behavior fallbacks:
 Tuning:
 
 * `A64_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
-* `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the --shared-proc *fallback* registry file and the System V shm segment files, used only when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux).
+* `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the backing directories of emulated tmpfs mounts (removed when the session ends; a session killed before it could clean up is swept by the next one), plus the --shared-proc *fallback* registry file and the System V shm segment files when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux).
 
 Note: `src/core/cpu.c` / `cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/AEPROF (hot-PC profiler), g_ring/AERING (recent-step ring buffer), g_tpc/AETPC (dump state at a target PC), and g_cov/AECOV (coverage-divergence finder) — carried over from the [ARM64EMU_System](https://github.com/sylirre/arm64emu-system) core. This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.

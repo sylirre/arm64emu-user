@@ -52,6 +52,8 @@ enum {
     AT_WHENCE,     /* lseek whence */
     AT_SIGHOW,     /* rt_sigprocmask how */
     AT_CLONEFLAGS, /* clone/unshare flags (CLONE_*) */
+    AT_SIGMASK,    /* pointer to a 64-bit sigset: [SIGUSR1 SIGCHLD] */
+    AT_SFDFLAGS,   /* signalfd4 flags (SFD_*) */
     AT_SODOMAIN,   /* socket domain (AF_*) */
     AT_SOTYPE,     /* socket type (SOCK_* base + flag bits) */
     /* System V IPC */
@@ -130,6 +132,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_pipe2,     { AT_PTR, AT_OFLAGS }, 0 },
     { G_NR_mount,     { AT_STR, AT_STR, AT_STR, AT_MSFLAGS, AT_PTR }, 0 },
     { G_NR_umount2,   { AT_STR, AT_UMOUNTFLAGS }, 0 },
+    { G_NR_pivot_root,{ AT_STR, AT_STR }, 0 },
     { G_NR_fallocate, { AT_FD, AT_HEX, AT_INT, AT_INT }, 0 },
     { G_NR_preadv,    { AT_FD, AT_PTR, AT_INT, AT_INT }, 0 },
     { G_NR_pwritev,   { AT_FD, AT_PTR, AT_INT, AT_INT }, 0 },
@@ -258,7 +261,8 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_get_robust_list, { AT_INT, AT_PTR, AT_PTR }, 0 },
     /* signals */
     { G_NR_rt_sigaction,   { AT_SIG, AT_PTR, AT_PTR, AT_UINT }, 0 },
-    { G_NR_rt_sigprocmask, { AT_SIGHOW, AT_PTR, AT_PTR, AT_UINT }, 0 },
+    { G_NR_rt_sigprocmask, { AT_SIGHOW, AT_SIGMASK, AT_PTR, AT_UINT }, 0 },
+    { G_NR_signalfd4, { AT_FD, AT_SIGMASK, AT_UINT, AT_SFDFLAGS }, 0 },
     { G_NR_rt_sigreturn,   { AT_NONE }, 0 },
     { G_NR_rt_sigpending,  { AT_PTR, AT_UINT }, 0 },
     { G_NR_rt_sigsuspend,  { AT_PTR, AT_UINT }, 0 },
@@ -432,6 +436,9 @@ static const struct enumname sig_tab[] = {
     { 25, "SIGXFSZ" }, { 26, "SIGVTALRM" }, { 27, "SIGPROF" }, { 28, "SIGWINCH" },
     { 29, "SIGIO" }, { 30, "SIGPWR" }, { 31, "SIGSYS" }, { 0, NULL }
 };
+static const struct flagname sfd_tab[] = {
+    { 0004000, "SFD_NONBLOCK" }, { 02000000, "SFD_CLOEXEC" }, { 0, NULL }
+};
 static const struct enumname whence_tab[] = {
     { 0, "SEEK_SET" }, { 1, "SEEK_CUR" }, { 2, "SEEK_END" },
     { 3, "SEEK_DATA" }, { 4, "SEEK_HOLE" }, { 0, NULL }
@@ -580,6 +587,29 @@ static void fmt_enum(SB *s, u64 v, const struct enumname *tab) {
         if (tab->val == v) { sb_puts(s, tab->name); return; }
     sb_printf(s, "%llu", (unsigned long long)v);
 }
+/* A sigset argument, strace-style: "[USR1 CHLD]" (names without the SIG
+ * prefix, as strace prints them), "~[...]" left to the caller's context. */
+static void fmt_sigmask(SB *s, CPU *c, u64 va) {
+    if (va == 0) { sb_puts(s, "NULL"); return; }
+    u64 set;
+    if (copy_from_guest(c, &set, va, 8) < 0) {
+        sb_printf(s, "0x%llx", (unsigned long long)va);
+        return;
+    }
+    sb_puts(s, "[");
+    int first = 1;
+    for (int i = 1; i <= 64; i++) {
+        if (!(set & (1ULL << (i - 1)))) continue;
+        const char *nm = NULL;
+        for (const struct enumname *t = sig_tab; t->name; t++)
+            if (t->val == (u64)i) { nm = t->name + 3; break; }   /* skip "SIG" */
+        if (nm) sb_printf(s, "%s%s", first ? "" : " ", nm);
+        else    sb_printf(s, "%s%d", first ? "" : " ", i);
+        first = 0;
+    }
+    sb_puts(s, "]");
+}
+
 static void fmt_sotype(SB *s, u64 v) {
     fmt_enum(s, v & 0xff, socktype_tab);
     int first = 0;
@@ -790,6 +820,8 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_WHENCE:      fmt_enum(s, v, whence_tab); break;
     case AT_SIGHOW:      fmt_enum(s, v, sighow_tab); break;
     case AT_CLONEFLAGS:  fmt_flags(s, v, clone_tab, "0"); break;
+    case AT_SIGMASK:     fmt_sigmask(s, c, v); break;
+    case AT_SFDFLAGS:    fmt_flags(s, v, sfd_tab, "0"); break;
     case AT_SODOMAIN:    fmt_enum(s, v, af_tab); break;
     case AT_SOTYPE:      fmt_sotype(s, v); break;
     case AT_IPCKEY:

@@ -24,7 +24,7 @@ SYSDEF(renameat2); SYSDEF(symlinkat); SYSDEF(linkat); SYSDEF(ftruncate);
 SYSDEF(fchmod); SYSDEF(fchmodat); SYSDEF(fchownat); SYSDEF(fchown);
 SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
 SYSDEF(sync); SYSDEF(syncfs); SYSDEF(readahead);
-SYSDEF(mount); SYSDEF(umount2);
+SYSDEF(mount); SYSDEF(pivot_root); SYSDEF(umount2);
 SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
@@ -70,7 +70,7 @@ SYSDEF(process_vm_readv); SYSDEF(process_vm_writev);
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
 SYSDEF(sigaltstack); SYSDEF(kill); SYSDEF(tkill); SYSDEF(tgkill);
 SYSDEF(rt_sigpending); SYSDEF(rt_sigsuspend); SYSDEF(rt_sigtimedwait);
-SYSDEF(rt_sigqueueinfo);
+SYSDEF(rt_sigqueueinfo); SYSDEF(signalfd4);
 
 /* sys_time.c */
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
@@ -126,6 +126,7 @@ static const struct {
     { G_NR_fchdir, sys_fchdir, "fchdir" },
     { G_NR_chroot, sys_chroot, "chroot" },
     { G_NR_mount, sys_mount, "mount" },
+    { G_NR_pivot_root, sys_pivot_root, "pivot_root" },
     { G_NR_umount2, sys_umount2, "umount2" },
     { G_NR_fchmod, sys_fchmod, "fchmod" },
     { G_NR_fchmodat, sys_fchmodat, "fchmodat" },
@@ -277,6 +278,7 @@ static const struct {
     { G_NR_tkill, sys_tkill, "tkill" },
     { G_NR_tgkill, sys_tgkill, "tgkill" },
     { G_NR_rt_sigqueueinfo, sys_rt_sigqueueinfo, "rt_sigqueueinfo" },
+    { G_NR_signalfd4, sys_signalfd4, "signalfd4" },
 
     { G_NR_clock_gettime, sys_clock_gettime, "clock_gettime" },
     { G_NR_clock_getres, sys_clock_getres, "clock_getres" },
@@ -414,7 +416,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
     { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
     { G_NR_settimeofday, "settimeofday" },
-    { G_NR_signalfd4, "signalfd4" }, { G_NR_statmount, "statmount" },
+    { G_NR_statmount, "statmount" },
     { G_NR_swapoff, "swapoff" }, { G_NR_swapon, "swapon" }, { G_NR_tee, "tee" },
     { G_NR_userfaultfd, "userfaultfd" },
     { G_NR_vhangup, "vhangup" }, { G_NR_vmsplice, "vmsplice" },

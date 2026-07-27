@@ -117,17 +117,39 @@ stays reachable by name but unlisted.
 time, not just via `--bind`: `mount(src, dst, …, MS_BIND, …)` resolves `src` to
 its host path and `dst` to a canonical guest mount point and registers a new
 bind; `MS_REMOUNT` toggles a bind's `:ro`; `umount2(dst)` removes it (`sys_mount`
-/ `sys_umount2`). Only bind mounts are emulated — propagation-only changes
-(`MS_PRIVATE`/`MS_SHARED`/…) are accepted as no-ops, `MS_MOVE` returns `EINVAL`,
-and any real filesystem type returns `EPERM`, as does every call unless the guest
-is fake-root (`--fake-id`, `euid 0`), matching the kernel's `CAP_SYS_ADMIN`
-requirement (the `--bind` CLI stays the unprivileged startup path). The bind
-table is **process-shared** — a `MAP_SHARED` region created before the first fork
-(`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by the
-`mount` command, which runs as a *child* process, is visible to the parent shell
-and the whole session, as a single shared mount namespace would be; the lock-free
-slot claim (an `active` CAS mirroring `m->gtid`) keeps the hot-path readers
-lock-free and fork-safe. The model has no real mounts, so two caveats stand: a
+/ `sys_umount2`). Propagation-only changes (`MS_PRIVATE`/`MS_SHARED`/…) are accepted as no-ops and
+`MS_MOVE` returns `EINVAL`. Three filesystem types are emulated on top of the
+same table, because no sandbox helper gets off the ground without them:
+
+- **`tmpfs`** (and `ramfs`) binds a *fresh, empty host directory* at the
+  mountpoint. That gives the two properties a caller actually depends on — an
+  empty writable tree that hides whatever the mountpoint held, revealed again by
+  `umount` — without any privilege. A `mode=` option is honored. The backing
+  directories live under one per-invocation session directory (first writable of
+  `/dev/shm`, `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/data/local/tmp`, `/tmp`) which the
+  session's root process removes when it exits; a session killed before it could
+  clean up is swept by the next invocation that finds its root pid gone.
+- **`proc`** and **`devpts`** bind the corresponding passthrough zone at the
+  requested point, since the guest's `/proc` and `/dev/pts` already exist — the
+  synthesized `/proc` files and magic links keep working under the new name
+  (see *Reaching `/proc` under another name* below).
+
+Any other real filesystem type returns `EPERM`, as does every call unless the
+guest is fake-root (`--fake-id`, `euid 0`), matching the kernel's `CAP_SYS_ADMIN`
+requirement (the `--bind` CLI stays the unprivileged startup path).
+
+The bind table is **process-shared** — a `MAP_SHARED` region created before the
+first fork (`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by
+the `mount` command, which runs as a *child* process, is visible to the parent
+shell and the whole session, as a single shared mount namespace would be; the
+lock-free slot claim (an `active` CAS mirroring `m->gtid`) keeps the hot-path
+readers lock-free and fork-safe. A guest that asks for a **mount namespace of
+its own** (`clone`/`unshare` with `CLONE_NEWNS`, both faked) moves onto a private
+copy of the table (`bindtab_unshare`) that its own fork children keep sharing, so
+a sandbox's mounts and re-rooting stay invisible to the rest of the session.
+Each mount records its position in a session-wide stack, so two mounts at one
+point resolve to the topmost and `umount` uncovers the one underneath — which is
+what makes `pivot_root`'s idiom below work. The model has no real mounts, so two caveats stand: a
 bind mountpoint is not protected from `rmdir`, and reverse mapping (`getcwd`,
 `/proc/self/fd/N`) of a source that shares a host inode with another path prefers
 the bind view — an inherent limit of prefix-based reverse mapping, already true
@@ -150,6 +172,51 @@ auto-provided inside a chroot — the guest bind-mounts them into the new root
 free: `chroot` resolves its argument through the current root, so a chroot inside
 a chroot lands at the combined namespace path (`bind`/`chroot`/nested-`chroot`
 are all exercised together in the test suite).
+
+**`pivot_root(2)`** (`sys_pivot_root`) re-roots the guest the same way `chroot`
+does — `m->chroot_base` becomes the new root — and makes the old root reachable
+at `put_old` by binding it there, resolved before the switch. `put_old` must be
+at or under `new_root`, as the kernel requires; both must be directories; and
+like `mount`/`chroot` it is gated on fake-root. That is all "the root moved"
+means to a guest whose every path we resolve.
+
+The idiom that matters is bubblewrap's second call, `chdir(newroot);
+pivot_root(".", ".")`: the old root is deliberately stacked *on* the new one and
+detached right after with `umount2(".", MNT_DETACH)`, having `fchdir`'d back
+through a root fd taken before the pivot. It works here because the mount stack
+above is ordered: the later bind wins the tie, an fd's reverse mapping follows
+the same order (so the old fd names the mount now covering that directory), and
+removing the top uncovers the sandbox root underneath.
+
+**Reaching `/proc` under another name.** The special zones match the
+*namespace-absolute* path, so a rootfs that has been bound or pivoted elsewhere
+would leave its `/proc` behind — a sandbox asks for `/newroot/proc/self/maps`,
+and bubblewrap reads `/oldroot/proc/self/fd/N` to canonicalize its mounts. A bind
+whose target lands back inside the rootfs is therefore re-checked against the
+zones with its *rootfs-relative* path (`canon_to_host`), and the host path such a
+lookup resolves to doubles as the canonical `/proc/...` spelling, so the
+synthesized files and the magic `exe`/`cwd`/`root` links are found for both
+names (`proc_zone_path`). Nothing is shadowed by this: the rootfs's own `/proc`
+is an empty mountpoint directory.
+
+**The guest's own view.** Anything reported *back* to a guest that has re-rooted
+is expressed in its view rather than namespace-absolutely (`path_chroot_view`):
+`getcwd`, `readlink` targets (magic links and `/proc/self/fd/N` alike),
+`/proc/self/maps` pathnames, and the synthesized mount table — where mounts
+outside the current root are dropped, as the kernel drops what is unreachable in
+the namespace. A sandbox looks its own mounts up in `/proc/self/mountinfo` by
+the path it just got from `readlink`, so the two have to agree.
+
+**Sandbox helpers.** Together with the faked namespaces (`unshare`/`setns`
+succeed, `clone` strips `CLONE_NEW*`), the writable id maps of a faked user
+namespace, `signalfd`, and the rtnetlink ack for a faked network namespace, this
+is enough to run **bubblewrap** unmodified:
+`bwrap --unshare-all --bind / / --proc /proc --dev /dev CMD` works, including its
+`--tmpfs`, `--ro-bind` and pid-namespace monitor. It is emulation, not
+containment: the sandbox is a rearranged view of the same rootfs, enforced only
+because the emulator mediates every syscall, and a faked `CLONE_NEWPID` leaves
+the guest's pids alone. `tests/fixtures/sandbox_probe.c` pins the whole stack
+down (qemu cannot be the oracle: the real kernel refuses all of it unprivileged).
 
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
 contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
@@ -234,9 +301,23 @@ go wrong:
 Limits: one pending note per process (matching upstream), so a guest that
 pipelines two reconfiguring requests before reading either gets the ack only
 for whichever reply it reads first — the sequential request/ack pattern every
-real caller uses is unaffected. Faking `unshare` also means a guest that
-unshares a *mount* namespace still shares the process-wide bind table, so its
-later `mount --bind` calls stay visible to relatives.
+real caller uses is unaffected.
+
+The other faked namespaces are answered in the same spirit — accept the request,
+then make the consequences the caller depends on true:
+
+- `CLONE_NEWNS` gives the process a private copy of the bind table, so its
+  mounts and re-rooting stay its own (see the mount section above).
+- `CLONE_NEWUSER` makes `/proc/self/uid_map`, `gid_map` and `setgroups`
+  writable for that process: the host files describe the *initial* namespace,
+  whose map is fixed, so a real write is refused and bubblewrap dies with
+  "setting up uid map". They are synthesized instead (`sys_procfs.c`), take one
+  write each as the kernel's one-shot rule requires (a second returns `EPERM`, a
+  malformed one `EINVAL`, `setgroups` after `gid_map` `EPERM`), and read back in
+  the kernel's `%10u %10u %10u` form. The maps are *reported*, not applied: they
+  change no id the guest sees — `--fake-id` is how a guest becomes root here.
+- `CLONE_NEWPID` and the rest change nothing beyond the return value: the
+  guest's pids stay the host's.
 
 **Special zones** are checked on the canonical guest path before prefixing:
 

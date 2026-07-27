@@ -61,6 +61,23 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
 void procfs_pre_read(CPU *c, int fd, s64 off);
 /* Drop refresh tracking for a closing fd. */
 void procfs_unmark_fd(struct Machine *m, int fd);
+/* A write to a synthesized /proc file that accepts one (the id maps of a faked
+ * user namespace). Returns 1 with *ret set to the guest return value when it
+ * consumed the write, 0 for an ordinary fd. */
+int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
+                     s64 *ret);
+
+/* sys_sig.c: signalfd(2). The fd is a host eventfd carrying only readiness;
+ * the signals themselves come from the emulator's capture ring, so read(2) on
+ * one is answered here instead of by the host. sigfd_sync re-levels every
+ * signalfd of this process against the ring and must run before any host sleep
+ * that can wait on one (poll/ppoll/select/epoll). */
+int sig_fd_pending(u64 mask);                       /* signal.c: ring lookup */
+int sig_fd_take(u64 mask, GSignalfdSiginfo *out);   /* signal.c: ring pop */
+int sigfd_tracked(struct Machine *m, int fd);
+s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
+void sigfd_sync(struct Machine *m);
+void sigfd_unmark_fd(struct Machine *m, int fd);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 

@@ -444,9 +444,14 @@ SYSDEF(openat) {
     if (((gflags & O_ACCMODE) != O_RDONLY || (gflags & (O_CREAT | O_TRUNC))) &&
         host_ro(c->m, host))
         return (u64)(s64)-EROFS;
-    if (!strncmp(canon, "/proc/", 6)) {   /* maps/cmdline/mounts: guest view */
+    /* maps/cmdline/mounts: the guest view. A sandbox reaches /proc under
+     * another name (/newroot/proc/...), and the host path such a lookup
+     * resolves to is the canonical spelling, so that covers both. */
+    const char *pcanon = !strncmp(canon, "/proc/", 6) ? canon
+                       : (proc_zone_path(host) ? host : NULL);
+    if (pcanon) {
         s64 pf;
-        if (procfs_open(c, canon, gflags, &pf)) return (u64)pf;
+        if (procfs_open(c, pcanon, gflags, &pf)) return (u64)pf;
     }
     int fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
     return fd < 0 ? host_err() : (u64)fd;
@@ -455,6 +460,7 @@ SYSDEF(openat) {
 SYSDEF(close) {
     nl_unmark_fd(c->m, (int)a0);   /* drop any fake-netlink bookkeeping for this fd */
     procfs_unmark_fd(c->m, (int)a0);
+    sigfd_unmark_fd(c->m, (int)a0);
     return close((int)a0) < 0 ? host_err() : 0;
 }
 
@@ -463,7 +469,16 @@ SYSDEF(read) {
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
-    ssize_t n = read((int)a0, buf, len);
+    /* A signalfd carries no readable bytes of its own: the queued signals it
+     * reports live in the emulator's capture ring (sys_sig.c). */
+    ssize_t n;
+    if (sigfd_tracked(c->m, (int)a0)) {
+        s64 r = sigfd_fill(c, (int)a0, buf, len);
+        if (r < 0) { free(buf); return (u64)r; }
+        n = (ssize_t)r;
+    } else {
+        n = read((int)a0, buf, len);
+    }
     if (n < 0) { free(buf); return host_err(); }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
@@ -475,6 +490,8 @@ SYSDEF(write) {
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    s64 pr;
+    if (procfs_pre_write(c, (int)a0, buf, len, -1, &pr)) { free(buf); return (u64)pr; }
     ssize_t n = write((int)a0, buf, len);
     free(buf);
     return n < 0 ? host_err() : (u64)n;
@@ -486,7 +503,26 @@ SYSDEF(readv) {
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
     if (cnt < 0) return (u64)(s64)cnt;
-    ssize_t n = readv((int)a0, iov, cnt);
+    ssize_t n;
+    if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: filled from the ring */
+        size_t tot = 0;
+        for (int i = 0; i < cnt; i++) tot += iov[i].iov_len;
+        u8 *flat = malloc(tot ? tot : 1);
+        if (!flat) { free(bounce); return (u64)(s64)-ENOMEM; }
+        s64 r = sigfd_fill(c, (int)a0, flat, tot);
+        if (r < 0) { free(flat); free(bounce); return (u64)r; }
+        size_t left = (size_t)r, off = 0;
+        for (int i = 0; i < cnt && left; i++) {
+            size_t chunk = left < iov[i].iov_len ? left : iov[i].iov_len;
+            memcpy(iov[i].iov_base, flat + off, chunk);
+            off += chunk;
+            left -= chunk;
+        }
+        free(flat);
+        n = (ssize_t)r;
+    } else {
+        n = readv((int)a0, iov, cnt);
+    }
     if (n < 0) { free(bounce); return host_err(); }
     /* scatter back */
     GIovec g[1024];
@@ -517,6 +553,23 @@ SYSDEF(writev) {
             free(bounce);
             return (u64)(s64)-EFAULT;
         }
+    /* A synthesized file that takes writes (an id map) gets the gathered bytes
+     * as one write, which is the only shape the kernel accepts anyway. */
+    s64 pr;
+    size_t tot = 0;
+    for (int i = 0; i < cnt; i++) tot += iov[i].iov_len;
+    u8 *flat = cnt == 1 ? iov[0].iov_base : malloc(tot ? tot : 1);
+    if (!flat) { free(bounce); return (u64)(s64)-ENOMEM; }
+    if (cnt != 1) {
+        size_t o = 0;
+        for (int i = 0; i < cnt; i++) {
+            memcpy(flat + o, iov[i].iov_base, iov[i].iov_len);
+            o += iov[i].iov_len;
+        }
+    }
+    int consumed = procfs_pre_write(c, (int)a0, flat, tot, -1, &pr);
+    if (cnt != 1) free(flat);
+    if (consumed) { free(bounce); return (u64)pr; }
     ssize_t n = writev((int)a0, iov, cnt);
     free(bounce);
     return n < 0 ? host_err() : (u64)n;
@@ -539,6 +592,8 @@ SYSDEF(pwrite64) {
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    s64 pr;
+    if (procfs_pre_write(c, (int)a0, buf, len, (s64)a3, &pr)) { free(buf); return (u64)pr; }
     ssize_t n = pwrite((int)a0, buf, len, (off_t)a3);
     free(buf);
     return n < 0 ? host_err() : (u64)n;
@@ -754,7 +809,8 @@ SYSDEF(readlinkat) {
     ssize_t rn;
     /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
      * state; report the guest-view target instead. */
-    if (path_proc_magic(c->m, canon, buf)) {
+    if (path_proc_magic(c->m, canon, buf) ||
+        (proc_zone_path(host) && path_proc_magic(c->m, host, buf))) {
         rn = (ssize_t)strlen(buf);
     } else {
 #ifdef L2S_ENABLED
@@ -773,6 +829,17 @@ SYSDEF(readlinkat) {
             path_strip_rootfs(c->m, buf);
             rn = (ssize_t)strlen(buf);
         }
+    }
+    /* Report the target in the guest's own view: a link that resolves to a
+     * guest path (a magic self-link, or a /proc/self/fd entry mapped back
+     * through the mount table) is namespace-absolute here, and a guest that
+     * pivot_root'd would not recognize its own paths. */
+    if (buf[0] == '/' && c->m->chroot_base[0] && strcmp(c->m->chroot_base, "/")) {
+        buf[rn] = 0;
+        char view[PATH_MAX];
+        path_chroot_view(c->m, buf, view);
+        strcpy(buf, view);
+        rn = (ssize_t)strlen(buf);
     }
     size_t out = (size_t)rn < a3 ? (size_t)rn : a3;
     if (copy_to_guest(c, a2, buf, out) < 0) return (u64)(s64)-EFAULT;
@@ -1347,18 +1414,8 @@ SYSDEF(getcwd) {
     /* Report the cwd as the guest sees it: inside a chroot, subtract the chroot
      * base (m->cwd is namespace-absolute). If cwd lies outside the chroot — only
      * possible right after chroot(2), before the guest chdir("/")s — report "/". */
-    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
-    const char *cwd = m->cwd[0] ? m->cwd : "/";
     char view[PATH_MAX];
-    if (!strcmp(croot, "/")) {
-        strcpy(view, cwd);
-    } else {
-        size_t cl = strlen(croot);
-        if (!strncmp(cwd, croot, cl) && (cwd[cl] == '/' || cwd[cl] == 0))
-            strcpy(view, cwd[cl] ? cwd + cl : "/");
-        else
-            strcpy(view, "/");
-    }
+    path_chroot_view(m, m->cwd, view);
     size_t l = strlen(view) + 1;
     if (a1 < l) return (u64)(s64)-ERANGE;
     if (copy_to_guest(c, a0, view, l) < 0) return (u64)(s64)-EFAULT;
@@ -1378,8 +1435,13 @@ SYSDEF(chdir) {
 }
 
 SYSDEF(fchdir) {
-    /* Track cwd as the fd's guest path (guest fd == host fd). */
-    char link[64], buf[PATH_MAX];
+    /* Track cwd as the fd's guest path (guest fd == host fd). The mapping goes
+     * through the bind table (dirfd_guest_path), not a bare rootfs-prefix
+     * strip: a directory reached through a mount -- an emulated tmpfs, or the
+     * root a pivot_root moved -- has a host path outside the rootfs entirely,
+     * and used to land the guest on "/". bubblewrap fchdir()s a root fd it kept
+     * across its pivot_root, so it noticed immediately. */
+    char link[64], buf[PATH_MAX], guest[PATH_MAX];
     snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
     ssize_t n = readlink(link, buf, sizeof buf - 1);
     if (n < 0) return (u64)(s64)-EBADF;
@@ -1387,11 +1449,8 @@ SYSDEF(fchdir) {
     struct stat st;
     if (stat(buf, &st) < 0) return host_err();
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
-    size_t rl = strlen(c->m->rootfs);
-    if (!strncmp(buf, c->m->rootfs, rl)) {
-        if (buf[rl] == 0) strcpy(c->m->cwd, "/");
-        else strcpy(c->m->cwd, buf + rl);
-    } else strcpy(c->m->cwd, "/");
+    if (host_fd_guest_path(c->m, buf, guest, NULL) < 0) return (u64)(s64)-EBADF;
+    strcpy(c->m->cwd, guest);
     proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
     return 0;
 }
@@ -1460,7 +1519,104 @@ SYSDEF(mount) {
         return r < 0 ? (u64)(s64)r : 0;
     }
 
+    /* tmpfs: no real filesystem is created (that needs privilege we do not
+     * have), but what a caller wants from one -- an empty writable tree that
+     * hides the mountpoint's contents until umount -- is exactly a bind of a
+     * fresh host directory. bubblewrap builds its whole sandbox in a tmpfs, so
+     * without this no sandbox helper gets off the ground. ramfs is the same
+     * deal. Anything else really is a filesystem we cannot fabricate. */
+    char fstype[64] = {0};
+    if (a2 && copy_str_from_guest(c, fstype, a2, sizeof fstype) < 0)
+        return (u64)(s64)-EFAULT;
+    if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs")) {
+        char thost[PATH_MAX], tcanon[PATH_MAX], backing[PATH_MAX];
+        struct stat st;
+        int r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);
+        if (r < 0) return (u64)(s64)r;
+        if (stat(thost, &st) < 0) return host_err();
+        if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+        r = tmpfs_dir_new(m, backing);
+        if (r < 0) return (u64)(s64)r;
+        /* mode= from the option string, like the kernel's tmpfs parser; the
+         * default matches the kernel's (0755, not the /tmp 01777 an fstab sets). */
+        char data[256] = {0};
+        if (a4 && copy_str_from_guest(c, data, a4, sizeof data) >= 0) {
+            const char *mp = strstr(data, "mode=");
+            if (mp && (mp == data || mp[-1] == ',')) {
+                unsigned mode = 0;
+                const char *p = mp + 5;
+                for (; *p >= '0' && *p <= '7'; p++) mode = mode * 8 + (unsigned)(*p - '0');
+                if (p != mp + 5) chmod(backing, (mode_t)(mode & 07777));
+            }
+        }
+        r = bind_add(m, tcanon, backing, (flags & G_MS_RDONLY) ? 1 : 0);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
+    /* proc: the guest already has a /proc -- synthesized where it matters,
+     * host passthrough elsewhere -- so mounting one is a bind of the zone at
+     * the requested point. proc_zone_path then keeps the synthesized files and
+     * magic links working under the new name (bubblewrap --proc mounts one
+     * inside the sandbox it is about to pivot into).
+     *
+     * devpts is the same story: the guest's /dev/pts is the host's, so a mount
+     * of one is a bind of that zone (bubblewrap --dev builds a private /dev in
+     * a tmpfs and mounts devpts into it, and a sandbox without a pty device is
+     * not much of a shell host). */
+    const char *zone = !strcmp(fstype, "proc")   && !m->no_proc ? "/proc"    :
+                       !strcmp(fstype, "devpts") && !m->no_dev  ? "/dev/pts" : NULL;
+    if (zone) {
+        char thost[PATH_MAX], tcanon[PATH_MAX];
+        struct stat st;
+        int r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);
+        if (r < 0) return (u64)(s64)r;
+        if (stat(thost, &st) < 0) return host_err();
+        if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+        r = bind_add(m, tcanon, zone, 0);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
     return (u64)(s64)-EPERM;   /* a real filesystem type: unprivileged, can't */
+}
+
+/* pivot_root(new_root=a0, put_old=a1): re-root the guest at new_root and make
+ * the old root reachable at put_old. Emulated over the same two mechanisms
+ * chroot(2) and mount(2) already use -- m->chroot_base for the root, a bind for
+ * the old tree -- because that is all "the root moved" means to a guest whose
+ * every path we resolve. Gated on fake-root, like the kernel's CAP_SYS_ADMIN.
+ *
+ * bubblewrap's second call is the idiom `chdir(newroot); pivot_root(".", ".")`:
+ * the old root is stacked *on* the new one and detached right after with
+ * umount2(".", MNT_DETACH). That works here because a bind added later wins
+ * ties in the resolver, so removing it uncovers the mount underneath. */
+SYSDEF(pivot_root) {
+    struct Machine *m = c->m;
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    char nhost[PATH_MAX], ncanon[PATH_MAX], ohost[PATH_MAX], ocanon[PATH_MAX];
+    int r = resolve_at(c, G_AT_FDCWD, a0, 0, nhost, ncanon);
+    if (r < 0) return (u64)(s64)r;
+    r = resolve_at(c, G_AT_FDCWD, a1, 0, ohost, ocanon);
+    if (r < 0) return (u64)(s64)r;
+    struct stat st;
+    if (stat(nhost, &st) < 0) return host_err();
+    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    if (stat(ohost, &st) < 0) return host_err();
+    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    /* put_old must be at or underneath new_root, as the kernel requires. */
+    size_t nl = strlen(ncanon);
+    if (strncmp(ocanon, ncanon, nl) ||
+        (ocanon[nl] != 0 && ocanon[nl] != '/' && nl != 1))
+        return (u64)(s64)-EINVAL;
+    /* Where the current root lives on the host, resolved before it stops being
+     * the root, so put_old can be bound to it. */
+    char roothost[PATH_MAX];
+    r = path_resolve(m, G_AT_FDCWD, "/", 0, roothost, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = bind_add(m, ocanon, roothost, 0);
+    if (r < 0) return (u64)(s64)r;
+    strcpy(m->chroot_base, ncanon);
+    return 0;
 }
 
 /* umount2(target=a0, flags=a1): remove the bind mounted at exactly target.
@@ -1892,6 +2048,7 @@ SYSDEF(ppoll) {
             if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
         ssp = &ss;
     }
+    sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
     int r = ppoll(pf, nfds, tsp, ssp);
     if (r < 0) return host_err();
     if (nfds && copy_to_guest(c, a0, pf, sizeof(struct pollfd) * nfds) < 0)
@@ -1929,6 +2086,7 @@ SYSDEF(pselect6) {
             ssp = &ss;
         }
     }
+    sigfd_sync(c->m);
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
     if (rr < 0) return host_err();
     if (a1) copy_to_guest(c, a1, &r, setb);
@@ -2057,6 +2215,7 @@ SYSDEF(epoll_pwait) {
     }
     struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
     if (!evs) return (u64)(s64)-ENOMEM;
+    sigfd_sync(c->m);
     int r = epoll_pwait((int)a0, evs, maxevents, (int)a3, ssp);
     if (r < 0) { free(evs); return host_err(); }
     for (int i = 0; i < r; i++) {

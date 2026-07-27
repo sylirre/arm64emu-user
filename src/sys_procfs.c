@@ -50,6 +50,7 @@ enum {
     PF_CMDLINE, PF_MAPS, PF_MOUNTS, PF_MOUNTINFO,
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
+    PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
 };
 
 /* put_mounts format selector. */
@@ -92,6 +93,17 @@ static const char *rootfs_fstype(const struct Machine *m) {
     return "ext4";
 }
 
+/* A mount point in the guest's current view, or 0 when it is not reachable
+ * from the current root (chroot / pivot_root) and so has no name there. */
+static int mnt_view(struct Machine *m, const char *guest, char *out) {
+    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+    if (!strcmp(croot, "/")) { strcpy(out, guest); return 1; }
+    size_t cl = strlen(croot);
+    if (strncmp(guest, croot, cl) || (guest[cl] != 0 && guest[cl] != '/')) return 0;
+    strcpy(out, guest[cl] ? guest + cl : "/");
+    return 1;
+}
+
 /* The guest mount table: the rootfs plus the passthrough zones path.c binds
  * (/proc, /dev/pts, /dev/shm). The devpts and shm rows are omitted under
  * --no-dev, when that passthrough is disabled. Fixed mount IDs; the root's
@@ -117,20 +129,30 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
     };
     /* -bind mounts follow the pseudo rows. Source is the host directory (as the
      * user supplied it); the kernel doesn't tag /proc/mounts entries as "bind",
-     * so they read as ordinary mounts, ro or rw per the mount. */
+     * so they read as ordinary mounts, ro or rw per the mount.
+     *
+     * Every mount point is reported in the guest's own view: after a chroot or
+     * a pivot_root the table is otherwise unreadable to its own reader --
+     * bubblewrap looks its sandbox mounts up here by the path it just got from
+     * readlink(/proc/self/fd/N) -- and mounts outside the current root are
+     * dropped, as the kernel drops what is unreachable in the namespace. */
     size_t np = sizeof pseudo / sizeof pseudo[0];
+    int chrooted = m->chroot_base[0] && strcmp(m->chroot_base, "/");
     if (fmt == MNT_MOUNTINFO) {
         dprintf(fd, "1 1 %u:%u / / rw,relatime - %s /dev/root rw\n",
                 maj, min, fstype);
         for (size_t i = 0; i < np; i++) {
             if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
+            if (chrooted) continue;   /* not reachable from the current root */
             dprintf(fd, "%zu 1 0:%zu / %s %s - %s %s %s\n",
                     i + 2, i + 5, pseudo[i].dir, pseudo[i].opts,
                     pseudo[i].type, pseudo[i].src, pseudo[i].sopts);
         }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
-            char bg[PATH_MAX], bh[PATH_MAX]; int bro;
+            char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;   /* skip freed/mid-claim */
+            if (!mnt_view(m, bg, bv)) continue;
+            strcpy(bg, bv);
             struct stat bst;
             unsigned bmaj = maj, bmin = min;
             if (stat(bh, &bst) == 0) {
@@ -148,25 +170,29 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
         dprintf(fd, "device /dev/root mounted on / with fstype %s\n", fstype);
         for (size_t i = 0; i < np; i++) {
             if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
+            if (chrooted) continue;
             dprintf(fd, "device %s mounted on %s with fstype %s\n",
                     pseudo[i].src, pseudo[i].dir, pseudo[i].type);
         }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
-            char bg[PATH_MAX], bh[PATH_MAX];
+            char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX];
             if (!bind_get(i, bg, bh, NULL)) continue;
-            dprintf(fd, "device %s mounted on %s with fstype %s\n", bh, bg, fstype);
+            if (!mnt_view(m, bg, bv)) continue;
+            dprintf(fd, "device %s mounted on %s with fstype %s\n", bh, bv, fstype);
         }
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
         for (size_t i = 0; i < np; i++) {
             if (m->no_dev && !strncmp(pseudo[i].dir, "/dev", 4)) continue;
+            if (chrooted) continue;
             dprintf(fd, "%s %s %s %s 0 0\n", pseudo[i].src, pseudo[i].dir,
                     pseudo[i].type, pseudo[i].opts);
         }
         for (int i = 0, nb = bind_count(); i < nb; i++) {
-            char bg[PATH_MAX], bh[PATH_MAX]; int bro;
+            char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;
-            dprintf(fd, "%s %s %s %s 0 0\n", bh, bg,
+            if (!mnt_view(m, bg, bv)) continue;
+            dprintf(fd, "%s %s %s %s 0 0\n", bh, bv,
                     fstype, bro ? "ro,relatime" : "rw,relatime");
         }
     }
@@ -182,7 +208,15 @@ static void put_maps(int fd, struct Machine *m) {
     AddrSpace *as = &m->as;
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
+        /* Region paths are namespace-absolute guest paths; report them as the
+         * guest sees them now (a sandbox that pivot_root'd would not recognize
+         * its own mapped files otherwise). */
+        char nameview[PATH_MAX];
         const char *name = r->path;
+        if (name && name[0] == '/') {
+            path_chroot_view(m, name, nameview);
+            name = nameview;
+        }
         if (!name) {
             if (r->start >= as->brk_start && r->start < as->brk)
                 name = "[heap]";
@@ -353,6 +387,106 @@ static void put_stat(int fd, struct Machine *m) {
             (long long)(time(NULL) - ts.tv_sec), getpid());
 }
 
+/* ---- id maps of a faked user namespace ----
+ *
+ * A guest that thinks it unshared CLONE_NEWUSER writes /proc/self/uid_map,
+ * gid_map and setgroups exactly once and expects the values back; the host
+ * files describe the *initial* namespace, whose map is fixed, so a real write
+ * is refused (bubblewrap dies with "setting up uid map"). These three are
+ * therefore synthesized from Machine state whenever the namespace was faked,
+ * and pass through untouched otherwise -- outside the fiction the host file is
+ * the truthful answer. The recorded maps are reported, not applied: they
+ * change no id the guest sees (that is what --fake-id does). */
+static void put_idmap(int fd, struct Machine *m, int kind) {
+    const char *s = kind == PF_UIDMAP ? m->uid_map :
+                    kind == PF_GIDMAP ? m->gid_map :
+                    (m->setgroups_deny ? "deny\n" : "allow\n");
+    if (*s) { ssize_t w = write(fd, s, strlen(s)); (void)w; }
+}
+
+/* Parse one written map into the kernel's read-back form ("%10u %10u %10u\n"
+ * per extent). Returns 0, or -errno for what the kernel would reject. */
+static int idmap_format(const char *in, size_t len, char *out, size_t outsz) {
+    size_t o = 0;
+    int lines = 0;
+    for (size_t i = 0; i < len; ) {
+        while (i < len && (in[i] == ' ' || in[i] == '\t' || in[i] == '\n')) i++;
+        if (i >= len) break;
+        unsigned long v[3];
+        for (int f = 0; f < 3; f++) {
+            if (i >= len || in[i] < '0' || in[i] > '9') return -EINVAL;
+            unsigned long n = 0;
+            while (i < len && in[i] >= '0' && in[i] <= '9') {
+                n = n * 10 + (unsigned long)(in[i++] - '0');
+                if (n > 0xffffffffUL) return -EINVAL;
+            }
+            v[f] = n;
+            while (i < len && (in[i] == ' ' || in[i] == '\t')) i++;
+        }
+        if (i < len && in[i] != '\n') return -EINVAL;
+        if (v[2] == 0) return -EINVAL;       /* zero-length extent */
+        if (o + 34 > outsz) return -EINVAL;  /* more extents than we hold */
+        o += (size_t)snprintf(out + o, outsz - o, "%10lu %10lu %10lu\n",
+                              v[0], v[1], v[2]);
+        lines++;
+    }
+    return lines ? 0 : -EINVAL;   /* an empty map is EINVAL, as in the kernel */
+}
+
+/* write(2) landing on one of the three files. Enforces the kernel's one-shot
+ * rules; returns 1 with *ret set (byte count or -errno) when it consumed the
+ * write, 0 to let an ordinary fd take it. `off` is the explicit pwrite-family
+ * offset or -1 for the fd's own position: the kernel only accepts a map write
+ * at offset 0, and a write that landed in the backing memfd instead would be a
+ * silent lie (unformatted on read-back, and the one-shot rule unapplied). */
+int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *ret) {
+    struct Machine *m = c->m;
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
+    pthread_mutex_lock(&pf_lock);
+    int i;
+    for (i = 0; i < m->pf_fds_count; i++)
+        if (m->pf_fds[i].fd == fd) break;
+    if (i == m->pf_fds_count) { pthread_mutex_unlock(&pf_lock); return 0; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino) {
+        m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
+        pthread_mutex_unlock(&pf_lock);
+        return 0;
+    }
+    int kind = m->pf_fds[i].kind;
+    pthread_mutex_unlock(&pf_lock);
+    if (kind != PF_UIDMAP && kind != PF_GIDMAP && kind != PF_SETGROUPS) return 0;
+    if (off < 0) off = lseek(fd, 0, SEEK_CUR);
+    if (off != 0) { *ret = -EINVAL; return 1; }
+
+    if (kind == PF_SETGROUPS) {
+        /* "allow" or "deny", and only until gid_map is set -- afterwards the
+         * kernel refuses, since the decision has already been used. */
+        int deny;
+        if (len >= 4 && !memcmp(buf, "deny", 4))       deny = 1;
+        else if (len >= 5 && !memcmp(buf, "allow", 5)) deny = 0;
+        else { *ret = -EINVAL; return 1; }
+        if (m->gid_map_set)                { *ret = -EPERM; return 1; }
+        if (m->setgroups_deny && !deny)    { *ret = -EPERM; return 1; }
+        m->setgroups_deny = (u8)deny;
+        m->setgroups_set = 1;
+        *ret = (s64)len;
+        return 1;
+    }
+    if (kind == PF_UIDMAP ? m->uid_map_set : m->gid_map_set) {
+        *ret = -EPERM;   /* only one successful write to a map */
+        return 1;
+    }
+    char fmt[IDMAP_MAX];
+    fmt[0] = 0;
+    int r = idmap_format((const char *)buf, len, fmt, sizeof fmt);
+    if (r < 0) { *ret = r; return 1; }
+    if (kind == PF_UIDMAP) { memcpy(m->uid_map, fmt, sizeof fmt); m->uid_map_set = 1; }
+    else                   { memcpy(m->gid_map, fmt, sizeof fmt); m->gid_map_set = 1; }
+    *ret = (s64)len;
+    return 1;
+}
+
 /* Track an open fd of a time-varying file for refresh-on-rewind. The memfd
  * inode is recorded so a stale entry (fd number reused after a close this
  * table missed: dup2-onto, execve's CLOEXEC sweep) is detected and dropped
@@ -403,6 +537,10 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     case PF_LOADAVG: put_loadavg(fd);   break;
     case PF_UPTIME:  put_uptime(fd, m); break;
     case PF_STAT:    put_stat(fd, m);   break;
+    /* Re-read after a write must show what was written. */
+    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
+        put_idmap(fd, m, m->pf_fds[i].kind);
+        break;
     }
     lseek(fd, 0, SEEK_SET);
 out:
@@ -599,6 +737,11 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         else if (!strcmp(tail, "mounts"))     kind = PF_MOUNTS;
         else if (!strcmp(tail, "mountinfo"))  kind = PF_MOUNTINFO;
         else if (!strcmp(tail, "mountstats")) kind = PF_MOUNTSTATS;
+        /* Writable, and only while the guest believes it has a user namespace
+         * of its own -- otherwise the host files are the truthful answer. */
+        else if (m->fake_userns && !strcmp(tail, "uid_map"))   kind = PF_UIDMAP;
+        else if (m->fake_userns && !strcmp(tail, "gid_map"))   kind = PF_GIDMAP;
+        else if (m->fake_userns && !strcmp(tail, "setgroups")) kind = PF_SETGROUPS;
         else return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS;   /* the /etc/mtab symlink usually lands here */
@@ -617,8 +760,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if (kind == PF_CMDLINE && !m->cmdline) return 0;
     if (kind == PF_ENVIRON && !m->environ) return 0;
     if (kind == PF_AUXV    && !m->auxv)    return 0;
-    if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
-    if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+    int writable = kind == PF_UIDMAP || kind == PF_GIDMAP || kind == PF_SETGROUPS;
+    if (!writable && (gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+    if (gflags & G_O_DIRECTORY)                        { *ret = -ENOTDIR; return 1; }
 
     int fd = synth_memfd();
     if (fd < 0) return 0;   /* no memfd: degrade to host passthrough */
@@ -636,12 +780,14 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_UPTIME:     put_uptime(fd, m); break;
     case PF_VERSION:    put_version(fd); break;
     case PF_STAT:       put_stat(fd, m); break;
+    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
+                        put_idmap(fd, m, kind); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
-    if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT)
-        pf_track(m, fd, kind);   /* time-varying: regenerate on rewind */
+    if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT || writable)
+        pf_track(m, fd, kind);   /* time-varying, or written through */
     *ret = fd;
     return 1;
 }

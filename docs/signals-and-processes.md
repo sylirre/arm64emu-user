@@ -55,6 +55,32 @@ kernel's `EINTR` when a *different* deliverable signal pends (the run loop then
 delivers it). The libc timer helper thread lives in this call, so `SIGEV_THREAD`
 timers depend on it.
 
+### `signalfd(2)`
+
+A host signalfd would never fire for the guest: the emulator catches signals
+itself and leaves none pending host-side, which is the whole point of the
+capture ring. So `signalfd4` hands out a host **eventfd** that carries nothing
+but readiness — armed (counter 1) exactly while the ring holds a signal the
+fd's mask covers — and `read(2)` on it is intercepted (`sys_file.c` →
+`sigfd_fill`) and answered from the ring as `struct signalfd_siginfo` records.
+Because readiness lives in a real fd, `poll`/`ppoll`/`select`/`epoll` need no
+special case; they only need the level re-computed before the host sleeps, which
+`sigfd_sync` does at each of those entry points.
+
+Two consequences worth knowing:
+
+- A signal at `SIG_DFL` is normally not caught at all (the host default applies,
+  and `SIGCHLD` — the usual signalfd subject — is default-ignore, so it would
+  simply vanish). `sig_host_update` therefore installs the capture handler for
+  every signal any signalfd covers, and drops it again when the last one goes.
+  A signal that was *already* pending before a signalfd covered it is not
+  visible to that fd for the same reason: the emulator only starts queueing a
+  signal once something asks for it.
+- The ring is per-thread while the fd is per-process, so a signal queued on one
+  thread arms the fd but only that thread's own `read` consumes it. Every real
+  signalfd user blocks the signal and reads it on one thread, which is exactly
+  this case.
+
 ### POSIX interval timers and the guest-32/33 carrier remap
 
 The `timer_create` family (`sys_time.c`) wraps host libc timers behind a

@@ -42,6 +42,7 @@
 #define G_NR_renameat          38
 #define G_NR_umount2           39
 #define G_NR_mount             40
+#define G_NR_pivot_root        41
 #define G_NR_statfs            43
 #define G_NR_fstatfs           44
 #define G_NR_truncate          45
@@ -414,6 +415,38 @@ typedef struct {
 #define G_SIGEV_SIGNAL    0
 #define G_SIGEV_NONE      1
 #define G_SIGEV_THREAD_ID 4
+
+/* struct signalfd_siginfo: what a read(2) on a signalfd returns, one per
+ * signal. Fixed-width throughout, so the layout is the same on every arch and
+ * host word size; the tail padding brings it to the ABI's 128 bytes. */
+typedef struct {
+    u32 ssi_signo;
+    s32 ssi_errno;
+    s32 ssi_code;
+    u32 ssi_pid;
+    u32 ssi_uid;
+    s32 ssi_fd;
+    u32 ssi_tid;
+    u32 ssi_band;
+    u32 ssi_overrun;
+    u32 ssi_trapno;
+    s32 ssi_status;
+    s32 ssi_int;
+    u64 ssi_ptr;
+    u64 ssi_utime;
+    u64 ssi_stime;
+    u64 ssi_addr;
+    u16 ssi_addr_lsb;
+    u16 __pad2;
+    s32 ssi_syscall;
+    u64 ssi_call_addr;
+    u32 ssi_arch;
+    u8  __pad[28];
+} GSignalfdSiginfo;
+
+/* signalfd4 flags (asm-generic O_* values). */
+#define G_SFD_NONBLOCK 0004000
+#define G_SFD_CLOEXEC  02000000
 
 /* struct new_utsname */
 typedef struct {

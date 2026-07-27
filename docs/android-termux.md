@@ -56,6 +56,13 @@ unfiltered:
   `loopback_setup()` depends on it. The read-only `SIOCGIF*` interface-query
   ioctls (`ifconfig`/net-tools) are likewise answered in-process from the host
   interface table, so they work even where the socket ioctls return EACCES.
+* **Sandbox helpers**: `bubblewrap` and friends run unmodified. Nothing they
+  need is privileged here — namespace creation is faked, `mount -t tmpfs` is a
+  bind of a fresh host directory (under `$TMPDIR` where Android has no
+  ownerless tmpfs), `mount -t proc`/`-t devpts` bind the passthrough zones,
+  `pivot_root(2)` re-roots like `chroot(2)`, the id maps of a faked user
+  namespace are writable, and `signalfd` is answered from the emulator's own
+  signal-capture ring. See [syscalls.md](syscalls.md).
 * **System V IPC** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
   `shmdt`/`shmctl` run over an in-process broker backed by an anonymous `memfd`
   (on the Oreo allow-list) passed between processes over `SCM_RIGHTS` on an

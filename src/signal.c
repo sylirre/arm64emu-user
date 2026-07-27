@@ -316,7 +316,15 @@ void sig_host_update(struct Machine *m, int sig) {
          * sync fault signals still arrive from the interpreter, so skip those).
          * Dispositions are process-wide, so the catcher stays while *any* thread
          * of this process is traced (ptrace_traced), not just the calling one. */
-        if (ptrace_traced() && !is_sync_sig(sig) && sig_default_terminates(sig)) {
+        /* Likewise when a signalfd covers this signal: it reads from the
+         * capture ring, so the signal has to be caught and queued even at
+         * SIG_DFL -- the host default would otherwise discard it (SIGCHLD)
+         * or kill us outright, and the fd would never become readable. */
+        if ((m->sfd_mask & (1ULL << (sig - 1))) && !is_sync_sig(sig)) {
+            sa.sa_sigaction = host_catcher;
+            sa.sa_flags = SA_SIGINFO;
+            sigfillset(&sa.sa_mask);
+        } else if (ptrace_traced() && !is_sync_sig(sig) && sig_default_terminates(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -549,6 +557,48 @@ int sig_pending_deliverable(struct Machine *m) {
     return 0;
 }
 
+/* ---- signalfd(2) view of the capture ring (sys_sig.c drives these) ----
+ *
+ * A signalfd reports signals that are *pending*, i.e. queued and not yet
+ * dispositioned -- exactly what the ring holds, since sig_deliver_pending
+ * consumes everything the guest mask lets through (including the
+ * default-ignore discards). So the ring restricted to the fd's mask is the
+ * set a read(2) may return, and no separate bookkeeping is needed. */
+int sig_fd_pending(u64 mask) {
+    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN)
+        if (mask & (1ULL << (sigq[t].signo - 1))) return 1;
+    return 0;
+}
+
+/* Pop the oldest queued signal covered by `mask` into a signalfd_siginfo.
+ * Returns 0 when the ring holds no match. Only the fields the kernel fills for
+ * the signal's si_code are set; the rest stay zero, as they do there. */
+int sig_fd_take(u64 mask, GSignalfdSiginfo *out) {
+    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+        int sig = sigq[t].signo;
+        if (!(mask & (1ULL << (sig - 1)))) continue;
+        PendSig p = sigq[t];
+        for (int u = t; u != sigq_tail; ) {   /* remove by shifting, as above */
+            int prev = (u + SIGQ_LEN - 1) % SIGQ_LEN;
+            sigq[u] = sigq[prev];
+            u = prev;
+        }
+        sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
+        if (sigq_tail == sigq_head) g_sig_npend = 0;
+        memset(out, 0, sizeof *out);
+        out->ssi_signo = (u32)p.signo;
+        out->ssi_code = p.code;
+        out->ssi_pid = (u32)p.pid;
+        out->ssi_uid = (u32)p.uid;
+        out->ssi_status = p.status;
+        out->ssi_addr = p.addr;
+        out->ssi_int = (s32)p.value;
+        out->ssi_ptr = (u64)p.value;
+        return 1;
+    }
+    return 0;
+}
+
 /* rt_sigtimedwait: synchronously consume one pending signal from `set` off
  * this thread's capture ring -- without invoking its handler -- as sigwait/
  * sigwaitinfo do. The caller keeps these signals *blocked* (the POSIX
@@ -628,6 +678,7 @@ void guest_terminate_by_signal(CPU *c, int sig) {
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     sembroker_exit(c->m);                /* apply SEM_UNDO now, not at the
                                           * broker's reclaim tick */
+    tmpfs_session_cleanup(c->m);         /* session root only: emulated tmpfs */
     ptrace_wake_waiters();               /* wake a parent polling in wait4 */
     /* Restore the host default and re-raise so the real parent also sees the same
      * WIFSIGNALED status (the guest default action really is terminate). */
