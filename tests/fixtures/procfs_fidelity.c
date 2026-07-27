@@ -237,5 +237,22 @@ int main(void) {
     } else {
         puts("auxv_foreign pipe=FAIL");
     }
+
+    /* /proc/sys/kernel/overflow{u,g}id — run_tests.sh sets
+     * A64_OVERFLOWID_FORCE_SYNTH, so these are the synthesized fallback for a
+     * host that denies them (Android SELinux); with a readable host file they
+     * pass through unchanged instead, which run_tests.sh checks separately. */
+    char ou[32] = "", og[32] = "";
+    fd = open("/proc/sys/kernel/overflowuid", O_RDONLY);
+    n = fd >= 0 ? read(fd, ou, sizeof ou - 1) : -1;
+    if (fd >= 0) close(fd);
+    ou[n > 0 ? n : 0] = 0;
+    ou[strcspn(ou, "\n")] = 0;
+    fd = open("/proc/sys/kernel/overflowgid", O_RDONLY);
+    n = fd >= 0 ? read(fd, og, sizeof og - 1) : -1;
+    if (fd >= 0) close(fd);
+    og[n > 0 ? n : 0] = 0;
+    og[strcspn(og, "\n")] = 0;
+    printf("overflowuid=%s overflowgid=%s\n", ou, og);
     return 0;
 }

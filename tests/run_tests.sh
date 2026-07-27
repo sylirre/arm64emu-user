@@ -611,8 +611,9 @@ fi
 # escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo/
 # loadavg/uptime/version/auxv (incl. another guest PID's auxv — the gdb-attach
 # shape), against a throwaway mini-rootfs (qemu has no rootfs concept).
-# A64_PROCSTAT_FORCE_SYNTH exercises the /proc/stat fallback (on a
-# normal Linux host the readable real file would pass through instead). ----
+# A64_PROCSTAT_FORCE_SYNTH and A64_OVERFLOWID_FORCE_SYNTH exercise the
+# /proc/stat and /proc/sys/kernel/overflow{u,g}id fallbacks (on a normal Linux
+# host the readable real files would pass through instead). ----
 if "$AGCC" -static -O2 -o tests/fixtures/procfs_fidelity.bin \
         tests/fixtures/procfs_fidelity.c 2>/dev/null; then
     PFROOT=$(mktemp -d)
@@ -640,12 +641,23 @@ version_guest=1
 stat ncpu=1 running1=1 btime_ok=1 idle_agree=1
 stat_rewind=1
 uptime_rewind=1
-auxv_foreign entries>10=1 hwcap=1 pagesz=1'
-    got=$(A64_PROCSTAT_FORCE_SYNTH=1 "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
+auxv_foreign entries>10=1 hwcap=1 pagesz=1
+overflowuid=65534 overflowgid=65534'
+    got=$(A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1 \
+          "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
     if [ "$got" = "$expect_pf" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_fidelity"
     else
         fail=$((fail+1)); echo "FAIL fixture: procfs_fidelity"
         diff <(echo "$expect_pf") <(echo "$got") | head -10 | sed 's/^/     /'
+    fi
+    # Passthrough tier: with the host files readable the guest must see their
+    # real contents, not the synthesized default.
+    if [ -r /proc/sys/kernel/overflowuid ]; then
+        want="$(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)"
+        got=$("$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null |
+              sed -n 's/^overflowuid=\(.*\) overflowgid=\(.*\)$/\1 \2/p')
+        if [ "$got" = "$want" ]; then pass=$((pass+1)); echo "PASS procfs: overflowids passthrough"
+        else fail=$((fail+1)); echo "FAIL procfs: overflowids passthrough (want '$want', got '$got')"; fi
     fi
     rm -rf "$PFROOT"
     rm -f tests/fixtures/procfs_fidelity.bin

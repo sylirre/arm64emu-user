@@ -112,10 +112,11 @@ Pass `--no-dev` to disable this passthrough entirely; /dev is then served from
 the rootfs only, so bind your own (e.g. `--bind /dev:/dev`) if you need it.
 
 Many /proc entries are synthesized: maps, cmdline, comm, environ, auxv,
-mounts, mountinfo, mountstats, loadavg, uptime, version. The /proc/stat is
-being synthesized only when can't be read (Android OS primarily). Pass
-`--no-proc` to disable the synthesis entirely; /proc is then served from the
-rootfs only (bind your own, e.g. `--bind /proc:/proc`, for the real host view).
+mounts, mountinfo, mountstats, loadavg, uptime, version. The /proc/stat and
+/proc/sys/kernel/overflow{u,g}id are synthesized only when they can't be read
+(Android OS primarily). Pass `--no-proc` to disable the synthesis entirely;
+/proc is then served from the rootfs only (bind your own, e.g.
+`--bind /proc:/proc`, for the real host view).
 
 Emulator can't be escaped and guest programs can't see processes running
 on the host.

@@ -94,7 +94,10 @@ unfiltered:
   readable by an app), and `ps`/`top` start times are correct because `btime`
   is computed exactly. These time-varying files regenerate when procps-style
   readers rewind and reread them through one long-lived fd, so a running
-  `top` updates live instead of freezing.
+  `top` updates live instead of freezing. `/proc/sys/kernel/overflow{u,g}id`
+  get the same try-host-first treatment (65534, the kernel's own default, when
+  the host denies them) — reading them is the first thing bubblewrap does, and
+  it dies outright if it cannot.
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).

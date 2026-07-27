@@ -271,6 +271,8 @@ static void help(void) {
         {"A64_JIT_NOVRA", "Disable the V-register cache."},
         {"A64_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
         {"A64_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
+        {"A64_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
+                        "/proc/sys/kernel/overflow{u,g}id fallback."},
         {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
         {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "

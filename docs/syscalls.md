@@ -363,11 +363,15 @@ then make the consequences the caller depends on true:
   load average (monotonic, so `top`/`vmstat` deltas work), `btime` exact from
   `time() − CLOCK_BOOTTIME` (procps computes process start times from it),
   the rest honest zeros. `/proc/uptime`'s idle field comes from the host
-  `stat` when readable, else the same estimate, so the two files agree. The
-  time-varying files (`loadavg`/`uptime`/`stat`) are regenerated when a read
-  starts at offset 0: procps opens them once and `lseek(0)`+rereads every
-  refresh cycle, so an open-time snapshot would freeze `top`. The guest
-  program's name is also set as the process `comm`
+  `stat` when readable, else the same estimate, so the two files agree.
+  `/proc/sys/kernel/overflowuid` and `overflowgid` are try-host-first the same
+  way: 65534 — the kernel's own compiled-in default for both sysctls — where
+  the host denies them, which Android does along with the rest of `/proc/sys`.
+  Reading them is the *first* thing bubblewrap does, and it dies on the spot
+  if it cannot. The time-varying files (`loadavg`/`uptime`/`stat`) are
+  regenerated when a read starts at offset 0: procps opens them once and
+  `lseek(0)`+rereads every refresh cycle, so an open-time snapshot would
+  freeze `top`. The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
   correctly for every guest process — except that under `--fake-id` the
   `Uid:`/`Gid:`/`Groups:` lines of `status` are rewritten through the ownership

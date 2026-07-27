@@ -11,7 +11,10 @@
  * identity sys_uname presents, not the host's. /proc/stat is different:
  * the readable host file is strictly richer than anything we can rebuild
  * (real per-CPU jiffies, intr, ctxt), so it passes through and synthesis
- * kicks in only where the host denies it (Android again). openat() diverts
+ * kicks in only where the host denies it (Android again) -- and
+ * /proc/sys/kernel/overflow{u,g}id work the same try-host-first way, since
+ * Android denies an app all of /proc/sys and a guest that cannot read them
+ * (bubblewrap reads them before anything else) simply dies. openat() diverts
  * a read-only open of those names to an anonymous in-memory file holding
  * the guest view. The time-varying files (loadavg/uptime/stat) are also
  * regenerated when a read starts at offset 0 (procfs_pre_read): procps
@@ -51,6 +54,7 @@ enum {
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
+    PF_OVERFLOWID,
 };
 
 /* put_mounts format selector. */
@@ -282,6 +286,36 @@ static int stat_blocked(void) {
         }
     }
     return blocked;
+}
+
+/* Same try-host-first gate for /proc/sys/kernel/overflow{u,g}id, which Android
+ * SELinux denies an app along with the rest of /proc/sys. A guest that cannot
+ * read them is not a hypothetical: it is the first thing bubblewrap does, and
+ * it dies outright ("Can't read /proc/sys/kernel/overflowuid"). Probed once per
+ * file per process; A64_OVERFLOWID_FORCE_SYNTH forces the fallback in tests. */
+static int overflowid_blocked(int is_gid) {
+    static int blocked[2] = { -1, -1 };
+    if (blocked[is_gid] < 0) {
+        if (getenv("A64_OVERFLOWID_FORCE_SYNTH")) {
+            blocked[is_gid] = 1;
+        } else {
+            int fd = open(is_gid ? "/proc/sys/kernel/overflowgid"
+                                 : "/proc/sys/kernel/overflowuid",
+                          O_RDONLY | O_CLOEXEC);
+            blocked[is_gid] = fd < 0;
+            if (fd >= 0) close(fd);
+        }
+    }
+    return blocked[is_gid];
+}
+
+/* The id a file's owner is reported as when it does not fit the caller's view
+ * of it (a 16-bit stat, an unmapped id in a user namespace). 65534 is the
+ * kernel's compiled-in default for both sysctls, which is also what every
+ * distro ships -- so it is the right answer when the real file is out of
+ * reach, and the readable one passes through when it is not. */
+static void put_overflowid(int fd) {
+    dprintf(fd, "65534\n");
 }
 
 static u64 stat_ncpu(void) {
@@ -754,6 +788,11 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     } else if (!strcmp(canon, "/proc/stat")) {
         if (!stat_blocked()) return 0;   /* readable host file is richer */
         kind = PF_STAT;
+    } else if (!strcmp(canon, "/proc/sys/kernel/overflowuid") ||
+               !strcmp(canon, "/proc/sys/kernel/overflowgid")) {
+        int is_gid = !strcmp(canon, "/proc/sys/kernel/overflowgid");
+        if (!overflowid_blocked(is_gid)) return 0;   /* readable host file wins */
+        kind = PF_OVERFLOWID;
     } else {
         return 0;
     }
@@ -780,6 +819,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_UPTIME:     put_uptime(fd, m); break;
     case PF_VERSION:    put_version(fd); break;
     case PF_STAT:       put_stat(fd, m); break;
+    case PF_OVERFLOWID: put_overflowid(fd); break;
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
                         put_idmap(fd, m, kind); break;
     }
