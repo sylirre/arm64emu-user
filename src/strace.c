@@ -2,7 +2,9 @@
 /* Copyright 2026 Sylirre */
 /* --strace-full argument decoder. A per-syscall argument-type table drives a
  * set of small formatters: symbolic flags (O_*, PROT_*, MAP_*, AT_*, MS_*,
- * signals, SEEK_*, AF_*, SOCK_*), quoted strings, execve argv/envp arrays,
+ * signals, SEEK_*, AF_*, SOCK_*, and the SysV IPC_, SEM_, MSG_ and SHM_
+ * families incl. semctl/msgctl/shmctl cmd names, decoded sembuf vectors and
+ * {mtype, mtext} messages), quoted strings, execve argv/envp arrays,
  * errno-named returns, and {field=...} pretty-printing of the common structs
  * defined in guest_abi.h (stat, timespec, timeval, rlimit, utsname, sockaddr).
  * Arguments a syscall's descriptor does not cover fall back to hex, so coverage
@@ -51,6 +53,18 @@ enum {
     AT_SIGHOW,     /* rt_sigprocmask how */
     AT_SODOMAIN,   /* socket domain (AF_*) */
     AT_SOTYPE,     /* socket type (SOCK_* base + flag bits) */
+    /* System V IPC */
+    AT_IPCKEY,     /* key_t: IPC_PRIVATE or hex */
+    AT_IPCGETFLG,  /* *get flg: IPC_CREAT/IPC_EXCL + octal mode */
+    AT_SHMATFLG,   /* shmat shmflg: SHM_RDONLY/RND/REMAP/EXEC */
+    AT_SEMCTLCMD,  /* semctl cmd (GETVAL, SETALL, SEM_STAT, …) */
+    AT_MSGCTLCMD,  /* msgctl cmd (MSG_STAT, …) */
+    AT_SHMCTLCMD,  /* shmctl cmd (SHM_STAT, SHM_LOCK, …) */
+    AT_SEMBUF,     /* sembuf array, nsops = the next arg */
+    AT_SEMUN,      /* semctl arg: int for SETVAL (cmd = arg 2), else pointer */
+    AT_MSGFLG,     /* msgsnd/msgrcv flg: IPC_NOWAIT/MSG_NOERROR/EXCEPT/COPY */
+    AT_MSGBUF_IN,  /* msgp input: {mtype, mtext}, msgsz = the next arg (msgsnd) */
+    AT_MSGBUF_OUT, /* msgp output: {mtype, mtext}, len = return value (msgrcv) */
     /* structs — the *_O variants are kernel outputs: on a failed call the buffer
      * was not written, so they print as a raw pointer instead of stale fields. */
     AT_STAT,       /* struct stat *   (output) */
@@ -166,22 +180,21 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_mlock2,    { AT_PTR, AT_UINT, AT_HEX }, 0 },
     { G_NR_mlockall,  { AT_HEX }, 0 },
     { G_NR_munlockall,{ AT_NONE }, 0 },
-    /* System V shared memory: key/shmflg carry mode + IPC_ flag bits (hex);
-     * shmat returns the attach address (hex); shmctl cmd is an IPC/SHM op. */
-    { G_NR_shmget,    { AT_HEX, AT_UINT, AT_HEX }, 0 },
-    { G_NR_shmat,     { AT_INT, AT_PTR, AT_HEX }, AT_HEX },
+    /* System V IPC: symbolic keys (IPC_PRIVATE), *get flag words
+     * (IPC_CREAT|0600), *ctl cmd names, decoded sembuf vectors and
+     * {mtype, mtext} messages; STAT/SET buffers stay raw pointers. */
+    { G_NR_shmget,    { AT_IPCKEY, AT_UINT, AT_IPCGETFLG }, 0 },
+    { G_NR_shmat,     { AT_INT, AT_PTR, AT_SHMATFLG }, AT_HEX },
     { G_NR_shmdt,     { AT_PTR }, 0 },
-    { G_NR_shmctl,    { AT_INT, AT_INT, AT_PTR }, 0 },
-    /* System V semaphores & message queues: keys and flag words hex (mode +
-     * IPC_/SEM_/MSG_ bits), ids/counts/cmds decimal, buffers raw pointers. */
-    { G_NR_semget,    { AT_HEX, AT_INT, AT_HEX }, 0 },
-    { G_NR_semop,     { AT_INT, AT_PTR, AT_UINT }, 0 },
-    { G_NR_semtimedop,{ AT_INT, AT_PTR, AT_UINT, AT_TIMESPEC }, 0 },
-    { G_NR_semctl,    { AT_INT, AT_INT, AT_INT, AT_HEX }, 0 },
-    { G_NR_msgget,    { AT_HEX, AT_HEX }, 0 },
-    { G_NR_msgsnd,    { AT_INT, AT_PTR, AT_UINT, AT_HEX }, 0 },
-    { G_NR_msgrcv,    { AT_INT, AT_PTR, AT_UINT, AT_INT, AT_HEX }, 0 },
-    { G_NR_msgctl,    { AT_INT, AT_INT, AT_PTR }, 0 },
+    { G_NR_shmctl,    { AT_INT, AT_SHMCTLCMD, AT_PTR }, 0 },
+    { G_NR_semget,    { AT_IPCKEY, AT_INT, AT_IPCGETFLG }, 0 },
+    { G_NR_semop,     { AT_INT, AT_SEMBUF, AT_UINT }, 0 },
+    { G_NR_semtimedop,{ AT_INT, AT_SEMBUF, AT_UINT, AT_TIMESPEC }, 0 },
+    { G_NR_semctl,    { AT_INT, AT_INT, AT_SEMCTLCMD, AT_SEMUN }, 0 },
+    { G_NR_msgget,    { AT_IPCKEY, AT_IPCGETFLG }, 0 },
+    { G_NR_msgsnd,    { AT_INT, AT_MSGBUF_IN, AT_UINT, AT_MSGFLG }, 0 },
+    { G_NR_msgrcv,    { AT_INT, AT_MSGBUF_OUT, AT_UINT, AT_INT, AT_MSGFLG }, 0 },
+    { G_NR_msgctl,    { AT_INT, AT_MSGCTLCMD, AT_PTR }, 0 },
     /* process */
     { G_NR_execve,    { AT_STR, AT_STRARRAY, AT_STRARRAY }, 0 },
     { G_NR_execveat,  { AT_DIRFD, AT_STR, AT_STRARRAY, AT_STRARRAY, AT_ATFLAGS }, 0 },
@@ -369,6 +382,21 @@ static const struct flagname umount_tab[] = {
 static const struct flagname socktype_flag_tab[] = {
     { 04000, "SOCK_NONBLOCK" }, { 02000000, "SOCK_CLOEXEC" }, { 0, NULL }
 };
+static const struct flagname ipcget_tab[] = {   /* *get flg above the mode bits */
+    { 01000, "IPC_CREAT" }, { 02000, "IPC_EXCL" }, { 04000, "IPC_NOWAIT" },
+    { 0, NULL }
+};
+static const struct flagname shmat_tab[] = {
+    { 010000, "SHM_RDONLY" }, { 020000, "SHM_RND" }, { 040000, "SHM_REMAP" },
+    { 0100000, "SHM_EXEC" }, { 0, NULL }
+};
+static const struct flagname msgflg_tab[] = {
+    { 04000, "IPC_NOWAIT" }, { 010000, "MSG_NOERROR" }, { 020000, "MSG_EXCEPT" },
+    { 040000, "MSG_COPY" }, { 0, NULL }
+};
+static const struct flagname semflg_tab[] = {   /* sembuf.sem_flg */
+    { 04000, "IPC_NOWAIT" }, { 0x1000, "SEM_UNDO" }, { 0, NULL }
+};
 
 struct enumname { u64 val; const char *name; };
 static const struct enumname sig_tab[] = {
@@ -395,6 +423,21 @@ static const struct enumname af_tab[] = {
 static const struct enumname socktype_tab[] = {
     { 1, "SOCK_STREAM" }, { 2, "SOCK_DGRAM" }, { 3, "SOCK_RAW" },
     { 4, "SOCK_RDM" }, { 5, "SOCK_SEQPACKET" }, { 0, NULL }
+};
+static const struct enumname semcmd_tab[] = {
+    { 0, "IPC_RMID" }, { 1, "IPC_SET" }, { 2, "IPC_STAT" }, { 3, "IPC_INFO" },
+    { 11, "GETPID" }, { 12, "GETVAL" }, { 13, "GETALL" }, { 14, "GETNCNT" },
+    { 15, "GETZCNT" }, { 16, "SETVAL" }, { 17, "SETALL" }, { 18, "SEM_STAT" },
+    { 19, "SEM_INFO" }, { 20, "SEM_STAT_ANY" }, { 0, NULL }
+};
+static const struct enumname msgcmd_tab[] = {
+    { 0, "IPC_RMID" }, { 1, "IPC_SET" }, { 2, "IPC_STAT" }, { 3, "IPC_INFO" },
+    { 11, "MSG_STAT" }, { 12, "MSG_INFO" }, { 13, "MSG_STAT_ANY" }, { 0, NULL }
+};
+static const struct enumname shmcmd_tab[] = {
+    { 0, "IPC_RMID" }, { 1, "IPC_SET" }, { 2, "IPC_STAT" }, { 3, "IPC_INFO" },
+    { 11, "SHM_LOCK" }, { 12, "SHM_UNLOCK" }, { 13, "SHM_STAT" },
+    { 14, "SHM_INFO" }, { 15, "SHM_STAT_ANY" }, { 0, NULL }
 };
 
 /* asm-generic errno names, indexed by number. Message text comes from the host
@@ -518,6 +561,54 @@ static void fmt_sotype(SB *s, u64 v) {
     fmt_enum(s, v & 0xff, socktype_tab);
     int first = 0;
     fmt_flag_body(s, v & ~0xffull, socktype_flag_tab, &first);
+}
+
+/* *get flg: control flags, then the permission mode in octal (strace prints
+ * "IPC_CREAT|0600"; %#o renders a bare 0 mode as just "0"). */
+static void fmt_ipcget(SB *s, u64 v) {
+    int first = 1;
+    fmt_flag_body(s, v & ~0777ull, ipcget_tab, &first);
+    sb_printf(s, "%s%#llo", first ? "" : "|", (unsigned long long)(v & 0777));
+}
+
+/* *ctl cmd: symbolic name, honoring an (arm64-unused) IPC_64 bit. */
+static void fmt_ipccmd(SB *s, u64 v, const struct enumname *tab) {
+    if (v & 0x100) sb_puts(s, "IPC_64|");
+    fmt_enum(s, v & ~(u64)0x100, tab);
+}
+
+/* semop sops vector: up to 4 decoded {sem_num, sem_op, sem_flg} entries. */
+static void fmt_sembuf(SB *s, struct CPU *c, u64 va, u64 nsops) {
+    if (va == 0) { sb_puts(s, "NULL"); return; }
+    GSembuf b[4];
+    u64 n = nsops < 4 ? nsops : 4;
+    if (n == 0 || copy_from_guest(c, b, va, (size_t)(n * sizeof b[0])) < 0) {
+        sb_printf(s, "0x%llx", (unsigned long long)va);
+        return;
+    }
+    sb_puts(s, "[");
+    for (u64 i = 0; i < n; i++) {
+        if (i) sb_puts(s, ", ");
+        sb_printf(s, "{sem_num=%u, sem_op=%d, sem_flg=",
+                  (unsigned)b[i].sem_num, (int)b[i].sem_op);
+        fmt_flags(s, (u16)b[i].sem_flg, semflg_tab, "0");
+        sb_puts(s, "}");
+    }
+    if (nsops > n) sb_puts(s, ", ...");
+    sb_puts(s, "]");
+}
+
+/* msgsnd/msgrcv msgp: {mtype=…, mtext="…"} with `len` payload bytes. */
+static void fmt_msgbuf(SB *s, struct CPU *c, u64 va, u64 len) {
+    if (va == 0) { sb_puts(s, "NULL"); return; }
+    s64 mtype;
+    if (copy_from_guest(c, &mtype, va, sizeof mtype) < 0) {
+        sb_printf(s, "0x%llx", (unsigned long long)va);
+        return;
+    }
+    sb_printf(s, "{mtype=%lld, mtext=", (long long)mtype);
+    fmt_buf(s, c, va + 8, len);
+    sb_puts(s, "}");
 }
 static void fmt_stmode(SB *s, u32 m) {
     u32 t = m & 0170000;
@@ -677,6 +768,37 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_SIGHOW:      fmt_enum(s, v, sighow_tab); break;
     case AT_SODOMAIN:    fmt_enum(s, v, af_tab); break;
     case AT_SOTYPE:      fmt_sotype(s, v); break;
+    case AT_IPCKEY:
+        if (v == 0) sb_puts(s, "IPC_PRIVATE");
+        else sb_printf(s, "0x%llx", (unsigned long long)v);
+        break;
+    case AT_IPCGETFLG:   fmt_ipcget(s, v); break;
+    case AT_SHMATFLG:    fmt_flags(s, v, shmat_tab, "0"); break;
+    case AT_SEMCTLCMD:   fmt_ipccmd(s, v, semcmd_tab); break;
+    case AT_MSGCTLCMD:   fmt_ipccmd(s, v, msgcmd_tab); break;
+    case AT_SHMCTLCMD:   fmt_ipccmd(s, v, shmcmd_tab); break;
+    case AT_MSGFLG:      fmt_flags(s, v, msgflg_tab, "0"); break;
+    case AT_SEMBUF:
+        fmt_sembuf(s, c, v, (idx + 1 < 6) ? args[idx + 1] : 0);
+        break;
+    case AT_SEMUN:
+        /* union semun by value: an int for SETVAL (the cmd is arg 2), a
+         * pointer for the array/buf commands, opaque otherwise. */
+        if ((args[2] & ~(u64)0x100) == G_SETVAL)
+            sb_printf(s, "%d", (int)(s32)v);
+        else if (v == 0) sb_puts(s, "NULL");
+        else sb_printf(s, "0x%llx", (unsigned long long)v);
+        break;
+    case AT_MSGBUF_IN:
+        /* Input message: valid regardless of success; msgsz is the next arg. */
+        fmt_msgbuf(s, c, v, (idx + 1 < 6) ? args[idx + 1] : 0);
+        break;
+    case AT_MSGBUF_OUT:
+        /* Received message: only the returned byte count was written. */
+        if (v == 0) sb_puts(s, "NULL");
+        else if (!ok) sb_printf(s, "0x%llx", (unsigned long long)v);
+        else fmt_msgbuf(s, c, v, ret);
+        break;
     default:             fmt_struct(s, c, ty, v, ok); break;
     }
 }
