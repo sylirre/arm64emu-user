@@ -51,6 +51,7 @@ enum {
     AT_SIG,        /* signal number → name */
     AT_WHENCE,     /* lseek whence */
     AT_SIGHOW,     /* rt_sigprocmask how */
+    AT_CLONEFLAGS, /* clone/unshare flags (CLONE_*) */
     AT_SODOMAIN,   /* socket domain (AF_*) */
     AT_SOTYPE,     /* socket type (SOCK_* base + flag bits) */
     /* System V IPC */
@@ -200,7 +201,11 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_execveat,  { AT_DIRFD, AT_STR, AT_STRARRAY, AT_STRARRAY, AT_ATFLAGS }, 0 },
     { G_NR_exit,      { AT_INT }, 0 },
     { G_NR_exit_group,{ AT_INT }, 0 },
+    /* clone's flag word carries the child's exit signal in its low byte, so it
+     * stays hex; unshare's is flags only. */
     { G_NR_clone,     { AT_HEX, AT_PTR, AT_PTR, AT_PTR, AT_PTR }, 0 },
+    { G_NR_unshare,   { AT_CLONEFLAGS }, 0 },
+    { G_NR_setns,     { AT_FD, AT_CLONEFLAGS }, 0 },
     { G_NR_ptrace,    { AT_INT, AT_INT, AT_HEX, AT_HEX }, 0 },
     { G_NR_process_vm_readv,  { AT_INT, AT_PTR, AT_INT, AT_PTR, AT_INT, AT_HEX }, 0 },
     { G_NR_process_vm_writev, { AT_INT, AT_PTR, AT_INT, AT_PTR, AT_INT, AT_HEX }, 0 },
@@ -396,6 +401,24 @@ static const struct flagname msgflg_tab[] = {
 };
 static const struct flagname semflg_tab[] = {   /* sembuf.sem_flg */
     { 04000, "IPC_NOWAIT" }, { 0x1000, "SEM_UNDO" }, { 0, NULL }
+};
+/* clone(2)/unshare(2) flags. The low byte of clone's is the exit signal, not a
+ * flag, so it is rendered separately; unshare has no such field but never sets
+ * those bits either. */
+static const struct flagname clone_tab[] = {
+    { 0x00000100, "CLONE_VM" }, { 0x00000200, "CLONE_FS" },
+    { 0x00000400, "CLONE_FILES" }, { 0x00000800, "CLONE_SIGHAND" },
+    { 0x00001000, "CLONE_PIDFD" }, { 0x00002000, "CLONE_PTRACE" },
+    { 0x00004000, "CLONE_VFORK" }, { 0x00008000, "CLONE_PARENT" },
+    { 0x00010000, "CLONE_THREAD" }, { 0x00020000, "CLONE_NEWNS" },
+    { 0x00040000, "CLONE_SYSVSEM" }, { 0x00080000, "CLONE_SETTLS" },
+    { 0x00100000, "CLONE_PARENT_SETTID" }, { 0x00200000, "CLONE_CHILD_CLEARTID" },
+    { 0x00400000, "CLONE_DETACHED" }, { 0x00800000, "CLONE_UNTRACED" },
+    { 0x01000000, "CLONE_CHILD_SETTID" }, { 0x02000000, "CLONE_NEWCGROUP" },
+    { 0x04000000, "CLONE_NEWUTS" }, { 0x08000000, "CLONE_NEWIPC" },
+    { 0x10000000, "CLONE_NEWUSER" }, { 0x20000000, "CLONE_NEWPID" },
+    { 0x40000000, "CLONE_NEWNET" }, { 0x80000000, "CLONE_IO" },
+    { 0, NULL }
 };
 
 struct enumname { u64 val; const char *name; };
@@ -766,6 +789,7 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_SIG:         fmt_enum(s, v, sig_tab); break;
     case AT_WHENCE:      fmt_enum(s, v, whence_tab); break;
     case AT_SIGHOW:      fmt_enum(s, v, sighow_tab); break;
+    case AT_CLONEFLAGS:  fmt_flags(s, v, clone_tab, "0"); break;
     case AT_SODOMAIN:    fmt_enum(s, v, af_tab); break;
     case AT_SOTYPE:      fmt_sotype(s, v); break;
     case AT_IPCKEY:

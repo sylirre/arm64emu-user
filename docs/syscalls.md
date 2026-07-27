@@ -159,7 +159,8 @@ literal, the rest follow symlinks), and `getsockname`/`getpeername`/`accept`/
 host path. **Abstract-namespace sockets** (leading NUL in `sun_path`) have no
 filesystem node, so they can't be scoped by the rootfs prefix — and the
 unprivileged emulator can't give the guest its own network namespace
-(`unshare`/`setns` are `-ENOSYS`). Instead they are isolated per rootfs by
+(`unshare`/`setns` only *pretend* to — see the netlink section below). Instead
+they are isolated per rootfs by
 splicing a short per-rootfs tag (`\x01a64<hash>`, from `fnv1a32(rootfs)`) right
 after the leading NUL on `bind`/`connect`/`sendto`/`sendmsg` and stripping it
 back on the readback calls: same-rootfs guests still rendezvous, while the host
@@ -189,6 +190,53 @@ from. Results are written at fixed guest `struct ifreq` offsets (never a raw
 host-struct bounce), so the marshalling is correct on 64-bit and 32-bit hosts
 alike. Write (`SIOCSIF*`) ioctls are not emulated. Like `SIOCGIFINDEX`, the
 family is ungated (it does not depend on the host actually blocking netlink).
+
+**`AF_NETLINK` / `NETLINK_ROUTE`** (`src/sys_netlink.c`, ported from Termux
+PRoot) is emulated in two independent tiers, because two different things can
+go wrong:
+
+- **The host denies netlink outright** — Android's SELinux policy on
+  `untrusted_app`, an inherited seccomp filter, a hardened container. Probed
+  once per process by `nl_host_blocks()`: `socket()`, then `bind()`, then a
+  *write* (an `RTM_NEWADDR` in the `AF_UNSPEC` family, which rtnetlink has no
+  handler for and so cannot act on). The write matters because LSM policies
+  filter netlink **per message type** — Android grants `nlmsg_read` but not
+  `nlmsg_write`, so a socket that creates and binds fine still rejects every
+  reconfiguring message in `sendmsg(2)` with `EACCES`, and probing only
+  socket+bind would wrongly classify such a host as working. Only a `send`
+  that fails outright counts: rtnetlink's own refusals (`EPERM`,
+  `EOPNOTSUPP`) come back asynchronously as a netlink reply, so a host that
+  merely refuses the *request* keeps its real socket. When the probe says
+  blocked, `socket()` hands out an `AF_UNIX`/`SOCK_DGRAM` stand-in and the
+  netlink-shaped syscalls on it are synthesized: `NLMSG_ERROR(err=0)` for
+  non-dump requests, and real host interfaces (via `getifaddrs`) or an empty
+  `NLMSG_DONE` for dumps. `A64_NETLINK_FORCE_BLOCK` forces this tier for
+  testing.
+- **The host grants netlink, but the guest has no `CAP_NET_ADMIN` in it.**
+  Namespace creation is impossible here, so `clone(CLONE_NEW*)` silently drops
+  the flags and `unshare`/`setns` return 0 without doing anything — sandbox
+  helpers like bubblewrap and flatpak only check the return value. A guest that
+  asked for `CLONE_NEWNET` therefore believes it owns a network namespace and
+  proceeds to configure "its" loopback, but its socket sits in the host's
+  namespace, where rtnetlink answers every reconfiguring request with
+  `NLMSG_ERROR(-EPERM)` — killing bubblewrap's `loopback_setup()`. Substituting
+  the socket wholesale would cost the guest the real answers to its queries, so
+  only that refusal is rewritten: a guest with a faked namespace
+  (`m->fake_netns`, inherited across fork) has its real `NETLINK_ROUTE` fds
+  tracked, a reconfiguring request noted (rtnetlink types come in NEW/DEL/GET/
+  SET groups of four; everything but `GET` reconfigures), and the error field of
+  the matching reply zeroed as it is received. The ack the caller reads is the
+  kernel's own, so its sequence number and port id are the ones it expects.
+  Requests from a guest that never asked for a namespace, and errors other than
+  the expected refusal, are left alone; `MSG_PEEK` keeps the note pending for
+  the read that consumes the reply.
+
+Limits: one pending note per process (matching upstream), so a guest that
+pipelines two reconfiguring requests before reading either gets the ack only
+for whichever reply it reads first — the sequential request/ack pattern every
+real caller uses is unaffected. Faking `unshare` also means a guest that
+unshares a *mount* namespace still shares the process-wide bind table, so its
+later `mount --bind` calls stay visible to relatives.
 
 **Special zones** are checked on the canonical guest path before prefixing:
 

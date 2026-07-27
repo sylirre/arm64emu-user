@@ -18,6 +18,23 @@ bool nl_is_fd(struct Machine *m, int fd);
 void nl_mark_fd(struct Machine *m, int fd);
 void nl_unmark_fd(struct Machine *m, int fd);   /* frees any pending reply */
 
+/* Real-NETLINK_ROUTE fd table + faked-net-namespace ack emulation. A guest
+ * whose CLONE_NEWNET was faked (m->fake_netns) still talks to the host's
+ * network namespace over a real netlink socket, where it has no CAP_NET_ADMIN,
+ * so rtnetlink refuses every reconfiguring request with NLMSG_ERROR(-EPERM).
+ * The request reaches the kernel untouched; only that refusal is rewritten
+ * into the kernel's own ack (right seq and port id, error zeroed).
+ *   nlr_mark_fd  -- socket() handed out a real NETLINK_ROUTE fd.
+ *   nlr_note_request -- a sendto/sendmsg on such an fd may need the rewrite.
+ *   nlr_fix_reply -- rewrite the noted refusal in a just-received buffer.
+ * nl_unmark_fd drops an fd from both tables (close). */
+void nlr_mark_fd(struct Machine *m, int fd);
+void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len);
+/* `buf` holds `len` received bytes from `fd`; rewrites in place. `peek` (a
+ * MSG_PEEK receive) keeps the note pending for the read that consumes the
+ * reply. Returns 1 if a refusal was turned into an ack. */
+int  nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek);
+
 /* Netlink-shaped syscalls issued on a fake fd. Each returns the guest x0
  * value (a non-negative result, or a negative errno). */
 u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len);

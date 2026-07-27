@@ -52,6 +52,7 @@ SYSDEF(gettid); SYSDEF(set_tid_address); SYSDEF(set_robust_list);
 SYSDEF(get_robust_list);
 SYSDEF(uname); SYSDEF(clone); SYSDEF(execve); SYSDEF(execveat); SYSDEF(wait4);
 SYSDEF(setpgid); SYSDEF(getpgid); SYSDEF(setsid); SYSDEF(getsid);
+SYSDEF(unshare); SYSDEF(setns);
 SYSDEF(prctl); SYSDEF(getgroups); SYSDEF(setgroups); SYSDEF(umask);
 SYSDEF(setuid); SYSDEF(setgid); SYSDEF(setresuid); SYSDEF(setresgid);
 SYSDEF(getresuid); SYSDEF(getresgid); SYSDEF(setreuid); SYSDEF(setregid);
@@ -234,6 +235,8 @@ static const struct {
     { G_NR_getpgid, sys_getpgid, "getpgid" },
     { G_NR_setsid, sys_setsid, "setsid" },
     { G_NR_getsid, sys_getsid, "getsid" },
+    { G_NR_unshare, sys_unshare, "unshare" },
+    { G_NR_setns, sys_setns, "setns" },
     { G_NR_prctl, sys_prctl, "prctl" },
     { G_NR_getgroups, sys_getgroups, "getgroups" },
     { G_NR_setgroups, sys_setgroups, "setgroups" },
@@ -347,8 +350,8 @@ static const u16 quiet_enosys[] = {
     G_NR_process_madvise, G_NR_membarrier /* handled, listed for symmetry */,
     G_NR_futex_wake, G_NR_futex_wait, G_NR_futex_requeue,
     /* mount / namespaces (mount/umount2/chroot are emulated in sys_file.c —
-     * bind mounts and guest re-root — so they are handled, not ENOSYS'd) */
-    G_NR_unshare, G_NR_setns,
+     * bind mounts and guest re-root; unshare/setns fake success in sys_proc.c
+     * — so they are handled, not ENOSYS'd) */
     G_NR_open_tree, G_NR_move_mount, G_NR_fsopen, G_NR_fsconfig,
     G_NR_fsmount, G_NR_fspick, G_NR_mount_setattr,
     /* privileged / system-global */
@@ -410,10 +413,10 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_seccomp, "seccomp" },
     { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
     { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
-    { G_NR_setns, "setns" }, { G_NR_settimeofday, "settimeofday" },
+    { G_NR_settimeofday, "settimeofday" },
     { G_NR_signalfd4, "signalfd4" }, { G_NR_statmount, "statmount" },
     { G_NR_swapoff, "swapoff" }, { G_NR_swapon, "swapon" }, { G_NR_tee, "tee" },
-    { G_NR_unshare, "unshare" }, { G_NR_userfaultfd, "userfaultfd" },
+    { G_NR_userfaultfd, "userfaultfd" },
     { G_NR_vhangup, "vhangup" }, { G_NR_vmsplice, "vmsplice" },
 };
 

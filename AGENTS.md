@@ -52,7 +52,7 @@ src/
   sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions)
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)
-  sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style fallback when host denies netlink)
+  sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style): AF_UNIX fallback when the host denies netlink (probed incl. a write, per-message-type LSM policies), plus rtnetlink-refusal-to-ack rewriting for a guest whose CLONE_NEWNET was faked
   sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
   sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, ...)
   sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)

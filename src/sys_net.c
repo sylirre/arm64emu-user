@@ -48,6 +48,10 @@ SYSDEF(socket) {
             return (u64)(s64)-EPROTONOSUPPORT;
         return host_err();
     }
+    /* A real NETLINK_ROUTE socket still needs the ack emulation when the guest
+     * believes it configures a network namespace of its own (sys_netlink.c). */
+    if (domain == AF_NETLINK && protocol == NETLINK_ROUTE)
+        nlr_mark_fd(c->m, fd);
     return (u64)fd;
 }
 
@@ -276,6 +280,9 @@ SYSDEF(sendto) {
         if (tr < 0) { free(buf); return (u64)(s64)tr; }
         dp = (struct sockaddr *)&ss;
     }
+    /* A reconfiguring rtnetlink request from a guest with a faked network
+     * namespace: note it, so the kernel's refusal becomes an ack on receive. */
+    if (len) nlr_note_request(c->m, (int)a0, buf, len);
     ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
     free(buf);
     if (dfd >= 0) close(dfd);
@@ -292,6 +299,12 @@ SYSDEF(recvfrom) {
     socklen_t sl = sizeof ss;
     ssize_t n = recvfrom((int)a0, buf, len, (int)a3, (struct sockaddr *)&ss, &sl);
     if (n < 0) { free(buf); return host_err(); }
+    /* Turn the refusal of a request against a faked network namespace into the
+     * kernel's own ack, before the guest sees the reply. MSG_TRUNC reports the
+     * untruncated length, so clamp to what the buffer actually holds. */
+    if (n > 0)
+        nlr_fix_reply(c->m, (int)a0, buf,
+                      (size_t)n < len ? (size_t)n : len, (int)a3 & MSG_PEEK);
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     u64 e = addr_out(c, a4, a5, &ss, sl);
@@ -420,6 +433,10 @@ SYSDEF(sendmsg) {
     int dfd = -1;
     int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
     if (cnt < 0) return (u64)(s64)cnt;   /* dfd == -1 on error: nothing to close */
+    /* As in sendto: note a reconfiguring rtnetlink request from a guest with a
+     * faked network namespace. The message starts at the first iovec, which
+     * msg_import laid at the head of the bounce buffer. */
+    if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
     free(iov); free(bounce);
     if (dfd >= 0) close(dfd);
@@ -468,6 +485,16 @@ SYSDEF(recvmsg) {
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
     if (n < 0) { free(iov); free(bounce); return host_err(); }
+    /* Rewrite a faked-namespace refusal before the reply is scattered back to
+     * the guest. The received bytes are contiguous at the head of the bounce
+     * buffer (msg_import concatenates the iovecs in order), so the whole
+     * datagram is walkable regardless of how the caller split it. */
+    if (n > 0) {
+        size_t total = 0;
+        for (int i = 0; i < cnt; i++) total += iov[i].iov_len;
+        nlr_fix_reply(c->m, (int)a0, bounce,
+                      (size_t)n < total ? (size_t)n : total, (int)a2 & MSG_PEEK);
+    }
     recvmsg_writeback(c, a1, &g, &h, iov, bounce, &ss, ctrl, n);
     free(iov); free(bounce);
     return (u64)n;

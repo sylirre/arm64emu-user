@@ -541,6 +541,44 @@ check_fixture() {   # check_fixture <name> <expected>
 check_fixture robust $'get0 rc=0 len=24 head_set=1\nset_badlen rc=-1 err=22\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 
+# ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
+# Self-checking rather than qemu-diffed: the emulator answers *differently*
+# from the bare kernel here on purpose (that is the feature), so qemu is not an
+# oracle. Run twice -- once over a real netlink socket (the ack rewrite) and
+# once with the AF_UNIX fallback forced (the substituted socket synthesises its
+# own acks) -- because the guest must not be able to tell the tiers apart. The
+# fixture reports "skip" lines where the host grants no netlink socket. ----
+if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
+        tests/fixtures/netns_ack.c 2>/dev/null; then
+    for tier in real af_unix; do
+        if [ "$tier" = af_unix ]; then
+            # The substituted socket has no kernel behind it, so it acks every
+            # non-dump request whether or not a namespace was faked -- there is
+            # no real refusal to pass through on a host that denies netlink.
+            expect_nl=$'no_netns=acked\nunshare=1\nafter_netns=ack\nquery=data'
+            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout 60 "$EMU" / \
+                  tests/fixtures/netns_ack.bin 2>/dev/null)
+        else
+            # A real socket must keep refusing a guest that never asked for a
+            # namespace: an ack here would be one the emulator invented. The
+            # switch must be *absent*, not empty -- these A64_* switches are
+            # presence-tested (getenv), so FOO= would select the fallback.
+            expect_nl=$'no_netns=passed-through\nunshare=1\nafter_netns=ack\nquery=data'
+            got=$(env -u A64_NETLINK_FORCE_BLOCK timeout 60 "$EMU" / \
+                  tests/fixtures/netns_ack.bin 2>/dev/null)
+        fi
+        if [ "$got" = "$expect_nl" ]; then
+            pass=$((pass+1)); echo "PASS fixture: netns_ack ($tier)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: netns_ack ($tier)"
+            diff <(echo "$expect_nl") <(echo "$got") | head -6 | sed 's/^/     /'
+        fi
+    done
+    rm -f tests/fixtures/netns_ack.bin
+else
+    echo "SKIP build fixtures/netns_ack"
+fi
+
 # ---- /proc fidelity: guest-view magic links (root/cwd/exe/fd — root must not
 # escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo/
 # loadavg/uptime/version/auxv (incl. another guest PID's auxv — the gdb-attach

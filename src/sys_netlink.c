@@ -98,7 +98,116 @@ void nl_unmark_fd(struct Machine *m, int fd)
         free(m->nl_fds[i].reply);
         m->nl_fds[i] = m->nl_fds[--m->nl_fds_count];
     }
+    /* Same for the real-NETLINK_ROUTE table: an fd number outliving its socket
+     * there would make us inspect an unrelated file's traffic. */
+    for (int j = 0; j < m->nlr_fds_count; j++) {
+        if (m->nlr_fds[j] == fd) {
+            m->nlr_fds[j] = m->nlr_fds[--m->nlr_fds_count];
+            break;
+        }
+    }
+    if (m->nl_ack_pending && m->nl_ack_fd == fd)
+        m->nl_ack_pending = 0;
     pthread_mutex_unlock(&nl_lock);
+}
+
+/* --- faked net namespace: ack what the host refuses (proot 87af48f5) ------
+ * A guest whose CLONE_NEWNET we faked believes it configures a namespace of
+ * its own, but its real NETLINK_ROUTE socket lives in the host's namespace
+ * where it has no CAP_NET_ADMIN. rtnetlink answers every reconfiguring
+ * request with NLMSG_ERROR(-EPERM) (or -EACCES), which kills bubblewrap's
+ * loopback_setup(). Let the request reach the kernel untouched and rewrite
+ * only that refusal in the reply the guest reads: the ack is the kernel's
+ * own, so its sequence number and port id are the ones the caller expects. */
+
+/* rtnetlink message types come in groups of four -- NEW, DEL, GET, SET -- and
+ * everything but the GET reconfigures the network. */
+static bool nlr_type_reconfigures(uint16_t type)
+{
+    if (type < RTM_BASE || type > RTM_MAX)
+        return false;
+    return ((type - RTM_BASE) & 3) != 2 /* RTM_GET* */;
+}
+
+/* True for a real NETLINK_ROUTE fd held by a guest that thinks it owns a
+ * network namespace. Caller holds nl_lock. */
+static bool nlr_is_netns_fd(struct Machine *m, int fd)
+{
+    if (!m->fake_netns || fd < 0)
+        return false;
+    for (int i = 0; i < m->nlr_fds_count; i++)
+        if (m->nlr_fds[i] == fd)
+            return true;
+    return false;
+}
+
+void nlr_mark_fd(struct Machine *m, int fd)
+{
+    pthread_mutex_lock(&nl_lock);
+    if (fd >= 0 && m->nlr_fds_count < NLR_MAX_FDS) {
+        bool present = false;
+        for (int i = 0; i < m->nlr_fds_count; i++)
+            if (m->nlr_fds[i] == fd) { present = true; break; }
+        if (!present)
+            m->nlr_fds[m->nlr_fds_count++] = fd;
+    }
+    pthread_mutex_unlock(&nl_lock);
+}
+
+void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
+{
+    struct nlmsghdr hdr;
+
+    if (!msg || len < sizeof(hdr))
+        return;
+    memcpy(&hdr, msg, sizeof(hdr));
+    if (!nlr_type_reconfigures(hdr.nlmsg_type))
+        return;
+
+    pthread_mutex_lock(&nl_lock);
+    if (nlr_is_netns_fd(m, fd)) {
+        m->nl_ack_pending = 1;
+        m->nl_ack_fd = fd;
+        m->nl_ack_seq = hdr.nlmsg_seq;
+    }
+    pthread_mutex_unlock(&nl_lock);
+}
+
+int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
+{
+    int fixed = 0;
+
+    pthread_mutex_lock(&nl_lock);
+    if (!m->nl_ack_pending || m->nl_ack_fd != fd) {
+        pthread_mutex_unlock(&nl_lock);
+        return 0;
+    }
+    /* Walk the datagram's messages for the NLMSG_ERROR carrying our sequence
+     * number. Only the expected permission refusal is rewritten -- a real
+     * error (EINVAL on a malformed request, say) must still reach the guest. */
+    for (size_t off = 0; off + NLMSG_HDRLEN + sizeof(int) <= len; ) {
+        struct nlmsghdr hdr;
+        memcpy(&hdr, (char *)buf + off, sizeof(hdr));
+        if (hdr.nlmsg_len < NLMSG_HDRLEN)
+            break;
+        if (hdr.nlmsg_type == NLMSG_ERROR && hdr.nlmsg_seq == m->nl_ack_seq) {
+            int error;
+            memcpy(&error, (char *)buf + off + NLMSG_HDRLEN, sizeof(error));
+            if (error != -EPERM && error != -EACCES)
+                break;                     /* a real error: report it as is */
+            error = 0;
+            memcpy((char *)buf + off + NLMSG_HDRLEN, &error, sizeof(error));
+            fixed = 1;
+            break;
+        }
+        off += NLMSG_ALIGN(hdr.nlmsg_len);
+    }
+    /* MSG_PEEK leaves the reply in the socket: keep the note for the read that
+     * consumes it. */
+    if (!peek)
+        m->nl_ack_pending = 0;
+    pthread_mutex_unlock(&nl_lock);
+    return fixed;
 }
 
 /* --- host netlink probe (cached process-wide) --- */

@@ -118,6 +118,25 @@ struct Machine {
     } nl_fds[NL_MAX_FDS];
     int nl_fds_count;
 
+    /* Faked network namespace. A guest that asked for one (clone/unshare with
+     * CLONE_NEWNET) keeps talking to the host's namespace, where it has no
+     * CAP_NET_ADMIN: when the host does hand out a *real* NETLINK_ROUTE
+     * socket, rtnetlink answers every reconfiguring request with
+     * NLMSG_ERROR(-EPERM) and bubblewrap dies on the RTM_NEWADDR it sends for
+     * the loopback of the namespace it believes it got. Substituting the
+     * socket wholesale would cost the guest the real answers to its queries,
+     * so only those refusals are rewritten into plain acks: the real
+     * NETLINK_ROUTE fds are tracked, a reconfiguring request is noted, and the
+     * error field of the matching reply is zeroed as it is received
+     * (sys_netlink.c). Inherited by fork children like the fds themselves. */
+    u8 fake_netns;            /* this process asked for a net namespace */
+#define NLR_MAX_FDS 8
+    int nlr_fds[NLR_MAX_FDS]; /* real NETLINK_ROUTE fds held by this process */
+    int nlr_fds_count;
+    u8 nl_ack_pending;        /* a noted request awaits its reply */
+    int nl_ack_fd;            /* the socket it was sent on */
+    u32 nl_ack_seq;           /* its nlmsg_seq, matched in the reply */
+
     /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
      * backing memfd, because procps opens these once and lseek(0)+rereads

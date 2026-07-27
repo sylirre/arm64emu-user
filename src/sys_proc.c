@@ -138,6 +138,10 @@ SYSDEF(uname) {
 #define G_CLONE_CHILD_CLEARTID 0x00200000
 #define G_CLONE_CHILD_SETTID   0x01000000
 #define G_CSIGNAL       0x000000ff
+/* Namespace flags: unsupported in a user-mode chroot, so they are ignored
+ * rather than failed (sandbox helpers only check the return value). Only
+ * CLONE_NEWNET has a consequence — see m->fake_netns. */
+#define G_CLONE_NEWNET  0x40000000
 
 /* A spawned guest thread: its own CPU, sharing the Machine (address space,
  * fds, signal dispositions) with the rest of the process. The guest tid IS
@@ -311,6 +315,13 @@ SYSDEF(clone) {
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */
+        /* CLONE_NEWNET is stripped (we cannot create namespaces), but the
+         * child now believes it configures a network namespace of its own:
+         * remember that, so rtnetlink's refusals become acks. The inherited
+         * netlink fd tables come along with the fork; a reply pending on one
+         * belongs to whoever sent the request, so it does not carry over. */
+        if (flags & G_CLONE_NEWNET) m->fake_netns = 1;
+        m->nl_ack_pending = 0;
         if (flags & G_CLONE_CHILD_SETTID) {
             s32 tid = (s32)getpid();
             copy_to_guest(c, ctid, &tid, 4);
@@ -797,6 +808,22 @@ SYSDEF(setpgid) { return setpgid((pid_t)(s32)a0, (pid_t)(s32)a1) < 0 ? host_err(
 SYSDEF(getpgid) { pid_t r = getpgid((pid_t)(s32)a0); return r < 0 ? host_err() : (u64)r; }
 SYSDEF(setsid)  { pid_t r = setsid(); return r < 0 ? host_err() : (u64)r; }
 SYSDEF(getsid)  { pid_t r = getsid((pid_t)(s32)a0); return r < 0 ? host_err() : (u64)r; }
+
+/* Namespaces cannot be created in a user-mode chroot, but failing outright
+ * breaks sandbox helpers (bubblewrap, flatpak) that only check the return
+ * value, so pretend they succeeded — the same lie clone() already tells by
+ * silently ignoring the CLONE_NEW* flags. CLONE_NEWNET is the one with a
+ * consequence: the caller now expects to configure "its" interfaces, so
+ * remember it for the rtnetlink ack emulation (sys_netlink.c). */
+SYSDEF(unshare) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (a0 & G_CLONE_NEWNET) c->m->fake_netns = 1;
+    return 0;
+}
+SYSDEF(setns) {
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return 0;
+}
 
 SYSDEF(prctl) {
     int op = (int)a0;

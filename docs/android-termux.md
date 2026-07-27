@@ -45,7 +45,15 @@ unfiltered:
   are quiet `-ENOSYS` dispatcher entries and never reach the host.
 * **Netlink emulation**: where the host denies `AF_NETLINK` sockets (common
   under SELinux app policy), `NETLINK_ROUTE` is emulated in-process, so guest
-  `getifaddrs()`/`ip` keep working. The read-only `SIOCGIF*` interface-query
+  `getifaddrs()`/`ip` keep working. The probe that decides this sends a harmless
+  rtnetlink message too, not just `socket()`+`bind()`: SELinux filters netlink
+  per message type, and `untrusted_app` is granted `nlmsg_read` but not
+  `nlmsg_write`, so on those devices (kernel 4.14 era) a socket binds fine yet
+  rejects every configuring message with EACCES. Where the host *does* grant a
+  real socket, requests from a guest that thinks it unshared a network
+  namespace still can't succeed (no `CAP_NET_ADMIN`), so rtnetlink's `EPERM`
+  refusal is rewritten into the kernel's own ack — bubblewrap's
+  `loopback_setup()` depends on it. The read-only `SIOCGIF*` interface-query
   ioctls (`ifconfig`/net-tools) are likewise answered in-process from the host
   interface table, so they work even where the socket ioctls return EACCES.
 * **System V IPC** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
