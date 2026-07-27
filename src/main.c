@@ -28,7 +28,7 @@
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
-#define PROGRAM_VERSION "1.2.0"
+#define PROGRAM_VERSION "1.3.0"
 
 struct Machine g_machine;
 
