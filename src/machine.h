@@ -137,6 +137,14 @@ struct Machine {
     int nl_ack_fd;            /* the socket it was sent on */
     u32 nl_ack_seq;           /* its nlmsg_seq, matched in the reply */
 
+    /* prctl(PR_SET_NO_NEW_PRIVS) as the guest asked for it, which is not
+     * necessarily the host task flag: an Android app process already carries
+     * it from zygote, and answering PR_GET from the host would tell a guest it
+     * is locked down when it never asked (sudo-rs and friends refuse to run).
+     * One-way latch, fork-inherited with the rest of Machine, kept across
+     * execve exactly like the kernel's. */
+    u8 no_new_privs;
+
     /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
      * backing memfd, because procps opens these once and lseek(0)+rereads

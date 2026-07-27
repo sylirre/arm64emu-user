@@ -23,6 +23,14 @@
 #include "jit.h"
 #include "ptrace.h"
 
+/* Older libc headers (and some NDK levels) predate these prctl operations. */
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+#ifndef PR_GET_NO_NEW_PRIVS
+#define PR_GET_NO_NEW_PRIVS 39
+#endif
+
 SYSDEF(exit) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     /* A spawned guest thread (tid != pid) ends just itself; the run loop
@@ -306,12 +314,6 @@ SYSDEF(clone) {
         /* Only the forking thread exists here. */
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
-        /* A plain fork does not re-run load_elf, so publish the child (with the
-         * inherited cmdline/exe/cwd/environ/auxv and its own fresh starttime) or
-         * it would be invisible in the hidden /proc view until it execve'd. */
-        proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
-                         m->exec_path, m->cwd, m->environ, m->environ_len,
-                         m->auxv, m->auxv_len);
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */
@@ -335,6 +337,18 @@ SYSDEF(clone) {
         ptrace_fork_child(c, pt_ev);
         return 0;
     }
+    /* A plain fork does not re-run load_elf, so the child needs publishing (with
+     * the inherited cmdline/exe/cwd/environ/auxv and its own fresh starttime) or
+     * it stays invisible in the hidden /proc view until it execve's. The PARENT
+     * does it, not the child: the kernel guarantees /proc/<child> exists the
+     * moment clone(2) returns, and a caller that immediately looks the child up
+     * -- bubblewrap opens /proc/<pid>/ns right after cloning -- beat the child
+     * to its own registration and got ENOENT. Everything registered here is
+     * fork-inherited state, identical to what the child would have written, and
+     * the single writer keeps the slot's seqlock uncontended. */
+    proctab_register((s32)pid, m->cmdline, m->cmdline_len,
+                     m->exec_path, m->cwd, m->environ, m->environ_len,
+                     m->auxv, m->auxv_len);
     if (flags & G_CLONE_PARENT_SETTID) {
         s32 tid = (s32)pid;
         copy_to_guest(c, ptid, &tid, 4);
@@ -858,6 +872,25 @@ SYSDEF(prctl) {
         }
         case PR_SET_KEEPCAPS:
             return prctl(PR_SET_KEEPCAPS, (unsigned long)a1) < 0 ? host_err() : 0;
+        /* "No new privileges" is already true of every guest here: execve maps
+         * the ELF into the emulator's own address space and never honors a
+         * setuid bit, so nothing the guest can exec grants it anything. Set the
+         * host flag anyway -- guest processes *are* host processes, so the
+         * kernel's own fork/execve inheritance then applies for free -- but do
+         * not fail the guest if the host refuses (pre-3.5 kernel), since the
+         * guarantee does not depend on it. PR_GET is answered from the recorded
+         * intent, not from the host task, so an inherited flag (Android zygote
+         * sets one before its seccomp filter) is not reported as the guest's.
+         * Kernel argument rules: arg2 must be 1, arg3..arg5 zero, never clears.
+         * bubblewrap dies on the spot if this returns an error. */
+        case PR_SET_NO_NEW_PRIVS:
+            if (a1 != 1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            c->m->no_new_privs = 1;
+            return 0;
+        case PR_GET_NO_NEW_PRIVS:
+            if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            return c->m->no_new_privs;
         default:
             return (u64)(s64)-EINVAL;
     }
