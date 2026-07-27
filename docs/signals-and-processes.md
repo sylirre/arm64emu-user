@@ -80,6 +80,12 @@ Two consequences worth knowing:
   thread arms the fd but only that thread's own `read` consumes it. Every real
   signalfd user blocks the signal and reads it on one thread, which is exactly
   this case.
+- The mask, the pending set and the readiness belong to the **file
+  description**, not to an fd number: `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)`
+  register the copy too (keyed by the eventfd's inode, so the counter is armed
+  once no matter how many names it has). Without that a read on the duplicate
+  reached the bare eventfd, which carries readiness rather than signals and is
+  not even armed — the guest simply blocked forever.
 
 ### POSIX interval timers and the guest-32/33 carrier remap
 
@@ -111,6 +117,19 @@ never reaches the syscall level (guest libc implements it in userspace), and is
 rejected with `-EINVAL` like the kernel does — critically so, since letting it
 reach the *host* wrapper would spawn a host helper thread on a junk guest
 function pointer.
+
+### Blocked signals are held, not applied
+
+A blocked signal is *pending*, not delivered: the kernel holds it until the
+guest unblocks it. Only signals with a guest handler used to be caught here, so
+a signal the guest had blocked at `SIG_DFL` was left to the host default, which
+acted immediately — killing the process for most signals, and silently
+discarding `SIGCHLD`. `sig_host_update` therefore installs the capture handler
+for any signal the calling thread has blocked (as well as any a signalfd
+covers), and `sig_sync_host_mask` re-mirrors just the bits a `sigprocmask`
+changed, so the common case stays cheap. The signal then waits in the ring and
+the run loop applies the disposition at unblock time, terminating there if that
+is the default action — which is what the kernel does.
 
 ## Job control: mirroring the block mask to the host
 

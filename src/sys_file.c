@@ -1330,7 +1330,11 @@ SYSDEF(fcntl) {
     int fd = (int)a0, cmd = (int)a1;
     switch (cmd) {
         case F_DUPFD:
-        case F_DUPFD_CLOEXEC:
+        case F_DUPFD_CLOEXEC: {
+            int r = fcntl(fd, cmd, (int)a2);
+            if (r >= 0) sigfd_track_dup(c->m, fd, r);   /* as dup(2) above */
+            return r < 0 ? host_err() : (u64)r;
+        }
         case F_GETFD:
         case F_SETFD: {
             int r = fcntl(fd, cmd, (int)a2);
@@ -1394,10 +1398,19 @@ SYSDEF(fcntl) {
     }
 }
 
-SYSDEF(dup) { int r = dup((int)a0); return r < 0 ? host_err() : (u64)r; }
+SYSDEF(dup) {
+    int r = dup((int)a0);
+    if (r >= 0) sigfd_track_dup(c->m, (int)a0, r);   /* a signalfd's second name */
+    return r < 0 ? host_err() : (u64)r;
+}
 
 SYSDEF(dup3) {
+    /* dup2/dup3 also *replace* newfd, so whatever it named is gone. */
+    sigfd_unmark_fd(c->m, (int)a1);
+    procfs_unmark_fd(c->m, (int)a1);
+    nl_unmark_fd(c->m, (int)a1);
     int r = dup3((int)a0, (int)a1, oflags_g2h((int)a2));
+    if (r >= 0) sigfd_track_dup(c->m, (int)a0, r);
     return r < 0 ? host_err() : (u64)r;
 }
 

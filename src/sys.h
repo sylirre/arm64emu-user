@@ -78,6 +78,7 @@ int sigfd_tracked(struct Machine *m, int fd);
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
 void sigfd_sync(struct Machine *m);
 void sigfd_unmark_fd(struct Machine *m, int fd);
+void sigfd_track_dup(struct Machine *m, int oldfd, int newfd);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 

@@ -96,6 +96,26 @@ int main(void) {
     waitpid(kid, &st, 0);
     printf("reaped=%d\n", WIFEXITED(st) && WEXITSTATUS(st) == 7);
 
+    /* dup(2) gives a second name for the same signalfd: the queued signals,
+     * the mask and the readiness are the file description's, not the fd
+     * number's, so either fd must see all of it. */
+    int fl2 = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl2 | O_NONBLOCK);
+    printf("remask2=%d\n", signalfd(fd, &just_usr, 0) == fd);
+    int dfd = dup(fd);
+    printf("dup_ok=%d\n", dfd >= 0 && dfd != fd);
+    raise(SIGUSR1);
+    n = read(dfd, si, sizeof si[0]);
+    printf("dup_read=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    /* A mask set through one fd applies to the other. */
+    printf("dup_remask=%d\n", signalfd(dfd, &just_chld_early, 0) == dfd);
+    raise(SIGUSR2);                       /* no longer covered: not readable */
+    struct pollfd pf2 = { fd, POLLIN, 0 };
+    printf("dup_masked_out=%d\n", poll(&pf2, 1, 0));
+    sigtimedwait(&just_usr, NULL, &zero);   /* drain it again */
+    close(dfd);
+    printf("after_close=%zd\n", read(fd, si, sizeof si[0]));
+
     /* Bad arguments. */
     printf("badflags=%d\n", signalfd(-1, &just_usr, 1 << 30) < 0 && errno == EINVAL);
     close(fd);

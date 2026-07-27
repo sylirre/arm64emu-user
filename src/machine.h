@@ -350,7 +350,7 @@ void sig_return(CPU *c);
 void sig_reset_for_exec(struct Machine *m);
 /* Mirror the calling thread's guest block-state of terminal job-control
  * signals to the host process mask. */
-void sig_sync_host_mask(void);
+void sig_sync_host_mask(struct Machine *m);
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
 void sig_install_kick_net(void);

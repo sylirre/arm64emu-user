@@ -267,8 +267,10 @@ void sig_install_kick_net(void) {
     sigaction(PTRACE_KICKSIG, &sa, NULL);
 }
 
-/* Mirror the guest block-state of the terminal job-control signals to the host
- * process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
+/* Mirror the guest block-state to the host where it has to be observed.
+ *
+ * Two separate things happen here. First the terminal job-control signals are
+ * mirrored onto the host process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
  * kernel* (tcsetpgrp, background terminal I/O) and would stop our process
  * before the run loop can mediate; SIGTSTP travels with them in bash's
  * give_terminal_to() critical section. When the guest blocks one of these
@@ -276,7 +278,7 @@ void sig_install_kick_net(void) {
  * then suppresses the signal entirely instead of stopping us. The guest
  * blocked set is per-thread (g_tls); the shells that need this mirroring are
  * single-threaded, so mirroring the calling thread's view suffices. */
-void sig_sync_host_mask(void) {
+void sig_sync_host_mask(struct Machine *m) {
     static const int sigs[] = { SIGTTOU, SIGTTIN, SIGTSTP };
     sigset_t block, unblock;
     sigemptyset(&block);
@@ -287,6 +289,19 @@ void sig_sync_host_mask(void) {
     }
     sigprocmask(SIG_BLOCK, &block, NULL);
     sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+
+    /* Then the dispositions of whatever the guest just blocked or unblocked:
+     * at SIG_DFL a *blocked* signal has to be caught rather than left to the
+     * host default, which would act on it right now. Only the bits that
+     * changed are re-mirrored -- shells call sigprocmask constantly. */
+    static __thread u64 mirrored;
+    u64 changed = mirrored ^ g_tls.sigmask;
+    mirrored = g_tls.sigmask;
+    for (int s = 1; changed && s <= 64; s++)
+        if (changed & (1ULL << (s - 1))) {
+            changed &= ~(1ULL << (s - 1));
+            sig_host_update(m, s);
+        }
 }
 
 void sig_host_update(struct Machine *m, int sig) {
@@ -316,11 +331,16 @@ void sig_host_update(struct Machine *m, int sig) {
          * sync fault signals still arrive from the interpreter, so skip those).
          * Dispositions are process-wide, so the catcher stays while *any* thread
          * of this process is traced (ptrace_traced), not just the calling one. */
-        /* Likewise when a signalfd covers this signal: it reads from the
-         * capture ring, so the signal has to be caught and queued even at
-         * SIG_DFL -- the host default would otherwise discard it (SIGCHLD)
-         * or kill us outright, and the fd would never become readable. */
-        if ((m->sfd_mask & (1ULL << (sig - 1))) && !is_sync_sig(sig)) {
+        /* Likewise when the guest has this signal BLOCKED, or a signalfd
+         * covers it. A blocked signal is pending, not delivered: the kernel
+         * holds it until the guest unblocks it, and the run loop applies the
+         * disposition then (terminating on a default-terminate signal, exactly
+         * as the kernel would). Left at the host default it would instead act
+         * immediately -- killing us for most signals, and silently discarding
+         * the SIGCHLD a signalfd was waiting for, so the fd never became
+         * readable. */
+        if (((g_tls.sigmask | m->sfd_mask) & (1ULL << (sig - 1))) &&
+            !is_sync_sig(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -515,7 +535,7 @@ void sig_return(CPU *c) {
     c->nzcv = (u32)v & (PS_N | PS_Z | PS_C | PS_V);
     if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) < 0) goto bad;
     g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    sig_sync_host_mask();
+    sig_sync_host_mask(c->m);
     /* fpsimd */
     u32 magic = 0;
     copy_from_guest(c, &magic, frame + MC_RESERVED, 4);

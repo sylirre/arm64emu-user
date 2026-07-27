@@ -61,7 +61,7 @@ SYSDEF(rt_sigprocmask) {
         }
         /* SIGKILL/SIGSTOP cannot be blocked */
         g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-        sig_sync_host_mask();   /* propagate job-control-signal block state */
+        sig_sync_host_mask(c->m);   /* propagate the new block state to the host */
     }
     if (a2 && copy_to_guest(c, a2, &old, 8) < 0) return (u64)(s64)-EFAULT;
     return 0;
@@ -90,7 +90,7 @@ SYSDEF(rt_sigsuspend) {
     g_tls.saved_sigmask = g_tls.sigmask;
     g_tls.have_saved_sigmask = 1;
     g_tls.sigmask = set;
-    sig_sync_host_mask();
+    sig_sync_host_mask(c->m);
     /* Sleep until the capture queue holds a deliverable signal. A bare
      * pause() loses the race against a signal captured *before* it parks:
      * the kernel's sigsuspend swaps the mask and sleeps atomically, but here
@@ -247,6 +247,16 @@ static int sfd_slot(struct Machine *m, int fd) {
     return -1;
 }
 
+/* Every fd naming the same signalfd is one entry here, so mask changes and
+ * readiness have to apply to the *file description* (the recorded eventfd
+ * inode), not to one fd number: dup(2) hands the guest a second name for the
+ * same signalfd, and the kernel's mask and pending set are shared between
+ * them. */
+static void sfd_set_mask(struct Machine *m, u64 ino, u64 mask) {
+    for (int i = 0; i < m->sfd_fds_count; i++)
+        if (m->sfd_fds[i].ino == ino) m->sfd_fds[i].mask = mask;
+}
+
 /* Recompute the union of the live masks and re-mirror every disposition it
  * newly covers: a signal nobody handles must still be caught and queued for a
  * signalfd to see it (sig_host_update reads m->sfd_mask). */
@@ -287,6 +297,10 @@ void sigfd_sync(struct Machine *m) {
     if (!m->sfd_fds_count) return;   /* unlocked fast path */
     pthread_mutex_lock(&sfd_lock);
     for (int i = 0; i < m->sfd_fds_count; i++) {
+        int dup_of = -1;   /* one eventfd counter per description, not per fd */
+        for (int j = 0; j < i; j++)
+            if (m->sfd_fds[j].ino == m->sfd_fds[i].ino) { dup_of = j; break; }
+        if (dup_of >= 0) { m->sfd_fds[i].armed = m->sfd_fds[dup_of].armed; continue; }
         int want = sig_fd_pending(m->sfd_fds[i].mask);
         u64 one = 1;
         if (want && !m->sfd_fds[i].armed) {
@@ -294,6 +308,22 @@ void sigfd_sync(struct Machine *m) {
         } else if (!want && m->sfd_fds[i].armed) {
             if (read(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 0;
         }
+    }
+    pthread_mutex_unlock(&sfd_lock);
+}
+
+/* A second fd for an existing signalfd (dup/dup2/dup3, fcntl F_DUPFD): the
+ * copy has to be tracked too, or read(2) on it would reach the bare eventfd --
+ * which carries readiness, not signals, and is not even armed unless something
+ * synced it, so the guest simply blocked forever. */
+void sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
+    if (!m->sfd_fds_count || oldfd == newfd) return;   /* unlocked fast path */
+    pthread_mutex_lock(&sfd_lock);
+    int i = sfd_slot(m, oldfd);
+    if (i >= 0 && m->sfd_fds_count < SFD_MAX_FDS) {
+        m->sfd_fds[m->sfd_fds_count] = m->sfd_fds[i];
+        m->sfd_fds[m->sfd_fds_count].fd = newfd;
+        m->sfd_fds_count++;
     }
     pthread_mutex_unlock(&sfd_lock);
 }
@@ -345,7 +375,7 @@ SYSDEF(signalfd4) {
     if (fd >= 0) {
         pthread_mutex_lock(&sfd_lock);
         int i = sfd_slot(m, fd);
-        if (i >= 0) { m->sfd_fds[i].mask = mask; sfd_remask(m); }
+        if (i >= 0) { sfd_set_mask(m, m->sfd_fds[i].ino, mask); sfd_remask(m); }
         pthread_mutex_unlock(&sfd_lock);
         if (i < 0) return (u64)(s64)-EINVAL;
         sigfd_sync(m);
