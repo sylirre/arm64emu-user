@@ -54,6 +54,8 @@ enum {
     AT_CLONEFLAGS, /* clone/unshare flags (CLONE_*) */
     AT_SIGMASK,    /* pointer to a 64-bit sigset: [SIGUSR1 SIGCHLD] */
     AT_SFDFLAGS,   /* signalfd4 flags (SFD_*) */
+    AT_SECCOMPOP,  /* seccomp(2) operation */
+    AT_SECCOMPFLG, /* seccomp(2) filter flags */
     AT_SODOMAIN,   /* socket domain (AF_*) */
     AT_SOTYPE,     /* socket type (SOCK_* base + flag bits) */
     /* System V IPC */
@@ -263,6 +265,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_rt_sigaction,   { AT_SIG, AT_PTR, AT_PTR, AT_UINT }, 0 },
     { G_NR_rt_sigprocmask, { AT_SIGHOW, AT_SIGMASK, AT_PTR, AT_UINT }, 0 },
     { G_NR_signalfd4, { AT_FD, AT_SIGMASK, AT_UINT, AT_SFDFLAGS }, 0 },
+    { G_NR_seccomp,   { AT_SECCOMPOP, AT_SECCOMPFLG, AT_PTR }, 0 },
     { G_NR_rt_sigreturn,   { AT_NONE }, 0 },
     { G_NR_rt_sigpending,  { AT_PTR, AT_UINT }, 0 },
     { G_NR_rt_sigsuspend,  { AT_PTR, AT_UINT }, 0 },
@@ -435,6 +438,17 @@ static const struct enumname sig_tab[] = {
     { 21, "SIGTTIN" }, { 22, "SIGTTOU" }, { 23, "SIGURG" }, { 24, "SIGXCPU" },
     { 25, "SIGXFSZ" }, { 26, "SIGVTALRM" }, { 27, "SIGPROF" }, { 28, "SIGWINCH" },
     { 29, "SIGIO" }, { 30, "SIGPWR" }, { 31, "SIGSYS" }, { 0, NULL }
+};
+static const struct enumname seccompop_tab[] = {
+    { 0, "SECCOMP_SET_MODE_STRICT" }, { 1, "SECCOMP_SET_MODE_FILTER" },
+    { 2, "SECCOMP_GET_ACTION_AVAIL" }, { 3, "SECCOMP_GET_NOTIF_SIZES" },
+    { 0, NULL }
+};
+static const struct flagname seccompflg_tab[] = {
+    { 1, "SECCOMP_FILTER_FLAG_TSYNC" }, { 2, "SECCOMP_FILTER_FLAG_LOG" },
+    { 4, "SECCOMP_FILTER_FLAG_SPEC_ALLOW" },
+    { 8, "SECCOMP_FILTER_FLAG_NEW_LISTENER" },
+    { 16, "SECCOMP_FILTER_FLAG_TSYNC_ESRCH" }, { 0, NULL }
 };
 static const struct flagname sfd_tab[] = {
     { 0004000, "SFD_NONBLOCK" }, { 02000000, "SFD_CLOEXEC" }, { 0, NULL }
@@ -822,6 +836,8 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_CLONEFLAGS:  fmt_flags(s, v, clone_tab, "0"); break;
     case AT_SIGMASK:     fmt_sigmask(s, c, v); break;
     case AT_SFDFLAGS:    fmt_flags(s, v, sfd_tab, "0"); break;
+    case AT_SECCOMPOP:   fmt_enum(s, v, seccompop_tab); break;
+    case AT_SECCOMPFLG:  fmt_flags(s, v, seccompflg_tab, "0"); break;
     case AT_SODOMAIN:    fmt_enum(s, v, af_tab); break;
     case AT_SOTYPE:      fmt_sotype(s, v); break;
     case AT_IPCKEY:

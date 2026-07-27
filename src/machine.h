@@ -168,6 +168,16 @@ struct Machine {
     char uid_map[IDMAP_MAX];       /* kernel-formatted text, "" until written */
     char gid_map[IDMAP_MAX];
 
+    /* seccomp-BPF (sys_seccomp.c). A guest filter is evaluated by the syscall
+     * dispatcher, not installed on the host: a host filter would see the
+     * emulator's own syscalls -- an entirely different stream, on a different
+     * architecture -- and killing the emulator is not what the guest asked
+     * for. The chain is newest-first, malloc'd, and so copied by fork and kept
+     * across execve, exactly as the kernel keeps filters. Threads share it,
+     * which is the kernel's TSYNC behavior rather than its default. */
+    u8 seccomp_mode;          /* G_SECCOMP_MODE_* (0 = none: the hot path) */
+    void *seccomp_filters;    /* struct SeccompProg *, newest first */
+
     /* signalfd(2) descriptors held by this process. A host signalfd cannot
      * serve the guest: the emulator catches signals itself, so none is ever
      * left pending host-side and the fd would stay silent forever. Each guest
@@ -341,6 +351,8 @@ int  sig_arm_rt_remap(int guest_sig);
 int  ptimer_siginfo(s32 slot, u64 *val);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
+/* SECCOMP_RET_TRAP: SIGSYS carrying the blocked syscall (sys_seccomp.c). */
+void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr);
 /* Queue a signal into this thread's capture ring for cooperative delivery
  * (routes a traced process's self-directed stop signal through ptrace). */
 void sig_raise_local(int sig);

@@ -209,14 +209,48 @@ the path it just got from `readlink`, so the two have to agree.
 
 **Sandbox helpers.** Together with the faked namespaces (`unshare`/`setns`
 succeed, `clone` strips `CLONE_NEW*`), the writable id maps of a faked user
-namespace, `signalfd`, and the rtnetlink ack for a faked network namespace, this
-is enough to run **bubblewrap** unmodified:
+namespace, `signalfd`, enforced `seccomp` filters and the rtnetlink ack for a
+faked network namespace, this is enough to run **bubblewrap** unmodified:
 `bwrap --unshare-all --bind / / --proc /proc --dev /dev CMD` works, including its
 `--tmpfs`, `--ro-bind` and pid-namespace monitor. It is emulation, not
 containment: the sandbox is a rearranged view of the same rootfs, enforced only
 because the emulator mediates every syscall, and a faked `CLONE_NEWPID` leaves
 the guest's pids alone. `tests/fixtures/sandbox_probe.c` pins the whole stack
 down (qemu cannot be the oracle: the real kernel refuses all of it unprivileged).
+
+**`seccomp(2)`** (`src/sys_seccomp.c`) is *enforced*, not faked. A guest filter
+is classic BPF over `struct seccomp_data` and is meant to constrain **guest**
+syscalls — guest numbers, guest arguments, `AUDIT_ARCH_AARCH64`. Handing it to
+the host would apply it to something else entirely (the emulator's own host
+syscalls, on the host's ISA, issued to serve calls the guest never made), and
+its first mismatch would kill the emulator rather than the guest. But the
+emulator already sees every guest syscall at one choke point, so the filter is
+simply evaluated there, between the ptrace syscall-entry stop and the handler —
+the kernel's own order, since a tracer may have rewritten the number the filter
+is meant to judge.
+
+What that buys: `bwrap --seccomp`, flatpak's syscall blacklists and any
+libseccomp-generated program behave as they would on a kernel. The accepted
+instruction set is the kernel's (`seccomp_check_filter`): 32-bit aligned
+absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset, jumps
+forward and in range, a `RET` last — anything else is `EINVAL` at install time.
+`SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
+`TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, the call skipped
+with `-ENOSYS`), `TRACE` (no listener here, so the kernel's no-tracer answer:
+skip and `ENOSYS`), `KILL_THREAD`/`KILL_PROCESS` and unknown actions (SIGSYS
+death) are all implemented, as is strict mode (`read`/`write`/`exit`/
+`rt_sigreturn` only, SIGKILL for the rest). Filters stack, every one runs, and
+the most severe answer wins with the newest breaking ties. `no_new_privs` is
+required exactly as the kernel requires it, a mode cannot be switched once set,
+and the chain is inherited by fork and kept across execve.
+
+Two divergences worth knowing: threads share the chain (the kernel's `TSYNC`
+behavior rather than its per-thread default), so a filter installed by one
+thread applies to the process; and `SECCOMP_RET_USER_NOTIF` is declined at
+install (`SECCOMP_FILTER_FLAG_NEW_LISTENER` → `EOPNOTSUPP`), since servicing a
+notification fd would mean parking guest syscalls on an external agent. Note
+this is entirely separate from the emulator's *own* SIGSYS net, which absorbs
+the **host** seccomp filter Android imposes on the emulator process.
 
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
 contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/

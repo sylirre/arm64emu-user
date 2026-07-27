@@ -416,6 +416,57 @@ typedef struct {
 #define G_SIGEV_NONE      1
 #define G_SIGEV_THREAD_ID 4
 
+/* ---- seccomp(2) ----
+ * A guest filter is classic BPF over struct seccomp_data. The emulator
+ * dispatches every guest syscall itself, so the filter is evaluated there
+ * (sys_seccomp.c) rather than handed to the host -- a host filter would see
+ * the emulator's own syscalls, which have nothing to do with the guest's. */
+#define G_SECCOMP_SET_MODE_STRICT   0
+#define G_SECCOMP_SET_MODE_FILTER   1
+#define G_SECCOMP_GET_ACTION_AVAIL  2
+#define G_SECCOMP_GET_NOTIF_SIZES   3
+
+#define G_SECCOMP_FILTER_FLAG_TSYNC         (1u << 0)
+#define G_SECCOMP_FILTER_FLAG_LOG           (1u << 1)
+#define G_SECCOMP_FILTER_FLAG_SPEC_ALLOW    (1u << 2)
+#define G_SECCOMP_FILTER_FLAG_NEW_LISTENER  (1u << 3)
+#define G_SECCOMP_FILTER_FLAG_TSYNC_ESRCH   (1u << 4)
+
+/* prctl(PR_SET_SECCOMP) / PR_GET_SECCOMP modes. */
+#define G_SECCOMP_MODE_DISABLED 0
+#define G_SECCOMP_MODE_STRICT   1
+#define G_SECCOMP_MODE_FILTER   2
+
+/* Filter return actions. Lower (masked with G_SECCOMP_RET_ACTION) is more
+ * severe, which is how the kernel picks between stacked filters. */
+#define G_SECCOMP_RET_KILL_PROCESS 0x80000000u
+#define G_SECCOMP_RET_KILL_THREAD  0x00000000u
+#define G_SECCOMP_RET_TRAP         0x00030000u
+#define G_SECCOMP_RET_ERRNO        0x00050000u
+#define G_SECCOMP_RET_USER_NOTIF   0x7fc00000u
+#define G_SECCOMP_RET_TRACE        0x7ff00000u
+#define G_SECCOMP_RET_LOG          0x7ffc0000u
+#define G_SECCOMP_RET_ALLOW        0x7fff0000u
+#define G_SECCOMP_RET_ACTION_FULL  0xffff0000u
+#define G_SECCOMP_RET_ACTION       0x7fff0000u
+#define G_SECCOMP_RET_DATA         0x0000ffffu
+
+/* What a filter reads: fixed layout, native endianness, 32-bit aligned. */
+typedef struct {
+    s32 nr;
+    u32 arch;
+    u64 instruction_pointer;
+    u64 args[6];
+} GSeccompData;
+
+/* struct sock_filter (8 bytes, arch-independent) and struct sock_fprog as the
+ * LP64 guest lays it out: a 16-bit length, padding, then the 64-bit pointer. */
+typedef struct { u16 code; u8 jt; u8 jf; u32 k; } GSockFilter;
+typedef struct { u16 len; u16 __pad[3]; u64 filter; } GSockFprog;
+
+#define G_AUDIT_ARCH_AARCH64 0xc00000b7u   /* EM_AARCH64 | 64BIT | LE */
+#define G_BPF_MAXINSNS 4096
+
 /* struct signalfd_siginfo: what a read(2) on a signalfd returns, one per
  * signal. Fixed-width throughout, so the layout is the same on every arch and
  * host word size; the tail padding brings it to the ABI's 128 bytes. */

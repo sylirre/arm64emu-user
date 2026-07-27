@@ -56,6 +56,7 @@ src/
   sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
   sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, writable uid_map/gid_map/setgroups of a faked user namespace, ...)
   sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)
+  sys_seccomp.c                      seccomp(2): classic-BPF evaluator over guest seccomp_data, run by the dispatcher for every guest syscall (a host filter would see the emulator's own syscalls instead)
   proctab.c                          Shared-memory guest-PID registry (cross-process ps/top view) + unified IPC broker daemon backing System V IPC: owns shm memfd/file backings (handed out over SCM_RIGHTS) and all semaphore/message-queue state, parks blocking semop/msgsnd/msgrcv waiters, applies SEM_UNDO at process death, self-cleans on idle
   ptracetab.c ptrace.h               Cross-process ptrace(2): shared tracer<->tracee link registry + futex mailbox (tracee services PEEK/POKE/GETREGSET/CONT about itself while parked at a stop)
   signal.c                           Host capture -> guest rt_sigframe / rt_sigreturn

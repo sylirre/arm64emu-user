@@ -31,6 +31,9 @@
 #define GSIG_DFL 0
 #define GSIG_IGN 1
 
+/* si_code of a SIGSYS raised by a seccomp filter (SYS_SECCOMP). */
+#define SIG_SECCOMP_CODE 1
+
 /* guest SA_* flag values (arm64 == asm-generic) */
 #define G_SA_NOCLDSTOP 0x00000001
 #define G_SA_NOCLDWAIT 0x00000002
@@ -461,6 +464,12 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
         wr32(c, frame, SI_OFF + 24, (u32)info->status);
     } else if (is_sync_sig(sig)) {
         wr64(c, frame, SI_OFF + 16, info->addr);
+    } else if (sig == SIGSYS && info->code == SIG_SECCOMP_CODE) {
+        /* _sigsys: the call address, the syscall number and the architecture
+         * -- what a seccomp trap handler reads to decide what was blocked. */
+        wr64(c, frame, SI_OFF + 16, info->addr);
+        wr32(c, frame, SI_OFF + 24, (u32)info->status);
+        wr32(c, frame, SI_OFF + 28, G_AUDIT_ARCH_AARCH64);
     } else {
         wr32(c, frame, SI_OFF + 16, (u32)info->pid);
         wr32(c, frame, SI_OFF + 20, (u32)info->uid);
@@ -772,6 +781,36 @@ void sig_deliver_pending(CPU *c) {
         return;   /* one at a time; the next check happens after sigreturn */
     }
     g_sig_npend = 0;
+}
+
+/* SECCOMP_RET_TRAP: SIGSYS to the guest, carrying the blocked syscall. It is
+ * synchronous like a fault -- the guest is at the syscall it just attempted --
+ * so it takes the same path, but with the _sigsys siginfo fields. The `data`
+ * bits of the filter's return travel in si_errno, as the kernel puts them. */
+void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr) {
+    struct Machine *m = c->m;
+    int sig = SIGSYS;
+    if (UNLIKELY(g_ptrace_active)) {
+        int ns = ptrace_report_fault(c, sig, SIG_SECCOMP_CODE, c->pc);
+        if (ns == 0) return;
+        sig = ns;
+    }
+    u64 h = m->sigact[sig].handler;
+    if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
+        PendSig p;
+        memset(&p, 0, sizeof p);
+        p.signo = sig;
+        p.code = SIG_SECCOMP_CODE;
+        p.addr = c->pc;
+        p.status = nr;
+        (void)data;
+        g_tls.sc_ret_eintr = 0;
+        deliver_to_handler(c, sig, &p);
+        return;
+    }
+    /* No handler: the default action for SIGSYS is to terminate, and a filter
+     * that traps a call the guest cannot survive means exactly that. */
+    guest_terminate_by_signal(c, sig);
 }
 
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr) {

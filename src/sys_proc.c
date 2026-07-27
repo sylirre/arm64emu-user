@@ -915,6 +915,14 @@ SYSDEF(prctl) {
         case PR_GET_NO_NEW_PRIVS:
             if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
             return c->m->no_new_privs;
+        /* The older way into seccomp, and still the one bubblewrap uses.
+         * PR_GET_SECCOMP reports the mode -- and, per the kernel, kills a
+         * process already in strict mode for asking (prctl is not on strict
+         * mode's allow-list, so the gate has already dealt with it). */
+        case PR_SET_SECCOMP:
+            return (u64)seccomp_prctl_set(c, a1, a2);
+        case PR_GET_SECCOMP:
+            return c->m->seccomp_mode;
         default:
             return (u64)(s64)-EINVAL;
     }

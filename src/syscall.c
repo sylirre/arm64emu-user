@@ -24,7 +24,7 @@ SYSDEF(renameat2); SYSDEF(symlinkat); SYSDEF(linkat); SYSDEF(ftruncate);
 SYSDEF(fchmod); SYSDEF(fchmodat); SYSDEF(fchownat); SYSDEF(fchown);
 SYSDEF(utimensat); SYSDEF(fsync); SYSDEF(fdatasync); SYSDEF(sendfile);
 SYSDEF(sync); SYSDEF(syncfs); SYSDEF(readahead);
-SYSDEF(mount); SYSDEF(pivot_root); SYSDEF(umount2);
+SYSDEF(mount); SYSDEF(pivot_root); SYSDEF(seccomp); SYSDEF(umount2);
 SYSDEF(fallocate); SYSDEF(statfs); SYSDEF(fstatfs); SYSDEF(truncate);
 SYSDEF(statx); SYSDEF(ppoll); SYSDEF(pselect6); SYSDEF(splice);
 SYSDEF(copy_file_range); SYSDEF(flock); SYSDEF(faccessat2);
@@ -127,6 +127,7 @@ static const struct {
     { G_NR_chroot, sys_chroot, "chroot" },
     { G_NR_mount, sys_mount, "mount" },
     { G_NR_pivot_root, sys_pivot_root, "pivot_root" },
+    { G_NR_seccomp, sys_seccomp, "seccomp" },
     { G_NR_umount2, sys_umount2, "umount2" },
     { G_NR_fchmod, sys_fchmod, "fchmod" },
     { G_NR_fchmodat, sys_fchmodat, "fchmodat" },
@@ -363,7 +364,7 @@ static const u16 quiet_enosys[] = {
     /* clock setting */
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
-    G_NR_kcmp, G_NR_seccomp, G_NR_bpf, G_NR_pkey_mprotect,
+    G_NR_kcmp, G_NR_bpf, G_NR_pkey_mprotect,
     G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
@@ -412,7 +413,6 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_remap_file_pages, "remap_file_pages" },
     { G_NR_restart_syscall, "restart_syscall" }, { G_NR_rseq, "rseq" },
     { G_NR_sched_getattr, "sched_getattr" }, { G_NR_sched_setattr, "sched_setattr" },
-    { G_NR_seccomp, "seccomp" },
     { G_NR_setdomainname, "setdomainname" }, { G_NR_set_mempolicy, "set_mempolicy" },
     { G_NR_set_mempolicy_home_node, "set_mempolicy_home_node" },
     { G_NR_settimeofday, "settimeofday" },
@@ -464,9 +464,19 @@ void syscall_dispatch(CPU *c) {
     StraceSnap snap;
     if (m->strace_full) strace_pre(c, nr, av, &snap);
 
+    /* seccomp-BPF, after the ptrace entry stop (a tracer may have rewritten the
+     * number the filter is meant to judge) and before the handler, which is the
+     * kernel's order. Gated on a mode byte that is zero for every guest that
+     * never installed a filter. */
+    s64 scret = 0;
+    int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
+    if (UNLIKELY(m->seccomp_mode)) scskip = seccomp_gate(c, nr, av, &scret);
+
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;
-    if (nr == (u64)-1) {
+    if (scskip) {
+        ret = (u64)scret;   /* filtered out: the call never runs */
+    } else if (nr == (u64)-1) {
         ret = c->x[0];   /* tracer cancelled the syscall (nr := -1) */
     } else if (fn) {
         ret = fn(c, a0, a1, a2, a3, a4, a5);
@@ -525,4 +535,10 @@ void syscall_dispatch(CPU *c) {
         }
     }
     syscall_return(c, ret);
+
+    /* SECCOMP_RET_TRAP: now that the result is in x0, the SIGSYS frame
+     * captures it and the guest's handler runs with x0..x2 as its arguments;
+     * sigreturn restores the result the guest then observes. */
+    if (UNLIKELY(scskip == 2))
+        sig_deliver_seccomp_trap(c, 0, (s32)nr);
 }

@@ -80,6 +80,13 @@ void sigfd_sync(struct Machine *m);
 void sigfd_unmark_fd(struct Machine *m, int fd);
 void sigfd_track_dup(struct Machine *m, int oldfd, int newfd);
 
+/* sys_seccomp.c: guest seccomp-BPF. seccomp_gate runs the installed filters
+ * for one guest syscall; it returns 1 when the call must not run (with *ret as
+ * the guest's return value), 0 to proceed, and does not return at all for a
+ * killing action. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret);
+s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
+
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
 /* sys_ipc.c: System V shm attachment bookkeeping across fork/exec/exit.

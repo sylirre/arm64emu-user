@@ -168,9 +168,14 @@ arm64chroot --fake-id ./rootfs \
     bwrap --unshare-all --bind / / --proc /proc --dev /dev /bin/sh
 ```
 
-This is emulation, not containment — the sandbox is a rearranged view of the
-same rootfs, and the namespaces it thinks it created do not exist. It is enough
-for helpers that only check whether their setup calls succeeded.
+Guest `seccomp` filters are the exception to the faking: they are evaluated for
+real, by the same dispatcher that runs every guest syscall, so `bwrap
+--seccomp` and flatpak-style syscall blacklists actually block what they say
+they block.
+
+The rest is emulation, not containment — the sandbox is a rearranged view of
+the same rootfs, and the namespaces it thinks it created do not exist. It is
+enough for helpers that only check whether their setup calls succeeded.
 
 ### Fake identity
 
@@ -299,6 +304,8 @@ src/
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, the
                 writable id maps of a faked user namespace, ...)
+  sys_seccomp.c seccomp(2): classic-BPF evaluator over guest seccomp_data,
+                run by the dispatcher for every guest syscall
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view) +
                 unified IPC broker: portable System V IPC — memfd-backed shared
                 memory, semaphores (blocking semop, SEM_UNDO), message queues
