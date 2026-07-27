@@ -9,6 +9,7 @@
 #define _GNU_SOURCE   /* MSG_EXCEPT, MSG_INFO/MSG_STAT + struct msginfo */
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -54,6 +55,12 @@ int main(void) {
     printf("enomsg=%d,%d\n",
            msgrcv(id, &m, sizeof m.mtext, 0, IPC_NOWAIT) < 0 && errno == ENOMSG,
            msgrcv(id, &m, sizeof m.mtext, -9, IPC_NOWAIT) < 0 && errno == ENOMSG);
+
+    /* msgtyp == LONG_MIN: unnegatable; the kernel defines it as a LONG_MAX
+     * limit, i.e. it matches any message. */
+    snd(id, 5, "min", 0);
+    n = msgrcv(id, &m, sizeof m.mtext, LONG_MIN, IPC_NOWAIT);
+    printf("typmin: n=%ld t=%ld s=%s\n", n, m.mtype, m.mtext);
 
     /* Bad arguments. */
     printf("badtype=%d ", snd(id, 0, "x", 0) < 0 && errno == EINVAL);

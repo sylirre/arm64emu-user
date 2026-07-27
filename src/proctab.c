@@ -958,7 +958,11 @@ static int msg_matches(const struct GMsg *m, s64 msgtyp, s32 msgflg) {
     if (msgtyp == 0) return 1;
     if (msgtyp > 0)
         return (msgflg & G_MSG_EXCEPT) ? m->mtype != msgtyp : m->mtype == msgtyp;
-    return m->mtype <= -msgtyp;
+    /* msgtyp == LONG_MIN cannot be negated: the kernel defines it as a
+     * LONG_MAX limit (ipc/msg.c convert_mode), which also dodges the UB. */
+    s64 limit = msgtyp == (-0x7fffffffffffffffLL - 1) ? 0x7fffffffffffffffLL
+                                                      : -msgtyp;
+    return m->mtype <= limit;
 }
 
 /* Pick the message an msgrcv would take: FIFO for msgtyp >= 0; for msgtyp < 0
@@ -1036,8 +1040,14 @@ static int waiter_park(int cfd, const struct BReq *q,
     w->pid = q->pid;
     w->start = proc_starttime(q->pid);
     w->seq = g_wait_seq++;
-    w->deadline_ms = q->timeout_ns >= 0
-        ? mono_ms() + (q->timeout_ns + 999999) / 1000000 : -1;
+    if (q->timeout_ns >= 0) {
+        /* ceil to ms; clamp first so a saturated (~292-year) timeout cannot
+         * overflow the +999999 — it just becomes a very distant deadline */
+        s64 t = q->timeout_ns;
+        if (t > 0x7fffffffffffffffLL - 1000000) t = 0x7fffffffffffffffLL - 1000000;
+        w->deadline_ms = mono_ms() + (t + 999999) / 1000000;
+    } else
+        w->deadline_ms = -1;
     w->sops = sops; w->nsops = nsops; w->blk = blk;
     w->msg = msg;
     w->msgtyp = q->mtype; w->msgsz = q->size; w->msgflg = q->arg;
