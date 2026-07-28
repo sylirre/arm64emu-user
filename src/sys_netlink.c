@@ -92,20 +92,72 @@ bool nl_is_fd(struct Machine *m, int fd)
     return r;
 }
 
+/* --- datagram framing -------------------------------------------------------
+ * A dump does not reach a netlink socket as one blob: the kernel fills a socket
+ * buffer, sends it, and closes the sequence with an NLMSG_DONE of its own.
+ * Callers count on that framing -- fastfetch's default-route lookup stops
+ * walking a datagram the moment it has the route it wanted, then reads again
+ * only to reach the terminator that ends its loop. Handing the whole reply back
+ * at once leaves such a caller reading from a substitute socket that has
+ * nothing more to give, so keep the terminator in a datagram of its own. */
+
+/* Length of the next datagram out of the @len bytes of reply at @reply. */
+static size_t nl_datagram_len(const uint8_t *reply, size_t len)
+{
+    size_t off = 0;
+
+    while (off + NLMSG_HDRLEN <= len) {
+        struct nlmsghdr hdr;
+        size_t mlen;
+
+        memcpy(&hdr, reply + off, sizeof hdr);
+        mlen = hdr.nlmsg_len;
+        if (mlen < NLMSG_HDRLEN || off + mlen > len)
+            break;
+        if (hdr.nlmsg_type == NLMSG_DONE)
+            break;
+        off += NLMSG_ALIGN(mlen);
+    }
+
+    /* No terminator in sight (a plain ack, or a truncated dump): the whole
+     * remainder is one datagram. Reaching it at @off == 0 means the terminator
+     * is all that is left, and it goes out on its own. */
+    return (off == 0 || off > len) ? len : off;
+}
+
+/* Point @reply at the datagram slot @i is about to deliver and return its
+ * length, or 0 when that socket has nothing pending. Caller holds nl_lock. */
+static size_t nl_pending_datagram(struct Machine *m, int i, const uint8_t **reply)
+{
+    if (i < 0 || m->nl_fds[i].reply_len == 0)
+        return 0;
+    *reply = m->nl_fds[i].reply + m->nl_fds[i].reply_off;
+    return nl_datagram_len(*reply, m->nl_fds[i].reply_len - m->nl_fds[i].reply_off);
+}
+
+/* Drop the datagram just delivered; a datagram socket discards whatever didn't
+ * fit in the caller's buffer, so it is consumed whole. Caller holds nl_lock. */
+static void nl_consume_datagram(struct Machine *m, int i, size_t datagram)
+{
+    m->nl_fds[i].reply_off += datagram;
+    if (m->nl_fds[i].reply_off >= m->nl_fds[i].reply_len) {
+        m->nl_fds[i].reply_len = 0;
+        m->nl_fds[i].reply_off = 0;
+    }
+}
+
 /* --- readiness: make the stand-in socket look like what it is standing in for -
  * A synthesised reply lives in the emulator, so poll(2), select(2) and epoll --
  * which ask the kernel about the fd, not us -- would never report the socket
  * readable and a caller that waits before reading waits forever. Give them
  * something true to see: an AF_UNIX datagram socket may be connected to itself,
- * so a copy of the reply posted on it lands in its own receive queue, and the
- * kernel then answers every readiness mechanism (present and future) for us.
+ * so the reply posted on it lands in its own receive queue, and the kernel then
+ * answers every readiness mechanism (present and future) for us.
  *
- * The copy is the reply itself rather than a token, so it stays harmless if a
- * receive ever reaches the socket instead of the emulation -- through a dup of
- * the fd, say, which nothing tracks. The invariant is that the queue holds
- * exactly what nl_fds[i].reply_len says: armed while a reply is pending, drained
- * as the guest consumes it, so a receive that finds no reply still finds the
- * socket empty and waits on it (nl_no_reply). */
+ * What is posted is the reply itself, split into the same datagrams the guest
+ * will be handed, rather than a readiness token: it stays harmless -- correct,
+ * even -- if a receive ever reaches the socket instead of the emulation,
+ * through a dup of the fd say, which nothing tracks. */
 
 /* Connect @fd to itself so a send on it is a send to itself: autobind for a
  * name (an abstract one, invisible in the filesystem), then connect to it. The
@@ -126,32 +178,35 @@ static bool nl_selfconnect(int fd)
     return connect(fd, (struct sockaddr *) &un, sl) == 0;
 }
 
-/* Drop whatever the socket holds. Caller holds nl_lock. */
-static void nl_disarm(struct Machine *m, int i)
+/* Make the socket's queue hold exactly the datagrams still to be delivered, so
+ * every readiness mechanism agrees with the emulation datagram by datagram.
+ * Re-derived from scratch each time rather than tracked incrementally: it costs
+ * a handful of syscalls on a rare path and cannot drift -- not even if a read
+ * slipped past the emulation and took a datagram of its own. Best-effort, since
+ * a socket that never self-connected simply reports no readiness; delivery does
+ * not go through the queue either way. Caller holds nl_lock. */
+static void nl_sync_ready(struct Machine *m, int i)
 {
     uint8_t drop[64];
+    size_t off;
 
-    if (!m->nl_fds[i].armed)
-        return;
-    while (recv(m->nl_fds[i].fd, drop, sizeof drop, MSG_DONTWAIT | MSG_TRUNC) >= 0)
-        ;
-    m->nl_fds[i].armed = 0;
-}
-
-/* Post @len bytes of the pending reply so the socket reads as readable. Replaces
- * any older copy, matching the single reply the emulator keeps. Best-effort: a
- * socket that never self-connected, or a send that won't fit, simply leaves
- * readiness unreported -- delivery goes through the emulation regardless.
- * Caller holds nl_lock. */
-static void nl_arm(struct Machine *m, int i, const uint8_t *reply, size_t len)
-{
     if (!m->nl_fds[i].ready)
         return;
-    nl_disarm(m, i);
-    if (len == 0)
-        return;
-    if (send(m->nl_fds[i].fd, reply, len, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t) len)
+    if (m->nl_fds[i].armed) {
+        while (recv(m->nl_fds[i].fd, drop, sizeof drop, MSG_DONTWAIT) >= 0)
+            ;
+        m->nl_fds[i].armed = 0;
+    }
+    off = m->nl_fds[i].reply_off;
+    while (off < m->nl_fds[i].reply_len) {
+        const uint8_t *at = m->nl_fds[i].reply + off;
+        size_t dg = nl_datagram_len(at, m->nl_fds[i].reply_len - off);
+
+        if (send(m->nl_fds[i].fd, at, dg, MSG_DONTWAIT | MSG_NOSIGNAL) != (ssize_t) dg)
+            break;
         m->nl_fds[i].armed = 1;
+        off += dg;
+    }
 }
 
 void nl_mark_fd(struct Machine *m, int fd)
@@ -163,11 +218,27 @@ void nl_mark_fd(struct Machine *m, int fd)
         m->nl_fds[m->nl_fds_count].fd = fd;
         m->nl_fds[m->nl_fds_count].reply = NULL;
         m->nl_fds[m->nl_fds_count].reply_len = 0;
+        m->nl_fds[m->nl_fds_count].reply_off = 0;
         m->nl_fds[m->nl_fds_count].ready = ready;
         m->nl_fds[m->nl_fds_count].armed = 0;
         m->nl_fds_count++;
     }
     pthread_mutex_unlock(&nl_lock);
+}
+
+/* A fork child keeps its parent's substituted sockets -- they are its fds too --
+ * but not the replies pending on them: a reply belongs to whoever sent the
+ * request, and the copy the child inherited would otherwise be delivered twice,
+ * once out of each process. The buffers stay allocated for the child's own
+ * requests to reuse, and `armed` stays set so the next sync drains whatever the
+ * parent posted in the queue they now share. Called on the child side of fork,
+ * where only the forking thread exists, so no lock is taken. */
+void nl_fork_child(struct Machine *m)
+{
+    for (int i = 0; i < m->nl_fds_count; i++) {
+        m->nl_fds[i].reply_len = 0;
+        m->nl_fds[i].reply_off = 0;
+    }
 }
 
 void nl_unmark_fd(struct Machine *m, int fd)
@@ -1110,11 +1181,12 @@ static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
         pthread_mutex_unlock(&nl_lock);
         return (u64)(s64)-ENOBUFS;
     }
+    c->m->nl_fds[i].reply_off = 0;
     c->m->nl_fds[i].reply_len =
         build_reply_into(c, c->m->nl_fds[i].reply, NL_REPLY_MAX, base, blen);
     /* The reply is ready now, so the socket must read as readable now: a caller
      * that waits for POLLIN before receiving is the common shape. */
-    nl_arm(c->m, i, c->m->nl_fds[i].reply, c->m->nl_fds[i].reply_len);
+    nl_sync_ready(c->m, i);
     pthread_mutex_unlock(&nl_lock);
     return (u64)blen;
 }
@@ -1162,55 +1234,50 @@ u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
     return nl_take_request(c, fd, base, blen);
 }
 
-/* True when @fd has no synthesised reply waiting, so the receive should run on
- * the substitute socket instead of being answered here. rtnetlink hands out one
- * datagram per reply and nothing at all once the queue is empty -- it never
- * delivers a zero-length message, and a caller reading a dump until NLMSG_DONE
- * cannot make progress on one: glibc's __netlink_request() walks no message,
- * finds no terminator and reads again; musl's __netlink_enumerate() escapes
- * only because it treats the zero as a hard error and abandons the dump. The
- * substitute socket's receive queue is always empty (nl_take_request records a
- * reply rather than putting anything in it), so the kernel blocks a caller that
+/* Hand the next pending datagram on @fd to a flat buffer (@buf, @len) or, when
+ * @iov_va is non-zero, to a guest iovec array. On 1, *datagram is its
+ * untruncated length and *taken the bytes actually delivered.
+ *
+ * Returns 0 when the socket has nothing left, and then the caller must let the
+ * real syscall run: rtnetlink hands out one datagram per reply and nothing at
+ * all once the queue is empty -- it never delivers a zero-length message, and a
+ * caller reading a dump until NLMSG_DONE cannot make progress on one (glibc's
+ * __netlink_request() walks no message, finds no terminator and reads again;
+ * musl's __netlink_enumerate() escapes only because it treats the zero as a
+ * hard error and abandons the dump). The substitute socket then holds only what
+ * nl_sync_ready posted, which is nothing, so the kernel blocks a caller that
  * asked to wait and reports EAGAIN to one that didn't -- which is what a
  * netlink socket with nothing left to say does. Every send leaves a reply
- * behind (build_reply_into), so a read waits only when nothing was ever asked.
- * Caller holds nl_lock. */
-static bool nl_no_reply(struct Machine *m, int i)
-{
-    return i < 0 || m->nl_fds[i].reply_len == 0;
-}
-
-/* Hand the pending reply on @fd to a flat buffer (@buf, @len) or, when @iov_va
- * is non-zero, to a guest iovec array. Returns 0 when nothing is pending -- the
- * caller must then let the real syscall run (see nl_no_reply). On 1, *reply_len
- * is the untruncated reply length and *taken the bytes actually delivered. */
+ * behind (build_reply_into), so a read waits only when nothing was ever
+ * asked. */
 static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
                          u64 iov_va, u64 iov_cnt, int flags,
-                         size_t *reply_len, size_t *taken)
+                         size_t *datagram, size_t *taken)
 {
+    const uint8_t *reply = NULL;
+
     pthread_mutex_lock(&nl_lock);
     int i = nl_slot(c->m, fd);
-    if (nl_no_reply(c->m, i)) {
+    *datagram = nl_pending_datagram(c->m, i, &reply);
+    if (*datagram == 0) {
         pthread_mutex_unlock(&nl_lock);
         return 0;
     }
-    *reply_len = c->m->nl_fds[i].reply_len;
     *taken = 0;
     if (iov_va != 0) {
         if (iov_cnt > 0)
-            *taken = nl_scatter(c, iov_va, iov_cnt,
-                                c->m->nl_fds[i].reply, *reply_len);
+            *taken = nl_scatter(c, iov_va, iov_cnt, reply, *datagram);
     } else if (buf != 0) {
-        size_t copied = len < *reply_len ? len : *reply_len;
-        if (copied > 0 && copy_to_guest(c, buf, c->m->nl_fds[i].reply, copied) == 0)
+        size_t copied = len < *datagram ? len : *datagram;
+        if (copied > 0 && copy_to_guest(c, buf, reply, copied) == 0)
             *taken = copied;
     }
-    /* MSG_PEEK leaves the reply pending for the following real read -- and the
-     * socket armed, since it is still readable. Consuming it disarms, so the
-     * queue keeps saying exactly what reply_len does. */
+    /* MSG_PEEK leaves the datagram pending for the following real read -- and
+     * the socket armed, since it is still readable. Consuming it re-syncs the
+     * queue, which then says exactly what is left. */
     if (!(flags & MSG_PEEK)) {
-        c->m->nl_fds[i].reply_len = 0;
-        nl_disarm(c->m, i);
+        nl_consume_datagram(c->m, i, *datagram);
+        nl_sync_ready(c->m, i);
     }
     pthread_mutex_unlock(&nl_lock);
     return 1;
@@ -1219,13 +1286,13 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
 int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
                       u64 addr_va, u64 size_va, u64 *ret)
 {
-    size_t reply_len, copied;
+    size_t datagram, copied;
 
-    if (!nl_take_reply(c, fd, buf, len, 0, 0, flags, &reply_len, &copied))
+    if (!nl_take_reply(c, fd, buf, len, 0, 0, flags, &datagram, &copied))
         return 0;                      /* let the real recvfrom(2) run */
 
     /* MSG_TRUNC asks for the untruncated length (libnetlink size probe). */
-    size_t result = (flags & MSG_TRUNC) ? reply_len : copied;
+    size_t result = (flags & MSG_TRUNC) ? datagram : copied;
     /* Name the kernel (nl_pid == 0), not this socket, as the sender: that is
      * how a netlink caller tells a reply apart from a message another socket
      * sent it, and glibc's __netlink_request() drops -- and then reads past --
@@ -1238,11 +1305,11 @@ int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
 
 int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
 {
-    size_t reply_len, scattered;
+    size_t datagram, scattered;
 
     if (iov_va == 0)                   /* nothing to scatter into */
         return 0;
-    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &reply_len, &scattered))
+    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &datagram, &scattered))
         return 0;                      /* let the real readv(2) run */
     *ret = (u64)scattered;
     return 1;
@@ -1251,7 +1318,7 @@ int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
 int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
 {
     u64 msg_name = 0, iov_va = 0, iov_count = 0;
-    size_t reply_len, scattered;
+    size_t datagram, scattered;
 
     if (msghdr_va == 0)                /* no header: let the real one EFAULT */
         return 0;
@@ -1260,10 +1327,10 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
     if (copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0) iov_count = 0;
 
     if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_count, flags,
-                       &reply_len, &scattered))
+                       &datagram, &scattered))
         return 0;                      /* let the real recvmsg(2) run */
 
-    size_t result = (flags & MSG_TRUNC) ? reply_len : scattered;
+    size_t result = (flags & MSG_TRUNC) ? datagram : scattered;
 
     /* Hand back a kernel sockaddr_nl (nl_pid == 0) as the source, and set
      * msg_namelen accordingly; glibc's getifaddrs() inspects it. */
@@ -1279,8 +1346,8 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
             (void) copy_to_guest(c, msghdr_va + 8, &real, 4);
         }
     }
-    /* msg_flags @+48 (guest LP64): MSG_TRUNC iff the reply didn't fit. */
-    u32 mf = (scattered < reply_len) ? MSG_TRUNC : 0;
+    /* msg_flags @+48 (guest LP64): MSG_TRUNC iff the datagram didn't fit. */
+    u32 mf = (scattered < datagram) ? MSG_TRUNC : 0;
     (void) copy_to_guest(c, msghdr_va + 48, &mf, 4);
 
     *ret = (u64)result;

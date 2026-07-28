@@ -318,9 +318,9 @@ go wrong:
   `write`/`writev` as readily as by `send*` — busybox's `ip` uses `write(2)` —
   and the reply is read back by `read`/`readv` as readily as by `recv*`. All
   eight are routed to the emulation; an unaddressed write to the stand-in would
-  otherwise fail with `ENOTCONN`. A send never touches the stand-in socket: it
-  only records the reply its request draws, so the socket's own receive queue
-  stays empty for good. That is what answers a read with nothing pending — it
+  otherwise fail with `ENOTCONN`. A send records the reply its request draws
+  rather than delivering it, so what is left to read is the emulator's own
+  business. That is what answers a read with nothing pending — it
   is left to the real syscall, which waits there, or reports `EAGAIN` to a
   caller that asked not to. Answering it here instead would mean a zero-length
   datagram, which rtnetlink never delivers and which no caller reading a dump
@@ -333,19 +333,33 @@ go wrong:
   `__netlink_request()` discards, then reads past, anything else); a socket
   naming *itself*, via `getsockname`, still reports its own port id.
 
+  The reply is handed back one datagram at a time, with the `NLMSG_DONE` that
+  ends a dump in a datagram of its own — which is how the kernel frames one,
+  and what callers depend on. fastfetch's default-route lookup stops walking a
+  datagram the moment it has the route it wanted, then reads again purely to
+  reach the terminator that ends its loop; concatenating the whole dump into a
+  single datagram leaves that second read with nothing to receive. The reply
+  also belongs to the socket rather than to the process, so a guest walking a
+  route dump on one netlink socket can answer the interface lookups it makes
+  along the way on a second, and a fork child inherits the sockets but not the
+  replies pending on them (those belong to whoever sent the request, and a
+  child holding a copy would deliver each one twice).
+
   A reply the emulator holds is invisible to `poll`, `select` and `epoll`,
   which ask the kernel about the fd rather than asking us — so a guest that
   waits to be told the reply arrived would wait forever. The stand-in carries
   that readiness itself: an `AF_UNIX` datagram socket can be *connected to
-  itself*, so a copy of the reply is posted into its own receive queue when the
-  request is answered and drained again as the guest consumes it, and the
-  kernel then reports readiness through every mechanism, present and future,
-  for free. The queue therefore says exactly what the emulator's pending-reply
-  state says: armed while a reply waits (`MSG_PEEK` included, since the reply
-  is still there), empty otherwise — which is also what makes the fall-through
-  above wait correctly. The posted copy is the reply rather than a token so
-  that it stays harmless should a receive ever reach the socket instead of the
-  emulation, through a `dup` of the fd say. The self-connection is set up once
+  itself*, so the datagrams still to be delivered are posted into its own
+  receive queue and drained again as the guest consumes them, and the kernel
+  then reports readiness through every mechanism, present and future, for free.
+  The queue therefore says exactly what the emulator has left: armed while a
+  reply waits (`MSG_PEEK` included, since the reply is still there), empty
+  otherwise — which is also what makes the fall-through above wait correctly.
+  It is re-derived from scratch on each send and each consume rather than
+  tracked incrementally, so it cannot drift. What gets posted is the reply
+  itself, in the same datagrams the guest will be handed, rather than a
+  readiness token: it stays harmless — correct, even — should a receive ever
+  reach the socket instead of the emulation, through a `dup` of the fd say. The self-connection is set up once
   in `socket()` and is best-effort: a host that refuses it loses only readiness
   reporting, never delivery. It also means the guest's own `bind`/`connect` on
   such a socket are answered without touching it — they would otherwise fail on

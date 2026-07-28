@@ -17,6 +17,9 @@ bool nl_host_blocks(void);
 bool nl_is_fd(struct Machine *m, int fd);
 void nl_mark_fd(struct Machine *m, int fd);
 void nl_unmark_fd(struct Machine *m, int fd);   /* frees any pending reply */
+/* Fork child: keeps the sockets, drops the replies pending on them (they belong
+ * to whoever sent the request). Child side of fork, single-threaded, unlocked. */
+void nl_fork_child(struct Machine *m);
 
 /* Real-NETLINK_ROUTE fd table + faked-net-namespace ack emulation. A guest
  * whose CLONE_NEWNET was faked (m->fake_netns) still talks to the host's

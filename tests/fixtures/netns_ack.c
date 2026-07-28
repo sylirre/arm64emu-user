@@ -149,6 +149,50 @@ static const char *readiness_cycle(int fd) {
     return recv(fd, buf, sizeof buf, 0) > 0 ? "ok" : "empty";
 }
 
+/* Walk a dump the way fastfetch's default-route lookup does: stop reading a
+ * datagram the moment the wanted entry turns up, then keep reading until
+ * NLMSG_DONE ends the loop. The terminator has to arrive in a datagram the
+ * caller has not already walked past, which is why the kernel closes a dump
+ * with one of its own -- hand the whole reply back at once and the read that
+ * follows finds nothing and blocks. Bounded by a poll timeout so a regression
+ * reports itself instead of wedging the suite. */
+static const char *dump_walk(int fd) {
+    struct { struct nlmsghdr n; struct rtgenmsg g; } req;
+    struct sockaddr_nl snl;
+    char buf[8192];
+    int round, found = 0;
+
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = sizeof req;
+    req.n.nlmsg_type = RTM_GETADDR;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = 1006;
+    req.g.rtgen_family = AF_INET;
+    if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&snl, sizeof snl) < 0)
+        return "sendfail";
+
+    for (round = 0; round < 16; round++) {
+        struct pollfd p = { fd, POLLIN, 0 };
+        ssize_t n;
+
+        if (poll(&p, 1, 5000) != 1) return "hang";
+        n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0) return "recvfail";
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)n);
+             h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE)
+                return found ? "ok" : "nodata";
+            if (h->nlmsg_type == NLMSG_ERROR)
+                return "error";
+            found = 1;
+            break;            /* stop mid-datagram, as fastfetch does */
+        }
+    }
+    return "noend";
+}
+
 /* Send a minimal RTM_NEWADDR (a reconfiguring request) and report the reply:
  * "ack" (error == 0), "eperm", another errno name, or a non-error message.
  * @src_pid takes the port id the reply claims to come from. */
@@ -191,7 +235,7 @@ int main(void) {
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
         printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
-               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n");
+               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\nframe=skip\n");
         return 0;
     }
 
@@ -212,7 +256,7 @@ int main(void) {
     /* After the faked unshare, the same refusal must come back as an ack. */
     fd = nl_open();
     if (fd < 0) {
-        printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n");
+        printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\nframe=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -253,7 +297,7 @@ int main(void) {
      * AF_UNIX substitute has no such default destination and would answer
      * ENOTCONN, so these must be routed to the emulation like send/recv are. */
     fd = nl_open();
-    if (fd < 0) { printf("wrdump=skip\nready=skip\n"); return 0; }
+    if (fd < 0) { printf("wrdump=skip\nready=skip\nframe=skip\n"); return 0; }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
     memset(&d, 0, sizeof d);
     d.n.nlmsg_len = sizeof d;
@@ -274,7 +318,14 @@ int main(void) {
     /* Readiness: poll/select/epoll must track whether a reply is waiting, and
      * a caller must be able to wait for one before reading it. */
     fd = nl_open();
-    if (fd < 0) { printf("ready=skip\n"); return 0; }
+    if (fd < 0) { printf("ready=skip\nframe=skip\n"); return 0; }
     printf("ready=%s\n", readiness_cycle(fd));
+    close(fd);
+
+    /* Dump framing: the terminator must arrive in a datagram of its own, or a
+     * caller that stops walking early never reaches it. */
+    fd = nl_open();
+    if (fd < 0) { printf("frame=skip\n"); return 0; }
+    printf("frame=%s\n", dump_walk(fd));
     return 0;
 }

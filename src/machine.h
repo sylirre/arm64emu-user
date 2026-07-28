@@ -120,19 +120,28 @@ struct Machine {
      * and the netlink-shaped syscalls on it are synthesised (sys_netlink.c).
      * Shared across guest threads, copied on fork — like the host fds.
      *
+     * A reply belongs to the socket, not to the process: a guest walking a
+     * route dump on one netlink socket answers the interface lookups it makes
+     * along the way on a second. It is handed back one datagram at a time
+     * (`reply_off` is how far the guest has read), because that is how the
+     * kernel delivers a dump — and a caller that stops walking a datagram early
+     * then reads on for the NLMSG_DONE would never reach it otherwise.
+     *
      * The stand-in also carries *readiness*: a synthesised reply lives in the
-     * emulator, where poll/select/epoll cannot see it, so a copy is posted into
-     * the socket's own queue and drained again as the guest consumes the reply.
-     * That needs the socket connected to itself, which an AF_UNIX datagram
-     * socket permits; `ready` records whether that succeeded (it is the whole
-     * mechanism, and a host that refuses it just loses readiness reporting). */
+     * emulator, where poll/select/epoll cannot see it, so the datagrams still
+     * pending are posted into the socket's own queue and drained again as the
+     * guest consumes them. That needs the socket connected to itself, which an
+     * AF_UNIX datagram socket permits; `ready` records whether that succeeded
+     * (it is the whole mechanism, and a host that refuses it just loses
+     * readiness reporting). */
 #define NL_MAX_FDS 32
     struct {
         int fd;
         u8 *reply;            /* pending reply buffer (malloc'd), or NULL */
         size_t reply_len;     /* valid bytes in reply awaiting recv */
+        size_t reply_off;     /* how much of it the guest has taken */
         u8 ready;             /* socket is self-connected: readiness works */
-        u8 armed;             /* a reply copy sits in its queue right now */
+        u8 armed;             /* datagrams of ours sit in its queue right now */
     } nl_fds[NL_MAX_FDS];
     int nl_fds_count;
 

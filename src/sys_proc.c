@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "sys.h"
+#include "sys_netlink.h"
 #include "jit.h"
 #include "ptrace.h"
 
@@ -321,11 +322,15 @@ SYSDEF(clone) {
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */
-        /* CLONE_NEWNET is stripped (we cannot create namespaces), but the
-         * child now believes it configures a network namespace of its own:
-         * remember that, so rtnetlink's refusals become acks. The inherited
-         * netlink fd tables come along with the fork; a reply pending on one
-         * belongs to whoever sent the request, so it does not carry over. */
+        /* The inherited netlink fd tables come along with the fork, but a reply
+         * pending on one belongs to whoever sent the request, so it does not
+         * carry over -- for the substituted sockets (nl_fork_child) any more
+         * than for the noted rtnetlink refusal (m->nl_ack_pending below).
+         *
+         * CLONE_NEWNET is stripped (we cannot create namespaces), but the child
+         * now believes it configures a network namespace of its own: remember
+         * that, so rtnetlink's refusals become acks. */
+        nl_fork_child(m);
         /* A mount namespace of its own means its mounts -- and the re-rooting
          * bubblewrap performs with them -- must not reach the rest of the
          * session, so the child moves onto a private copy of the bind table. */
