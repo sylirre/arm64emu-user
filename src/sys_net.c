@@ -290,8 +290,13 @@ SYSDEF(sendto) {
 }
 
 SYSDEF(recvfrom) {
-    if (nl_is_fd(c->m, (int)a0))
-        return nl_recvfrom(c, (int)a0, a1, a2, (int)a3, a4, a5);
+    /* A fake netlink socket with a reply waiting is answered here; with none it
+     * falls through, so the read waits on the (always empty) substitute socket
+     * rather than being handed a zero-length datagram (sys_netlink.c). */
+    u64 nlret;
+    if (nl_is_fd(c->m, (int)a0) &&
+        nl_maybe_recvfrom(c, (int)a0, a1, a2, (int)a3, a4, a5, &nlret))
+        return nlret;
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -474,7 +479,9 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
 }
 
 SYSDEF(recvmsg) {
-    if (nl_is_fd(c->m, (int)a0)) return nl_recvmsg(c, (int)a0, a1, (int)a2);
+    u64 nlret;   /* as in recvfrom: no pending reply -> the real recvmsg runs */
+    if (nl_is_fd(c->m, (int)a0) && nl_maybe_recvmsg(c, (int)a0, a1, (int)a2, &nlret))
+        return nlret;
     GMsghdr g;
     struct msghdr h;
     struct iovec *iov;

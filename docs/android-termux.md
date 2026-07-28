@@ -45,7 +45,9 @@ unfiltered:
   are quiet `-ENOSYS` dispatcher entries and never reach the host.
 * **Netlink emulation**: where the host denies `AF_NETLINK` sockets (common
   under SELinux app policy), `NETLINK_ROUTE` is emulated in-process, so guest
-  `getifaddrs()`/`ip` keep working. The probe that decides this sends a harmless
+  `getifaddrs()`/`ip` keep working — including busybox's `ip`, which sends its
+  dump requests with `write(2)` rather than `send(2)`. The probe that decides
+  this sends a harmless
   rtnetlink message too, not just `socket()`+`bind()`: SELinux filters netlink
   per message type, and `untrusted_app` is granted `nlmsg_read` but not
   `nlmsg_write`, so on those devices (kernel 4.14 era) a socket binds fine yet

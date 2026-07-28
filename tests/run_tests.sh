@@ -594,8 +594,11 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # from the bare kernel here on purpose (that is the feature), so qemu is not an
 # oracle. Run twice -- once over a real netlink socket (the ack rewrite) and
 # once with the AF_UNIX fallback forced (the substituted socket synthesises its
-# own acks) -- because the guest must not be able to tell the tiers apart. The
-# fixture reports "skip" lines where the host grants no netlink socket. ----
+# own acks) -- because the guest must not be able to tell the tiers apart. Only
+# the ack line differs between the two; empty=/self=/src= must match, which is
+# what pins the substitute socket's empty-queue and sockaddr_nl behavior to the
+# real thing. The fixture reports "skip" lines where the host grants no netlink
+# socket. ----
 if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
         tests/fixtures/netns_ack.c 2>/dev/null; then
     for tier in real af_unix; do
@@ -603,7 +606,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             # The substituted socket has no kernel behind it, so it acks every
             # non-dump request whether or not a namespace was faked -- there is
             # no real refusal to pass through on a host that denies netlink.
-            expect_nl=$'no_netns=acked\nunshare=1\nafter_netns=ack\nquery=data'
+            expect_nl=$'empty=eagain\nself=own\nno_netns=acked\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data'
             got=$(A64_NETLINK_FORCE_BLOCK=1 timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         else
@@ -611,7 +614,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             # namespace: an ack here would be one the emulator invented. The
             # switch must be *absent*, not empty -- these A64_* switches are
             # presence-tested (getenv), so FOO= would select the fallback.
-            expect_nl=$'no_netns=passed-through\nunshare=1\nafter_netns=ack\nquery=data'
+            expect_nl=$'empty=eagain\nself=own\nno_netns=passed-through\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data'
             got=$(env -u A64_NETLINK_FORCE_BLOCK timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         fi

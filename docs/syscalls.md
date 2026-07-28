@@ -313,6 +313,25 @@ go wrong:
   non-dump requests, and real host interfaces (via `getifaddrs`) or an empty
   `NLMSG_DONE` for dumps. `A64_NETLINK_FORCE_BLOCK` forces this tier for
   testing.
+
+  A netlink socket needs no destination address, so a request arrives by
+  `write`/`writev` as readily as by `send*` — busybox's `ip` uses `write(2)` —
+  and the reply is read back by `read`/`readv` as readily as by `recv*`. All
+  eight are routed to the emulation; an unaddressed write to the stand-in would
+  otherwise fail with `ENOTCONN`. A send never touches the stand-in socket: it
+  only records the reply its request draws, so the socket's own receive queue
+  stays empty for good. That is what answers a read with nothing pending — it
+  is left to the real syscall, which waits there, or reports `EAGAIN` to a
+  caller that asked not to. Answering it here instead would mean a zero-length
+  datagram, which rtnetlink never delivers and which no caller reading a dump
+  until `NLMSG_DONE` can make progress on. So that a read waits only when
+  nothing was ever asked, every request leaves a reply behind: the cases that
+  match nothing (a message too short to parse, a single get for an interface
+  that isn't there) get an `NLMSG_ERROR` too. A reply names the kernel —
+  port id 0 — as its sender, not the socket itself, since that is how a caller
+  tells a kernel reply from a message another socket sent it (glibc's
+  `__netlink_request()` discards, then reads past, anything else); a socket
+  naming *itself*, via `getsockname`, still reports its own port id.
 - **The host grants netlink, but the guest has no `CAP_NET_ADMIN` in it.**
   Namespace creation is impossible here, so `clone(CLONE_NEW*)` silently drops
   the flags and `unshare`/`setns` return 0 without doing anything — sandbox
@@ -335,7 +354,12 @@ go wrong:
 Limits: one pending note per process (matching upstream), so a guest that
 pipelines two reconfiguring requests before reading either gets the ack only
 for whichever reply it reads first — the sequential request/ack pattern every
-real caller uses is unaffected.
+real caller uses is unaffected. And in the substituted tier a pending reply is
+invisible to `poll`/`select`/`epoll`, which see the stand-in socket's own (never
+readable) queue: a caller must read the reply rather than wait to be told it has
+arrived. Every netlink caller that matters here does — glibc, musl, busybox
+`ip`, iproute2 and bubblewrap all read straight after sending — but a
+readiness-driven one would wait forever.
 
 The other faked namespaces are answered in the same spirit — accept the request,
 then make the consequences the caller depends on true:

@@ -14,7 +14,13 @@
  * (via getifaddrs) or an empty NLMSG_DONE for dumps (glibc/apt getifaddrs
  * RTM_GETADDR, iproute2 RTM_GETLINK/RTM_GETROUTE). The substitution only fires
  * when the host actually refuses AF_NETLINK, so ordinary users (c-ares, dnf,
- * getaddrinfo) keep a real netlink socket when one is available. */
+ * getaddrinfo) keep a real netlink socket when one is available.
+ *
+ * The substitute socket is never written to -- a send only records the reply it
+ * should draw -- so its own receive queue stands in for "the kernel has nothing
+ * more to say": a receive with no synthesised reply pending is left to the real
+ * syscall, which waits or reports EAGAIN there. Answering it here instead would
+ * mean a zero-length datagram, which rtnetlink never delivers. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -72,6 +78,13 @@ static int nl_slot(struct Machine *m, int fd)
 
 bool nl_is_fd(struct Machine *m, int fd)
 {
+    /* Unlocked fast path, as in sigfd_tracked() / procfs_pre_read(): every
+     * read(2) and write(2) asks this, and the table is empty in every process
+     * that never got a substituted socket -- which is all of them wherever the
+     * host grants AF_NETLINK. The race is benign: a count that just went
+     * non-zero was raised by the same thread's own socket(2). */
+    if (!m->nl_fds_count || fd < 0)
+        return false;
     pthread_mutex_lock(&nl_lock);
     bool r = nl_slot(m, fd) >= 0;
     pthread_mutex_unlock(&nl_lock);
@@ -92,6 +105,9 @@ void nl_mark_fd(struct Machine *m, int fd)
 
 void nl_unmark_fd(struct Machine *m, int fd)
 {
+    /* Unlocked fast path (see nl_is_fd): close(2) calls this for every fd. */
+    if (!m->nl_fds_count && !m->nlr_fds_count && !m->nl_ack_pending)
+        return;
     pthread_mutex_lock(&nl_lock);
     int i = nl_slot(m, fd);
     if (i >= 0) {
@@ -158,6 +174,11 @@ void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
 {
     struct nlmsghdr hdr;
 
+    /* Unlocked fast path (see nl_is_fd): every sendto/sendmsg passes here, and
+     * only a guest with both a faked network namespace and a real
+     * NETLINK_ROUTE socket can have anything to note. */
+    if (!m->fake_netns || !m->nlr_fds_count)
+        return;
     if (!msg || len < sizeof(hdr))
         return;
     memcpy(&hdr, msg, sizeof(hdr));
@@ -177,6 +198,11 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
 {
     int fixed = 0;
 
+    /* Unlocked fast path (see nl_is_fd): every recvfrom/recvmsg that got bytes
+     * passes here, and nothing is ever pending unless a faked namespace's
+     * reconfiguring request is awaiting its refusal. */
+    if (!m->nl_ack_pending)
+        return 0;
     pthread_mutex_lock(&nl_lock);
     if (!m->nl_ack_pending || m->nl_ack_fd != fd) {
         pthread_mutex_unlock(&nl_lock);
@@ -839,7 +865,8 @@ static size_t relay_route_dump(const uint8_t *req, size_t req_len,
 /* ==================================================================== */
 
 /* Parse the netlink request at [buf_va, buf_len) and build the reply the kernel
- * would have produced into @out (capacity @max). Returns the reply length. */
+ * would have produced into @out (capacity @max). Returns the reply length,
+ * which is never zero: see the `reply:` tail. */
 static size_t build_reply_into(CPU *c, uint8_t *out, size_t max,
                                u64 buf_va, u64 buf_len)
 {
@@ -847,16 +874,16 @@ static size_t build_reply_into(CPU *c, uint8_t *out, size_t max,
     size_t  req_len;
     struct nlmsghdr hdr;
     uint32_t pid = (uint32_t) getpid();
-    uint32_t seq;
+    uint32_t seq = 0;
     uint16_t type, flags;
     bool dump;
     size_t off = 0;
 
     if (buf_va == 0 || buf_len < sizeof(hdr))
-        return 0;
+        goto reply;
     req_len = buf_len < sizeof(req) ? buf_len : sizeof(req);
     if (copy_from_guest(c, req, buf_va, req_len) < 0)
-        return 0;
+        goto reply;
 
     memcpy(&hdr, req, sizeof(hdr));
     type  = hdr.nlmsg_type;
@@ -928,6 +955,15 @@ static size_t build_reply_into(CPU *c, uint8_t *out, size_t max,
         break;
     }
 
+reply:
+    /* Never leave a request unanswered. The cases that would otherwise build
+     * nothing are a message too short to parse and a single get whose selector
+     * matches no host interface (an RTM_GETADDR for an exotic family, say);
+     * an empty reply turns the read that follows into a wait on the substitute
+     * socket, which nobody will ever wake (see nl_maybe_recvfrom). */
+    if (off == 0)
+        off = nl_build_error(out, off, max, seq, pid, -EINVAL);
+
     return off;
 }
 
@@ -986,106 +1022,178 @@ static size_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
 }
 
 /* ==================================================================== */
-/* Public syscall handlers (called from sys_net.c on a fake netlink fd).   */
+/* Public syscall handlers, called on a fake netlink fd by sys_net.c (the  */
+/* socket calls) and sys_file.c (read/write and their vector forms).       */
 /* ==================================================================== */
 
-u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len)
+/* Record the reply the request at [base, blen) draws, and report the whole
+ * request as sent. Called unconditionally, even for a message we couldn't read:
+ * build_reply_into always leaves something behind, so no send on this socket
+ * can strand a later read. */
+static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
 {
     pthread_mutex_lock(&nl_lock);
     int i = nl_slot(c->m, fd);
     if (i < 0) { pthread_mutex_unlock(&nl_lock); return (u64)(s64)-EBADF; }
     if (!c->m->nl_fds[i].reply)
         c->m->nl_fds[i].reply = malloc(NL_REPLY_MAX);
-    if (c->m->nl_fds[i].reply)
-        c->m->nl_fds[i].reply_len =
-            build_reply_into(c, c->m->nl_fds[i].reply, NL_REPLY_MAX, buf, len);
-    else
-        c->m->nl_fds[i].reply_len = 0;
+    if (!c->m->nl_fds[i].reply) {
+        /* Refuse the send rather than swallow it: a request with no reply
+         * behind it leaves the read that follows waiting forever. */
+        pthread_mutex_unlock(&nl_lock);
+        return (u64)(s64)-ENOBUFS;
+    }
+    c->m->nl_fds[i].reply_len =
+        build_reply_into(c, c->m->nl_fds[i].reply, NL_REPLY_MAX, base, blen);
     pthread_mutex_unlock(&nl_lock);
-    return (u64)len;   /* pretend the whole request was sent */
+    return (u64)blen;
+}
+
+/* First segment of a guest iovec array, which is where the netlink callers we
+ * care about put their (single) message: multi-iovec netlink requests don't
+ * occur for bwrap / glibc / iproute2. Zeroed when there is no such segment. */
+static void nl_first_iovec(CPU *c, u64 iov_va, u64 iov_cnt, u64 *base, u64 *len)
+{
+    GIovec gi;
+
+    *base = *len = 0;
+    if (iov_va == 0 || iov_cnt == 0)
+        return;
+    if (copy_from_guest(c, &gi, iov_va, sizeof gi) < 0)
+        return;
+    *base = gi.iov_base;
+    *len  = gi.iov_len;
+}
+
+u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len)
+{
+    return nl_take_request(c, fd, buf, len);
 }
 
 u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va)
 {
-    /* struct msghdr (guest LP64): msg_iov @+16, msg_iovlen @+24. Use the first
-     * iovec as the request (multi-iovec netlink requests don't occur for the
-     * bwrap/glibc/iproute2 callers we care about). */
-    u64 iov_va = 0, iov_count = 0, total = 0;
+    /* struct msghdr (guest LP64): msg_iov @+16, msg_iovlen @+24. */
+    u64 iov_va = 0, iov_count = 0, base, blen;
+
     if (msghdr_va != 0) {
         if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0 ||
             copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0)
             iov_va = iov_count = 0;
     }
-    pthread_mutex_lock(&nl_lock);
-    int i = nl_slot(c->m, fd);
-    if (i < 0) { pthread_mutex_unlock(&nl_lock); return (u64)(s64)-EBADF; }
-    c->m->nl_fds[i].reply_len = 0;
-    if (iov_va != 0 && iov_count > 0) {
-        GIovec gi;
-        if (copy_from_guest(c, &gi, iov_va, sizeof gi) == 0) {
-            if (!c->m->nl_fds[i].reply)
-                c->m->nl_fds[i].reply = malloc(NL_REPLY_MAX);
-            if (c->m->nl_fds[i].reply)
-                c->m->nl_fds[i].reply_len = build_reply_into(
-                    c, c->m->nl_fds[i].reply, NL_REPLY_MAX,
-                    gi.iov_base, gi.iov_len);
-            total = gi.iov_len;
-        }
-    }
-    pthread_mutex_unlock(&nl_lock);
-    return (u64)total;
+    nl_first_iovec(c, iov_va, iov_count, &base, &blen);
+    return nl_take_request(c, fd, base, blen);
 }
 
-u64 nl_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
-                u64 addr_va, u64 size_va)
+u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
+{
+    u64 base, blen;
+
+    nl_first_iovec(c, iov_va, iov_cnt, &base, &blen);
+    return nl_take_request(c, fd, base, blen);
+}
+
+/* True when @fd has no synthesised reply waiting, so the receive should run on
+ * the substitute socket instead of being answered here. rtnetlink hands out one
+ * datagram per reply and nothing at all once the queue is empty -- it never
+ * delivers a zero-length message, and a caller reading a dump until NLMSG_DONE
+ * cannot make progress on one: glibc's __netlink_request() walks no message,
+ * finds no terminator and reads again; musl's __netlink_enumerate() escapes
+ * only because it treats the zero as a hard error and abandons the dump. The
+ * substitute socket's receive queue is always empty (nl_take_request records a
+ * reply rather than putting anything in it), so the kernel blocks a caller that
+ * asked to wait and reports EAGAIN to one that didn't -- which is what a
+ * netlink socket with nothing left to say does. Every send leaves a reply
+ * behind (build_reply_into), so a read waits only when nothing was ever asked.
+ * Caller holds nl_lock. */
+static bool nl_no_reply(struct Machine *m, int i)
+{
+    return i < 0 || m->nl_fds[i].reply_len == 0;
+}
+
+/* Hand the pending reply on @fd to a flat buffer (@buf, @len) or, when @iov_va
+ * is non-zero, to a guest iovec array. Returns 0 when nothing is pending -- the
+ * caller must then let the real syscall run (see nl_no_reply). On 1, *reply_len
+ * is the untruncated reply length and *taken the bytes actually delivered. */
+static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
+                         u64 iov_va, u64 iov_cnt, int flags,
+                         size_t *reply_len, size_t *taken)
 {
     pthread_mutex_lock(&nl_lock);
     int i = nl_slot(c->m, fd);
-    if (i < 0) { pthread_mutex_unlock(&nl_lock); return (u64)(s64)-EBADF; }
-    size_t reply_len = c->m->nl_fds[i].reply_len;
-    size_t copied = 0;
-    if (reply_len > 0 && buf != 0) {
-        copied = len < reply_len ? len : reply_len;
-        if (copied > 0 && copy_to_guest(c, buf, c->m->nl_fds[i].reply, copied) < 0)
-            copied = 0;
+    if (nl_no_reply(c->m, i)) {
+        pthread_mutex_unlock(&nl_lock);
+        return 0;
     }
-    /* MSG_PEEK leaves the reply pending for the following real read;
-     * MSG_TRUNC asks for the untruncated length (libnetlink size probe). */
+    *reply_len = c->m->nl_fds[i].reply_len;
+    *taken = 0;
+    if (iov_va != 0) {
+        if (iov_cnt > 0)
+            *taken = nl_scatter(c, iov_va, iov_cnt,
+                                c->m->nl_fds[i].reply, *reply_len);
+    } else if (buf != 0) {
+        size_t copied = len < *reply_len ? len : *reply_len;
+        if (copied > 0 && copy_to_guest(c, buf, c->m->nl_fds[i].reply, copied) == 0)
+            *taken = copied;
+    }
+    /* MSG_PEEK leaves the reply pending for the following real read. */
     if (!(flags & MSG_PEEK))
         c->m->nl_fds[i].reply_len = 0;
     pthread_mutex_unlock(&nl_lock);
-
-    size_t result = (flags & MSG_TRUNC) ? reply_len : copied;
-    if (addr_va != 0 && size_va != 0)
-        (void) nl_write_sockname(c, addr_va, size_va, (uint32_t) getpid());
-    return (u64)result;
+    return 1;
 }
 
-u64 nl_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags)
+int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
+                      u64 addr_va, u64 size_va, u64 *ret)
+{
+    size_t reply_len, copied;
+
+    if (!nl_take_reply(c, fd, buf, len, 0, 0, flags, &reply_len, &copied))
+        return 0;                      /* let the real recvfrom(2) run */
+
+    /* MSG_TRUNC asks for the untruncated length (libnetlink size probe). */
+    size_t result = (flags & MSG_TRUNC) ? reply_len : copied;
+    /* Name the kernel (nl_pid == 0), not this socket, as the sender: that is
+     * how a netlink caller tells a reply apart from a message another socket
+     * sent it, and glibc's __netlink_request() drops -- and then reads past --
+     * every buffer whose source claims a port id of its own. */
+    if (addr_va != 0 && size_va != 0)
+        (void) nl_write_sockname(c, addr_va, size_va, 0);
+    *ret = (u64)result;
+    return 1;
+}
+
+int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
+{
+    size_t reply_len, scattered;
+
+    if (iov_va == 0)                   /* nothing to scatter into */
+        return 0;
+    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &reply_len, &scattered))
+        return 0;                      /* let the real readv(2) run */
+    *ret = (u64)scattered;
+    return 1;
+}
+
+int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
 {
     u64 msg_name = 0, iov_va = 0, iov_count = 0;
-    if (msghdr_va != 0) {
-        if (copy_from_guest(c, &msg_name, msghdr_va, 8) < 0)       msg_name = 0;
-        if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0)    iov_va = 0;
-        if (copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0) iov_count = 0;
-    }
+    size_t reply_len, scattered;
 
-    pthread_mutex_lock(&nl_lock);
-    int i = nl_slot(c->m, fd);
-    if (i < 0) { pthread_mutex_unlock(&nl_lock); return (u64)(s64)-EBADF; }
-    size_t reply_len = c->m->nl_fds[i].reply_len;
-    size_t scattered = 0;
-    if (iov_va != 0 && iov_count > 0)
-        scattered = nl_scatter(c, iov_va, iov_count, c->m->nl_fds[i].reply, reply_len);
-    if (!(flags & MSG_PEEK))
-        c->m->nl_fds[i].reply_len = 0;
-    pthread_mutex_unlock(&nl_lock);
+    if (msghdr_va == 0)                /* no header: let the real one EFAULT */
+        return 0;
+    if (copy_from_guest(c, &msg_name, msghdr_va, 8) < 0)       msg_name = 0;
+    if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0)    iov_va = 0;
+    if (copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0) iov_count = 0;
+
+    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_count, flags,
+                       &reply_len, &scattered))
+        return 0;                      /* let the real recvmsg(2) run */
 
     size_t result = (flags & MSG_TRUNC) ? reply_len : scattered;
 
     /* Hand back a kernel sockaddr_nl (nl_pid == 0) as the source, and set
      * msg_namelen accordingly; glibc's getifaddrs() inspects it. */
-    if (msg_name != 0 && msghdr_va != 0) {
+    if (msg_name != 0) {
         u32 in_namelen;
         if (copy_from_guest(c, &in_namelen, msghdr_va + 8, 4) == 0 && in_namelen > 0) {
             struct sockaddr_nl snl;
@@ -1098,11 +1206,11 @@ u64 nl_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags)
         }
     }
     /* msg_flags @+48 (guest LP64): MSG_TRUNC iff the reply didn't fit. */
-    if (msghdr_va != 0) {
-        u32 mf = (scattered < reply_len) ? MSG_TRUNC : 0;
-        (void) copy_to_guest(c, msghdr_va + 48, &mf, 4);
-    }
-    return (u64)result;
+    u32 mf = (scattered < reply_len) ? MSG_TRUNC : 0;
+    (void) copy_to_guest(c, msghdr_va + 48, &mf, 4);
+
+    *ret = (u64)result;
+    return 1;
 }
 
 u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va)

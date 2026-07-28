@@ -465,6 +465,13 @@ SYSDEF(close) {
 }
 
 SYSDEF(read) {
+    /* read(2) on a netlink socket is recvfrom(2) with no address. A fake one
+     * answers it from the reply the last request recorded, or falls through so
+     * the read waits on the substitute socket (sys_netlink.c). */
+    u64 nlret;
+    if (nl_is_fd(c->m, (int)a0) &&
+        nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
+        return nlret;
     procfs_pre_read(c, (int)a0, -1);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
@@ -486,6 +493,10 @@ SYSDEF(read) {
 }
 
 SYSDEF(write) {
+    /* As in read: a netlink socket takes a message by write(2) too (busybox's
+     * `ip` sends its dump requests that way), and the AF_UNIX substitute has no
+     * default destination to write to -- it would answer ENOTCONN. */
+    if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -498,6 +509,9 @@ SYSDEF(write) {
 }
 
 SYSDEF(readv) {
+    u64 nlret;   /* fake netlink socket: as in read */
+    if (nl_is_fd(c->m, (int)a0) && nl_maybe_readv(c, (int)a0, a1, a2, &nlret))
+        return nlret;
     procfs_pre_read(c, (int)a0, -1);
     struct iovec iov[1024];
     u8 *bounce;
@@ -541,6 +555,7 @@ SYSDEF(readv) {
 }
 
 SYSDEF(writev) {
+    if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, a2);   /* as in write */
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);

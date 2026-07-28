@@ -7,13 +7,21 @@
  * in the host's namespace) with NLMSG_ERROR(-EPERM); the emulator must turn
  * that into a plain ack carrying the request's own sequence number.
  *
+ * The socket-shaped checks (empty=, self=, src=) are the ones a guest could
+ * use to tell the two tiers apart, so they must answer the same whether a real
+ * netlink socket or the AF_UNIX substitute is underneath: an empty receive
+ * queue reports EAGAIN rather than a zero-length message (which rtnetlink never
+ * delivers, and which strands every caller that reads a dump until NLMSG_DONE),
+ * a reply names the kernel as its sender, and the socket names itself.
+ *
  * Prints one line per check so a failure names itself. Skips silently (with
  * the expected output) where the host hands out no netlink socket at all —
  * then the AF_UNIX fallback is in charge and synthesises its own acks, which
- * the netlink_fallback test covers. */
+ * the af_unix tier of this same test covers. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* unshare(2), CLONE_NEWNET */
 #endif
+#include <errno.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,14 +40,47 @@ static int nl_open(void) {
     return fd;
 }
 
+/* An empty receive queue must report EAGAIN, never a zero-length message: a
+ * caller reading a dump can make no progress on one, so it either spins on the
+ * socket or (musl) abandons the dump as broken. */
+static const char *empty_read(int fd) {
+    static char out[64];
+    char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+
+    if (n == 0) return "zerolen";
+    if (n > 0) return "data";                /* nothing was ever requested */
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return "eagain";
+    snprintf(out, sizeof out, "err%d", errno);
+    return out;
+}
+
+/* A netlink socket names itself with the port id the kernel gave it, in a
+ * sockaddr_nl of the full length (iproute2 rejects anything shorter with
+ * "Wrong address length"). Port id 0 is the kernel's own and never a socket's. */
+static const char *sockname(int fd) {
+    static char out[64];
+    struct sockaddr_nl snl;
+    socklen_t sl = sizeof snl;
+
+    memset(&snl, 0, sizeof snl);
+    if (getsockname(fd, (struct sockaddr *)&snl, &sl) < 0) return "fail";
+    if (sl != sizeof snl) { snprintf(out, sizeof out, "len%u", sl); return out; }
+    if (snl.nl_family != AF_NETLINK) return "family";
+    return snl.nl_pid != 0 ? "own" : "kernel";
+}
+
 /* Send a minimal RTM_NEWADDR (a reconfiguring request) and report the reply:
- * "ack" (error == 0), "eperm", another errno name, or a non-error message. */
-static const char *newaddr_roundtrip(int fd, unsigned seq) {
+ * "ack" (error == 0), "eperm", another errno name, or a non-error message.
+ * @src_pid takes the port id the reply claims to come from. */
+static const char *newaddr_roundtrip(int fd, unsigned seq, unsigned *src_pid) {
     static char out[64];
     struct { struct nlmsghdr n; struct ifaddrmsg i; } r;
     struct sockaddr_nl snl;
+    socklen_t sl = sizeof snl;
     char buf[4096];
 
+    *src_pid = (unsigned)-1;
     memset(&snl, 0, sizeof snl);
     snl.nl_family = AF_NETLINK;
     memset(&r, 0, sizeof r);
@@ -53,8 +94,10 @@ static const char *newaddr_roundtrip(int fd, unsigned seq) {
 
     if (sendto(fd, &r, r.n.nlmsg_len, 0, (struct sockaddr *)&snl, sizeof snl) < 0)
         return "sendfail";
-    ssize_t n = recv(fd, buf, sizeof buf, 0);
+    memset(&snl, 0, sizeof snl);
+    ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&snl, &sl);
     if (n < 0) return "recvfail";
+    if (sl >= sizeof snl && snl.nl_family == AF_NETLINK) *src_pid = snl.nl_pid;
     struct nlmsghdr *h = (struct nlmsghdr *)buf;
     if ((size_t)n < NLMSG_HDRLEN || h->nlmsg_type != NLMSG_ERROR) return "nonerror";
     if (h->nlmsg_seq != seq) return "badseq";
@@ -65,16 +108,23 @@ static const char *newaddr_roundtrip(int fd, unsigned seq) {
 }
 
 int main(void) {
+    unsigned src_pid;
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
-        printf("no_netns=skip\nunshare=1\nafter_netns=skip\nquery=skip\n");
+        printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
+               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\n");
         return 0;
     }
+
+    /* Nothing has been asked of this socket yet, so a non-blocking read must
+     * find the queue empty rather than be handed a message of length zero. */
+    printf("empty=%s\n", empty_read(fd));
+    printf("self=%s\n", sockname(fd));
 
     /* Before any unshare: a refusal must reach the caller untouched. The host
      * may legitimately allow this (running as root), so accept either, but
      * never an ack that the emulator invented -- that is the bug this guards. */
-    const char *before = newaddr_roundtrip(fd, 1001);
+    const char *before = newaddr_roundtrip(fd, 1001, &src_pid);
     printf("no_netns=%s\n", strcmp(before, "ack") == 0 ? "acked" : "passed-through");
     close(fd);
 
@@ -82,9 +132,14 @@ int main(void) {
 
     /* After the faked unshare, the same refusal must come back as an ack. */
     fd = nl_open();
-    if (fd < 0) { printf("after_netns=skip\nquery=skip\n"); return 0; }
-    const char *after = newaddr_roundtrip(fd, 1002);
+    if (fd < 0) { printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\n"); return 0; }
+    const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
     printf("after_netns=%s\n", strcmp(after, "ack") == 0 ? "ack" : after);
+    /* The reply comes from the kernel, which owns port id 0. Callers rely on
+     * it: glibc's __netlink_request() discards a buffer whose source claims a
+     * port id of its own, then reads on for a reply already delivered. */
+    printf("src=%s\n", src_pid == 0 ? "kernel" :
+                       src_pid == (unsigned)-1 ? "noaddr" : "self");
 
     /* A query (RTM_GET*) is not a reconfiguration: it must still deliver real
      * data from the host's namespace, not a synthesised ack. */
@@ -107,6 +162,30 @@ int main(void) {
     struct nlmsghdr *h = (struct nlmsghdr *)buf;
     printf("query=%s\n",
            n > 0 && h->nlmsg_type == RTM_NEWADDR ? "data" :
+           n > 0 && h->nlmsg_type == NLMSG_DONE  ? "data" : "broken");
+    close(fd);
+
+    /* The same dump driven by write(2)/read(2) rather than the socket calls: a
+     * netlink socket needs no destination address, so plain writes carry a
+     * request just as well -- which is how busybox's `ip` sends its. The
+     * AF_UNIX substitute has no such default destination and would answer
+     * ENOTCONN, so these must be routed to the emulation like send/recv are. */
+    fd = nl_open();
+    if (fd < 0) { printf("wrdump=skip\n"); return 0; }
+    struct { struct nlmsghdr n; struct rtgenmsg g; } d;
+    memset(&d, 0, sizeof d);
+    d.n.nlmsg_len = sizeof d;
+    d.n.nlmsg_type = RTM_GETLINK;
+    d.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ROOT | NLM_F_MATCH;   /* busybox's */
+    d.n.nlmsg_seq = 1004;
+    d.g.rtgen_family = AF_UNSPEC;
+    if (write(fd, &d, sizeof d) != (ssize_t)sizeof d) {
+        printf("wrdump=writefail\n");
+        return 0;
+    }
+    n = read(fd, buf, sizeof buf);
+    printf("wrdump=%s\n",
+           n > 0 && h->nlmsg_type == RTM_NEWLINK ? "data" :
            n > 0 && h->nlmsg_type == NLMSG_DONE  ? "data" : "broken");
     return 0;
 }

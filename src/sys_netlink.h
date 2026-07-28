@@ -35,13 +35,28 @@ void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len);
  * reply. Returns 1 if a refusal was turned into an ack. */
 int  nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek);
 
-/* Netlink-shaped syscalls issued on a fake fd. Each returns the guest x0
- * value (a non-negative result, or a negative errno). */
+/* Sends on a fake fd: the request is parsed and the reply it draws recorded for
+ * the receive that follows. Each returns the guest x0 value (a non-negative
+ * result, or a negative errno). A netlink socket takes a message by write(2)
+ * just as well as by send(2) -- busybox's `ip` uses write, and an unaddressed
+ * write to the AF_UNIX substitute would fail with ENOTCONN -- so nl_sendto
+ * doubles as the write(2) handler and nl_writev as the writev(2) one. */
 u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len);
 u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va);
-u64 nl_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags, u64 addr_va, u64 size_va);
-u64 nl_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags);
+u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt);
 u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va);
+
+/* Receives on a fake fd (nl_maybe_recvfrom also serves read(2), passed flags 0
+ * and no address). Each returns 1 and stores the guest x0 in *ret when a
+ * synthesised reply was pending; 0 when none was, which means the real syscall
+ * must run on the substitute AF_UNIX socket. Its receive queue is always empty,
+ * so it blocks or reports EAGAIN exactly as a netlink socket with nothing left
+ * to say does -- unlike a zero-length message, which rtnetlink never delivers
+ * and which strands every caller that reads a dump until NLMSG_DONE. */
+int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
+                      u64 addr_va, u64 size_va, u64 *ret);
+int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret);
+int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret);
 
 /* Read-only interface-query ioctls answered from the host's own interface
  * table (getifaddrs + best-effort host ioctls) with a synthesised loopback
