@@ -332,6 +332,24 @@ go wrong:
   tells a kernel reply from a message another socket sent it (glibc's
   `__netlink_request()` discards, then reads past, anything else); a socket
   naming *itself*, via `getsockname`, still reports its own port id.
+
+  A reply the emulator holds is invisible to `poll`, `select` and `epoll`,
+  which ask the kernel about the fd rather than asking us — so a guest that
+  waits to be told the reply arrived would wait forever. The stand-in carries
+  that readiness itself: an `AF_UNIX` datagram socket can be *connected to
+  itself*, so a copy of the reply is posted into its own receive queue when the
+  request is answered and drained again as the guest consumes it, and the
+  kernel then reports readiness through every mechanism, present and future,
+  for free. The queue therefore says exactly what the emulator's pending-reply
+  state says: armed while a reply waits (`MSG_PEEK` included, since the reply
+  is still there), empty otherwise — which is also what makes the fall-through
+  above wait correctly. The posted copy is the reply rather than a token so
+  that it stays harmless should a receive ever reach the socket instead of the
+  emulation, through a `dup` of the fd say. The self-connection is set up once
+  in `socket()` and is best-effort: a host that refuses it loses only readiness
+  reporting, never delivery. It also means the guest's own `bind`/`connect` on
+  such a socket are answered without touching it — they would otherwise fail on
+  a `sockaddr_nl`, and `connect` would re-point the self-connection.
 - **The host grants netlink, but the guest has no `CAP_NET_ADMIN` in it.**
   Namespace creation is impossible here, so `clone(CLONE_NEW*)` silently drops
   the flags and `unshare`/`setns` return 0 without doing anything — sandbox
@@ -354,12 +372,9 @@ go wrong:
 Limits: one pending note per process (matching upstream), so a guest that
 pipelines two reconfiguring requests before reading either gets the ack only
 for whichever reply it reads first — the sequential request/ack pattern every
-real caller uses is unaffected. And in the substituted tier a pending reply is
-invisible to `poll`/`select`/`epoll`, which see the stand-in socket's own (never
-readable) queue: a caller must read the reply rather than wait to be told it has
-arrived. Every netlink caller that matters here does — glibc, musl, busybox
-`ip`, iproute2 and bubblewrap all read straight after sending — but a
-readiness-driven one would wait forever.
+real caller uses is unaffected. Likewise the substituted tier keeps one reply
+per socket, so a guest that pipelines two dumps reads only the second; a real
+netlink socket queues both.
 
 The other faked namespaces are answered in the same spirit — accept the request,
 then make the consequences the caller depends on true:

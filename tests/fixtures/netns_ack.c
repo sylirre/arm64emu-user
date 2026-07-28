@@ -22,10 +22,13 @@
 #define _GNU_SOURCE   /* unshare(2), CLONE_NEWNET */
 #endif
 #include <errno.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -70,6 +73,82 @@ static const char *sockname(int fd) {
     return snl.nl_pid != 0 ? "own" : "kernel";
 }
 
+/* Is @fd readable right now, according to each of the three mechanisms a guest
+ * can ask with? They must agree with each other and with whether a reply is
+ * actually waiting -- a synthesised one lives in the emulator, where none of
+ * them can see it, so the substitute socket has to carry the readiness itself.
+ * Returns a 3-bit set so a disagreement names the odd one out. */
+static int readable(int fd, int ep) {
+    struct pollfd p = { fd, POLLIN, 0 };
+    fd_set rs;
+    struct timeval tv = { 0, 0 };
+    struct epoll_event ev;
+    int bits = 0;
+
+    if (poll(&p, 1, 0) == 1 && (p.revents & POLLIN)) bits |= 1;
+    FD_ZERO(&rs);
+    FD_SET(fd, &rs);
+    if (select(fd + 1, &rs, NULL, NULL, &tv) == 1 && FD_ISSET(fd, &rs)) bits |= 2;
+    if (epoll_wait(ep, &ev, 1, 0) == 1) bits |= 4;
+    return bits;
+}
+
+/* Ask for a dump, then wait to be told the reply arrived before reading it --
+ * the shape that hangs when readiness isn't reported. Reports what each stage
+ * saw: idle (nothing asked) -> pending -> consumed, then the wait-then-read. */
+static const char *readiness_cycle(int fd) {
+    static char out[96];
+    struct { struct nlmsghdr n; struct rtgenmsg g; } req;
+    struct sockaddr_nl snl;
+    char buf[8192];
+    int idle, pending, consumed, ep;
+
+    ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0) return "noepoll";
+    struct epoll_event add = { .events = EPOLLIN, .data.fd = fd };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, fd, &add) < 0) { close(ep); return "noctl"; }
+
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = sizeof req;
+    req.n.nlmsg_type = RTM_GETADDR;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = 1005;
+    req.g.rtgen_family = AF_INET;
+
+    idle = readable(fd, ep);            /* nothing asked for yet */
+    if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&snl, sizeof snl) < 0) {
+        close(ep);
+        return "sendfail";
+    }
+    pending = readable(fd, ep);         /* a reply is waiting */
+    /* Drain it all: a real kernel may split a dump across datagrams, and both
+     * tiers must end up with nothing left to report. */
+    while (recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0)
+        ;
+    consumed = readable(fd, ep);        /* nothing left */
+
+    if (idle != 0 || pending != 7 || consumed != 0) {
+        snprintf(out, sizeof out, "idle%d/pending%d/consumed%d",
+                 idle, pending, consumed);
+        close(ep);
+        return out;
+    }
+
+    /* Now the shape itself: wait for the reply, then take it. A tier that
+     * can't report readiness times out here instead of answering. */
+    if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&snl, sizeof snl) < 0) {
+        close(ep);
+        return "sendfail2";
+    }
+    struct pollfd p = { fd, POLLIN, 0 };
+    int r = poll(&p, 1, 5000);
+    close(ep);
+    if (r != 1 || !(p.revents & POLLIN)) return "timeout";
+    return recv(fd, buf, sizeof buf, 0) > 0 ? "ok" : "empty";
+}
+
 /* Send a minimal RTM_NEWADDR (a reconfiguring request) and report the reply:
  * "ack" (error == 0), "eperm", another errno name, or a non-error message.
  * @src_pid takes the port id the reply claims to come from. */
@@ -112,7 +191,7 @@ int main(void) {
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
         printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
-               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\n");
+               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n");
         return 0;
     }
 
@@ -132,7 +211,10 @@ int main(void) {
 
     /* After the faked unshare, the same refusal must come back as an ack. */
     fd = nl_open();
-    if (fd < 0) { printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n");
+        return 0;
+    }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
     printf("after_netns=%s\n", strcmp(after, "ack") == 0 ? "ack" : after);
     /* The reply comes from the kernel, which owns port id 0. Callers rely on
@@ -171,7 +253,7 @@ int main(void) {
      * AF_UNIX substitute has no such default destination and would answer
      * ENOTCONN, so these must be routed to the emulation like send/recv are. */
     fd = nl_open();
-    if (fd < 0) { printf("wrdump=skip\n"); return 0; }
+    if (fd < 0) { printf("wrdump=skip\nready=skip\n"); return 0; }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
     memset(&d, 0, sizeof d);
     d.n.nlmsg_len = sizeof d;
@@ -187,5 +269,12 @@ int main(void) {
     printf("wrdump=%s\n",
            n > 0 && h->nlmsg_type == RTM_NEWLINK ? "data" :
            n > 0 && h->nlmsg_type == NLMSG_DONE  ? "data" : "broken");
+    close(fd);
+
+    /* Readiness: poll/select/epoll must track whether a reply is waiting, and
+     * a caller must be able to wait for one before reading it. */
+    fd = nl_open();
+    if (fd < 0) { printf("ready=skip\n"); return 0; }
+    printf("ready=%s\n", readiness_cycle(fd));
     return 0;
 }

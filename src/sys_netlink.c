@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_addr.h>
@@ -91,13 +92,79 @@ bool nl_is_fd(struct Machine *m, int fd)
     return r;
 }
 
+/* --- readiness: make the stand-in socket look like what it is standing in for -
+ * A synthesised reply lives in the emulator, so poll(2), select(2) and epoll --
+ * which ask the kernel about the fd, not us -- would never report the socket
+ * readable and a caller that waits before reading waits forever. Give them
+ * something true to see: an AF_UNIX datagram socket may be connected to itself,
+ * so a copy of the reply posted on it lands in its own receive queue, and the
+ * kernel then answers every readiness mechanism (present and future) for us.
+ *
+ * The copy is the reply itself rather than a token, so it stays harmless if a
+ * receive ever reaches the socket instead of the emulation -- through a dup of
+ * the fd, say, which nothing tracks. The invariant is that the queue holds
+ * exactly what nl_fds[i].reply_len says: armed while a reply is pending, drained
+ * as the guest consumes it, so a receive that finds no reply still finds the
+ * socket empty and waits on it (nl_no_reply). */
+
+/* Connect @fd to itself so a send on it is a send to itself: autobind for a
+ * name (an abstract one, invisible in the filesystem), then connect to it. The
+ * guest never sees either -- its own bind/connect are answered without touching
+ * the socket, and getsockname/getpeername are synthesised. */
+static bool nl_selfconnect(int fd)
+{
+    struct sockaddr_un un;
+    socklen_t sl = sizeof un;
+
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    /* addrlen == sizeof(sa_family_t) is the autobind request. */
+    if (bind(fd, (struct sockaddr *) &un, sizeof(sa_family_t)) < 0)
+        return false;
+    if (getsockname(fd, (struct sockaddr *) &un, &sl) < 0)
+        return false;
+    return connect(fd, (struct sockaddr *) &un, sl) == 0;
+}
+
+/* Drop whatever the socket holds. Caller holds nl_lock. */
+static void nl_disarm(struct Machine *m, int i)
+{
+    uint8_t drop[64];
+
+    if (!m->nl_fds[i].armed)
+        return;
+    while (recv(m->nl_fds[i].fd, drop, sizeof drop, MSG_DONTWAIT | MSG_TRUNC) >= 0)
+        ;
+    m->nl_fds[i].armed = 0;
+}
+
+/* Post @len bytes of the pending reply so the socket reads as readable. Replaces
+ * any older copy, matching the single reply the emulator keeps. Best-effort: a
+ * socket that never self-connected, or a send that won't fit, simply leaves
+ * readiness unreported -- delivery goes through the emulation regardless.
+ * Caller holds nl_lock. */
+static void nl_arm(struct Machine *m, int i, const uint8_t *reply, size_t len)
+{
+    if (!m->nl_fds[i].ready)
+        return;
+    nl_disarm(m, i);
+    if (len == 0)
+        return;
+    if (send(m->nl_fds[i].fd, reply, len, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t) len)
+        m->nl_fds[i].armed = 1;
+}
+
 void nl_mark_fd(struct Machine *m, int fd)
 {
+    bool ready = fd >= 0 && nl_selfconnect(fd);
+
     pthread_mutex_lock(&nl_lock);
     if (fd >= 0 && nl_slot(m, fd) < 0 && m->nl_fds_count < NL_MAX_FDS) {
         m->nl_fds[m->nl_fds_count].fd = fd;
         m->nl_fds[m->nl_fds_count].reply = NULL;
         m->nl_fds[m->nl_fds_count].reply_len = 0;
+        m->nl_fds[m->nl_fds_count].ready = ready;
+        m->nl_fds[m->nl_fds_count].armed = 0;
         m->nl_fds_count++;
     }
     pthread_mutex_unlock(&nl_lock);
@@ -1045,6 +1112,9 @@ static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
     }
     c->m->nl_fds[i].reply_len =
         build_reply_into(c, c->m->nl_fds[i].reply, NL_REPLY_MAX, base, blen);
+    /* The reply is ready now, so the socket must read as readable now: a caller
+     * that waits for POLLIN before receiving is the common shape. */
+    nl_arm(c->m, i, c->m->nl_fds[i].reply, c->m->nl_fds[i].reply_len);
     pthread_mutex_unlock(&nl_lock);
     return (u64)blen;
 }
@@ -1135,9 +1205,13 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
         if (copied > 0 && copy_to_guest(c, buf, c->m->nl_fds[i].reply, copied) == 0)
             *taken = copied;
     }
-    /* MSG_PEEK leaves the reply pending for the following real read. */
-    if (!(flags & MSG_PEEK))
+    /* MSG_PEEK leaves the reply pending for the following real read -- and the
+     * socket armed, since it is still readable. Consuming it disarms, so the
+     * queue keeps saying exactly what reply_len does. */
+    if (!(flags & MSG_PEEK)) {
         c->m->nl_fds[i].reply_len = 0;
+        nl_disarm(c->m, i);
+    }
     pthread_mutex_unlock(&nl_lock);
     return 1;
 }

@@ -187,7 +187,10 @@ static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
 }
 
 SYSDEF(bind) {
-    if (nl_is_fd(c->m, (int)a0)) return 0;   /* fake netlink socket: silent success */
+    /* Fake netlink socket: silent success. The stand-in is already bound to a
+     * name of the emulator's own choosing (sys_netlink.c gives it one so it can
+     * carry readiness), and the guest's sockaddr_nl means nothing to AF_UNIX. */
+    if (nl_is_fd(c->m, (int)a0)) return 0;
     struct sockaddr_storage ss;
     socklen_t sl;
     int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);
@@ -199,6 +202,10 @@ SYSDEF(bind) {
 }
 
 SYSDEF(connect) {
+    /* As in bind: connecting a netlink socket to the kernel (nl_pid 0) is an
+     * ordinary success, and letting a sockaddr_nl reach the AF_UNIX stand-in
+     * would both fail and re-point the self-connection its readiness rides on. */
+    if (nl_is_fd(c->m, (int)a0)) return 0;
     struct sockaddr_storage ss;
     socklen_t sl;
     int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);

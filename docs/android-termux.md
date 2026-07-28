@@ -46,8 +46,10 @@ unfiltered:
 * **Netlink emulation**: where the host denies `AF_NETLINK` sockets (common
   under SELinux app policy), `NETLINK_ROUTE` is emulated in-process, so guest
   `getifaddrs()`/`ip` keep working — including busybox's `ip`, which sends its
-  dump requests with `write(2)` rather than `send(2)`. The probe that decides
-  this sends a harmless
+  dump requests with `write(2)` rather than `send(2)`, and callers that wait on
+  `poll`/`select`/`epoll` before reading (the stand-in socket is connected to
+  itself, so a pending reply sits in its own queue and the kernel reports it
+  readable). The probe that decides this sends a harmless
   rtnetlink message too, not just `socket()`+`bind()`: SELinux filters netlink
   per message type, and `untrusted_app` is granted `nlmsg_read` but not
   `nlmsg_write`, so on those devices (kernel 4.14 era) a socket binds fine yet

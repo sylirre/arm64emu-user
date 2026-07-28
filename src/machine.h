@@ -118,12 +118,21 @@ struct Machine {
     /* Emulated AF_NETLINK/NETLINK_ROUTE sockets. On Android the host denies a
      * real netlink socket, so socket() hands out an AF_UNIX/SOCK_DGRAM stand-in
      * and the netlink-shaped syscalls on it are synthesised (sys_netlink.c).
-     * Shared across guest threads, copied on fork — like the host fds. */
+     * Shared across guest threads, copied on fork — like the host fds.
+     *
+     * The stand-in also carries *readiness*: a synthesised reply lives in the
+     * emulator, where poll/select/epoll cannot see it, so a copy is posted into
+     * the socket's own queue and drained again as the guest consumes the reply.
+     * That needs the socket connected to itself, which an AF_UNIX datagram
+     * socket permits; `ready` records whether that succeeded (it is the whole
+     * mechanism, and a host that refuses it just loses readiness reporting). */
 #define NL_MAX_FDS 32
     struct {
         int fd;
         u8 *reply;            /* pending reply buffer (malloc'd), or NULL */
         size_t reply_len;     /* valid bytes in reply awaiting recv */
+        u8 ready;             /* socket is self-connected: readiness works */
+        u8 armed;             /* a reply copy sits in its queue right now */
     } nl_fds[NL_MAX_FDS];
     int nl_fds_count;
 
