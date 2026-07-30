@@ -173,7 +173,7 @@ SYSDEF(kill) {
      * group-stop cooperatively (reports EVENT_STOP) instead of a real host signal. */
     if ((s32)a0 > 0 && a0 != (u64)getpid() && ptrace_signal_cont((s32)a0, (int)a1))
         return 0;
-    return kill((pid_t)(s32)a0, (int)a1) < 0 ? host_err() : 0;
+    return kill((pid_t)(s32)a0, sig_send_host_nr((int)a1)) < 0 ? host_err() : 0;
 }
 
 SYSDEF(tkill) {
@@ -192,7 +192,8 @@ SYSDEF(tkill) {
         if (ptrace_signal_stop(tid, (int)a1)) return 0;
         if (ptrace_signal_cont(tid, (int)a1)) return 0;
     }
-    return syscall(SYS_tkill, (pid_t)tid, (int)a1) < 0 ? host_err() : 0;
+    return syscall(SYS_tkill, (pid_t)tid, sig_send_host_nr((int)a1)) < 0
+               ? host_err() : 0;
 }
 
 SYSDEF(tgkill) {
@@ -210,7 +211,8 @@ SYSDEF(tgkill) {
          * to one it has put into a listening group-stop -> group-stop end. */
         return 0;
     }
-    return syscall(SYS_tgkill, (pid_t)tgid, (pid_t)tid, (int)a2) < 0 ? host_err() : 0;
+    return syscall(SYS_tgkill, (pid_t)tgid, (pid_t)tid, sig_send_host_nr((int)a2)) < 0
+               ? host_err() : 0;
 }
 
 /* ---- signalfd(2) ----
@@ -421,15 +423,16 @@ SYSDEF(rt_sigqueueinfo) {
     memcpy(&pid, gsi + 16, 4);
     memcpy(&uid, gsi + 20, 4);
     memcpy(&value, gsi + 24, 8);
+    int hs = sig_send_host_nr((int)(s32)a1);   /* 32/33 ride the carrier */
     siginfo_t si;
     memset(&si, 0, sizeof si);
-    si.si_signo = (int)(s32)a1;
+    si.si_signo = hs;
     si.si_code = code;
     si.si_pid = (pid_t)pid;
     si.si_uid = (uid_t)uid;
     /* An ILP32 host truncates a pointer-sized payload to its 32-bit sival;
      * int payloads (the sigqueue API) are preserved everywhere. */
     si.si_value.sival_ptr = (void *)(uintptr_t)value;
-    long r = syscall(SYS_rt_sigqueueinfo, (pid_t)(s32)a0, (int)(s32)a1, &si);
+    long r = syscall(SYS_rt_sigqueueinfo, (pid_t)(s32)a0, hs, &si);
     return r < 0 ? host_err() : 0;
 }

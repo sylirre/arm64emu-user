@@ -130,6 +130,20 @@ int sig_arm_rt_remap(int guest_sig) {
     return host;
 }
 
+/* The host signal number to raise on the guest's behalf. Guest 32/33 are its
+ * libc's own SIGCANCEL/SIGSETXID -- pthread_cancel sends one, and glibc's
+ * setuid() broadcasts the other to every thread -- but those numbers are the
+ * *host* libc's internals and cannot be raised as themselves: a glibc host
+ * takes the stray signal in its own setxid handler and dereferences a NULL
+ * command block, and a musl host has no handler at all and dies of the default
+ * action. Either way the emulator is killed instead of the guest receiving its
+ * signal. Route them onto the reserved carrier, which the capture handler maps
+ * back to 32/33 (sig_remap_to_guest) before the guest ever sees it. */
+int sig_send_host_nr(int guest_sig) {
+    return (guest_sig == 32 || guest_sig == 33) ? sig_arm_rt_remap(guest_sig)
+                                                : guest_sig;
+}
+
 /* Queue a signal into this thread's own capture ring as if the host had caught
  * it, for cooperative delivery at the next run-loop boundary. Routes a traced
  * process's self-directed stop signal (SIGSTOP/SIGTSTP/...) through ptrace's

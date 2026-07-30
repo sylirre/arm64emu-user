@@ -361,6 +361,8 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns);
  * owns those) and return the host signal to raise instead; the capture
  * handler translates it back to the guest number (sys_time.c timer_create). */
 int  sig_arm_rt_remap(int guest_sig);
+/* Host signal number to raise for a guest signal (32/33 -> armed carrier). */
+int  sig_send_host_nr(int guest_sig);
 
 /* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
  * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval
