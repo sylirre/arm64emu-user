@@ -222,6 +222,8 @@ static int broker_send(int sock, const void *data, size_t len, int fd) {
     return r < 0 ? -1 : 0;
 }
 
+static int read_full(int fd, void *buf, size_t len);
+
 /* Receive a fixed-size payload plus an optional fd. When `fd_out` is non-NULL it
  * gets the received fd or -1 (none). Returns 0, or -1 on EOF/error (e.g. the
  * daemon exiting mid-handshake). */
@@ -243,6 +245,12 @@ static int broker_recv(int sock, void *data, size_t len, int *fd_out) {
     if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
         c->cmsg_len == CMSG_LEN(sizeof(int)) && fd_out)
         memcpy(fd_out, CMSG_DATA(c), sizeof(int));
+    /* A stream socket may hand back less than asked. Only the first read has
+     * to be a recvmsg (the ancillary data rides with the first byte), so
+     * finish the payload plainly rather than letting a caller act on a
+     * half-filled request/reply struct. */
+    if ((size_t)r < len &&
+        read_full(sock, (char *)data + r, len - (size_t)r) != 0) return -1;
     return 0;
 }
 
@@ -1630,6 +1638,7 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
                     struct timeval tv = { 2, 0 };   /* don't wedge on a stuck client */
                     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
                     struct BReq q;
+                    memset(&q, 0, sizeof q);   /* never dispatch on stack junk */
                     int parked = 0;
                     if (broker_recv(c, &q, sizeof q, NULL) == 0)
                         parked = ipc_serve(c, &q, memfd);
