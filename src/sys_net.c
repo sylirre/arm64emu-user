@@ -380,6 +380,95 @@ typedef struct {
     s32 msg_flags; u32 _pad2;
 } GMsghdr;
 
+/* ---- ancillary data: guest cmsghdr <-> host cmsghdr ----
+ *
+ * The guest's is LP64 -- {u64 cmsg_len; s32 cmsg_level; s32 cmsg_type;}, data
+ * at +16, each element padded up to a multiple of 8. A 64-bit host's is byte
+ * for byte the same, but an ILP32 host's cmsg_len is 4 bytes wide, which makes
+ * the header 12 and the padding 4. Handing that host a guest-shaped buffer
+ * verbatim gives it a cmsg_len read out of the wrong half of the field and a
+ * level/type read out of the payload, so nothing survived the trip: SCM_RIGHTS
+ * fd passing over AF_UNIX simply did not work on the 32-bit build.
+ *
+ * Both directions run on every host rather than being compiled out where the
+ * layouts agree, so the common build exercises the same code -- and so the
+ * guest's buffer is validated rather than trusted. Descriptors inside
+ * SCM_RIGHTS need no translation of their own: guest fds are host fds. */
+#define GCMSG_HDRLEN   16u
+#define GCMSG_ALIGN(n) (((n) + 7u) & ~(u64)7u)
+#define MSG_CTRL_MAX   4096   /* both callers' staging buffers are this big */
+
+/* Guest control buffer -> host. Returns the host controllen, or -1 if the
+ * result would not fit (the caller reports EINVAL, as the kernel does for a
+ * control buffer it cannot hold). */
+static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
+    size_t goff = 0, hoff = 0;
+    while (goff + GCMSG_HDRLEN <= glen) {
+        u64 clen;
+        s32 level, type;
+        memcpy(&clen, gb + goff, 8);
+        memcpy(&level, gb + goff + 8, 4);
+        memcpy(&type, gb + goff + 12, 4);
+        /* Bound by subtraction: clen is a guest u64 and must not be trusted to
+         * advance the walk (see the netlink walks for the same hazard). */
+        if (clen < GCMSG_HDRLEN || clen > glen - goff) break;
+        size_t dlen = (size_t)(clen - GCMSG_HDRLEN);
+        size_t hel = CMSG_LEN(dlen), hstep = CMSG_ALIGN(hel);
+        if (hstep > hcap - hoff) return -1;
+        struct cmsghdr ch;
+        memset(&ch, 0, sizeof ch);
+        ch.cmsg_len = hel;
+        ch.cmsg_level = level;
+        ch.cmsg_type = type;
+        memset(hb + hoff, 0, hstep);
+        memcpy(hb + hoff, &ch, sizeof ch);
+        memcpy(hb + hoff + CMSG_ALIGN(sizeof ch), gb + goff + GCMSG_HDRLEN, dlen);
+        hoff += hstep;
+        goff += (size_t)GCMSG_ALIGN(clen);
+    }
+    return (ssize_t)hoff;
+}
+
+/* Host control buffer -> guest, in the guest's layout and bounded by the
+ * guest's buffer. Sets *ctrunc when anything had to be dropped or cut short. */
+static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
+                       int *ctrunc) {
+    size_t hoff = 0, goff = 0;
+    while (hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) <= hlen) {
+        struct cmsghdr ch;
+        memcpy(&ch, hb + hoff, sizeof ch);
+        size_t clen = ch.cmsg_len;
+        if (clen < CMSG_LEN(0) || clen > hlen - hoff) break;
+        size_t dlen = clen - CMSG_LEN(0);
+        u64 gel = GCMSG_HDRLEN + (u64)dlen;
+        size_t avail = gcap - goff;
+        if (gel > avail) {
+            /* Too big for what is left. The kernel's put_cmsg does not drop
+             * the element -- it writes the header with the *truncated* length,
+             * copies as much payload as fits, and raises MSG_CTRUNC. An ILP32
+             * host reaches this where a real LP64 kernel would, because the
+             * guest's element is four bytes bigger than the host's. */
+            *ctrunc = 1;
+            if (avail < GCMSG_HDRLEN) break;   /* not even a header fits */
+            gel = avail;
+            dlen = (size_t)gel - GCMSG_HDRLEN;
+        }
+        size_t gstep = (size_t)GCMSG_ALIGN(gel);
+        if (gstep > avail) gstep = avail;      /* last element: no room to pad */
+        s32 level = ch.cmsg_level, type = ch.cmsg_type;
+        memset(gb + goff, 0, gstep);
+        memcpy(gb + goff, &gel, 8);
+        memcpy(gb + goff + 8, &level, 4);
+        memcpy(gb + goff + 12, &type, 4);
+        memcpy(gb + goff + GCMSG_HDRLEN,
+               hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)), dlen);
+        goff += gstep;
+        hoff += CMSG_ALIGN(clen);
+    }
+    if (hoff < hlen) *ctrunc = 1;   /* elements left over that never fit */
+    return goff;
+}
+
 static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
                       struct iovec **iov_out, u8 **bounce_out,
                       struct sockaddr_storage *ss, u8 *ctrl, size_t ctrl_cap,
@@ -432,11 +521,26 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     h->msg_iovlen = cnt;
     if (g->msg_control && g->msg_controllen) {
         size_t cl = g->msg_controllen > ctrl_cap ? ctrl_cap : g->msg_controllen;
-        if (for_send && copy_from_guest(c, ctrl, g->msg_control, cl) < 0) {
-            free(bounce); free(iov); return -EFAULT;
+        if (cl > MSG_CTRL_MAX) cl = MSG_CTRL_MAX;
+        if (for_send) {
+            /* Stage the guest's buffer, then rebuild it in the host's cmsghdr
+             * layout -- the two differ on an ILP32 host. */
+            u8 gctrl[MSG_CTRL_MAX];
+            if (copy_from_guest(c, gctrl, g->msg_control, cl) < 0) {
+                free(bounce); free(iov); return -EFAULT;
+            }
+            ssize_t hl = cmsg_g2h(gctrl, cl, ctrl, ctrl_cap);
+            if (hl < 0) { free(bounce); free(iov); return -EINVAL; }
+            h->msg_controllen = (size_t)hl;
+        } else {
+            /* Receiving: the host writes its own layout here and the writeback
+             * converts. A host element is never larger than the guest's, so on
+             * an ILP32 host the conversion can expand past what the guest
+             * offered; that is reported as a short controllen plus MSG_CTRUNC,
+             * exactly as the kernel reports a control buffer it outgrew. */
+            h->msg_controllen = cl;
         }
         h->msg_control = ctrl;
-        h->msg_controllen = cl;
     }
     h->msg_flags = g->msg_flags;
     *iov_out = iov;
@@ -501,10 +605,19 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
         u32 out = (u32)sl < g->msg_namelen ? (u32)sl : g->msg_namelen;
         if (out) copy_to_guest(c, g->msg_name, ss, out);
     }
-    if (g->msg_control && h->msg_controllen)
-        copy_to_guest(c, g->msg_control, ctrl, h->msg_controllen);
+    if (g->msg_control && h->msg_controllen) {
+        u8 gctrl[MSG_CTRL_MAX];
+        size_t gcap = g->msg_controllen > MSG_CTRL_MAX ? MSG_CTRL_MAX
+                                                       : (size_t)g->msg_controllen;
+        int ctrunc = 0;
+        size_t gl = cmsg_h2g(ctrl, h->msg_controllen, gctrl, gcap, &ctrunc);
+        if (gl) copy_to_guest(c, g->msg_control, gctrl, gl);
+        if (ctrunc) h->msg_flags |= MSG_CTRUNC;
+        g->msg_controllen = gl;
+    } else {
+        g->msg_controllen = h->msg_controllen;
+    }
     g->msg_namelen = h->msg_namelen;
-    g->msg_controllen = h->msg_controllen;
     g->msg_flags = h->msg_flags;
     copy_to_guest(c, hdr_va, g, sizeof *g);
 }
