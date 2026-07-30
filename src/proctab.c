@@ -848,6 +848,9 @@ static s32 sem_try_op(struct SemSet *s, const GSembuf *sops, u32 nsops,
     for (u32 i = 0; i < nsops; i++)
         if (sops[i].sem_num >= s->nsems) return -EFBIG;
 
+    /* The undo row is per (pid, set), so one lookup serves the whole vector;
+     * created lazily on the first SEM_UNDO op. */
+    struct SemUndo *undo = NULL;
     s32 result = 0;
     u32 i;
     for (i = 0; i < nsops; i++) {
@@ -861,29 +864,33 @@ static s32 sem_try_op(struct SemSet *s, const GSembuf *sops, u32 nsops,
         }
         if (v > G_SEMVMX) { result = -ERANGE; break; }
         if (op->sem_flg & G_SEM_UNDO) {
-            struct SemUndo *u = sem_undo_find(pid, s, 1);
-            if (!u) { result = -ENOMEM; break; }   /* undo table exhausted */
-            int adj = (int)u->adj[op->sem_num] - op->sem_op;
-            if (adj < -G_SEMAEM || adj > G_SEMAEM) { result = -ERANGE; break; }
+            if (!undo) undo = sem_undo_find(pid, s, 1);
+            if (!undo) { result = -ENOMEM; break; }   /* undo table exhausted */
+            /* Accumulate here, not after the vector commits: two SEM_UNDO ops
+             * on one semaphore in the same vector must see each other, or each
+             * passes the range check against the same stale base and their sum
+             * silently overflows the s16 semadj. Kernel range (SEMAEM is the
+             * positive bound, one more is allowed on the negative side). */
+            int adj = (int)undo->adj[op->sem_num] - op->sem_op;
+            if (adj < -G_SEMAEM - 1 || adj > G_SEMAEM) { result = -ERANGE; break; }
+            undo->adj[op->sem_num] = (s16)adj;
         }
         s->val[op->sem_num] = (u16)v;
     }
-    if (result != 0) {                    /* roll back the applied prefix */
-        while (i--)
+    if (result != 0) {           /* roll back the applied prefix, undo included */
+        while (i--) {
+            if ((sops[i].sem_flg & G_SEM_UNDO) && undo)
+                undo->adj[sops[i].sem_num] =
+                    (s16)((int)undo->adj[sops[i].sem_num] + sops[i].sem_op);
             s->val[sops[i].sem_num] =
                 (u16)((int)s->val[sops[i].sem_num] - sops[i].sem_op);
+        }
         return result;
     }
-    /* Committed: record undo adjustments and stamp sempid on every referenced
-     * semaphore (zero-ops included — kernel behavior), otime on the set. */
-    for (i = 0; i < nsops; i++) {
-        if (sops[i].sem_flg & G_SEM_UNDO) {
-            struct SemUndo *u = sem_undo_find(pid, s, 0);
-            if (u) u->adj[sops[i].sem_num] =
-                (s16)(u->adj[sops[i].sem_num] - sops[i].sem_op);
-        }
+    /* Committed: stamp sempid on every referenced semaphore (zero-ops
+     * included — kernel behavior), otime on the set. */
+    for (i = 0; i < nsops; i++)
         s->lpid[sops[i].sem_num] = pid;
-    }
     s->otime = (s64)time(NULL);
     s->tpid = pid;
     return 0;

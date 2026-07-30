@@ -598,7 +598,10 @@ crashing guest can never corrupt IPC state.
   share the pid, giving `CLONE_SYSVSEM` semantics for free. A `SIGKILL`'d
   holder is caught by the broker's ~1 s liveness-reclaim tick, which also
   wakes any waiter the applied undo unblocks. `SETVAL`/`SETALL` clear the
-  affected adjustments in every process's list (kernel rule).
+  affected adjustments in every process's list (kernel rule). Adjustments
+  accumulate *within* a vector, so two `SEM_UNDO` ops on one semaphore see
+  each other and the pair can exceed `SEMAEM` (`ERANGE`); a vector that fails
+  or blocks rolls its adjustments back along with the values.
 - **Fidelity.** Values clamp at `SEMVMX` (32767) with `ERANGE`; `semop`
   vectors apply all-or-nothing with prefix rollback; `sempid`, `sem_otime` and
   `GETNCNT`/`GETZCNT` (counted from the parked-waiter queue) behave as the
