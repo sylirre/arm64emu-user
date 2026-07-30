@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -201,17 +202,51 @@ SYSDEF(personality) {
     return old;
 }
 
+/* Capability-set versions, as the kernel names them. */
+#define G_CAP_VER_1 0x19980330u
+#define G_CAP_VER_2 0x20071026u
+#define G_CAP_VER_3 0x20080522u   /* what the kernel prefers, and reports */
+
 SYSDEF(capget) {
     /* header {version, pid}. Report the full capability set for fake-root,
      * otherwise none. */
     struct { u32 version; s32 pid; } hdr;
     if (copy_from_guest(c, &hdr, a0, sizeof hdr) < 0) return (u64)(s64)-EFAULT;
+
+    /* Version negotiation, as cap_validate_magic does. A version the kernel
+     * does not know is answered by writing the preferred one *back into the
+     * header*, and libcap asks exactly that way at startup: it calls capget
+     * with a deliberately bogus version and a NULL data pointer purely to read
+     * the answer out of the header. Ignoring the field left that probe seeing
+     * its own zero, so libcap could not tell which layout to use. The kernel
+     * reports success for the NULL-data probe and EINVAL when data was really
+     * wanted. */
+    unsigned nsets;
+    switch (hdr.version) {
+        case G_CAP_VER_1: nsets = 1; break;
+        case G_CAP_VER_2:
+        case G_CAP_VER_3: nsets = 2; break;
+        default: {
+            u32 pref = G_CAP_VER_3;
+            if (copy_to_guest(c, a0, &pref, 4) < 0) return (u64)(s64)-EFAULT;
+            return a1 ? (u64)(s64)-EINVAL : 0;
+        }
+    }
+
+    /* The header's pid was ignored outright, so asking about a process that
+     * does not exist reported a capability set for it. Guest pids are host
+     * pids, so the host can answer whether it is there; a pid we exist but may
+     * not signal comes back EPERM, which is not ESRCH and not our concern. */
+    if (hdr.pid < 0) return (u64)(s64)-EINVAL;
+    if (hdr.pid && hdr.pid != getpid() &&
+        kill((pid_t)hdr.pid, 0) < 0 && errno == ESRCH)
+        return (u64)(s64)-ESRCH;
+
     if (a1) {
         struct { u32 eff, perm, inh; } d[2];
         u32 all = (c->m->fake_id && c->m->cred.euid == 0) ? 0xffffffffu : 0;
         for (int i = 0; i < 2; i++) { d[i].eff = all; d[i].perm = all; d[i].inh = 0; }
-        int n = (hdr.version == 0x19980330) ? 1 : 2;
-        if (copy_to_guest(c, a1, d, sizeof(d[0]) * (size_t)n) < 0)
+        if (copy_to_guest(c, a1, d, sizeof(d[0]) * (size_t)nsets) < 0)
             return (u64)(s64)-EFAULT;
     }
     return 0;
