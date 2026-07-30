@@ -110,7 +110,15 @@ One wrinkle: guest signals **32/33** are the *guest* libc's internal numbers
 they can never be raised as host signals. A timer armed with guest 32/33 is
 created with a reserved high host RT carrier (`SIGRTMAX-1`/`SIGRTMAX-2`)
 instead, translated back to the guest number when the capture handler queues
-it. The carriers are armed on first use, so a guest that never touches 32/33
+it. The same carrier carries a guest signal 32/33 sent *directly* —
+`kill`/`tkill`/`tgkill`/`rt_sigqueueinfo` all route through `sig_send_host_nr`
+— which is what makes `pthread_cancel` (musl and glibc send `SIGCANCEL` = 32)
+and glibc's `setuid` broadcast (33 to every thread) work at all: raised raw,
+they hit the *host* libc's own handler for those numbers, and the emulator died
+of its own signal instead of the guest receiving one. Threads share the armed
+carrier, which is what those two cases need, since both are intra-process; a
+cross-process send to a peer that has not armed its carrier still misnames the
+signal. The carriers are armed on first use, so a guest that never touches 32/33
 keeps those host numbers; a guest using *both* 32/33 timers *and* the top RT
 numbers directly would collide — a documented corner. `SIGEV_THREAD` itself
 never reaches the syscall level (guest libc implements it in userspace), and is

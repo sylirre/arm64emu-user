@@ -94,6 +94,22 @@ is what keeps runtimes that reserve specific high addresses and munmap anything
 placed elsewhere — Go's heap-arena reservation is the motivating case — from
 thrashing at startup, and is why the guest VA space is 47 bits (`sys_mm.c`).
 
+`mremap` shrinks and grows in place where it can, and otherwise moves by
+allocating, copying and unmapping. `MREMAP_FIXED` is honored — the destination
+comes from the fifth argument, replaces whatever was mapped there, and is
+refused when it overlaps the source — because a caller that names an address
+goes on to *use* that address, so returning a different one silently corrupts
+it. Both lengths must be non-zero, as in Linux: a zero new length is not a
+request to unmap the region, and a zero old length only means anything for the
+shared-mapping duplication this does not implement. Every range-taking entry
+point bounds its request against `GUEST_TASK_SIZE` with a subtraction rather
+than an addition (`range_ok`), since the page-table walk indexes `l1[va >> 26]`
+for each page and a length chosen to wrap the sum would walk off the array.
+
+One thing the move path still does not preserve: a moved file or `MAP_SHARED`
+region is re-created as anonymous memory and byte-copied, so it loses its
+connection to the file.
+
 ## Host memory-ordering discipline
 
 This is the subtle part. The interpreter runs one guest thread per host thread

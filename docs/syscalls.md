@@ -425,10 +425,17 @@ then make the consequences the caller depends on true:
   targets during the walk (`path_proc_magic`), so `stat /proc/self/exe` reaches
   the guest binary and `/proc/self/root/…` resolves inside the rootfs instead of
   escaping to the host fs; `readlinkat` reports the same guest targets, and
-  strips the rootfs prefix from `fd/N` link targets. This covers the `self`/
-  own-pid spelling (served from this `Machine`) *and* any other guest PID (`exe`/
-  `cwd` served from the shared PID registry, `root` being the common rootfs), so
-  a child reading `/proc/$$/exe` sees the guest binary, not the emulator. And
+  strips the rootfs prefix from `fd/N` link targets. This covers every "this
+  process" spelling the kernel offers — `self`, the own-pid form, `thread-self`,
+  and the `task/<tid>` sub-path of any of them for one of our own threads
+  (`proc_self_tail`, shared with the synthesized-file classifier so both agree)
+  — *and* any other guest PID (`exe`/`cwd` served from the shared PID registry,
+  `root` being the common rootfs), so a child reading `/proc/$$/exe` sees the
+  guest binary, not the emulator. The alternative spellings matter as much as
+  the plain one: left unrecognized they fell through to the host files, handing
+  the guest the emulator's own binary path, host cwd and full command line.
+  Everything served this way is per-process, which is why a thread's own task
+  directory can be answered from the same `Machine`. And
   `openat` diverts **synthesized files** (`sys_procfs.c`) to an in-memory guest
   view: `maps` (from the region list, PTE-true protections, `[heap]`/`[stack]`
   labels), `cmdline` (exec-time guest argv), `environ` (exec-time guest
