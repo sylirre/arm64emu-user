@@ -67,15 +67,10 @@ static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Tail after "/proc/self/" or "/proc/<own-pid>/", else NULL. */
+/* Tail after any "this process" spelling -- self, own pid, thread-self, or one
+ * of our threads' task/<tid> -- else NULL. See proc_self_tail (path.c). */
 static const char *self_tail(const char *canon) {
-    if (!strncmp(canon, "/proc/self/", 11)) return canon + 11;
-    if (!strncmp(canon, "/proc/", 6)) {
-        char own[32];
-        int n = snprintf(own, sizeof own, "%d/", getpid());
-        if (n > 0 && !strncmp(canon + 6, own, (size_t)n)) return canon + 6 + n;
-    }
-    return NULL;
+    return proc_self_tail(canon);
 }
 
 /* Guest fstype of the rootfs: host statfs magic -> name, "ext4" fallback. */

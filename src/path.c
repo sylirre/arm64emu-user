@@ -95,6 +95,43 @@ int proc_zone_path(const char *host) {
     return !strncmp(host, "/proc", 5) && (host[5] == 0 || host[5] == '/');
 }
 
+/* Tail after the "this process" spellings of a /proc path: /proc/self/,
+ * /proc/<own-pid>/, /proc/thread-self/, and the task/<tid>/ sub-path of any of
+ * them for one of our own threads. NULL if canon names something else.
+ *
+ * The kernel offers every one of these names for the same files, and everything
+ * served through here -- exe, cwd, root, cmdline, environ, auxv, maps, the mount
+ * tables, the id maps -- is per-process, so a thread's own task directory is
+ * answered from the same Machine. Missing the alternative spellings meant they
+ * fell through to the host files, which describe the *emulator*: readlink
+ * /proc/thread-self/exe handed the guest our binary's host path and
+ * thread-self/cmdline the whole arm64chroot command line. */
+const char *proc_self_tail(const char *canon) {
+    if (strncmp(canon, "/proc/", 6)) return NULL;
+    const char *rest = canon + 6, *tail;
+    if (!strncmp(rest, "self/", 5)) tail = rest + 5;
+    else if (!strncmp(rest, "thread-self/", 12)) tail = rest + 12;
+    else {
+        char own[32];
+        int n = snprintf(own, sizeof own, "%d/", getpid());
+        if (n <= 0 || strncmp(rest, own, (size_t)n)) return NULL;
+        tail = rest + n;
+    }
+    if (!strncmp(tail, "task/", 5)) {
+        const char *t = tail + 5;
+        if (*t < '0' || *t > '9') return tail;
+        while (*t >= '0' && *t <= '9') t++;
+        if (*t != '/') return tail;
+        /* Guest tid == host tid, so our own thread list is the host's: anything
+         * else keeps resolving as a plain path (the kernel's own ENOENT). */
+        char probe[64];
+        snprintf(probe, sizeof probe, "/proc/self/task/%.*s",
+                 (int)(t - (tail + 5)), tail + 5);
+        if (!access(probe, F_OK)) return t + 1;
+    }
+    return tail;
+}
+
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
  * state (our binary, the host cwd, the host root). Following or reading them raw
  * would leak host paths, and root/… would escape the rootfs entirely, so the
@@ -109,14 +146,8 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     if (strncmp(canon, "/proc/", 6)) return 0;
     const char *rest = canon + 6;
 
-    /* self / own-pid: this Machine's own live state. */
-    const char *tail = NULL;
-    if (!strncmp(canon, "/proc/self/", 11)) tail = canon + 11;
-    else {
-        char own[32];
-        int n = snprintf(own, sizeof own, "%d/", getpid());
-        if (n > 0 && !strncmp(rest, own, (size_t)n)) tail = rest + n;
-    }
+    /* self / own-pid / thread-self / our own task/<tid>: this Machine's state. */
+    const char *tail = proc_self_tail(canon);
     if (tail) {
         if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
         if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }

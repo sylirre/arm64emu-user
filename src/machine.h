@@ -404,6 +404,9 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
 /* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
  * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
+/* Tail after a "this process" /proc spelling (self, own pid, thread-self, our
+ * own task/<tid>), or NULL. */
+const char *proc_self_tail(const char *canon);
 
 /* A namespace-absolute guest path as the guest sees it: subtract the chroot /
  * pivot_root base. out >= PATH_MAX. */
