@@ -392,10 +392,17 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     if (cnt > 1024) return -EINVAL;
     GIovec gi[1024];
     if (cnt && copy_from_guest(c, gi, g->msg_iov, sizeof(GIovec) * cnt) < 0) return -EFAULT;
-    size_t total = 0;
-    for (unsigned i = 0; i < cnt; i++) total += gi[i].iov_len;
-    if (total > (1u << 24)) return -EINVAL;
-    u8 *bounce = malloc(total ? total : 1);
+    /* Bound every segment on its own, not just the sum: iov_len is a guest u64,
+     * so lengths chosen to wrap the host-width total would pass a sum-only check
+     * while each stays huge, and the per-segment copy below uses the unclamped
+     * length. Accumulate in u64 (cnt <= 1024, each <= 2^24: no wrap). */
+    u64 total = 0;
+    for (unsigned i = 0; i < cnt; i++) {
+        if (gi[i].iov_len > (1u << 24)) return -EINVAL;
+        total += gi[i].iov_len;
+        if (total > (1u << 24)) return -EINVAL;
+    }
+    u8 *bounce = malloc(total ? (size_t)total : 1);
     struct iovec *iov = malloc(sizeof(struct iovec) * (cnt ? cnt : 1));
     if (!bounce || !iov) { free(bounce); free(iov); return -ENOMEM; }
     size_t off = 0;
