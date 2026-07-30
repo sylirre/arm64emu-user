@@ -630,6 +630,40 @@ the emulator's own path. A wrong arch/format yields `ENOEXEC` so the guest shell
 script fallback works. `do_execve` takes private copies of argv/envp — the caller
 retains ownership (a subtle earlier use-after-free lives in the git history).
 
+**Sibling threads.** The kernel's `de_thread` kills every other thread of the
+group before loading the new image. That is **not implemented**, and without it
+the teardown frees the address space while another thread is still walking it —
+which kills the *emulator*, not the guest, with a SIGSEGV inside the interpreter.
+
+A sibling parked in the syscall layer holds no guest translation, though, and
+that case matters in practice: glibc runs `SIGEV_THREAD` timers on a permanent
+helper thread sitting in `rt_sigtimedwait`, so refusing whenever any thread
+exists would stop a program that ever armed one from ever exec'ing again. So the
+test is whether another thread is *executing guest code* (`as->nrunning`,
+bracketed around the syscall layer in `emu_loop`), not whether another thread
+exists. `execve` returns **`ENOSYS`** — a value it never returns on a real
+kernel, so it reads as "the emulator does not do this" — when:
+
+- another thread is running guest code, which is the crash; or
+- the caller is not the main thread, even with everything else parked. The
+  kernel hands group leadership to the exec'ing thread so the new image sees
+  `tid == pid`; a host thread cannot become the group leader, and guest tid ==
+  host tid is relied on throughout (ptrace links, `tkill`/`tgkill`, the proc
+  registry). Doing this properly means landing the new image on the main thread
+  whichever guest thread asked for it.
+
+What makes the permitted case safe rather than lucky is the **image epoch**
+(`m->exec_epoch`), bumped by every successful reload. A sibling that later wakes
+finds its own epoch stale and leaves at the run loop's next boundary instead of
+resuming the old program's registers against the new address space — which
+otherwise faults immediately. It drops its `CLONE_CHILD_CLEARTID` word on the
+way out, since that address now belongs to whatever the new image put there and
+the joiner it was meant for died with the old program.
+
+The ordinary fork-then-exec path is unaffected throughout: `fork(2)` duplicates
+only the calling thread, so the child is single-threaded whatever its parent
+was.
+
 ## `--fake-id` (fakeroot/fake-uid)
 
 `--fake-id [uid[:gid]]` (default `0:0`) makes the guest believe it runs as a chosen

@@ -112,6 +112,11 @@ void as_init(AddrSpace *as) {
     if (!as->l1) { perror("arm64chroot: calloc"); exit(127); }
     as->mmap_next = 0x6000000000ULL;
     as->nthreads = 1;
+    /* Nobody is executing guest code yet, and every reset of this happens from
+     * inside the syscall layer (as_init via execve, the fork child), where the
+     * caller's own contribution is already zero. emu_loop adds it back on the
+     * way out. */
+    as->nrunning = 0;
 }
 
 /* A guest thread joining or leaving this address space. The count gates the
@@ -122,6 +127,16 @@ void as_thread_enter(AddrSpace *as) {
 }
 void as_thread_exit(AddrSpace *as) {
     __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Bracket the syscall layer. Only a thread running guest instructions can walk
+ * the page table, so this is what says whether tearing the address space down
+ * would be pulling it out from under somebody (sys_proc.c, execve). */
+void as_leave_guest(AddrSpace *as) {
+    __atomic_fetch_sub(&as->nrunning, 1, __ATOMIC_ACQ_REL);
+}
+void as_enter_guest(AddrSpace *as) {
+    __atomic_fetch_add(&as->nrunning, 1, __ATOMIC_ACQ_REL);
 }
 
 static uintptr_t pte_get(AddrSpace *as, u64 va) {

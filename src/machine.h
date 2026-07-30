@@ -193,6 +193,12 @@ struct Machine {
      * for. The chain is newest-first, malloc'd, and so copied by fork and kept
      * across execve, exactly as the kernel keeps filters. Threads share it,
      * which is the kernel's TSYNC behavior rather than its default. */
+    /* Image generation, bumped by every successful execve. A guest thread that
+     * was parked in a syscall while another thread exec'd belongs to the
+     * program that is gone; the run loop compares this against the thread's own
+     * copy and makes it leave instead of resuming into the new image. */
+    u32 exec_epoch;
+
     u8 seccomp_mode;          /* G_SECCOMP_MODE_* (0 = none: the hot path) */
     void *seccomp_filters;    /* struct SeccompProg *, newest first */
 

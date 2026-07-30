@@ -27,6 +27,9 @@ typedef struct {
     u64 sigmask;
     u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
     int have_saved_sigmask;
+    u32 exec_epoch;           /* the image generation this thread belongs to;
+                               * a mismatch with the Machine's means an execve
+                               * replaced it and this thread must leave */
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;

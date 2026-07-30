@@ -571,6 +571,30 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
     fi
 fi
 
+# ---- execve with live sibling threads. Self-checking: the emulator answers
+# differently from a kernel on purpose. It has no de_thread, so rather than
+# tearing the address space down under threads still running against it -- which
+# killed the emulator itself with a SIGSEGV -- it refuses with ENOSYS before
+# anything is torn down. The other half is that *joined* threads must not count,
+# or ordinary join-then-exec programs would start failing; that half is a race,
+# and the fixture's loop is sized to catch it (it failed about one run in ten
+# before the thread-exit ordering was fixed). ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/mtexec.bin \
+            tests/fixtures/mtexec.c -lpthread 2>/dev/null; then
+        expect=$'reached_child\nafter_join exited=1 status=0\nreached_child\nafter_parked exited=1 status=0\nlive_siblings=1\nlive_exited=1 status=0\nsecondary_siblings=1\nsecondary_exited=1 status=0\ndone'
+        got=$(timeout 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: mtexec"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/mtexec.bin
+    else
+        echo "SKIP build fixtures/mtexec"
+    fi
+fi
+
 # ---- a :ro bind mount stays read-only for fd-based mutation too. Self-checking:
 # bind mounts are the emulator's own feature, so qemu is not an oracle. The
 # point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr

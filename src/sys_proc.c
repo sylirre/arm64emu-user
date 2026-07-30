@@ -197,6 +197,7 @@ static void *thread_entry(void *arg) {
     t->tid = tid;
     g_tls.tid = tid;
     g_tls.clear_child_tid = (t->flags & G_CLONE_CHILD_CLEARTID) ? t->ctid : 0;
+    g_tls.exec_epoch = __atomic_load_n(&t->m->exec_epoch, __ATOMIC_ACQUIRE);
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
     CPU *c = &t->cpu;
@@ -230,8 +231,19 @@ static void *thread_entry(void *arg) {
     /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes
      * joiners. */
     jit_thread_exit();
-    if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
+    /* Leave the address space's thread count *before* releasing a joiner. That
+     * count is what tells the rest of the emulator how many guest threads are
+     * live -- it gates the retired-backing drain, and execve refuses to run
+     * with siblings around -- so a guest that joins this thread and then calls
+     * execve must find a count that already excludes us. Waking first left a
+     * window where a legitimately single-threaded exec was refused, which
+     * showed up as one failure in ten on a join-then-exec loop.
+     *
+     * Touching the guest's CLEARTID word after the decrement is still safe: the
+     * joiner has not been woken yet, so it cannot have freed the stack that
+     * word lives in. */
     as_thread_exit(&t->m->as);
+    if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     free(t);
     return NULL;
 }
@@ -327,6 +339,7 @@ SYSDEF(clone) {
          * backing drain (mem.c) -- has to come back to one, or a child of a
          * threaded parent would never reclaim any address space. */
         m->as.nthreads = 1;
+        m->as.nrunning = 0;   /* we are inside a syscall; emu_loop re-adds us */
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
@@ -498,6 +511,54 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     struct Machine *m = c->m;
     char host[PATH_MAX], canon[PATH_MAX];
     char pathbuf[PATH_MAX];
+
+    /* execve with sibling threads still alive.
+     *
+     * The kernel's de_thread kills every other thread of the group before the
+     * new image is loaded. That is not implemented here, so the teardown below
+     * can free the address space while another thread is still walking it --
+     * and what dies then is the *emulator*, a SIGSEGV inside the interpreter
+     * that takes every guest thread with it and explains nothing.
+     *
+     * A sibling parked in the syscall layer holds no guest translation, though,
+     * and that covers the case that matters in practice: glibc runs
+     * SIGEV_THREAD timers on a permanent helper thread which sits in
+     * rt_sigtimedwait, so a program that ever armed one would otherwise never
+     * be able to exec again. So the test is whether any *other* thread is
+     * executing guest code, not whether any other thread exists. The epoch
+     * bumped after the reload is what keeps that honest: a sibling that later
+     * wakes finds the image it belonged to gone and leaves, instead of resuming
+     * the old program's registers against the new address space.
+     *
+     * Two things are still refused, with ENOSYS -- a value execve never returns
+     * on a real kernel, so it reads as "the emulator does not do this" rather
+     * than as something to retry:
+     *
+     *  - a sibling actually running guest code, which is the crash;
+     *  - any exec from a thread that is not the main one, even with everything
+     *    else parked. The kernel would hand group leadership to the caller so
+     *    the new image sees tid == pid; a host thread cannot become the group
+     *    leader, and guest tid == host tid is relied on throughout (ptrace
+     *    links, tkill/tgkill, the proc registry). Doing this properly means
+     *    landing the new image on the main thread instead.
+     *
+     * The ordinary fork-then-exec path is untouched: fork(2) duplicates only
+     * the calling thread, so the child is single-threaded whatever its parent
+     * was. */
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) > 1) {
+        int running = __atomic_load_n(&m->as.nrunning, __ATOMIC_ACQUIRE);
+        int is_main = (g_tls.tid == (s32)getpid());
+        if (running > 0 || !is_main) {
+            fprintf(stderr,
+                    "arm64chroot: execve(%s) with %d live guest threads "
+                    "(%d running%s) is not implemented (no de_thread); "
+                    "refusing with ENOSYS\n",
+                    gpath, __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE),
+                    running, is_main ? "" : ", caller is not the main thread");
+            return (u64)(s64)-ENOSYS;
+        }
+    }
+
     snprintf(pathbuf, sizeof pathbuf, "%s", gpath);
 
     char **argv = dup_strvec(argv_in);   /* private working copy */
@@ -603,6 +664,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * space and faults immediately. The initial exec and any main-thread exec
      * pass c == &m->cpu, where this is a no-op. */
     if (c != &m->cpu) *c = m->cpu;
+    /* The image is now a new generation. Any sibling still parked in a syscall
+     * belongs to the previous one and leaves when it wakes (loop.c); this
+     * thread carries the new image, so it moves forward with it. */
+    g_tls.exec_epoch = __atomic_add_fetch(&m->exec_epoch, 1, __ATOMIC_ACQ_REL);
     exec_close_cloexec(m);   /* CLOEXEC fds die here, as on a real execve */
     /* A traced process reports a stop after execve (with the new image live but
      * before its first instruction), so the tracer can re-arm. No-op on the
