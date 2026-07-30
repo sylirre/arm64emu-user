@@ -91,6 +91,9 @@ typedef struct Region {
     u64  start, end;          /* guest range [start, end), page aligned */
     u32  prot;                /* PTE_R/W/X */
     u32  shared;              /* MAP_SHARED file mapping (host prot mirrors) */
+    u32  file;                /* file-backed: `path` is only a /proc/maps name,
+                               * and is set for the ELF image alone, so it can't
+                               * be used to tell a file mapping from anonymous */
     u8  *host;                /* host address backing `start`: hmap->base plus a
                                * pad for a MAP_SHARED mapping whose 4 KB-aligned
                                * file offset isn't host-page aligned (host page

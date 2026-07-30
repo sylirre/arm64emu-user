@@ -175,7 +175,22 @@ SYSDEF(madvise) {
              * (and the host backing of a MAP_SHARED region *is* the file), so
              * never scribble zeros there. */
             const Region *r = as_find_region(as, va);
-            if (!r || r->path || r->shared) continue;
+            if (!r) continue;
+            if (r->file || r->shared) {
+                /* File-backed: the kernel drops the private copy (or the cached
+                 * page) and re-faults from the file, so zeroing here would
+                 * destroy data the guest expects to get back. Where the backing
+                 * is a real host mapping of that file and host pages are guest
+                 * sized, hand the discard to the host, which reproduces the
+                 * re-fault exactly; a bigger host page would take neighbouring
+                 * guest pages with it, so there we leave the range alone. */
+                long hps = sysconf(_SC_PAGESIZE);
+                if (!r->shared && hps == (long)GUEST_PAGE_SIZE) {
+                    void *h = mem_host_ptr(c, va, GUEST_PAGE_SIZE, ACC_READ);
+                    if (h) madvise(h, GUEST_PAGE_SIZE, MADV_DONTNEED);
+                }
+                continue;
+            }
             void *h = mem_host_ptr(c, va, GUEST_PAGE_SIZE, ACC_WRITE);
             if (h) memset(h, 0, GUEST_PAGE_SIZE);
         }

@@ -323,7 +323,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     }
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = (u32)shared, .host = host,
+                 .shared = (u32)shared, .file = 1, .host = host,
                  .hmap = hmap_new(host - pad, len + pad),
                  .path = path ? strdup(path) : NULL, .file_off = off };
     region_insert(as, r);
