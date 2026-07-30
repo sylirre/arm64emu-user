@@ -364,7 +364,10 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
         }
         case PT_CMD_PEEKUSR: {
             u64 w = 0;
-            if (e->addr + 8 <= sizeof(GUserRegs) && (e->addr & 7) == 0) {
+            /* Bound written so it cannot wrap: `addr + 8 <= size` is true for
+             * an addr just below 2^64, and the read then lands before the
+             * image (our own stack). The offset is guest-controlled. */
+            if (e->addr <= (u64)sizeof(GUserRegs) - 8 && (e->addr & 7) == 0) {
                 u8 buf[sizeof(GUserRegs)];
                 pt_build_regset(c, G_NT_PRSTATUS, buf);
                 memcpy(&w, buf + e->addr, 8);
