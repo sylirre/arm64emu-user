@@ -104,8 +104,13 @@ SYSDEF(futex) {
     int op = (int)a1 & 127;
     void *uaddr = mem_host_ptr(c, a0, 4, ACC_READ);
     if (!uaddr) return (u64)(s64)-EFAULT;
+    /* The kernel's own futex_cmd_has_timeout() list. LOCK_PI2 belongs here too:
+     * left out, its timeout pointer took the val2 path below and reached the
+     * kernel truncated, so glibc's pthread_mutex_clocklock on a PI mutex got
+     * EFAULT (it only falls back on ENOSYS). */
     int takes_ts = op == 0 /*WAIT*/ || op == 6 /*LOCK_PI*/ ||
-                   op == 9 /*WAIT_BITSET*/ || op == 11 /*WAIT_REQUEUE_PI*/;
+                   op == 9 /*WAIT_BITSET*/ || op == 11 /*WAIT_REQUEUE_PI*/ ||
+                   op == 13 /*LOCK_PI2*/;
     int takes_u2 = op == 3 /*REQUEUE*/ || op == 4 /*CMP_REQUEUE*/ ||
                    op == 5 /*WAKE_OP*/ || op == 11 ||
                    op == 12 /*CMP_REQUEUE_PI*/;
