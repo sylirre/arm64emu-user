@@ -360,6 +360,8 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns);
  * internal SIGTIMER/SIGCANCEL, unraisable as host numbers -- the host libc
  * owns those) and return the host signal to raise instead; the capture
  * handler translates it back to the guest number (sys_time.c timer_create). */
+/* Signals queued in this thread's capture ring (the guest's pending set). */
+u64  sig_pending_set(void);
 int  sig_arm_rt_remap(int guest_sig);
 /* Host signal number to raise for a guest signal (32/33 -> armed carrier). */
 int  sig_send_host_nr(int guest_sig);

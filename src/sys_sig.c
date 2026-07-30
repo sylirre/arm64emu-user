@@ -75,8 +75,12 @@ SYSDEF(rt_sigreturn) {
 
 SYSDEF(rt_sigpending) {
     if (a1 != 8) return (u64)(s64)-EINVAL;
-    u64 none = 0;
-    return copy_to_guest(c, a0, &none, 8) < 0 ? (u64)(s64)-EFAULT : 0;
+    /* Report what the capture ring is holding, intersected with the blocked
+     * mask exactly as the kernel does. Answering "nothing" made sigpending()
+     * lie about the one case it exists for: a guest that blocks a signal and
+     * then asks whether it has arrived. */
+    u64 pend = sig_pending_set() & g_tls.sigmask;
+    return copy_to_guest(c, a0, &pend, 8) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
 SYSDEF(rt_sigsuspend) {

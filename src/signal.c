@@ -130,6 +130,18 @@ int sig_arm_rt_remap(int guest_sig) {
     return host;
 }
 
+/* The signals sitting in this thread's capture ring. That ring *is* the guest's
+ * pending set: everything the host catches is queued here, and one the guest has
+ * blocked stays queued instead of being delivered (sig_deliver_pending). */
+u64 sig_pending_set(void) {
+    u64 m = 0;
+    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+        int sig = sigq[t].signo;
+        if (sig >= 1 && sig <= 64) m |= 1ULL << (sig - 1);
+    }
+    return m;
+}
+
 /* The host signal number to raise on the guest's behalf. Guest 32/33 are its
  * libc's own SIGCANCEL/SIGSETXID -- pthread_cancel sends one, and glibc's
  * setuid() broadcasts the other to every thread -- but those numbers are the
