@@ -46,6 +46,11 @@ static u64 brk_locked(CPU *c, u64 a0) {
     AddrSpace *as = &c->m->as;
     u64 newbrk = a0;
     if (!newbrk || newbrk < as->brk_start) return as->brk;
+    /* Out of the address space entirely: the kernel just reports the unchanged
+     * break. Checking before the round-up matters -- PG_UP() of a value in the
+     * top page wraps to 0, which would read as "shrink to nothing" below and
+     * unmap everything under the old break, the guest's own image included. */
+    if (newbrk >= GUEST_TASK_SIZE) return as->brk;
     u64 old_end = PG_UP(as->brk), new_end = PG_UP(newbrk);
     if (new_end > old_end) {
         /* refuse if the range collides with an existing mapping */
