@@ -38,7 +38,8 @@
  * starttime) lets a reader reject a stale slot left by a process the host
  * SIGKILL'd (no unregister ran) whose PID was later reused. With the persistent
  * shared backing such stale slots accumulate, so a full-table register reclaims
- * slots whose process is gone before giving up. */
+ * slots whose process is gone before giving up — resetting the seqlock as it
+ * does, since the dead owner may have been killed mid-write and left it odd. */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -1795,7 +1796,7 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
     u32 cwd_len = cwd ? (u32)strlen(cwd) : 0;
     if (cwd_len > PROCTAB_PATH) cwd_len = PROCTAB_PATH;
     u64 start = proc_starttime(pid);
-    int slot = -1;
+    int slot = -1, claimed = 0;
     for (int i = 0; i < g_tab_n; i++)
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) { slot = i; break; }
     if (slot < 0)
@@ -1803,7 +1804,7 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
             s32 expect = 0;
             if (__atomic_compare_exchange_n(&g_tab[i].pid, &expect, pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-                slot = i; break;
+                slot = i; claimed = 1; break;
             }
         }
     if (slot < 0)   /* full: reclaim a slot whose process is gone (stale after a
@@ -1814,13 +1815,24 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
             if (dead <= 0 || proc_starttime(dead) != 0) continue;
             if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-                slot = i; break;
+                slot = i; claimed = 1; break;
             }
         }
     if (slot < 0) return;   /* table full: falls back to host cmdline / hidden */
     struct ProcEnt *e = &g_tab[slot];
-    u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
-    __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELAXED);   /* odd: write begins */
+    /* A slot we just claimed starts from a clean seqlock. Its previous owner
+     * may have been SIGKILL'd inside the critical section below (which copies
+     * up to ~6 KB), leaving the counter odd with nobody left to close it — and
+     * an odd start inverts the parity for the whole life of the new entry, so
+     * every reader either spins out on a permanently odd counter or takes a
+     * half-written payload for a stable one. */
+    if (claimed) __atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
+    /* fetch_add, not load+store: two threads of one guest process can reach a
+     * writer at once (a concurrent chdir via proctab_set_cwd), and a lost
+     * update there would invert the parity the same way. Two adds per writer
+     * keep it right however they interleave; which payload wins is still the
+     * guest's own race. */
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* odd: write begins */
     __atomic_thread_fence(__ATOMIC_RELEASE);
     e->start = start;
     e->len = len;
@@ -1834,13 +1846,14 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
     if (exe_len)           memcpy(e->exe, exe, exe_len);
     if (cwd_len)           memcpy(e->cwd, cwd, cwd_len);
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED);   /* even: write done */
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* even: write done */
 }
 
 /* Update just this process's own cwd slot (called from chdir/fchdir) so another
- * process reading /proc/<pid>/cwd sees the live value. Single writer per PID,
- * as with proctab_register (a concurrent double-chdir from two threads is
- * already a guest-level race on the shared cwd). No-op if we hold no slot. */
+ * process reading /proc/<pid>/cwd sees the live value. Two threads chdir'ing at
+ * once is a guest-level race on the shared cwd, so which value wins is
+ * undefined -- but the seqlock counter must survive it (see proctab_register).
+ * No-op if we hold no slot. */
 void proctab_set_cwd(s32 pid, const char *cwd) {
     if (!g_tab || pid <= 0) return;
     u32 cwd_len = cwd ? (u32)strlen(cwd) : 0;
@@ -1848,13 +1861,12 @@ void proctab_set_cwd(s32 pid, const char *cwd) {
     for (int i = 0; i < g_tab_n; i++) {
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) != pid) continue;
         struct ProcEnt *e = &g_tab[i];
-        u32 s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
-        __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELAXED);   /* odd: write begins */
+        __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* odd: write begins */
         __atomic_thread_fence(__ATOMIC_RELEASE);
         e->cwd_len = (u16)cwd_len;
         if (cwd_len) memcpy(e->cwd, cwd, cwd_len);
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELAXED);   /* even: write done */
+        __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* even: write done */
         return;
     }
 }
