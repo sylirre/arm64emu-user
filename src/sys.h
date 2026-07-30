@@ -84,7 +84,7 @@ void sigfd_track_dup(struct Machine *m, int oldfd, int newfd);
  * for one guest syscall; it returns 1 when the call must not run (with *ret as
  * the guest's return value), 0 to proceed, and does not return at all for a
  * killing action. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
-int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret);
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data);
 s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);

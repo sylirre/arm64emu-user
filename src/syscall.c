@@ -469,8 +469,9 @@ void syscall_dispatch(CPU *c) {
      * kernel's order. Gated on a mode byte that is zero for every guest that
      * never installed a filter. */
     s64 scret = 0;
+    u16 sctrap = 0;   /* SECCOMP_RET_DATA of a trapping filter -> si_errno */
     int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
-    if (UNLIKELY(m->seccomp_mode)) scskip = seccomp_gate(c, nr, av, &scret);
+    if (UNLIKELY(m->seccomp_mode)) scskip = seccomp_gate(c, nr, av, &scret, &sctrap);
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;
@@ -540,5 +541,5 @@ void syscall_dispatch(CPU *c) {
      * captures it and the guest's handler runs with x0..x2 as its arguments;
      * sigreturn restores the result the guest then observes. */
     if (UNLIKELY(scskip == 2))
-        sig_deliver_seccomp_trap(c, 0, (s32)nr);
+        sig_deliver_seccomp_trap(c, sctrap, (s32)nr);
 }

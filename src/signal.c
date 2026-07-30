@@ -55,6 +55,7 @@
 typedef struct {
     int signo;
     int code;
+    int err;     /* si_errno; only a seccomp trap's RET_DATA uses it */
     int pid, uid, status;
     u64 addr;
     s64 value;   /* full guest sigval width, even on a 32-bit host */
@@ -91,6 +92,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     PendSig *p = &sigq[sigq_head];
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
+    p->err = si->si_errno;   /* the ring is reused: never leave this stale */
     p->pid = (int)si->si_pid;
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
@@ -483,6 +485,7 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
 
     /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16) */
     wr32(c, frame, SI_OFF + 0, (u32)sig);
+    wr32(c, frame, SI_OFF + 4, (u32)info->err);
     wr32(c, frame, SI_OFF + 8, (u32)info->code);
     if (sig == SIGCHLD) {
         wr32(c, frame, SI_OFF + 16, (u32)info->pid);
@@ -829,7 +832,7 @@ void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr) {
         p.code = SIG_SECCOMP_CODE;
         p.addr = c->pc;
         p.status = nr;
-        (void)data;
+        p.err = data;   /* SECCOMP_RET_DATA -> si_errno, as the kernel does */
         g_tls.sc_ret_eintr = 0;
         deliver_to_handler(c, sig, &p);
         return;

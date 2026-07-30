@@ -221,9 +221,10 @@ static int strict_allows(u64 nr) {
 
 /* Called by the dispatcher for every guest syscall once a filter exists (the
  * m->seccomp_mode check keeps the unfiltered path free). Returns 1 when the
- * syscall must NOT run, with *ret holding what the guest sees; 0 to proceed.
- * Killing actions do not return at all. */
-int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret) {
+ * syscall must NOT run, with *ret holding what the guest sees; 2 when a SIGSYS
+ * is owed as well, with *trap_data holding the filter's SECCOMP_RET_DATA for
+ * si_errno; 0 to proceed. Killing actions do not return at all. */
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data) {
     struct Machine *m = c->m;
     if (m->seccomp_mode == G_SECCOMP_MODE_STRICT) {
         if (strict_allows(nr)) return 0;
@@ -251,11 +252,13 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret) {
         /* SIGSYS to the guest, syscall skipped, -ENOSYS left behind as the
          * result like the kernel. A handler that inspects si_syscall/si_arch
          * sees them; that is how a libseccomp-style trap handler identifies
-         * the call. Delivery is deferred to the dispatcher (return 2): the
-         * signal frame has to capture the *result* in x0, and the handler's
-         * own arguments go into x0..x2 after that -- doing it here would have
-         * both overwritten. */
+         * the call. The filter's low 16 bits ride along in si_errno, which is
+         * how one filter distinguishes several traps it installed. Delivery is
+         * deferred to the dispatcher (return 2): the signal frame has to
+         * capture the *result* in x0, and the handler's own arguments go into
+         * x0..x2 after that -- doing it here would have both overwritten. */
         *ret = -ENOSYS;
+        *trap_data = (u16)(action & G_SECCOMP_RET_DATA);
         return 2;
     case G_SECCOMP_RET_TRACE:
         /* No tracer is listening for seccomp events here, and the kernel's

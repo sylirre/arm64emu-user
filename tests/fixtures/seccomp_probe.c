@@ -50,14 +50,19 @@ static int install(struct sock_filter *f, unsigned short len) {
     return seccomp_(SECCOMP_SET_MODE_FILTER, 0, &prog);
 }
 
-static volatile int trap_sig, trap_code, trap_nr, trap_arch;
+static volatile int trap_sig, trap_code, trap_nr, trap_arch, trap_data;
 static void on_sigsys(int sig, siginfo_t *si, void *u) {
     (void)u;
     trap_sig = sig;
     trap_code = si->si_code;
     trap_nr = si->si_syscall;
     trap_arch = (int)si->si_arch;
+    trap_data = si->si_errno;   /* the filter's SECCOMP_RET_DATA */
 }
+
+/* The low 16 bits a trapping filter returns; the kernel hands them to the
+ * handler in si_errno, which is how one filter tells its own traps apart. */
+#define TRAP_DATA 0x0042
 
 int main(void) {
     /* Without no_new_privs the kernel refuses to install a filter. */
@@ -148,17 +153,17 @@ int main(void) {
     struct sock_filter trap_prio[] = {
         PROLOGUE,
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpriority, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | TRAP_DATA),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
     printf("install4=%d\n", install(trap_prio,
                                     sizeof trap_prio / sizeof trap_prio[0]));
     errno = 0;
     r = (int)syscall(__NR_getpriority, 0, 0);
-    printf("trap sig=%d code=%d nr=%d arch=%d ret=%d errno=%d\n",
+    printf("trap sig=%d code=%d nr=%d arch=%d ret=%d errno=%d data=%d\n",
            trap_sig == SIGSYS, trap_code == SYS_SECCOMP,
            trap_nr == __NR_getpriority, trap_arch == (int)AUDIT_ARCH_AARCH64,
-           r, errno == ENOSYS);
+           r, errno == ENOSYS, trap_data == TRAP_DATA);
 
     /* Inherited by a fork child, filters and all. */
     fflush(stdout);
