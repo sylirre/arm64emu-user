@@ -94,6 +94,9 @@ typedef struct Region {
     u32  file;                /* file-backed: `path` is only a /proc/maps name,
                                * and is set for the ELF image alone, so it can't
                                * be used to tell a file mapping from anonymous */
+    u32  wr_ok;               /* the host backing may be made writable: always so
+                               * except for a MAP_SHARED mapping of a fd that was
+                               * not opened for writing (mprotect -> EACCES) */
     u8  *host;                /* host address backing `start`: hmap->base plus a
                                * pad for a MAP_SHARED mapping whose 4 KB-aligned
                                * file offset isn't host-page aligned (host page

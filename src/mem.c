@@ -5,6 +5,7 @@
  * copied core uses. Guest VAs never become host pointers except through the
  * table, so the layout is independent of the host's pointer width. */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -273,7 +274,7 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     if (!host) return -ENOMEM;
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = 0, .host = host, .hmap = hmap_new(host, len),
+                 .shared = 0, .wr_ok = 1, .host = host, .hmap = hmap_new(host, len),
                  .path = NULL, .file_off = 0 };
     region_insert(as, r);
     pte_set_range(as, addr, len, host, prot);
@@ -322,8 +323,16 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
         } else host = p;
     }
     region_punch(as, addr, addr + len);
+    /* Only a MAP_SHARED mapping keeps the file's own access restrictions: the
+     * private cases get RW host backing regardless (the emulator must be able
+     * to write it), so only this one can be refused a later mprotect(PROT_WRITE). */
+    int wr_ok = 1;
+    if (shared) {
+        int fl = fcntl(host_fd, F_GETFL);
+        wr_ok = fl >= 0 && ((fl & O_ACCMODE) == O_WRONLY || (fl & O_ACCMODE) == O_RDWR);
+    }
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = (u32)shared, .file = 1, .host = host,
+                 .shared = (u32)shared, .file = 1, .wr_ok = (u32)wr_ok, .host = host,
                  .hmap = hmap_new(host - pad, len + pad),
                  .path = path ? strdup(path) : NULL, .file_off = off };
     region_insert(as, r);
@@ -345,6 +354,18 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     /* All pages must be mapped (Linux returns ENOMEM otherwise). */
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
         if (!pte_get(as, addr + off)) return -ENOMEM;
+    /* The kernel refuses to make a MAP_SHARED mapping of a file that was not
+     * opened for writing writable, and answers EACCES. Checking before anything
+     * is mutated matters more here than fidelity alone: granting PTE_W over a
+     * PROT_READ host mapping would turn the guest's next store into a *host*
+     * SIGSEGV, and a synchronous host fault cannot be delivered to the guest --
+     * it takes the whole emulator, and every other guest thread, down with it. */
+    if (prot & PTE_W)
+        for (int i = 0; i < as->nregions; i++) {
+            const Region *r = &as->regions[i];
+            if (r->end <= addr || r->start >= addr + len) continue;
+            if (r->shared && !r->wr_ok) return -EACCES;
+        }
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
         if (r->end <= addr || r->start >= addr + len) continue;
@@ -353,8 +374,9 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
             u64 lo = addr > r->start ? addr : r->start;
             u64 hi = (addr + len) < r->end ? (addr + len) : r->end;
             if (g_host_pagesz == (long)GUEST_PAGE_SIZE) {
-                mprotect(r->host + (lo - r->start), hi - lo,
-                         PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0));
+                if (mprotect(r->host + (lo - r->start), hi - lo,
+                             PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0)) < 0)
+                    return -EACCES;   /* PTEs untouched: guest protection unchanged */
             } else if (prot & PTE_W) {
                 /* >4 KB host: up to four 4 KB guest pages share one host page, so the
                  * host mapping can't track them independently. Only ever widen write
