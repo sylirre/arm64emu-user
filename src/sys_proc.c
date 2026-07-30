@@ -18,6 +18,7 @@
 #include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sys.h"
@@ -32,6 +33,13 @@
 #ifndef PR_GET_NO_NEW_PRIVS
 #define PR_GET_NO_NEW_PRIVS 39
 #endif
+
+/* States of the de_thread rendezvous (m->dethread_state); the protocol they
+ * belong to is documented at dethread_begin, below. Up here because clone()'s
+ * fork child resets the whole handshake. */
+#define DT_PENDING 0
+#define DT_COMMIT  1
+#define DT_CANCEL  2
 
 SYSDEF(exit) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -170,6 +178,11 @@ typedef struct {
     struct Machine *m;
     u64 flags, ptid, ctid, tls;
     u64 sigmask;              /* creator's blocked set, inherited (POSIX) */
+    /* The creator's call-out counters, not the Machine's current ones: if the
+     * creator was already out of date -- an execve called it out while it sat
+     * in clone() -- then so is this thread, and it must stop at its first
+     * safepoint instead of running an image that is being replaced. */
+    u32 stop_gen, image_gen;
     int tid;                  /* real host tid, filled by the thread itself */
     volatile s32 *start_tid;  /* startup handshake word on the creator's stack */
     /* ptrace thread-follow (PTRACE_O_TRACECLONE): the creator's tracer/options/
@@ -197,7 +210,8 @@ static void *thread_entry(void *arg) {
     t->tid = tid;
     g_tls.tid = tid;
     g_tls.clear_child_tid = (t->flags & G_CLONE_CHILD_CLEARTID) ? t->ctid : 0;
-    g_tls.exec_epoch = __atomic_load_n(&t->m->exec_epoch, __ATOMIC_ACQUIRE);
+    g_tls.stop_gen = t->stop_gen;
+    g_tls.image_gen = t->image_gen;
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
     CPU *c = &t->cpu;
@@ -233,11 +247,11 @@ static void *thread_entry(void *arg) {
     jit_thread_exit();
     /* Leave the address space's thread count *before* releasing a joiner. That
      * count is what tells the rest of the emulator how many guest threads are
-     * live -- it gates the retired-backing drain, and execve refuses to run
-     * with siblings around -- so a guest that joins this thread and then calls
-     * execve must find a count that already excludes us. Waking first left a
-     * window where a legitimately single-threaded exec was refused, which
-     * showed up as one failure in ten on a join-then-exec loop.
+     * live -- it gates the retired-backing drain, and de_thread waits on it --
+     * so a guest that joins this thread and then calls execve must find a count
+     * that already excludes us. Waking first left a window where a
+     * legitimately single-threaded exec did the whole de_thread dance, which
+     * showed up as one stall in ten on a join-then-exec loop.
      *
      * Touching the guest's CLEARTID word after the decrement is still safe: the
      * joiner has not been woken yet, so it cannot have freed the stack that
@@ -271,6 +285,8 @@ SYSDEF(clone) {
         t->ctid = ctid;
         t->tls = tls;
         t->sigmask = g_tls.sigmask;
+        t->stop_gen = g_tls.stop_gen;
+        t->image_gen = g_tls.image_gen;
         /* ptrace thread-follow: a CLONE_THREAD clone is a PTRACE_EVENT_CLONE
          * (kernel rule; its exit signal is none). When followed, the new
          * thread auto-attaches to the creator's tracer, inheriting options
@@ -339,7 +355,13 @@ SYSDEF(clone) {
          * backing drain (mem.c) -- has to come back to one, or a child of a
          * threaded parent would never reclaim any address space. */
         m->as.nthreads = 1;
-        m->as.nrunning = 0;   /* we are inside a syscall; emu_loop re-adds us */
+        /* Any call-out outstanding in the parent belongs to the parent's thread
+         * group, which this child is not part of: it inherited the state by
+         * copy, together with the only thread it applies to. */
+        m->dethread_req = m->dethread_parked = m->dethread_done = 0;
+        m->dethread_state = DT_PENDING;
+        g_tls.stop_gen = m->stop_gen;
+        g_tls.image_gen = m->image_gen;
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
@@ -507,57 +529,259 @@ static void exec_close_cloexec(struct Machine *m) {
     if (cl != stack) free(cl);
 }
 
+/* ---- de_thread: execve from a thread group with more than one thread ----
+ *
+ * The kernel kills every other thread of the group before the new image is
+ * loaded, and lets the exec'ing thread inherit the group leader's pid. Neither
+ * half comes for free here.
+ *
+ * Killing is not free because a host thread cannot be killed from outside: it
+ * has to be *asked*, at a point where it holds no guest translation. That
+ * point is the run-loop safepoint, and getting a thread there takes two
+ * things -- m->stop_gen, which every loop iteration compares, and a kick
+ * signal to interrupt whatever host syscall a parked thread is blocked in.
+ * Without it the teardown ran while other threads were still walking the
+ * address space, and what died was the *emulator*: a SIGSEGV inside the
+ * interpreter that took every guest thread with it and explained nothing.
+ *
+ * Inheriting the leader's pid is not free because guest tid == host tid == pid
+ * is relied on throughout (ptrace links, tkill/tgkill, the /proc registry) and
+ * a host thread cannot become the group leader. So the new image is always
+ * landed on the *main* thread, whichever guest thread asked for it: the caller
+ * loads the program, hands it over, and disappears. That the main thread is
+ * there to receive it follows from exit(2)'s own simplification -- exit on the
+ * main thread ends the process -- which this makes load-bearing; the check
+ * below is still made rather than assumed, so a later, faithful exit(2) shows
+ * up as a refusal instead of a crash.
+ *
+ * The handshake is two-phase. Siblings park at the rendezvous and are told to
+ * die only once every one of them has arrived, so a thread the emulator cannot
+ * reach -- one in an uninterruptible host operation, or parked at a ptrace stop
+ * its tracer never resumes -- costs a refused execve rather than a
+ * half-dismantled thread group. Everyone then resumes and the guest sees
+ * ENOSYS, which is what this execve returned before any of it existed. */
+
+/* A thread reaches a safepoint in microseconds -- a blocked host syscall is
+ * interrupted by the kick, a running one notices at its next loop iteration --
+ * so this bound only expires for a thread that cannot be reached at all. */
+#define DT_TIMEOUT_MS 5000
+#define DT_KICK_MS    10        /* re-kick: a thread can enter a *new* blocking
+                                 * syscall after consuming the previous kick */
+
+static void dt_nap(long us) {
+    struct timespec ts = { 0, us * 1000 };
+    nanosleep(&ts, NULL);
+}
+
+/* Interrupt one thread's blocked host syscall. Carries DETHREAD_MAGIC on the
+ * reserved kick signal so the handler can tell it from a guest-directed signal
+ * of the same number (signal.c, sig_kick_net). */
+static void dethread_kick(s32 tid) {
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = PTRACE_KICKSIG;
+    si.si_code = SI_QUEUE;
+    si.si_pid = getpid();
+    si.si_uid = (uid_t)getuid();
+    si.si_value.sival_int = DETHREAD_MAGIC;
+    syscall(SYS_rt_tgsigqueueinfo, (pid_t)getpid(), (pid_t)tid,
+            PTRACE_KICKSIG, &si);
+}
+
+/* Kick every thread of this process but `self`. Guest tid == host tid, so the
+ * host's own task list *is* the guest thread list. Without /proc a thread
+ * running guest code never leaves the interpreter/JIT fast path on its own and
+ * de_thread falls back on timing out -- correctly, if unhelpfully. */
+static void dethread_kick_all(s32 self) {
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        s32 tid = (s32)atoi(de->d_name);
+        if (tid > 0 && tid != self) dethread_kick(tid);
+    }
+    closedir(d);
+}
+
+/* A cancelled de_thread must be invisible to the guest. The kick that called
+ * this thread out interrupted whatever host syscall it was blocked in, and no
+ * guest signal is being delivered to account for the EINTR -- so rewind to the
+ * SVC and let the syscall run again, as the kernel does for its own internal
+ * wakeups. The PC test is what separates "just returned from that syscall"
+ * from a stale flag left by an EINTR the guest has already seen. */
+static void dethread_restart_syscall(CPU *c) {
+    if (!g_tls.sc_ret_eintr || c->pc != g_tls.sc_svc_pc + 4) return;
+    c->pc = g_tls.sc_svc_pc;
+    c->x[0] = g_tls.sc_orig_x0;
+    g_tls.sc_ret_eintr = 0;
+}
+
+/* Sibling side of the rendezvous: park until the exec'ing thread commits or
+ * gives up. Reached from the safepoint, with no guest translation held -- which
+ * is the whole reason for parking here rather than wherever the thread was. */
+static void dethread_join(CPU *c) {
+    struct Machine *m = c->m;
+    int carrier =
+        g_tls.tid == __atomic_load_n(&m->dethread_carrier, __ATOMIC_ACQUIRE);
+    __atomic_add_fetch(&m->dethread_parked, 1, __ATOMIC_ACQ_REL);
+    int st;
+    while ((st = __atomic_load_n(&m->dethread_state, __ATOMIC_ACQUIRE)) ==
+           DT_PENDING)
+        dt_nap(200);
+    __atomic_sub_fetch(&m->dethread_parked, 1, __ATOMIC_ACQ_REL);
+    if (st == DT_CANCEL) { dethread_restart_syscall(c); return; }
+
+    if (!carrier) {
+        /* Killed by de_thread. Publish the death for a tracer, but without a
+         * stop -- exactly what exit_group's fan-out does, and for the same
+         * reason: the thread group is going away and nothing here may block on
+         * a tracer collecting it. The CLONE_CHILD_CLEARTID futex wake is
+         * dropped because that address belongs to an address space about to be
+         * replaced, and the joiner it was meant for is dying too. */
+        if (ptrace_self_active()) ptrace_report_exit(c, 0);
+        g_tls.clear_child_tid = 0;
+        c->stop = true;
+        return;
+    }
+    /* The main thread: wait for the image, then take it over. */
+    int done;
+    while (!(done = __atomic_load_n(&m->dethread_done, __ATOMIC_ACQUIRE)))
+        dt_nap(200);
+    if (done < 0) { dethread_restart_syscall(c); return; }   /* abandoned */
+
+    /* Adopt the program the exec'ing thread loaded into m->cpu -- which is this
+     * thread's own CPU, since the main thread is where load_elf builds initial
+     * state -- and resume at its first instruction. The rest is per-thread
+     * state execve resets, except the blocked signal mask: that is the caller's,
+     * because execve preserves it. */
+    if (c != &m->cpu) *c = m->cpu;
+    memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
+    g_tls.clear_child_tid = 0;
+    g_tls.robust_head = 0;
+    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
+    g_tls.sig_altstack_flags = 0;
+    g_tls.saved_sigmask = 0;
+    g_tls.have_saved_sigmask = 0;
+    g_tls.sc_ret_eintr = 0;
+    g_tls.sigmask = m->dethread_sigmask;
+    g_tls.image_gen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);
+    g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
+    ptrace_report_exec(c);
+}
+
+void guest_stop_point(CPU *c) {
+    struct Machine *m = c->m;
+    /* Sync first: everything below decides on state, never on the counter. */
+    g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
+
+    if (g_tls.image_gen != __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE)) {
+        /* The program this thread belongs to is gone: it was either killed by
+         * the de_thread that replaced it, or it *is* the thread that loaded the
+         * replacement and handed it to the main one. Either way it must not run
+         * another guest instruction -- and must not write its CLEARTID word,
+         * which now addresses whatever the new image put there. A tracer is
+         * told, without a stop, for the same reason the rendezvous tells it
+         * (dethread_join): a thread death is not host-waitable, so a tracer
+         * that never hears of it polls a stale link forever. */
+        if (ptrace_self_active()) ptrace_report_exit(c, 0);
+        g_tls.clear_child_tid = 0;
+        c->stop = true;
+        return;
+    }
+    s32 req = __atomic_load_n(&m->dethread_req, __ATOMIC_ACQUIRE);
+    if (req && req != g_tls.tid) dethread_join(c);
+}
+
+int guest_stop_pending(struct Machine *m) {
+    return __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen;
+}
+
+/* Bring the thread group down to this thread plus the main thread, so the
+ * address space can be replaced under nobody. Returns 0 with *carrier_is_me
+ * saying whether the caller keeps the new image or hands it over, or -errno
+ * with the group left exactly as it was. */
+static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
+    struct Machine *m = c->m;
+    s32 self = g_tls.tid, leader = (s32)getpid();
+
+    /* The ordinary case, including every fork-then-exec: fork(2) duplicates
+     * only the calling thread, so the child is single-threaded whatever its
+     * parent was, and whichever thread that is carries the new image itself. */
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= 1) {
+        *carrier_is_me = 1;
+        return 0;
+    }
+    *carrier_is_me = (self == leader);
+    if (!*carrier_is_me &&
+        syscall(SYS_tgkill, (pid_t)leader, (pid_t)leader, 0) != 0) {
+        fprintf(stderr, "arm64chroot: execve(%s) from thread %d: the main "
+                "thread is gone, so there is nothing to land the new image "
+                "on; refusing with ENOSYS\n", gpath, (int)self);
+        return -ENOSYS;
+    }
+
+    s32 none = 0;
+    if (!__atomic_compare_exchange_n(&m->dethread_req, &none, self, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return -EINTR;   /* another thread is already exec'ing: we are one of
+                          * the threads it is about to kill, and find that out
+                          * at the safepoint the moment this syscall returns */
+
+    __atomic_store_n(&m->dethread_carrier, leader, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->dethread_parked, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->dethread_done, 0, __ATOMIC_RELAXED);
+    m->dethread_sigmask = g_tls.sigmask;
+    __atomic_store_n(&m->dethread_state, DT_PENDING, __ATOMIC_RELEASE);
+    /* Publish the call-out last: this counter is what the run loop reads. */
+    g_tls.stop_gen = __atomic_add_fetch(&m->stop_gen, 1, __ATOMIC_ACQ_REL);
+
+    /* Phase 1 -- wait for every other thread to reach the rendezvous. `parked`
+     * only grows and `nthreads` only shrinks while a request is outstanding,
+     * except that a sibling already inside clone() may add one more; that one
+     * is counted before it can run and stops at its first safepoint, so
+     * re-reading both each round still converges. */
+    int ok = 0, live = 0, parked = 0;
+    for (int ms = 0; ms < DT_TIMEOUT_MS; ms++) {
+        if (ms % DT_KICK_MS == 0) dethread_kick_all(self);
+        parked = __atomic_load_n(&m->dethread_parked, __ATOMIC_ACQUIRE);
+        live = __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE);
+        if (parked + 1 >= live) { ok = 1; break; }
+        dt_nap(1000);
+    }
+    if (!ok) {
+        __atomic_store_n(&m->dethread_state, DT_CANCEL, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&m->dethread_parked, __ATOMIC_ACQUIRE) > 0)
+            dt_nap(200);
+        __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
+        fprintf(stderr, "arm64chroot: execve(%s): %d of %d guest threads did "
+                "not reach a safepoint within %d ms; refusing with ENOSYS\n",
+                gpath, live - 1 - parked, live, DT_TIMEOUT_MS);
+        return -ENOSYS;
+    }
+
+    /* Phase 2 -- commit: everyone but the carrier leaves for good. */
+    __atomic_store_n(&m->dethread_state, DT_COMMIT, __ATOMIC_RELEASE);
+    int want = *carrier_is_me ? 1 : 2;
+    for (int ms = 0; ms < DT_TIMEOUT_MS; ms++) {
+        if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want)
+            return 0;
+        dt_nap(1000);
+    }
+    /* Not reachable in practice: what a committed thread has left to do is a
+     * few frees and cannot block. Hand the main thread its old image back
+     * rather than tear down an address space someone may still be inside. */
+    __atomic_store_n(&m->dethread_done, -1, __ATOMIC_RELEASE);
+    __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
+    fprintf(stderr, "arm64chroot: execve(%s): guest threads did not finish "
+            "leaving; refusing with ENOSYS\n", gpath);
+    return -ENOSYS;
+}
+
 u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     struct Machine *m = c->m;
     char host[PATH_MAX], canon[PATH_MAX];
     char pathbuf[PATH_MAX];
-
-    /* execve with sibling threads still alive.
-     *
-     * The kernel's de_thread kills every other thread of the group before the
-     * new image is loaded. That is not implemented here, so the teardown below
-     * can free the address space while another thread is still walking it --
-     * and what dies then is the *emulator*, a SIGSEGV inside the interpreter
-     * that takes every guest thread with it and explains nothing.
-     *
-     * A sibling parked in the syscall layer holds no guest translation, though,
-     * and that covers the case that matters in practice: glibc runs
-     * SIGEV_THREAD timers on a permanent helper thread which sits in
-     * rt_sigtimedwait, so a program that ever armed one would otherwise never
-     * be able to exec again. So the test is whether any *other* thread is
-     * executing guest code, not whether any other thread exists. The epoch
-     * bumped after the reload is what keeps that honest: a sibling that later
-     * wakes finds the image it belonged to gone and leaves, instead of resuming
-     * the old program's registers against the new address space.
-     *
-     * Two things are still refused, with ENOSYS -- a value execve never returns
-     * on a real kernel, so it reads as "the emulator does not do this" rather
-     * than as something to retry:
-     *
-     *  - a sibling actually running guest code, which is the crash;
-     *  - any exec from a thread that is not the main one, even with everything
-     *    else parked. The kernel would hand group leadership to the caller so
-     *    the new image sees tid == pid; a host thread cannot become the group
-     *    leader, and guest tid == host tid is relied on throughout (ptrace
-     *    links, tkill/tgkill, the proc registry). Doing this properly means
-     *    landing the new image on the main thread instead.
-     *
-     * The ordinary fork-then-exec path is untouched: fork(2) duplicates only
-     * the calling thread, so the child is single-threaded whatever its parent
-     * was. */
-    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) > 1) {
-        int running = __atomic_load_n(&m->as.nrunning, __ATOMIC_ACQUIRE);
-        int is_main = (g_tls.tid == (s32)getpid());
-        if (running > 0 || !is_main) {
-            fprintf(stderr,
-                    "arm64chroot: execve(%s) with %d live guest threads "
-                    "(%d running%s) is not implemented (no de_thread); "
-                    "refusing with ENOSYS\n",
-                    gpath, __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE),
-                    running, is_main ? "" : ", caller is not the main thread");
-            return (u64)(s64)-ENOSYS;
-        }
-    }
 
     snprintf(pathbuf, sizeof pathbuf, "%s", gpath);
 
@@ -636,6 +860,15 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         }
     }
 
+    /* Last thing that can still be refused: empty the thread group, so nothing
+     * is walking the address space when it is replaced (de_thread, above). It
+     * comes after resolution and the shebang loop deliberately -- ENOENT and
+     * ENOEXEC must leave the group untouched, exactly as they do on a kernel,
+     * where de_thread runs only once the binary is known to be loadable. */
+    int carrier_is_me = 1;
+    int dt = dethread_begin(c, pathbuf, &carrier_is_me);
+    if (dt < 0) { free_strvec(argv); free_strvec(envp_copy); return (u64)(s64)dt; }
+
     /* Point of no return: tear down and reload. */
     shm_detach_all(m);       /* System V shm attaches do not survive execve */
     ipc_exec_clear(m);       /* forget parked-IPC sockets (the CLOEXEC walk
@@ -655,20 +888,32 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         fprintf(stderr, "arm64chroot: execve reload of %s failed (%d)\n", pathbuf, r);
         _exit(127);
     }
-    /* load_elf built the new image's initial state on m->cpu (the main-thread
-     * CPU). When a secondary guest thread execs -- Go fork+execs its tool
-     * children from an M thread via clone(CLONE_VM|CLONE_VFORK), so the forked
-     * child runs on that thread's own &t->cpu, not &m->cpu -- adopt that state
-     * onto the executing CPU. Otherwise the caller keeps running the previous
-     * program's registers (PC, g in x28, SP) against the freshly loaded address
-     * space and faults immediately. The initial exec and any main-thread exec
-     * pass c == &m->cpu, where this is a no-op. */
-    if (c != &m->cpu) *c = m->cpu;
-    /* The image is now a new generation. Any sibling still parked in a syscall
-     * belongs to the previous one and leaves when it wakes (loop.c); this
-     * thread carries the new image, so it moves forward with it. */
-    g_tls.exec_epoch = __atomic_add_fetch(&m->exec_epoch, 1, __ATOMIC_ACQ_REL);
     exec_close_cloexec(m);   /* CLOEXEC fds die here, as on a real execve */
+    /* A new image generation, and the counter the run loop watches moves with
+     * it: any thread still holding the old one is now out of date and leaves. */
+    u32 img = __atomic_add_fetch(&m->image_gen, 1, __ATOMIC_ACQ_REL);
+    u32 gen = __atomic_add_fetch(&m->stop_gen, 1, __ATOMIC_ACQ_REL);
+
+    if (!carrier_is_me) {
+        /* A secondary thread exec'd: hand the program to the main thread, the
+         * only one that can run it under guest tid == host tid == pid, and go
+         * away. Our own image_gen deliberately stays behind, so the run loop
+         * ends this thread as soon as this syscall returns. */
+        __atomic_store_n(&m->dethread_done, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    /* load_elf built the new image's initial state on m->cpu (the main-thread
+     * CPU). A forked child running on a secondary thread's own &t->cpu -- Go
+     * fork+execs its tool children from an M thread via
+     * clone(CLONE_VM|CLONE_VFORK) -- has to adopt that state onto the CPU it is
+     * actually executing, or it keeps running the previous program's registers
+     * (PC, g in x28, SP) against the freshly loaded address space and faults
+     * immediately. The initial exec and any main-thread exec pass c == &m->cpu,
+     * where this is a no-op. */
+    if (c != &m->cpu) *c = m->cpu;
+    g_tls.image_gen = img;
+    g_tls.stop_gen = gen;
+    __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
     /* A traced process reports a stop after execve (with the new image live but
      * before its first instruction), so the tracer can re-arm. No-op on the
      * initial exec / untraced processes. */
@@ -789,6 +1034,10 @@ SYSDEF(wait4) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
                     if (g_sig_npend && sig_pending_deliverable(c->m))
                         return (u64)(s64)-EINTR;   /* guest signal: deliver */
+                    /* Called out to a safepoint (execve's de_thread): stop
+                     * waiting and get there, or the thread that is dismantling
+                     * this group waits on us until it gives up. */
+                    if (guest_stop_pending(c->m)) return (u64)(s64)-EINTR;
                     continue;   /* wake kick / undeliverable: re-evaluate mode */
                 }
                 return host_err();
@@ -857,6 +1106,7 @@ SYSDEF(wait4) {
         if (g_ptrace_kick) ptrace_service_kick(c);
         if (g_sig_npend && sig_pending_deliverable(c->m))
             return (u64)(s64)-EINTR;         /* guest signal: let it deliver */
+        if (guest_stop_pending(c->m)) return (u64)(s64)-EINTR;   /* safepoint */
     }
 }
 
@@ -897,6 +1147,8 @@ SYSDEF(waitid) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
                     if (g_sig_npend && sig_pending_deliverable(c->m))
                         return (u64)(s64)-EINTR;   /* guest signal: deliver */
+                    if (guest_stop_pending(c->m))
+                        return (u64)(s64)-EINTR;   /* safepoint: see wait4 */
                     continue;   /* wake kick / undeliverable: re-evaluate mode */
                 }
                 return host_err();
@@ -954,6 +1206,7 @@ SYSDEF(waitid) {
         if (g_ptrace_kick) ptrace_service_kick(c);
         if (g_sig_npend && sig_pending_deliverable(c->m))
             return (u64)(s64)-EINTR;
+        if (guest_stop_pending(c->m)) return (u64)(s64)-EINTR;   /* safepoint */
     }
 }
 

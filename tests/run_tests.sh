@@ -571,18 +571,20 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
     fi
 fi
 
-# ---- execve with live sibling threads. Self-checking: the emulator answers
-# differently from a kernel on purpose. It has no de_thread, so rather than
-# tearing the address space down under threads still running against it -- which
-# killed the emulator itself with a SIGSEGV -- it refuses with ENOSYS before
-# anything is torn down. The other half is that *joined* threads must not count,
-# or ordinary join-then-exec programs would start failing; that half is a race,
-# and the fixture's loop is sized to catch it (it failed about one run in ten
-# before the thread-exit ordering was fixed). ----
+# ---- execve from a thread group with more than one thread (de_thread).
+# Self-checking: this is the emulator's own thread bookkeeping, and qemu's
+# answer would say nothing about it. Every case asserts the new image is
+# reached, that it runs on the main thread (tid == pid, which is how the
+# emulator substitutes for the kernel handing over group leadership), and that
+# the sibling alive at the moment of the exec is gone afterwards. Tearing the
+# address space down while a sibling still walks it killed the *emulator* with
+# a SIGSEGV. The joined-threads case is the other direction -- already-gone
+# threads must cost nothing -- and is a race the fixture's loop is sized to
+# catch (one run in ten before the thread-exit ordering was fixed). ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mtexec.bin \
             tests/fixtures/mtexec.c -lpthread 2>/dev/null; then
-        expect=$'reached_child\nafter_join exited=1 status=0\nreached_child\nafter_parked exited=1 status=0\nlive_siblings=1\nlive_exited=1 status=0\nsecondary_siblings=1\nsecondary_exited=1 status=0\ndone'
+        expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
         got=$(timeout 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
         else

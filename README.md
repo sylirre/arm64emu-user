@@ -289,7 +289,8 @@ src/
                 copy_to/from_guest, mem_host_ptr. Portable to 32-bit hosts:
                 guest VAs never become host pointers except through the table.
   exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
-  loop.c        run loop + exception dispatch + signal delivery point
+  loop.c        run loop + exception dispatch + signal delivery point +
+                the thread call-out safepoint (stop_gen)
   predecode.c   decoded-instruction cache: direct-threaded fast path over ~200
                 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   jit/          optional --jit translator (AArch64 & x86-64 hosts):

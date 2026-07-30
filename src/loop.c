@@ -51,27 +51,17 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
 }
 
 int emu_loop(CPU *c) {
-    /* This thread is executing guest code for as long as it is in here, minus
-     * the stretches it spends in the syscall layer. Bracketing it here rather
-     * than at each caller keeps the count symmetric: everything that resets it
-     * -- as_init, the fork child -- does so while inside a syscall, where the
-     * running contribution is already zero. */
-    as_enter_guest(&c->m->as);
     for (;;) {
-        if (UNLIKELY(c->stop)) { as_leave_guest(&c->m->as); return 0; }
-        /* An execve replaced the image while this thread was parked in a
-         * syscall. It belongs to the program that is gone: leave, rather than
-         * resume the old registers against the new address space. */
-        if (UNLIKELY(__atomic_load_n(&c->m->exec_epoch, __ATOMIC_ACQUIRE) !=
-                     g_tls.exec_epoch)) {
-            /* Drop the CLEARTID word too. It is an address in the address space
-             * that has just been replaced; writing the exit notification there
-             * now would land on whatever the new image has at that address, and
-             * the joiner it was meant for died with the old program. */
-            g_tls.clear_child_tid = 0;
-            c->stop = true;
-            as_leave_guest(&c->m->as);
-            return 0;
+        if (UNLIKELY(c->stop)) return 0;
+        /* Called out of guest code: an execve is dismantling this thread group,
+         * or has already replaced the image this thread belongs to. One shared
+         * load per iteration buys every thread a bounded response time, which
+         * is what lets execve tear the address space down knowing nobody is
+         * still walking it (guest_stop_point, sys_proc.c). */
+        if (UNLIKELY(__atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) !=
+                     g_tls.stop_gen)) {
+            guest_stop_point(c);
+            continue;   /* re-test c->stop, and the counter it just synced */
         }
 
         int stepped = 0;
@@ -114,13 +104,7 @@ int emu_loop(CPU *c) {
             unsigned ec = (unsigned)(esr >> 26);
             switch (ec) {
                 case EC_SVC64:
-                    /* Off the page table for the duration: a thread parked in
-                     * a syscall holds no guest translation, which is what lets
-                     * execve decide whether tearing the address space down
-                     * would pull it out from under a sibling. */
-                    as_leave_guest(&c->m->as);
                     syscall_dispatch(c);
-                    as_enter_guest(&c->m->as);
                     break;
                 case EC_DABORT_LOWER:
                 case EC_DABORT_SAME: {

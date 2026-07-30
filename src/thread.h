@@ -27,9 +27,12 @@ typedef struct {
     u64 sigmask;
     u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
     int have_saved_sigmask;
-    u32 exec_epoch;           /* the image generation this thread belongs to;
-                               * a mismatch with the Machine's means an execve
-                               * replaced it and this thread must leave */
+    /* Copies of the Machine's call-out counters (machine.h). stop_gen is
+     * compared once per run-loop iteration -- a mismatch means "go to the
+     * safepoint and find out why"; image_gen says which loaded program this
+     * thread belongs to, and a stale one means an execve replaced it. */
+    u32 stop_gen;
+    u32 image_gen;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;

@@ -27,6 +27,7 @@
 
 #include "sys.h"
 #include "sys_netlink.h"
+#include "ptrace.h"
 
 /* O_* translation: asm-generic (arm64/arm32 guest) vs host. Only these four
  * differ between asm-generic and x86; the rest pass through. */
@@ -2173,6 +2174,30 @@ static int pwait_mask_enter(CPU *c, u64 gmask) {
     return sig_pending_deliverable(c->m);
 }
 
+/* The guest's blocked set as a host sigset -- the mask these calls install for
+ * the duration of the wait -- with one signal held back.
+ *
+ * The emulator reserves a high RT signal for its own control channel
+ * (PTRACE_KICKSIG: a tracer's attach kick, and execve's de_thread call-out),
+ * and the guest must not be able to switch that off. It otherwise can, because
+ * blocking everything is the usual way to reach one of these calls and
+ * sigfillset covers that number too -- and then a thread parked here cannot be
+ * reached at all, so de_thread times out and execve is refused on a program
+ * that should have worked.
+ *
+ * The cost is confined to a guest-directed signal of that exact number arriving
+ * while the guest has it blocked and is inside one of these three calls: it is
+ * still queued in the capture ring (not lost, and delivered once the guest
+ * unblocks it), but the wait returns EINTR where a kernel would have kept
+ * waiting. Nothing sends SIGRTMAX in practice; being unable to reach our own
+ * threads is the worse failure of the two. */
+static void pwait_host_mask(sigset_t *ss, u64 gmask) {
+    sigemptyset(ss);
+    for (int i = 1; i <= 64; i++)
+        if (gmask & (1ULL << (i - 1))) sigaddset(ss, i);
+    sigdelset(ss, PTRACE_KICKSIG);
+}
+
 static void pwait_mask_leave(CPU *c) {
     if (sig_pending_deliverable(c->m)) return;   /* a handler is about to run */
     int e = errno;                               /* callers still owe host_err() */
@@ -2200,9 +2225,7 @@ SYSDEF(ppoll) {
     if (a3) {
         u64 gmask;
         if (copy_from_guest(c, &gmask, a3, 8) < 0) return (u64)(s64)-EFAULT;
-        sigemptyset(&ss);
-        for (int i = 1; i <= 64; i++)
-            if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
+        pwait_host_mask(&ss, gmask);
         ssp = &ss;
         if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
     }
@@ -2239,9 +2262,7 @@ SYSDEF(pselect6) {
         if (pair[0]) {
             u64 gmask;
             if (copy_from_guest(c, &gmask, pair[0], 8) < 0) return (u64)(s64)-EFAULT;
-            sigemptyset(&ss);
-            for (int i = 1; i <= 64; i++)
-                if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
+            pwait_host_mask(&ss, gmask);
             ssp = &ss;
             if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
         }
@@ -2369,9 +2390,7 @@ SYSDEF(epoll_pwait) {
     if (a4) {
         u64 gmask;
         if (copy_from_guest(c, &gmask, a4, 8) < 0) return (u64)(s64)-EFAULT;
-        sigemptyset(&ss);
-        for (int i = 1; i <= 64; i++)
-            if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
+        pwait_host_mask(&ss, gmask);
         ssp = &ss;
         if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
     }

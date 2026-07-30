@@ -2094,7 +2094,12 @@ static s32 ipc_wait_rpc(struct Machine *m, struct BReq *q,
         goto out;
     }
     for (;;) {
-        if (g_sig_npend && sig_pending_deliverable(m)) {
+        /* Interrupted either by a signal the guest can take, or by a call-out
+         * to a run-loop safepoint (execve's de_thread) -- which this thread
+         * must reach, and cannot while parked here. The cancel exchange is the
+         * same either way, and so is the EINTR the guest is told. */
+        if ((g_sig_npend && sig_pending_deliverable(m)) ||
+            guest_stop_pending(m)) {
             struct BReq cq;
             memset(&cq, 0, sizeof cq);
             cq.op = REQ_CANCEL;

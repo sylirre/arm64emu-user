@@ -510,9 +510,13 @@ individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
 signal / group / synchronous-fault / execve / fork-clone-thread / attach /
 pre-exit stops above. Everything works under both the interpreter and `--jit`.
 Unimplemented requests return `-EIO`/`-ESRCH` rather than misbehaving.
+A *multithreaded* `execve` reports as the kernel's does, by a different route
+(see `de_thread` in [syscalls.md](syscalls.md#execve)): each sibling the exec
+kills publishes a `WIFEXITED` status on its own link — without a stop, since
+nothing in that path may block on a tracer collecting it — and the exec stop
+arrives on the **main** thread's tid, because that is where the emulator lands
+the new image rather than renumbering the caller.
+
 Remaining simplifications: in a mixed traced/untraced thread group a group-stop
-stops only the traced threads; a *multithreaded* `execve` of a traced process
-does not fold the sibling threads' links (the kernel kills the siblings and the
-execing thread assumes the pid — multithreaded execve is equally simplified
-untraced); only the exiting thread reports the `PTRACE_EVENT_EXIT` pre-exit
-stop on a group exit.
+stops only the traced threads; only the exiting thread reports the
+`PTRACE_EVENT_EXIT` pre-exit stop on a group exit.

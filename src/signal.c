@@ -302,6 +302,17 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         return;   /* tracee->tracer wake: the EINTR on a blocked host
                      wait4/waitid is the whole effect; no flags, invisible
                      to the guest */
+    if (si->si_code == SI_QUEUE && si->si_value.sival_int == DETHREAD_MAGIC) {
+        /* execve's de_thread call-out. Nothing to record: the run loop's
+         * stop_gen check already knows what to do, and the EINTR this inflicts
+         * on a blocked host syscall is the whole point -- it is what gets a
+         * parked thread back to the loop to see it. The lever below is only
+         * how a thread running guest code leaves the interpreter/JIT fast
+         * path, which never returns for the counter's sake alone. */
+        g_sig_npend = 1;
+        jit_signal_interrupt();
+        return;
+    }
     host_catcher(sig, si, uctx);    /* a guest-directed signal of this number */
 }
 
@@ -724,6 +735,10 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
          * the kernel return EINTR -- mirror that when the ring holds another
          * deliverable signal, so the run loop can deliver it. */
         if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
+        /* Called out to a run-loop safepoint (execve's de_thread): stop waiting
+         * and go there. This is the loop that made a libc SIGEV_THREAD timer
+         * helper look permanently parked. */
+        if (guest_stop_pending(m)) return -EINTR;
         if (timeout_ns == 0) return -EAGAIN;   /* pure poll */
         if (timeout_ns > 0) {
             struct timespec now;

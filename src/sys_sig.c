@@ -371,6 +371,9 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
         sigfd_sync(m);
         if (nonblock) return -EAGAIN;
         if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
+        /* Called out to a run-loop safepoint (execve's de_thread): stop waiting
+         * and go there, or the thread dismantling this group waits on us. */
+        if (guest_stop_pending(m)) return -EINTR;
         struct timespec nap = { 0, 2 * 1000 * 1000 };
         nanosleep(&nap, NULL);
     }

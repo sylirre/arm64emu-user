@@ -630,39 +630,77 @@ the emulator's own path. A wrong arch/format yields `ENOEXEC` so the guest shell
 script fallback works. `do_execve` takes private copies of argv/envp — the caller
 retains ownership (a subtle earlier use-after-free lives in the git history).
 
-**Sibling threads.** The kernel's `de_thread` kills every other thread of the
-group before loading the new image. That is **not implemented**, and without it
-the teardown frees the address space while another thread is still walking it —
-which kills the *emulator*, not the guest, with a SIGSEGV inside the interpreter.
+### `de_thread`: exec from a thread group with more than one thread
 
-A sibling parked in the syscall layer holds no guest translation, though, and
-that case matters in practice: glibc runs `SIGEV_THREAD` timers on a permanent
-helper thread sitting in `rt_sigtimedwait`, so refusing whenever any thread
-exists would stop a program that ever armed one from ever exec'ing again. So the
-test is whether another thread is *executing guest code* (`as->nrunning`,
-bracketed around the syscall layer in `emu_loop`), not whether another thread
-exists. `execve` returns **`ENOSYS`** — a value it never returns on a real
-kernel, so it reads as "the emulator does not do this" — when:
+The kernel's `de_thread` kills every other thread of the group before loading
+the new image, and lets the exec'ing thread inherit the group leader's pid.
+Neither half comes for free here, and skipping them was fatal: the teardown
+freed the address space while another thread was still walking it, which killed
+the *emulator*, not the guest, with a SIGSEGV inside the interpreter.
 
-- another thread is running guest code, which is the crash; or
-- the caller is not the main thread, even with everything else parked. The
-  kernel hands group leadership to the exec'ing thread so the new image sees
-  `tid == pid`; a host thread cannot become the group leader, and guest tid ==
-  host tid is relied on throughout (ptrace links, `tkill`/`tgkill`, the proc
-  registry). Doing this properly means landing the new image on the main thread
-  whichever guest thread asked for it.
+**Killing is asking.** A host thread cannot be killed from outside; it has to be
+brought to a point where it holds no guest translation. That point is the
+run-loop safepoint, and two things get a thread there:
 
-What makes the permitted case safe rather than lucky is the **image epoch**
-(`m->exec_epoch`), bumped by every successful reload. A sibling that later wakes
-finds its own epoch stale and leaves at the run loop's next boundary instead of
-resuming the old program's registers against the new address space — which
-otherwise faults immediately. It drops its `CLONE_CHILD_CLEARTID` word on the
-way out, since that address now belongs to whatever the new image put there and
-the joiner it was meant for died with the old program.
+- `m->stop_gen`, compared against the thread's own copy once per `emu_loop`
+  iteration. A mismatch sends it out of line into `guest_stop_point`, which is
+  where every decision below is made. This is the only shared load added to the
+  interpreter's hot loop.
+- a **kick signal** for a thread parked in a blocking host syscall, which never
+  reaches the loop on its own. It rides the reserved control signal
+  (`PTRACE_KICKSIG`, carrying `DETHREAD_MAGIC` so the handler can tell it from a
+  guest-directed signal of that number) and does nothing but interrupt the
+  syscall. Threads are re-kicked every 10 ms while the rendezvous waits, because
+  a thread can enter a *new* blocking syscall after consuming the previous kick.
+  The emulator's own blocking loops — `wait4`/`waitid`, `rt_sigtimedwait`,
+  `signalfd` reads, parked SysV IPC waiters — poll `guest_stop_pending` for the
+  same reason: an interrupted host call there is retried, not returned, so
+  without the check the thread would go straight back to sleep.
 
-The ordinary fork-then-exec path is unaffected throughout: `fork(2)` duplicates
+**The new image lands on the main thread**, whichever guest thread asked for it.
+Guest tid == host tid == pid is relied on throughout (ptrace links,
+`tkill`/`tgkill`, the proc registry) and a host thread cannot become the group
+leader, so instead of renumbering, the caller loads the program into `m->cpu`,
+hands it over and disappears; the main thread adopts it (registers, and the
+caller's signal mask, which `execve` preserves) and resumes at its first
+instruction. That the main thread is always there to receive it follows from
+`exit(2)`'s own simplification — exit on the main thread ends the process — which
+this makes load-bearing. `dethread_begin` checks rather than assumes, so making
+`exit(2)` faithful later surfaces as a refusal instead of a crash.
+
+**The handshake is two-phase.** Siblings park at the rendezvous and are told to
+die only once *every* one of them has arrived. A thread the emulator cannot
+reach therefore costs a refused `execve` rather than a half-dismantled thread
+group: after 5 s everyone is released, whatever host syscall the kick
+interrupted is restarted (so the cancellation is invisible to the guest — no
+bare `EINTR` it never asked for), and `execve` returns **`ENOSYS`**, a value it
+never returns on a real kernel and so reads as "the emulator does not do this".
+The rendezvous runs only *after* path resolution and the shebang loop, so
+`ENOENT`/`ENOEXEC` leave the thread group untouched exactly as on a kernel,
+where `de_thread` runs only once the binary is known to be loadable.
+
+Reaching a safepoint takes microseconds, so the timeout expires only for a
+thread that cannot be reached at all — one in an uninterruptible host operation,
+or parked at a ptrace stop its tracer never resumes. One case that *would* have
+hit it is handled instead: a guest blocking every signal across
+`ppoll`/`pselect6`/`epoll_pwait` used to block the kick too, so
+`pwait_host_mask` (`sys_file.c`) holds the reserved control signal out of the
+mask those calls install.
+
+Threads killed this way publish their death to a tracer without a stop, the way
+`exit_group`'s fan-out does — a thread death is not host-waitable, so a tracer
+that never hears of it polls a stale link until the process exits. They drop
+their `CLONE_CHILD_CLEARTID` word, since that address belongs to an address
+space about to be replaced and the joiner it was meant for is dying too.
+
+Backstopping all of it is the **image generation** (`m->image_gen`), bumped by
+every successful reload: any thread still holding the previous one leaves at its
+next safepoint instead of resuming the old program's registers against the new
+address space.
+
+The ordinary fork-then-exec path skips the whole mechanism: `fork(2)` duplicates
 only the calling thread, so the child is single-threaded whatever its parent
-was.
+was, and `dethread_begin` returns immediately.
 
 ## `--fake-id` (fakeroot/fake-uid)
 

@@ -128,11 +128,6 @@ typedef struct AddrSpace {
     int nthreads;             /* guest threads sharing this space (atomic).
                                * 1 means the quarantine can be drained: no other
                                * D-TLB exists to hold a stale host pointer. */
-    int nrunning;             /* of those, how many are executing guest code
-                               * rather than sitting in the syscall layer
-                               * (atomic). A parked thread touches no guest
-                               * address, which is what lets execve tear the
-                               * space down with siblings still alive. */
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
     u64 stack_top;            /* initial stack top (guest VA) */
@@ -156,8 +151,6 @@ int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
 void as_thread_enter(AddrSpace *as);   /* a guest thread joins this space */
 void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
-void as_enter_guest(AddrSpace *as);    /* resuming guest instructions */
-void as_leave_guest(AddrSpace *as);    /* entering the syscall layer */
 /* A file changed size: drop the guest PTEs of any mapping of it that now
  * reaches past end-of-file, so an access faults instead of reaching a host page
  * the kernel would refuse (mem.c). */

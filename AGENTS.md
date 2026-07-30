@@ -34,7 +34,7 @@ src/
     cpu.c sysreg.c                   Step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr. Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
-  loop.c                             Run loop + exception dispatch + signal delivery point
+  loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen)
   predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   jit/                               Optional --jit translator (AArch64 & x86-64 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
@@ -48,7 +48,7 @@ src/
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
-  sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads)
+  sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread)
   sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions, signalfd over the capture ring)
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)

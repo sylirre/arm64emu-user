@@ -62,6 +62,33 @@ struct Machine {
 
     AddrSpace as;
 
+    /* ---- thread call-out rendezvous (execve's de_thread, sys_proc.c) ----
+     *
+     * `stop_gen` is the hot one: the run loop compares it against the calling
+     * thread's own copy once per iteration, and any mismatch sends that thread
+     * out of line into guest_stop_point(). It is bumped to call every guest
+     * thread out of guest code and bumped again to release them, so a thread
+     * never has to know *why* it was called out — it just goes and looks.
+     *
+     * `image_gen` names the loaded program. A thread whose copy is stale
+     * belongs to an image execve has already replaced and must leave rather
+     * than resume the old program's registers against the new address space.
+     *
+     * The rest is the de_thread handshake itself. Sibling threads park at the
+     * rendezvous and are destroyed only once *every* one of them has arrived,
+     * so a sibling that cannot be reached costs a refused execve instead of a
+     * half-dismantled thread group (see dethread_begin). */
+    u32 stop_gen;
+    u32 image_gen;
+    s32 dethread_req;         /* tid running de_thread, 0 = none */
+    s32 dethread_carrier;     /* tid that will run the new image (the main one) */
+    s32 dethread_parked;      /* siblings currently waiting at the rendezvous */
+    s32 dethread_state;       /* DT_PENDING / DT_COMMIT / DT_CANCEL */
+    s32 dethread_done;        /* 1 = the new image is loaded and the carrier may
+                               * adopt it; -1 = abandoned, resume unchanged */
+    u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
+                               * new image inherits (execve preserves it) */
+
     /* Rootfs containment */
     char rootfs[PATH_MAX];    /* realpath'd host prefix, no trailing slash */
     char cwd[PATH_MAX];       /* canonical guest cwd ("/" based, namespace-absolute) */
@@ -193,12 +220,6 @@ struct Machine {
      * for. The chain is newest-first, malloc'd, and so copied by fork and kept
      * across execve, exactly as the kernel keeps filters. Threads share it,
      * which is the kernel's TSYNC behavior rather than its default. */
-    /* Image generation, bumped by every successful execve. A guest thread that
-     * was parked in a syscall while another thread exec'd belongs to the
-     * program that is gone; the run loop compares this against the thread's own
-     * copy and makes it leave instead of resuming into the new image. */
-    u32 exec_epoch;
-
     u8 seccomp_mode;          /* G_SECCOMP_MODE_* (0 = none: the hot path) */
     void *seccomp_filters;    /* struct SeccompProg *, newest first */
 
@@ -348,6 +369,21 @@ void syscall_dispatch(CPU *c);
 /* sys_proc.c: resolve+load a program (shebang-aware); returns 0 or -errno.
  * Does not take ownership of argv/envp. */
 u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
+
+/* Run-loop safepoint: called out of line when m->stop_gen no longer matches
+ * this thread's copy. Adopts a newly exec'd image, joins a de_thread
+ * rendezvous, or ends the thread — setting c->stop when it must not run guest
+ * code again. */
+void guest_stop_point(CPU *c);
+/* Has this thread been called out to a safepoint? The emulator's own blocking
+ * loops poll this so a parked guest thread stops waiting and goes there; the
+ * kick signal only gets it out of the *host* syscall underneath. */
+int  guest_stop_pending(struct Machine *m);
+/* Value carried by the de_thread call-out kick, which rides the same reserved
+ * host signal as the ptrace attach kick (PTRACE_KICKSIG, ptrace.h): all it has
+ * to do is interrupt a blocked host syscall so the thread reaches the run-loop
+ * safepoint, which is precisely what that signal already exists for. */
+#define DETHREAD_MAGIC 0x44544852   /* "DTHR" */
 
 /* signal.c */
 /* Host-caught signals queued on this thread (per-thread ring; see signal.c). */
