@@ -686,6 +686,24 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
             tn = readlink(hostbuf, tgt, sizeof tgt - 1);
             if (tn < 0) continue;         /* not a symlink (or missing) */
             tgt[tn] = 0;
+            /* A link in the passthrough /proc zone (/proc/<pid>/fd/N, and the
+             * /dev/fd/N and /dev/std* that resolve there) names a HOST path, so
+             * its target cannot enter the guest walk as-is: re-rooting it would
+             * apply the rootfs prefix a second time and the open would miss.
+             * As the final component leave it untouched -- the /proc path passes
+             * through and the host performs the kernel's own reopen of that fd,
+             * which is what keeps O_TMPFILE publishing working and is the only
+             * thing that can open an anonymous target (pipe:[N], socket:[N]).
+             * With a remainder still to walk, splice the guest view instead, so
+             * the rest of the path stays under containment. */
+            if (proc_zone_path(hostbuf)) {
+                if (last || tgt[0] != '/') continue;
+                char gview[PATH_MAX];
+                if (host_fd_guest_path(m, tgt, gview, NULL) < 0) return -ENAMETOOLONG;
+                if (strlen(gview) + 1 > sizeof tgt) return -ENAMETOOLONG;
+                strcpy(tgt, gview);
+                tn = (ssize_t)strlen(tgt);
+            }
         }
         if (++nlinks > 40) return -ELOOP;
         /* Splice: target replaces the component; unprocessed remainder is
