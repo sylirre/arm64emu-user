@@ -218,16 +218,25 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
     if (e) return e;
     for (int i = 0; i < PTRACE_MAX; i++) {
         s32 expect = 0;
-        if (__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect, tracee,
+        /* Take the slot with a sentinel, fill it, and only then publish the
+         * real tid. Every scan of the registry skips a non-positive `tracee`,
+         * so no other process can act on a half-initialized link -- one still
+         * carrying the *previous* owner's tgid, which a concurrent
+         * exit_group fan-out would sweep as one of its own threads and either
+         * publish a bogus exit on or free outright, out from under the task
+         * that just claimed it. */
+        if (__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect, -1,
                                         false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             e = &g_tab->links[i];
             e->tgid = tgid;
             e->tracer = 0; e->options = 0; e->state = PT_ST_RUNNING;
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
             e->eventmsg = 0; e->si_signo = e->si_code = e->si_errno = 0;
+            e->fault_addr = 0;
             e->attach_pending = e->interrupt_pending = 0;
             e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
+            __atomic_store_n(&e->tracee, tracee, __ATOMIC_RELEASE);
             return e;
         }
     }
