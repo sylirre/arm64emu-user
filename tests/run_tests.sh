@@ -571,6 +571,37 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
     fi
 fi
 
+# ---- a :ro bind mount stays read-only for fd-based mutation too. Self-checking:
+# bind mounts are the emulator's own feature, so qemu is not an oracle. The
+# point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr
+# needs a writable fd, so a plain read-only open used to be enough to reach the
+# host file behind the bind and change its metadata. ----
+if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
+    if "$AGCC" -static -O2 -o "$ALPINE/tmp/robind.bin" \
+            tests/fixtures/robind.c 2>/dev/null; then
+        ROSRC="$A64_TEST_ROOT/robind_src"
+        rm -rf "$ROSRC"; mkdir -p "$ROSRC"; echo content > "$ROSRC/f"
+        chmod 644 "$ROSRC/f"
+        got=$("$EMU" --bind "$ROSRC:/ro:ro" "$ALPINE" /tmp/robind.bin 2>/dev/null)
+        expect=$'path_chmod=EROFS\npath_truncate=EROFS\nopen_rdonly=1\nfchmod=EROFS\nfchown=EROFS\nftruncate=EROFS\nfallocate=EROFS\nfutimens=EROFS\nfsetxattr=EROFS\nmode=644 size_nonzero=1\nopen_wronly=EROFS\ndone'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS bind: :ro blocks fd-based mutation"
+        else
+            fail=$((fail+1)); echo "FAIL bind: :ro blocks fd-based mutation"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        # The host file must be untouched: mode 644 and its content intact.
+        hmode=$(stat -c %a "$ROSRC/f" 2>/dev/null)
+        if [ "$hmode" = "644" ] && [ "$(cat "$ROSRC/f")" = "content" ]; then
+            pass=$((pass+1)); echo "PASS bind: host file untouched through :ro"
+        else
+            fail=$((fail+1)); echo "FAIL bind: host file untouched through :ro (mode=$hmode)"
+        fi
+        rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin"
+    else
+        echo "SKIP build fixtures/robind"
+    fi
+fi
+
 # ---- self-checking fixtures for syscalls qemu-user cannot model (it
 # returns ENOSYS for set/get_robust_list and mlock2) ----
 check_fixture() {   # check_fixture <name> <expected>

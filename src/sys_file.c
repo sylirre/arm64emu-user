@@ -61,6 +61,23 @@ static int host_ro(struct Machine *m, const char *host) {
     return i >= 0 && bind_ro(i);
 }
 
+/* Same question asked of an open fd, for the syscalls that name a file by
+ * descriptor rather than by path. A read-only bind was only ever enforced on
+ * the path-taking calls, so a guest that opened a file -- read-only was enough,
+ * none of these need write access -- could still fchmod, fchown, ftruncate,
+ * fallocate or set xattrs on it, straight through to the host. Guest fds are
+ * host fds, so the fd's own /proc/self/fd link is the host path to test.
+ * Skipped entirely when no bind mounts exist, which is the usual case. */
+static int fd_ro(struct Machine *m, int fd) {
+    if (fd < 0 || bind_count() == 0) return 0;
+    char link[64], host[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, host, sizeof host - 1);
+    if (n <= 0 || (size_t)n >= sizeof host) return 0;
+    host[n] = 0;
+    return host_ro(m, host);
+}
+
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
     memset(g, 0, sizeof *g);
     g->st_dev = st->st_dev;
@@ -1192,6 +1209,7 @@ SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
     char name[XATTR_NAME_BUF];
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
     return xattr_write(c, NULL, (int)a0, 1, name, a2, a3, (int)a4);
 }
 SYSDEF(removexattr) {  /* (path, name) — follow */
@@ -1218,6 +1236,7 @@ SYSDEF(fremovexattr) { /* (fd, name) */
     char name[XATTR_NAME_BUF];
     long nn = xattr_name(c, name, a1);
     if (nn < 0) return (u64)(s64)nn;
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
     if (fremovexattr((int)a0, name) < 0) return host_err();
     return 0;
 }
@@ -1827,6 +1846,7 @@ static void note_resize(CPU *c, int fd, s64 newsize) {
 }
 
 SYSDEF(ftruncate) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
     if (ftruncate((int)a0, (off_t)(s64)a1) < 0) return host_err();
     note_resize(c, (int)a0, (s64)a1);
     return 0;
@@ -1853,7 +1873,10 @@ static u64 chattr_result(struct Machine *m, int rr) {
     return host_err();
 }
 
-SYSDEF(fchmod) { return chattr_result(c->m, fchmod((int)a0, (mode_t)a1)); }
+SYSDEF(fchmod) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    return chattr_result(c->m, fchmod((int)a0, (mode_t)a1));
+}
 
 SYSDEF(fchmodat) {
     char host[PATH_MAX];
@@ -1884,6 +1907,7 @@ SYSDEF(fchownat) {
 }
 
 SYSDEF(fchown) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
     return chattr_result(c->m, fchown((int)a0, (uid_t)a1, (gid_t)a2));
 }
 
@@ -1897,6 +1921,7 @@ SYSDEF(utimensat) {
         tsp = ts;
     }
     if (a1 == 0) {   /* NULL path: operate on the fd itself */
+        if (fd_ro(c->m, (int)(s32)a0)) return (u64)(s64)-EROFS;
         return futimens((int)(s32)a0, tsp) < 0 ? host_err() : 0;
     }
     char host[PATH_MAX];
@@ -1972,6 +1997,7 @@ SYSDEF(sendfile) {
 }
 
 SYSDEF(fallocate) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
     if (fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0)
         return host_err();
     /* FALLOC_FL_PUNCH_HOLE / COLLAPSE_RANGE can shrink a file, and the plain
