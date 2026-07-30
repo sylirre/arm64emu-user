@@ -150,9 +150,22 @@ static void fx_wake(volatile u32 *a) {
     syscall(SYS_futex, (u32 *)a, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 }
 static void fx_wait(volatile u32 *a, u32 val, int ms) {
-    struct timespec ts;
-    if (ms >= 0) { ts.tv_sec = ms / 1000; ts.tv_nsec = (long)(ms % 1000) * 1000000L; }
-    syscall(SYS_futex, (u32 *)a, FUTEX_WAIT, val, ms >= 0 ? &ts : NULL, NULL, 0);
+    if (ms < 0) { syscall(SYS_futex, (u32 *)a, FUTEX_WAIT, val, NULL, NULL, 0); return; }
+    /* As in sys_misc.c futex: a 32-bit host's plain SYS_futex takes a pair of
+     * 32-bit words, so a libc timespec built with _TIME_BITS=64 would be read
+     * as {low half of tv_sec, 0} and the wait would not wait at all -- here
+     * that would spin the mailbox instead of parking on it. */
+#if defined(SYS_futex_time64) && __SIZEOF_LONG__ == 4
+    struct { s64 tv_sec, tv_nsec; } ts = { ms / 1000, (s64)(ms % 1000) * 1000000 };
+    if (syscall(SYS_futex_time64, (u32 *)a, FUTEX_WAIT, val, &ts, NULL, 0) < 0 &&
+        errno == ENOSYS) {
+        struct { s32 tv_sec, tv_nsec; } t32 = { ms / 1000, (ms % 1000) * 1000000 };
+        syscall(SYS_futex, (u32 *)a, FUTEX_WAIT, val, &t32, NULL, 0);
+    }
+#else
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    syscall(SYS_futex, (u32 *)a, FUTEX_WAIT, val, &ts, NULL, 0);
+#endif
 }
 
 /* A job-control stop signal: the kernel turns these into a group-stop rather than

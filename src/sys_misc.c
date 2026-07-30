@@ -109,18 +109,11 @@ SYSDEF(futex) {
     int takes_u2 = op == 3 /*REQUEUE*/ || op == 4 /*CMP_REQUEUE*/ ||
                    op == 5 /*WAKE_OP*/ || op == 11 ||
                    op == 12 /*CMP_REQUEUE_PI*/;
-    struct timespec ts;
-    unsigned long arg3 = 0;
-    if (takes_ts) {
-        if (a3) {
-            GTimespec g;
-            if (copy_from_guest(c, &g, a3, sizeof g) < 0) return (u64)(s64)-EFAULT;
-            ts.tv_sec = (time_t)g.tv_sec;
-            ts.tv_nsec = (long)g.tv_nsec;
-            arg3 = (unsigned long)&ts;
-        }
-    } else {
-        arg3 = (u32)a3;   /* val2: wake/requeue count */
+    GTimespec gts;
+    int have_ts = 0;
+    if (takes_ts && a3) {
+        if (copy_from_guest(c, &gts, a3, sizeof gts) < 0) return (u64)(s64)-EFAULT;
+        have_ts = 1;
     }
     void *uaddr2 = NULL;
     if (takes_u2) {
@@ -128,7 +121,29 @@ SYSDEF(futex) {
         uaddr2 = mem_host_ptr(c, a4, 4, op == 5 ? ACC_WRITE : ACC_READ);
         if (!uaddr2) return (u64)(s64)-EFAULT;
     }
-    long r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, arg3, uaddr2, (u32)a5);
+    long r;
+    if (have_ts) {
+        /* GTimespec is exactly struct __kernel_timespec, so the guest's timeout
+         * needs no conversion -- but on a 32-bit host it must not go to plain
+         * SYS_futex, whose timespec is two 32-bit words there. It would read
+         * tv_sec's low half as the seconds and its *high* half (always 0) as the
+         * nanoseconds, so every sub-second wait returned ETIMEDOUT at once and
+         * timed condvar/semaphore waits busy-spun. */
+#if defined(SYS_futex_time64) && __SIZEOF_LONG__ == 4
+        r = syscall(SYS_futex_time64, uaddr, (int)a1, (u32)a2, &gts, uaddr2, (u32)a5);
+        if (r < 0 && errno == ENOSYS) {   /* kernel older than 5.1 */
+            struct { s32 tv_sec, tv_nsec; } t32 =
+                { (s32)gts.tv_sec, (s32)gts.tv_nsec };
+            r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, &t32, uaddr2, (u32)a5);
+        }
+#else
+        r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, &gts, uaddr2, (u32)a5);
+#endif
+    } else {
+        /* val2 (wake/requeue count) for the ops that take one, else no timeout. */
+        unsigned long arg3 = takes_ts ? 0 : (u32)a3;
+        r = syscall(SYS_futex, uaddr, (int)a1, (u32)a2, arg3, uaddr2, (u32)a5);
+    }
     return r < 0 ? host_err() : (u64)r;
 }
 
