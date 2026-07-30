@@ -436,6 +436,13 @@ SYSDEF(openat) {
     char host[PATH_MAX], canon[PATH_MAX];
     int gflags = (int)a2;
     unsigned rf = (gflags & G_O_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    if (gflags & O_CREAT) rf |= PATH_CREATING;   /* "/nope/" -> EISDIR, not ENOENT */
+    /* O_CREAT|O_EXCL never follows a final symlink (the kernel's LOOKUP_EXCL):
+     * finding one there is EEXIST, whether or not it points anywhere. Following
+     * it meant a guest could be redirected into creating the link's target --
+     * exactly the race O_EXCL exists to prevent -- and a dangling link made the
+     * open succeed where the kernel refuses it. */
+    if ((gflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) rf |= PATH_NOFOLLOW_LAST;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, canon);
     if (r < 0) return (u64)(s64)r;
     /* Write intent (non-RDONLY, or create/truncate) into a :ro bind -> EROFS.

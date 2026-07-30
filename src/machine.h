@@ -406,9 +406,13 @@ int load_elf(struct Machine *m, const char *guest_path,
 /* path.c: resolve a guest path against the rootfs.
  * dirfd: guest fd for *at syscalls, or AT_FDCWD.
  * flags: PATH_NOFOLLOW_LAST to not follow a final symlink (lstat, unlink...).
+ * PATH_CREATING says the caller will create the final component if it is
+ * missing, which only changes the error a trailing slash produces (EISDIR
+ * rather than ENOENT, as the kernel answers open("/nope/", O_CREAT)).
  * host_out: rootfs-prefixed host path. canon_out (optional): canonical guest
  * path. Returns 0 or -errno. */
 #define PATH_NOFOLLOW_LAST 1
+#define PATH_CREATING      2
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out);
 

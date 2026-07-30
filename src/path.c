@@ -650,6 +650,18 @@ int bind_get(int i, char *guest_out, char *host_out, int *ro_out) {
     return 1;
 }
 
+/* Does this path demand that its final component be a directory? A trailing
+ * slash says so, and so does a final "." or ".." -- the kernel refuses
+ * open("/etc/hostname/") and open("/etc/hostname/.") alike with ENOTDIR. */
+static int path_wants_dir(const char *s) {
+    size_t n = strlen(s);
+    if (!n) return 0;
+    if (s[n - 1] == '/') return 1;
+    const char *base = strrchr(s, '/');
+    base = base ? base + 1 : s;
+    return !strcmp(base, ".") || !strcmp(base, "..");
+}
+
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out) {
     char canon[PATH_MAX];      /* canonical guest path built so far */
@@ -675,6 +687,11 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
     if (strlen(gpath) + 1 > sizeof rest) return -ENAMETOOLONG;
     strcpy(rest, gpath);
 
+    /* The walk throws away trailing slashes and "." components, so record up
+     * front that the caller asked for a directory; without it "file/" resolved
+     * to "file" and every operation went through -- open("file/") succeeded and
+     * unlink("file/") deleted the file. */
+    int want_dir = path_wants_dir(rest);
     int nlinks = 0;
     char *p = rest;
     while (*p) {
@@ -699,8 +716,10 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         int r = canon_push(canon, comp);
         if (r < 0) return r;
 
-        /* Follow symlinks (last component only if the caller wants it). */
-        if (last && (flags & PATH_NOFOLLOW_LAST)) continue;
+        /* Follow symlinks (last component only if the caller wants it). A
+         * trailing slash overrides that: the kernel follows a final symlink
+         * regardless, because the slash demands a directory to enter. */
+        if (last && (flags & PATH_NOFOLLOW_LAST) && !want_dir) continue;
         char tgt[PATH_MAX];
         ssize_t tn;
         r = canon_to_host(m, canon, hostbuf);
@@ -744,6 +763,7 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         strcpy(newrest, tgt);
         strcat(newrest, p);
         strcpy(rest, newrest);
+        want_dir = path_wants_dir(rest);   /* the link may end in a slash too */
         p = rest;
         canon_pop(canon);                 /* the link itself is replaced */
         if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
@@ -751,6 +771,18 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
 
     int r = canon_to_host(m, canon, host_out);   /* -bind > /dev,/proc > rootfs */
     if (r < 0) return r;
+    if (want_dir) {
+        struct stat st;
+        if (stat(host_out, &st) == 0) {
+            if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
+        } else if (flags & PATH_CREATING) {
+            /* Nothing there and the caller would create it: a trailing slash
+             * names a directory, and creating one is not open(2)'s job. */
+            return -EISDIR;
+        }
+        /* Otherwise leave it missing: the syscall reports its own ENOENT, and
+         * mkdir("/new/") must still be allowed to succeed. */
+    }
     if (canon_out) strcpy(canon_out, canon);
     return 0;
 }
