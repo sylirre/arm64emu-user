@@ -637,7 +637,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             # The substituted socket has no kernel behind it, so it acks every
             # non-dump request whether or not a namespace was faked -- there is
             # no real refusal to pass through on a host that denies netlink.
-            expect_nl=$'empty=eagain\nself=own\nno_netns=acked\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok'
+            expect_nl=$'empty=eagain\nself=own\nno_netns=acked\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
             got=$(A64_NETLINK_FORCE_BLOCK=1 timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         else
@@ -645,7 +645,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             # namespace: an ack here would be one the emulator invented. The
             # switch must be *absent*, not empty -- these A64_* switches are
             # presence-tested (getenv), so FOO= would select the fallback.
-            expect_nl=$'empty=eagain\nself=own\nno_netns=passed-through\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok'
+            expect_nl=$'empty=eagain\nself=own\nno_netns=passed-through\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
             got=$(env -u A64_NETLINK_FORCE_BLOCK timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         fi

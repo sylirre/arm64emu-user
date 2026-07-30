@@ -662,11 +662,27 @@ SYSDEF(sendmmsg) {
     int sent = 0;
     for (unsigned i = 0; i < vlen; i++) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
+        /* Each element is a sendmsg, so a substituted netlink socket has to be
+         * answered here too. Going straight to the host would write the guest's
+         * netlink request into the AF_UNIX stand-in as opaque bytes and leave
+         * the emulator with no record that a request was ever made. */
+        if (nl_is_fd(c->m, (int)a0)) {
+            u64 r = nl_sendmsg(c, (int)a0, entry);
+            if ((s64)r < 0) return sent ? (u64)sent : r;
+            u32 nlen = (u32)r;
+            if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &nlen, 4) < 0)
+                return sent ? (u64)sent : (u64)(s64)-EFAULT;
+            sent++;
+            continue;
+        }
         GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
         int dfd = -1;
         int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
         if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;   /* dfd == -1 */
+        /* As sendmsg: note a reconfiguring rtnetlink request from a guest whose
+         * network namespace was faked, so its refusal can be rewritten. */
+        if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
         free(iov); free(bounce);
         if (dfd >= 0) close(dfd);
@@ -687,17 +703,38 @@ SYSDEF(recvmmsg) {
     int got = 0;
     for (unsigned i = 0; i < vlen; i++) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
+        int mf = flags & ~MSG_WAITFORONE;
+        if (got > 0) mf |= MSG_DONTWAIT;   /* only the first message blocks */
+        /* A substituted netlink socket answers from the reply it recorded, one
+         * datagram per element, exactly as recvmsg does. */
+        u64 nlret;
+        if (nl_is_fd(c->m, (int)a0) &&
+            nl_maybe_recvmsg(c, (int)a0, entry, mf, &nlret)) {
+            if ((s64)nlret < 0) {
+                if (got) break;
+                return nlret;
+            }
+            u32 nlen = (u32)nlret;
+            copy_to_guest(c, entry + GMMSG_LEN_OFF, &nlen, 4);
+            got++;
+            continue;
+        }
         GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
         int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
         if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
-        int mf = flags & ~MSG_WAITFORONE;
-        if (got > 0) mf |= MSG_DONTWAIT;   /* only the first message blocks */
         ssize_t n = recvmsg((int)a0, &h, mf);
         if (n < 0) {
             free(iov); free(bounce);
             if (got) break;   /* return the messages received so far */
             return host_err();
+        }
+        /* Rewrite a faked-namespace refusal, as recvmsg does. */
+        if (n > 0) {
+            size_t total = 0;
+            for (int k = 0; k < cnt; k++) total += iov[k].iov_len;
+            nlr_fix_reply(c->m, (int)a0, bounce,
+                          (size_t)n < total ? (size_t)n : total, mf & MSG_PEEK);
         }
         recvmsg_writeback(c, entry, &g, &h, iov, bounce, &ss, ctrl, n);
         u32 mlen = (u32)n;

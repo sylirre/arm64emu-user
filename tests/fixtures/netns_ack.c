@@ -230,6 +230,39 @@ static const char *newaddr_roundtrip(int fd, unsigned seq, unsigned *src_pid) {
     return out;
 }
 
+/* One request out via sendmmsg and one reply back via recvmmsg. */
+static const char *mmsg_cycle(int fd) {
+    struct { struct nlmsghdr nh; struct rtgenmsg g; } req;
+    memset(&req, 0, sizeof req);
+    req.nh.nlmsg_len = sizeof req;
+    req.nh.nlmsg_type = RTM_GETLINK;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nh.nlmsg_seq = 99;
+    req.g.rtgen_family = AF_UNSPEC;
+
+    struct iovec siov = { &req, sizeof req };
+    struct mmsghdr smm;
+    memset(&smm, 0, sizeof smm);
+    smm.msg_hdr.msg_iov = &siov;
+    smm.msg_hdr.msg_iovlen = 1;
+    if (sendmmsg(fd, &smm, 1, 0) != 1) return "sendfail";
+    if (smm.msg_len != sizeof req) return "shortsend";
+
+    static char buf[8192];
+    struct iovec riov = { buf, sizeof buf };
+    struct mmsghdr rmm;
+    memset(&rmm, 0, sizeof rmm);
+    rmm.msg_hdr.msg_iov = &riov;
+    rmm.msg_hdr.msg_iovlen = 1;
+    if (recvmmsg(fd, &rmm, 1, 0, NULL) != 1) return "recvfail";
+    if (rmm.msg_len < sizeof(struct nlmsghdr)) return "short";
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+    /* A reply, not our own request handed back. */
+    if (h->nlmsg_type == RTM_GETLINK) return "echoed";
+    return (h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == NLMSG_DONE)
+               ? "data" : "broken";
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
@@ -327,5 +360,15 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) { printf("frame=skip\n"); return 0; }
     printf("frame=%s\n", dump_walk(fd));
+    close(fd);
+
+    /* sendmmsg/recvmmsg are sendmsg/recvmsg per element, so a substituted
+     * socket has to answer them too. Going straight to the host wrote the
+     * request into the AF_UNIX stand-in as opaque bytes and read them back --
+     * the guest saw its own request echoed instead of a reply. */
+    fd = nl_open();
+    if (fd < 0) { printf("mmsg=skip\n"); return 0; }
+    printf("mmsg=%s\n", mmsg_cycle(fd));
+    close(fd);
     return 0;
 }
