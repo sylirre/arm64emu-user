@@ -2085,6 +2085,47 @@ SYSDEF(statx) {
     return copy_to_guest(c, a4, buf, 256) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
+/* ---- the temporary signal mask of ppoll / pselect6 / epoll_pwait ----
+ *
+ * These install a signal mask for the duration of the wait and restore it on
+ * return. That is the whole point of the p-variants: a guest blocks SIGCHLD,
+ * checks its state, and then sleeps with SIGCHLD unblocked *only* while
+ * sleeping, so the handler cannot run in the window between the check and the
+ * sleep.
+ *
+ * Handing the mask to the host call alone does not implement that here. The
+ * host mask is not the guest's -- everything except the job-control trio stays
+ * unblocked host-side so host_catcher can queue into the capture ring, and
+ * g_tls.sigmask is what actually gates delivery to the guest. So the wait was
+ * interrupted, the syscall returned EINTR, and the run loop then declined to
+ * run the handler because the guest mask still had the signal blocked: the
+ * guest saw a bare EINTR and no signal, forever.
+ *
+ * Swap the guest mask too, and hold it across delivery the way rt_sigsuspend
+ * does -- the handler must run under the temporary mask, and sigreturn puts
+ * the original back from the frame (have_saved_sigmask). If the wait ends
+ * without a signal to deliver, restore it here instead. */
+static int pwait_mask_enter(CPU *c, u64 gmask) {
+    g_tls.saved_sigmask = g_tls.sigmask;
+    g_tls.have_saved_sigmask = 1;
+    g_tls.sigmask = gmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sig_sync_host_mask(c->m);
+    /* The kernel tests for a pending signal before it sleeps. Without this, one
+     * that arrived while the caller had it blocked -- already sitting in the
+     * ring, which is the case the idiom exists to handle -- would not be seen
+     * until some later signal happened to wake the wait. */
+    return sig_pending_deliverable(c->m);
+}
+
+static void pwait_mask_leave(CPU *c) {
+    if (sig_pending_deliverable(c->m)) return;   /* a handler is about to run */
+    int e = errno;                               /* callers still owe host_err() */
+    g_tls.sigmask = g_tls.saved_sigmask;
+    g_tls.have_saved_sigmask = 0;
+    sig_sync_host_mask(c->m);
+    errno = e;
+}
+
 SYSDEF(ppoll) {
     unsigned nfds = (unsigned)a1;
     if (nfds > 4096) return (u64)(s64)-EINVAL;
@@ -2107,9 +2148,11 @@ SYSDEF(ppoll) {
         for (int i = 1; i <= 64; i++)
             if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
         ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
     }
     sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
     int r = ppoll(pf, nfds, tsp, ssp);
+    if (ssp) pwait_mask_leave(c);
     if (r < 0) return host_err();
     if (nfds && copy_to_guest(c, a0, pf, sizeof(struct pollfd) * nfds) < 0)
         return (u64)(s64)-EFAULT;
@@ -2144,10 +2187,12 @@ SYSDEF(pselect6) {
             for (int i = 1; i <= 64; i++)
                 if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
             ssp = &ss;
+            if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
         }
     }
     sigfd_sync(c->m);
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
+    if (ssp) pwait_mask_leave(c);
     if (rr < 0) return host_err();
     if (a1) copy_to_guest(c, a1, &r, setb);
     if (a2) copy_to_guest(c, a2, &w, setb);
@@ -2272,11 +2317,13 @@ SYSDEF(epoll_pwait) {
         for (int i = 1; i <= 64; i++)
             if (gmask & (1ULL << (i - 1))) sigaddset(&ss, i);
         ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
     }
     struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
-    if (!evs) return (u64)(s64)-ENOMEM;
+    if (!evs) { if (ssp) pwait_mask_leave(c); return (u64)(s64)-ENOMEM; }
     sigfd_sync(c->m);
     int r = epoll_pwait((int)a0, evs, maxevents, (int)a3, ssp);
+    if (ssp) pwait_mask_leave(c);
     if (r < 0) { free(evs); return host_err(); }
     for (int i = 0; i < r; i++) {
         GEpollEvent g = { .events = evs[i].events, .__pad = 0, .data = evs[i].data.u64 };
