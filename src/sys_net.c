@@ -387,10 +387,19 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     if (copy_from_guest(c, g, va, sizeof *g) < 0) return -EFAULT;
     memset(h, 0, sizeof *h);
     if (g->msg_name && g->msg_namelen) {
-        u32 nl = g->msg_namelen > sizeof *ss ? sizeof *ss : g->msg_namelen;
-        if (copy_from_guest(c, ss, g->msg_name, nl) < 0) return -EFAULT;
-        h->msg_name = ss;
-        h->msg_namelen = nl;
+        if (for_send) {
+            u32 nl = g->msg_namelen > sizeof *ss ? sizeof *ss : g->msg_namelen;
+            if (copy_from_guest(c, ss, g->msg_name, nl) < 0) return -EFAULT;
+            h->msg_name = ss;
+            h->msg_namelen = nl;
+        } else {
+            /* Receiving: give the kernel the whole staging buffer rather than the
+             * guest's, so the source address arrives untruncated -- unix_path_out
+             * needs the complete sun_path to translate it to the guest view. The
+             * writeback clamps to what the guest actually asked for. */
+            h->msg_name = ss;
+            h->msg_namelen = sizeof *ss;
+        }
     }
     unsigned cnt = (unsigned)g->msg_iovlen;
     if (cnt > 1024) return -EINVAL;
@@ -486,7 +495,11 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
         socklen_t sl = h->msg_namelen;
         unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
         h->msg_namelen = sl;
-        copy_to_guest(c, g->msg_name, ss, h->msg_namelen);
+        /* Write at most the buffer the guest supplied, but report the true
+         * length below -- POSIX: "fromlen shall refer to the value before
+         * truncation", which is what the kernel's move_addr_to_user does. */
+        u32 out = (u32)sl < g->msg_namelen ? (u32)sl : g->msg_namelen;
+        if (out) copy_to_guest(c, g->msg_name, ss, out);
     }
     if (g->msg_control && h->msg_controllen)
         copy_to_guest(c, g->msg_control, ctrl, h->msg_controllen);
