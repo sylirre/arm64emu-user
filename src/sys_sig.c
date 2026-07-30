@@ -135,10 +135,15 @@ SYSDEF(rt_sigtimedwait) {
 }
 
 SYSDEF(sigaltstack) {
+    /* Whether we are "on" the alternate stack is a question about the current
+     * stack pointer, not a flag (sig_on_altstack) -- see signal.c. */
+    int on = sig_on_altstack(*cpu_cur_sp(c));
     if (a1) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } old = {
             g_tls.sig_altstack_sp,
-            (s32)(g_tls.sig_altstack_size ? g_tls.sig_altstack_flags : 2 /*SS_DISABLE*/),
+            (s32)(!g_tls.sig_altstack_size ? 2 /*SS_DISABLE*/
+                                           : (on ? 1 /*SS_ONSTACK*/ : 0) |
+                                                 (s32)g_tls.sig_altstack_flags),
             0,
             g_tls.sig_altstack_size,
         };
@@ -147,6 +152,9 @@ SYSDEF(sigaltstack) {
     if (a0) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } ss;
         if (copy_from_guest(c, &ss, a0, sizeof ss) < 0) return (u64)(s64)-EFAULT;
+        /* The kernel refuses to move the alternate stack out from under a
+         * handler that is running on it -- disabling it included. */
+        if (on) return (u64)(s64)-EPERM;
         if (ss.flags & 2 /*SS_DISABLE*/) {
             g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
         } else {

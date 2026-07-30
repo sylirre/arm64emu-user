@@ -175,6 +175,22 @@ void sig_raise_local(int sig) {
     jit_signal_interrupt();
 }
 
+/* Is `sp` inside the guest's alternate signal stack? The kernel keeps no "am I
+ * on the altstack" flag -- it asks this of the current stack pointer every time
+ * (on_sig_stack), and the bounds are exactly its own: open at the low end,
+ * closed at the high end.
+ *
+ * A flag set at delivery and cleared at sigreturn gets stuck set whenever a
+ * handler leaves without returning. siglongjmp out of a handler is the normal
+ * way to recover from a stack-overflow SIGSEGV, and it was enough to disable
+ * the alternate stack for the rest of the thread's life -- every later
+ * SA_ONSTACK signal was then delivered onto the stack that had just
+ * overflowed, where the frame write faults again. */
+int sig_on_altstack(u64 sp) {
+    return g_tls.sig_altstack_size && sp > g_tls.sig_altstack_sp &&
+           sp - g_tls.sig_altstack_sp <= g_tls.sig_altstack_size;
+}
+
 /* Signals delivered synchronously from the interpreter (never host-caught). */
 static int is_sync_sig(int sig) {
     return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE ||
@@ -414,7 +430,6 @@ void sig_reset_for_exec(struct Machine *m) {
     sigq_head = sigq_tail = 0;   /* this thread's queue; post-exec is single-threaded */
     g_sig_npend = 0;
     g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
-    g_tls.on_altstack = 0;
 }
 
 /* ---- guest frame layout (arm64 kernel ABI) ---- */
@@ -463,7 +478,7 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     /* Pick the stack: guest sigaltstack if requested and configured. */
     u64 sp = *cpu_cur_sp(c);
     int used_altstack = 0;
-    if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !g_tls.on_altstack) {
+    if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !sig_on_altstack(sp)) {
         sp = g_tls.sig_altstack_sp + g_tls.sig_altstack_size;
         used_altstack = 1;
     }
@@ -514,8 +529,8 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     g_tls.have_saved_sigmask = 0;
     wr64(c, frame, UC_STACK + 0, g_tls.sig_altstack_sp);
     wr32(c, frame, UC_STACK + 8,
-         g_tls.sig_altstack_size ? (g_tls.on_altstack ? 1 /*SS_ONSTACK*/ : 0)
-                              : 2 /*SS_DISABLE*/);
+         !g_tls.sig_altstack_size ? 2 /*SS_DISABLE*/
+                                  : (used_altstack ? 0 : 1 /*SS_ONSTACK*/));
     wr64(c, frame, UC_STACK + 16, g_tls.sig_altstack_size);
     wr64(c, frame, UC_SIGMASK, mask_to_save);
 
@@ -543,7 +558,6 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     c->x[30] = m->sigtramp_va;
     *cpu_cur_sp(c) = frame;
     c->pc = act->handler;
-    if (used_altstack) g_tls.on_altstack = 1;
 
     /* New blocked set while the handler runs. */
     g_tls.sigmask |= act->mask;
@@ -584,7 +598,6 @@ void sig_return(CPU *c) {
         for (int i = 0; i < 32; i++)
             copy_from_guest(c, &c->v[i], frame + MC_RESERVED + 16 + 16u * (unsigned)i, 16);
     }
-    g_tls.on_altstack = 0;
     c->excl_valid = false;
     return;
 bad:

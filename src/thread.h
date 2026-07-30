@@ -31,7 +31,6 @@ typedef struct {
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;
     int tid;                  /* thread id (main thread tid == pid) */
-    int on_altstack;          /* executing on the guest sigaltstack */
     /* Alternate signal stack: per-thread, as POSIX sigaltstack(2) is a
      * thread-local attribute. Storing it process-wide corrupts delivery under
      * multithreading -- each Go M registers its own gsignal stack, so a shared
