@@ -467,6 +467,15 @@ static s32 shm_do_get(struct BReq *q) {
         if (!(q->arg & G_IPC_CREAT)) return -ENOENT;
     }
     if (q->size == 0) return -EINVAL;
+    /* Kernel bounds, both of which the guest can otherwise walk straight past.
+     * SHMMAX (ULONG_MAX - 16 MiB) is the EINVAL rule; without it a size just
+     * under 2^64 wraps when rounded up to a page, and the segment is created
+     * over a 0-byte backing — shmctl then reports a segsz no mapping covers,
+     * and a guest that trusts it walks off the end of a one-page attach. A
+     * segment larger than the guest address space can never be attached, which
+     * the kernel reaches as ENOMEM (it must account every page up front). */
+    if (q->size > (u64)-1 - (1u << 24)) return -EINVAL;
+    if (q->size > GUEST_TASK_SIZE) return -ENOMEM;
     int slot = -1;
     for (int i = 0; i < SHM_SEG_MAX; i++) if (!g_seg[i].used) { slot = i; break; }
     if (slot < 0) return -ENOSPC;

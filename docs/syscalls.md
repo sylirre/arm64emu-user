@@ -546,6 +546,9 @@ over `SCM_RIGHTS`) and all semaphore/message-queue state.
   `$TMPDIR`, `/data/local/tmp`, …) when `memfd_create` is unavailable; if neither
   is possible `shmget` fails loud with `-ENOSPC` rather than handing back
   non-shared memory. `A64_SHM_FORCE_FILE` forces the file tier for testing.
+  Sizes are bounded as the kernel bounds them: `0` and anything above `SHMMAX`
+  (`ULONG_MAX - 16 MiB`) are `EINVAL`, and a segment larger than the guest
+  address space — which no attach could ever cover — is `ENOMEM`.
 - **Attach.** `shmat` receives the backing fd, maps it `MAP_SHARED` into the
   guest address space with `guest_map_file` (so stores are visible to every
   attached process), then closes the fd — a process holds a segment only as a
