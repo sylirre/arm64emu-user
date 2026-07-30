@@ -116,6 +116,35 @@ int main(void) {
     close(dfd);
     printf("after_close=%zd\n", read(fd, si, sizeof si[0]));
 
+    /* Two *independent* signalfds, which is not the dup case above: each has
+     * its own mask and its own readiness, and a signal only one of them covers
+     * must wake only that one. The emulator backs each with a host eventfd,
+     * and every anon_inode file shares a single inode -- so anything keyed on
+     * st_ino sees these two as one description and the second never becomes
+     * readable at all. */
+    sigset_t only1, only2;
+    sigemptyset(&only1); sigaddset(&only1, SIGUSR1);
+    sigemptyset(&only2); sigaddset(&only2, SIGUSR2);
+    int s1 = signalfd(-1, &only1, SFD_NONBLOCK);
+    int s2 = signalfd(-1, &only2, SFD_NONBLOCK);
+    printf("two_ok=%d\n", s1 >= 0 && s2 >= 0 && s1 != s2);
+    raise(SIGUSR2);                       /* covered by s2 only */
+    struct pollfd pf3[2] = { { s1, POLLIN, 0 }, { s2, POLLIN, 0 } };
+    printf("two_poll=%d s1=%d s2=%d\n", poll(pf3, 2, 1000),
+           (pf3[0].revents & POLLIN) != 0, (pf3[1].revents & POLLIN) != 0);
+    n = read(s2, si, sizeof si[0]);
+    printf("two_read=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    printf("two_other_empty=%d\n",
+           read(s1, si, sizeof si[0]) < 0 && errno == EAGAIN);
+    /* A mask change on one must not touch the other's. */
+    printf("two_remask=%d\n", signalfd(s1, &only2, 0) == s1);
+    raise(SIGUSR1);                       /* now covered by neither */
+    pf3[0].revents = pf3[1].revents = 0;
+    printf("two_none=%d\n", poll(pf3, 2, 0));
+    sigtimedwait(&only1, NULL, &zero);   /* drain */
+    close(s1);
+    close(s2);
+
     /* Bad arguments. */
     printf("badflags=%d\n", signalfd(-1, &just_usr, 1 << 30) < 0 && errno == EINVAL);
     close(fd);

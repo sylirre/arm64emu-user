@@ -236,10 +236,13 @@ SYSDEF(tgkill) {
  * blocks the signal and reads it on one thread, which is exactly this case. */
 
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
+static u64 sfd_next_id = 1;   /* under sfd_lock; identifies a description */
 
 /* Slot of a live signalfd, or -1. A slot whose fd number was reused behind our
- * back (dup2 onto it, execve's CLOEXEC sweep) is detected by the recorded
- * eventfd inode and dropped, so an innocent fd is never intercepted. */
+ * back is detected by the recorded inode and dropped, so an innocent fd is not
+ * intercepted. This check is weaker than it looks -- every anon_inode file
+ * shares one inode, so reuse by another eventfd or a timerfd slips through --
+ * which is why each path that closes or replaces an fd unmarks it explicitly. */
 static int sfd_slot(struct Machine *m, int fd) {
     for (int i = 0; i < m->sfd_fds_count; i++) {
         if (m->sfd_fds[i].fd != fd) continue;
@@ -254,13 +257,12 @@ static int sfd_slot(struct Machine *m, int fd) {
 }
 
 /* Every fd naming the same signalfd is one entry here, so mask changes and
- * readiness have to apply to the *file description* (the recorded eventfd
- * inode), not to one fd number: dup(2) hands the guest a second name for the
- * same signalfd, and the kernel's mask and pending set are shared between
- * them. */
-static void sfd_set_mask(struct Machine *m, u64 ino, u64 mask) {
+ * readiness have to apply to the *file description* (`id`), not to one fd
+ * number: dup(2) hands the guest a second name for the same signalfd, and the
+ * kernel's mask and pending set are shared between them. */
+static void sfd_set_mask(struct Machine *m, u64 id, u64 mask) {
     for (int i = 0; i < m->sfd_fds_count; i++)
-        if (m->sfd_fds[i].ino == ino) m->sfd_fds[i].mask = mask;
+        if (m->sfd_fds[i].id == id) m->sfd_fds[i].mask = mask;
 }
 
 /* Recompute the union of the live masks and re-mirror every disposition it
@@ -305,7 +307,7 @@ void sigfd_sync(struct Machine *m) {
     for (int i = 0; i < m->sfd_fds_count; i++) {
         int dup_of = -1;   /* one eventfd counter per description, not per fd */
         for (int j = 0; j < i; j++)
-            if (m->sfd_fds[j].ino == m->sfd_fds[i].ino) { dup_of = j; break; }
+            if (m->sfd_fds[j].id == m->sfd_fds[i].id) { dup_of = j; break; }
         if (dup_of >= 0) { m->sfd_fds[i].armed = m->sfd_fds[dup_of].armed; continue; }
         int want = sig_fd_pending(m->sfd_fds[i].mask);
         u64 one = 1;
@@ -381,7 +383,7 @@ SYSDEF(signalfd4) {
     if (fd >= 0) {
         pthread_mutex_lock(&sfd_lock);
         int i = sfd_slot(m, fd);
-        if (i >= 0) { sfd_set_mask(m, m->sfd_fds[i].ino, mask); sfd_remask(m); }
+        if (i >= 0) { sfd_set_mask(m, m->sfd_fds[i].id, mask); sfd_remask(m); }
         pthread_mutex_unlock(&sfd_lock);
         if (i < 0) return (u64)(s64)-EINVAL;
         sigfd_sync(m);
@@ -404,6 +406,7 @@ SYSDEF(signalfd4) {
     m->sfd_fds[m->sfd_fds_count].mask = mask;
     m->sfd_fds[m->sfd_fds_count].armed = 0;
     m->sfd_fds[m->sfd_fds_count].ino = (u64)st.st_ino;
+    m->sfd_fds[m->sfd_fds_count].id = sfd_next_id++;
     m->sfd_fds_count++;
     sfd_remask(m);
     pthread_mutex_unlock(&sfd_lock);

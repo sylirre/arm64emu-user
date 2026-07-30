@@ -205,9 +205,17 @@ struct Machine {
      * answered from the ring (sys_sig.c). Copied by fork like the fds are; a
      * parent and child then share one eventfd but have separate rings, so each
      * can briefly see the other's readiness -- a spurious poll wake followed by
-     * EAGAIN, which the next sync corrects. */
+     * EAGAIN, which the next sync corrects.
+     *
+     * One entry per *fd*, so dup(2) adds a second entry naming the same
+     * description. `id` is what says two entries are the same description --
+     * a counter handed out at creation, because the inode cannot say it: the
+     * kernel gives every anon_inode file the same inode, so an eventfd, a
+     * second eventfd and a timerfd all report the identical st_ino. `ino` is
+     * kept only as a weak "this fd number was reused behind our back" check
+     * (it still catches reuse by a regular file, socket or pipe). */
 #define SFD_MAX_FDS 8
-    struct { int fd; u64 mask; u64 ino; u8 armed; } sfd_fds[SFD_MAX_FDS];
+    struct { int fd; u64 mask; u64 ino; u64 id; u8 armed; } sfd_fds[SFD_MAX_FDS];
     int sfd_fds_count;
     u64 sfd_mask;             /* union of the masks above: sig_host_update
                                * forces the capture handler on for these, or a
