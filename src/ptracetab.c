@@ -276,6 +276,19 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
     }
 }
 
+/* How many bytes the regset `which` holds (0 = not modelled). The kernel
+ * clamps a GETREGSET/SETREGSET iov_len to this and writes the clamped value
+ * back, so the tracer needs the size even for a write. */
+static u32 pt_regset_size(u32 which) {
+    switch (which) {
+    case G_NT_PRSTATUS:        return (u32)sizeof(GUserRegs);
+    case G_NT_PRFPREG:         return (u32)sizeof(GUserFpsimd);
+    case G_NT_ARM_TLS:         return 8;
+    case G_NT_ARM_SYSTEM_CALL: return 4;
+    default:                   return 0;
+    }
+}
+
 static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
     switch (which) {
     case G_NT_PRSTATUS: {
@@ -410,6 +423,9 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
         }
         case PT_CMD_SETREGS:
             e->result = pt_apply_regset(c, (u32)e->addr, e->data, e->rlen);
+            /* Hand the regset's own size back so the tracer can report the
+             * kernel's clamped iov_len. */
+            if (e->result == 0) e->rlen = pt_regset_size((u32)e->addr);
             break;
         case PT_CMD_RESUME:
             g_ptrace_syscall_armed = (e->arg == PT_RES_SYSCALL);
@@ -1062,18 +1078,22 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         u32 n = e->rlen;
         if (iov.iov_len < n) n = (u32)iov.iov_len;
         if (n && copy_to_guest(c, iov.iov_base, e->data, n) < 0) return -EFAULT;
-        iov.iov_len = e->rlen;
+        /* The kernel returns iov_len clamped to what it copied, not the
+         * regset's full size: a caller with a short buffer must not be told
+         * more was written than fits in it. */
+        iov.iov_len = n;
         return copy_to_guest(c, data, &iov, sizeof iov) < 0 ? -EFAULT : 0;
     }
     case G_PTRACE_SETREGSET: {
         GIovec iov;
         if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
-        u32 n = (u32)iov.iov_len;
-        if (n > PT_MBOX) n = PT_MBOX;
+        u32 n = iov.iov_len > PT_MBOX ? PT_MBOX : (u32)iov.iov_len;
         if (n && copy_from_guest(c, e->data, iov.iov_base, n) < 0) return -EFAULT;
         e->rlen = n;
         if (pt_cmd(e, PT_CMD_SETREGS, addr, 0) < 0) return -ESRCH;
-        return e->result < 0 ? (long)e->result : 0;
+        if (e->result < 0) return (long)e->result;
+        if (e->rlen < iov.iov_len) iov.iov_len = e->rlen;   /* clamped, as above */
+        return copy_to_guest(c, data, &iov, sizeof iov) < 0 ? -EFAULT : 0;
     }
     case G_PTRACE_CONT:
         return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);

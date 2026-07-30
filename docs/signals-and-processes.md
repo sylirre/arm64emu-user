@@ -434,7 +434,9 @@ its tracer through `pt_wake_tracer`, on two channels at once:
 
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
-`NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`). `PTRACE_SINGLESTEP` runs
+`NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`); as in the kernel, both write
+the *clamped* `iov_len` back — `min(the caller's length, the regset size)` — so
+a short buffer is never reported as a full transfer. `PTRACE_SINGLESTEP` runs
 exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.
