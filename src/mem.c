@@ -108,6 +108,17 @@ void as_init(AddrSpace *as) {
     as->l1 = calloc(L1_SIZE, sizeof(uintptr_t *));
     if (!as->l1) { perror("arm64chroot: calloc"); exit(127); }
     as->mmap_next = 0x6000000000ULL;
+    as->nthreads = 1;
+}
+
+/* A guest thread joining or leaving this address space. The count gates the
+ * quarantine drain in as_drain_retired, so the increment has to happen in the
+ * creator before the new thread can run. */
+void as_thread_enter(AddrSpace *as) {
+    __atomic_fetch_add(&as->nthreads, 1, __ATOMIC_ACQ_REL);
+}
+void as_thread_exit(AddrSpace *as) {
+    __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
 }
 
 static uintptr_t pte_get(AddrSpace *as, u64 va) {
@@ -194,7 +205,14 @@ static u8 *host_alloc(u64 len, int prot) {
  * but another thread's D-TLB is only invalidated lazily (at its next access,
  * via the generation check) and it may still hold a host pointer it already
  * translated. Unmapping the backing under it would turn that stale-but-benign
- * access into a host SIGSEGV. Drained in as_destroy (execve/exit). */
+ * access into a host SIGSEGV.
+ *
+ * That reasoning only applies while another thread exists. Waiting for
+ * as_destroy unconditionally meant a single-threaded guest that maps and
+ * unmaps in a loop -- an allocator returning memory, a linker mapping objects
+ * one after another -- never gave a byte back: 1.5 GB of address space where
+ * qemu holds 70 MB. as_drain_retired releases the quarantine as soon as this
+ * address space has one guest thread left. */
 static void as_retire(AddrSpace *as, void *addr, size_t len) {
     if (as->nretired == as->cap_retired) {
         as->cap_retired = as->cap_retired ? as->cap_retired * 2 : 16;
@@ -205,6 +223,18 @@ static void as_retire(AddrSpace *as, void *addr, size_t len) {
     as->retired[as->nretired].addr = addr;
     as->retired[as->nretired].len = len;
     as->nretired++;
+}
+
+/* Release quarantined backing when no other thread could still be holding a
+ * host pointer into it. With one guest thread in this address space the only
+ * D-TLB that mattered is the caller's own, and the generation bump that every
+ * mutation performs emptied that before this runs. Callers hold the AS lock. */
+static void as_drain_retired(AddrSpace *as) {
+    if (!as->nretired) return;
+    if (__atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) != 1) return;
+    for (int i = 0; i < as->nretired; i++)
+        munmap(as->retired[i].addr, as->retired[i].len);
+    as->nretired = 0;
 }
 
 static HostMap *hmap_new(u8 *base, size_t len) {
@@ -725,15 +755,26 @@ long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
 
 /* ---- thread-safe wrappers: serialize address-space mutations ---- */
 int guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot) {
-    as_lock(); int r = guest_map_anon_impl(as, addr, len, prot); as_unlock(); return r;
+    as_lock();
+    int r = guest_map_anon_impl(as, addr, len, prot);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
 }
 int guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int fd, u64 off,
                    int shared, const char *path) {
-    as_lock(); int r = guest_map_file_impl(as, addr, len, prot, fd, off, shared, path);
-    as_unlock(); return r;
+    as_lock();
+    int r = guest_map_file_impl(as, addr, len, prot, fd, off, shared, path);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
 }
 int guest_unmap(AddrSpace *as, u64 addr, u64 len) {
-    as_lock(); int r = guest_unmap_impl(as, addr, len); as_unlock(); return r;
+    as_lock();
+    int r = guest_unmap_impl(as, addr, len);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
 }
 int guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     as_lock(); int r = guest_protect_impl(as, addr, len, prot); as_unlock(); return r;

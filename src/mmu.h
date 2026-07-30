@@ -120,6 +120,9 @@ typedef struct AddrSpace {
     int nregions, cap_regions;
     RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
     int nretired, cap_retired;
+    int nthreads;             /* guest threads sharing this space (atomic).
+                               * 1 means the quarantine can be drained: no other
+                               * D-TLB exists to hold a stale host pointer. */
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
     u64 stack_top;            /* initial stack top (guest VA) */
@@ -141,6 +144,8 @@ int  guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot);
 int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                     u64 off, int shared, const char *path);
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
+void as_thread_enter(AddrSpace *as);   /* a guest thread joins this space */
+void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
 int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);

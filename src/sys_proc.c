@@ -231,6 +231,7 @@ static void *thread_entry(void *arg) {
      * joiners. */
     jit_thread_exit();
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
+    as_thread_exit(&t->m->as);
     free(t);
     return NULL;
 }
@@ -279,9 +280,13 @@ SYSDEF(clone) {
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        /* Count the thread before it can run: the retired-backing quarantine
+         * is drained only while this address space has one thread, so the
+         * count must never lag behind reality. */
+        as_thread_enter(&m->as);
         int e = pthread_create(&t->host, &at, thread_entry, t);
         pthread_attr_destroy(&at);
-        if (e) { free(t); return (u64)(s64)-EAGAIN; }
+        if (e) { as_thread_exit(&m->as); free(t); return (u64)(s64)-EAGAIN; }
         s32 tid;
         while ((tid = __atomic_load_n(&start_tid, __ATOMIC_ACQUIRE)) == 0)
             syscall(SYS_futex, (s32 *)&start_tid, 0 /*FUTEX_WAIT*/, 0,
