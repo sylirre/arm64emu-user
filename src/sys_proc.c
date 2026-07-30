@@ -4,6 +4,7 @@
  * fork() (the interpreter state is inherited by copy), execve reloads the
  * guest image in-process, wait/kill/pgid pass through. Threads (CLONE_VM)
  * arrive in M6. */
+#include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -433,6 +434,57 @@ static char **dup_strvec(char **v) {
 
 /* Resolve and reload the guest image. Does NOT take ownership of the caller's
  * argv/envp (it works on private copies), so the caller still frees them. */
+/* Close the fds a real execve would close, and drop each one from the tables
+ * that shadow an fd number (fake netlink, synthesized /proc file, signalfd)
+ * exactly as close(2) does. Skipping the unmark leaves an entry pointing at a
+ * closed number, and the new image's very next open lands on it: a timerfd
+ * inheriting a stale signalfd's number had its read(2) answered from the
+ * signal ring, which fails with EINVAL because 8 bytes cannot hold a
+ * signalfd_siginfo.
+ *
+ * The fd numbers are snapshotted before anything is closed -- /proc/self/fd is
+ * generated as it is read, so closing during the walk can make readdir skip
+ * entries. Probing a fixed range is the fallback for a host without /proc;
+ * guest fds are host fds, so a guest that dup2'd high is otherwise missed. */
+static void exec_close_cloexec(struct Machine *m) {
+    int stack[64], *cl = stack;
+    size_t n = 0, cap = sizeof stack / sizeof stack[0];
+    DIR *d = opendir("/proc/self/fd");
+    int dfd = d ? dirfd(d) : -1;
+    int probe = 3;
+    for (;;) {
+        int fd;
+        if (d) {
+            struct dirent *de = readdir(d);
+            if (!de) break;
+            fd = atoi(de->d_name);
+            if (fd < 3 || fd == dfd) continue;
+        } else {
+            if (probe >= 1024) break;
+            fd = probe++;
+        }
+        int fl = fcntl(fd, F_GETFD);
+        if (fl < 0 || !(fl & FD_CLOEXEC)) continue;
+        if (n == cap) {
+            size_t nc = cap * 2;
+            int *nb = realloc(cl == stack ? NULL : cl, nc * sizeof *nb);
+            if (!nb) break;
+            if (cl == stack) memcpy(nb, stack, n * sizeof *nb);
+            cl = nb;
+            cap = nc;
+        }
+        cl[n++] = fd;
+    }
+    if (d) closedir(d);
+    for (size_t i = 0; i < n; i++) {
+        nl_unmark_fd(m, cl[i]);
+        procfs_unmark_fd(m, cl[i]);
+        sigfd_unmark_fd(m, cl[i]);
+        close(cl[i]);
+    }
+    if (cl != stack) free(cl);
+}
+
 u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     struct Machine *m = c->m;
     char host[PATH_MAX], canon[PATH_MAX];
@@ -542,16 +594,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * space and faults immediately. The initial exec and any main-thread exec
      * pass c == &m->cpu, where this is a no-op. */
     if (c != &m->cpu) *c = m->cpu;
-    /* CLOEXEC fds are closed by the host on real execve; emulate. */
-    /* (fds carry host FD_CLOEXEC; walk /proc/self/fd and close flagged ones) */
-    {
-        char link[64];
-        for (int fd = 3; fd < 1024; fd++) {
-            snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-            int fl = fcntl(fd, 1 /*F_GETFD*/);
-            if (fl > 0 && (fl & 1 /*FD_CLOEXEC*/)) close(fd);
-        }
-    }
+    exec_close_cloexec(m);   /* CLOEXEC fds die here, as on a real execve */
     /* A traced process reports a stop after execve (with the new image live but
      * before its first instruction), so the tracer can re-arm. No-op on the
      * initial exec / untraced processes. */
