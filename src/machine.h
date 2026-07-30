@@ -82,12 +82,31 @@ struct Machine {
     u32 image_gen;
     s32 dethread_req;         /* tid running de_thread, 0 = none */
     s32 dethread_carrier;     /* tid that will run the new image (the main one) */
+    s32 dethread_carrier_here;/* ...and it has reached the rendezvous. Tracked
+                               * separately because a *parked* main thread (see
+                               * leader_parked) is not in as.nthreads, so the
+                               * arrival count alone cannot say it arrived */
     s32 dethread_parked;      /* siblings currently waiting at the rendezvous */
     s32 dethread_state;       /* DT_PENDING / DT_COMMIT / DT_CANCEL */
     s32 dethread_done;        /* 1 = the new image is loaded and the carrier may
                                * adopt it; -1 = abandoned, resume unchanged */
     u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
                                * new image inherits (execve preserves it) */
+
+    /* The guest's main thread called exit(2) while siblings were still
+     * running. exit(2) ends only the calling thread, and the kernel keeps such
+     * a group leader as a zombie -- still listed in /proc/<pid>/task, still
+     * counted in Threads:, still signalable, running nothing -- until the last
+     * thread of the group goes. The host thread parks instead of exiting (see
+     * leader_park, sys_proc.c) and drops out of as.nthreads, so this flag is
+     * what the rest of the emulator has to consult instead of "is there more
+     * than one thread". Cleared if de_thread later hands it a new image. */
+    u8  leader_parked;
+    /* Exit status the process will carry out, rewritten by every exit(2) and
+     * set outright by exit_group. Measured against the kernel: with no
+     * exit_group involved the parent sees the code of whichever thread exits
+     * *last*, not the leader's. */
+    int group_exit_code;
 
     /* Rootfs containment */
     char rootfs[PATH_MAX];    /* realpath'd host prefix, no trailing slash */

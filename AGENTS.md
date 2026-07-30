@@ -48,7 +48,7 @@ src/
   sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
-  sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread)
+  sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread); a main thread that exit(2)s while siblings run parks as the kernel's zombie leader instead of ending the process
   sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions, signalfd over the capture ring)
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)

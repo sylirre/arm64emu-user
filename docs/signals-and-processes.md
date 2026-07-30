@@ -252,9 +252,32 @@ One host thread per guest thread over the shared `Machine`/address space:
 
 ### exit
 
-`exit_group` terminates the whole process. `exit` from a spawned thread ends just
-that thread (returns from its `emu_loop`); from the main thread it ends the
-process.
+`exit_group` terminates the whole process. `exit` ends just the calling thread —
+including the **main** thread, whose exit does not end the process any more than
+any other thread's does. A spawned thread simply returns from its `emu_loop`;
+the main thread cannot, because its host thread is the group leader and the pid
+belongs to it, so it **parks** instead (`leader_park`).
+
+That reproduces what the kernel does with a leader that called `exit(2)` while
+other threads ran: it keeps it as a zombie — running nothing, but still listed in
+`/proc/<pid>/task`, still counted in `Threads:`, still signalable — until the
+last thread of the group goes. All three were measured against a real kernel and
+hold here; qemu-aarch64, by contrast, reports one thread too many. The parked
+thread blocks every host signal first, since the kernel never picks a zombie to
+receive a process-directed signal and the capture ring is per-thread, so a
+signal landing there would never be delivered to anyone.
+
+Parking rather than really exiting buys one more thing: the thread stays
+available to carry a new image, so a later multithreaded `execve` still lands on
+the pid (see `de_thread` in [syscalls.md](syscalls.md#execve)). The kernel
+reaches that by renumbering — it releases the zombie leader and hands its pid to
+the exec'ing thread — which is exactly what the emulator cannot do.
+
+Whichever thread turns out to be the last one alive then performs the process
+teardown and carries the status out (`process_exit`). The status itself is not
+the obvious one: with no `exit_group` involved the parent sees the code of the
+thread that exits **last**, not the leader's, so every `exit(2)` overwrites
+`m->group_exit_code` and the last writer wins.
 
 ## ptrace(2) (`src/ptracetab.c`, `src/sys_ptrace.c`)
 

@@ -597,6 +597,30 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- a group leader that has exited: what the rest of the group sees, and what
+# execve does about it. Self-checking, because qemu is not an oracle here -- it
+# keeps an extra host thread and reports Threads: 3 where the kernel says 2. The
+# values asserted are a real kernel's. (The parts qemu does get right are diffed
+# in tests/c/mainexit.c.) The delay sweep at the end is there because every bug
+# found in this area was a timing race: the exec'ing thread leaving before the
+# revived main thread was counted back in, and the reload resetting the thread
+# count to one. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/mainexit.bin \
+            tests/fixtures/mainexit.c -lpthread 2>/dev/null; then
+        expect=$'tasks=1 threads=1 leader_signalable=1\nview_exit=1\nexec_after_leader=1\ngroup_after_leader=1\nstress_exit=1 stress_exec=1\ndone'
+        got=$(timeout 300 "$EMU" / tests/fixtures/mainexit.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mainexit"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: mainexit"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/mainexit.bin
+    else
+        echo "SKIP build fixtures/mainexit"
+    fi
+fi
+
 # ---- a :ro bind mount stays read-only for fd-based mutation too. Self-checking:
 # bind mounts are the emulator's own feature, so qemu is not an oracle. The
 # point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr

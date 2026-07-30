@@ -663,10 +663,19 @@ Guest tid == host tid == pid is relied on throughout (ptrace links,
 leader, so instead of renumbering, the caller loads the program into `m->cpu`,
 hands it over and disappears; the main thread adopts it (registers, and the
 caller's signal mask, which `execve` preserves) and resumes at its first
-instruction. That the main thread is always there to receive it follows from
-`exit(2)`'s own simplification — exit on the main thread ends the process — which
-this makes load-bearing. `dethread_begin` checks rather than assumes, so making
-`exit(2)` faithful later surfaces as a refusal instead of a crash.
+instruction. The main thread is always there to receive it because its host
+thread lives as long as the process does: it either runs guest code or is parked
+after its own `exit(2)` (see [exit](signals-and-processes.md#exit)), and a
+parked one is revived by the hand-over — the same place the kernel reaches by
+releasing a zombie leader and giving its pid to the exec'ing thread.
+`dethread_begin` checks rather than assumes, so a future change that breaks the
+invariant refuses instead of hanging.
+
+A parked main thread has to be excluded from the single-threaded fast path
+explicitly, because it is not in `as.nthreads`: taking that path with one around
+would run the new program on a secondary tid instead of on the pid. For the same
+reason the rendezvous waits for the carrier *by name* (`dethread_carrier_here`)
+and not only by arrival count.
 
 **The handshake is two-phase.** Siblings park at the rendezvous and are told to
 die only once *every* one of them has arrived. A thread the emulator cannot
@@ -686,6 +695,16 @@ hit it is handled instead: a guest blocking every signal across
 `ppoll`/`pselect6`/`epoll_pwait` used to block the kick too, so
 `pwait_host_mask` (`sys_file.c`) holds the reserved control signal out of the
 mask those calls install.
+
+**Nothing else is left running when the new program starts.** A kernel's
+`de_thread` has every other thread *gone* first, and a guest can tell the
+difference (`tgkill`, `/proc/self/task`), so the commit phase waits on the host
+thread count as well as the guest one, and the carrier waits for the thread that
+handed it the image — which by construction cannot have left before publishing
+the hand-over. The first of those is defensive; the second is not, and a program
+caught the difference before it was added. The reload also carries the live
+thread count across `as_init`, which otherwise resets it to one and makes the
+next thread to leave look like the last of the group.
 
 Threads killed this way publish their death to a tracer without a stop, the way
 `exit_group`'s fan-out does — a thread death is not host-waitable, so a tracer

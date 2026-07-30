@@ -6,6 +6,7 @@
  * arrive in M6. */
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -41,47 +42,136 @@
 #define DT_COMMIT  1
 #define DT_CANCEL  2
 
-SYSDEF(exit) {
-    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    /* A spawned guest thread (tid != pid) ends just itself; the run loop
-     * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake. A
-     * traced thread first reports its own EVENT_EXIT and WIFEXITED status --
-     * always as a synthetic exit, since a thread death is never host-waitable. */
-    if (g_tls.tid != getpid()) {
-        ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);
-        ptrace_report_exit(c, ((int)a0 & 0xff) << 8);
-        c->stop = true;
-        return 0;
-    }
-    ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
-    /* Main-thread exit(2) ends the whole process here (a simplification: the
-     * process would linger while other threads run), so report the death for
-     * every traced thread of the group, as exit_group does. */
-    ptrace_report_exit_group(((int)a0 & 0xff) << 8);
-    shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
-    sembroker_exit(c->m);       /* apply this process's SEM_UNDO adjustments */
-    tmpfs_session_cleanup(c->m);/* session root only: drop emulated tmpfs trees */
+/* futex(2) opcodes used directly here (the guest's own futex calls go through
+ * sys_misc.c). Machine is per-process memory, so the private forms apply. */
+#define FUTEX_WAIT_PRIVATE 128
+#define FUTEX_WAKE_PRIVATE 129
+
+static void futex_wake_addr(CPU *c, u64 va);
+
+/* Bump the counter every guest thread compares once per run-loop iteration,
+ * and wake anyone sleeping on it. A running thread finds it by polling, but a
+ * parked main thread (leader_park) has nothing else to notice it by. */
+static u32 stop_gen_bump(struct Machine *m) {
+    u32 g = __atomic_add_fetch(&m->stop_gen, 1, __ATOMIC_ACQ_REL);
+    syscall(SYS_futex, &m->stop_gen, FUTEX_WAKE_PRIVATE, INT_MAX,
+            NULL, NULL, 0);
+    return g;
+}
+
+/* Everything the process gives back before it dies, then the status the group
+ * agreed on. Shared by exit_group, by a lone main thread's exit(2), and by
+ * whichever thread turns out to be the last one alive when the main thread has
+ * already parked. */
+static __attribute__((noreturn)) void process_exit(struct Machine *m) {
+    int code = __atomic_load_n(&m->group_exit_code, __ATOMIC_ACQUIRE);
+    /* The whole thread group dies without its remaining threads running their
+     * own exit paths: publish the WIFEXITED status on every traced thread's
+     * link (a parked sibling dies inside its service loop; its tracer would
+     * otherwise poll a stale link forever). */
+    ptrace_report_exit_group((code & 0xff) << 8);
+    shm_detach_all(m);          /* drop this process's shm attaches (nattch--) */
+    sembroker_exit(m);          /* apply this process's SEM_UNDO adjustments */
+    tmpfs_session_cleanup(m);   /* session root only: drop emulated tmpfs trees */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
     jit_stats_flush();
-    _exit((int)a0);
+    _exit(code);                /* terminates the whole process (all threads) */
+}
+
+/* The guest's main thread called exit(2) with siblings still running.
+ *
+ * exit(2) ends only the calling thread. The kernel keeps such a group leader
+ * as a zombie -- running nothing, but still listed in /proc/<pid>/task, still
+ * counted in Threads:, still signalable -- and the process lives until its
+ * last thread goes. So the host thread parks rather than exits: exiting it
+ * would not reproduce any of that, and parking keeps it available as the
+ * carrier for a later multithreaded execve. (The kernel gets that by
+ * renumbering -- de_thread releases the zombie leader and the exec'ing thread
+ * takes its pid. We cannot renumber, so we keep alive the one thread whose tid
+ * already *is* the pid.)
+ *
+ * Every host signal is blocked first. The kernel never picks a zombie to
+ * receive a process-directed signal, and the capture ring is per-thread, so a
+ * signal landing here would never be delivered to anyone at all.
+ *
+ * Returns only if de_thread hands this thread a new image, at which point it
+ * is an ordinary live guest thread again. */
+static void leader_park(CPU *c) {
+    struct Machine *m = c->m;
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    jit_thread_exit();   /* hand back the code cache; jit_run builds a fresh
+                          * one if this thread is ever revived */
+    g_tls.sc_ret_eintr = 0;   /* exit(2) is not a syscall to be restarted, and
+                               * a cancelled de_thread must not try (see
+                               * dethread_restart_syscall) */
+    while (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE)) {
+        if (guest_stop_pending(m)) { guest_stop_point(c); continue; }
+        /* Sleep on the very counter guest_stop_pending reads. FUTEX_WAIT
+         * rechecks the value itself, so a bump landing between the test above
+         * and this call returns EAGAIN instead of sleeping through it: no
+         * wakeup can be lost, and no timeout is needed to paper over one. */
+        syscall(SYS_futex, &m->stop_gen, FUTEX_WAIT_PRIVATE,
+                (int)g_tls.stop_gen, NULL, NULL, 0);
+    }
+    pthread_sigmask(SIG_UNBLOCK, &all, NULL);
+    sig_sync_host_mask(m);   /* re-mirror the job-control trio for the new image */
+}
+
+SYSDEF(exit) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    struct Machine *m = c->m;
+    int code = (int)a0 & 0xff, ws = code << 8;
+    /* Every exit(2) rewrites the status the process will carry out; the last
+     * one to run is the one that counts, which is what the kernel reports. */
+    __atomic_store_n(&m->group_exit_code, code, __ATOMIC_RELEASE);
+
+    /* A spawned guest thread (tid != pid) ends just itself; the run loop
+     * returns and thread_entry does the CLONE_CHILD_CLEARTID futex wake and
+     * the last-thread-out check. A traced thread first reports its own
+     * EVENT_EXIT and WIFEXITED status -- always as a synthetic exit, since a
+     * thread death is never host-waitable. */
+    if (g_tls.tid != getpid()) {
+        ptrace_report_exit_stop(c, ws);
+        ptrace_report_exit(c, ws);
+        c->stop = true;
+        return 0;
+    }
+
+    ptrace_report_exit_stop(c, ws);   /* PTRACE_EVENT_EXIT */
+
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) > 1) {
+        /* The main thread, with siblings still running: the process does not
+         * end here. Report only this thread's own death and release anything
+         * pthread_join'ing it, then park (leader_park). */
+        ptrace_report_exit(c, ws);
+        if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
+        g_tls.clear_child_tid = 0;
+        /* Announce the parked leader *before* dropping out of the live count.
+         * A sibling exec'ing in between would otherwise see a single-threaded
+         * process and run the new image on its own tid instead of the pid. */
+        __atomic_store_n(&m->leader_parked, 1, __ATOMIC_RELEASE);
+        as_thread_exit(&m->as);
+        /* Every sibling may have exited while we were getting here, in which
+         * case that decrement was the last one and nobody else is left to tear
+         * the process down. (thread_entry makes the same test for the opposite
+         * order; exactly one decrement can reach zero, so exactly one fires.) */
+        if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0)
+            process_exit(m);
+        leader_park(c);
+        return 0;   /* revived: de_thread handed this thread a new image */
+    }
+
+    process_exit(m);   /* the last thread of the group */
 }
 
 SYSDEF(exit_group) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    __atomic_store_n(&c->m->group_exit_code, (int)a0 & 0xff, __ATOMIC_RELEASE);
     ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
-    /* The whole thread group dies without the sibling threads running their
-     * own exit paths: publish the WIFEXITED status on every traced thread's
-     * link (a parked sibling dies inside its service loop; its tracer would
-     * otherwise poll a stale link forever). */
-    ptrace_report_exit_group(((int)a0 & 0xff) << 8);
-    shm_detach_all(c->m);       /* drop this process's shm attaches (nattch--) */
-    sembroker_exit(c->m);       /* apply this process's SEM_UNDO adjustments */
-    tmpfs_session_cleanup(c->m);/* session root only: drop emulated tmpfs trees */
-    proctab_unregister((s32)getpid());
-    ptrace_wake_waiters();      /* wake a parent polling in wait4 */
-    jit_stats_flush();
-    _exit((int)a0);   /* terminates the whole process (all threads) */
+    process_exit(c->m);
 }
 
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
@@ -256,9 +346,15 @@ static void *thread_entry(void *arg) {
      * Touching the guest's CLEARTID word after the decrement is still safe: the
      * joiner has not been woken yet, so it cannot have freed the stack that
      * word lives in. */
-    as_thread_exit(&t->m->as);
+    struct Machine *m = t->m;
+    as_thread_exit(&m->as);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     free(t);
+    /* Last thread of a group whose main thread has already parked: nobody else
+     * is left to tear the process down or carry its status out. The count can
+     * only reach zero that way -- a live main thread is always counted, and it
+     * exits through process_exit rather than through here. */
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(m);
     return NULL;
 }
 
@@ -359,9 +455,15 @@ SYSDEF(clone) {
          * group, which this child is not part of: it inherited the state by
          * copy, together with the only thread it applies to. */
         m->dethread_req = m->dethread_parked = m->dethread_done = 0;
+        m->dethread_carrier_here = 0;
         m->dethread_state = DT_PENDING;
         g_tls.stop_gen = m->stop_gen;
         g_tls.image_gen = m->image_gen;
+        /* fork(2) duplicates the calling thread alone, and in the child that
+         * thread is the main one (tid == pid, set above) -- so whatever the
+         * parent's main thread was doing, this child has a live leader. */
+        m->leader_parked = 0;
+        m->group_exit_code = 0;
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
@@ -588,6 +690,23 @@ static void dethread_kick(s32 tid) {
             PTRACE_KICKSIG, &si);
 }
 
+/* How many host threads this process still has. Guest tid == host tid, so this
+ * is exactly the thread group the guest can see -- what /proc/<pid>/task and
+ * Threads: report, and what tgkill can still find. It outlives as.nthreads by a
+ * little: a guest thread stops counting there when it leaves the run loop, but
+ * its host thread lingers for a few frees after that, and a kernel's de_thread
+ * has every other thread *gone* before the new program runs. Returns -1 without
+ * /proc, which the callers treat as "cannot tell". */
+static int host_task_count(void) {
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) if (e->d_name[0] != '.') n++;
+    closedir(d);
+    return n;
+}
+
 /* Kick every thread of this process but `self`. Guest tid == host tid, so the
  * host's own task list *is* the guest thread list. Without /proc a thread
  * running guest code never leaves the interpreter/JIT fast path on its own and
@@ -624,6 +743,11 @@ static void dethread_join(CPU *c) {
     int carrier =
         g_tls.tid == __atomic_load_n(&m->dethread_carrier, __ATOMIC_ACQUIRE);
     __atomic_add_fetch(&m->dethread_parked, 1, __ATOMIC_ACQ_REL);
+    /* Announce the carrier's arrival separately from the count: if it is a
+     * parked main thread it is not in as.nthreads at all, so the arrival count
+     * would say "everyone is here" while the one thread that must be here is
+     * still on its way. Committing then would load an image nobody adopts. */
+    if (carrier) __atomic_store_n(&m->dethread_carrier_here, 1, __ATOMIC_RELEASE);
     int st;
     while ((st = __atomic_load_n(&m->dethread_state, __ATOMIC_ACQUIRE)) ==
            DT_PENDING)
@@ -649,12 +773,31 @@ static void dethread_join(CPU *c) {
         dt_nap(200);
     if (done < 0) { dethread_restart_syscall(c); return; }   /* abandoned */
 
+    /* The thread that loaded this image is on its way out but is not gone yet:
+     * it had to publish the hand-over before it could leave. Wait for it, for
+     * the same reason phase 2 waits for the victims -- a kernel's de_thread has
+     * every other thread gone before the new program runs, and the program can
+     * tell. Its remaining work is a few frees and cannot block; the bound is
+     * only there so a pathology degrades into a slow exec, not a hang. */
+    s32 leaving = __atomic_load_n(&m->dethread_req, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < 5000 && leaving > 0 && leaving != g_tls.tid; i++) {
+        if (syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)leaving, 0) != 0) break;
+        dt_nap(200);
+    }
+
     /* Adopt the program the exec'ing thread loaded into m->cpu -- which is this
      * thread's own CPU, since the main thread is where load_elf builds initial
      * state -- and resume at its first instruction. The rest is per-thread
      * state execve resets, except the blocked signal mask: that is the caller's,
      * because execve preserves it. */
     if (c != &m->cpu) *c = m->cpu;
+    /* If this thread had already exited as the previous program's main thread,
+     * it is a live guest thread again -- the same outcome the kernel reaches by
+     * releasing a zombie leader and giving its pid to the exec'ing thread.
+     * leader_park sees the cleared flag and lets it back into the run loop.
+     * The live count was already raised on our behalf by the thread that handed
+     * the image over; see do_execve. */
+    __atomic_store_n(&m->leader_parked, 0, __ATOMIC_RELEASE);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
     g_tls.robust_head = 0;
@@ -707,12 +850,20 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
 
     /* The ordinary case, including every fork-then-exec: fork(2) duplicates
      * only the calling thread, so the child is single-threaded whatever its
-     * parent was, and whichever thread that is carries the new image itself. */
-    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= 1) {
+     * parent was, and whichever thread that is carries the new image itself.
+     * A parked main thread has to be excluded explicitly -- it is not in the
+     * live count, and taking this path with one around would run the new
+     * program on a secondary tid instead of on the pid. */
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= 1 &&
+        !__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE)) {
         *carrier_is_me = 1;
         return 0;
     }
     *carrier_is_me = (self == leader);
+    /* The main thread is always there to carry the image: it either runs guest
+     * code or is parked after its own exit(2) (leader_park), and either way the
+     * host thread lives as long as the process. Checked rather than assumed, so
+     * a future change that breaks the invariant refuses instead of hanging. */
     if (!*carrier_is_me &&
         syscall(SYS_tgkill, (pid_t)leader, (pid_t)leader, 0) != 0) {
         fprintf(stderr, "arm64chroot: execve(%s) from thread %d: the main "
@@ -729,24 +880,29 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
                           * at the safepoint the moment this syscall returns */
 
     __atomic_store_n(&m->dethread_carrier, leader, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->dethread_carrier_here, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&m->dethread_parked, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&m->dethread_done, 0, __ATOMIC_RELAXED);
     m->dethread_sigmask = g_tls.sigmask;
     __atomic_store_n(&m->dethread_state, DT_PENDING, __ATOMIC_RELEASE);
     /* Publish the call-out last: this counter is what the run loop reads. */
-    g_tls.stop_gen = __atomic_add_fetch(&m->stop_gen, 1, __ATOMIC_ACQ_REL);
+    g_tls.stop_gen = stop_gen_bump(m);
 
     /* Phase 1 -- wait for every other thread to reach the rendezvous. `parked`
      * only grows and `nthreads` only shrinks while a request is outstanding,
      * except that a sibling already inside clone() may add one more; that one
      * is counted before it can run and stops at its first safepoint, so
-     * re-reading both each round still converges. */
+     * re-reading both each round still converges. The carrier is waited for by
+     * name as well: a parked main thread is not in `live`, so the count alone
+     * could report everyone present while it is still on its way. */
     int ok = 0, live = 0, parked = 0;
     for (int ms = 0; ms < DT_TIMEOUT_MS; ms++) {
         if (ms % DT_KICK_MS == 0) dethread_kick_all(self);
         parked = __atomic_load_n(&m->dethread_parked, __ATOMIC_ACQUIRE);
         live = __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE);
-        if (parked + 1 >= live) { ok = 1; break; }
+        int carrier_here = *carrier_is_me ||
+            __atomic_load_n(&m->dethread_carrier_here, __ATOMIC_ACQUIRE);
+        if (parked + 1 >= live && carrier_here) { ok = 1; break; }
         dt_nap(1000);
     }
     if (!ok) {
@@ -760,11 +916,17 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
         return -ENOSYS;
     }
 
-    /* Phase 2 -- commit: everyone but the carrier leaves for good. */
+    /* Phase 2 -- commit: everyone but the carrier leaves for good. Waited out
+     * on the host thread count as well as the guest one, because the guest can
+     * see the difference: a kernel's de_thread has every other thread gone
+     * before the new program runs, and a program that looks (tgkill,
+     * /proc/self/task) would otherwise catch a victim in the act of leaving. */
     __atomic_store_n(&m->dethread_state, DT_COMMIT, __ATOMIC_RELEASE);
-    int want = *carrier_is_me ? 1 : 2;
+    int want = *carrier_is_me ? 1 : 2;   /* this thread, plus the carrier */
     for (int ms = 0; ms < DT_TIMEOUT_MS; ms++) {
-        if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want)
+        int tasks = host_task_count();
+        if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want &&
+            (tasks < 0 || tasks <= want))
             return 0;
         dt_nap(1000);
     }
@@ -875,8 +1037,16 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                               * below closes the fds); SEM_UNDO lists and
                               * m->sem_undo_used survive exec */
     ptimers_exec_clear();    /* POSIX timers do not survive execve */
+    /* as_init starts a fresh address space at one thread, which is right for a
+     * new process but not for a reload: the threads de_thread left alive go on
+     * sharing this one. Carry the count across, or the next thread to leave
+     * looks like the last of the group and takes the process down with it --
+     * which is what happened when a *live* main thread was carrying the image,
+     * because then two threads survive and the reset forgot one. */
+    int live = __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE);
     as_destroy(&m->as);
     as_init(&m->as);
+    __atomic_store_n(&m->as.nthreads, live, __ATOMIC_RELEASE);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
@@ -892,13 +1062,23 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     /* A new image generation, and the counter the run loop watches moves with
      * it: any thread still holding the old one is now out of date and leaves. */
     u32 img = __atomic_add_fetch(&m->image_gen, 1, __ATOMIC_ACQ_REL);
-    u32 gen = __atomic_add_fetch(&m->stop_gen, 1, __ATOMIC_ACQ_REL);
+    u32 gen = stop_gen_bump(m);
 
     if (!carrier_is_me) {
         /* A secondary thread exec'd: hand the program to the main thread, the
          * only one that can run it under guest tid == host tid == pid, and go
          * away. Our own image_gen deliberately stays behind, so the run loop
-         * ends this thread as soon as this syscall returns. */
+         * ends this thread as soon as this syscall returns.
+         *
+         * If the carrier is a main thread parked after its own exit(2), it is
+         * about to become a live guest thread again -- and it has to be counted
+         * as one *here*, before the handover. Counting it on its own side loses
+         * a race this thread would then win: we return, leave, and drop the
+         * live count to zero while the carrier is still waking, which makes us
+         * look like the last thread of the group and tears the process down
+         * underneath the program we just loaded. */
+        if (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE))
+            as_thread_enter(&m->as);
         __atomic_store_n(&m->dethread_done, 1, __ATOMIC_RELEASE);
         return 0;
     }
