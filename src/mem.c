@@ -22,6 +22,14 @@
 #define L1_IDX(va) ((size_t)((va) >> 26))
 #define L2_IDX(va) ((size_t)(((va) >> 12) & (L2_SIZE - 1)))
 
+/* Is [addr, addr+len) a valid guest range? Written so that addr + len cannot
+ * wrap: every page-table index is derived from a VA in this range, and L1 only
+ * has entries for VAs below GUEST_TASK_SIZE, so a range that escapes it walks
+ * off the end of as->l1. Matches the kernel's own check in do_vmi_munmap(). */
+static inline int range_ok(u64 addr, u64 len) {
+    return addr <= GUEST_TASK_SIZE && len <= GUEST_TASK_SIZE - addr;
+}
+
 /* Per-thread: each guest thread fetches from its own PC. */
 __thread FetchCache g_fcache;
 
@@ -257,7 +265,7 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
 
 int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
-    if ((addr | len) & GUEST_PAGE_MASK || addr + len > GUEST_TASK_SIZE || !len)
+    if ((addr | len) & GUEST_PAGE_MASK || !range_ok(addr, len) || !len)
         return -EINVAL;
     /* Host backing stays RW: guest protection is enforced in software, and the
      * emulator itself must always be able to read/write the backing. */
@@ -275,7 +283,7 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
 int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                    u64 off, int shared, const char *path) {
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
-    if ((addr | len | off) & GUEST_PAGE_MASK || addr + len > GUEST_TASK_SIZE || !len)
+    if ((addr | len | off) & GUEST_PAGE_MASK || !range_ok(addr, len) || !len)
         return -EINVAL;
     u8 *host;
     u64 pad = 0;
@@ -324,7 +332,8 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
 }
 
 int guest_unmap_impl(AddrSpace *as, u64 addr, u64 len) {
-    if ((addr | len) & GUEST_PAGE_MASK || !len) return -EINVAL;
+    if ((addr | len) & GUEST_PAGE_MASK || !len || !range_ok(addr, len))
+        return -EINVAL;
     region_punch(as, addr, addr + len);
     pte_set_range(as, addr, len, NULL, 0);
     return 0;
@@ -332,6 +341,7 @@ int guest_unmap_impl(AddrSpace *as, u64 addr, u64 len) {
 
 int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     if ((addr | len) & GUEST_PAGE_MASK) return -EINVAL;
+    if (!range_ok(addr, len)) return -ENOMEM;   /* no VMA out there, as in Linux */
     /* All pages must be mapped (Linux returns ENOMEM otherwise). */
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
         if (!pte_get(as, addr + off)) return -ENOMEM;
