@@ -277,8 +277,11 @@ SYSDEF(timer_create) {
     if (!err && timer_create((clockid_t)(s32)a0, &sev, &ht) < 0)
         err = -errno;
     if (!err) {
-        s64 gid = slot;
-        if (copy_to_guest(c, a2, &gid, 8) < 0) {
+        /* timer_t in the syscall ABI is __kernel_timer_t, i.e. int: the kernel
+         * put_user()s 4 bytes, and both musl and glibc pass the address of a
+         * stack int. Writing 8 would clobber whatever follows it. */
+        s32 gid = (s32)slot;
+        if (copy_to_guest(c, a2, &gid, 4) < 0) {
             timer_delete(ht);
             err = -EFAULT;
         }
