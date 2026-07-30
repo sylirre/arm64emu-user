@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "machine.h"
@@ -22,6 +24,7 @@
 #define L2_SIZE (1u << L2_BITS)
 #define L1_IDX(va) ((size_t)((va) >> 26))
 #define L2_IDX(va) ((size_t)(((va) >> 12) & (L2_SIZE - 1)))
+#define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK)
 
 /* Is [addr, addr+len) a valid guest range? Written so that addr + len cannot
  * wrap: every page-table index is derived from a VA in this range, and L1 only
@@ -255,6 +258,27 @@ static void hmap_unref(AddrSpace *as, HostMap *hm) {
     }
 }
 
+/* Split any region that straddles `va` so that `va` becomes a region boundary.
+ * mprotect needs this: it used to leave a partially covered region's recorded
+ * protection alone and rely on the PTEs, but a file mapping's pages past
+ * end-of-file have no PTE, so the region record is the only thing left to say
+ * what protection they get when the file grows into them. */
+static void region_split_at(AddrSpace *as, u64 va) {
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if (va <= r->start || va >= r->end) continue;
+        Region tail = *r;
+        tail.start = va;
+        tail.host = r->host + (va - r->start);
+        tail.file_off = r->file_off + (va - r->start);
+        tail.path = r->path ? strdup(r->path) : NULL;
+        tail.hmap->refs++;
+        r->end = va;
+        region_insert(as, tail);
+        return;
+    }
+}
+
 /* Remove the guest range [addr, addr+len) from every overlapping region,
  * splitting as needed. Backing is never released here slice-wise: fragments
  * keep a reference to their HostMap, and the last one to go retires the whole
@@ -318,6 +342,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
         return -EINVAL;
     u8 *host;
     u64 pad = 0;
+    int filemap = 1;   /* cleared by the anonymous pread fallback below */
     if (shared) {
         /* MAP_SHARED must be a real host mapping so stores reach the file.
          * Host prot mirrors guest write permission (host write to a read-only
@@ -350,6 +375,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
             if (!host) return -ENOMEM;
             ssize_t rd = pread(host_fd, host, len, (off_t)off);
             if (rd < 0) { munmap(host, len); return -errno; }
+            filemap = 0;   /* anonymous copy: no end-of-file to run past */
         } else host = p;
     }
     region_punch(as, addr, addr + len);
@@ -361,13 +387,60 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
         int fl = fcntl(host_fd, F_GETFL);
         wr_ok = fl >= 0 && ((fl & O_ACCMODE) == O_WRONLY || (fl & O_ACCMODE) == O_RDWR);
     }
+    /* The file's identity and its size now. A mapping may legally extend past
+     * end-of-file -- mmap does not object -- but touching a page wholly beyond
+     * it is a bus error, and the host raises that on *us*: SIGBUS in the middle
+     * of the emulator's own memcpy, with no handler and nothing to unwind to,
+     * so the emulator died where the guest should have taken a signal.
+     *
+     * Leave those pages out of the page table instead. An access then takes the
+     * ordinary translation-fault path, which recognises a hole in a file
+     * mapping and raises the guest's bus error (see raise_dabort). Only a real
+     * host mapping of the file can fault this way; the private
+     * pread-into-anonymous fallback above has no end-of-file. */
+    struct stat fst;
+    int have_st = fstat(host_fd, &fst) == 0;
+    u64 eof = have_st ? PG_UP((u64)fst.st_size) : 0;
     Region r = { .start = addr, .end = addr + len, .prot = prot,
                  .shared = (u32)shared, .file = 1, .wr_ok = (u32)wr_ok, .host = host,
                  .hmap = hmap_new(host - pad, len + pad),
-                 .path = path ? strdup(path) : NULL, .file_off = off };
+                 .path = path ? strdup(path) : NULL, .file_off = off,
+                 .dev = have_st ? (u64)fst.st_dev : 0,
+                 .ino = have_st ? (u64)fst.st_ino : 0,
+                 .hostmap = (u32)filemap };
     region_insert(as, r);
-    pte_set_range(as, addr, len, host, prot);
+    if (filemap && have_st && off + len > eof) {
+        u64 mapped = off < eof ? eof - off : 0;
+        if (mapped) pte_set_range(as, addr, mapped, host, prot);
+        pte_set_range(as, addr + mapped, len - mapped, NULL, 0);
+    } else {
+        pte_set_range(as, addr, len, host, prot);
+    }
     return 0;
+}
+
+/* A file's size changed under mappings of it. Growing is picked up lazily by
+ * the fault path (as_fault_fill probes the backing), so only shrinking needs
+ * doing here: pages that have fallen past end-of-file already have PTEs, and
+ * an access through one would reach the host mapping and take the host's
+ * SIGBUS. Drop them.
+ *
+ * This catches the guest truncating a file it has mapped. A truncation from
+ * outside the emulator is not visible here and remains the one way a host
+ * SIGBUS can still be raised. */
+void as_file_resized(AddrSpace *as, u64 dev, u64 ino, u64 newsize) {
+    if (!dev && !ino) return;
+    as_lock();
+    u64 eof = PG_UP(newsize);
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if (!r->hostmap || r->dev != dev || r->ino != ino) continue;
+        u64 rlen = r->end - r->start;
+        if (r->file_off + rlen <= eof) continue;          /* still all backed */
+        u64 keep = r->file_off < eof ? eof - r->file_off : 0;
+        if (keep < rlen) pte_set_range(as, r->start + keep, rlen - keep, NULL, 0);
+    }
+    as_unlock();
 }
 
 int guest_unmap_impl(AddrSpace *as, u64 addr, u64 len) {
@@ -382,8 +455,15 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     if ((addr | len) & GUEST_PAGE_MASK) return -EINVAL;
     if (!range_ok(addr, len)) return -ENOMEM;   /* no VMA out there, as in Linux */
     /* All pages must be mapped (Linux returns ENOMEM otherwise). */
+    /* "Is it mapped" is a question about the mapping, not about the page table:
+     * a file mapping's pages past end-of-file have no PTE (they must fault as
+     * bus errors) but are still part of the mapping, and the kernel's mprotect
+     * works on VMAs. Asking the PTEs made ld.so fail to protect the tail of a
+     * library segment -- "cannot change memory protections" -- because the bss
+     * beyond the file end is exactly such a page. */
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
-        if (!pte_get(as, addr + off)) return -ENOMEM;
+        if (!pte_get(as, addr + off) && !as_find_region(as, addr + off))
+            return -ENOMEM;
     /* The kernel refuses to make a MAP_SHARED mapping of a file that was not
      * opened for writing writable, and answers EACCES. Checking before anything
      * is mutated matters more here than fidelity alone: granting PTE_W over a
@@ -396,6 +476,10 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
             if (r->end <= addr || r->start >= addr + len) continue;
             if (r->shared && !r->wr_ok) return -EACCES;
         }
+    /* Make the requested range line up with region boundaries, so every region
+     * below is either fully covered or untouched. */
+    region_split_at(as, addr);
+    region_split_at(as, addr + len);
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
         if (r->end <= addr || r->start >= addr + len) continue;
@@ -421,11 +505,7 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
                 mprotect((void *)a, (size_t)(b - a), PROT_READ | PROT_WRITE);
             }
         }
-        if (addr <= r->start && addr + len >= r->end) {
-            r->prot = prot;   /* fully covered: update bookkeeping */
-        }
-        /* Partially-covered regions keep their recorded prot; the PTEs below
-         * are authoritative for actual access checks. */
+        r->prot = prot;   /* fully covered after the splits above */
     }
     pte_prot_range(as, addr, len, prot);
     return 0;
@@ -478,11 +558,55 @@ void as_destroy(AddrSpace *as) {
 
 static AddrSpace *cpu_as(CPU *c) { return &c->m->as; }
 
+/* Is `va` a page of a file mapping that lies past end-of-file? Such a page is
+ * deliberately left out of the page table (guest_map_file_impl), so it looks
+ * unmapped to the walk -- but the kernel answers it with a bus error, not a
+ * segmentation fault, and the distinction is what a guest handling SIGBUS on a
+ * shrinking file is looking for. Cold: only reached once an access has already
+ * failed. */
+static int __attribute__((cold)) va_is_file_hole(CPU *c, u64 va) {
+    AddrSpace *as = cpu_as(c);
+    as_lock();
+    const Region *r = as_find_region(as, va);
+    int hole = r && r->hostmap;
+    as_unlock();
+    return hole;
+}
+
+/* Fill a page the walk found missing, if the file has grown into it since the
+ * mapping was made. The host backing is already there -- the mapping covers the
+ * whole range, it was only end-of-file that made these pages untouchable -- so
+ * the question is just whether the kernel will hand the page over now.
+ *
+ * process_vm_readv answers it without faulting: it reports EFAULT for a page
+ * the kernel would refuse, where a plain load would raise SIGBUS on the
+ * emulator. Cold, and only on a page that is genuinely missing. */
+static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
+    AddrSpace *as = cpu_as(c);
+    uintptr_t pte = 0;
+    as_lock();
+    const Region *r = as_find_region(as, va);
+    if (r && r->hostmap) {
+        u64 page = va & ~(u64)GUEST_PAGE_MASK;
+        u8 *hp = r->host + (page - r->start);
+        u8 probe;
+        struct iovec loc = { &probe, 1 }, rem = { hp, 1 };
+        if (process_vm_readv(getpid(), &loc, 1, &rem, 1, 0) == 1) {
+            pte_set_range(as, page, GUEST_PAGE_SIZE, hp, r->prot);
+            pte = (uintptr_t)hp | r->prot;
+        }
+    }
+    as_unlock();
+    return pte;
+}
+
 /* Raise the guest-visible abort for a failed data access. The DFSC encodes
  * unmapped (translation fault -> SEGV_MAPERR) vs permission (-> SEGV_ACCERR)
- * for precise siginfo later. */
+ * for precise siginfo later, and a hole in a file mapping as an external abort
+ * (-> SIGBUS/BUS_ADRERR), which is what the kernel reports past end-of-file. */
 static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool perm) {
-    unsigned fsc = perm ? FSC_PERM_L3 : FSC_TRANS_L3;
+    unsigned fsc = perm ? FSC_PERM_L3
+                        : (va_is_file_hole(c, va) ? FSC_EXTERNAL : FSC_TRANS_L3);
     cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, fsc)), va);
 }
 
@@ -515,6 +639,9 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
         as_lock();
         pte = pte_get(cpu_as(c), va);
         as_unlock();
+        /* Missing may mean "past end-of-file when this was mapped"; the file
+         * may have grown into it since. */
+        if (UNLIKELY(!pte)) pte = as_fault_fill(c, va);
         if (!pte) return NULL;                 /* never cache misses */
         e->page = page;
         e->pte = pte;
@@ -621,7 +748,9 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     bool perm;
     u8 *p = translate(c, va, PTE_X, &perm);
     if (!p) {
-        unsigned fsc = perm ? FSC_PERM_L3 : FSC_TRANS_L3;
+        /* As raise_dabort: executing from past end-of-file is a bus error. */
+        unsigned fsc = perm ? FSC_PERM_L3
+                            : (va_is_file_hole(c, va) ? FSC_EXTERNAL : FSC_TRANS_L3);
         cpu_raise_sync(c, esr_make(EC_IABORT_LOWER, fsc), va);
         return false;
     }

@@ -1809,8 +1809,20 @@ SYSDEF(linkat) {
     return host_err();
 }
 
+/* A file the guest has mapped just changed size. Shrinking pulls the ground
+ * out from under any mapping that reached past the new end: those pages must
+ * stop resolving, or the emulator would read a host page the kernel now
+ * refuses and take the SIGBUS itself (mem.c as_file_resized). */
+static void note_resize(CPU *c, int fd, s64 newsize) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)newsize);
+}
+
 SYSDEF(ftruncate) {
-    return ftruncate((int)a0, (off_t)(s64)a1) < 0 ? host_err() : 0;
+    if (ftruncate((int)a0, (off_t)(s64)a1) < 0) return host_err();
+    note_resize(c, (int)a0, (s64)a1);
+    return 0;
 }
 
 SYSDEF(truncate) {
@@ -1818,7 +1830,11 @@ SYSDEF(truncate) {
     int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
     if (r < 0) return (u64)(s64)r;
     if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return truncate(host, (off_t)(s64)a1) < 0 ? host_err() : 0;
+    if (truncate(host, (off_t)(s64)a1) < 0) return host_err();
+    struct stat st;
+    if (stat(host, &st) == 0)
+        as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)(s64)a1);
+    return 0;
 }
 
 /* Fake-root (fake_id && euid==0) turns an EPERM/EINVAL failure on an ownership/
@@ -1949,7 +1965,14 @@ SYSDEF(sendfile) {
 }
 
 SYSDEF(fallocate) {
-    return fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0 ? host_err() : 0;
+    if (fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0)
+        return host_err();
+    /* FALLOC_FL_PUNCH_HOLE / COLLAPSE_RANGE can shrink a file, and the plain
+     * form can grow it; re-read the size rather than infer it. */
+    struct stat st;
+    if (fstat((int)a0, &st) == 0)
+        as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)st.st_size);
+    return 0;
 }
 
 /* guest struct statfs (LP64 asm-generic): all fields u64 except fsid. */

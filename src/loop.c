@@ -99,14 +99,23 @@ int emu_loop(CPU *c) {
                 case EC_DABORT_LOWER:
                 case EC_DABORT_SAME: {
                     unsigned fsc = esr & 0x3f;
-                    sig_deliver_fault(c, SIGSEGV,
-                                      (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
-                                      far);
+                    /* A synchronous external abort is how a file mapping
+                     * reports a page past end-of-file: SIGBUS/BUS_ADRERR, not
+                     * SIGSEGV (mem.c raise_dabort). */
+                    if (fsc == FSC_EXTERNAL)
+                        sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
+                    else
+                        sig_deliver_fault(c, SIGSEGV,
+                                          (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
+                                          far);
                     break;
                 }
                 case EC_IABORT_LOWER:
                 case EC_IABORT_SAME:
-                    sig_deliver_fault(c, SIGSEGV, 1, far);
+                    if ((esr & 0x3f) == FSC_EXTERNAL)
+                        sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
+                    else
+                        sig_deliver_fault(c, SIGSEGV, 1, far);
                     break;
                 case EC_PC_ALIGN:
                 case EC_SP_ALIGN:

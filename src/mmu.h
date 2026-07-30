@@ -104,6 +104,11 @@ typedef struct Region {
     HostMap *hmap;            /* refcounted host allocation backing this region */
     char *path;               /* strdup'd guest path for /proc/self/maps, or NULL */
     u64  file_off;            /* file offset at `start` (file-backed only) */
+    u64  dev, ino;            /* the mapped file's identity, so a later truncate
+                               * can find the mappings it invalidates */
+    u32  hostmap;             /* backed by a real host mapping OF THE FILE, so a
+                               * page past end-of-file faults; the private
+                               * pread-into-anonymous fallback sets this to 0 */
 } Region;
 
 /* Host backing whose guest mapping is gone but whose munmap is deferred:
@@ -146,6 +151,10 @@ int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
 void as_thread_enter(AddrSpace *as);   /* a guest thread joins this space */
 void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
+/* A file changed size: drop the guest PTEs of any mapping of it that now
+ * reaches past end-of-file, so an access faults instead of reaching a host page
+ * the kernel would refuse (mem.c). */
+void as_file_resized(AddrSpace *as, u64 dev, u64 ino, u64 newsize);
 int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
