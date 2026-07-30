@@ -322,7 +322,11 @@ SYSDEF(clone) {
     if (pid < 0) return host_err();
     if (pid == 0) {
         g_tls.tid = getpid();             /* new process: tid == pid */
-        /* Only the forking thread exists here. */
+        /* Only the forking thread exists here: fork(2) duplicates the calling
+         * thread alone, so the inherited count -- which gates the retired-
+         * backing drain (mem.c) -- has to come back to one, or a child of a
+         * threaded parent would never reclaim any address space. */
+        m->as.nthreads = 1;
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */

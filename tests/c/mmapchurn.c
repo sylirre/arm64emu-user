@@ -16,13 +16,18 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define ROUNDS 20000
 #define CHUNK  (64 * 1024)
+
+static void *idle_thread(void *a) { (void)a; for (;;) pause(); return NULL; }
 
 int main(void) {
     struct rlimit rl;
@@ -66,6 +71,35 @@ int main(void) {
         munmap(keep[i], 16 * 1024);
         munmap((char *)keep[i] + 32 * 1024, 32 * 1024);
     }
+
+    /* Same again in a child forked from a *threaded* parent. fork(2) duplicates
+     * only the calling thread, so the child is single-threaded however many
+     * threads the parent had -- and the count that gates reclamation has to say
+     * so, or the child reclaims nothing. */
+    for (int i = 0; i < 3; i++) {
+        pthread_t th;
+        pthread_create(&th, NULL, idle_thread, NULL);
+    }
+    usleep(50000);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        int n = 0;
+        for (int i = 0; i < ROUNDS; i++) {
+            void *q = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (q == MAP_FAILED) break;
+            memset(q, 0x5a, 4096);
+            if (munmap(q, CHUNK) != 0) break;
+            n++;
+        }
+        printf("forked_rounds=%d\n", n == ROUNDS);
+        fflush(stdout);
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(kid, &st, 0);
+    printf("forked_ok=%d\n", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
     /* Still room to work after all that. */
     void *tail = mmap(NULL, 32 * 1024 * 1024, PROT_READ | PROT_WRITE,
