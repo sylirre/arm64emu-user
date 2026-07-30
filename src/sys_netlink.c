@@ -112,7 +112,12 @@ static size_t nl_datagram_len(const uint8_t *reply, size_t len)
 
         memcpy(&hdr, reply + off, sizeof hdr);
         mlen = hdr.nlmsg_len;
-        if (mlen < NLMSG_HDRLEN || off + mlen > len)
+        /* Bound the length by subtraction, before aligning it. `off + mlen`
+         * wraps for an nlmsg_len near the size_t maximum -- which is every
+         * 32-bit host, since nlmsg_len is itself 32 bits -- and NLMSG_ALIGN of
+         * such a length rounds up to 0, leaving `off` where it was. The walk
+         * then never advances and never ends. */
+        if (mlen < NLMSG_HDRLEN || mlen > len - off)
             break;
         if (hdr.nlmsg_type == NLMSG_DONE)
             break;
@@ -352,7 +357,13 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
     for (size_t off = 0; off + NLMSG_HDRLEN + sizeof(int) <= len; ) {
         struct nlmsghdr hdr;
         memcpy(&hdr, (char *)buf + off, sizeof(hdr));
-        if (hdr.nlmsg_len < NLMSG_HDRLEN)
+        /* As in nl_datagram_len: reject a length that runs past the bytes
+         * actually received *before* aligning it, or a crafted nlmsg_len near
+         * UINT32_MAX aligns to 0 and spins this loop forever holding nl_lock.
+         * A guest can put one here -- netlink carries userspace-to-userspace
+         * unicast, so it can address a datagram to its own socket. */
+        size_t mlen = hdr.nlmsg_len;
+        if (mlen < NLMSG_HDRLEN || mlen > len - off)
             break;
         if (hdr.nlmsg_type == NLMSG_ERROR && hdr.nlmsg_seq == m->nl_ack_seq) {
             int error;
@@ -364,7 +375,7 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
             fixed = 1;
             break;
         }
-        off += NLMSG_ALIGN(hdr.nlmsg_len);
+        off += NLMSG_ALIGN(mlen);
     }
     /* MSG_PEEK leaves the reply in the socket: keep the note for the read that
      * consumes it. */
