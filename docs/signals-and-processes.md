@@ -82,10 +82,50 @@ Two consequences worth knowing:
   this case.
 - The mask, the pending set and the readiness belong to the **file
   description**, not to an fd number: `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)`
-  register the copy too (keyed by the eventfd's inode, so the counter is armed
-  once no matter how many names it has). Without that a read on the duplicate
-  reached the bare eventfd, which carries readiness rather than signals and is
-  not even armed — the guest simply blocked forever.
+  register the copy too, so the counter is armed once no matter how many names
+  it has. Without that a read on the duplicate reached the bare eventfd, which
+  carries readiness rather than signals and is not even armed — the guest simply
+  blocked forever.
+
+  Which entries name the *same* description is decided by an id handed out at
+  creation, **not** by the eventfd's inode: the kernel gives every `anon_inode`
+  file one shared inode, so two eventfds and a timerfd all report the same
+  `st_ino`. Keying on it made every signalfd look like a duplicate of the first,
+  and a guest holding two never saw the second become readable. The recorded
+  inode survives only as a weak "this fd number was reused behind our back"
+  check — it still catches reuse by a regular file, socket or pipe, but not by
+  another `anon_inode` file, which is why every path that closes or replaces an
+  fd unmarks it explicitly (`close`, `dup2` over an fd, and **`execve`'s CLOEXEC
+  sweep**; a stale entry there let a timerfd inherit a dead signalfd's number
+  and have its `read` answered from the signal ring).
+
+### `sigaltstack(2)` and `SA_ONSTACK`
+
+Whether a thread is running on its alternate stack is decided by testing the
+current stack pointer against the stack's range (`sig_on_altstack`, the kernel's
+`on_sig_stack`), not by a flag set at delivery and cleared at `rt_sigreturn`.
+A handler that leaves by `siglongjmp` never reaches `sigreturn`, and that is the
+normal way to recover from a stack-overflow `SIGSEGV` — with a flag it stayed
+set for the life of the thread, so every later `SA_ONSTACK` signal was delivered
+onto the stack that had just overflowed. The same test drives `uc_stack`'s
+`ss_flags`, `sigaltstack`'s `SS_ONSTACK` reporting, and its `EPERM` refusal to
+move the stack out from under a handler standing on it.
+
+### The temporary mask of `ppoll` / `pselect6` / `epoll_pwait`
+
+These install a signal mask for the duration of the wait, which is why they
+exist: block a signal, check whatever it would have changed, then sleep with it
+unblocked *only* while sleeping. Handing the mask to the host call alone does
+not implement that here — every signal but the job-control trio stays unblocked
+host-side so `host_catcher` can queue it, and `g_tls.sigmask` is what gates
+delivery. So the wait was interrupted and the run loop then declined to run the
+handler, leaving the guest with a bare `EINTR` and no signal. The guest mask is
+swapped too, and held across delivery exactly as `rt_sigsuspend` does (the frame
+records the caller's via `have_saved_sigmask`; `sigreturn` restores it); a wait
+that ends with nothing to deliver restores it directly. The enter path also
+tests for an already-deliverable signal before sleeping, as the kernel does —
+without it the queued-before-the-wait case, the one the idiom exists for, was
+not noticed until some later signal happened to wake the wait.
 
 ### POSIX interval timers and the guest-32/33 carrier remap
 

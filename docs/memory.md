@@ -87,6 +87,41 @@ referencing it retires the whole thing at once — an interior slice can't be
 munmapped independently when host pages exceed the guest's 4 KB, and a trimmed
 fragment's host pointer need not be host-page aligned.
 
+Retired backing is **quarantined** rather than unmapped on the spot: another
+guest thread's D-TLB is invalidated only lazily (at its next access, via the
+generation counter), so it may still hold a host pointer it translated before
+the unmap, and releasing the backing under it would turn a stale-but-harmless
+access into a host `SIGSEGV`. The quarantine is drained as soon as the address
+space has **one** guest thread left (`as->nthreads`), when the only D-TLB that
+could hold such a pointer is the caller's own — already emptied by the
+generation bump every mutation performs. A multithreaded address space still
+waits for `as_destroy`. Without the drain a single-threaded map/unmap loop never
+returned anything: 1.25 GB churned through a 512 MB limit died two-thirds of the
+way in, where the same loop costs qemu 7 MB.
+
+A file mapping may extend past end-of-file, and touching a page wholly beyond it
+is a **bus error**. Those pages are deliberately left out of the page table, so
+the access takes the ordinary translation-fault path; `raise_dabort`
+distinguishes a hole in a file mapping from genuinely unmapped memory and raises
+a synchronous external abort (`FSC_EXTERNAL`), which `loop.c` delivers as
+`SIGBUS`/`BUS_ADRERR` rather than the `SIGSEGV`/`SEGV_MAPERR` an unmapped
+address gets. Reaching the host page instead would raise `SIGBUS` *on the
+emulator*, mid-memcpy, with nothing to unwind to. End-of-file moves, so the
+decision is not made once: growth is picked up lazily by the fault path, which
+probes the backing with `process_vm_readv` (it reports `EFAULT` where a load
+would raise `SIGBUS`) and installs the PTE if the file has grown into it;
+shrinking is handled by `ftruncate`/`truncate`/`fallocate`, which drop the PTEs
+of any mapping of that file now reaching past the end. A file truncated from
+*outside* the emulator is not visible here and remains the one way a host
+`SIGBUS` can still be raised.
+
+Because a mapped page need not have a PTE, "is it mapped" is a question about
+the region list, not the page table: `mprotect`'s coverage check asks the
+regions (as the kernel asks VMAs), and it splits a region it only partly covers
+so the recorded protection stays exact — for a page with no PTE that record is
+the only thing left to say what protection it gets when the file grows into
+it.
+
 An `mmap` **address hint** without `MAP_FIXED` is treated the way Linux treats it —
 as advisory, not ignored: if `[hint, hint+len)` lies in range and is free the hint
 is honored, otherwise `as_find_free` bump-allocates a fresh range. Honoring the hint

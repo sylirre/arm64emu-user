@@ -72,6 +72,16 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   aligns `s64` to 4. Reading a guest `struct flock` into a host struct therefore
   puts `l_start` at the wrong offset on 32-bit hosts. Read/write such structs at
   **explicit byte offsets** (see `sys_fcntl`'s lock path).
+- *Ancillary data has its own layout.* The guest's `cmsghdr` is LP64 — an 8-byte
+  `cmsg_len`, payload at +16, elements padded to a multiple of 8 — while an
+  ILP32 host's `cmsg_len` is 4 bytes, making the header 12 and the padding 4.
+  `sys_net.c` rebuilds the elements in the target layout in both directions
+  (`cmsg_g2h`/`cmsg_h2g`); passing the buffer through verbatim broke `SCM_RIGHTS`
+  descriptor passing outright on the 32-bit build. Both conversions run on every
+  host so the ordinary build exercises them, and truncation follows `put_cmsg` —
+  a partly-fitting element goes out with the truncated length plus `MSG_CTRUNC`,
+  which is where an ILP32 host lands because the guest's element is four bytes
+  bigger than its own.
 - *Command constants can be remapped by feature macros.* With
   `-D_FILE_OFFSET_BITS=64`, the host `F_SETLK` *macro* becomes `F_SETLK64` (13) on
   ILP32 hosts, but the guest sends arm64's `F_SETLK` (6). Match the **guest's
@@ -88,7 +98,20 @@ containment.) `path_resolve` walks the guest path
 
 - an absolute symlink target restarts the walk at the guest root;
 - `..` clamps at the guest root and cannot escape;
-- `ELOOP` after 40 hops.
+- `ELOOP` after 40 hops;
+- a **trailing slash** (or a final `.`/`..`) demands that the final component be
+  a directory, and is checked after bind translation against the host path the
+  syscall will use. The walk splits on `/` and discards the empty last
+  component, so without this `"file/"` resolved to `"file"` and `open`, `stat`
+  and even `unlink` all went through where the kernel answers `ENOTDIR`. A
+  missing path stays missing so `mkdir("d/")` still works, except that a caller
+  about to create the file gets `EISDIR`. A trailing slash also forces a final
+  symlink to be followed even for callers that asked not to.
+
+`O_CREAT|O_EXCL` resolves with the final symlink **not** followed (the kernel's
+`LOOKUP_EXCL`): finding one there is `EEXIST` whether or not it points anywhere.
+Following it let a guest be redirected into creating the link's target — the
+race `O_EXCL` exists to prevent — and a dangling link made the open succeed.
 
 `*at` syscalls resolve `dirfd` via the fd's recorded guest path (`AT_FDCWD` → the
 task's canonical cwd string, which is tracked independently of the host cwd). That
@@ -104,7 +127,11 @@ its real host location — symlinks and all — and reverse lookups (`dirfd`,
 (`bind_of_host`). Containment is preserved inside the bind: absolute symlinks
 re-root to the guest root and `..` climbs into the rootfs, never to the host
 parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
-(enforced in the `sys_file.c` handlers via `host_ro`). Binds are listed in the
+(enforced in the `sys_file.c` handlers via `host_ro`, and via `fd_ro` for the
+ones that name the file by descriptor — `fchmod`, `fchown`, `ftruncate`,
+`fallocate`, `futimens`, `fsetxattr`, `fremovexattr`. None of those needs a
+writable fd, so a plain read-only open was otherwise enough to change the host
+file's metadata through a read-only bind). Binds are listed in the
 synthesized `/proc/mounts` and `/proc/mountinfo`. A bind destination is a pure
 resolution overlay with no physical dirent in the rootfs, so `getdents64`
 (`bind_inject_dents` in `sys_file.c`) splices the mount point into a listing of
@@ -235,8 +262,9 @@ instruction set is the kernel's (`seccomp_check_filter`): 32-bit aligned
 absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset, jumps
 forward and in range, a `RET` last — anything else is `EINVAL` at install time.
 `SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
-`TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, the call skipped
-with `-ENOSYS`), `TRACE` (no listener here, so the kernel's no-tracer answer:
+`TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, plus the filter's
+own `SECCOMP_RET_DATA` in `si_errno` — that is how one filter tells its several
+traps apart — with the call skipped and `-ENOSYS` left behind), `TRACE` (no listener here, so the kernel's no-tracer answer:
 skip and `ENOSYS`), `KILL_THREAD`/`KILL_PROCESS` and unknown actions (SIGSYS
 death) are all implemented, as is strict mode (`read`/`write`/`exit`/
 `rt_sigreturn` only, SIGKILL for the rest). Filters stack, every one runs, and
@@ -629,7 +657,11 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   synthesized through the same remap — a static snapshot of the host file, self
   or any visible guest pid — so `ps` shows the fake identity's user.
 - **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
-  `capget` reporting the full capability set for fake-root. The capability
+  `capget` reporting the full capability set for fake-root — its header protocol
+  is answered too: an unrecognised version is written back as the preferred one
+  (libcap probes with a bogus version and a NULL data pointer purely to read
+  that), and the header's pid is honoured, so a pid naming no process is
+  `ESRCH`. The capability
   *bounding set* (`prctl(PR_CAPBSET_READ/DROP)`) and `PR_SET/GET_KEEPCAPS`
   are real host-kernel state independent of the fake identity, so those are
   passed straight through to the host `prctl()` instead (`sys_proc.c`).
