@@ -387,7 +387,11 @@ thread-local `g_ptrace_*` int gates the hot paths):
   every live link of the group (`ptrace_report_exit_group`), since the sibling
   threads die without running their own exit paths (a parked one dies inside
   its service loop; the tracer-side mailbox wait also bails to `-ESRCH` when a
-  link flips to exited under it).
+  link flips to exited under it). A tracee `SIGKILL`ed *while parked in a stop*
+  publishes nothing at all — nothing of it runs — so the mailbox wait also
+  checks the host task itself after a slice with no answer, and reports
+  `-ESRCH` for a task that is gone or a zombie; every request that needs a
+  round-trip surfaces that as ptrace's own `ESRCH`, as the kernel does.
 
 **`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
 tracee is a running host process parked in its service loop), so a **tracer's**

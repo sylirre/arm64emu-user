@@ -422,9 +422,13 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
         case PT_CMD_DETACH:
             inject = (int)e->addr;
             e->result = 0;
+            /* Answer *before* releasing the link: pt_self_detach frees the
+             * registry slot, which a tracer still waiting on the mailbox would
+             * read as "the tracee vanished" and report as ESRCH. */
+            __atomic_add_fetch(&e->done_seq, 1, __ATOMIC_RELEASE);
+            fx_wake(&e->done_seq);
             pt_self_detach();
-            leave = 1;
-            break;
+            return inject;
         default:
             e->result = -EIO;
             break;
@@ -759,7 +763,13 @@ static long ptrace_traceme(CPU *c) {
 }
 
 /* ---- tracer: mailbox round-trip to a stopped tracee ---- */
-static void pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
+static int pt_task_dead(s32 t);
+
+/* Post a command to a stopped tracee's mailbox and wait for its answer.
+ * Returns 0 once answered (the result is in e->result), or -ESRCH if the tracee
+ * vanished instead -- which the caller must surface as ptrace's own ESRCH, the
+ * kernel's answer for a tracee that is no longer there. */
+static int pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
     e->cmd = cmd;
     e->addr = addr;
     e->arg = arg;
@@ -767,18 +777,31 @@ static void pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
     __atomic_add_fetch(&e->cmd_seq, 1, __ATOMIC_RELEASE);
     fx_wake(&e->cmd_seq);
     while (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d) {
-        /* Tracee gone while we waited -- its slot freed (killed), or its exit
+        /* Tracee gone while we waited -- its slot freed (detached), or its exit
          * published (a sibling thread's exit_group fan-out flips a parked
          * thread's link to EXITED without it ever answering): bail so ptrace
-         * doesn't hang. Checked while done_seq is still unbumped, so an answer
-         * that did land is never discarded. */
-        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0 ||
+         * doesn't hang. Each bail re-reads done_seq first, so an answer that
+         * landed between the loop test and the check is never discarded. */
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 ||
             __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
+            if (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) != d) break;
             e->result = -ESRCH;
-            return;
+            return -ESRCH;
         }
         fx_wait(&e->done_seq, d, 500);
+        /* A full slice with the mailbox still unanswered: a tracee SIGKILLed
+         * while parked in its service loop leaves a live-looking link (nothing
+         * runs to publish an exit) and is never going to answer, so check the
+         * host task itself. Only after a timeout, so the normal round-trip --
+         * which the tracee answers immediately -- never touches /proc. */
+        if (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d &&
+            pt_task_dead(t)) {
+            e->result = -ESRCH;
+            return -ESRCH;
+        }
     }
+    return 0;
 }
 
 /* Kick a running tracee task to a stop point: queue the reserved signal at the
@@ -1018,23 +1041,23 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     switch (req) {
     case G_PTRACE_PEEKTEXT:
     case G_PTRACE_PEEKDATA:
-        pt_cmd(e, PT_CMD_PEEK, addr, 0);
+        if (pt_cmd(e, PT_CMD_PEEK, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EIO;
         return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
     case G_PTRACE_PEEKUSR:
-        pt_cmd(e, PT_CMD_PEEKUSR, addr, 0);
+        if (pt_cmd(e, PT_CMD_PEEKUSR, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EIO;
         return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
     case G_PTRACE_POKETEXT:
     case G_PTRACE_POKEDATA:
-        pt_cmd(e, PT_CMD_POKE, addr, data);
+        if (pt_cmd(e, PT_CMD_POKE, addr, data) < 0) return -ESRCH;
         return e->result < 0 ? -EIO : 0;
     case G_PTRACE_POKEUSR:
         return -EIO;   /* user-area writes not modelled (gdb uses SETREGSET) */
     case G_PTRACE_GETREGSET: {
         GIovec iov;
         if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
-        pt_cmd(e, PT_CMD_GETREGS, addr, 0);
+        if (pt_cmd(e, PT_CMD_GETREGS, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EINVAL;
         u32 n = e->rlen;
         if (iov.iov_len < n) n = (u32)iov.iov_len;
@@ -1049,21 +1072,17 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         if (n > PT_MBOX) n = PT_MBOX;
         if (n && copy_from_guest(c, e->data, iov.iov_base, n) < 0) return -EFAULT;
         e->rlen = n;
-        pt_cmd(e, PT_CMD_SETREGS, addr, 0);
+        if (pt_cmd(e, PT_CMD_SETREGS, addr, 0) < 0) return -ESRCH;
         return e->result < 0 ? (long)e->result : 0;
     }
     case G_PTRACE_CONT:
-        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);
-        return 0;
+        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);
     case G_PTRACE_SYSCALL:
-        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SYSCALL);
-        return 0;
+        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SYSCALL);
     case G_PTRACE_SINGLESTEP:
-        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SINGLESTEP);
-        return 0;
+        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SINGLESTEP);
     case G_PTRACE_DETACH:
-        pt_cmd(e, PT_CMD_DETACH, data, 0);
-        return 0;
+        return pt_cmd(e, PT_CMD_DETACH, data, 0);
     case G_PTRACE_LISTEN:
         /* Only on a SEIZE'd tracee currently in an EVENT_STOP (a group-stop or a
          * PTRACE_INTERRUPT stop). Keep it parked-but-listening: it does not resume;
