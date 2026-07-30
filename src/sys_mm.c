@@ -204,11 +204,22 @@ SYSDEF(madvise) {
     return 0;   /* other advice: accepted and ignored */
 }
 
-static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3) {
+#define G_MREMAP_MAYMOVE 1
+#define G_MREMAP_FIXED   2
+
+static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     AddrSpace *as = &c->m->as;
     u64 old_addr = a0, old_len = PG_UP(a1), new_len = PG_UP(a2);
     int flags = (int)a3;
     if (old_addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+    if (flags & ~(G_MREMAP_MAYMOVE | G_MREMAP_FIXED)) return (u64)(s64)-EINVAL;
+    /* Neither length may be zero. A zero new length is not a request to unmap
+     * everything -- the kernel rejects it outright -- and a zero old length
+     * only means anything for the shared-mapping duplication this does not
+     * implement; both are EINVAL on a native run. */
+    if (!new_len || !old_len) return (u64)(s64)-EINVAL;
+    if ((flags & G_MREMAP_FIXED) && !(flags & G_MREMAP_MAYMOVE))
+        return (u64)(s64)-EINVAL;
     /* The old range must be fully mapped; the kernel returns EFAULT when it
      * is not. musl's pthread_getattr_np probes for the main-thread stack
      * bottom with growing mremaps and relies on this non-ENOMEM failure to
@@ -216,26 +227,43 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3) {
      * stray mapping below the stack. */
     for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
         if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
-    if (new_len <= old_len) {
-        if (new_len < old_len) guest_unmap(as, old_addr + new_len, old_len - new_len);
-        return old_addr;
-    }
-    if (!(flags & 1 /* MREMAP_MAYMOVE */)) {
-        /* try to grow in place */
-        for (u64 va = old_addr + old_len; va < old_addr + new_len; va += GUEST_PAGE_SIZE)
-            if (as_find_region(as, va)) return (u64)(s64)-ENOMEM;
-        int r = guest_map_anon(as, old_addr + old_len, new_len - old_len, PTE_R | PTE_W);
-        return r < 0 ? (u64)(s64)r : old_addr;
+    if (!(flags & G_MREMAP_FIXED)) {
+        /* Staying put: shrink in place, or grow in place when allowed. */
+        if (new_len <= old_len) {
+            if (new_len < old_len) guest_unmap(as, old_addr + new_len, old_len - new_len);
+            return old_addr;
+        }
+        if (!(flags & G_MREMAP_MAYMOVE)) {
+            for (u64 va = old_addr + old_len; va < old_addr + new_len; va += GUEST_PAGE_SIZE)
+                if (as_find_region(as, va)) return (u64)(s64)-ENOMEM;
+            int r = guest_map_anon(as, old_addr + old_len, new_len - old_len, PTE_R | PTE_W);
+            return r < 0 ? (u64)(s64)r : old_addr;
+        }
     }
     /* move: allocate new anon, copy, unmap old */
-    u64 new_addr = as_find_free(as, new_len);
-    if (!new_addr) return (u64)(s64)-ENOMEM;
+    u64 new_addr;
+    if (flags & G_MREMAP_FIXED) {
+        /* The destination is the caller's to choose, and whatever already
+         * lives there is replaced (guest_map_anon punches it out). Handing
+         * back some other address instead, as this used to, silently breaks a
+         * caller that goes on to use the address it asked for. */
+        new_addr = a4;
+        if (new_addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+        if (new_addr > GUEST_TASK_SIZE || new_len > GUEST_TASK_SIZE - new_addr)
+            return (u64)(s64)-EINVAL;
+        if (new_addr < old_addr + old_len && old_addr < new_addr + new_len)
+            return (u64)(s64)-EINVAL;   /* overlaps the source */
+    } else {
+        new_addr = as_find_free(as, new_len);
+        if (!new_addr) return (u64)(s64)-ENOMEM;
+    }
     const Region *reg = as_find_region(as, old_addr);
     u32 prot = reg ? reg->prot : (PTE_R | PTE_W);
     int r = guest_map_anon(as, new_addr, new_len, PTE_R | PTE_W);
     if (r < 0) return (u64)(s64)r;
     u8 buf[4096];
-    for (u64 o = 0; o < old_len; o += GUEST_PAGE_SIZE) {
+    u64 copy_len = old_len < new_len ? old_len : new_len;   /* FIXED may shrink */
+    for (u64 o = 0; o < copy_len; o += GUEST_PAGE_SIZE) {
         if (copy_from_guest(c, buf, old_addr + o, GUEST_PAGE_SIZE) == 0)
             copy_to_guest(c, new_addr + o, buf, GUEST_PAGE_SIZE);
     }
@@ -246,7 +274,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3) {
 
 SYSDEF(mremap) {
     as_lock();
-    u64 r = mremap_locked(c, a0, a1, a2, a3);
+    u64 r = mremap_locked(c, a0, a1, a2, a3, a4);
     as_unlock();
     return r;
 }
