@@ -1406,6 +1406,31 @@ SYSDEF(fcntl) {
             }
             return (u64)r;
         }
+#ifdef F_SETOWN_EX
+        /* These take a pointer too, so the default branch below would hand the
+         * host the guest VA itself -- EFAULT, or a write into whatever the
+         * emulator happens to have at that address. struct f_owner_ex is
+         * {s32 type; s32 pid} on guest and host alike. Literal guest command
+         * values, for the reason given above the lock commands. */
+        case 15: case 16: {
+            struct f_owner_ex ex;
+            u8 gex[8];
+            s32 type = 0, pid = 0;
+            if (cmd == 15) {
+                if (copy_from_guest(c, gex, a2, sizeof gex) < 0) return (u64)(s64)-EFAULT;
+                memcpy(&type, gex + 0, 4); memcpy(&pid, gex + 4, 4);
+                ex.type = type; ex.pid = pid;
+            }
+            int r = fcntl(fd, cmd == 15 ? F_SETOWN_EX : F_GETOWN_EX, &ex);
+            if (r < 0) return host_err();
+            if (cmd == 16) {
+                type = (s32)ex.type; pid = (s32)ex.pid;
+                memcpy(gex + 0, &type, 4); memcpy(gex + 4, &pid, 4);
+                if (copy_to_guest(c, a2, gex, sizeof gex) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)r;
+        }
+#endif
         default: {
             int r = fcntl(fd, cmd, (unsigned long)a2);
             return r < 0 ? host_err() : (u64)r;
