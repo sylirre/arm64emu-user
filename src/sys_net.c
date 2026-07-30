@@ -317,7 +317,11 @@ SYSDEF(recvfrom) {
     if (n > 0)
         nlr_fix_reply(c->m, (int)a0, buf,
                       (size_t)n < len ? (size_t)n : len, (int)a3 & MSG_PEEK);
-    if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    /* Copy only what the buffer holds -- with MSG_TRUNC n is the untruncated
+     * datagram length, which exceeds both the bounce allocation and the guest
+     * buffer -- but still report n, as the kernel does. */
+    size_t got = (size_t)n < len ? (size_t)n : len;
+    if (n > 0 && copy_to_guest(c, a1, buf, got) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     u64 e = addr_out(c, a4, a5, &ss, sl);
     if ((s64)e < 0) return e;
