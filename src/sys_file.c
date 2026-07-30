@@ -1458,7 +1458,14 @@ SYSDEF(pipe2) {
     int fds[2];
     if (pipe2(fds, oflags_g2h((int)a1)) < 0) return host_err();
     s32 gfds[2] = { fds[0], fds[1] };
-    if (copy_to_guest(c, a0, gfds, sizeof gfds) < 0) return (u64)(s64)-EFAULT;
+    if (copy_to_guest(c, a0, gfds, sizeof gfds) < 0) {
+        /* The kernel releases both descriptors before returning EFAULT. Leaving
+         * them open leaks a pair per failed call -- and since guest fd == host
+         * fd they are guest-visible -- so a guest looping on a bad pointer would
+         * exhaust its own descriptor table. */
+        close(fds[0]); close(fds[1]);
+        return (u64)(s64)-EFAULT;
+    }
     return 0;
 }
 
