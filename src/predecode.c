@@ -131,8 +131,8 @@ static void fill_dp_imm(PDEnt *e, u32 insn) {
     }
     if (t == 0x27) {                                 /* EXTR / ROR imm */
         unsigned imms = BITS(15, 10);
-        /* N (bit22) must equal sf and bit21 must be 0 (decode.c's guard). */
-        if (BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0) return;
+        /* bits 30:29 RES0, N (bit22) must equal sf, bit21 must be 0. */
+        if (BITS(30, 29) != 0 || BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0) return;
         if (sf) { e->op = PD_EXTR64; e->imm = imms; }
         else if (imms < 32) { e->op = PD_EXTR32; e->imm = imms; }
         return;
@@ -357,7 +357,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
     if (op24 == 0x0b) {                              /* add/sub register */
         bool op = BIT(30), S = BIT(29);
         if (BIT(21)) {                               /* extended register */
-            if (BITS(12, 10) > 4) return;            /* shift amount 5-7: unallocated */
+            if (BITS(12, 10) > 4 || BITS(23, 22) != 0) return;   /* unallocated */
             static const u8 ids[2][2][2] = {         /* [op][S][sf] */
                 { { PD_ADDX32, PD_ADDX64 }, { PD_ADDSX32, PD_ADDSX64 } },
                 { { PD_SUBX32, PD_SUBX64 }, { PD_SUBSX32, PD_SUBSX64 } },
@@ -386,6 +386,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
         return;
     }
     if (op24 == 0x1b) {                              /* 3-source */
+        if (BITS(30, 29) != 0) return;               /* op54 is RES0 */
         unsigned key = (BITS(23, 21) << 1) | BIT(15);
         e->imm = BITS(14, 10);                       /* Ra */
         switch (key) {
@@ -405,6 +406,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
     if (op24 == 0x1a) {
         unsigned op21 = BITS(28, 21);
         if (op21 == 0xd2) {                          /* CCMP/CCMN */
+            if (!BIT(29) || BIT(10) || BIT(4)) return;
             bool op = BIT(30), is_imm = BIT(11);
             unsigned nzcv = BITS(3, 0);
             u32 flags = ((nzcv & 8) ? PS_N : 0) | ((nzcv & 4) ? PS_Z : 0) |
@@ -418,6 +420,7 @@ static void fill_dp_reg(PDEnt *e, u32 insn) {
             return;
         }
         if (op21 == 0xd4) {                          /* CSEL family */
+            if (BIT(29) || BIT(11)) return;
             bool op = BIT(30), o2 = BIT(10);
             static const u8 ids[2][2][2] = {         /* [op][o2][sf] */
                 { { PD_CSEL32, PD_CSEL64 }, { PD_CSINC32, PD_CSINC64 } },

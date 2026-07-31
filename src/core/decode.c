@@ -243,6 +243,11 @@ static void dp_immediate(CPU *c, u32 insn) {
     }
     if (t == 0x26) {                              /* bitfield SBFM/BFM/UBFM */
         unsigned opc = BITS(30, 29), N = BIT(22), immr = BITS(21, 16), imms = BITS(15, 10);
+        /* opc==11 has no bitfield instruction, and N must equal sf. (The
+         * sf==0/N==1 half is already rejected inside decode_bitmasks; this
+         * catches sf==1/N==0, which was running as a 32-bit-pattern bitfield
+         * on a 64-bit register.) */
+        if (opc == 3 || N != (unsigned)(sf != 0)) { undefined(c, insn); return; }
         u64 wmask, tmask;
         if (!decode_bitmasks(N, imms, immr, sf, &wmask, &tmask)) { undefined(c, insn); return; }
         u64 src = reg_x(c, Rn);
@@ -261,7 +266,8 @@ static void dp_immediate(CPU *c, u32 insn) {
         /* N (bit22) must equal sf, bit21 must be 0, and the 32-bit form only
          * allows lsb<32 — otherwise unallocated. Guarding also avoids the host
          * UB of shifting a u32 by 32-lsb when lsb>=32. */
-        if (BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0 || (!sf && (imms & 0x20))) {
+        if (BITS(30, 29) != 0 || BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0 ||
+            (!sf && (imms & 0x20))) {
             undefined(c, insn); return;
         }
         /* EXTR Rd, Rn, Rm, #lsb : result = (Rn:Rm) >> lsb */
@@ -305,7 +311,7 @@ static void dp_register(CPU *c, u32 insn) {
         u64 op2, n; u32 fl;
         if (ext) {                                 /* add/sub extended register */
             unsigned option = BITS(15, 13), imm3 = BITS(12, 10);
-            if (imm3 > 4) { undefined(c, insn); return; }  /* shift amount 5-7: unallocated */
+            if (imm3 > 4 || BITS(23, 22) != 0) { undefined(c, insn); return; }
             op2 = extend_reg(reg_x(c, Rm), option, imm3);
             n = reg_xsp(c, Rn);
         } else {                                   /* add/sub shifted register */
@@ -325,6 +331,7 @@ static void dp_register(CPU *c, u32 insn) {
     }
     if (op24 == 0x1b) {                            /* data processing (3 source) */
         unsigned op31 = BITS(23, 21), o0 = BIT(15), Ra = BITS(14, 10);
+        if (BITS(30, 29) != 0) { undefined(c, insn); return; }  /* op54 is RES0 */
         /* The widening/high multiplies (op31!=0: S/UMADDL, S/UMSUBL, S/UMULH)
          * require sf=1; sf=0 is unallocated. MADD/MSUB (op31==0) are valid both. */
         if (!sf && op31 != 0) { undefined(c, insn); return; }
@@ -386,6 +393,7 @@ static void dp_register(CPU *c, u32 insn) {
             return;
         }
         if (op21 == 0xd2) {                        /* conditional compare */
+            if (!BIT(29) || BIT(10) || BIT(4)) { undefined(c, insn); return; }
             bool op = BIT(30);
             unsigned cond = BITS(15, 12), nzcv = BITS(3, 0);
             bool is_imm = BIT(11);
@@ -403,6 +411,7 @@ static void dp_register(CPU *c, u32 insn) {
             return;
         }
         if (op21 == 0xd4) {                        /* conditional select */
+            if (BIT(29) || BIT(11)) { undefined(c, insn); return; }
             bool op = BIT(30), o2 = BIT(10);
             unsigned cond = BITS(15, 12);
             u64 n = reg_x(c, Rn), m = reg_x(c, Rm), r;

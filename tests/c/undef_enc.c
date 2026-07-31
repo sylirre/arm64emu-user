@@ -59,6 +59,17 @@ int main(void) {
     PROBE("movk w, lsl #32",     0x72C00020);
     PROBE("extr w, N=1",         0x13C20020);  /* N must equal sf */
     PROBE("extr w, bit21=1",     0x13A20020);  /* bit21 must be 0 */
+    PROBE("extr w, op54!=0",     0x33820020);  /* bits 30:29 are RES0 */
+    PROBE("bitfield opc=3",      0x73000020);  /* no such bitfield instruction */
+    PROBE("bitfield x, N=0",     0xD3000020);  /* N must equal sf */
+
+    /* ---- unallocated: DP-register RES0 fields ---- */
+    PROBE("madd, op54!=0",       0x3B020C20);  /* bits 30:29 are RES0 */
+    PROBE("add x, uxtx opt=1",   0x8B627020);  /* opt (bits 23:22) must be 0 */
+    PROBE("ccmp, S=0",           0xDA400820);  /* S must be 1 */
+    PROBE("ccmp, o3=1",          0xFA400830);  /* bit 4 must be 0 */
+    PROBE("csel, S=1",           0xBA820020);  /* S must be 0 */
+    PROBE("csel, op2<1>=1",      0x9A820820);  /* bit 11 must be 0 */
 
     /* ---- unallocated: loads/stores ---- */
     PROBE("ldr q-form size=1",   0x7DC00020);  /* opc&2 with size!=0 */
@@ -104,6 +115,11 @@ int main(void) {
     PROBE("extr w, #31",         0x1382FC20);
     PROBE("ldrsw x0, [x1]",      0xB9800020);  /* size=2 opc=2: the valid one */
     PROBE("ldrsh w0, [x1]",      0x79C00020);  /* size=1 opc=3 is allocated */
+    PROBE("ubfm x0, x1, N=1",    0xD3400020);  /* the sf==N pairing that is legal */
+    PROBE("madd w0, w1, w2, w3", 0x1B020C20);
+    PROBE("ccmp x1, #0, #0, eq", 0xFA400820);
+    PROBE("csel x0, x1, x2, eq", 0x9A820020);
+    PROBE("extr w0, w1, w2, #0", 0x13820020);
 
     return 0;
 }
