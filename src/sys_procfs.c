@@ -655,17 +655,23 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
 
     /* /proc/<pid>/cmdline of ANOTHER guest process: served from the shared PID
      * registry (self / own-pid keep using m->cmdline via self_tail below). A
-     * non-guest PID misses here and, under the hidden view, path.c has already
-     * routed it to an ENOENT. */
+     * non-guest PID is not answered here at all -- path.c has already routed it
+     * to the hidden view's ENOENT. For one that IS a guest process the answer
+     * comes from here whatever the registry says: a lookup that comes up dry
+     * (the entry is mid-rewrite, or its process raced away) writes an empty
+     * file, as the kernel does for a process whose cmdline is gone. Falling
+     * through instead handed the guest the host file -- the emulator's own
+     * command line. */
     s32 opid;
     if (proc_other_cmdline(canon, &opid) && opid != (s32)getpid()) {
+        if (!proctab_has(opid)) return 0;
         char cbuf[PROCTAB_CMDLINE];
         u32 clen = 0;
-        if (!proctab_cmdline(opid, cbuf, &clen)) return 0;
+        if (!proctab_cmdline(opid, cbuf, &clen)) clen = 0;
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
-        if (fd < 0) return 0;
+        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
@@ -687,7 +693,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
-        if (fd < 0) return 0;
+        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
         int fmt = !strcmp(mtail, "mountinfo")  ? MNT_MOUNTINFO :
                   !strcmp(mtail, "mountstats") ? MNT_MOUNTSTATS : MNT_MOUNTS;
         put_mounts(fd, m, fmt);
@@ -699,11 +705,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
 
     /* /proc/<pid>/{environ,auxv} of ANOTHER guest process: served from the guest
      * environ/auxv that process published in the registry (self / own-pid use
-     * m->environ / m->auxv via self_tail below). Off the registry (non-guest /
-     * raced) it falls through to the host path's ENOENT rather than leaking the
-     * emulator's own copy (gdb reads the inferior's auxv for AT_HWCAP; the host
-     * file's wrong-ISA value sends it chasing pauth/SVE regsets the ptrace shim
-     * doesn't have). */
+     * m->environ / m->auxv via self_tail below). As with cmdline above, a
+     * non-guest PID is left to path.c's ENOENT and a guest one is answered from
+     * here either way -- a dry lookup is an empty file, never the emulator's
+     * own copy. That copy is the whole host environment, and for auxv it is the
+     * wrong ISA besides (gdb reads the inferior's AT_HWCAP and goes chasing
+     * pauth/SVE regsets the ptrace shim does not have). */
     s32 epid;
     const char *etail = proc_other_tail(canon, &epid);
     if (etail && epid != (s32)getpid() &&
@@ -712,12 +719,14 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         struct ProcSnap snap;
-        if (!proctab_get(epid, &snap)) return 0;
-        const char *buf = snap.env;
-        u32 blen = snap.env_len;
-        if (etail[0] == 'a') { buf = snap.auxv; blen = snap.auxv_len; }
+        const char *buf = NULL;
+        u32 blen = 0;
+        if (proctab_get(epid, &snap)) {
+            buf = etail[0] == 'a' ? snap.auxv : snap.env;
+            blen = etail[0] == 'a' ? snap.auxv_len : snap.env_len;
+        }
         int fd = synth_memfd();
-        if (fd < 0) return 0;
+        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
         if (blen) { ssize_t w = write(fd, buf, blen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);

@@ -849,8 +849,11 @@ SYSDEF(readlinkat) {
     ssize_t rn;
     /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
      * state; report the guest-view target instead. */
-    if (path_proc_magic(c->m, canon, buf) ||
-        (proc_zone_path(host) && path_proc_magic(c->m, host, buf))) {
+    int magic = path_proc_magic(c->m, canon, buf);
+    if (magic == 0 && proc_zone_path(host))
+        magic = path_proc_magic(c->m, host, buf);
+    if (magic < 0) return (u64)(s64)magic;   /* guest process, no guest target */
+    if (magic > 0) {
         rn = (ssize_t)strlen(buf);
     } else {
 #ifdef L2S_ENABLED

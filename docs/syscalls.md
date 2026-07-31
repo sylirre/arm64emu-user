@@ -520,8 +520,16 @@ then make the consequences the caller depends on true:
   PID from the session's own mount table (the guest view is process-independent,
   so a plain `cat /proc/$$/mountinfo` read by a child no longer leaks the host
   mount namespace); `path_proc_magic` likewise resolves another guest PID's
-  `exe`/`cwd` from the registry. The same registry powers a **hidden-process
-  view**: the
+  `exe`/`cwd` from the registry. **Every one of those is answered from here or
+  denied, never passed through**: both spellings reach it (`proc_other_tail`
+  folds `/proc/<pid>/task/<tid>/<name>` into `/proc/<pid>/<name>`, since these
+  are per-process files and the kernel offers both names), and a registry
+  lookup that comes up dry — the entry is mid-rewrite, or its process raced
+  away — yields an empty file, or `ENOENT` for `exe`/`cwd`, as the kernel does
+  for a process whose data is gone. Falling through on either would hand the
+  guest the host file, which for a guest process describes the *emulator*: its
+  command line, its binary path, and its entire environment. The same registry
+  powers a **hidden-process view**: the
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
   PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
   the guest sees only its own process tree — a pid namespace without the

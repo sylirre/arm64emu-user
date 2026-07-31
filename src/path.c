@@ -176,7 +176,10 @@ const char *proc_other_tail(const char *canon, s32 *pid) {
  * ANOTHER guest process is served the guest exe/cwd it published in the shared
  * PID registry (root is the shared rootfs). A non-guest or unregistered PID is
  * not magic, so the host-path resolution / hidden-PID ENOENT stands. Writes the
- * guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
+ * guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic; negative
+ * (an errno) for a guest process we admit exists but have no guest target for —
+ * denying is the only safe answer there, since falling through would report the
+ * host link, and that names the emulator's own binary and the host cwd. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     if (m->no_proc) return 0;   /* --no-proc: no /proc emulation at all */
     if (strncmp(canon, "/proc/", 6)) return 0;
@@ -200,9 +203,12 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     int want_exe = !strcmp(ot, "exe"), want_cwd = !strcmp(ot, "cwd");
     if (!want_exe && !want_cwd) return 0;
     struct ProcSnap snap;
-    if (!proctab_get(pid, &snap)) return 0;   /* raced away: fall through */
+    /* No guest answer (the entry is mid-rewrite, or its process raced away):
+     * ENOENT, which is what the kernel reports for these links once a process
+     * is gone -- never the host link. */
+    if (!proctab_get(pid, &snap)) return -ENOENT;
     if (want_exe) {
-        if (!snap.exe_len) return 0;
+        if (!snap.exe_len) return -ENOENT;
         memcpy(tgt, snap.exe, snap.exe_len);
         tgt[snap.exe_len] = 0;
     } else if (snap.cwd_len) {
@@ -759,8 +765,11 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
          * elsewhere asks for /newroot/proc/self/exe -- and the host path a
          * passthrough resolves to *is* the canonical spelling, so check both;
          * otherwise the walk follows the host link and leaks emulator state. */
-        if (path_proc_magic(m, canon, tgt) ||
-            (proc_zone_path(hostbuf) && path_proc_magic(m, hostbuf, tgt))) {
+        int magic = path_proc_magic(m, canon, tgt);
+        if (magic == 0 && proc_zone_path(hostbuf))
+            magic = path_proc_magic(m, hostbuf, tgt);
+        if (magic < 0) return magic;      /* guest process, no guest target */
+        if (magic > 0) {
             tn = (ssize_t)strlen(tgt);
         } else {
             tn = readlink(hostbuf, tgt, sizeof tgt - 1);

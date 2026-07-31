@@ -621,6 +621,31 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- nothing under ANOTHER guest process's /proc may hand back the emulator's
+# own state. Self-checking: qemu has no guest PID registry, so it cannot be the
+# oracle -- the fixture compares every file against what it sees for itself,
+# which is always the guest view. Covers both spellings (/proc/<pid>/<name> and
+# /proc/<pid>/task/<tid>/<name>, the same per-process files) and races a reader
+# against a child re-exec'ing itself, which is what drives the registry lookup
+# to come up dry. SECRET= marks the emulator's environment so a leak of it is
+# unmistakable in the diff. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/procfs_hostleak.bin \
+            tests/fixtures/procfs_hostleak.c 2>/dev/null; then
+        expect=$'no_host_view=1\ndone'
+        got=$(SECRET=emulator-only timeout 300 "$EMU" / \
+              tests/fixtures/procfs_hostleak.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_hostleak"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: procfs_hostleak"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/procfs_hostleak.bin
+    else
+        echo "SKIP build fixtures/procfs_hostleak"
+    fi
+fi
+
 # ---- a :ro bind mount stays read-only for fd-based mutation too. Self-checking:
 # bind mounts are the emulator's own feature, so qemu is not an oracle. The
 # point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr
