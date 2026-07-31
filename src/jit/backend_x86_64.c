@@ -353,10 +353,6 @@ static int cond_setup(BE *be, unsigned cond) {
     Emit *e = be->e;
     ld32(e, RAX, R14, OFF_NZCV);
     switch (cond) {
-        case 0:  alu_ri32(e, 0, 0 /*F7 path below*/, RAX, 0); break;
-        default: break;
-    }
-    switch (cond) {
         case 0: case 1:                          /* EQ/NE: Z */
             /* test eax, PS_Z */
             rex(e, 0, 0, 0, RAX); e8(e, 0xF7); e8(e, 0xC0); e32(e, PS_Z);
@@ -2252,12 +2248,13 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             materialize_flags(be);
             vop_src(be, 0, rn);
             vop_src(be, 1, rm);
-            if (opc3 == 0x19) {                  /* FMLA / FMLS: d +- n*m */
-                vop_src(be, 2, rd);
-                sse_rr(e, pfx, 0x59, 0, 1);
-                sse_rr(e, pfx, a23 ? 0x5C : 0x58, 2, 0);
-                res = 2;
-            } else if (opc3 == 0x1a && !U) {     /* FADD / FSUB */
+            /* No FMLA/FMLS (opc3 0x19) recipe here on purpose. The frontend
+             * never classifies them VC_VF3S because the interpreter fuses
+             * them through __builtin_fma (single rounding) and anything this
+             * backend can emit is an unfused mul+add — a different result,
+             * not a slower one. If they are ever inlined, the emit has to
+             * come from an FMA-capable path, not from mulps + addps. */
+            if (opc3 == 0x1a && !U) {            /* FADD / FSUB */
                 sse_rr(e, pfx, a23 ? 0x5C : 0x58, 0, 1);
             } else if (opc3 == 0x1b) {           /* FMUL */
                 sse_rr(e, pfx, 0x59, 0, 1);

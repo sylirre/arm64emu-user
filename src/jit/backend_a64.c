@@ -1066,6 +1066,11 @@ static void emit_vop(BE *be, const IROp *o) {
              * result exposes the interpreter's compiler-chosen NaN operand
              * priority, so re-run those in the interpreter. */
             unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            /* FMLA/FMLS (opc3 0x19) do not currently reach here — the
+             * frontend leaves them on the helper for the x86 backend's sake,
+             * whose only option is an unfused mul+add. Native replay makes
+             * them correct on this host, so the accumulate path is kept
+             * ready rather than deleted. */
             int mla = (((insn >> 11) & 0x1f) == 0x19);
             materialize_flags(be);               /* cmn below */
             vop_src(be, 0, rn);
