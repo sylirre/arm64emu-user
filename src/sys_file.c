@@ -1386,12 +1386,19 @@ SYSDEF(ioctl) {
         cmd == 0x40086602 /*guest FS_IOC_SETFLAGS*/) {
         int is_set = (cmd == 0x40086602);
         unsigned long hcmd = is_set ? _IOW('f', 2, long) : _IOR('f', 1, long);
-        int flags = 0;
-        if (is_set && copy_from_guest(c, &flags, a2, sizeof flags) < 0)
+        /* Give the call a buffer of the width the command declares, not of the
+         * width the handler happens to touch. A bare int left the four bytes
+         * the command promises undefined -- valgrind flags the ioctl -- and a
+         * handler that ever did honour the declared size would write those four
+         * bytes past it, into the emulator's stack frame. The int member starts
+         * at the same address, so it is exactly the word every filesystem's
+         * handler get_user/put_user's there. */
+        union { long declared; int val; } arg = { .declared = 0 };
+        if (is_set && copy_from_guest(c, &arg.val, a2, sizeof arg.val) < 0)
             return (u64)(s64)-EFAULT;
-        int r = ioctl((int)a0, hcmd, &flags);
+        int r = ioctl((int)a0, hcmd, &arg);
         if (r < 0) return host_err();
-        if (!is_set && copy_to_guest(c, a2, &flags, sizeof flags) < 0)
+        if (!is_set && copy_to_guest(c, a2, &arg.val, sizeof arg.val) < 0)
             return (u64)(s64)-EFAULT;
         return (u64)r;
     }
@@ -1425,6 +1432,14 @@ SYSDEF(ioctl) {
         return r < 0 ? host_err() : (u64)r;
     }
     u8 buf[256];
+    if (e->size > sizeof buf) return (u64)(s64)-EINVAL;   /* table entry too big */
+    /* Zero it first. The table's size is what the command *declares*, and a
+     * driver is under no obligation to fill all of it -- a legacy number (the
+     * 0x54xx tty block) encodes no size at all, so nothing even checks. Copying
+     * an unfilled tail back would hand the guest whatever was on the emulator's
+     * stack, the same disclosure shape as the SIMD-pair bug. Cold path; the
+     * largest entry is a 36-byte termios. */
+    memset(buf, 0, e->size);
     if (e->dir & 2)
         if (copy_from_guest(c, buf, a2, e->size) < 0) return (u64)(s64)-EFAULT;
     int r = ioctl((int)a0, cmd, buf);
