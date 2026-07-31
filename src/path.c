@@ -132,6 +132,42 @@ const char *proc_self_tail(const char *canon) {
     return tail;
 }
 
+/* The same, for ANOTHER process: tail after "/proc/<pid>/", with that process's
+ * own task/<tid>/ sub-path folded away, and *pid set. NULL if canon does not
+ * name "/proc/<digits>/...".
+ *
+ * The task spelling matters for exactly the reason it does above: the files
+ * reached through it are per-process, so /proc/<pid>/task/<tid>/environ is
+ * /proc/<pid>/environ. Left unrecognized it resolved as a plain path and the
+ * guest got the *host* file -- the emulator's own command line, its binary
+ * path, and its entire environment, for any guest pid it could name. */
+const char *proc_other_tail(const char *canon, s32 *pid) {
+    if (strncmp(canon, "/proc/", 6)) return NULL;
+    const char *p = canon + 6;
+    if (*p < '0' || *p > '9') return NULL;
+    u64 n = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (u64)(*p - '0');
+        if (n > 0x7fffffff) return NULL;
+    }
+    if (*p != '/') return NULL;
+    *pid = (s32)n;
+    const char *tail = p + 1;
+    if (strncmp(tail, "task/", 5)) return tail;
+    const char *t = tail + 5;
+    if (*t < '0' || *t > '9') return tail;
+    while (*t >= '0' && *t <= '9') t++;
+    if (*t != '/') return tail;
+    /* Guest tid == host tid, so the process's thread list is the host's:
+     * anything that is not one of its tasks keeps resolving as a plain path,
+     * for the kernel's own ENOENT. */
+    char probe[80];
+    snprintf(probe, sizeof probe, "/proc/%d/task/%.*s",
+             (int)*pid, (int)(t - (tail + 5)), tail + 5);
+    if (!access(probe, F_OK)) return t + 1;
+    return tail;
+}
+
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
  * state (our binary, the host cwd, the host root). Following or reading them raw
  * would leak host paths, and root/… would escape the rootfs entirely, so the
@@ -144,7 +180,6 @@ const char *proc_self_tail(const char *canon) {
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     if (m->no_proc) return 0;   /* --no-proc: no /proc emulation at all */
     if (strncmp(canon, "/proc/", 6)) return 0;
-    const char *rest = canon + 6;
 
     /* self / own-pid / thread-self / our own task/<tid>: this Machine's state. */
     const char *tail = proc_self_tail(canon);
@@ -155,16 +190,11 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
         return 0;
     }
 
-    /* /proc/<N>/<tail> of another process: only a registered guest PID is magic. */
-    if (*rest < '0' || *rest > '9') return 0;
+    /* /proc/<N>/<tail> of another process (its own task/<tid>/ spelling names
+     * the same links): only a registered guest PID is magic. */
     s32 pid = 0;
-    const char *p = rest;
-    for (; *p >= '0' && *p <= '9'; p++) {
-        pid = pid * 10 + (*p - '0');
-        if (pid > 0x7fffffff) return 0;
-    }
-    if (*p != '/') return 0;
-    const char *ot = p + 1;
+    const char *ot = proc_other_tail(canon, &pid);
+    if (!ot) return 0;
     if (pid == (s32)getpid() || !proctab_has(pid)) return 0;
     if (!strcmp(ot, "root")) { strcpy(tgt, "/"); return 1; }
     int want_exe = !strcmp(ot, "exe"), want_cwd = !strcmp(ot, "cwd");

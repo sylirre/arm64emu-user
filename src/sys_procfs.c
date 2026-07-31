@@ -586,22 +586,6 @@ static int synth_memfd(void) {
 #endif
 }
 
-/* "/proc/<N>/<leaf>" with N all-digits -> *pid = N, returns the leaf after the
- * slash (e.g. "status"); NULL if canon isn't of that shape. */
-static const char *proc_num_tail(const char *canon, s32 *pid) {
-    if (strncmp(canon, "/proc/", 6)) return NULL;
-    const char *p = canon + 6;
-    if (*p < '0' || *p > '9') return NULL;
-    long n = 0;
-    for (; *p >= '0' && *p <= '9'; p++) {
-        n = n * 10 + (*p - '0');
-        if (n > 0x7fffffff) return NULL;
-    }
-    if (*p != '/') return NULL;
-    *pid = (s32)n;
-    return p + 1;
-}
-
 /* True if canon names "/proc/<pid>/status" for a VISIBLE process: self,
  * own-pid, or a registered guest pid. A hidden (non-guest) pid returns 0 so the
  * path layer's ENOENT stands and no foreign process's status can leak -- the
@@ -610,7 +594,7 @@ static int status_target(const char *canon) {
     const char *t = self_tail(canon);
     if (t) return !strcmp(t, "status");
     s32 pid;
-    t = proc_num_tail(canon, &pid);
+    t = proc_other_tail(canon, &pid);
     return t && !strcmp(t, "status") && proctab_has(pid);
 }
 
@@ -654,9 +638,10 @@ static int put_status(int fd, struct Machine *m, const char *canon) {
     return 0;
 }
 
-/* "/proc/<N>/cmdline" with N all-digits -> *pid = N, returns 1; else 0. */
+/* "/proc/<N>/cmdline" (or that process's own task/<tid>/cmdline, the same
+ * file) -> *pid = N, returns 1; else 0. */
 static int proc_other_cmdline(const char *canon, s32 *pid) {
-    const char *t = proc_num_tail(canon, pid);
+    const char *t = proc_other_tail(canon, pid);
     return t && !strcmp(t, "cmdline");
 }
 
@@ -694,7 +679,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
      * namespace (self / own-pid go through self_tail below). A non-guest PID
      * misses proctab_has and falls through to the host path's ENOENT. */
     s32 mpid;
-    const char *mtail = proc_num_tail(canon, &mpid);
+    const char *mtail = proc_other_tail(canon, &mpid);
     if (mtail && mpid != (s32)getpid() &&
         (!strcmp(mtail, "mounts") || !strcmp(mtail, "mountinfo") ||
          !strcmp(mtail, "mountstats"))) {
@@ -720,7 +705,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
      * file's wrong-ISA value sends it chasing pauth/SVE regsets the ptrace shim
      * doesn't have). */
     s32 epid;
-    const char *etail = proc_num_tail(canon, &epid);
+    const char *etail = proc_other_tail(canon, &epid);
     if (etail && epid != (s32)getpid() &&
         (!strcmp(etail, "environ") || !strcmp(etail, "auxv"))) {
         if (!proctab_has(epid)) return 0;

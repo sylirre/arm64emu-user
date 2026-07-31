@@ -483,6 +483,10 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
 /* Tail after a "this process" /proc spelling (self, own pid, thread-self, our
  * own task/<tid>), or NULL. */
 const char *proc_self_tail(const char *canon);
+/* Tail after "/proc/<pid>/" for another process, folding away that process's
+ * own task/<tid>/ sub-path (same per-process files); *pid gets the pid. NULL
+ * if canon does not name "/proc/<digits>/...". */
+const char *proc_other_tail(const char *canon, s32 *pid);
 
 /* A namespace-absolute guest path as the guest sees it: subtract the chroot /
  * pivot_root base. out >= PATH_MAX. */
