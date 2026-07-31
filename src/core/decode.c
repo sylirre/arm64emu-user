@@ -985,10 +985,13 @@ static void ldst_register(CPU *c, u32 insn) {
         if (wb == 1) base = base + imm9;            /* post writeback value */
     }
 
-    /* opc==3 with size==3 is unallocated for the plain load/store forms (LSE
-     * atomics reach this function too but return above, so opc here is the
-     * size/sign field). Was executed as a 64-bit signed load truncated to 32. */
-    if (!V && opc == 3 && size == 3) { undefined(c, insn); return; }
+    /* opc==3 is the "load signed, 32-bit result" column, which exists only for
+     * the byte and halfword sizes: size==2 (LDRSW has opc==2) and size==3 are
+     * both unallocated. LSE atomics reach this function too but return above,
+     * so opc here is always the size/sign field. size==3 was executed as a
+     * 64-bit signed load truncated to 32; size==2 as a sign-extending word
+     * load truncated to 32 — qemu raises SIGILL for both. */
+    if (!V && opc == 3 && size >= 2) { undefined(c, insn); return; }
 
     bool ok;
     if (V) ok = is_store ? vreg_store(c, Rt, va, bytes) : vreg_load(c, Rt, va, bytes);

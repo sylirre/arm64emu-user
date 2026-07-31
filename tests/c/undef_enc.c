@@ -64,6 +64,13 @@ int main(void) {
     PROBE("ldr q-form size=1",   0x7DC00020);  /* opc&2 with size!=0 */
     PROBE("ldtr-space simd",     0xBC400820);  /* no SIMD&FP unprivileged form */
 
+    /* opc==3 (signed load, 32-bit result) exists only for B/H sizes; the word
+     * and doubleword columns are unallocated in every addressing mode. */
+    PROBE("ldr size=2 opc=3 uoff", 0xB9C00020);
+    PROBE("ldur size=2 opc=3",     0xB8C00020);
+    PROBE("ldr size=2 opc=3 ro",   0xB8E06820);
+    PROBE("ldr size=3 opc=3 uoff", 0xF9C00020);
+
     /* SIMD&FP pair with opc==3, every addressing mode. The V branch derives
      * scale = opc+2, so accepting these yields a 32-byte "element" that
      * reaches mem_read/mem_write against a u64 stack slot: the load direction
@@ -95,6 +102,8 @@ int main(void) {
     PROBE("smov w, v.b",         0x0E012C20);
     PROBE("movz w, lsl #16",     0x52A00020);  /* hw=1: the allowed neighbour */
     PROBE("extr w, #31",         0x1382FC20);
+    PROBE("ldrsw x0, [x1]",      0xB9800020);  /* size=2 opc=2: the valid one */
+    PROBE("ldrsh w0, [x1]",      0x79C00020);  /* size=1 opc=3 is allocated */
 
     return 0;
 }
