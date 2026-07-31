@@ -632,7 +632,7 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/procfs_hostleak.bin \
             tests/fixtures/procfs_hostleak.c 2>/dev/null; then
-        expect=$'no_host_view=1\ndone'
+        expect=$'no_host_view=1\naddrspace_denied=1\ndone'
         got=$(SECRET=emulator-only timeout 300 "$EMU" / \
               tests/fixtures/procfs_hostleak.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_hostleak"

@@ -533,9 +533,15 @@ then make the consequences the caller depends on true:
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
   PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
   the guest sees only its own process tree — a pid namespace without the
-  namespace. Limits: beyond the registry cap extra guest processes fall back to
-  the emulator cmdline and are hidden, and `stat`/`status` memory/state fields
-  still describe the emulator process.
+  namespace. The **address-space** files of another guest process
+  (`maps`, `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`, `stack`, `mem`,
+  `clear_refs`, `syscall`) have no registry answer to give, and the host's
+  describes the emulator's own mappings at its own foreign-ISA addresses, so
+  they are refused with `EACCES` — the same refusal a host running yama
+  `ptrace_scope=1` already gives between siblings. This process's own stay
+  synthesized. Limits: beyond the registry cap extra guest processes fall back
+  to the emulator cmdline and are hidden, and `stat`/`status` memory/state
+  fields still describe the emulator process.
 
 ## System V IPC (`src/sys_ipc.c`)
 

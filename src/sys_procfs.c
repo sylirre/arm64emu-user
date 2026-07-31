@@ -31,7 +31,10 @@
  * --fake-id, /proc/<pid>/status is also synthesized: the host file's
  * Uid:/Gid:/Groups: lines carry the real invoking uid, but ps/top read them to
  * name the user, so those lines are rewritten through the fake-id remap (a static
- * snapshot; the rest of the file passes through). Everything else under /proc
+ * snapshot; the rest of the file passes through). Another guest process's
+ * address-space files (maps, smaps, pagemap, mem, ...) have no guest answer to
+ * synthesize and the host's describes the emulator, so those are refused with
+ * EACCES rather than passed through. Everything else under /proc
  * stays host-passthrough — including stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <pthread.h>
@@ -645,6 +648,22 @@ static int proc_other_cmdline(const char *canon, s32 *pid) {
     return t && !strcmp(t, "cmdline");
 }
 
+/* Per-process address-space files. Nothing in the registry can synthesize
+ * these, and the host's answer describes the *emulator* -- its own mappings, at
+ * its own foreign-ISA addresses, naming its binary and its libraries -- so for
+ * another guest process they are refused rather than passed through. EACCES is
+ * the shape of refusal a host already gives here: reading them needs
+ * PTRACE_MODE_READ, which yama's ptrace_scope=1 denies between siblings. */
+static int proc_addrspace_leaf(const char *t) {
+    static const char *n[] = {
+        "maps", "smaps", "smaps_rollup", "numa_maps", "pagemap",
+        "stack", "mem", "clear_refs", "syscall",
+    };
+    for (size_t i = 0; i < sizeof n / sizeof n[0]; i++)
+        if (!strcmp(t, n[i])) return 1;
+    return 0;
+}
+
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
  * sets *ret to a host fd or -errno; returns 0 to fall through to the host. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
@@ -731,6 +750,18 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         *ret = fd;
+        return 1;
+    }
+
+    /* Address-space files of ANOTHER guest process: refused, never passed
+     * through (see proc_addrspace_leaf). Only for a pid we admit exists -- a
+     * non-guest one keeps path.c's ENOENT, so this cannot be used to probe
+     * which host pids are real. */
+    s32 apid;
+    const char *atail = proc_other_tail(canon, &apid);
+    if (atail && apid != (s32)getpid() && proc_addrspace_leaf(atail) &&
+        proctab_has(apid)) {
+        *ret = -EACCES;
         return 1;
     }
 

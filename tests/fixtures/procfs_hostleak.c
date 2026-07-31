@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -103,6 +104,35 @@ int main(int argc, char **argv) {
     snprintf(task, sizeof task, "/proc/%d/task/%d", (int)w, (int)w);
     for (int i = 0; i < ROUNDS; i++) { probe(w, plain); probe(w, task); }
 
+    /* The address-space files have no guest answer at all, so they must be
+     * refused rather than passed through -- the host's describe the emulator's
+     * own mappings. EACCES, as a host with yama ptrace_scope=1 already gives
+     * between siblings. Our own stay readable. */
+    static const char *as[] = { "maps", "smaps", "numa_maps", "pagemap",
+                                "stack", "mem", "syscall" };
+    int denied = 1;
+    for (size_t i = 0; i < sizeof as / sizeof as[0]; i++) {
+        char p[128];
+        for (int spelling = 0; spelling < 2; spelling++) {
+            if (spelling) snprintf(p, sizeof p, "/proc/%d/task/%d/%s",
+                                   (int)w, (int)w, as[i]);
+            else          snprintf(p, sizeof p, "/proc/%d/%s", (int)w, as[i]);
+            errno = 0;
+            int fd = open(p, O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                printf("READABLE %s\n", p);
+                denied = 0;
+            } else if (errno != EACCES && errno != ENOENT) {
+                printf("UNEXPECTED errno %d for %s\n", errno, p);
+                denied = 0;
+            }
+        }
+    }
+    int self_maps = open("/proc/self/maps", O_RDONLY);
+    if (self_maps < 0) { printf("own maps unreadable\n"); denied = 0; }
+    else close(self_maps);
+
     kill(w, SIGKILL);
     waitpid(w, NULL, 0);
 
@@ -112,7 +142,9 @@ int main(int argc, char **argv) {
         printf("FAIL: %d host-view reads\n", total);
         return 1;
     }
+    if (!denied) return 1;
     printf("no_host_view=1\n");
+    printf("addrspace_denied=1\n");
     printf("done\n");
     return 0;
 }
