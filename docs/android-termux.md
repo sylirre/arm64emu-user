@@ -161,7 +161,10 @@ filter because the *host glibc* issues them before the net is armed or in ways
 Bionic never would (`rseq`, `set_robust_list`, `clone3`, `membarrier`,
 `accept`); the rationale lives in the `seccomp_wrap.c` header. The related
 `make test-android-sim` target additionally forces the statx-fallback and
-Bionic-keyring code paths at compile time.
+Bionic-keyring code paths at compile time, and compiles in the
+`--link2symlink` hardlink emulation (which `__ANDROID__` enables on its own),
+forcing it to be taken even though the build host allows real hardlinks —
+otherwise that scheme would only ever be exercised on a device.
 
 ## On-device smoke-test checklist
 

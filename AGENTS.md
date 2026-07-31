@@ -107,7 +107,7 @@ Basic testing which enough for most cases to ensure no regressions:
 
 Specialized tests focused at Android OS compatibility:
 
-* `make test-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate).
+* `make test-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here).
 * `make test-seccomp`: suite with the emulator under an Android-Oreo SECCOMP_RET_TRAP filter (no device).
 
 **Important**: do not run any of tests above in parallel with each other.

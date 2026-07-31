@@ -36,7 +36,13 @@ BUILDDIR  := build
 # (tests/asm/m22_fpsr). SSE math makes the FP core behave exactly like the
 # 64-bit build; every host that can run this is an x86-64 with SSE2.
 M32FLAGS  := -m32 -msse2 -mfpmath=sse
-ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS
+# A64_LINK2SYMLINK compiles in the emulated-hardlink scheme that __ANDROID__
+# enables automatically, and A64_L2S_FORCE makes --link2symlink take it even
+# where the host allows real hardlinks. Both are inert unless the guest is run
+# with --link2symlink, so they cost the rest of this variant nothing — and
+# without them the scheme has no coverage anywhere off Android.
+ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
+             -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 DEPFLAGS   = -MMD -MP
 
 NATIVE_OBJ := $(SRCS:%.c=$(BUILDDIR)/native/%.o)

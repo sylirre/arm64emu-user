@@ -421,6 +421,69 @@ static void l2s_decref(const char *data, unsigned long count) {
         rename(m, newm);
 }
 
+/* A group member is being renamed OUT of the directory holding its backing.
+ *
+ * A "hardlink" symlink targets a bare same-directory basename (".l2s.<ino>",
+ * see l2s_link), which is what makes it resolve identically for the guest and
+ * for us. Move that symlink to another directory and the target no longer
+ * names anything: the host rename reports success, the new name dangles, and
+ * its reference is stranded -- the marker still counts it, so the backing can
+ * never be reclaimed even after every visible name is gone.
+ *
+ * Two cases, and the second follows the policy l2s_link already sets for a
+ * cross-directory hardlink (copy, independent inode):
+ *   last name  -- move the backing itself onto the new name. Exact: same
+ *                 inode, same contents, and the guest gets an ordinary file
+ *                 back with st_nlink 1, which is the truth.
+ *   others left -- copy the contents to the new name and drop this reference.
+ *                 The names that stay behind keep sharing; the moved one
+ *                 becomes independent. Sharing cannot survive the move,
+ *                 because a same-directory target cannot address another
+ *                 directory and an absolute one is wrong for either side.
+ *
+ * Not atomic, unlike rename(2) -- neither is the cross-directory link it
+ * mirrors. Returns 1 when it handled the rename (*err = 0 or -errno), 0 when
+ * this is not that case and the caller should do the ordinary host rename. */
+static int l2s_rename_out(struct Machine *m, const char *src, const char *dst,
+                          int may_replace, int *err) {
+    char data[PATH_MAX];
+    unsigned long count;
+    if (l2s_resolve(src, data, &count) != 1) return 0;   /* not a group member */
+
+    char sdir[PATH_MAX], ddir[PATH_MAX];
+    l2s_dirname(data, sdir);
+    l2s_dirname(dst, ddir);
+    if (strcmp(sdir, ddir) == 0) return 0;   /* same dir: the target still resolves */
+
+    unsigned long long ino;
+    if (!l2s_parse_data(l2s_basename(data), &ino)) return 0;
+
+    if (!may_replace) {                      /* RENAME_NOREPLACE */
+        struct stat dst_st;
+        if (lstat(dst, &dst_st) == 0) { *err = -EEXIST; return 1; }
+    }
+
+    if (count <= 1) {                        /* last name: move the real file */
+        if (rename(data, dst) < 0) { *err = -errno; return 1; }
+        char mk[PATH_MAX];
+        if (l2s_marker_name(mk, sdir, ino, count ? count : 1) == 0) unlink(mk);
+        unlink(src);                         /* the now-stale symlink */
+        *err = 0;
+        return 1;
+    }
+
+    /* l2s_materialize creates with O_EXCL, so clear a destination the caller
+     * is entitled to replace; its own l2s bookkeeping is the caller's job and
+     * was captured before this point. */
+    if (may_replace) unlink(dst);
+    int r = l2s_materialize(m, data, dst);
+    if (r < 0) { *err = r; return 1; }
+    unlink(src);
+    l2s_decref(data, count);                 /* this name left the group */
+    *err = 0;
+    return 1;
+}
+
 /* If `host` resolves to one of our backing files, stat it (a regular file) into
  * *out with st_nlink = live count. Returns 1 (filled), 0 (not ours), -errno. */
 static int l2s_stat(const char *host, struct stat *out) {
@@ -1776,6 +1839,14 @@ SYSDEF(renameat) {
     if (c->m->link2symlink && strcmp(h1, h2) != 0) {
         isl = l2s_resolve(h2, backing, &count);   /* dest replaced by the rename */
         if (isl < 0) isl = 0;
+        /* Moving a group member to another directory cannot be a plain host
+         * rename: the symlink's same-directory target would stop resolving. */
+        int lerr = 0;
+        if (l2s_rename_out(c->m, h1, h2, 1, &lerr)) {
+            if (lerr < 0) return (u64)(s64)lerr;
+            if (isl == 1) l2s_decref(backing, count);
+            return 0;
+        }
     }
 #endif
     if (rename(h1, h2) < 0) return host_err();
@@ -1793,6 +1864,25 @@ SYSDEF(renameat2) {
     r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
     if (r < 0) return (u64)(s64)r;
     if (host_ro(c->m, h1) || host_ro(c->m, h2)) return (u64)(s64)-EROFS;
+#ifdef L2S_ENABLED
+    /* RENAME_NOREPLACE is plain rename plus "the destination must not exist",
+     * so a group member leaving its directory needs the same handling; the
+     * helper enforces the extra condition itself. RENAME_EXCHANGE is a
+     * different operation (two names swap, each possibly its own group) and
+     * still goes to the host untouched -- a cross-directory exchange of an
+     * l2s symlink remains broken, as it was. */
+    if (c->m->link2symlink && (unsigned)a4 == 1 /*RENAME_NOREPLACE*/ &&
+        strcmp(h1, h2) != 0) {
+        char backing[PATH_MAX]; unsigned long count;
+        int isl = l2s_resolve(h2, backing, &count);
+        int lerr = 0;
+        if (l2s_rename_out(c->m, h1, h2, 0, &lerr)) {
+            if (lerr < 0) return (u64)(s64)lerr;
+            if (isl == 1) l2s_decref(backing, count);
+            return 0;
+        }
+    }
+#endif
     long rr = syscall(SYS_renameat2, AT_FDCWD, h1, AT_FDCWD, h2, (unsigned)a4);
     return rr < 0 ? host_err() : 0;
 }

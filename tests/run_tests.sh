@@ -70,6 +70,25 @@ for cfile in tests/c/*.c; do
 done
 rm -f /tmp/t.bin
 
+# ---- -link2symlink: emulated hardlinks ----
+# The C loop above already ran this test with real hardlinks. Run it again with
+# the option on: under the android-sim build (which compiles the scheme in and
+# forces it) that exercises the symlink+backing emulation, and under every
+# other build the option is accepted but link(2) still reaches the host, so the
+# check stays valid either way. qemu is a usable oracle because the test asserts
+# only what both worlds must agree on -- names readable, directories reclaimable
+# -- and not st_nlink, which the scheme reports from its own bookkeeping.
+if [ -x tests/c/l2s_rename_static.bin ]; then
+    out_q=$(timeout 60 "$QEMU" tests/c/l2s_rename_static.bin 2>/dev/null); rc_q=$?
+    out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/l2s_rename(--link2symlink)"
+    else
+        fail=$((fail+1)); echo "FAIL c/l2s_rename(--link2symlink) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -8 | sed 's/^/     /'
+    fi
+fi
+
 # ---- System V shm: file-backed fallback tier ----
 # The shm tests already ran memfd-backed vs the qemu oracle in the C loop above.
 # Re-run them with A64_SHM_FORCE_FILE=1 so the broker backs each segment with a
