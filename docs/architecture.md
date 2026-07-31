@@ -128,6 +128,16 @@ tightening an encoding in `decode.c`, check whether `pd_fill` classifies that
 form and tighten it in the same commit; `tests/c/undef_enc.c` runs under the
 default (predecode) engine, and `make test-jit` covers the frontend.
 
+The invariant is also enforced directly, by the `chaos` mode of
+`tests/fixtures/insnfuzz.c`: it runs random instruction words through the
+decode cache, `--no-predecode` and `--jit` and requires all three to produce
+the same result. qemu cannot referee that comparison — it rejects encodings we
+still execute and implements extensions we do not — but the three engines
+refereeing each other needs no oracle at all, and a guard that reaches
+`decode.c` alone shows up there immediately. Its sibling `conform` mode covers
+the other half: a table of real allocated encodings, replayed against varying
+input state, where qemu *is* the oracle and the match must be exact.
+
 The optional `--jit` inserts one more rung above `pd_run`: `jit_run`
 (`src/jit/`) executes native translations of guest basic blocks and honors the
 same return contract, handing control back to `emu_loop` on the same rare

@@ -247,6 +247,17 @@ from scratch into a repo-local cache (`tests/.cache/`) on first run. The
 glibc tree is built offline from the cross sysroot. The Alpine tree needs
 a one-time network fetch.
 
+The suite ends with a differential instruction fuzzer
+(`tests/fixtures/insnfuzz.c`), which executes one instruction at a time
+against a varying register/vector state and compares a digest of the result.
+It runs in two modes because the two useful comparisons have different
+oracles: `conform` replays a table of real, allocated encodings and requires
+an exact match against qemu-aarch64, while `chaos` feeds fully random
+instruction words — where qemu is *not* an oracle, since the emulator still
+executes some unallocated encodings and implements no MTE/SM3/SM4/I8MM — and
+instead requires the decode cache, the plain decoder and the JIT to agree
+with each other.
+
 Override the location of test environment with variable `A64_TEST_ROOT`.
 Wipe test environment with `make clean-testenv`.
 

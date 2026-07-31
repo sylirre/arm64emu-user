@@ -857,6 +857,44 @@ for pt in tests/ptrace/*.c; do
     rm -f "$ptbin"
 done
 
+# ---- differential instruction fuzzer (tests/fixtures/insnfuzz.c) ----
+# Two comparisons, because they have different oracles.
+#
+# conform: a table of real, allocated encodings run against a varying random
+# register/vector state. qemu is the oracle and the match must be exact. The
+# encodings are fixed; what the seeds buy is input values -- saturation edges,
+# rounding ties, flag corners -- which is where the arithmetic bugs were.
+#
+# chaos: fully random instruction words, where qemu is NOT an oracle (we still
+# execute some unallocated encodings it rejects, and do not implement
+# MTE/SM3/SM4/I8MM). Instead the three engines -- decode cache, plain decoder,
+# JIT -- must agree with each other. That is the invariant a classifier bug
+# breaks: pd_fill is both the decode cache's classifier and the JIT frontend's
+# decoder, so a guard missing from it changes architectural behaviour in two
+# engines while --no-predecode keeps the old one. --jit degrades to the
+# interpreter where no backend exists, which still leaves the check valid.
+if [ -n "$AGCC" ]; then
+    ifb=tests/fixtures/insnfuzz.bin
+    if "$AGCC" -static -O1 -o "$ifb" tests/fixtures/insnfuzz.c 2>/dev/null; then
+        for seed in 1 7 12345; do
+            run_diff "insnfuzz: conform (seed $seed)" "$ifb" conform "$seed" 15200
+        done
+        c_pd=$(timeout 120 "$EMU" / "$ifb" chaos 1 15000 2>/dev/null)
+        c_np=$(timeout 120 "$EMU" --no-predecode / "$ifb" chaos 1 15000 2>/dev/null)
+        c_jit=$(timeout 120 "$EMU" --jit / "$ifb" chaos 1 15000 2>/dev/null)
+        if [ -n "$c_pd" ] && [ "$c_pd" = "$c_np" ] && [ "$c_pd" = "$c_jit" ]; then
+            pass=$((pass+1)); echo "PASS insnfuzz: chaos (engines agree)"
+        else
+            fail=$((fail+1)); echo "FAIL insnfuzz: chaos (engines disagree)"
+            diff <(echo "$c_pd") <(echo "$c_np") | head -4 | sed 's/^/     pd-vs-decoder /'
+            diff <(echo "$c_pd") <(echo "$c_jit") | head -4 | sed 's/^/     pd-vs-jit     /'
+        fi
+        rm -f "$ifb"
+    else
+        echo "SKIP build fixtures/insnfuzz"
+    fi
+fi
+
 echo
 echo "== $pass passed, $fail failed =="
 exit $((fail > 0))
