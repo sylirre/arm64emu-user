@@ -75,7 +75,28 @@ struct ProcEnt {
     char auxv[PROCTAB_AUXV];     /* raw guest auxv (u64 tag/value pairs) */
     char exe[PROCTAB_PATH];      /* canonical guest exe path */
     char cwd[PROCTAB_PATH];      /* canonical guest cwd */
+
+    /* Faked user namespace: which process asked for one, and the id maps of
+     * "its" namespace (sys_procfs.c). Unlike everything above these are written
+     * by OTHER processes too -- the standard setup has the parent write the
+     * child's maps while the child waits -- so they sit outside the owner-only
+     * seqlock and carry their own publication order: text first, length last
+     * (release), and a CAS on *_claim for the kernel's write-once rule. Nothing
+     * here is ever rewritten once published, so a reader needs no retry. */
+    u8  userns;                  /* the owner faked CLONE_NEWUSER */
+    u8  sg_deny;                 /* setgroups: "deny" latched */
+    u8  uid_claim, gid_claim;    /* the single allowed write, CAS-claimed */
+    u32 uid_len, gid_len;        /* published AFTER the text below */
+    char uid_map[IDMAP_MAX];     /* kernel read-back form, "" until written */
+    char gid_map[IDMAP_MAX];
 };
+
+/* A slot claimed for a process that does not exist yet (proctab_reserve): not a
+ * pid and not 0, so no scan matches it and the free-slot CAS will not take it.
+ * A registrar SIGKILL'd between reserving and registering -- a window that
+ * spans one fork(2) -- leaves the slot reserved for good, which costs one entry
+ * of a persistent --shared-proc table and nothing at all otherwise. */
+#define PT_RESERVED ((s32)0x80000000)
 
 static struct ProcEnt *g_tab;    /* MAP_SHARED, or NULL if unavailable */
 static int g_tab_n;              /* PROCTAB_MAX, or 0 */
@@ -135,10 +156,11 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v3 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v4 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
-     * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v3.%u.%08x",
+     * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
+     * faked user namespace's id maps.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v4.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;
@@ -178,17 +200,19 @@ static int proctab_memfd(void) {
  * shm). leading NUL => no filesystem entry. `session` != 0 keys it per-invocation
  * (shm without --shared-proc, scoped to one launch's process tree); session == 0
  * keys it per-rootfs by `key_hash` (proctab, and --shared-proc shm, so every
- * invocation of the same rootfs and uid meets at one broker). The "ipc.v2"
+ * invocation of the same rootfs and uid meets at one broker). The "ipc.v3"
  * version tag guarantees a differently-versioned build never joins a daemon
- * speaking an incompatible request protocol. Returns the sockaddr length. */
+ * speaking an incompatible request protocol -- or, for proctab, one holding a
+ * memfd sized for an older struct ProcEnt, which this build would map past its
+ * end. Returns the sockaddr length. */
 static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     memset(a, 0, sizeof *a);
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v2.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v3.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v2.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v3.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -256,10 +280,16 @@ static int broker_recv(int sock, void *data, size_t len, int *fd_out) {
 
 /* Any guest of this rootfs still alive? The registry is the liveness signal: a
  * slot's pid is cleared on clean exit and reads dead (starttime 0) after a
- * SIGKILL, so an all-dead scan means the session is truly over. */
+ * SIGKILL, so an all-dead scan means the session is truly over. A slot claimed
+ * as -pid is mid-registration and counts for its process just the same: a
+ * session must not be declared over on the strength of a window a few
+ * instructions wide. PT_RESERVED names no process and says nothing either way
+ * -- whoever reserved it has a live entry of its own. */
 static int broker_table_live(struct ProcEnt *tab) {
     for (int i = 0; i < PROCTAB_MAX; i++) {
         s32 pid = __atomic_load_n(&tab[i].pid, __ATOMIC_ACQUIRE);
+        if (pid == PT_RESERVED) continue;
+        if (pid < 0) pid = -pid;
         if (pid > 0 && proc_starttime(pid) != 0) return 1;
     }
     return 0;
@@ -1789,13 +1819,60 @@ void proctab_init(const char *rootfs_key) {
     g_tab_n = PROCTAB_MAX;
 }
 
-/* Register/refresh this process's entry: reuse its slot (execve) or CAS-claim a
- * free one (initial exec / fork child). `start` is sampled before the seqlock so
- * the critical section is syscall-free (a tiny, kill-safe window). */
-void proctab_register(s32 pid, const char *cmd, u32 len,
-                      const char *exe, const char *cwd,
-                      const char *env, u32 env_len,
-                      const char *auxv, u32 auxv_len) {
+/* Our own slot, when we know it: set when we register ourselves, adopted from
+ * the reservation our parent made for us (proctab_slot_adopt). -1 = unknown,
+ * fall back to searching. Per thread, because a new thread inherits nothing --
+ * and it needs nothing: registration is per process. */
+static __thread int g_own_slot = -1;
+
+/* A free slot, claimed for a process that does not exist yet. The pid field
+ * takes a sentinel that no scan will match, and the entry is cleared here --
+ * before the fork, where nothing else can be looking at it. The point is that
+ * the CHILD then knows its slot the instant it starts: its entry is published
+ * by its parent, which runs concurrently with it, and a child that needs the
+ * entry first (unshare(CLONE_NEWUSER), whose namespace has to be recorded
+ * somewhere its parent can write to) would otherwise have to guess how long to
+ * wait, or race the parent for a free slot and end up with two. Returns a slot
+ * index, or -1 when the table is full (callers fall back to searching). */
+int proctab_reserve(void) {
+    if (!g_tab) return -1;
+    for (int i = 0; i < g_tab_n; i++) {
+        s32 expect = 0;
+        if (!__atomic_compare_exchange_n(&g_tab[i].pid, &expect, PT_RESERVED,
+                                         false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        struct ProcEnt *e = &g_tab[i];
+        /* A previous owner SIGKILL'd mid-write may have left the seqlock odd,
+         * which would invert its parity for the whole life of the new entry. */
+        __atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
+        e->start = 0;
+        __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
+        e->sg_deny = e->uid_claim = e->gid_claim = 0;
+        __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+        return i;
+    }
+    return -1;
+}
+
+/* Give a reservation back (the fork it was made for failed). */
+void proctab_release(int slot) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return;
+    s32 expect = PT_RESERVED;
+    __atomic_compare_exchange_n(&g_tab[slot].pid, &expect, 0, false,
+                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+/* In the fork child: the slot our parent reserved for us is ours. */
+void proctab_slot_adopt(int slot) { g_own_slot = slot; }
+
+/* Register/refresh this process's entry: use the slot reserved for it, reuse
+ * its own (execve), or CAS-claim a free one. `start` is sampled before the
+ * seqlock so the critical section is syscall-free (a tiny, kill-safe window). */
+void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
+                         const char *exe, const char *cwd,
+                         const char *env, u32 env_len,
+                         const char *auxv, u32 auxv_len) {
     if (!g_tab || pid <= 0) return;
     if (len > PROCTAB_CMDLINE) len = PROCTAB_CMDLINE;
     if (env_len > PROCTAB_ENVIRON) env_len = PROCTAB_ENVIRON;
@@ -1805,24 +1882,50 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
     u32 cwd_len = cwd ? (u32)strlen(cwd) : 0;
     if (cwd_len > PROCTAB_PATH) cwd_len = PROCTAB_PATH;
     u64 start = proc_starttime(pid);
-    int slot = -1, claimed = 0;
-    for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) { slot = i; break; }
+    int slot = -1, claimed = 0, reserved = 0;
+    /* The slot reserved for this pid before it was forked, if there is one:
+     * already cleared, already exclusively ours, and possibly already carrying
+     * a namespace the child recorded in it -- so nothing below may clear it. */
+    if (rsv >= 0 && rsv < g_tab_n &&
+        __atomic_load_n(&g_tab[rsv].pid, __ATOMIC_ACQUIRE) == PT_RESERVED) {
+        slot = rsv; reserved = 1;
+    }
+    /* Registering ourselves (execve) while our own slot is still the
+     * reservation our parent made -- it publishes that, concurrently with us --
+     * must use it, or the search below would miss it and claim a second slot
+     * for the same pid. */
+    if (slot < 0 && pid == (s32)getpid() && g_own_slot >= 0 && g_own_slot < g_tab_n) {
+        s32 cur = __atomic_load_n(&g_tab[g_own_slot].pid, __ATOMIC_ACQUIRE);
+        if (cur == pid)              slot = g_own_slot;
+        else if (cur == PT_RESERVED) { slot = g_own_slot; reserved = 1; }
+    }
+    if (slot < 0)
+        for (int i = 0; i < g_tab_n; i++)
+            if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) { slot = i; break; }
+    /* A searched-out slot is claimed as -pid, not pid: negative matches no scan
+     * (they all want a positive pid, and the free-slot CAS wants 0), so the
+     * entry stays invisible until it is built. Published straight away, it
+     * would be visible for the few instructions up to the clear below -- long
+     * enough for the process it is FOR to find it, record a namespace in it,
+     * and have that clear wipe it out again. */
     if (slot < 0)
         for (int i = 0; i < g_tab_n; i++) {
             s32 expect = 0;
-            if (__atomic_compare_exchange_n(&g_tab[i].pid, &expect, pid, false,
+            if (__atomic_compare_exchange_n(&g_tab[i].pid, &expect, -pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
                 slot = i; claimed = 1; break;
             }
         }
     if (slot < 0)   /* full: reclaim a slot whose process is gone (stale after a
                      * missed unregister — common with the persistent shared
-                     * backing) by CAS'ing its dead pid straight to ours. */
+                     * backing) by CAS'ing its dead pid straight to ours. A slot
+                     * left reserved by a registrar killed mid-write is dead in
+                     * the same way, and is reclaimed on the same terms. */
         for (int i = 0; i < g_tab_n; i++) {
             s32 dead = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
-            if (dead <= 0 || proc_starttime(dead) != 0) continue;
-            if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, pid, false,
+            if (dead == 0 || dead == PT_RESERVED) continue;
+            if (proc_starttime(dead < 0 ? -dead : dead) != 0) continue;
+            if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, -pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
                 slot = i; claimed = 1; break;
             }
@@ -1836,6 +1939,19 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
      * every reader either spins out on a permanently odd counter or takes a
      * half-written payload for a stable one. */
     if (claimed) __atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
+    /* Likewise the id-map sub-record, which lives outside the seqlock: a new
+     * process must not inherit the previous owner's namespace. The slot is the
+     * same process only when its starttime still matches -- an execve
+     * re-registering, which keeps the user namespace, and which is also how a
+     * parent's already-seeded maps for a child survive the child's own exec. A
+     * slot left by a dead process (a missed unregister, then PID reuse) is as
+     * fresh as one just claimed. */
+    if (claimed || (!reserved && e->start != start)) {
+        __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
+        e->sg_deny = e->uid_claim = e->gid_claim = 0;
+        __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+    }
     /* fetch_add, not load+store: two threads of one guest process can reach a
      * writer at once (a concurrent chdir via proctab_set_cwd), and a lost
      * update there would invert the parity the same way. Two adds per writer
@@ -1856,6 +1972,16 @@ void proctab_register(s32 pid, const char *cmd, u32 len,
     if (cwd_len)           memcpy(e->cwd, cwd, cwd_len);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* even: write done */
+    /* Built: publish the slot under its real pid (see the claim above). */
+    if (claimed || reserved) __atomic_store_n(&e->pid, pid, __ATOMIC_RELEASE);
+    if (pid == (s32)getpid()) g_own_slot = slot;
+}
+
+void proctab_register(s32 pid, const char *cmd, u32 len,
+                      const char *exe, const char *cwd,
+                      const char *env, u32 env_len,
+                      const char *auxv, u32 auxv_len) {
+    proctab_register_at(-1, pid, cmd, len, exe, cwd, env, env_len, auxv, auxv_len);
 }
 
 /* Update just this process's own cwd slot (called from chdir/fchdir) so another
@@ -1882,6 +2008,7 @@ void proctab_set_cwd(s32 pid, const char *cwd) {
 
 void proctab_unregister(s32 pid) {
     if (!g_tab || pid <= 0) return;
+    if (pid == (s32)getpid()) g_own_slot = -1;
     for (int i = 0; i < g_tab_n; i++)
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) {
             __atomic_store_n(&g_tab[i].pid, 0, __ATOMIC_RELEASE);
@@ -1955,6 +2082,147 @@ int proctab_cmdline(s32 pid, char *out, u32 *len) {
     if (!proctab_get(pid, &snap)) return 0;
     memcpy(out, snap.cmd, snap.cmd_len);
     *len = snap.cmd_len;
+    return 1;
+}
+
+/* ---- id maps of a faked user namespace ----------------------------------
+ *
+ * These live here rather than in struct Machine because the standard way to set
+ * a user namespace up is for the PARENT to write the child's maps -- a process
+ * that unshared CLONE_NEWUSER usually cannot map anything itself -- and one
+ * emulator process cannot reach another's Machine. sys_procfs.c serves the
+ * three files out of whichever answers: this record when the namespace was
+ * recorded here, the caller's own Machine otherwise (no slot, or a table that
+ * degraded off entirely -- and then only for the caller itself).
+ *
+ * Concurrency: see the sub-record's declaration. The writes are one-shot and
+ * the entry's owner never touches these fields, so no seqlock is involved. */
+
+static struct ProcEnt *entry_of(s32 pid) {
+    if (!g_tab || pid <= 0) return NULL;
+    for (int i = 0; i < g_tab_n; i++)
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) return &g_tab[i];
+    return NULL;
+}
+
+/* Our own entry, which may still be the reservation our parent made rather than
+ * a published slot -- it publishes that concurrently with us running, so a
+ * search by pid can miss it. Reaching it anyway is the point of the
+ * reservation: a process that unshares the moment it starts can still record
+ * the namespace where its parent will look to write its maps. */
+static struct ProcEnt *own_entry(void) {
+    s32 me = (s32)getpid();
+    if (g_own_slot >= 0 && g_own_slot < g_tab_n) {
+        s32 cur = __atomic_load_n(&g_tab[g_own_slot].pid, __ATOMIC_ACQUIRE);
+        if (cur == me || cur == PT_RESERVED) return &g_tab[g_own_slot];
+    }
+    return entry_of(me);
+}
+
+/* Our own entry via own_entry (it may still be a reservation), anyone else's by
+ * search — a slot nobody has published is nobody else's business. */
+static struct ProcEnt *resolve_entry(s32 pid) {
+    return pid == (s32)getpid() ? own_entry() : entry_of(pid);
+}
+
+/* Record that we have a brand-new (empty) faked user namespace: unshare(2). */
+void proctab_userns_fresh(s32 pid) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e) return;   /* table full: Machine answers, for us alone */
+    e->sg_deny = e->uid_claim = e->gid_claim = 0;
+    __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->userns, 1, __ATOMIC_RELEASE);   /* last: gates readers */
+}
+
+/* Seed the user namespace of a process about to be forked into the slot
+ * reserved for it: `fresh` if it asked for CLONE_NEWUSER, otherwise a copy of
+ * ours, maps and all, exactly as it will inherit the Machine copy.
+ *
+ * Before the fork on purpose. Afterwards the child is the only writer of its
+ * own record -- its own unshare -- and parent and child have no ordering
+ * between them, so a seed running late would hand a child that has just
+ * unshared the namespace it left. Here the slot is reserved and the child does
+ * not exist, so nothing can be looking: plain stores, no publication order. */
+void proctab_userns_seed(int slot, int fresh) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return;
+    struct ProcEnt *e = &g_tab[slot];   /* cleared by proctab_reserve */
+    if (fresh) { e->userns = 1; return; }
+    struct ProcEnt *p = own_entry();
+    if (!p || !__atomic_load_n(&p->userns, __ATOMIC_ACQUIRE)) return;
+    u32 ul = __atomic_load_n(&p->uid_len, __ATOMIC_ACQUIRE);
+    u32 gl = __atomic_load_n(&p->gid_len, __ATOMIC_ACQUIRE);
+    if (ul > IDMAP_MAX) ul = IDMAP_MAX;
+    if (gl > IDMAP_MAX) gl = IDMAP_MAX;
+    if (ul) memcpy(e->uid_map, p->uid_map, ul);
+    if (gl) memcpy(e->gid_map, p->gid_map, gl);
+    e->sg_deny = __atomic_load_n(&p->sg_deny, __ATOMIC_ACQUIRE);
+    e->uid_claim = ul ? 1 : 0;   /* an inherited map is already written */
+    e->gid_claim = gl ? 1 : 0;
+    e->uid_len = ul;
+    e->gid_len = gl;
+    e->userns = 1;
+}
+
+/* Does `pid` have a faked user namespace recorded here? */
+int proctab_userns(s32 pid) {
+    struct ProcEnt *e = resolve_entry(pid);
+    return e && __atomic_load_n(&e->userns, __ATOMIC_ACQUIRE);
+}
+
+/* Read one of the three files for `pid` into `out`. Returns 1 when this record
+ * answered (`*len` set, possibly 0 for a map nobody has written), 0 to leave
+ * the caller with its own Machine state. */
+int proctab_idmap_read(s32 pid, int kind, char *out, u32 outsz, u32 *len) {
+    *len = 0;
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
+    if (kind == PT_IDMAP_SG) {
+        /* Never empty: the kernel always reports one word or the other. */
+        const char *s = __atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE)
+                        ? "deny\n" : "allow\n";
+        u32 n = (u32)strlen(s);
+        if (n <= outsz) { memcpy(out, s, n); *len = n; }
+        return 1;
+    }
+    int uid = kind == PT_IDMAP_UID;
+    u32 n = __atomic_load_n(uid ? &e->uid_len : &e->gid_len, __ATOMIC_ACQUIRE);
+    if (n > IDMAP_MAX) n = IDMAP_MAX;   /* a foreign build's value: clamp */
+    if (n > outsz) n = outsz;
+    if (n) memcpy(out, uid ? e->uid_map : e->gid_map, n);
+    *len = n;
+    return 1;
+}
+
+/* Write one of the three files for `pid`. `text` is the kernel read-back form
+ * the caller already validated ("deny\n"/"allow\n" for setgroups). Returns 1
+ * when this record took the write, with *err 0 or the errno the kernel's
+ * ordering rules call for; 0 to leave the caller with its own Machine state. */
+int proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
+    *err = 0;
+    if (kind == PT_IDMAP_SG) {
+        /* Settable only until gid_map is written (the decision has been used by
+         * then), and never back from "deny" to "allow". */
+        int deny = len >= 4 && !memcmp(text, "deny", 4);
+        if (__atomic_load_n(&e->gid_len, __ATOMIC_ACQUIRE)) *err = -EPERM;
+        else if (!deny && __atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE)) *err = -EPERM;
+        else __atomic_store_n(&e->sg_deny, (u8)deny, __ATOMIC_RELEASE);
+        return 1;
+    }
+    int uid = kind == PT_IDMAP_UID;
+    u8 expect = 0;
+    if (!__atomic_compare_exchange_n(uid ? &e->uid_claim : &e->gid_claim,
+                                     &expect, 1, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        *err = -EPERM;   /* the kernel's one successful write per map */
+        return 1;
+    }
+    if (len > IDMAP_MAX) len = IDMAP_MAX;
+    if (len) memcpy(uid ? e->uid_map : e->gid_map, text, len);
+    /* Length last, so a reader that sees it takes bytes already in place. */
+    __atomic_store_n(uid ? &e->uid_len : &e->gid_len, len, __ATOMIC_RELEASE);
     return 1;
 }
 

@@ -442,9 +442,24 @@ SYSDEF(clone) {
             pt_ev = (o & G_PTRACE_O_TRACEFORK) ? G_PTRACE_EVENT_FORK : 0;
     }
 
+    /* The child's registry slot, taken before it exists so that both sides know
+     * it: the parent fills it in below, and the child -- which runs from here
+     * on concurrently with the parent -- can reach its own entry straight away
+     * rather than wait for that, or race the parent for a free slot and end up
+     * with two. It matters for a child that unshares a user namespace at once:
+     * that has to be recorded where its parent will look to write its maps. */
+    int rsv = proctab_reserve();
+    /* Its user namespace goes in now, while the slot is reserved and the child
+     * does not exist: after the fork the child is the only writer of its own
+     * record, and we have no ordering with it -- seeding late would hand a
+     * child that had just unshared the namespace it left. */
+    if (flags & G_CLONE_NEWUSER) proctab_userns_seed(rsv, 1);
+    else if (m->fake_userns)     proctab_userns_seed(rsv, 0);
+
     pid_t pid = fork();
-    if (pid < 0) return host_err();
+    if (pid < 0) { proctab_release(rsv); return host_err(); }
     if (pid == 0) {
+        proctab_slot_adopt(rsv);          /* the slot our parent reserved */
         g_tls.tid = getpid();             /* new process: tid == pid */
         /* Only the forking thread exists here: fork(2) duplicates the calling
          * thread alone, so the inherited count -- which gates the retired-
@@ -491,6 +506,13 @@ SYSDEF(clone) {
             m->uid_map_set = m->gid_map_set = m->setgroups_set = 0;
             m->setgroups_deny = 0;
             m->uid_map[0] = m->gid_map[0] = 0;
+        } else if (m->fake_userns) {
+            /* Otherwise we keep the parent's namespace -- and its maps, which
+             * may live only in the shared registry (whoever wrote them for the
+             * parent had nowhere else to put them). Take a copy now, so this
+             * does not depend on our own slot, which our parent publishes
+             * concurrently with us running. */
+            procfs_idmap_inherit(m, (s32)getppid());
         }
         m->nl_ack_pending = 0;
         if (flags & G_CLONE_CHILD_SETTID) {
@@ -515,9 +537,9 @@ SYSDEF(clone) {
      * to its own registration and got ENOENT. Everything registered here is
      * fork-inherited state, identical to what the child would have written, and
      * the single writer keeps the slot's seqlock uncontended. */
-    proctab_register((s32)pid, m->cmdline, m->cmdline_len,
-                     m->exec_path, m->cwd, m->environ, m->environ_len,
-                     m->auxv, m->auxv_len);
+    proctab_register_at(rsv, (s32)pid, m->cmdline, m->cmdline_len,
+                        m->exec_path, m->cwd, m->environ, m->environ_len,
+                        m->auxv, m->auxv_len);
     if (flags & G_CLONE_PARENT_SETTID) {
         s32 tid = (s32)pid;
         copy_to_guest(c, ptid, &tid, 4);
@@ -1406,10 +1428,16 @@ SYSDEF(unshare) {
     if (a0 & G_CLONE_NEWNS) bindtab_unshare();
     if (a0 & G_CLONE_NEWNET) c->m->fake_netns = 1;
     if (a0 & G_CLONE_NEWUSER) {
-        c->m->fake_userns = 1;
-        c->m->uid_map_set = c->m->gid_map_set = c->m->setgroups_set = 0;
-        c->m->setgroups_deny = 0;
-        c->m->uid_map[0] = c->m->gid_map[0] = 0;
+        struct Machine *m = c->m;
+        m->fake_userns = 1;
+        m->uid_map_set = m->gid_map_set = m->setgroups_set = 0;
+        m->setgroups_deny = 0;
+        m->uid_map[0] = m->gid_map[0] = 0;
+        /* Publish the namespace where a parent can find it and write our maps
+         * for us -- the usual way they get written. Our registry slot reaches
+         * back to the reservation made before we were forked, so this lands
+         * even if our parent has not published the entry yet. */
+        proctab_userns_fresh((s32)getpid());
     }
     return 0;
 }

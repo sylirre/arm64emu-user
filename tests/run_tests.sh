@@ -562,17 +562,21 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
-# ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps,
-# a private mount namespace, and pivot_root (bubblewrap's stack-then-detach
-# idiom included). Self-checking: qemu hands all of these to the real kernel,
-# which refuses them unprivileged, so it cannot be the oracle. Gated on
-# --fake-id, like the mount and chroot emulation itself. ----
+# ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
+# (written by the process itself AND, the usual arrangement, by its parent), a
+# private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom
+# included). Self-checking: qemu hands all of these to the real kernel, which
+# refuses them unprivileged, so it cannot be the oracle. The umap_* block is
+# nonetheless exactly what a real kernel prints -- it runs before the process
+# has unshared anything, where an unprivileged parent may map its own euid into
+# a child's namespace for real. Gated on --fake-id, like the mount and chroot
+# emulation itself. ----
 if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
     if "$AGCC" -static -O2 -o "$ALPINE/tmp/sandbox_probe.bin" \
             tests/fixtures/sandbox_probe.c 2>/dev/null; then
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
         got=$("$EMU" --fake-id "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null)
-        expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\nouter_root=1'
+        expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\numap_sg=4\numap_empty=[]\numap_gid=8\numap_sg_late=1\numap_uid=8\numap_junk=1\numap_back=         0       1000          1\numap_child_uid=         0       1000          1\numap_child_gid=         0       1000          1\numap_child_sg=deny\numap_child_twice=1\numap_inherit=         0       1000          1\numap_status=0\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\nouter_root=1'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS sandbox: mount/userns/pivot_root"
         else
             fail=$((fail+1)); echo "FAIL sandbox: mount/userns/pivot_root"
@@ -587,6 +591,30 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
     else
         echo "SKIP build fixtures/sandbox_probe"
+    fi
+fi
+
+# ---- registration order around a faked user namespace. Its maps live in the
+# shared PID registry (a parent writes its child's), so the child unsharing, the
+# parent publishing the child's slot and the parent writing the maps all land on
+# one record in an order fork does not fix. Self-checking, and qemu is no oracle
+# here: it hands unshare to the host, which refuses it unprivileged or -- under
+# an AppArmor userns restriction -- grants a namespace holding no capability.
+# Timing races, so the fixture loops; with either ordering guard removed both
+# the nested case and the parent-writes-child case trip inside one round. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/userns_race.bin \
+            tests/fixtures/userns_race.c 2>/dev/null; then
+        expect=$'R1 ok=1\nR2 ok=1\nR3 ok=1\nR4 ok=1'
+        got=$(timeout 120 "$EMU" / tests/fixtures/userns_race.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: userns_race"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: userns_race"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/userns_race.bin
+    else
+        echo "SKIP build fixtures/userns_race"
     fi
 fi
 

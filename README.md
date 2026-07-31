@@ -320,12 +320,15 @@ src/
   syscall.c sys_*.c   dispatcher + per-area handlers (~225 syscalls)
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, the
-                writable id maps of a faked user namespace, ...)
+                writable id maps of a faked user namespace — own or a
+                child's, ...)
   sys_seccomp.c seccomp(2): classic-BPF evaluator over guest seccomp_data,
                 run by the dispatcher for every guest syscall
-  proctab.c     shared-memory guest-PID registry (cross-process ps/top view) +
-                unified IPC broker: portable System V IPC — memfd-backed shared
-                memory, semaphores (blocking semop, SEM_UNDO), message queues
+  proctab.c     shared-memory guest-PID registry (cross-process ps/top view,
+                and the id maps of a faked user namespace, so a parent can
+                write its child's) + unified IPC broker: portable System V IPC
+                — memfd-backed shared memory, semaphores (blocking semop,
+                SEM_UNDO), message queues
   ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex
                 mailbox (tracee serves PEEK/POKE/GETREGSET/CONT while stopped)
   signal.c      host capture -> guest rt_sigframe / rt_sigreturn

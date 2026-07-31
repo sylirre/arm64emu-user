@@ -66,6 +66,10 @@ void procfs_unmark_fd(struct Machine *m, int fd);
  * consumed the write, 0 for an ordinary fd. */
 int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
                      s64 *ret);
+/* Copy `from`'s recorded id maps into this Machine, for a fork child taking
+ * over its parent's user namespace: maps a parent wrote for us went to the
+ * shared registry, never to the Machine copy we inherit. */
+void procfs_idmap_inherit(struct Machine *m, s32 from);
 
 /* sys_sig.c: signalfd(2). The fd is a host eventfd carrying only readiness;
  * the signals themselves come from the emulator's capture ring, so read(2) on

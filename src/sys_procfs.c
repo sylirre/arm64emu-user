@@ -421,19 +421,84 @@ static void put_stat(int fd, struct Machine *m) {
 
 /* ---- id maps of a faked user namespace ----
  *
- * A guest that thinks it unshared CLONE_NEWUSER writes /proc/self/uid_map,
- * gid_map and setgroups exactly once and expects the values back; the host
- * files describe the *initial* namespace, whose map is fixed, so a real write
- * is refused (bubblewrap dies with "setting up uid map"). These three are
- * therefore synthesized from Machine state whenever the namespace was faked,
- * and pass through untouched otherwise -- outside the fiction the host file is
- * the truthful answer. The recorded maps are reported, not applied: they
- * change no id the guest sees (that is what --fake-id does). */
-static void put_idmap(int fd, struct Machine *m, int kind) {
-    const char *s = kind == PF_UIDMAP ? m->uid_map :
-                    kind == PF_GIDMAP ? m->gid_map :
-                    (m->setgroups_deny ? "deny\n" : "allow\n");
+ * A guest that thinks it unshared CLONE_NEWUSER writes uid_map, gid_map and
+ * setgroups exactly once and expects the values back; the host files describe
+ * the *initial* namespace, whose map is fixed, so a real write is refused
+ * (bubblewrap dies with "setting up uid map"). These three are therefore
+ * synthesized whenever the namespace was faked, and pass through untouched
+ * otherwise -- outside the fiction the host file is the truthful answer. The
+ * recorded maps are reported, not applied: they change no id the guest sees
+ * (that is what --fake-id does).
+ *
+ * Both spellings are served, because both are used: /proc/self/... by a guest
+ * that maps its own ids, and /proc/<child>/... by a parent doing it on the
+ * child's behalf -- the usual arrangement, since a process that just unshared
+ * generally has no privilege to map anything itself. Cross-process means the
+ * maps cannot live in the writer's Machine, so they live in the shared PID
+ * registry (proctab.c) and Machine only backs the case where the registry has
+ * no answer: no slot for the pid, or a table that degraded off entirely. */
+
+/* Registry-side name for a PF_* id-map kind. */
+static int pt_idmap_kind(int kind) {
+    return kind == PF_UIDMAP ? PT_IDMAP_UID :
+           kind == PF_GIDMAP ? PT_IDMAP_GID : PT_IDMAP_SG;
+}
+
+/* `pid` is the process whose namespace this is: 0 means our own.
+ *
+ * Whichever side holds a value wins, rather than the registry unconditionally.
+ * The two only ever disagree by one being empty -- a namespace the registry
+ * never got a slot for lives in Machine alone, and maps written for us by
+ * somebody else reach the registry alone -- so preferring the side that has an
+ * answer is what makes a degraded registry cost nothing. */
+static void put_idmap(int fd, struct Machine *m, int kind, s32 pid) {
+    if (!pid) pid = (s32)getpid();
+    int self = pid == (s32)getpid();
+    char buf[IDMAP_MAX];
+    u32 len = 0;
+    int reg = proctab_idmap_read(pid, pt_idmap_kind(kind), buf, sizeof buf, &len);
+    if (!reg && !self) return;          /* only we can answer from Machine */
+    if (kind == PF_SETGROUPS) {
+        /* "deny" is a one-way latch, so either side holding it decides. */
+        int deny = (reg && len >= 4 && !memcmp(buf, "deny", 4)) ||
+                   (self && m->setgroups_deny);
+        const char *s = deny ? "deny\n" : "allow\n";
+        ssize_t w = write(fd, s, strlen(s));
+        (void)w;
+        return;
+    }
+    if (reg && len) { ssize_t w = write(fd, buf, len); (void)w; return; }
+    const char *s = kind == PF_UIDMAP ? m->uid_map : m->gid_map;
     if (*s) { ssize_t w = write(fd, s, strlen(s)); (void)w; }
+}
+
+/* A fork child taking over its parent's user namespace. Maps written *for* the
+ * parent reached its registry record and nothing else -- a Machine is private,
+ * so whoever wrote them had nowhere else to put them -- which leaves the copy
+ * this child inherits empty. Pull them across at fork, so the Machine side is
+ * complete: it is the whole answer for a child the registry could find no slot
+ * for, and the registry's own copy of them is seeded separately (into the slot
+ * reserved for this child before the fork, see proctab.c). */
+void procfs_idmap_inherit(struct Machine *m, s32 from) {
+    char buf[IDMAP_MAX];
+    u32 len = 0;
+    if (!m->uid_map_set && proctab_idmap_read(from, PT_IDMAP_UID, buf, sizeof buf, &len) && len) {
+        if (len >= IDMAP_MAX) len = IDMAP_MAX - 1;
+        memcpy(m->uid_map, buf, len);
+        m->uid_map[len] = 0;
+        m->uid_map_set = 1;
+    }
+    if (!m->gid_map_set && proctab_idmap_read(from, PT_IDMAP_GID, buf, sizeof buf, &len) && len) {
+        if (len >= IDMAP_MAX) len = IDMAP_MAX - 1;
+        memcpy(m->gid_map, buf, len);
+        m->gid_map[len] = 0;
+        m->gid_map_set = 1;
+    }
+    if (proctab_idmap_read(from, PT_IDMAP_SG, buf, sizeof buf, &len) &&
+        len >= 4 && !memcmp(buf, "deny", 4)) {
+        m->setgroups_deny = 1;   /* a one-way latch: only ever pulled forward */
+        m->setgroups_set = 1;
+    }
 }
 
 /* Parse one written map into the kernel's read-back form ("%10u %10u %10u\n"
@@ -486,33 +551,72 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
         return 0;
     }
     int kind = m->pf_fds[i].kind;
+    s32 tpid = m->pf_fds[i].pid ? m->pf_fds[i].pid : (s32)getpid();
     pthread_mutex_unlock(&pf_lock);
     if (kind != PF_UIDMAP && kind != PF_GIDMAP && kind != PF_SETGROUPS) return 0;
     if (off < 0) off = lseek(fd, 0, SEEK_CUR);
     if (off != 0) { *ret = -EINVAL; return 1; }
+    /* Whose namespace this is decides where the state lives: the registry holds
+     * a faked one (that is what lets a parent write its child's maps), Machine
+     * only ever answers for us. The two are consulted together, for the reason
+     * put_idmap explains. A target the registry has forgotten, and that is not
+     * us, is a process that is gone. */
+    int self = tpid == (s32)getpid(), err = 0;
+    int reg = proctab_userns(tpid);
+    if (!reg && !self) { *ret = -ESRCH; return 1; }
 
     if (kind == PF_SETGROUPS) {
         /* "allow" or "deny", and only until gid_map is set -- afterwards the
-         * kernel refuses, since the decision has already been used. */
+         * kernel refuses, since the decision has already been used. Nor may
+         * "deny" be taken back. */
         int deny;
         if (len >= 4 && !memcmp(buf, "deny", 4))       deny = 1;
         else if (len >= 5 && !memcmp(buf, "allow", 5)) deny = 0;
         else { *ret = -EINVAL; return 1; }
-        if (m->gid_map_set)                { *ret = -EPERM; return 1; }
-        if (m->setgroups_deny && !deny)    { *ret = -EPERM; return 1; }
+        if (self && (m->gid_map_set || (m->setgroups_deny && !deny))) {
+            *ret = -EPERM;
+            return 1;
+        }
+        if (reg && proctab_idmap_write(tpid, PT_IDMAP_SG, deny ? "deny\n" : "allow\n",
+                                       deny ? 5 : 6, &err)) {
+            /* Mirror our own writes into Machine so the fallback never
+             * contradicts the registry if the slot later goes away. */
+            if (!err && self) { m->setgroups_deny = (u8)deny; m->setgroups_set = 1; }
+            *ret = err ? err : (s64)len;
+            return 1;
+        }
+        if (!self) { *ret = -ESRCH; return 1; }
         m->setgroups_deny = (u8)deny;
         m->setgroups_set = 1;
         *ret = (s64)len;
         return 1;
     }
-    if (kind == PF_UIDMAP ? m->uid_map_set : m->gid_map_set) {
-        *ret = -EPERM;   /* only one successful write to a map */
-        return 1;
+    /* One shot per map, tested before anything is parsed -- the kernel's order,
+     * so a second write is EPERM whatever it holds rather than EINVAL. The
+     * registry's own claim is what actually enforces it; this only gets the
+     * errno right for the ordinary sequential case. */
+    int written = self && (kind == PF_UIDMAP ? m->uid_map_set : m->gid_map_set);
+    if (reg && !written) {
+        char cur[IDMAP_MAX];
+        u32 curlen = 0;
+        proctab_idmap_read(tpid, pt_idmap_kind(kind), cur, sizeof cur, &curlen);
+        written = curlen != 0;
     }
+    if (written) { *ret = -EPERM; return 1; }
     char fmt[IDMAP_MAX];
     fmt[0] = 0;
     int r = idmap_format((const char *)buf, len, fmt, sizeof fmt);
     if (r < 0) { *ret = r; return 1; }
+    if (reg && proctab_idmap_write(tpid, pt_idmap_kind(kind), fmt,
+                                   (u32)strlen(fmt), &err)) {
+        if (!err && self) {
+            if (kind == PF_UIDMAP) { memcpy(m->uid_map, fmt, sizeof fmt); m->uid_map_set = 1; }
+            else                   { memcpy(m->gid_map, fmt, sizeof fmt); m->gid_map_set = 1; }
+        }
+        *ret = err ? err : (s64)len;
+        return 1;
+    }
+    if (!self) { *ret = -ESRCH; return 1; }
     if (kind == PF_UIDMAP) { memcpy(m->uid_map, fmt, sizeof fmt); m->uid_map_set = 1; }
     else                   { memcpy(m->gid_map, fmt, sizeof fmt); m->gid_map_set = 1; }
     *ret = (s64)len;
@@ -524,14 +628,16 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
  * table missed: dup2-onto, execve's CLOEXEC sweep) is detected and dropped
  * instead of clobbering an innocent file. Table full: the fd just keeps its
  * open-time snapshot. */
-static void pf_track(struct Machine *m, int fd, int kind) {
+static void pf_track(struct Machine *m, int fd, int kind, s32 pid) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
+    u64 ino = (u64)st.st_ino;
     pthread_mutex_lock(&pf_lock);
     if (m->pf_fds_count < PF_MAX_FDS) {
         m->pf_fds[m->pf_fds_count].fd = fd;
         m->pf_fds[m->pf_fds_count].kind = (u8)kind;
-        m->pf_fds[m->pf_fds_count].ino = (u64)st.st_ino;
+        m->pf_fds[m->pf_fds_count].pid = pid;
+        m->pf_fds[m->pf_fds_count].ino = ino;
         m->pf_fds_count++;
     }
     pthread_mutex_unlock(&pf_lock);
@@ -569,9 +675,10 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     case PF_LOADAVG: put_loadavg(fd);   break;
     case PF_UPTIME:  put_uptime(fd, m); break;
     case PF_STAT:    put_stat(fd, m);   break;
-    /* Re-read after a write must show what was written. */
+    /* Re-read after a write must show what was written -- by us or, for a
+     * child's namespace, by whoever set it up. */
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
-        put_idmap(fd, m, m->pf_fds[i].kind);
+        put_idmap(fd, m, m->pf_fds[i].kind, m->pf_fds[i].pid);
         break;
     }
     lseek(fd, 0, SEEK_SET);
@@ -765,6 +872,34 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 1;
     }
 
+    /* /proc/<pid>/{uid_map,gid_map,setgroups} of ANOTHER guest process. This is
+     * how a user namespace is normally set up: the child unshares and waits,
+     * the PARENT writes its maps -- a process that just unshared has no
+     * privilege to map ids into the namespace it came from. Left to the host
+     * these writes are refused (they name the initial namespace, whose map is
+     * fixed), which is exactly the failure the self spelling was synthesized to
+     * avoid. Answered for a process whose faked namespace the registry knows
+     * about; for anything else the host file, describing the real initial
+     * namespace, remains the truthful answer. */
+    s32 upid;
+    const char *utail = proc_other_tail(canon, &upid);
+    if (utail && upid != (s32)getpid() && proctab_userns(upid)) {
+        int k = !strcmp(utail, "uid_map")   ? PF_UIDMAP :
+                !strcmp(utail, "gid_map")   ? PF_GIDMAP :
+                !strcmp(utail, "setgroups") ? PF_SETGROUPS : -1;
+        if (k >= 0) {
+            if (gflags & G_O_DIRECTORY) { *ret = -ENOTDIR; return 1; }
+            int fd = synth_memfd();
+            if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
+            put_idmap(fd, m, k, upid);
+            lseek(fd, 0, SEEK_SET);
+            if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+            pf_track(m, fd, k, upid);   /* written through, and re-read after */
+            *ret = fd;
+            return 1;
+        }
+    }
+
     /* /proc/<pid>/status under --fake-id: the host file's Uid:/Gid:/Groups:
      * lines carry the real invoking uid, but ps/top read them to name the user.
      * Rewrite those lines through the fake-id remap. Off fake-id the host file
@@ -841,13 +976,13 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_STAT:       put_stat(fd, m); break;
     case PF_OVERFLOWID: put_overflowid(fd); break;
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
-                        put_idmap(fd, m, kind); break;
+                        put_idmap(fd, m, kind, 0); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
     if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT || writable)
-        pf_track(m, fd, kind);   /* time-varying, or written through */
+        pf_track(m, fd, kind, 0);   /* time-varying, or written through */
     *ret = fd;
     return 1;
 }

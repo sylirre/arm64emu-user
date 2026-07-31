@@ -67,6 +67,72 @@ static int write_str(const char *path, const char *s) {
     return e;
 }
 
+/* One-byte handshakes, so parent and child prints stay strictly ordered. */
+static void wake(int fd)  { char c = 'x'; if (write(fd, &c, 1) != 1) _exit(90); }
+static void wait1(int fd) { char c;       if (read(fd, &c, 1) != 1)  _exit(91); }
+
+/* The usual way a user namespace is populated: the child unshares and waits,
+ * and the PARENT writes /proc/<child>/{setgroups,gid_map,uid_map} for it --
+ * a process that just unshared normally has no privilege to map anything
+ * itself. Left to the host every one of these writes is refused, because they
+ * name the initial namespace, whose map is fixed.
+ *
+ * This runs BEFORE the outer process unshares anything, which is what keeps
+ * the token block checkable against a real kernel: an unprivileged parent may
+ * write a single line mapping its own euid, and does so from the initial
+ * namespace. (Once the parent is itself inside an unprivileged namespace the
+ * kernel refuses -- on an AppArmor-restricted host it holds no capability
+ * there at all -- so the nested spelling could not be compared with anything.) */
+static void id_maps_from_parent(void) {
+    int up[2], down[2];
+    char buf[256], path[64];
+    if (pipe(up) || pipe(down)) { printf("umap_pipe=-1\n"); return; }
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(up[0]); close(down[1]);
+        if (unshare(CLONE_NEWUSER) != 0) _exit(2);
+        wake(up[1]);
+        wait1(down[0]);
+        printf("umap_child_uid=%s\n", slurp("/proc/self/uid_map", buf, sizeof buf));
+        printf("umap_child_gid=%s\n", slurp("/proc/self/gid_map", buf, sizeof buf));
+        printf("umap_child_sg=%s\n", slurp("/proc/self/setgroups", buf, sizeof buf));
+        printf("umap_child_twice=%d\n",
+               write_str("/proc/self/uid_map", "0 1000 1") == -EPERM);
+        /* A child of its own inherits the namespace, and so the maps. */
+        fflush(stdout);
+        pid_t g = fork();
+        if (g == 0) {
+            printf("umap_inherit=%s\n", slurp("/proc/self/uid_map", buf, sizeof buf));
+            fflush(stdout);
+            _exit(0);
+        }
+        int gs = 0;
+        waitpid(g, &gs, 0);
+        _exit(WIFEXITED(gs) ? WEXITSTATUS(gs) : 3);
+    }
+    close(up[1]); close(down[0]);
+    wait1(up[0]);
+    snprintf(path, sizeof path, "/proc/%d/setgroups", (int)kid);
+    printf("umap_sg=%d\n", write_str(path, "deny"));
+    snprintf(path, sizeof path, "/proc/%d/gid_map", (int)kid);
+    printf("umap_empty=[%s]\n", slurp(path, buf, sizeof buf));
+    printf("umap_gid=%d\n", write_str(path, "0 1000 1"));
+    snprintf(path, sizeof path, "/proc/%d/setgroups", (int)kid);
+    printf("umap_sg_late=%d\n", write_str(path, "deny") == -EPERM);
+    snprintf(path, sizeof path, "/proc/%d/uid_map", (int)kid);
+    printf("umap_uid=%d\n", write_str(path, "0 1000 1"));
+    /* Written once: a second write is EPERM whatever it holds, which is the
+     * kernel's order -- the one-shot rule is tested before the parse. */
+    printf("umap_junk=%d\n", write_str(path, "junk") == -EPERM);
+    printf("umap_back=%s\n", slurp(path, buf, sizeof buf));
+    fflush(stdout);
+    wake(down[1]);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    printf("umap_status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
 int main(void) {
     char buf[256];
 
@@ -81,7 +147,10 @@ int main(void) {
     printf("restored=%s gone=%d\n", slurp("/sbx/marker", buf, sizeof buf),
            access("/sbx/inner", F_OK) != 0);
 
-    /* ---- a faked user namespace's id maps: written once, read back ---- */
+    /* ---- a faked user namespace's id maps, written from the parent ---- */
+    id_maps_from_parent();
+
+    /* ---- and written by the process itself: once, read back ---- */
     printf("unshare_user=%d\n", unshare(CLONE_NEWUSER));
     printf("setgroups=%d %s\n", write_str("/proc/self/setgroups", "deny") > 0,
            slurp("/proc/self/setgroups", buf, sizeof buf));

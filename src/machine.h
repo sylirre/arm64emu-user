@@ -272,12 +272,14 @@ struct Machine {
     /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
      * backing memfd, because procps opens these once and lseek(0)+rereads
-     * every refresh cycle. Shared across guest threads, copied on fork —
-     * like the host fds. */
+     * every refresh cycle. The written-through id-map files are tracked here
+     * too, so a re-read shows what was written. Shared across guest threads,
+     * copied on fork — like the host fds. */
 #define PF_MAX_FDS 8
     struct {
         int fd;
         u8 kind;              /* PF_* kind (sys_procfs.c) */
+        s32 pid;              /* whose file: another guest PID, or 0 for ours */
         u64 ino;              /* memfd inode: stale-entry check on fd reuse */
     } pf_fds[PF_MAX_FDS];
     int pf_fds_count;
@@ -602,11 +604,36 @@ void proctab_register(s32 pid, const char *cmd, u32 len,   /* exec / fork */
                       const char *exe, const char *cwd,
                       const char *env, u32 env_len,
                       const char *auxv, u32 auxv_len);
+/* The same, into a slot reserved before the fork (rsv < 0 = search as above).
+ * The reservation is what lets a fork child reach its own entry before its
+ * parent has published it — see proctab_reserve. */
+void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
+                         const char *exe, const char *cwd,
+                         const char *env, u32 env_len,
+                         const char *auxv, u32 auxv_len);
+int  proctab_reserve(void);         /* before fork; -1 when the table is full */
+void proctab_release(int slot);     /* the fork failed */
+void proctab_slot_adopt(int slot);  /* in the child: that slot is now ours */
 void proctab_unregister(s32 pid);                          /* exit */
 void proctab_set_cwd(s32 pid, const char *cwd);            /* chdir / fchdir */
 int  proctab_has(s32 pid);                                 /* is a guest PID? */
 int  proctab_cmdline(s32 pid, char *out, u32 *len);        /* guest cmdline */
 int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap */
+
+/* Id maps of a faked user namespace, kept in the registry rather than in the
+ * owner's Machine because the standard setup has the PARENT write the child's
+ * maps -- and one emulator process cannot reach another's Machine. sys_procfs.c
+ * serves /proc/<pid>/{uid_map,gid_map,setgroups} from here when the namespace
+ * was recorded (proctab_userns), and from its own Machine otherwise. */
+#define PT_IDMAP_UID 0
+#define PT_IDMAP_GID 1
+#define PT_IDMAP_SG  2
+void proctab_userns_fresh(s32 pid);            /* unshare(CLONE_NEWUSER) */
+void proctab_userns_seed(int slot, int fresh); /* pre-fork, into a reservation */
+int  proctab_userns(s32 pid);                  /* has one recorded here? */
+/* Both return 1 when the registry answered, 0 to fall back to Machine state. */
+int  proctab_idmap_read(s32 pid, int kind, char *out, u32 outsz, u32 *len);
+int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err);
 
 /* proctab.c: System V shared-memory broker (client side). The unified IPC
  * daemon (an extension of the proctab broker) is the authoritative registry:

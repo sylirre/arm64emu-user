@@ -423,14 +423,46 @@ then make the consequences the caller depends on true:
 
 - `CLONE_NEWNS` gives the process a private copy of the bind table, so its
   mounts and re-rooting stay its own (see the mount section above).
-- `CLONE_NEWUSER` makes `/proc/self/uid_map`, `gid_map` and `setgroups`
-  writable for that process: the host files describe the *initial* namespace,
-  whose map is fixed, so a real write is refused and bubblewrap dies with
-  "setting up uid map". They are synthesized instead (`sys_procfs.c`), take one
-  write each as the kernel's one-shot rule requires (a second returns `EPERM`, a
-  malformed one `EINVAL`, `setgroups` after `gid_map` `EPERM`), and read back in
-  the kernel's `%10u %10u %10u` form. The maps are *reported*, not applied: they
-  change no id the guest sees — `--fake-id` is how a guest becomes root here.
+- `CLONE_NEWUSER` makes `uid_map`, `gid_map` and `setgroups` writable for that
+  process: the host files describe the *initial* namespace, whose map is fixed,
+  so a real write is refused and bubblewrap dies with "setting up uid map".
+  They are synthesized instead (`sys_procfs.c`), take one write each as the
+  kernel's one-shot rule requires (a second returns `EPERM` whatever it holds,
+  since the rule is tested before the parse; a malformed first write `EINVAL`;
+  `setgroups` after `gid_map` `EPERM`), and read back in the kernel's
+  `%10u %10u %10u` form. The maps are *reported*, not applied: they change no id
+  the guest sees — `--fake-id` is how a guest becomes root here.
+
+  Both spellings are served, because both are used. `/proc/self/...` covers a
+  guest that maps its own ids; `/proc/<child>/...` covers the usual arrangement,
+  where the child unshares and waits while the **parent** writes its maps — a
+  process that just unshared generally has no privilege to map anything itself,
+  so this is the path `newuidmap`, LXC, runc and `unshare -U` take. Writing
+  another process's file means the state cannot live in the writer's `Machine`,
+  so a faked namespace and its maps are recorded in the shared PID registry
+  (`proctab.c`) instead: kept across `execve` (which keeps the namespace) and
+  cleared whenever a slot passes to a different process. `Machine` still carries
+  a copy and answers when the registry has nothing for the pid — no slot, or a
+  table that degraded off — and then only for the process itself; a fork child
+  copies its parent's registry record into that `Machine` at once
+  (`procfs_idmap_inherit`), because maps written *for* the parent went to the
+  registry and are in no `Machine` state a fork hands down. One write per map is
+  enforced by a CAS on the registry's claim flag, and a published map is never
+  rewritten, so a reader needs no seqlock.
+
+  What makes that record race-free is **who writes it, and when**. Parent and
+  child run concurrently from the fork on, so an unshare in the child and a seed
+  from the parent have no order between them, and either landing last is wrong
+  for a different reason. The registry therefore hands out a slot *before* the
+  fork (`proctab_reserve`): the parent clears it, seeds the child's namespace
+  into it — fresh for `CLONE_NEWUSER`, a copy of its own otherwise — and only
+  then forks. Both sides inherit the slot index as an ordinary local, so the
+  child can reach its own entry the instant it starts, without waiting for the
+  parent to publish it and without racing the parent for a free slot (which
+  would leave two entries for one pid). After the fork the child is the only
+  writer of its own record. A reserved slot carries a pid sentinel no scan
+  matches, so the entry stays invisible until it is built; the same trick covers
+  the searched-out claims that `execve` and the initial exec use.
 - `CLONE_NEWPID` and the rest change nothing beyond the return value: the
   guest's pids stay the host's.
 
@@ -510,7 +542,13 @@ then make the consequences the caller depends on true:
   each process publishes its NUL-joined argv, guest exe path, cwd, NUL-joined
   environ and raw auxv block keyed by PID at `load_elf` and in the `fork` child
   (and refreshes cwd on `chdir`/`fchdir`), with the `/proc/<pid>/stat` starttime
-  as a stale-slot guard against host PID reuse. `procfs_open` then synthesizes
+  as a stale-slot guard against host PID reuse. A fork child's slot is reserved
+  by its parent *before* the fork, so both know it without searching (see
+  `CLONE_NEWUSER` above), and a slot stays invisible — a pid sentinel no scan
+  matches — until its entry is built. The entry carries one thing that is *not*
+  published by its owner: the id maps of a faked user namespace, which another
+  process writes, and which therefore sit outside the owner-only seqlock.
+  `procfs_open` then synthesizes
   `/proc/<pid>/cmdline`, `/proc/<pid>/environ` and `/proc/<pid>/auxv` for any
   guest PID (otherwise the host files show the `arm64chroot …` invocation and
   the emulator's environment and auxv — `gdb` attaching to a guest process
