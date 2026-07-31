@@ -925,6 +925,11 @@ static u64 sat_neg(s64 v, unsigned e) {
     if (e >= 64 && v == INT64_MIN) { g_fpexc |= FPSR_QC; return (u64)INT64_MAX; }
     return sat_s(-v, e);
 }
+/* Clamp an unsigned value to an element mask, flagging the clamp. */
+static u64 sat_umask(u64 v, u64 emask) {
+    if (v > emask) { g_fpexc |= FPSR_QC; return emask; }
+    return v;
+}
 static u64 ssat_add(s64 a, s64 b, unsigned e) {
     if (e < 64) return sat_s(a + b, e);
     s64 r = (s64)((u64)a + (u64)b);
@@ -957,6 +962,15 @@ static u64 usat_sub(u64 a, u64 b, unsigned e) {
     (void)e;
     if (a < b) { g_fpexc |= FPSR_QC; return 0; }
     return a - b;
+}
+/* USQADD: unsigned accumulator + SIGNED addend, clamped to the unsigned
+ * range. The magnitude is formed unsigned so that sa == INT64_MIN (whose
+ * negation is not representable) stays well defined. */
+static u64 usqadd_sat(u64 d, s64 sa, unsigned e) {
+    if (sa >= 0) return usat_add(d, (u64)sa, e);
+    u64 mag = (u64)0 - (u64)sa;
+    if (d < mag) { g_fpexc |= FPSR_QC; return 0; }
+    return d - mag;
 }
 
 /* FEAT_RDM SQRDMLAH/SQRDMLSH core, shared by the vector, scalar and by-element
@@ -1067,7 +1081,7 @@ static u64 suqadd_sat(u64 d, u64 a, unsigned e) {
     if (e < 64) return sat_s(sd + (s64)ua, e);
     u64 lim = (sd >= 0) ? ((u64)INT64_MAX - (u64)sd)      /* headroom above sd */
                         : ((u64)INT64_MAX + (-(u64)sd));  /* INT64_MAX + |sd|  */
-    if (ua > lim) return (u64)INT64_MAX;
+    if (ua > lim) { g_fpexc |= FPSR_QC; return (u64)INT64_MAX; }
     return (u64)sd + ua;   /* true sum fits s64; the wrapping sum is its 2's-comp */
 }
 
@@ -1085,15 +1099,20 @@ static u64 vreg_shift(u64 val, int sh, unsigned e, int sgn, int round, int sat) 
             s64 max = (e >= 64) ? INT64_MAX : (((s64)1 << (e - 1)) - 1);
             s64 min = (e >= 64) ? INT64_MIN : (-((s64)1 << (e - 1)));
             if (sv == 0) return 0;
-            if (sh >= 64) return (u64)(sv > 0 ? max : min);
-            if (sv > 0) return (sv > (max >> sh)) ? (u64)max : ((u64)(sv << sh) & emask);
-            return (sv < (min >> sh)) ? ((u64)min & emask) : ((u64)(sv << sh) & emask);
+            if (sh >= 64) { g_fpexc |= FPSR_QC; return (u64)(sv > 0 ? max : min); }
+            if (sv > 0) {
+                if (sv > (max >> sh)) { g_fpexc |= FPSR_QC; return (u64)max; }
+                return (u64)(sv << sh) & emask;
+            }
+            if (sv < (min >> sh)) { g_fpexc |= FPSR_QC; return (u64)min & emask; }
+            return (u64)(sv << sh) & emask;
         } else {
             u64 uv = val & emask;
             u64 max = emask;
             if (uv == 0) return 0;
-            if (sh >= 64) return max;
-            return (uv > (max >> sh)) ? max : ((uv << sh) & emask);
+            if (sh >= 64) { g_fpexc |= FPSR_QC; return max; }
+            if (uv > (max >> sh)) { g_fpexc |= FPSR_QC; return max; }
+            return (uv << sh) & emask;
         }
     }
     unsigned rs = (unsigned)-sh;                    /* right shift */
@@ -1644,19 +1663,22 @@ static u64 narrow_shr(u64 src, unsigned esize, unsigned shift, int round,
         s64 sv = sx(src, 2 * esize);
         s64 w = sv >> shift;
         if (round) w += (sv >> (shift - 1)) & 1;
-        if (sat_unsigned)                           /* SQSHRUN/SQRSHRUN */
-            return (w < 0) ? 0 : ((w > (s64)emask) ? emask : (u64)w);
+        if (sat_unsigned) {                         /* SQSHRUN/SQRSHRUN */
+            if (w < 0) { g_fpexc |= FPSR_QC; return 0; }
+            return sat_umask((u64)w, emask);
+        }
         return sat_s64_to(w, esize);                /* SQSHRN/SQRSHRN */
     }
     u64 w = src >> shift;                           /* UQSHRN/UQRSHRN */
     if (round) w += (src >> (shift - 1)) & 1;
-    return (w > emask) ? emask : w;
+    return sat_umask(w, emask);
 }
 
 /* SQSHLU: signed source, unsigned saturating left shift (0 <= sh < 64). */
 static u64 sqshlu_sat(s64 sv, int sh, u64 emask) {
-    if (sv <= 0) return 0;
-    if ((u64)sv > (emask >> sh)) return emask;
+    if (sv < 0) { g_fpexc |= FPSR_QC; return 0; }   /* negative -> unsigned 0 */
+    if (sv == 0) return 0;
+    if ((u64)sv > (emask >> sh)) { g_fpexc |= FPSR_QC; return emask; }
     return ((u64)sv << sh) & emask;
 }
 
@@ -1670,8 +1692,8 @@ static u64 sqdmull_sat(s64 sa, s64 sb, unsigned e) {
     s64 p = sa * sb;
     /* 2p > max  <=>  p >= (max+1)/2 = 2^(e-2);  2p < min  <=>  p < -2^(e-2) */
     s64 hi = (s64)1 << (e - 2);
-    if (p >= hi) return (u64)max;
-    if (p < -hi) return (u64)min;
+    if (p >= hi) { g_fpexc |= FPSR_QC; return (u64)max; }
+    if (p < -hi) { g_fpexc |= FPSR_QC; return (u64)min; }
     return (u64)(2 * p);
 }
 static void simd_three_diff(CPU *c, u32 insn) {
@@ -2244,7 +2266,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
             u64 src = velem_get(&c->v[Rn], size + 1, i), nv;
             if (opc == 0x12)  nv = sat_u(sx(src, 2*esz), esz);          /* SQXTUN: signed->unsigned */
             else if (U == 0)  nv = sat_s(sx(src, 2*esz), esz);          /* SQXTN: signed */
-            else              nv = (src > emask) ? emask : src;         /* UQXTN: unsigned */
+            else              nv = sat_umask(src, emask);              /* UQXTN: unsigned */
             velem_set(&r, size, base + i, nv & emask);
         }
         c->v[Rd] = r; return;
@@ -2278,8 +2300,8 @@ static void simd_two_misc(CPU *c, u32 insn) {
                 for (int bit = esize - 2; bit >= 0; bit--) { if (((val >> bit) & 1) == msb) cnt++; else break; } v = cnt; } break;
             case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i);     /* SUQADD: signed acc + unsigned */
                 v = suqadd_sat(d, a, esize); } break;
-            case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i) & emask; s64 sa = sx(a, esize); /* USQADD */
-                v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
+            case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i) & emask; /* USQADD */
+                v = usqadd_sat(d, sx(a, esize), esize); } break;
             case (0 << 5) | 0x07: { s64 s = sx(a, esize);                      /* SQABS */
                 v = (s < 0) ? sat_neg(s, esize) : sat_s(s, esize); } break;
             case (1 << 5) | 0x07: v = sat_neg(sx(a, esize), esize); break;      /* SQNEG */
@@ -2398,7 +2420,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         u64 src = velem_get(&c->v[Rn], size + 1, 0), nv;
         if (opcode == 0x12)  nv = sat_u(sx(src, 2*esize), esize);
         else if (U == 0)     nv = sat_s(sx(src, 2*esize), esize);
-        else                 nv = (src > emask) ? emask : src;
+        else                 nv = sat_umask(src, emask);
         V128 r; r.d[0] = r.d[1] = 0; velem_set(&r, size, 0, nv & emask); c->v[Rd] = r; return;
     }
     u64 a = velem_get(&c->v[Rn], size, 0), v; int ok = 1;
@@ -2407,8 +2429,8 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
             v = (s < 0) ? sat_neg(s, esize) : sat_s(s, esize); } break;
         case (1 << 5) | 0x07: v = sat_neg(sx(a,esize), esize); break;                             /* SQNEG */
         case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0); v = suqadd_sat(d, a, esize); } break; /* SUQADD */
-        case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0)&emask; s64 sa = sx(a,esize);  /* USQADD */
-            v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
+        case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0) & emask;       /* USQADD */
+            v = usqadd_sat(d, sx(a,esize), esize); } break;
         case (0 << 5) | 0x08: v = (sx(a,esize) >  0) ? emask : 0; break;   /* CMGT #0 */
         case (1 << 5) | 0x08: v = (sx(a,esize) >= 0) ? emask : 0; break;   /* CMGE #0 */
         case (0 << 5) | 0x09: v = (a == 0) ? emask : 0; break;             /* CMEQ #0 */
