@@ -1901,7 +1901,17 @@ int proctab_has(s32 pid) {
 
 /* Snapshot the whole mutable payload (cmdline, environ, auxv, exe, cwd) for
  * `pid` via a seqlock read, then confirm the entry's starttime still matches
- * the live process. Returns 1 on a fresh hit, 0 on miss/stale. */
+ * the live process. Returns 1 on a fresh hit, 0 on miss/stale.
+ *
+ * Retries spin first and then nap. A writer holds the entry odd across up to
+ * ~6 KB of memcpy — far longer than bare retries take — so spinning alone gave
+ * up on an ordinary concurrent register (any execve re-registers), and the
+ * caller was left with no answer for a process that has one. The budget is
+ * still bounded: an entry a killed writer left odd must not park a reader. */
+#define PT_SPINS 32                      /* bare retries before napping */
+#define PT_TRIES 96                      /* total, so <= 64 naps: ~3 ms worst case */
+#define PT_NAP_NS 50000
+
 int proctab_get(s32 pid, struct ProcSnap *out) {
     if (!g_tab || pid <= 0) return 0;
     int slot = -1;
@@ -1909,7 +1919,9 @@ int proctab_get(s32 pid, struct ProcSnap *out) {
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) { slot = i; break; }
     if (slot < 0) return 0;
     struct ProcEnt *e = &g_tab[slot];
-    for (int tries = 0; tries < 100; tries++) {
+    for (int tries = 0; tries < PT_TRIES; tries++) {
+        if (tries >= PT_SPINS)
+            nanosleep(&(struct timespec){ 0, PT_NAP_NS }, NULL);
         u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
         if (s1 & 1) continue;                         /* writer active */
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
