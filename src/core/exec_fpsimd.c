@@ -2358,22 +2358,16 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         return;
     }
     if (opcode == 0x1a || opcode == 0x1b || (opcode == 0x1c && o2 == 0)) { /* FCVT* fp->int */
+        /* Same rounding-mode selection and saturating convert as the vector
+         * form in simd_two_misc: 0x1a is N/P, 0x1b is M/Z, 0x1c is A. Going
+         * through fround_mode + fcvt_to_int rather than open-coding it is what
+         * gets FCVTN*'s ties-to-even (f_round is ties-AWAY) and the FPToFixed
+         * flags -- IOC on NaN or saturation, IXC when rounding lost bits. */
         double v = dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn);
-        double r;
-        if      (opcode == 0x1a) r = o2 ? f_ceil(v)  : f_round(v);   /* P : N  */
-        else if (opcode == 0x1b) r = o2 ? f_trunc(v) : f_floor(v);   /* Z : M  */
-        else                     r = f_round(v);                    /* A      */
-        if (r != r) r = 0.0;     /* NaN -> 0 (FPToFixed), not INT_MIN */
-        u64 out;
-        if (U == 0) {            /* signed, with saturation (same clamps as SCVTF block) */
-            if (dbl) out = (u64)((r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r);
-            else     out = (u64)(u32)((r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r);
-        } else {                 /* unsigned */
-            if (r < 0) r = 0;
-            if (dbl) out = (r >= 18446744073709551615.0) ? UINT64_MAX : (u64)r;
-            else     out = (r >= 4294967295.0) ? UINT32_MAX : (u32)r;
-        }
-        c->v[Rd].d[0] = out; c->v[Rd].d[1] = 0;
+        int rmode = (opcode == 0x1a) ? (o2 ? 1 : 0)
+                  : (opcode == 0x1b) ? (o2 ? 3 : 2) : 4;
+        c->v[Rd].d[0] = fcvt_to_int(fround_mode(v, rmode), v, U == 0, dbl);
+        c->v[Rd].d[1] = 0;
         return;
     }
     if (opcode == 0x16 && U == 1 && o2 == 0 && sz == 1) {  /* FCVTXN Sd,Dn: round-to-odd .d -> .s */
