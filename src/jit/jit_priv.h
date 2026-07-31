@@ -25,6 +25,19 @@
 #define JIT_PAGE_BITS 12                      /* page->blocks index buckets */
 #define JIT_PAGE_TBL  (1u << JIT_PAGE_BITS)
 #define JIT_MAX_BLOCKS 65536                  /* arena cap; full -> flush */
+#define JIT_MAX_FIXUPS (2 * JIT_MAX_BLOCKS)   /* bus-fault fixups; full -> stop
+                                               * recording (those faults stay
+                                               * fatal, nothing else changes) */
+
+/* One inline memory access: the host code range of its fast path, and the
+ * entry of the slow path the D-TLB probe would have branched to, both as
+ * offsets from cache_rx. A host SIGBUS inside the fast range (a file truncated
+ * from outside the address space, mem.c) is repaired by resuming at `slow`:
+ * that path spills the block's cached guest registers and re-runs the access
+ * through the helper, which is the only way out of generated code that does
+ * not lose registers living nowhere else. Appended in increasing `fast` order
+ * because blocks are bump-allocated, so a lookup is a binary search. */
+typedef struct { u32 fast, slow; } JFixup;
 
 /* Exit identifiers returned by a block run: (block index << 1) | slot for a
  * chainable exit that just went back to the dispatcher, EXIT_NONE otherwise.
@@ -105,6 +118,8 @@ typedef struct JitEnv {
     u32 nblocks;
     JEdge *edges;               /* incoming-chain edge pool */
     u32 nedges;
+    JFixup *fixups;             /* inline-memory-access fault fixups */
+    u32 nfixups;
     u32 flush_count;            /* invalidates jit_run's chaining pointers */
     unsigned long inval_gen_seen;
 
@@ -162,6 +177,8 @@ void be_unpatch_chain(JitEnv *env, JBlock *b, int slot);
 int  be_vop_ok(unsigned vclass, u32 insn);
 /* Make [rx, rx+len) (written via rw) visible to instruction fetch. */
 void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
+/* Record one inline memory access for bus-fault recovery (see JFixup). */
+void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off);
 
 /* ---- helpers called from generated code (jit.c) ---- */
 

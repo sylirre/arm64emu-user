@@ -111,9 +111,40 @@ decision is not made once: growth is picked up lazily by the fault path, which
 probes the backing with `process_vm_readv` (it reports `EFAULT` where a load
 would raise `SIGBUS`) and installs the PTE if the file has grown into it;
 shrinking is handled by `ftruncate`/`truncate`/`fallocate`, which drop the PTEs
-of any mapping of that file now reaching past the end. A file truncated from
-*outside* the emulator is not visible here and remains the one way a host
-`SIGBUS` can still be raised.
+of any mapping of that file now reaching past the end.
+
+A truncation from *outside* the address space — another program on the host, or
+simply another guest process, since `as_file_resized` only walks the caller's
+own mappings — cannot be seen coming. The PTEs stay, and the next access reaches
+a host page the kernel now refuses, so the host `SIGBUS` really does arrive; the
+recovery is what stops it being fatal. `as_bus_init` installs a handler that
+acts only on a fault inside the host backing of one of this process's file
+mappings (everything else keeps the default and dies as before). It drops that
+region's PTEs, so the pages that are gone stay unmapped and the ones still there
+come back through the probe above, and then returns control to a point where the
+guest's own `SIGBUS` can be raised:
+
+* From emulator C code — the interpreter's `mem_read`/`mem_write`, or one of the
+  JIT's memory helpers — it records the abort and `siglongjmp`s to a bracket
+  `loop.c` wraps around the execution engines. That unwind is only safe because
+  of where it unwinds *from*: the engines hold no lock while touching guest
+  memory, and the JIT's slow path spills every dirty guest register and
+  materializes NZCV before calling a helper, so the CPU struct is the whole
+  guest state and `cur_insn_pc` names the faulting instruction.
+* From JIT-*generated* code there is nothing to unwind to, since guest registers
+  may live only in host registers. Each inline memory access therefore records
+  its fast-path range and its slow-path entry (`JFixup`), and the handler
+  resumes at the slow path — exactly where a D-TLB probe miss would have gone.
+  That path spills the cached registers and re-runs the access through the
+  helper, which now misses, probes, and raises the guest's abort. Registers
+  survive because the redirect lands on a label the fast path could already have
+  branched to with this machine state.
+
+The bracket is a `sigsetjmp` with `savemask` 0 (a register save, no syscall)
+taken once per run-loop round trip, and the fixups are recorded at translate
+time, so neither costs anything measurable. Syscall dispatch is deliberately
+*outside* the bracket: a handler may hold locks that an unwind would strand, so
+a fault while marshalling a syscall's buffers stays fatal.
 
 Because a mapped page need not have a PTE, "is it mapped" is a question about
 the region list, not the page table: `mprotect`'s coverage check asks the

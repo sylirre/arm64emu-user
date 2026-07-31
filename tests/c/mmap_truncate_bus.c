@@ -12,9 +12,12 @@
  * child's ftruncate back to the parent's page table -- the same situation as a
  * host process, but self-contained and deterministic.
  *
- * The page read after the shrink is one this process has never touched, so its
- * translation is cold. That matters: a warm translation is reached by a
- * different path inside the emulator, covered separately.
+ * Both translation states are covered, because the emulator reaches them by
+ * different paths. A page never touched before the shrink has no cached
+ * translation, so the access goes through the emulator's C memory helper. A
+ * page touched first has one, so under --jit the access is the inline fast
+ * path in generated code -- where there is no C frame to unwind and recovery
+ * has to resume at the access's own slow path instead.
  *
  * qemu is the oracle, and a real kernel agrees with it.
  */
@@ -60,8 +63,10 @@ static void shrink_elsewhere(const char *path, off_t len) {
     waitpid(k, &st, 0);
 }
 
-static void one(int shared) {
-    const char *tag = shared ? "shared" : "private";
+static void one(int shared, int warm) {
+    char tag[24];
+    snprintf(tag, sizeof tag, "%s/%s", shared ? "shared" : "private",
+             warm ? "warm" : "cold");
     char path[] = "/tmp/mtbXXXXXX";
     char name[80];
     int fd = mkstemp(path);
@@ -72,9 +77,10 @@ static void one(int shared) {
                    shared ? MAP_SHARED : MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) { perror("mmap"); exit(1); }
 
-    /* Touch page 0 only — page 1's translation must stay cold. */
-    volatile char warm = p[0];
-    (void)warm;
+    volatile char first = p[0];
+    /* `warm` decides whether page 1 already has a cached translation when the
+     * file shrinks under it — the two paths the emulator recovers differently. */
+    if (warm) { volatile char w1 = p[PGSZ]; (void)w1; }
 
     shrink_elsewhere(path, PGSZ);
 
@@ -101,7 +107,7 @@ static void one(int shared) {
     /* The mapping must still work below the new end of file, and the process
      * must be able to carry on — the point of the whole exercise. */
     snprintf(name, sizeof name, "%s: page below EOF still readable", tag);
-    ck(name, p[0] == warm);
+    ck(name, p[0] == first);
 
     /* A second attempt must fault the same way, not escalate. */
     got_sig = 0;
@@ -123,8 +129,10 @@ static void one(int shared) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* keep verdicts if a probe kills us */
-    one(1);
-    one(0);
+    one(1, 0);
+    one(0, 0);
+    one(1, 1);
+    one(0, 1);
     printf("mmap_truncate_bus: %d failed\n", fails);
     return fails != 0;
 }

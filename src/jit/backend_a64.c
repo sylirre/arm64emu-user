@@ -183,6 +183,13 @@ static void emit_imm64(Emit *e, unsigned rd, u64 v) {
     if (first) ei(e, enc_movz(1, rd, 0, 0));       /* v == 0 or all-ones */
 }
 
+/* Offset of the emission cursor from the code-cache base, for the bus-fault
+ * fixup table (see JFixup): a host SIGBUS inside an inline access resumes at
+ * that access's slow path. */
+static u32 cache_off(BE *be) {
+    return (u32)(be->e->rx - be->env->cache_rx);
+}
+
 /* ---- register allocator (mirrors backend_x86_64.c) ---- */
 
 static s32 v_home(int v) {
@@ -573,7 +580,8 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     ei(e, enc_andi64(2, 2, 61, 60));              /* and x2, x2, #~7 (host) */
     ei(e, enc_andi64(16, 1, 0, 11));              /* and x16, x1, #0xfff */
 
-fast:
+fast:;
+    u32 fix_fast = cache_off(be);
     /* ---- fast access (base = x2, page offset = x16; loads -> x16) ---- */
     if (!is_v) {
         if (is_st) {
@@ -611,6 +619,7 @@ fast:
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);                         /* dirty bits kept: above */
     unsigned hoff;
     if (o->op == IRO_ST) {
@@ -718,7 +727,8 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     ei(e, enc_andi64(16, 1, 0, 11));              /* pageoff of va0 */
     ei(e, enc_addr(17, 2, 16));                   /* x17 = host ptr va0 */
 
-fast:
+fast:;
+    u32 fix_fast = cache_off(be);
     for (int t = 0; t < k; t++) {
         const IROp *p = &ir->ops[i + t];
         u64 d = (u64)((s64)p->imm - lo);
@@ -740,6 +750,7 @@ fast:
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);
     ei(e, enc_str(3, 1, 27, FUSE_VA_SLOT));
     for (int t = 0; t < k; t++) {
@@ -1460,6 +1471,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
         ei(e, enc_addr(17, 2, 16));               /* x17 = host ptr */
     }
 
+    u32 fix_fast = cache_off(be);
     icount_add(be, 1);                            /* retires from here (x16) */
 
     switch (kind) {
@@ -1576,6 +1588,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
     fwd_here(e, slow1);
     fwd_here(e, slow2);
     fwd_here(e, slow3);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);
     ei(e, enc_mov(1, 0, 28));                     /* jit_exec1(c, pc, insn) */
     emit_imm64(e, 1, o->imm2pc);

@@ -171,6 +171,13 @@ static void fwd_here(Emit *e, u8 *pos) {
     memcpy(pos, &rel, 4);
 }
 
+/* Offset of the emission cursor from the code-cache base, for the bus-fault
+ * fixup table (see JFixup): a host SIGBUS inside an inline access resumes at
+ * that access's slow path. */
+static u32 cache_off(BE *be) {
+    return (u32)(be->e->rx - be->env->cache_rx);
+}
+
 /* ---- register allocator ---- */
 
 static s32 v_home(int v) {
@@ -716,7 +723,8 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     alu_ri32(e, 0, 4, RAX, 0xfff);             /* page offset */
     op_rr(e, 1, 0x01, RAX, RDX);               /* add rdx, rax : host ptr */
 
-fast:
+fast:;
+    u32 fix_fast = cache_off(be);
     /* ---- fast access (loads: result -> rax; ptr = rdx) ---- */
     if (!is_v) {
         if (is_st) {
@@ -774,6 +782,7 @@ fast:
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);                       /* dirty bits kept: see above */
     s32 hoff;
     if (o->op == IRO_ST) {                      /* jit_st(c, va, val, pc, desc) */
@@ -917,7 +926,8 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     alu_ri32(e, 0, 4, RAX, 0xfff);
     op_rr(e, 1, 0x01, RAX, RDX);                 /* rdx = host ptr of va0 */
 
-fast:
+fast:;
+    u32 fix_fast = cache_off(be);
     for (int t = 0; t < k; t++) {
         const IROp *p = &ir->ops[i + t];
         s32 d = (s32)((s64)p->imm - lo);
@@ -930,6 +940,7 @@ fast:
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);
     st64(e, RSI, R15, FUSE_VA_SLOT);
     for (int t = 0; t < k; t++) {
@@ -2911,6 +2922,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
     }
 
     /* fast path retires unconditionally from here */
+    u32 fix_fast = cache_off(be);
     icount_add(be, 1);
 
     switch (kind) {
@@ -3033,6 +3045,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
     fwd_here(e, slow1);
     fwd_here(e, slow2);
     fwd_here(e, slow3);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
     slow_store_dirty(be);
     mov_rr(e, 1, RDI, R14);                      /* jit_exec1(c, pc, insn) */
     rex(e, 1, 0, 0, RSI); e8(e, (u8)(0xB8 | RSI)); e64(e, o->imm2pc);

@@ -59,6 +59,12 @@ void jit_thread_exit(void);
  * may live only in host registers there, with no way to write them back. */
 int jit_pc_in_generated(const void *pc);
 
+/* Where to resume a host bus fault taken at `pc` inside generated code: the
+ * slow-path entry of the inline memory access it belongs to, or NULL if `pc`
+ * is not in one. Resuming there re-runs the access through the memory helper
+ * with every cached guest register intact. */
+const void *jit_fault_fixup(const void *pc);
+
 /* Process termination via _exit (exit/exit_group syscalls bypass atexit):
  * flush the A64_JIT_STATS report if it is enabled. No-op otherwise. */
 void jit_stats_flush(void);

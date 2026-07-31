@@ -75,6 +75,30 @@ int be_vop_ok(unsigned vclass, u32 insn) {
 
 int jit_backend_available(void) { return be_available(); }
 
+void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off) {
+    if (env->nfixups >= JIT_MAX_FIXUPS || !env->fixups) return;   /* degrade */
+    env->fixups[env->nfixups].fast = fast_off;
+    env->fixups[env->nfixups].slow = slow_off;
+    /* Publish the entry before the count: a signal handler may read this
+     * table while translation is appending to it. */
+    __atomic_store_n(&env->nfixups, env->nfixups + 1, __ATOMIC_RELEASE);
+}
+
+const void *jit_fault_fixup(const void *pc) {
+    JitEnv *env = &g_jit_env;
+    if (!env->fixups || !jit_pc_in_generated(pc)) return NULL;
+    u32 off = (u32)((const u8 *)pc - env->cache_rx);
+    u32 lo = 0, hi = __atomic_load_n(&env->nfixups, __ATOMIC_ACQUIRE);
+    while (lo < hi) {                       /* last entry with fast <= off */
+        u32 mid = lo + (hi - lo) / 2;
+        if (env->fixups[mid].fast <= off) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    const JFixup *f = &env->fixups[lo - 1];
+    if (off < f->fast || off >= f->slow) return NULL;   /* between accesses */
+    return env->cache_rx + f->slow;
+}
+
 int jit_pc_in_generated(const void *pc) {
     JitEnv *env = &g_jit_env;
     if (!env->active || !env->cache_rx) return 0;
@@ -383,6 +407,7 @@ static void jit_flush_all(JitEnv *env) {
     memset(env->jcache, 0, sizeof env->jcache);
     env->nblocks = 0;
     env->nedges = 0;
+    env->nfixups = 0;
     env->ptr = env->blocks_start_rw;
     env->flush_count++;
 }
@@ -396,6 +421,7 @@ static void jit_env_destroy(JitEnv *env) {
     free(env->pages);
     free(env->arena);
     free(env->edges);
+    free(env->fixups);
     memset(env, 0, sizeof *env);
     env->memfd = -1;
 }
@@ -435,7 +461,9 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->pages = calloc(JIT_PAGE_TBL, sizeof *env->pages);
     env->arena = malloc(JIT_MAX_BLOCKS * sizeof *env->arena);
     env->edges = malloc(2 * JIT_MAX_BLOCKS * sizeof *env->edges);
-    if (!env->hash || !env->pages || !env->arena || !env->edges) {
+    env->fixups = malloc(JIT_MAX_FIXUPS * sizeof *env->fixups);
+    if (!env->hash || !env->pages || !env->arena || !env->edges ||
+        !env->fixups) {
         jit_env_destroy(env);
         return -1;
     }
@@ -668,7 +696,12 @@ retry:
     b->ninsns = n;
     b->code = e.rx;
 
+    u32 fixups_before = env->nfixups;
     if (be_emit_block(&e, env, b, t_ir) < 0) {
+        /* Discard the abandoned attempt's fixups along with its code, or the
+         * table would stop being sorted by offset and the binary search in
+         * jit_fault_fixup would go wrong. */
+        env->nfixups = fixups_before;
         if (max_insns > 1 && n > 1) {   /* pathological block: shrink, retry */
             max_insns = n / 2;
             goto retry;

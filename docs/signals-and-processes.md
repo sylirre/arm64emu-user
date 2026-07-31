@@ -22,6 +22,14 @@ come through the host catcher — they arrive from the interpreter as pending
 exceptions and are delivered directly by `sig_deliver_fault`, which has precise
 `si_addr`/`si_code` from `mem.c`.
 
+`SIGBUS` is the one whose *host* disposition the emulator keeps for itself, like
+`SIGSYS`: `sig_host_update` leaves it alone so the bus-error recovery net
+(`mem.c`, see docs/memory.md) is never replaced by a guest `sigaction`. A file
+truncated from outside the address space raises a real host `SIGBUS` on the
+emulator, and that net turns it into the guest's own abort. The guest's
+disposition is unaffected — it is applied by the run loop from `pend_exc`, as
+for every synchronous fault.
+
 ### Guest delivery
 
 At each loop boundary, if `g_sig_npend` is set, `sig_deliver_pending` delivers one

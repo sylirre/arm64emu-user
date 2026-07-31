@@ -655,11 +655,16 @@ void as_bus_disarm(void) { g_bus_armed = 0; }
 #if defined(__x86_64__)
 #define BUS_FAULT_PC(uc) ((const void *)(uintptr_t) \
     ((ucontext_t *)(uc))->uc_mcontext.gregs[REG_RIP])
+#define BUS_SET_PC(uc, p) \
+    (((ucontext_t *)(uc))->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)(p))
 #elif defined(__aarch64__)
 #define BUS_FAULT_PC(uc) ((const void *)(uintptr_t) \
     ((ucontext_t *)(uc))->uc_mcontext.pc)
-#else
-#define BUS_FAULT_PC(uc) ((const void *)0)   /* no JIT backend: never generated */
+#define BUS_SET_PC(uc, p) \
+    (((ucontext_t *)(uc))->uc_mcontext.pc = (unsigned long long)(uintptr_t)(p))
+#else                                /* no JIT backend: never in generated code */
+#define BUS_FAULT_PC(uc) ((void)(uc), (const void *)0)
+#define BUS_SET_PC(uc, p) ((void)(uc), (void)(p))
 #endif
 
 /* The region whose host backing contains `p`, or NULL. Only real host mappings
@@ -707,8 +712,24 @@ static int as_bus_repair(const void *hostaddr, u64 *far) {
 static void bus_catcher(int sig, siginfo_t *si, void *uc) {
     u64 far = 0;
     if (sig == SIGBUS && si && si->si_code == BUS_ADRERR && g_bus_armed &&
-        g_bus_cpu && !jit_pc_in_generated(BUS_FAULT_PC(uc)) &&
-        as_bus_repair(si->si_addr, &far)) {
+        g_bus_cpu && jit_pc_in_generated(BUS_FAULT_PC(uc))) {
+        /* Inside JIT-generated code there is nothing to unwind to: guest
+         * registers may live only in host registers, with no way to write
+         * them back from here. Resume at the faulting access's own slow path
+         * instead -- exactly where a D-TLB probe miss would have branched.
+         * That path spills the cached registers, then re-runs the access
+         * through the memory helper, which (the page table having just been
+         * repaired) misses, probes, and raises the guest's abort with the
+         * right FAR and the instruction's own baked pc. Registers survive
+         * because the redirect lands on a label the fast path could already
+         * have branched to with exactly this machine state. */
+        const void *fix = jit_fault_fixup(BUS_FAULT_PC(uc));
+        if (fix && as_bus_repair(si->si_addr, &far)) {
+            BUS_SET_PC(uc, fix);
+            return;
+        }
+    } else if (sig == SIGBUS && si && si->si_code == BUS_ADRERR && g_bus_armed &&
+        g_bus_cpu && as_bus_repair(si->si_addr, &far)) {
         g_bus_armed = 0;
         /* Exactly the abort the software path raises for a page past
          * end-of-file, so the run loop delivers SIGBUS/BUS_ADRERR at
