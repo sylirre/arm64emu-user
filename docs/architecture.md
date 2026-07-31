@@ -138,6 +138,17 @@ refereeing each other needs no oracle at all, and a guard that reaches
 the other half: a table of real allocated encodings, replayed against varying
 input state, where qemu *is* the oracle and the match must be exact.
 
+A third mode, `seq`, runs 2..24 allocated instructions as a single basic
+block under the same three-engine rule. Single-instruction stubs can only
+test decoding and arithmetic; `seq` is what reaches the machinery a
+translator runs *between* instructions — register allocation and spilling,
+the lazy-flag window between a flag producer and its consumer, fused
+memory runs behind one D-TLB probe, and the block-local vector-register
+cache. Each block is written to a fresh page, because rewriting one page is
+an `IC IVAU` per iteration and the JIT abandons a page after 32
+invalidations and interprets it — which would leave the comparison passing
+while comparing the interpreter with itself.
+
 The optional `--jit` inserts one more rung above `pd_run`: `jit_run`
 (`src/jit/`) executes native translations of guest basic blocks and honors the
 same return contract, handing control back to `emu_loop` on the same rare

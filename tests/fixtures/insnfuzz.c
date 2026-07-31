@@ -23,6 +23,17 @@
  *       architectural behaviour in two engines while --no-predecode, the
  *       documented bisection knob, keeps the old one.
  *
+ *   seq <seed> <count>
+ *       Blocks of 2..24 instructions drawn from the same allocated table,
+ *       run as ONE basic block. Everything a single-instruction stub cannot
+ *       reach lives here: the JIT's register allocator and its spills, the
+ *       lazy-flag windows between a flag producer and its consumer, fused
+ *       memory runs, and the block-local vector-register cache. Oracle is
+ *       the same as chaos -- the three engines must agree -- because a
+ *       sequence can manufacture NaN and Inf inputs mid-block that a single
+ *       instruction started clear of, and NaN payload propagation is a
+ *       documented deviation from qemu, not a bug to rediscover.
+ *
  *   dump <mode> <seed> <index>
  *       Replays to one iteration and prints the full input/output state. A
  *       digest mismatch on its own says nothing; this turns it into numbers.
@@ -380,11 +391,24 @@ static const Tmpl templates[] = {
 
 #define STUB_ADDR ((void *)0x60000000UL)
 
+/* seq mode gets its own region, mapped only when that mode runs, so the
+ * other two modes keep exactly the address space -- and therefore exactly
+ * the faulting behaviour -- they had before it existed.
+ *
+ * Every block goes on its own page. Rewriting one page instead would quietly
+ * stop testing the translator: each rewrite is an IC IVAU, the JIT counts
+ * invalidations per guest page, and after 32 of them it gives up on that
+ * page and runs it purely interpreted -- so the comparison would still pass
+ * while comparing the interpreter against itself. */
+#define SEQ_STUB_ADDR ((void *)0x68000000UL)
+#define SEQ_PAGES 1024
+#define SEQ_MAX_INSNS 24
+
 static jmp_buf jb;
 static volatile int g_sig;
 static void on_sig(int s) { g_sig = s; siglongjmp(jb, 1); }
 
-static uint32_t *stub;
+static uint32_t *stub, *seq_stub;
 static char scratch[1 << 18] __attribute__((aligned(4096)));
 
 static void run_one(const State *in, State *out, void *stubp) {
@@ -474,6 +498,16 @@ static void make_state(State *s, int kind) {
     s->fpsr = 0;
 }
 
+/* Hash a window of the scratch buffer, so a sequence's stores are compared
+ * too and not just the registers it happens to leave behind. */
+static uint64_t scratch_digest(void) {
+    uintptr_t base = (uintptr_t)scratch + (sizeof scratch / 2);
+    const unsigned char *p = (const unsigned char *)(base - 4096);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < 8192; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+
 static uint64_t digest(const State *s) {
     uint64_t h = 0xcbf29ce484222325ULL;
     const unsigned char *p = (const unsigned char *)s;
@@ -537,17 +571,24 @@ int main(int argc, char **argv) {
     const char *mode = (argc > 1) ? argv[1] : "";
     long dumpidx = -1;
     if (!strcmp(mode, "dump")) {
-        if (argc < 5) { puts("usage: insnfuzz dump <conform|chaos> <seed> <idx>"); return 1; }
+        if (argc < 5) { puts("usage: insnfuzz dump <conform|chaos|seq> <seed> <idx>"); return 1; }
         mode = argv[2]; rnd_state = strtoull(argv[3], 0, 0);
         dumpidx = strtol(argv[4], 0, 0);
     } else if (argc >= 4) {
         rnd_state = strtoull(argv[2], 0, 0);
     } else {
-        puts("usage: insnfuzz <conform|chaos> <seed> <count> | dump <mode> <seed> <idx>");
+        puts("usage: insnfuzz <conform|chaos|seq> <seed> <count> | dump <mode> <seed> <idx>");
         return 1;
     }
     int chaos = !strcmp(mode, "chaos");
-    if (!chaos && strcmp(mode, "conform")) { puts("bad mode"); return 1; }
+    int seq = !strcmp(mode, "seq");
+    if (!chaos && !seq && strcmp(mode, "conform")) { puts("bad mode"); return 1; }
+    if (seq) {
+        seq_stub = mmap(SEQ_STUB_ADDR, SEQ_PAGES * 4096,
+                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (seq_stub == MAP_FAILED) { puts("seq mmap failed"); return 1; }
+    }
     long count = (dumpidx >= 0) ? dumpidx + 1 : strtol(argv[3], 0, 0);
 
     for (long n = 0; n < count; n++) {
@@ -560,6 +601,44 @@ int main(int argc, char **argv) {
             const Tmpl *t = &templates[n % NTMPL];
             w = t->insn;
             mem_mode = t->kind;
+        }
+        if (seq) {
+            /* No template writes x0 or x1 as a destination, and the only
+             * updates to x0 are the pre/post-index writebacks (<= 32 bytes
+             * each), so a whole block stays pointed inside `scratch` the way
+             * a single instruction does. */
+            unsigned k = 2 + (unsigned)(rnd() % (SEQ_MAX_INSNS - 1));
+            uint32_t *sp = seq_stub + (size_t)(n % SEQ_PAGES) * 1024;
+            for (unsigned j = 0; j < k; j++)
+                sp[j] = templates[rnd() % NTMPL].insn;
+            sp[k] = 0xD65F03C0;                          /* ret */
+            __builtin___clear_cache((char *)sp, (char *)(sp + k + 1));
+            State sin, sout;
+            make_state(&sin, K_MEM);
+            for (int i = 0; i < 32; i++)                 /* keep NaN/Inf out */
+                sin.v[i] &= ~0x4000400040004000ULL;
+            /* Half the blocks straddle a guest page boundary: without that,
+             * a fused memory run's span check and the D-TLB probe's
+             * page-cross bail are never taken. */
+            if (rnd() & 1) {
+                uintptr_t mid = (uintptr_t)scratch + (sizeof scratch / 2);
+                uintptr_t pg  = (mid + 4095) & ~(uintptr_t)4095;
+                for (int i = 0; i < 16; i += 2)
+                    sin.x[i] = (uint64_t)(pg - 64 + ((rnd() % 17) * 8));
+            }
+            memset(&sout, 0, sizeof sout);
+            g_sig = 0;
+            if (sigsetjmp(jb, 1) == 0) run_one(&sin, &sout, sp);
+            if (n == dumpidx) {
+                for (unsigned j = 0; j < k; j++) printf("  w%-2u %08x\n", j, sp[j]);
+                dump_state(n, k, &sin, &sout);
+                return 0;
+            }
+            if (g_sig) printf("%03u S%d\n", k, g_sig);
+            else printf("%03u %016llx %016llx\n", k,
+                        (unsigned long long)digest(&sout),
+                        (unsigned long long)scratch_digest());
+            continue;
         }
         State in, out;
         make_state(&in, mem_mode);

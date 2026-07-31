@@ -889,6 +889,24 @@ if [ -n "$AGCC" ]; then
             diff <(echo "$c_pd") <(echo "$c_np") | head -4 | sed 's/^/     pd-vs-decoder /'
             diff <(echo "$c_pd") <(echo "$c_jit") | head -4 | sed 's/^/     pd-vs-jit     /'
         fi
+        # seq: allocated instructions run as whole basic blocks, refereed the
+        # same way. This is the only check that reaches what a translator does
+        # BETWEEN instructions -- register allocation and spills, the lazy-flag
+        # window from a producer to its consumer, fused memory runs, the
+        # block-local vector-register cache -- none of which a one-instruction
+        # stub can exercise. Each block gets a fresh page so the JIT's
+        # self-modifying-code thrash guard does not quietly demote it to the
+        # interpreter and leave the comparison comparing nothing.
+        s_pd=$(timeout 180 "$EMU" / "$ifb" seq 3 6000 2>/dev/null)
+        s_np=$(timeout 180 "$EMU" --no-predecode / "$ifb" seq 3 6000 2>/dev/null)
+        s_jit=$(timeout 180 "$EMU" --jit / "$ifb" seq 3 6000 2>/dev/null)
+        if [ -n "$s_pd" ] && [ "$s_pd" = "$s_np" ] && [ "$s_pd" = "$s_jit" ]; then
+            pass=$((pass+1)); echo "PASS insnfuzz: seq (engines agree)"
+        else
+            fail=$((fail+1)); echo "FAIL insnfuzz: seq (engines disagree)"
+            diff <(echo "$s_pd") <(echo "$s_np") | head -4 | sed 's/^/     pd-vs-decoder /'
+            diff <(echo "$s_pd") <(echo "$s_jit") | head -4 | sed 's/^/     pd-vs-jit     /'
+        fi
         rm -f "$ifb"
     else
         echo "SKIP build fixtures/insnfuzz"
