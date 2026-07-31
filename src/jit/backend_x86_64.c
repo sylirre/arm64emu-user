@@ -479,7 +479,13 @@ static void lea_bid(Emit *e, int dst, int base, int idx, int disp) {
 static int def_alias(BE *be, int d, int a, int w) {
     if (d == a) {
         int h = ra_use(be, a);
-        be->dirty[d] = 1;
+        /* A write to XZR is discarded, so it must never become dirty: the
+         * flag would make v_store spill VREG_ZERO, and VREG_ZERO's spill
+         * index is tmp_spill[3] — the slot a fused memory run parks its
+         * base VA in. Reachable as `tst xzr, #imm` / `cmn xzr, xzr` with
+         * dead flags, where ra_def's own VREG_ZERO guard is bypassed
+         * because d == a takes this branch. */
+        if (d != VREG_ZERO) be->dirty[d] = 1;
         if (!w) mov_rr(be->e, 0, h, h);          /* zext32 in place */
         return h;
     }
