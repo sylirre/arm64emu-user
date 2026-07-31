@@ -915,6 +915,16 @@ static u64 sat_u(s64 v, unsigned e) {
     if ((u64)v > max) { g_fpexc |= FPSR_QC; return max; }
     return (u64)v;
 }
+/* Saturating negation, the kernel of SQABS/SQNEG. Negating the most-negative
+ * value of the element width saturates. At e < 64 the negation is computed at
+ * full s64 width and sat_s clamps it, but at e == 64 negating INT64_MIN is
+ * signed overflow: it wraps straight back to INT64_MIN, which sat_s cannot
+ * recognize as out of range because INT64_MIN is exactly its lower bound. So
+ * the value passed through unclamped and unflagged. Handle it explicitly. */
+static u64 sat_neg(s64 v, unsigned e) {
+    if (e >= 64 && v == INT64_MIN) { g_fpexc |= FPSR_QC; return (u64)INT64_MAX; }
+    return sat_s(-v, e);
+}
 static u64 ssat_add(s64 a, s64 b, unsigned e) {
     if (e < 64) return sat_s(a + b, e);
     s64 r = (s64)((u64)a + (u64)b);
@@ -2270,8 +2280,9 @@ static void simd_two_misc(CPU *c, u32 insn) {
                 v = suqadd_sat(d, a, esize); } break;
             case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i) & emask; s64 sa = sx(a, esize); /* USQADD */
                 v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
-            case (0 << 5) | 0x07: { s64 s = sx(a, esize); v = sat_s(s < 0 ? -s : s, esize); } break; /* SQABS */
-            case (1 << 5) | 0x07: v = sat_s(-sx(a, esize), esize); break;      /* SQNEG */
+            case (0 << 5) | 0x07: { s64 s = sx(a, esize);                      /* SQABS */
+                v = (s < 0) ? sat_neg(s, esize) : sat_s(s, esize); } break;
+            case (1 << 5) | 0x07: v = sat_neg(sx(a, esize), esize); break;      /* SQNEG */
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
@@ -2392,8 +2403,9 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
     }
     u64 a = velem_get(&c->v[Rn], size, 0), v; int ok = 1;
     switch ((U << 5) | opcode) {
-        case (0 << 5) | 0x07: { s64 s = sx(a,esize); v = sat_s(s < 0 ? -s : s, esize); } break;  /* SQABS */
-        case (1 << 5) | 0x07: v = sat_s(-sx(a,esize), esize); break;                              /* SQNEG */
+        case (0 << 5) | 0x07: { s64 s = sx(a,esize);                                              /* SQABS */
+            v = (s < 0) ? sat_neg(s, esize) : sat_s(s, esize); } break;
+        case (1 << 5) | 0x07: v = sat_neg(sx(a,esize), esize); break;                             /* SQNEG */
         case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0); v = suqadd_sat(d, a, esize); } break; /* SUQADD */
         case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd],size,0)&emask; s64 sa = sx(a,esize);  /* USQADD */
             v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
