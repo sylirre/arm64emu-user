@@ -272,8 +272,11 @@ typedef struct IRBlock {
     u32  ninsns;            /* NATIVE-retired guest insn count (icount delta
                              * added by exit stubs; CALL1 insns not included
                              * — jit_exec1 counts those itself) */
-    /* per-op vreg liveness (bit v set = vreg v live after this op), filled
-     * by the liveness pass for the allocator's free-after-last-use */
+    /* Per-op vreg liveness (bit v set = vreg v live after this op). Computed
+     * by fe_liveness for a free-after-last-use allocator; NO backend reads it
+     * yet — both allocate LRU-style and spill on demand. Kept because the
+     * same backward walk already has to run for flags_dead, which is used.
+     * Anything wiring it up should re-check the def/use tables first. */
     u64  live_after[IR_MAX_OPS];
 } IRBlock;
 

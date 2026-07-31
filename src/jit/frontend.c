@@ -1567,9 +1567,16 @@ static void fe_liveness(IRBlock *ir) {
             case IRO_JMP: case IRO_NOP:
                 break;
             default:
+                /* Ops whose `dst` field is not a GPR definition are listed
+                 * here. IRO_LDV/IRO_STV belong: put_ldv/put_stv leave dst at
+                 * the ir_put default of 0, which is guest x0, and their real
+                 * destination is the V register packed into aux. Treating
+                 * that placeholder as a def would kill x0's liveness at every
+                 * vector load or store. */
                 if (o->dst < VREG_N && o->dst != VREG_ZERO &&
                     !(o->op >= IRO_CCMPR && o->op <= IRO_CCMNI) &&
-                    o->op != IRO_ST && o->op != IRO_BCOND &&
+                    o->op != IRO_ST && o->op != IRO_STV &&
+                    o->op != IRO_LDV && o->op != IRO_BCOND &&
                     o->op != IRO_CBZ && o->op != IRO_CBNZ &&
                     o->op != IRO_TBZ && o->op != IRO_TBNZ &&
                     o->op != IRO_JMPIND)
