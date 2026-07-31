@@ -54,6 +54,11 @@ void jit_fork_child(void);
 /* Guest thread exit: unregister and release this thread's JIT resources. */
 void jit_thread_exit(void);
 
+/* Is `pc` a host address inside this thread's translated-code cache? The
+ * bus-error recovery (mem.c) declines to unwind such a fault: guest registers
+ * may live only in host registers there, with no way to write them back. */
+int jit_pc_in_generated(const void *pc);
+
 /* Process termination via _exit (exit/exit_group syscalls bypass atexit):
  * flush the A64_JIT_STATS report if it is enabled. No-op otherwise. */
 void jit_stats_flush(void);

@@ -64,7 +64,21 @@ int emu_loop(CPU *c) {
             continue;   /* re-test c->stop, and the counter it just synced */
         }
 
-        int stepped = 0;
+        /* volatile: assigned inside the sigsetjmp bracket below, so a recovery
+         * unwind must not leave it indeterminate. It stays 0 on that path,
+         * which is right — an instruction that faulted did not single-step. */
+        volatile int stepped = 0;
+        /* Bus-error recovery bracket (mem.c). A file truncated from outside
+         * this address space leaves PTEs pointing at host pages the kernel now
+         * refuses; the handler records the guest abort and unwinds to here,
+         * where the sigsetjmp returns nonzero and the engines are skipped so
+         * the pending exception below is delivered. Cheap: once per run-loop
+         * round trip, not per instruction, and savemask 0 keeps it a pure
+         * register save (the handler unblocks SIGBUS itself before unwinding).
+         * Deliberately does NOT cover syscall dispatch further down: a handler
+         * may hold locks that an unwind would strand. */
+        if (sigsetjmp(g_bus_jb, 0) == 0) {
+        as_bus_arm(c);
         if (UNLIKELY(g_debug_hooks)) {
             /* Full step: keeps every per-instruction debug facility
              * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */
@@ -93,6 +107,8 @@ int emu_loop(CPU *c) {
                 c->icount++;
             }
         }
+        }
+        as_bus_disarm();
 
         /* WFE/WFI at EL0: treat as yield. */
         if (UNLIKELY(c->halted)) c->halted = false;

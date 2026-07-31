@@ -75,6 +75,13 @@ int be_vop_ok(unsigned vclass, u32 insn) {
 
 int jit_backend_available(void) { return be_available(); }
 
+int jit_pc_in_generated(const void *pc) {
+    JitEnv *env = &g_jit_env;
+    if (!env->active || !env->cache_rx) return 0;
+    const u8 *p = (const u8 *)pc;
+    return p >= env->cache_rx && p < env->cache_rx + env->cache_size;
+}
+
 /* ---- thread registry (cross-thread interrupt only) ----
  * Slots are claimed/released with atomics under as_lock; the fork child
  * clears the table outright (a fork must never inherit a lock or a pointer

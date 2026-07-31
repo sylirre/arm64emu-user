@@ -8,7 +8,10 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <string.h>
+#include <ucontext.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -608,6 +611,136 @@ static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool 
     unsigned fsc = perm ? FSC_PERM_L3
                         : (va_is_file_hole(c, va) ? FSC_EXTERNAL : FSC_TRANS_L3);
     cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, fsc)), va);
+}
+
+/* ---- host bus-error recovery ----
+ *
+ * Pages of a file mapping that lie past end-of-file are kept out of the page
+ * table, so touching one takes the ordinary translation-fault path and becomes
+ * the guest's SIGBUS (raise_dabort -> FSC_EXTERNAL). That covers every shrink
+ * the emulator performs itself, because as_file_resized runs on the way out of
+ * ftruncate/truncate/fallocate.
+ *
+ * A truncation from OUTSIDE this address space is invisible to it -- another
+ * program on the host, or simply another guest process, since as_file_resized
+ * only walks the caller's own mappings. The PTEs stay, they still point into
+ * the host mapping, and the next guest access reaches a page the kernel now
+ * refuses. The resulting SIGBUS lands on the emulator, in the middle of its
+ * own memcpy, where there was no handler and nothing to unwind to: the
+ * emulator died where the guest should have taken a signal.
+ *
+ * The handler below is deliberately narrow. It acts only on a fault whose
+ * address lies inside the host backing of one of this process's file mappings;
+ * every other bus error keeps the old fatal behaviour. It then drops that
+ * region's PTEs -- as_fault_fill re-probes each page with process_vm_readv,
+ * which reports the shrink without faulting, so pages that are gone stay
+ * unmapped and pages still there come back -- records the guest abort, and
+ * longjmps to the bracket loop.c wraps around the execution engines.
+ *
+ * Unwinding is safe because of where it unwinds FROM. The engines touch guest
+ * memory with no lock held, and the JIT's slow path stores every dirty guest
+ * register (slow_store_dirty) and materializes NZCV before calling a memory
+ * helper, so at any faulting point inside emulator C code the CPU struct holds
+ * the entire guest state and c->cur_insn_pc names the faulting instruction.
+ * A fault inside JIT-*generated* code is the one case that is not recoverable
+ * -- guest registers cached in host registers would be lost -- so it is
+ * declined and stays fatal. */
+__thread sigjmp_buf g_bus_jb;
+__thread int g_bus_armed;
+static __thread CPU *g_bus_cpu;
+
+void as_bus_arm(CPU *c) { g_bus_cpu = c; g_bus_armed = 1; }
+void as_bus_disarm(void) { g_bus_armed = 0; }
+
+#if defined(__x86_64__)
+#define BUS_FAULT_PC(uc) ((const void *)(uintptr_t) \
+    ((ucontext_t *)(uc))->uc_mcontext.gregs[REG_RIP])
+#elif defined(__aarch64__)
+#define BUS_FAULT_PC(uc) ((const void *)(uintptr_t) \
+    ((ucontext_t *)(uc))->uc_mcontext.pc)
+#else
+#define BUS_FAULT_PC(uc) ((const void *)0)   /* no JIT backend: never generated */
+#endif
+
+/* The region whose host backing contains `p`, or NULL. Only real host mappings
+ * of a file can produce this fault; anonymous backing has no end-of-file. */
+static Region *region_by_host_locked(AddrSpace *as, const u8 *p) {
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if (!r->hostmap) continue;
+        if (p >= r->host && p < r->host + (r->end - r->start)) return r;
+    }
+    return NULL;
+}
+
+/* Clear the PTEs of an existing mapping. Unlike pte_set_range this never
+ * allocates an L2 table and never calls jit_invalidate_range -- nothing is
+ * being unmapped, the translations stay valid and only the data PTEs go --
+ * which is what makes it usable from a signal handler. */
+static void pte_drop_existing(AddrSpace *as, u64 addr, u64 len) {
+    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
+        u64 va = addr + off;
+        uintptr_t *l2 = as->l1[L1_IDX(va)];
+        if (l2) l2[L2_IDX(va)] = 0;
+    }
+    __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
+}
+
+/* Returns 1 and fills *far when the fault was on a file mapping we own. */
+static int as_bus_repair(const void *hostaddr, u64 *far) {
+    AddrSpace *as = cpu_as(g_bus_cpu);
+    /* Recursive mutex: a trylock succeeds if this thread already holds it and
+     * balances on unlock. Held by ANOTHER thread, we simply skip the repair --
+     * the guest still gets its signal, and the next access faults again. */
+    if (pthread_mutex_trylock(&g_as_lock) != 0) return 0;
+    Region *r = region_by_host_locked(as, hostaddr);
+    if (r) {
+        *far = r->start + (u64)((const u8 *)hostaddr - r->host);
+        pte_drop_existing(as, r->start, r->end - r->start);
+    }
+    pthread_mutex_unlock(&g_as_lock);
+    if (!r) return 0;
+    jit_dtlb_reset();     /* the JIT reads these entries without a gen check */
+    return 1;
+}
+
+static void bus_catcher(int sig, siginfo_t *si, void *uc) {
+    u64 far = 0;
+    if (sig == SIGBUS && si && si->si_code == BUS_ADRERR && g_bus_armed &&
+        g_bus_cpu && !jit_pc_in_generated(BUS_FAULT_PC(uc)) &&
+        as_bus_repair(si->si_addr, &far)) {
+        g_bus_armed = 0;
+        /* Exactly the abort the software path raises for a page past
+         * end-of-file, so the run loop delivers SIGBUS/BUS_ADRERR at
+         * cur_insn_pc with FAR = the guest address. */
+        cpu_raise_sync(g_bus_cpu,
+                       esr_make(EC_DABORT_LOWER, iss_dabort(false, FSC_EXTERNAL)),
+                       far);
+        sigset_t only;                   /* delivery blocked it; siglongjmp
+                                          * (savemask 0) will not put it back */
+        sigemptyset(&only);
+        sigaddset(&only, SIGBUS);
+        sigprocmask(SIG_UNBLOCK, &only, NULL);
+        siglongjmp(g_bus_jb, 1);
+    }
+    /* Not ours, or not recoverable from here: restore the default so the
+     * retried access kills us exactly as it did before. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigaction(SIGBUS, &dfl, NULL);
+}
+
+/* Installed once at startup. sig_host_update leaves SIGBUS alone (the guest's
+ * own disposition is applied by the run loop, from pend_exc), so this handler
+ * is never replaced by a guest sigaction. */
+void as_bus_init(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = bus_catcher;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, NULL);
 }
 
 static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {

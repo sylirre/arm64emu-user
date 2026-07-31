@@ -8,6 +8,8 @@
 #ifndef A64_MMU_H
 #define A64_MMU_H
 
+#include <setjmp.h>
+
 #include "cpu.h"
 
 /* Branch-prediction hints for the interpreter hot paths (run loop, mem seam). */
@@ -56,6 +58,21 @@ bool mem_write128(CPU *c, u64 va, const V128 *val);
  * Cross-thread invalidation happens via the address-space generation counter
  * in mem.c, bumped by every PTE mutation. */
 void tlb_flush_all(void);
+
+/* ---- host bus-error recovery (mem.c) ----
+ * A file truncated from outside this address space leaves PTEs pointing at
+ * host pages the kernel now refuses; the resulting SIGBUS lands on the
+ * emulator rather than the guest. as_bus_init installs the handler, and the
+ * run loop brackets the execution engines with sigsetjmp(g_bus_jb, 0) +
+ * as_bus_arm/as_bus_disarm so a recoverable fault can unwind to a point where
+ * the CPU struct is the whole guest state. Arm ONLY around the engines: a
+ * syscall handler may hold locks that an unwind would strand. */
+struct CPU;
+extern __thread sigjmp_buf g_bus_jb;
+extern __thread int g_bus_armed;
+void as_bus_init(void);
+void as_bus_arm(struct CPU *c);
+void as_bus_disarm(void);
 
 /* ---- Guest address space (linux-user), defined in mem.c ---- */
 

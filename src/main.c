@@ -691,6 +691,8 @@ int main(int argc, char **argv)
     genv[ge] = NULL;
 
     as_init(&m->as);
+    as_bus_init();   /* host SIGBUS on a file truncated from outside this
+                      * address space becomes the guest's own abort */
     m->cpu.m = m;
     g_tls.tid = getpid();     /* main thread tid == pid */
 

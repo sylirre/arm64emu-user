@@ -368,6 +368,13 @@ void sig_host_update(struct Machine *m, int sig) {
     if (sig == SIGSYS) return;                   /* owned by the SIGSYS net; guest
                                                     dispositions are honored via
                                                     the capture queue */
+    if (sig == SIGBUS) return;                   /* owned by the bus-error recovery
+                                                    net (mem.c as_bus_init), which
+                                                    turns a host SIGBUS on a shrunk
+                                                    file mapping into the guest's
+                                                    own abort; the guest disposition
+                                                    is applied by the run loop from
+                                                    pend_exc, like every sync fault */
     if (sig == PTRACE_KICKSIG) return;           /* owned by the ptrace kick net;
                                                     guest dispositions honored via
                                                     the capture queue (sig_kick_net) */
