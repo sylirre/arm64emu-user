@@ -27,14 +27,15 @@
  * mountstats is the guest mount device list (the host file exposes the real
  * mount namespace). For any guest PID (not just self), the
  * exe/cwd/root symlinks resolve to the guest view too, spliced in path.c from
- * this Machine (self) or the shared PID registry (another guest process). Under
- * --fake-id, /proc/<pid>/status is also synthesized: the host file's
- * Uid:/Gid:/Groups: lines carry the real invoking uid, but ps/top read them to
- * name the user, so those lines are rewritten through the fake-id remap (a static
- * snapshot; the rest of the file passes through). Another guest process's
- * address-space files (maps, smaps, pagemap, mem, ...) have no guest answer to
- * synthesize and the host's describes the emulator, so those are refused with
- * EACCES rather than passed through. Everything else under /proc
+ * this Machine (self) or the shared PID registry (another guest process).
+ * /proc/<pid>/status is synthesized line by line: most of it is a true
+ * property of the process being asked about, but TracerPid, Seccomp, the
+ * signal masks, NoNewPrivs and (under --fake-id) Uid/Gid/Groups and the
+ * capability sets all describe the emulator instead, and the host kernel's
+ * x86_* arch-hook lines describe the host CPU (see put_status). Another guest
+ * process's address-space files (maps, smaps, pagemap, mem, ...) have no guest
+ * answer to synthesize and the host's describes the emulator, so those are
+ * refused with EACCES rather than passed through. Everything else under /proc
  * stays host-passthrough — including stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <pthread.h>
@@ -51,13 +52,14 @@
 #include <sys/vfs.h>
 
 #include "sys.h"
+#include "ptrace.h"
 
 enum {
     PF_CMDLINE, PF_MAPS, PF_MOUNTS, PF_MOUNTINFO,
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
-    PF_OVERFLOWID,
+    PF_OVERFLOWID, PF_STATUS,
 };
 
 /* put_mounts format selector. */
@@ -66,6 +68,11 @@ enum { MNT_MOUNTS = 0, MNT_MOUNTINFO = 1, MNT_MOUNTSTATS = 2 };
 /* Guards the pf_fds refresh registry (one struct Machine per process;
  * these files are opened rarely, so a single lock is fine). */
 static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Defined below with the rest of the /proc/<pid>/status handling; the refresh
+ * path (procfs_pre_read) comes first in this file. */
+static int put_status(int fd, struct Machine *m, const char *canon, int self,
+                      s32 *tid_out);
 /* Leaf lock for the /proc/stat busy estimate — the writers run both with
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -628,7 +635,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
  * table missed: dup2-onto, execve's CLOEXEC sweep) is detected and dropped
  * instead of clobbering an innocent file. Table full: the fd just keeps its
  * open-time snapshot. */
-static void pf_track(struct Machine *m, int fd, int kind, s32 pid) {
+static void pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
     u64 ino = (u64)st.st_ino;
@@ -636,6 +643,7 @@ static void pf_track(struct Machine *m, int fd, int kind, s32 pid) {
     if (m->pf_fds_count < PF_MAX_FDS) {
         m->pf_fds[m->pf_fds_count].fd = fd;
         m->pf_fds[m->pf_fds_count].kind = (u8)kind;
+        m->pf_fds[m->pf_fds_count].self = (u8)self;
         m->pf_fds[m->pf_fds_count].pid = pid;
         m->pf_fds[m->pf_fds_count].ino = ino;
         m->pf_fds_count++;
@@ -680,6 +688,17 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
         put_idmap(fd, m, m->pf_fds[i].kind, m->pf_fds[i].pid);
         break;
+    /* The rewritten lines (TracerPid, Seccomp, the signal masks) change over a
+     * process's life, so a re-read must go back to the host file. The tid the
+     * open resolved names it directly -- /proc/<tid> works for a non-leader
+     * thread too -- so no spelling of the original path has to be kept. */
+    case PF_STATUS: {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/status", (int)m->pf_fds[i].pid);
+        if (put_status(fd, m, path, m->pf_fds[i].self, NULL) < 0)
+            m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* process is gone */
+        break;
+    }
     }
     lseek(fd, 0, SEEK_SET);
 out:
@@ -696,55 +715,206 @@ static int synth_memfd(void) {
 #endif
 }
 
-/* True if canon names "/proc/<pid>/status" for a VISIBLE process: self,
- * own-pid, or a registered guest pid. A hidden (non-guest) pid returns 0 so the
+/* Which spelling of "status" canon names, if any: PS_SELF for this process
+ * (self / own-pid / thread-self / one of our own threads' task dirs), PS_OTHER
+ * for another guest process. A hidden (non-guest) pid returns PS_NONE so the
  * path layer's ENOENT stands and no foreign process's status can leak -- the
  * same visibility rule the other-pid handlers rely on. */
+enum { PS_NONE = 0, PS_SELF, PS_OTHER };
 static int status_target(const char *canon) {
     const char *t = self_tail(canon);
-    if (t) return !strcmp(t, "status");
+    if (t) return !strcmp(t, "status") ? PS_SELF : PS_NONE;
     s32 pid;
     t = proc_other_tail(canon, &pid);
-    return t && !strcmp(t, "status") && proctab_has(pid);
+    return (t && !strcmp(t, "status") && proctab_has(pid)) ? PS_OTHER : PS_NONE;
 }
 
-/* Copy the host /proc/<pid>/status through, rewriting only the Uid:/Gid:/Groups:
- * numeric fields via the fake-id remap so ps/top resolve the fake identity's
- * user/group (they read the Uid: line, which otherwise carries the emulator's
- * real host uid). Only called under m->fake_id; canon is the passthrough host
- * path. Returns 0 on success, -1 if the host file can't be read (caller then
- * falls through to plain passthrough). */
-static int put_status(int fd, struct Machine *m, const char *canon) {
-    FILE *hf = fopen(canon, "re");
-    if (!hf) return -1;
-    char line[4096];
-    while (fgets(line, sizeof line, hf)) {
-        if (!strncmp(line, "Uid:", 4) || !strncmp(line, "Gid:", 4)) {
-            int is_uid = line[0] == 'U';
+/* Does this status line carry exactly this key? ("Seccomp" must not match
+ * "Seccomp_filters:", so the colon is part of the test.) */
+static int is_key(const char *line, const char *key) {
+    size_t n = strlen(key);
+    return !strncmp(line, key, n) && line[n] == ':';
+}
+
+#define STATUS_MAX 16384   /* a status file is ~2 KB; Groups: is the long line */
+
+/* Guest view of /proc/<pid>/status: pass the host file through, rewriting the
+ * lines that describe the EMULATOR rather than the guest and dropping the ones
+ * that describe the host's architecture. Everything else -- State, PPid,
+ * FDSize, the Vm* sizes, Threads, the context-switch counters -- is a real
+ * property of the process being asked about and stands as it is.
+ *
+ * What has to be rewritten, and why the host file cannot answer it:
+ *   TracerPid  the emulated ptrace never host-attaches (ptracetab.c), so the
+ *              host task has no tracer to report even while a guest gdb has it
+ *              stopped -- and a real one would name a host pid regardless.
+ *   Seccomp    a guest filter is evaluated here and never installed on the
+ *              host (sys_seccomp.c), so a filtered guest reads 0; and where the
+ *              emulator itself runs under a filter the guest never asked for
+ *              (Android, `make test-seccomp`), an unfiltered guest reads 2.
+ *   Sig*       the capture layer's dispositions and mask, not the guest's: it
+ *              installs host handlers by its own rules and blocks/unblocks
+ *              around delivery.
+ *   NoNewPrivs the recorded guest intent, for the same reason PR_GET_NO_NEW_
+ *              PRIVS is answered from it: an inherited host flag (the Android
+ *              zygote sets one) is not something the guest asked for.
+ *   Uid/Gid    the real invoking ids, which --fake-id exists to hide; ps and
+ *              top read these lines to name the owner.
+ *   Cap*       under fake-root, capget(2) already answers with a full set
+ *              (sys_misc.c), so leaving zeros here contradicts the emulator's
+ *              own syscall. CapBnd is the host kernel's full set and is what
+ *              the rewritten CapPrm/CapEff report; CapInh/CapAmb stay empty,
+ *              matching capget's inheritable set.
+ *   x86_*      an arch hook of the host kernel. An aarch64 kernel prints no
+ *              such line, so its presence is a bare host-arch fingerprint in
+ *              a file the guest reads about itself.
+ *
+ * `self` says the file describes this Machine, the only place the guest's exact
+ * signal state and credentials exist. For another guest process we rewrite what
+ * the shared tables can answer -- TracerPid from the ptrace link registry,
+ * Seccomp from the PID registry -- and leave the host's approximation of the
+ * rest standing, the same split every other cross-process /proc file here
+ * makes: its blocked set would have to be republished on every sigprocmask and
+ * every delivery to be worth reading, and being per-thread it does not belong
+ * in a per-process record anyway.
+ *
+ * That per-thread part also decides which mask the self case reports: the
+ * *calling* thread's, since that is the one this emulator process can see. It
+ * is exact for /proc/self/status in a single-threaded guest, for thread-self,
+ * and for a thread's own task/<tid>; a thread reading a sibling's task dir gets
+ * its own instead of the sibling's -- still the guest's mask rather than the
+ * capture layer's, which is the choice being made everywhere here.
+ *
+ * `canon` is the passthrough host path. *tid_out gets the thread this file
+ * describes, so a refresh can name it directly whichever spelling was opened.
+ * Returns 0, or -1 if the host file can't be read (the caller then falls back
+ * to plain passthrough). */
+static int put_status(int fd, struct Machine *m, const char *canon, int self,
+                      s32 *tid_out) {
+    int hfd = open(canon, O_RDONLY | O_CLOEXEC);
+    if (hfd < 0) return -1;
+    char *buf = malloc(STATUS_MAX);
+    if (!buf) { close(hfd); return -1; }
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(hfd, buf + n, STATUS_MAX - 1 - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n >= STATUS_MAX - 1) break;
+    }
+    close(hfd);
+    /* Empty, or bigger than the buffer -- a rewrite of half a file would be
+     * worse than the host's own answer, so hand the caller back to it. (Only
+     * Groups: can grow without bound, and only towards NGROUPS_MAX.) */
+    if (!n || n >= STATUS_MAX - 1) { free(buf); return -1; }
+    buf[n] = 0;
+
+    /* Pass 1 for the two values a rewrite needs but does not carry: the tid
+     * (Pid: names the thread the file describes, so it is right for every
+     * spelling of the path) and the host kernel's own full capability set. */
+    s32 tid = 0;
+    char capfull[48] = "";
+    for (char *p = buf; *p; ) {
+        char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (is_key(p, "Pid")) tid = (s32)strtol(p + 4, NULL, 10);
+        else if (is_key(p, "CapBnd")) {
+            const char *v = p + 7;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t vl = len - (size_t)(v - p);
+            if (vl && vl < sizeof capfull) { memcpy(capfull, v, vl); capfull[vl] = 0; }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    if (tid_out) *tid_out = tid;
+
+    /* Guest signal state. The kernel's mask spelling puts signal N in bit N-1,
+     * which is the guest sigset layout too, so these transfer as they are. */
+    u64 blk = 0, ign = 0, cgt = 0, pnd = 0;
+    if (self) {
+        blk = g_tls.sigmask;
+        /* Our capture ring is per-thread, so everything queued is private to
+         * this thread and the process-wide (shared) pending set is empty. */
+        pnd = sig_pending_set();
+        for (int s = 1; s <= 64; s++) {
+            u64 h = m->sigact[s].handler;
+            if (h == 1) ign |= 1ull << (s - 1);          /* SIG_IGN */
+            else if (h) cgt |= 1ull << (s - 1);          /* a guest handler */
+        }
+    }
+    u8 scmode = 0;
+    u32 scfilters = 0;
+    int scknown;
+    if (self) { scmode = (u8)seccomp_status(m, &scfilters); scknown = 1; }
+    else scknown = proctab_seccomp_get(tid, &scmode, &scfilters);
+    int fakeroot = self && m->fake_id && m->cred.euid == 0 && capfull[0];
+
+    for (char *p = buf; *p; ) {
+        char *nl = strchr(p, '\n');
+        char *next = nl ? nl + 1 : NULL;
+        if (nl) *nl = 0;               /* one NUL-terminated line at a time */
+
+        if (!strncmp(p, "x86_", 4)) goto next_line;
+
+        if (is_key(p, "TracerPid")) {
+            dprintf(fd, "TracerPid:\t%d\n", (int)ptrace_tracer_of(tid));
+            goto next_line;
+        }
+        if (scknown && is_key(p, "Seccomp")) {
+            dprintf(fd, "Seccomp:\t%u\n", scmode);
+            goto next_line;
+        }
+        if (scknown && is_key(p, "Seccomp_filters")) {
+            dprintf(fd, "Seccomp_filters:\t%u\n", scfilters);
+            goto next_line;
+        }
+        if (self) {
+            if (is_key(p, "SigPnd")) { dprintf(fd, "SigPnd:\t%016llx\n", (unsigned long long)pnd); goto next_line; }
+            if (is_key(p, "ShdPnd")) { dprintf(fd, "ShdPnd:\t%016llx\n", 0ULL); goto next_line; }
+            if (is_key(p, "SigBlk")) { dprintf(fd, "SigBlk:\t%016llx\n", (unsigned long long)blk); goto next_line; }
+            if (is_key(p, "SigIgn")) { dprintf(fd, "SigIgn:\t%016llx\n", (unsigned long long)ign); goto next_line; }
+            if (is_key(p, "SigCgt")) { dprintf(fd, "SigCgt:\t%016llx\n", (unsigned long long)cgt); goto next_line; }
+            if (is_key(p, "NoNewPrivs")) { dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0); goto next_line; }
+        }
+        if (fakeroot) {
+            if (is_key(p, "CapPrm")) { dprintf(fd, "CapPrm:\t%s\n", capfull); goto next_line; }
+            if (is_key(p, "CapEff")) { dprintf(fd, "CapEff:\t%s\n", capfull); goto next_line; }
+        }
+        if (m->fake_id && (is_key(p, "Uid") || is_key(p, "Gid"))) {
+            int is_uid = p[0] == 'U';
             u32 id[4];   /* real, effective, saved-set, filesystem */
-            if (sscanf(line + 4, "%u %u %u %u",
+            if (sscanf(p + 4, "%u %u %u %u",
                        &id[0], &id[1], &id[2], &id[3]) == 4) {
                 for (int i = 0; i < 4; i++)
                     id[i] = is_uid ? remap_uid(m, id[i]) : remap_gid(m, id[i]);
                 dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
                         id[0], id[1], id[2], id[3]);
-                continue;
+                goto next_line;
             }
-        } else if (!strncmp(line, "Groups:", 7)) {
-            dprintf(fd, "Groups:");
-            const char *p = line + 7;
-            u32 g; int adv;
-            while (sscanf(p, " %u%n", &g, &adv) == 1) {
-                dprintf(fd, " %u", remap_gid(m, g));
-                p += adv;
+        }
+        if (m->fake_id && is_key(p, "Groups")) {
+            /* The kernel's spelling is "Groups:\t" and then "%u " per group,
+             * trailing space and all; readers that split on it notice. */
+            dprintf(fd, "Groups:\t");
+            const char *g = p + 7;
+            u32 gid; int adv;
+            while (sscanf(g, " %u%n", &gid, &adv) == 1) {
+                dprintf(fd, "%u ", remap_gid(m, gid));
+                g += adv;
             }
             dprintf(fd, "\n");
-            continue;
+            goto next_line;
         }
-        size_t len = strlen(line);
-        ssize_t w = write(fd, line, len); (void)w;
+        {
+            ssize_t w = write(fd, p, strlen(p)); (void)w;
+            if (nl) { w = write(fd, "\n", 1); (void)w; }
+        }
+    next_line:
+        if (!next) break;
+        p = next;
     }
-    fclose(hf);
+    free(buf);
     return 0;
 }
 
@@ -894,25 +1064,29 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             put_idmap(fd, m, k, upid);
             lseek(fd, 0, SEEK_SET);
             if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-            pf_track(m, fd, k, upid);   /* written through, and re-read after */
+            pf_track(m, fd, k, upid, 0);   /* written through, and re-read after */
             *ret = fd;
             return 1;
         }
     }
 
-    /* /proc/<pid>/status under --fake-id: the host file's Uid:/Gid:/Groups:
-     * lines carry the real invoking uid, but ps/top read them to name the user.
-     * Rewrite those lines through the fake-id remap. Off fake-id the host file
-     * is already correct and passes through. A static snapshot (uid never
-     * changes), so no pf_track refresh entry is needed. */
-    if (m->fake_id && status_target(canon)) {
+    /* /proc/<pid>/status: several of its lines describe the emulator and not
+     * the guest process the file is supposed to be about (see put_status).
+     * Tracked for refresh, since what those lines say changes as the process
+     * runs. If a memfd or the host file is unavailable the host's own answer
+     * still passes through -- it is wrong in places, not useless. */
+    int stgt = status_target(canon);
+    if (stgt) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
         if (fd < 0) return 0;                       /* no memfd: passthrough */
-        if (put_status(fd, m, canon) < 0) { close(fd); return 0; }
+        int self = stgt == PS_SELF;
+        s32 tid = 0;
+        if (put_status(fd, m, canon, self, &tid) < 0) { close(fd); return 0; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        if (tid > 0) pf_track(m, fd, PF_STATUS, tid, self);
         *ret = fd;
         return 1;
     }
@@ -982,7 +1156,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
     if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT || writable)
-        pf_track(m, fd, kind, 0);   /* time-varying, or written through */
+        pf_track(m, fd, kind, 0, 1);   /* time-varying, or written through */
     *ret = fd;
     return 1;
 }

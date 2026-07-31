@@ -562,6 +562,29 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- /proc/<pid>/status lines that describe the guest, not the emulator
+# (src/sys_procfs.c put_status). Self-checking: qemu-user has neither guest
+# seccomp nor an emulated ptrace, so it would report the host task's own state
+# for every field here. The block below is what a real kernel prints for this
+# program -- byte for byte, except x86lines, where the oracle has to be an
+# aarch64 kernel: an x86 one adds two x86_* arch-hook lines that do not exist
+# there, and passing them through tells the guest what the host CPU is. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/status_probe.bin \
+            tests/fixtures/status_probe.c 2>/dev/null; then
+        got=$(timeout 60 "$EMU" / tests/fixtures/status_probe.bin 2>/dev/null)
+        expect=$'ign_hup=1 cgt_hup=0 cgt_term=1 ign_term=0\nblk_usr1=1 blk_usr2=0 pnd_usr1=1 pnd_usr2=0 shd_usr1=0\nunblk_usr1=0\nuntraced=0\ntracer_is_me=1\nnnp0=0\nnnp1=1\nsec0=0 f0=0\ninstall1=0\nsec1=2 f1=1\ninstall2=0\nsec2=2 f2=2\nkid_sec=2 kid_f=2\nx86lines=0\ndone'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: status_probe"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: status_probe"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/status_probe.bin
+    else
+        echo "SKIP build fixtures/status_probe"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

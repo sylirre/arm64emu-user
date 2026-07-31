@@ -90,6 +90,11 @@ void sigfd_track_dup(struct Machine *m, int oldfd, int newfd);
  * killing action. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
 int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data);
 s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
+/* This process's seccomp mode (G_SECCOMP_MODE_*) and installed filter count,
+ * for /proc/self/status; seccomp_publish mirrors the same pair into the shared
+ * PID registry, where another process's status read can reach it. */
+int  seccomp_status(struct Machine *m, u32 *nfilters);
+void seccomp_publish(struct Machine *m);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 

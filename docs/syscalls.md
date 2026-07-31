@@ -526,11 +526,30 @@ then make the consequences the caller depends on true:
   regenerated when a read starts at offset 0: procps opens them once and
   `lseek(0)`+rereads every refresh cycle, so an open-time snapshot would
   freeze `top`. The guest program's name is also set as the process `comm`
-  (`PR_SET_NAME` in `load_elf`), so `comm`/`status`/`stat` pass through
-  correctly for every guest process — except that under `--fake-id` the
-  `Uid:`/`Gid:`/`Groups:` lines of `status` are rewritten through the ownership
-  remap (the host file carries the real invoking uid, which `ps`/`top` read to
-  name the user). `/proc/self/fd/N` open/stat stays
+  (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
+  for every guest process. `status` is rebuilt line by line instead
+  (`put_status`): most of it — `State`, `PPid`, `FDSize`, the `Vm*` sizes,
+  `Threads`, the context-switch counters — is a true property of the process
+  being asked about, but several lines describe the *emulator*, and one
+  describes the host CPU:
+
+  | line | why the host file is wrong |
+  |---|---|
+  | `TracerPid` | the emulated `ptrace` never host-attaches, so the host task reports no tracer even while a guest `gdb` has it stopped |
+  | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-seccomp`), an unfiltered guest reads 2 |
+  | `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` | the capture layer's dispositions and mask, not the guest's |
+  | `NoNewPrivs` | answered from the recorded guest intent, like `PR_GET_NO_NEW_PRIVS`: an inherited host flag (the Android zygote sets one) is not something the guest asked for |
+  | `Uid`/`Gid`/`Groups` | under `--fake-id`, the real invoking ids, which `ps`/`top` read to name the user |
+  | `CapPrm`/`CapEff` | under fake-root, `capget(2)` already answers with a full set, so zeros here contradict the emulator's own syscall |
+  | `x86_*` | an arch hook of the host kernel; an aarch64 kernel prints no such line, so passing it through tells the guest what the host CPU is |
+
+  The exact signal state and credentials exist only in the process's own
+  `Machine`, so for **another** guest process only what the shared tables can
+  answer is rewritten (`TracerPid` from the ptrace link registry, `Seccomp` from
+  the PID registry) and the host's approximation of the rest stands — the same
+  split every other cross-process `/proc` file makes. What these lines say
+  changes as a process runs, so `status` is refreshed on `lseek(0)`+reread like
+  the time-varying files above. `/proc/self/fd/N` open/stat stays
   host-passthrough deliberately: host fd == guest fd, and reopen semantics
   (including O_TMPFILE publishing) must keep working.
 
@@ -545,9 +564,12 @@ then make the consequences the caller depends on true:
   as a stale-slot guard against host PID reuse. A fork child's slot is reserved
   by its parent *before* the fork, so both know it without searching (see
   `CLONE_NEWUSER` above), and a slot stays invisible — a pid sentinel no scan
-  matches — until its entry is built. The entry carries one thing that is *not*
-  published by its owner: the id maps of a faked user namespace, which another
-  process writes, and which therefore sit outside the owner-only seqlock.
+  matches — until its entry is built. Two things sit outside the owner-only
+  seqlock: the id maps of a faked user namespace, because another process is
+  what writes them, and the owner's seccomp mode plus filter count, because
+  unlike everything else in the entry those keep changing — a filter can be
+  installed at any point in a process's life — and are read by anyone opening
+  that process's `status`.
   `procfs_open` then synthesizes
   `/proc/<pid>/cmdline`, `/proc/<pid>/environ` and `/proc/<pid>/auxv` for any
   guest PID (otherwise the host files show the `arm64chroot …` invocation and
@@ -801,10 +823,13 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   uid/gid the host reports for a Unix socket is remapped to the fake identity so
   peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()`.
 - **`/proc/<pid>/status`** (`sys_procfs.c`): the `Uid:`/`Gid:`/`Groups:` lines
-  of the passthrough host file carry the real invoking uid, but `ps`/`top` read
-  them (not `getuid()`) to name the USER/GROUP. Under fake-id those lines are
-  synthesized through the same remap — a static snapshot of the host file, self
-  or any visible guest pid — so `ps` shows the fake identity's user.
+  of the host file carry the real invoking uid, but `ps`/`top` read them (not
+  `getuid()`) to name the USER/GROUP. Under fake-id those lines are rewritten
+  through the same remap — self or any visible guest pid — so `ps` shows the
+  fake identity's user. `CapPrm:`/`CapEff:` are rewritten to the host kernel's
+  full set for fake-root as well, since `capget(2)` already reports one and
+  zeros here would contradict it. See the `status` table above for the lines
+  rewritten regardless of fake-id.
 - **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
   `capget` reporting the full capability set for fake-root — its header protocol
   is answered too: an unrecognised version is written back as the preferred one

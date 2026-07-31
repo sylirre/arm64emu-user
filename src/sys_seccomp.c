@@ -283,6 +283,29 @@ static int may_assign_mode(struct Machine *m, u8 mode) {
     return m->seccomp_mode == 0 || m->seccomp_mode == mode;
 }
 
+/* /proc/<pid>/status Seccomp: / Seccomp_filters: (sys_procfs.c).
+ *
+ * The host file cannot answer this. A guest filter is never installed on the
+ * host -- that is the whole point of evaluating it here -- so a filtered guest
+ * reads 0 there; and where the emulator itself runs under a filter it never
+ * asked for (Android, and `make test-seccomp`), an unfiltered guest reads 2.
+ * Both directions are wrong, so the guest's numbers come from its own chain.
+ *
+ * Publishing to the shared registry on every install keeps the answer available
+ * to another process reading /proc/<pid>/status, the way the id maps are. */
+int seccomp_status(struct Machine *m, u32 *nfilters) {
+    u32 n = 0;
+    for (struct SeccompProg *p = m->seccomp_filters; p; p = p->prev) n++;
+    if (nfilters) *nfilters = n;
+    return m->seccomp_mode;
+}
+
+void seccomp_publish(struct Machine *m) {
+    u32 n = 0;
+    u8 mode = (u8)seccomp_status(m, &n);
+    proctab_seccomp_set(mode, n);
+}
+
 /* Install a filter: copy the program in, validate it, push it on the chain. */
 static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     struct Machine *m = c->m;
@@ -316,6 +339,7 @@ static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     p->prev = m->seccomp_filters;
     m->seccomp_filters = p;
     m->seccomp_mode = G_SECCOMP_MODE_FILTER;
+    seccomp_publish(m);
     return 0;
 }
 
@@ -324,6 +348,7 @@ s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va) {
     if (mode == G_SECCOMP_MODE_STRICT) {
         if (!may_assign_mode(c->m, G_SECCOMP_MODE_STRICT)) return -EINVAL;
         c->m->seccomp_mode = G_SECCOMP_MODE_STRICT;
+        seccomp_publish(c->m);
         return 0;
     }
     if (mode == G_SECCOMP_MODE_FILTER) return seccomp_install(c, 0, prog_va);

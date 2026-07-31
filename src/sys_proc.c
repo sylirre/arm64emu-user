@@ -460,6 +460,10 @@ SYSDEF(clone) {
     if (pid < 0) { proctab_release(rsv); return host_err(); }
     if (pid == 0) {
         proctab_slot_adopt(rsv);          /* the slot our parent reserved */
+        /* seccomp survives fork, but the reservation was zeroed before it, so
+         * republish the inherited chain into our own record. Skipped for the
+         * unfiltered fork, which is nearly every fork. */
+        if (m->seccomp_mode) seccomp_publish(m);
         g_tls.tid = getpid();             /* new process: tid == pid */
         /* Only the forking thread exists here: fork(2) duplicates the calling
          * thread alone, so the inherited count -- which gates the retired-

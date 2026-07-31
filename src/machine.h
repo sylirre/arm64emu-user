@@ -273,13 +273,17 @@ struct Machine {
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
      * backing memfd, because procps opens these once and lseek(0)+rereads
      * every refresh cycle. The written-through id-map files are tracked here
-     * too, so a re-read shows what was written. Shared across guest threads,
-     * copied on fork — like the host fds. */
+     * too, so a re-read shows what was written, and so is per-process status,
+     * whose rewritten lines (TracerPid, Seccomp, the signal masks) change over
+     * a process's life. Shared across guest threads, copied on fork — like the
+     * host fds. */
 #define PF_MAX_FDS 8
     struct {
         int fd;
         u8 kind;              /* PF_* kind (sys_procfs.c) */
-        s32 pid;              /* whose file: another guest PID, or 0 for ours */
+        u8 self;              /* PF_STATUS: the file describes this Machine */
+        s32 pid;              /* whose file: another guest PID or TID, or 0
+                               * for ours (PF_STATUS always names a TID) */
         u64 ino;              /* memfd inode: stale-entry check on fd reuse */
     } pf_fds[PF_MAX_FDS];
     int pf_fds_count;
@@ -634,6 +638,14 @@ int  proctab_userns(s32 pid);                  /* has one recorded here? */
 /* Both return 1 when the registry answered, 0 to fall back to Machine state. */
 int  proctab_idmap_read(s32 pid, int kind, char *out, u32 outsz, u32 *len);
 int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err);
+
+/* Guest seccomp state, in the registry for the same reason: /proc/<pid>/status
+ * Seccomp:/Seccomp_filters: is readable for any process, and a guest filter
+ * lives in its own Machine (sys_seccomp.c evaluates it, the host never sees
+ * it). Only the owner writes. _get returns 1 if the registry knows the pid --
+ * mode 0 is the real answer "no seccomp", not "unknown". */
+void proctab_seccomp_set(u8 mode, u32 nfilters);
+int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);
 
 /* proctab.c: System V shared-memory broker (client side). The unified IPC
  * daemon (an extension of the proctab broker) is the authoritative registry:

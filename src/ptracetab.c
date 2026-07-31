@@ -680,6 +680,29 @@ u32 ptrace_self_seize(void) {
     return g_self_link ? g_self_link->seize : 0;
 }
 
+/* Tracer of an arbitrary guest thread, 0 if it is not being traced.
+ *
+ * Answers /proc/<tid>/status TracerPid (sys_procfs.c), which the host file
+ * cannot: this ptrace never host-attaches -- a tracee services its tracer's
+ * requests about itself through the mailbox above -- so the host task has no
+ * tracer to report even while a guest gdb has it stopped. Any process may ask
+ * about any thread, hence the registry scan rather than g_self_link. Guest tid
+ * == host tid, so `tid` is both what a link is keyed by and what the caller
+ * read out of the status file's Pid: line. */
+s32 ptrace_tracer_of(s32 tid) {
+    if (!g_tab || tid <= 0) return 0;
+    /* Links exist only once someone traces; skip the scan otherwise. */
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) != tid) continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
+            continue;                    /* dead, awaiting its tracer's wait */
+        return __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    }
+    return 0;
+}
+
 /* Parent side: report the fork/clone event stop, carrying the new child's pid
  * for PTRACE_GETEVENTMSG. */
 void ptrace_report_event(CPU *c, int event, u64 msg) {

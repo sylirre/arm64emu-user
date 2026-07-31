@@ -89,6 +89,14 @@ struct ProcEnt {
     u32 uid_len, gid_len;        /* published AFTER the text below */
     char uid_map[IDMAP_MAX];     /* kernel read-back form, "" until written */
     char gid_map[IDMAP_MAX];
+
+    /* seccomp mode + installed filter count of the owner, for another process
+     * reading its /proc/<pid>/status (sys_procfs.c). Outside the seqlock like
+     * the maps above, but written only by the owner -- and unlike them it is
+     * not one-shot: a filter can be installed at any point in a process's life.
+     * One word, stored and loaded atomically, so a reader always sees a mode
+     * and a count that were true together. */
+    u32 seccomp;                 /* mode << 16 | filter count */
 };
 
 /* A slot claimed for a process that does not exist yet (proctab_reserve): not a
@@ -159,8 +167,8 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
     /* v4 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
      * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
-     * faked user namespace's id maps.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v4.%u.%08x",
+     * faked user namespace's id maps; v5 the owner's seccomp state.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v5.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;
@@ -210,9 +218,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v3.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v4.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v3.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v4.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -1850,6 +1858,7 @@ int proctab_reserve(void) {
         e->sg_deny = e->uid_claim = e->gid_claim = 0;
         __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->seccomp, 0, __ATOMIC_RELAXED);
         return i;
     }
     return -1;
@@ -2223,6 +2232,30 @@ int proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err) 
     if (len) memcpy(uid ? e->uid_map : e->gid_map, text, len);
     /* Length last, so a reader that sees it takes bytes already in place. */
     __atomic_store_n(uid ? &e->uid_len : &e->gid_len, len, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* ---- seccomp state (see the sub-record's declaration) -------------------- */
+
+/* Publish our own mode + filter count. Called on every install, and once by a
+ * fork child for the chain it inherited (proctab_reserve zeroed the slot, and
+ * the parent's concurrent register leaves a reservation's sub-record alone). */
+void proctab_seccomp_set(u8 mode, u32 nfilters) {
+    struct ProcEnt *e = own_entry();
+    if (!e) return;
+    if (nfilters > 0xffff) nfilters = 0xffff;
+    __atomic_store_n(&e->seccomp, ((u32)mode << 16) | nfilters, __ATOMIC_RELEASE);
+}
+
+/* Read a process's mode + filter count. Returns 1 when the registry knows the
+ * process at all -- mode 0 is a real answer ("no seccomp"), so the caller has
+ * to tell that apart from "no slot", where the host file's own line stands. */
+int proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e) return 0;
+    u32 w = __atomic_load_n(&e->seccomp, __ATOMIC_ACQUIRE);
+    if (mode) *mode = (u8)(w >> 16);
+    if (nfilters) *nfilters = w & 0xffff;
     return 1;
 }
 

@@ -321,12 +321,13 @@ src/
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, the
                 writable id maps of a faked user namespace — own or a
-                child's, ...)
+                child's, per-process status rebuilt line by line, ...)
   sys_seccomp.c seccomp(2): classic-BPF evaluator over guest seccomp_data,
                 run by the dispatcher for every guest syscall
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view,
-                and the id maps of a faked user namespace, so a parent can
-                write its child's) + unified IPC broker: portable System V IPC
+                the id maps of a faked user namespace, so a parent can write
+                its child's, and each process's seccomp state, which its
+                status is read for) + unified IPC broker: portable System V IPC
                 — memfd-backed shared memory, semaphores (blocking semop,
                 SEM_UNDO), message queues
   ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex

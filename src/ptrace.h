@@ -52,6 +52,9 @@ int  ptrace_self_active(void);
 u32  ptrace_self_options(void);
 s32  ptrace_self_tracer(void);
 u32  ptrace_self_seize(void);
+/* Tracer of any guest thread (0 = untraced), for /proc/<tid>/status TracerPid:
+ * the host task is never really ptrace-attached, so its own file reads 0. */
+s32  ptrace_tracer_of(s32 tid);
 /* Is any thread of this process currently a tracee? Gates the process-wide
  * signal-disposition mirroring (sig_host_update): default-terminate catchers
  * must stay installed while any thread must report its stops/death. */
