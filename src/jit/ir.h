@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* JIT intermediate representation. One guest instruction becomes 1..4 linear
- * IR ops; the backends emit host code from them with per-block register
+/* JIT intermediate representation. One guest instruction becomes 1..
+ * IR_MAX_OPS_PER_INSN linear IR ops; the backends emit host code from them
+ * with per-block register
  * allocation. The frontend (frontend.c) is a transcription of the predecode
  * handler semantics (predecode.c, itself checked against decode.c by the
  * differential suite) — XZR/SP resolution, width truncation, pre-decoded
@@ -244,7 +245,26 @@ typedef struct IROp {
                              * (helper-executed insns count themselves) */
 } IROp;
 
+/* Number of 8-byte stores DC ZVA expands to (its zeroed block is 64 bytes).
+ * Named because it also fixes the worst case below; keep the two together. */
+#define DCZVA_STORES 8
+
+/* Worst-case IR ops emitted for ONE guest instruction. DC ZVA is the
+ * outlier by a wide margin — an address-mask op plus DCZVA_STORES stores —
+ * where the next largest (LDP with writeback) is 6. jit_fe_block must leave
+ * this much headroom free before translating another instruction, PLUS one
+ * slot for the IRO_JMP it appends when the budget runs out. Under-reserving
+ * does not merely truncate a block: the append runs off the end of ops[],
+ * and the liveness pass then indexes live_after[] one past its last element,
+ * which is 8 bytes past the end of the heap allocation. */
+#define IR_MAX_OPS_PER_INSN (DCZVA_STORES + 1)
+
+/* Sized from an ~4-ops-per-instruction average, not from the worst case: a
+ * block whose instructions expand more simply ends early on the headroom
+ * check above, covering fewer guest instructions. */
 #define IR_MAX_OPS (JIT_MAX_BLOCK_INSNS * 4 + 8)
+_Static_assert(IR_MAX_OPS > 2 * (IR_MAX_OPS_PER_INSN + 1),
+               "IR budget must fit several worst-case instructions");
 
 typedef struct IRBlock {
     IROp ops[IR_MAX_OPS];

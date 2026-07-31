@@ -1484,7 +1484,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                      * inline write probes keep the SMC coherence rules. */
                     ir_put(ir, IRO_ANDI, 1, VREG_TMP2, rx(rt), 0, 0,
                            ~63ULL, 0);
-                    for (int zi = 0; zi < 8; zi++)
+                    for (int zi = 0; zi < DCZVA_STORES; zi++)
                         put_st(ir, VREG_TMP2, 8 * zi, VREG_ZERO, 3, pc);
                     break;
                 }
@@ -1667,9 +1667,14 @@ u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns) {
         guest_n++;
         p += 4;
         if (r == FE_END) break;
+        /* Stop while ops[] still holds a worst-case instruction AND the
+         * IRO_JMP appended just below. The old reserve was a flat 8, one
+         * short of DC ZVA's 9, so a block landing exactly on the boundary
+         * wrote one IROp past ops[] — which is &ir->n — and fe_liveness then
+         * wrote live_after[IR_MAX_OPS], 8 bytes past the heap block. */
         if (guest_n >= max_insns ||
             (p & (GUEST_PAGE_SIZE - 1)) == 0 ||
-            ir->n >= IR_MAX_OPS - 8) {
+            ir->n + IR_MAX_OPS_PER_INSN + 1 > IR_MAX_OPS) {
             ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, p, 0);
             break;
         }
