@@ -85,12 +85,21 @@ int jit_backend_available(void) { return be_available(); }
 static JitEnv *g_jit_envs[JIT_ENVS_MAX];
 static unsigned long g_jit_inval_gen = 1;
 
-static void registry_add(JitEnv *env) {
+/* Returns 0 on success, -1 when every slot is taken. The caller MUST treat
+ * that as "no JIT for this thread": an unregistered thread never has its
+ * interrupt flag raised by jit_notify_mapping_change, so it would keep
+ * running translations of code another thread has since unmapped,
+ * reprotected or rewritten — silently executing stale native code. Falling
+ * back to the interpreter is slow; running the wrong instructions is not a
+ * trade we get to make. */
+static int registry_add(JitEnv *env) {
+    int ok = -1;
     as_lock();
     for (int i = 0; i < JIT_ENVS_MAX; i++) {
-        if (!g_jit_envs[i]) { g_jit_envs[i] = env; break; }
+        if (!g_jit_envs[i]) { g_jit_envs[i] = env; ok = 0; break; }
     }
     as_unlock();
+    return ok;
 }
 
 static void registry_del(JitEnv *env) {
@@ -434,7 +443,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->ptr = env->blocks_start_rw;
     env->end = env->cache_rw + env->cache_size;
     env->inval_gen_seen = __atomic_load_n(&g_jit_inval_gen, __ATOMIC_ACQUIRE);
-    registry_add(env);
+    if (registry_add(env) < 0) { jit_env_destroy(env); return -1; }
     env->active = 1;
     return 0;
 }
@@ -770,8 +779,12 @@ void jit_run(CPU *c) {
     JitEnv *env = &g_jit_env;
     if (UNLIKELY(!env->active)) {
         if (jit_env_init(env, c) < 0) {
+            /* No code cache (W^X denial), or the thread registry is full.
+             * Either way this thread cannot run translated code safely, and
+             * the run loop has no per-thread fallback — disable the JIT for
+             * the process, as the emitter-overflow path already does. */
             fprintf(stderr,
-                    "arm64chroot: cannot allocate JIT code cache, "
+                    "arm64chroot: cannot set up the JIT for this thread, "
                     "using interpreter\n");
             g_jit = 0;
             return;
