@@ -394,6 +394,14 @@ void syscall_dispatch(CPU *c);
 /* sys_proc.c: resolve+load a program (shebang-aware); returns 0 or -errno.
  * Does not take ownership of argv/envp. */
 u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
+/* Lowest fd number the guest cannot own — the hard RLIMIT_NOFILE this process
+ * started with. An fd from there up belongs to whatever is running the emulator
+ * (valgrind parks its own above the limit it lowers for its client), so neither
+ * fd sweep may close it: execve's CLOEXEC walk (sys_proc.c) or the IPC broker
+ * shedding what it inherited (proctab.c). Sampled once, in main() before the
+ * initial exec, since the guest may lower its own limit afterwards. */
+void guest_fd_ceiling_init(void);
+int  guest_fd_ceiling(void);
 
 /* Run-loop safepoint: called out of line when m->stop_gen no longer matches
  * this thread's copy. Adopts a newly exec'd image, joins a de_thread

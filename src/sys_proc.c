@@ -618,6 +618,35 @@ static char **dup_strvec(char **v) {
  * generated as it is read, so closing during the walk can make readdir skip
  * entries. Probing a fixed range is the fallback for a host without /proc;
  * guest fds are host fds, so a guest that dup2'd high is otherwise missed. */
+
+/* Lowest fd number the guest cannot own; from here up an fd belongs to whatever
+ * is running the emulator, and closing it is not ours to do. Both places that
+ * sweep fds consult it -- execve's CLOEXEC walk here, and the IPC broker
+ * shedding what it inherited (proctab.c).
+ *
+ * The kernel refuses to allocate an fd at or above the soft RLIMIT_NOFILE, and
+ * an unprivileged process cannot raise the hard ceiling -- so nothing the guest
+ * is ever handed reaches the hard limit this process started with. A runtime
+ * layered underneath can and does live up there: valgrind lowers its client's
+ * limit precisely so it can park its own fds above it, and both sweeps were
+ * closing them. That only stayed harmless because valgrind refuses the close
+ * and warns; a host libc holding a cached CLOEXEC fd would just lose it.
+ *
+ * Sampled once before any guest code runs (guest_fd_ceiling_init, called from
+ * main() ahead of the initial exec) rather than read per sweep, because the
+ * guest may LOWER its limit afterwards: an fd opened while the limit was high
+ * stays open below the new one, and a real execve still closes it. */
+static int g_fd_ceiling = INT_MAX;
+
+void guest_fd_ceiling_init(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY &&
+        rl.rlim_max <= (rlim_t)INT_MAX)
+        g_fd_ceiling = (int)rl.rlim_max;
+}
+
+int guest_fd_ceiling(void) { return g_fd_ceiling; }
+
 static void exec_close_cloexec(struct Machine *m) {
     int stack[64], *cl = stack;
     size_t n = 0, cap = sizeof stack / sizeof stack[0];
@@ -635,6 +664,7 @@ static void exec_close_cloexec(struct Machine *m) {
             if (probe >= 1024) break;
             fd = probe++;
         }
+        if (fd >= g_fd_ceiling) continue;   /* not reachable by the guest */
         int fl = fcntl(fd, F_GETFD);
         if (fl < 0 || !(fl & FD_CLOEXEC)) continue;
         if (n == cap) {

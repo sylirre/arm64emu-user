@@ -1708,7 +1708,11 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
  * buffer (no opendir/malloc), so this stays async-signal-safe when the lazy shm
  * spawn forks a multithreaded guest, is safe under the Android seccomp allow-list,
  * and touches only the handful of fds actually open — not a loop to _SC_OPEN_MAX
- * (2^20 here). A bounded loop is the last resort if /proc is unavailable. */
+ * (2^20 here). A bounded loop is the last resort if /proc is unavailable.
+ *
+ * "Inherited from the emulator" means what the guest could have, so the walk
+ * stops at guest_fd_ceiling(): above it sit the fds of whatever is running the
+ * emulator, which this daemon is not entitled to close (machine.h). */
 static void proctab_close_inherited(void) {
     int dfd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd >= 0) {
@@ -1721,14 +1725,15 @@ static void proctab_close_inherited(void) {
             for (long off = 0; off < n; ) {
                 struct ld64 *e = (struct ld64 *)(buf + off);
                 int fd = atoi(e->name);
-                if (fd >= 3 && fd != dfd) close(fd);
+                if (fd >= 3 && fd != dfd && fd < guest_fd_ceiling()) close(fd);
                 off += e->reclen;
             }
         }
         close(dfd);
         return;
     }
-    for (int fd = 3; fd < 1024; fd++) close(fd);   /* matches do_execve's walk */
+    int hi = guest_fd_ceiling() < 1024 ? guest_fd_ceiling() : 1024;
+    for (int fd = 3; fd < hi; fd++) close(fd);    /* matches do_execve's walk */
 }
 
 /* Spawn the broker as a detached grandchild (double-fork + setsid: reparented

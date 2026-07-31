@@ -723,6 +723,10 @@ int main(int argc, char **argv)
      * the first fork so every guest process in the session maps it. */
     ptrace_init();
 
+    /* What execve's CLOEXEC sweep may not close: read now, while the limit is
+     * still the one this process started with and no guest code has run. */
+    guest_fd_ceiling_init();
+
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */
     if (argv0) gargv[0] = (char *)argv0;
