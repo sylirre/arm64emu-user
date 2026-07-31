@@ -221,10 +221,24 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
  * family below is raise-free bit arithmetic, compares classify NaNs before
  * ordering), and nothing outside guest FP touches host FP (the one stats
  * printf in jit.c fences itself).
- * Known corners vs the architecture, deliberate: tininess is detected after
- * rounding on x86 (ARM: before) — one boundary ULP of difference in UFC for
- * float/double; f64-input fixed-point converts with 2^1000-scale overflow
- * leak host OFC. Both are far outside anything a guest exercises. */
+ * Known corners vs the architecture, deliberate. All were measured against
+ * qemu by sweeping random FP/SIMD words; the counts are per 30000 words with
+ * NaN and Inf excluded from every lane width, so they are the residue after
+ * the far larger NaN-payload class below:
+ *   - tininess is detected after rounding on x86 (ARM: before) — one boundary
+ *     ULP of difference in UFC for float/double;
+ *   - f64-input fixed-point converts with 2^1000-scale overflow leak host OFC;
+ *   - a *generated* NaN (0/0, inf-inf, ...) keeps the host's sign. ARM's
+ *     DefaultNaN is positive; x86 produces the negative "real indefinite"
+ *     QNaN, so e.g. FDIV of 0/0 yields -NaN where ARM yields +NaN (10/30000).
+ *     Distinguishing generated from propagated NaNs per operation is what a
+ *     fix needs, so this is not a local change;
+ *   - the FP16 widen-compute-narrow pipeline can miss UFC/IXC on a result
+ *     that is inexact in half but exact in double (6/30000, FCMLA).
+ * Separately and much more common: NaN *payload* propagation is not modelled
+ * at all — a NaN result carries the default payload rather than the input's.
+ * All of the above are values a guest only sees if it inspects NaN bit
+ * patterns or the sticky flags after an exceptional operation. */
 #define FPSR_IOC 0x01u
 #define FPSR_DZC 0x02u
 #define FPSR_OFC 0x04u

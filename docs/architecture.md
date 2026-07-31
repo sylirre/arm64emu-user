@@ -114,6 +114,20 @@ hooks and the system emulator's IRQ/FIQ-line checks (never taken in
 linux-user). `--no-predecode` selects a plain fetch → `exec_a64` step (diagnostic mode
 for bisecting decode-cache suspicions).
 
+**The classifier owes the decoder its guards.** `pd_fill` is a transcription of
+`decode.c`'s classification, and its safety property is that anything not
+recognized *with certainty* stays `PD_GENERIC` and re-dispatches into
+`exec_a64`. That only holds if a transcribed form carries the decoder's
+validation as well as its operand extraction: a classifier that extracts the
+operands but drops an encoding check produces a live cache entry for a word the
+decoder would have rejected, and then `--no-predecode` — the knob whose whole
+job is to answer "is this bug in the fast path or the real decoder?" — reports a
+different architectural result than the default engine. `pd_fill` is also the
+JIT frontend's decoder, so such a gap lands in all three engines at once. When
+tightening an encoding in `decode.c`, check whether `pd_fill` classifies that
+form and tighten it in the same commit; `tests/c/undef_enc.c` runs under the
+default (predecode) engine, and `make test-jit` covers the frontend.
+
 The optional `--jit` inserts one more rung above `pd_run`: `jit_run`
 (`src/jit/`) executes native translations of guest basic blocks and honors the
 same return contract, handing control back to `emu_loop` on the same rare
