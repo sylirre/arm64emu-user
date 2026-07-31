@@ -3219,17 +3219,18 @@ void exec_fpsimd(CPU *c, u32 insn) {
     if ((insn & 0x7f000000) == 0x1f000000) { exec_fp_dp3(c, insn);    return; }
 
     /* AdvSIMD across-lanes reductions (ADDV/UMAXV/UMINV/...): bits[11:10]=10. */
-    if (BITS(28, 24) == 0x0e && BITS(21, 17) == 0x18 && BIT(11) == 1 && BIT(10) == 0) {
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BITS(21, 17) == 0x18 && BIT(11) == 1 && BIT(10) == 0) {
         simd_across(c, insn); return;
     }
     /* AdvSIMD two-register misc (NOT/NEG/ABS/compare-with-zero): bits[11:10]=10. */
-    if (BITS(28, 24) == 0x0e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
         simd_two_misc(c, insn); return;
     }
     /* AdvSIMD two-register misc (FP16): FABS/FNEG/FSQRT, FRINTx, FCVT-to-int,
      * SCVTF/UCVTF, FCMxx #0, FRECPE/FRSQRTE on .4h/.8h. Its own encoding page
      * (bit22=1, bits[21:17]=0x1c). */
-    if (BITS(28, 24) == 0x0e && BIT(22) == 1 && BITS(21, 17) == 0x1c && BIT(11) == 1 && BIT(10) == 0) {
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(22) == 1 && BITS(21, 17) == 0x1c &&
+        BIT(11) == 1 && BIT(10) == 0) {
         simd_two_misc_fp16(c, insn); return;
     }
     /* AdvSIMD scalar two-register misc (bit30=1): scalar int<->FP converts. */
@@ -3255,7 +3256,8 @@ void exec_fpsimd(CPU *c, u32 insn) {
         crypto_sha2(c, insn); return;
     }
     /* AdvSIMD three-different PMULL/PMULL2 (opcode 0b1110, U=0). */
-    if (BITS(28, 24) == 0x0e && BIT(29) == 0 && BIT(21) == 1 && BITS(15, 12) == 0xe && BITS(11, 10) == 0) {
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(29) == 0 && BIT(21) == 1 &&
+        BITS(15, 12) == 0xe && BITS(11, 10) == 0) {
         crypto_pmull(c, insn); return;
     }
     /* ARMv8.2 crypto extensions (FEAT_SHA3 EOR3/BCAX/RAX1/XAR, FEAT_SHA512
@@ -3295,7 +3297,8 @@ void exec_fpsimd(CPU *c, u32 insn) {
     }
     /* AdvSIMD three-same (FP16): FADD/FMUL/FMLA/FMAX/FCMEQ/... on .4h/.8h. Its own
      * encoding page (bit22=1, bit21=0, bits[15:14]=0), distinct from the s/d form. */
-    if (BITS(28, 24) == 0x0e && BIT(22) == 1 && BIT(21) == 0 && BITS(15, 14) == 0 && BIT(10) == 1) {
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(22) == 1 && BIT(21) == 0 &&
+        BITS(15, 14) == 0 && BIT(10) == 1) {
         simd_three_same_fp16(c, insn); return;
     }
     /* AdvSIMD three-same extra (v8.1+ RDM/DotProd/FCMA page). */
@@ -3303,16 +3306,22 @@ void exec_fpsimd(CPU *c, u32 insn) {
         simd_three_same_extra(c, insn); return;
     }
     /* AdvSIMD three-same (vector integer): ADD/SUB/CMP/MIN/MAX/MUL/logical. */
-    if (BITS(28, 24) == 0x0e && BIT(21) == 1 && BIT(10) == 1) { simd_three_same(c, insn); return; }
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 1 && BIT(10) == 1) {
+        simd_three_same(c, insn); return;
+    }
 
     /* Advanced SIMD modified immediate (MOVI/MVNI/ORR/BIC/FMOV vector imm). */
-    if (BITS(28, 19) == 0x1e0 && BIT(10) == 1) { simd_modified_imm(c, insn); return; }
+    if (BIT(31) == 0 && BITS(28, 19) == 0x1e0 && BIT(10) == 1) { simd_modified_imm(c, insn); return; }
     /* AdvSIMD shift by immediate (SHL/SSHR/USHR/SSHLL/USHLL): immh != 0. */
-    if (BITS(28, 23) == 0x1e && BIT(10) == 1 && BITS(22, 19) != 0) { simd_shift_imm(c, insn); return; }
+    if (BIT(31) == 0 && BITS(28, 23) == 0x1e && BIT(10) == 1 && BITS(22, 19) != 0) {
+        simd_shift_imm(c, insn); return;
+    }
     /* AdvSIMD scalar shift by immediate (bit30=1): D-form SHL/SSHR/USHR. */
     if (BITS(28, 23) == 0x3e && BIT(10) == 1 && BITS(22, 19) != 0) { simd_scalar_shift(c, insn); return; }
     /* AdvSIMD copy (DUP/INS/UMOV/SMOV). */
-    if (BITS(28, 21) == 0x70 && BIT(15) == 0 && BIT(10) == 1) { simd_copy(c, insn); return; }
+    if (BIT(31) == 0 && BITS(28, 21) == 0x70 && BIT(15) == 0 && BIT(10) == 1) {
+        simd_copy(c, insn); return;
+    }
     /* AdvSIMD scalar copy (DUP element -> scalar: MOV Dd, Vn.D[i], etc.). */
     if (BITS(31, 21) == 0x2f0 && BIT(15) == 0 && BITS(14, 11) == 0 && BIT(10) == 1) {
         simd_scalar_copy(c, insn); return;
