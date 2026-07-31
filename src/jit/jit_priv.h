@@ -117,6 +117,20 @@ typedef struct JitEnv {
     struct { u64 page; u32 count; } thrash[JIT_THRASH_SLOTS];
 } JitEnv;
 
+/* The AArch64 backend reaches these structs from generated code with
+ * immediate-offset forms whose ranges are not checked at emission time:
+ * enc_ldr/enc_str build an LDR/STR imm12 scaled by the access size, and the
+ * jcache probe folds offsetof(JitEnv, jcache) into an ADD imm12 that it
+ * masks to 12 bits — a struct that outgrew the range would not fail to
+ * compile, it would silently address the wrong field. Bound them here so
+ * adding a member ahead of jcache, or widening CPU, is a build error on
+ * every host rather than a miscompile on one. */
+_Static_assert(offsetof(JitEnv, jcache) < 4096,
+               "JitEnv fields before jcache must stay in ADD/LDR imm12 reach");
+_Static_assert(offsetof(CPU, v) + 16 * 32 <= 65520 &&
+               offsetof(CPU, icount) <= 32760,
+               "CPU fields generated code touches must stay in imm12 reach");
+
 extern __thread JitEnv g_jit_env;
 
 /* Emission cursor. rw is where bytes are written, rx the address the same
