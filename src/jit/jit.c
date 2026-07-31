@@ -170,7 +170,7 @@ static void jstat_merge(u64 icount) {
 static const char *jstat_class(u32 w) {
     if ((w >> 24) == 0xD5) return "system";
     if ((w & 0x3F000000u) == 0x08000000u) return "excl";
-    if ((w & 0x3B200C00u) == 0x38200000u) return "lse";
+    if ((w & 0x3F200C00u) == 0x38200000u) return "lse";   /* V=0 only */
     unsigned grp = (w >> 25) & 0xf;
     if (grp == 0xa || grp == 0xb) return "branch";
     if ((grp & 5) == 4) return "ldst";

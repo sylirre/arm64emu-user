@@ -615,7 +615,12 @@ static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
                               VREG_ZERO, (u64)insn, AT_MAKE(AT_STX, szl, 0, o0));
         }
         /* LDXP/STXP/CASP: helper (128-bit / pair monitor; rare) */
-    } else if ((insn & 0x3B200C00u) == 0x38200000u) {   /* LSE atomic memops */
+    } else if ((insn & 0x3F200C00u) == 0x38200000u) {   /* LSE atomic memops */
+        /* bit 26 (V) MUST be in the mask: the atomic-memory-operation page is
+         * defined for V=0 only, and decode.c reaches ldst_atomic through
+         * `BITS(11,10) == 0 && !V`. Without it a V=1 word — architecturally
+         * unallocated, and UNDEF in the interpreter — was translated here as
+         * an LSE atomic and *wrote guest memory* under --jit. */
         unsigned szl = insn >> 30;
         int A = (insn >> 23) & 1, R = (insn >> 22) & 1;
         int o3 = (insn >> 15) & 1;

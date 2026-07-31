@@ -102,7 +102,20 @@ int main(void) {
     PROBE("smov w, v.s",         0x0E042C20);  /* SMOV Wd takes only B/H */
     PROBE("umov w, v.d",         0x0E083C20);  /* UMOV .d form needs Q=1 */
 
+    /* ---- unallocated: LSE atomic-memory-operation page with V=1 ----
+     * The page is defined for V (bit 26) == 0 only. These are gated in the
+     * JIT frontend as well as the decoder, and a lax gate does not merely
+     * mis-execute — it performs the atomic, writing guest memory. */
+    PROBE("ldadd v=1",           0xFC220020);
+    PROBE("ldadd v=1, 32-bit",   0xBC220020);
+    PROBE("swp v=1",             0xFC228020);
+    PROBE("ldclr v=1",           0xFC221020);
+    PROBE("ldapr v=1",           0xFC3FC020);
+
     /* ---- valid boundary neighbors: must execute ---- */
+    PROBE("ldadd x2, x0, [x1]",  0xF8220020);  /* the V=0 originals */
+    PROBE("swp x2, x0, [x1]",    0xF8228020);
+    PROBE("ldapr x0, [x1]",      0xF8BFC020);
     PROBE("add w, lsl #31",      0x0B027C20);  /* imm6=31 */
     PROBE("add x, uxtx #4",      0x8B227020);  /* imm3=4 */
     PROBE("ldr q0, [x1]",        0x3DC00020);  /* Q form with size=0 */
