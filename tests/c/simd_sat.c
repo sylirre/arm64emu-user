@@ -17,6 +17,21 @@ static uint64_t src[2], a[2], b[2];
 #define ONES  0xffffffffffffffffULL
 #define SMALL 0x0101010101010101ULL
 
+/* Two-input form: report the result register rather than just the flag. */
+#define SHV(name, setup, insn)                                               \
+    do {                                                                     \
+        a[0] = a[1] = b[0] = b[1] = 0;                                       \
+        setup;                                                               \
+        uint64_t lo, hi;                                                     \
+        __asm__ __volatile__("ldr q0, [%2]\n\t" "ldr q1, [%3]\n\t"           \
+                             "movi v3.2d, #0\n\t" insn "\n\t"                \
+                             "mov %0, v3.d[0]\n\t" "mov %1, v3.d[1]"         \
+                             : "=r"(lo), "=r"(hi) : "r"(a), "r"(b)           \
+                             : "v0", "v1", "v3", "memory");                  \
+        printf("%-14s %016llx%016llx\n", name,                               \
+               (unsigned long long)hi, (unsigned long long)lo);              \
+    } while (0)
+
 /* Clear FPSR, run one saturating op, report the sticky QC bit. */
 #define QC(name, setup, insn)                                                \
     do {                                                                     \
@@ -128,6 +143,36 @@ int main(void) {
                        b[0]=0x7fffffffffffffffULL),       "suqadd d0, d1");
     QC("usqadd.16b",  (a[0]=a[1]=SMALL, b[0]=b[1]=S8MIN), "usqadd v0.16b, v1.16b");
     QC("usqadd.d",    (a[0]=1, b[0]=0x8000000000000000ULL), "usqadd d0, d1");
+
+    /* Register-form saturating shifts with an amount at or past the element
+     * width. The amount comes from a vector lane, so it is not bounded by the
+     * element size the way the immediate forms are. The signed path decided
+     * saturation with `sv < (min >> sh)`, and min is held as a 64-bit value:
+     * for a 32-bit element it only decays to -1 however large sh gets, so
+     * sv == -1 tested as in-range and the shifted bits were then masked away,
+     * yielding 0 where the architecture saturates to INT32_MIN. */
+    SHV("sqshl -1 by 42",  (a[0]=a[1]=ONES, b[0]=b[1]=0x2a0000002aULL),
+        "sqshl v3.4s, v0.4s, v1.4s");
+    SHV("sqrshl -1 by 42", (a[0]=a[1]=ONES, b[0]=b[1]=0x2a0000002aULL),
+        "sqrshl v3.4s, v0.4s, v1.4s");
+    SHV("sqshl -1 by 32",  (a[0]=a[1]=ONES, b[0]=b[1]=0x2000000020ULL),
+        "sqshl v3.4s, v0.4s, v1.4s");
+    SHV("sqshl -1 by 31",  (a[0]=a[1]=ONES, b[0]=b[1]=0x1f0000001fULL),
+        "sqshl v3.4s, v0.4s, v1.4s");   /* exactly representable: INT32_MIN */
+    SHV("sqshl 1 by 42",   (a[0]=a[1]=0x0000000100000001ULL,
+                            b[0]=b[1]=0x2a0000002aULL),
+        "sqshl v3.4s, v0.4s, v1.4s");
+    SHV("sqshl -1b by 9",  (a[0]=a[1]=ONES, b[0]=b[1]=0x0909090909090909ULL),
+        "sqshl v3.16b, v0.16b, v1.16b");
+    SHV("sqshl -1d by 70", (a[0]=ONES, b[0]=70), "sqshl d3, d0, d1");
+    SHV("uqshl ~0 by 42",  (a[0]=a[1]=ONES, b[0]=b[1]=0x2a0000002aULL),
+        "uqshl v3.4s, v0.4s, v1.4s");
+    SHV("sqshl 0 by 42",   (a[0]=a[1]=0, b[0]=b[1]=0x2a0000002aULL),
+        "sqshl v3.4s, v0.4s, v1.4s");   /* zero never saturates */
+    QC("sqshl-wide QC",    (a[0]=a[1]=ONES, b[0]=b[1]=0x2a0000002aULL),
+        "sqshl v3.4s, v0.4s, v1.4s");
+    QC("no:sqshl 0 wide",  (a[0]=a[1]=0, b[0]=b[1]=0x2a0000002aULL),
+        "sqshl v3.4s, v0.4s, v1.4s");
 
     /* must NOT set QC */
     QC("no:sqadd",    (a[0]=a[1]=SMALL, b[0]=b[1]=SMALL), "sqadd v3.16b, v0.16b, v1.16b");
