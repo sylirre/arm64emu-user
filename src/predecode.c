@@ -85,6 +85,7 @@ static void fill_dp_imm(PDEnt *e, u32 insn) {
     }
     if (t == 0x25) {                                 /* move wide */
         unsigned opc = BITS(30, 29), hw = BITS(22, 21), imm16 = BITS(20, 5);
+        if (!sf && hw >= 2) return;                  /* 32-bit: hw in {0,1} only */
         unsigned shift = hw * 16;
         if (opc == 0) {                              /* MOVN: precompute */
             u64 r = ~((u64)imm16 << shift);
@@ -130,6 +131,8 @@ static void fill_dp_imm(PDEnt *e, u32 insn) {
     }
     if (t == 0x27) {                                 /* EXTR / ROR imm */
         unsigned imms = BITS(15, 10);
+        /* N (bit22) must equal sf and bit21 must be 0 (decode.c's guard). */
+        if (BIT(22) != (unsigned)(sf != 0) || BIT(21) != 0) return;
         if (sf) { e->op = PD_EXTR64; e->imm = imms; }
         else if (imms < 32) { e->op = PD_EXTR32; e->imm = imms; }
         return;

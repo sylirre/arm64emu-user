@@ -50,6 +50,16 @@ int main(void) {
     PROBE("add x, uxtx #5",      0x8B227420);  /* add/sub extended, imm3=5 */
     PROBE("smaddl sf=0",         0x1B227C20);  /* widening multiply needs sf=1 */
 
+    /* ---- unallocated: DP-immediate ----
+     * These live in the predecode classifier as well as the decoder, and the
+     * suite runs the default (predecode) engine, so a classifier that skips
+     * the guard shows up right here. */
+    PROBE("movz w, lsl #32",     0x52C00020);  /* 32-bit move-wide: hw<2 only */
+    PROBE("movn w, lsl #48",     0x12E00020);
+    PROBE("movk w, lsl #32",     0x72C00020);
+    PROBE("extr w, N=1",         0x13C20020);  /* N must equal sf */
+    PROBE("extr w, bit21=1",     0x13A20020);  /* bit21 must be 0 */
+
     /* ---- unallocated: loads/stores ---- */
     PROBE("ldr q-form size=1",   0x7DC00020);  /* opc&2 with size!=0 */
     PROBE("ldtr-space simd",     0xBC400820);  /* no SIMD&FP unprivileged form */
@@ -83,6 +93,8 @@ int main(void) {
     PROBE("stp q0, q1, [x1]",    0xAD000420);
     PROBE("dup v.2d q=1",        0x4E080420);
     PROBE("smov w, v.b",         0x0E012C20);
+    PROBE("movz w, lsl #16",     0x52A00020);  /* hw=1: the allowed neighbour */
+    PROBE("extr w, #31",         0x1382FC20);
 
     return 0;
 }
