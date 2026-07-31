@@ -54,6 +54,20 @@ int main(void) {
     PROBE("ldr q-form size=1",   0x7DC00020);  /* opc&2 with size!=0 */
     PROBE("ldtr-space simd",     0xBC400820);  /* no SIMD&FP unprivileged form */
 
+    /* SIMD&FP pair with opc==3, every addressing mode. The V branch derives
+     * scale = opc+2, so accepting these yields a 32-byte "element" that
+     * reaches mem_read/mem_write against a u64 stack slot: the load direction
+     * overran the emulator's stack with guest bytes, the store direction
+     * copied emulator stack into guest memory. */
+    PROBE("stnp v, opc=3",       0xEC000420);
+    PROBE("ldnp v, opc=3",       0xEC400420);
+    PROBE("stp v, opc=3, post",  0xEC800420);
+    PROBE("ldp v, opc=3, post",  0xECC00420);
+    PROBE("stp v, opc=3, off",   0xED000420);
+    PROBE("ldp v, opc=3, off",   0xED400420);
+    PROBE("stp v, opc=3, pre",   0xED800420);
+    PROBE("ldp v, opc=3, pre",   0xEDC00420);
+
     /* ---- unallocated: AdvSIMD copy ---- */
     PROBE("dup v.2d q=0",        0x0E080400);  /* .d element form needs Q=1 */
     PROBE("copy imm5=0",         0x0E000420);  /* no allocated element size */
@@ -65,6 +79,8 @@ int main(void) {
     PROBE("add x, uxtx #4",      0x8B227020);  /* imm3=4 */
     PROBE("ldr q0, [x1]",        0x3DC00020);  /* Q form with size=0 */
     PROBE("ldtr x0, [x1]",       0xF8400820);  /* integer LDTR: LDR at EL0 */
+    PROBE("ldp q0, q1, [x1]",    0xAD400420);  /* opc=2: the valid Q pair */
+    PROBE("stp q0, q1, [x1]",    0xAD000420);
     PROBE("dup v.2d q=1",        0x4E080420);
     PROBE("smov w, v.b",         0x0E012C20);
 

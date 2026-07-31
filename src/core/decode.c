@@ -1009,8 +1009,16 @@ static void ldst_pair(CPU *c, u32 insn) {
 
     unsigned scale, esz;
     bool signed_word = false;
-    if (V) { scale = opc + 2; esz = 1u << scale; }       /* S/D/Q = 4/8/16 bytes */
-    else {
+    if (V) {
+        /* opc==3 is unallocated. It must be rejected before scale is derived:
+         * scale = opc+2 would make esz 32, and a 32-byte "element" reaches
+         * vreg_load/vreg_store, whose non-16 path passes the size straight to
+         * mem_read/mem_write — i.e. a 32-byte memcpy into (or out of) a u64
+         * stack slot. Guest-triggerable emulator stack corruption one way and
+         * host stack disclosure into guest memory the other. */
+        if (opc == 3) { undefined(c, insn); return; }
+        scale = opc + 2; esz = 1u << scale;             /* S/D/Q = 4/8/16 bytes */
+    } else {
         if (opc == 3) { undefined(c, insn); return; }    /* unallocated (was run as a 32-bit pair) */
         scale = (opc == 2) ? 3 : 2; esz = 1u << scale; signed_word = (opc == 1);
     }
