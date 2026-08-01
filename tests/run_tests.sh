@@ -16,10 +16,8 @@ cd "$(dirname "$0")/.."
     echo "SKIP: no oracle (install qemu-aarch64, or run on a host that executes AArch64 binaries)"
     exit 0; }
 echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
-# Without a static libc every C test would silently skip its own build and the
-# suite would still report success, just a much smaller one. Say so once.
-printf 'int main(void){return 0;}\n' | "$AGCC" -static -O0 -x c - -o /dev/null 2>/dev/null ||
-    echo "WARN: $AGCC cannot link -static; the C tests will all skip (install the static libc)"
+[ "$A64_STATIC_OK" = 1 ] ||
+    echo "WARN: $AGCC cannot link -static; most tests will skip (install the static libc)"
 
 # Provision the Alpine + glibc test rootfs from scratch into a repo-local cache
 # (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
@@ -27,7 +25,15 @@ printf 'int main(void){return 0;}\n' | "$AGCC" -static -O0 -x c - -o /dev/null 2
 export A64_TEST_ROOT="${A64_TEST_ROOT:-$PWD/tests/.cache/rootfs}"
 tests/setup_env.sh || true
 
-pass=0 fail=0
+pass=0 fail=0 skip=0
+
+# A test whose binary would not build is not a pass and not a failure, but it
+# must not be invisible either: a toolchain missing one library used to drop
+# ~120 tests while the run still reported success. Counted, and named in the
+# summary.
+skip_build() {   # skip_build <what>
+    skip=$((skip+1)); echo "SKIP build $1"
+}
 
 run_diff() {   # run_diff <name> <binary> [args...]
     local name="$1"; shift
@@ -53,7 +59,7 @@ skip_unsupported() {   # skip_unsupported <label> <source-file>
     local miss
     miss=$(host_missing_features "$2")
     [ -z "$miss" ] && return 1
-    echo "SKIP $1 (host CPU lacks: $miss)"
+    skip=$((skip+1)); echo "SKIP $1 (host CPU lacks: $miss)"
     return 0
 }
 
@@ -74,11 +80,11 @@ for cfile in tests/c/*.c; do
     bs="tests/c/${base}_static.bin"
     bd="tests/c/${base}_dyn.bin"
     skip_unsupported "c/${base}" "$cfile" && continue
-    "$AGCC" -static -O2 -o "$bs" "$cfile" -lm -lpthread 2>/dev/null || {
-        echo "SKIP build $cfile"; continue; }
+    "$AGCC" -static -O2 -o "$bs" "$cfile" $A64_TESTLIBS 2>/dev/null || {
+        skip_build "$cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
     GLIBC_ROOT="$A64_TEST_ROOT/glibc"
-    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" -lm -lpthread 2>/dev/null; then
+    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null; then
         # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
         # us, at host /tmp for the oracle. QEMU_LD_PREFIX (unlike -L) survives
@@ -542,7 +548,7 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$ALPINE/tmp/chroot_probe.bin"
         rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
     else
-        echo "SKIP build fixtures/chroot_probe"
+        skip_build "fixtures/chroot_probe"
     fi
     # End-to-end `chroot` command: busybox runs from inside the new root, reached
     # through bind mounts (proves chroot composes with the bind table).
@@ -625,7 +631,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/seccomp_probe.bin
     else
-        echo "SKIP build fixtures/seccomp_probe"
+        skip_build "fixtures/seccomp_probe"
     fi
 fi
 
@@ -648,7 +654,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/status_probe.bin
     else
-        echo "SKIP build fixtures/status_probe"
+        skip_build "fixtures/status_probe"
     fi
 fi
 
@@ -680,7 +686,7 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$ALPINE/tmp/sandbox_probe.bin"
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
     else
-        echo "SKIP build fixtures/sandbox_probe"
+        skip_build "fixtures/sandbox_probe"
     fi
 fi
 
@@ -704,7 +710,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/userns_race.bin
     else
-        echo "SKIP build fixtures/userns_race"
+        skip_build "fixtures/userns_race"
     fi
 fi
 
@@ -720,7 +726,7 @@ fi
 # catch (one run in ten before the thread-exit ordering was fixed). ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mtexec.bin \
-            tests/fixtures/mtexec.c -lpthread 2>/dev/null; then
+            tests/fixtures/mtexec.c $A64_TESTLIBS 2>/dev/null; then
         expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
         got=$(timeout 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
@@ -730,7 +736,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/mtexec.bin
     else
-        echo "SKIP build fixtures/mtexec"
+        skip_build "fixtures/mtexec"
     fi
 fi
 
@@ -744,7 +750,7 @@ fi
 # count to one. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mainexit.bin \
-            tests/fixtures/mainexit.c -lpthread 2>/dev/null; then
+            tests/fixtures/mainexit.c $A64_TESTLIBS 2>/dev/null; then
         expect=$'tasks=1 threads=1 leader_signalable=1\nview_exit=1\nexec_after_leader=1\ngroup_after_leader=1\nstress_exit=1 stress_exec=1\ndone'
         got=$(timeout 300 "$EMU" / tests/fixtures/mainexit.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mainexit"
@@ -754,7 +760,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/mainexit.bin
     else
-        echo "SKIP build fixtures/mainexit"
+        skip_build "fixtures/mainexit"
     fi
 fi
 
@@ -779,7 +785,7 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f tests/fixtures/procfs_hostleak.bin
     else
-        echo "SKIP build fixtures/procfs_hostleak"
+        skip_build "fixtures/procfs_hostleak"
     fi
 fi
 
@@ -810,7 +816,7 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
         fi
         rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin"
     else
-        echo "SKIP build fixtures/robind"
+        skip_build "fixtures/robind"
     fi
 fi
 
@@ -819,7 +825,7 @@ fi
 check_fixture() {   # check_fixture <name> <expected>
     local name="$1" expect="$2"
     "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
-        echo "SKIP build fixtures/$name"; return; }
+        skip_build "fixtures/$name"; return; }
     local got
     got=$("$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: $name"
@@ -870,7 +876,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
     done
     rm -f tests/fixtures/netns_ack.bin
 else
-    echo "SKIP build fixtures/netns_ack"
+    skip_build "fixtures/netns_ack"
 fi
 
 # ---- /proc fidelity: guest-view magic links (root/cwd/exe/fd — root must not
@@ -928,7 +934,7 @@ overflowuid=65534 overflowgid=65534'
     rm -rf "$PFROOT"
     rm -f tests/fixtures/procfs_fidelity.bin
 else
-    echo "SKIP build fixtures/procfs_fidelity"
+    skip_build "fixtures/procfs_fidelity"
 fi
 
 # ---- Android seccomp-mimic: run the emulator under a SECCOMP_RET_TRAP
@@ -979,8 +985,8 @@ fi
 for pt in tests/ptrace/*.c; do
     [ -e "$pt" ] || continue
     ptbin="${pt%.c}.bin"
-    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" -lpthread 2>/dev/null; then
-        echo "SKIP build $pt"; continue
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $A64_TESTLIBS 2>/dev/null; then
+        skip_build "$pt"; continue
     fi
     for eng in "" "--jit"; do
         lbl="ptrace: $(basename "$pt" .c)${eng:+ (jit)}"
@@ -1051,10 +1057,14 @@ if [ -n "$AGCC" ]; then
         fi
         rm -f "$ifb"
     else
-        echo "SKIP build fixtures/insnfuzz"
+        skip_build "fixtures/insnfuzz"
     fi
 fi
 
 echo
-echo "== $pass passed, $fail failed =="
+if [ "$skip" -gt 0 ]; then
+    echo "== $pass passed, $fail failed, $skip skipped =="
+else
+    echo "== $pass passed, $fail failed =="
+fi
 exit $((fail > 0))

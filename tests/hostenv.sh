@@ -138,9 +138,13 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
 # loader itself — so binfmt_misc, which is what makes a plain execve of an
 # AArch64 binary work on a host that is not AArch64, never gets a say here.
 # Unless the CPU really is AArch64, proot has to be handed the interpreter.
-# (Pinning A64_ORACLE=qemu on an ARM host routes it through qemu as well, so
-# the whole reference stack stays one thing.)
-if a64_host_arm64 && [ "$ORACLE_KIND" != qemu ]; then
+#
+# On an AArch64 host it runs the rootfs natively whatever A64_ORACLE says. It
+# is not the oracle for instruction semantics — it is how the reference rootfs
+# gets executed at all — and demanding qemu-aarch64-static there (Termux has
+# proot but not qemu-static) silently drops every Alpine-backed block: the
+# shell, fake-id, bind, procview, mount, chroot and job-control tests.
+if a64_host_arm64; then
     PROOT_QEMU=
 else
     PROOT_QEMU=qemu-aarch64-static
@@ -158,6 +162,29 @@ oracle_proot() {   # oracle_proot <proot args...>
         proot "$@"
     fi
 }
+
+# ---- link libraries the guest compiler actually has --------------------------
+# -lm -lpthread are right for glibc and for a cross sysroot, and wrong for
+# Bionic, where both live in libc and the standalone archives may not exist at
+# all. Passing one that does not exist fails the LINK, and every such test then
+# reported "SKIP build" and vanished from the totals -- on Termux that was the
+# whole C, ptrace and threaded-fixture set, ~120 tests, with the suite still
+# exiting 0. So probe each once and keep only what links.
+A64_TESTLIBS=
+A64_STATIC_OK=0
+if [ -n "$AGCC" ]; then
+    # Probed in the same mode the tests link in, since a library can exist as a
+    # .so and not as a .a; most of the suite is -static.
+    printf 'int main(void){return 0;}\n' |
+        "$AGCC" -static -O0 -x c - -o /dev/null 2>/dev/null && A64_STATIC_OK=1
+    [ "$A64_STATIC_OK" = 1 ] && _st=-static || _st=
+    for _l in -lm -lpthread; do
+        if printf 'int main(void){return 0;}\n' |
+               "$AGCC" $_st -O0 -x c - $_l -o /dev/null 2>/dev/null; then
+            A64_TESTLIBS="$A64_TESTLIBS $_l"
+        fi
+    done
+fi
 
 # ---- optional-extension gating ----------------------------------------------
 # Most of the suite is ARMv8.0-A, which every AArch64 host implements. A few

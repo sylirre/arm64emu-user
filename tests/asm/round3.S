@@ -109,16 +109,23 @@ _start:
     mix x2
     ldr x2, [x20, #8]
     mix x2
-    // base-clobber hazard: writeback wins over the loaded value
+    // base-clobber hazard: writeback wins over the loaded value.
+    // rd == rn is CONSTRAINED UNPREDICTABLE, which is the point — the three
+    // engines must agree with each other and with qemu on what it does. Spelled
+    // as raw encodings because clang's integrated assembler refuses to assemble
+    // an unpredictable writeback at all (GNU as only warns), and a test the
+    // Termux/Android toolchain cannot build is a test that never runs there.
+    // The words are exactly what `ldr x2,[x2,#8]!` / `ldr x3,[x3],#16` /
+    // `ldrb w4,[x4],#1` assemble to.
     str x20, [x20]
     mov x2, x20
-    ldr x2, [x2, #8]!               // rd == rn pre
+    .inst 0xf8408c42                // ldr x2, [x2, #8]!   rd == rn pre
     mix x2
     mov x3, x20
-    ldr x3, [x3], #16               // rd == rn post
+    .inst 0xf8410463                // ldr x3, [x3], #16   rd == rn post
     mix x3
     mov x4, x20
-    ldrb w4, [x4], #1               // rd == rn post, 32-bit sub-word
+    .inst 0x38401484                // ldrb w4, [x4], #1   rd == rn post, sub-word
     mix x4
     sect
 
