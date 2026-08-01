@@ -7,6 +7,7 @@
  * fsqrt uses positive-only inputs (sqrt of a negative yields a NaN whose sign is
  * not bit-exact — documented caveat); frsqrte of a negative is the deterministic
  * default NaN and is fine. */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

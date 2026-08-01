@@ -55,6 +55,10 @@
  * the negative "real indefinite" QNaN where ARM's DefaultNaN is positive --
  * which is a known, documented deviation (see the "known corners" comment in
  * src/core/exec_fpsimd.c), not something this test should be re-discovering.
+ *
+ * The table is ARMv8.0-A apart from the three CRC32 forms, so conform can be
+ * diffed against a real CPU and not just against qemu.
+ * REQUIRES: crc32
  */
 #include <stdio.h>
 #include <stdlib.h>

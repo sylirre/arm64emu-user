@@ -14,14 +14,24 @@ Contains extra features: directory binding, fake user id, hardlink emulation via
 
 ## Tooling
 
-Packages required to compile the program and run test suite:
+The suite runs on an x86_64 host and on a real AArch64 one; `tests/hostenv.sh`
+decides what each provides. Packages required either way:
 
-* gcc-multilib
-* aarch64-linux-gnu-gcc (aarch64-linux-gnu-gcc-13)
 * make
-* qemu-aarch64, qemu-aarch64-static
 * proot
 * expect
+
+On an x86_64 host (the primary development one), additionally:
+
+* aarch64-linux-gnu-gcc (aarch64-linux-gnu-gcc-13) — builds the guest programs
+* qemu-aarch64, qemu-aarch64-static — the differential oracle
+* gcc-multilib — the `make test32` ILP32-host build
+
+On an AArch64 host the system `cc` already builds guest programs and the CPU
+is itself the oracle, so none of the three are needed (`qemu-aarch64` is still
+used when installed; `A64_ORACLE=native` forces hardware). `make test32` there
+wants an armhf cross compiler and an AArch64 CPU that implements AArch32 at
+EL0, and skips with a reason when either is missing.
 
 ## Project structure
 
@@ -63,7 +73,7 @@ src/
   machine.h thread.h                 Per-process shared Machine state + per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h                        ARM64 syscall numbers + explicit guest struct layouts
   main.c                             CLI, rootfs setup, initial exec
-tests/                               Asm + C differential tests, run_tests.sh (oracle: qemu-aarch64)
+tests/                               Asm + C differential tests, run_tests.sh; hostenv.sh picks the compiler and the oracle (qemu-aarch64, or an AArch64 host's own CPU)
 docs/                                Project documentation
 README.md                            User-facing project introduction and usage information
 ```
@@ -101,9 +111,16 @@ Commit messages:
 
 Basic testing which enough for most cases to ensure no regressions:
 
-* `make test`: full suite vs QEMU, interpreter mode.
+* `make test`: full suite vs the oracle, interpreter mode.
 * `make test-jit`: FP jit-vs-interpreter consistency + entire suite with --jit.
-* `make test32`: suite against the 32-bit ILP32-host build.
+* `make test32`: suite against the 32-bit ILP32-host build (skips, with the reason named, where the host has no runnable 32-bit toolchain).
+
+The oracle is `qemu-aarch64`, or on an AArch64 host the CPU itself when qemu
+is not installed; `A64_ORACLE=qemu|native` pins it and `A64_CC` overrides the
+compiler. Against hardware, a test needing an optional extension the CPU lacks
+skips instead of failing — it declares what it needs in a `REQUIRES:` marker
+naming HWCAP strings (see `tests/hostenv.sh`). Add one to any new test that
+uses an instruction outside ARMv8.0-A.
 
 Specialized tests focused at Android OS compatibility:
 

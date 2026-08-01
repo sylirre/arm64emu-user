@@ -12,7 +12,13 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
 LDFLAGS ?=
 LDFLAGS += -lm -lpthread
 # 8/16-byte atomics on 32-bit hosts may need libatomic; harmless if unused.
-LDFLAGS += $(shell echo 'int main(){return 0;}' | $(CC) $(CFLAGS) -latomic -x c - -o /dev/null 2>/dev/null && echo -latomic)
+# Probed with the compiler and flags that will actually link the variant, since
+# the 32-bit one may be a different compiler entirely (see M32CC). Recursively
+# expanded on purpose: the probe then runs when a link needs it, not on every
+# `make`.
+atomic_lib = $(shell echo 'int main(){return 0;}' | $(1) $(CFLAGS) $(2) -latomic -x c - -o /dev/null 2>/dev/null && echo -latomic)
+ATOMIC     = $(call atomic_lib,$(CC),)
+ATOMIC32   = $(call atomic_lib,$(M32CC),$(M32FLAGS))
 
 CORE := src/core/cpu.c src/core/decode.c src/core/exec_fpsimd.c src/core/sysreg.c
 # JIT backends self-select by host #ifdef (empty TUs elsewhere), so the list
@@ -30,12 +36,25 @@ SRCS := $(CORE) $(JIT) src/mem.c src/exception.c src/loop.c src/predecode.c src/
 # Variants that differ in compile flags (m32, asim) get their own object tree so
 # their objects never collide with the native ones.
 BUILDDIR  := build
-# -mfpmath=sse: the i386 x87 default computes guest FP in 80-bit excess
-# precision and, worse, transits every by-value double over FLD/FSTP, where an
-# sNaN load signals invalid — poisoning the lazily accumulated FPSR flags
-# (tests/asm/m22_fpsr). SSE math makes the FP core behave exactly like the
-# 64-bit build; every host that can run this is an x86-64 with SSE2.
-M32FLAGS  := -m32 -msse2 -mfpmath=sse
+# The ILP32-host variant keeps 32-bit-host correctness continuously tested, and
+# what "32-bit host" means depends on the machine doing the building: on x86-64
+# it is the same compiler with -m32, on an AArch64 host it is armhf, which is a
+# different compiler rather than a flag. `make test32` checks both that the
+# toolchain exists and that its output runs here before using it.
+#
+# -mfpmath=sse (x86 only): the i386 x87 default computes guest FP in 80-bit
+# excess precision and, worse, transits every by-value double over FLD/FSTP,
+# where an sNaN load signals invalid — poisoning the lazily accumulated FPSR
+# flags (tests/asm/m22_fpsr). SSE math makes the FP core behave exactly like
+# the 64-bit build; every x86 host that can run this has SSE2.
+HOSTARCH  := $(shell uname -m)
+ifeq ($(HOSTARCH),aarch64)
+M32CC     ?= arm-linux-gnueabihf-gcc
+M32FLAGS  ?=
+else
+M32CC     ?= $(CC)
+M32FLAGS  ?= -m32 -msse2 -mfpmath=sse
+endif
 # A64_LINK2SYMLINK compiles in the emulated-hardlink scheme that __ANDROID__
 # enables automatically, and A64_L2S_FORCE makes --link2symlink take it even
 # where the host allows real hardlinks. Both are inert unless the guest is run
@@ -66,24 +85,24 @@ $(BUILDDIR)/native/%.o: %.c $(BUILDCFG)
 
 $(BUILDDIR)/m32/%.o: %.c $(BUILDCFG)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(M32FLAGS) $(DEPFLAGS) -c $< -o $@
+	$(M32CC) $(CFLAGS) $(M32FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILDDIR)/asim/%.o: %.c $(BUILDCFG)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(ASIMFLAGS) $(DEPFLAGS) -c $< -o $@
 
 arm64chroot: $(NATIVE_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(ATOMIC)
 
-# 32-bit build (native on x86_64 with gcc-multilib): keeps ILP32-host
-# correctness continuously tested.
+# 32-bit build (gcc -m32 on x86_64, an armhf cross compiler on an AArch64
+# host): keeps ILP32-host correctness continuously tested.
 arm64chroot32: $(M32_OBJ)
-	$(CC) $(CFLAGS) $(M32FLAGS) -o $@ $^ $(LDFLAGS)
+	$(M32CC) $(CFLAGS) $(M32FLAGS) -o $@ $^ $(LDFLAGS) $(ATOMIC32)
 
 # Android-behavior variant: force the statx ENOSYS fallback and the Bionic
 # keyring gate. Built and exercised by test-android-sim.
 arm64chroot_asim: $(ASIM_OBJ)
-	$(CC) $(CFLAGS) $(ASIMFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ASIMFLAGS) -o $@ $^ $(LDFLAGS) $(ATOMIC)
 
 m32: arm64chroot32
 
@@ -99,13 +118,29 @@ test-env:
 test: arm64chroot
 	tests/run_tests.sh ./arm64chroot
 
-test32: arm64chroot32
-	tests/run_tests.sh ./arm64chroot32
+# The ILP32-host variant needs a 32-bit toolchain for THIS host *and* a 32-bit
+# runtime able to execute what it produces: gcc -m32 plus multilib on x86-64,
+# an armhf cross compiler plus armhf libraries on an AArch64 host — and there,
+# an AArch64 CPU that still implements AArch32 at EL0, which the server cores
+# do not. Both halves are probed, because a machine that cannot run the variant
+# should say so rather than fail a build the rest of the suite never needs.
+test32:
+	@t=$$(mktemp -d) || exit 1; \
+	if printf 'int main(void){return 0;}' | \
+	     $(M32CC) $(CFLAGS) $(M32FLAGS) -x c - -o $$t/probe 2>/dev/null && \
+	   $$t/probe >/dev/null 2>&1; then \
+	    rm -rf $$t; \
+	    $(MAKE) --no-print-directory arm64chroot32 && tests/run_tests.sh ./arm64chroot32; \
+	else \
+	    rm -rf $$t; \
+	    echo "SKIP test32: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
+	fi
 
 # The ENTIRE differential suite with the JIT enabled (same wrapper trick as
-# test-seccomp): the qemu oracle keeps the translator honest. Random-input
-# FP consistency (jit vs interpreter, same host) runs first — the FP corner
-# semantics are host-C by design and have no qemu oracle.
+# test-seccomp): the oracle keeps the translator honest. Random-input FP
+# consistency (jit vs interpreter, same host) runs first — the FP corner
+# semantics are host-C by design and have no external oracle. On an AArch64
+# host this is also the only thing that ever executes backend_a64.c.
 test-jit: arm64chroot
 	tests/run_consist.sh ./arm64chroot
 	printf '#!/bin/sh\nexec ./arm64chroot --jit "$$@"\n' > tests/jit_emu.sh
@@ -115,7 +150,7 @@ test-jit: arm64chroot
 
 # Android-behavior simulation on the dev host: force the statx ENOSYS
 # fallback and the Bionic keyring gate, then require the differential suite
-# to still match the qemu oracle.
+# to still match the oracle.
 test-android-sim: arm64chroot_asim
 	tests/run_tests.sh ./arm64chroot_asim
 

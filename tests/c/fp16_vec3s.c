@@ -9,6 +9,7 @@
  * negate the product operand, so a NaN's sign/payload is not bit-exact there —
  * the documented caveat. NaN propagation is covered by the scalar FP16 tests,
  * which exercise the same fop_d kernels. */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

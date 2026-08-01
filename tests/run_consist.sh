@@ -5,10 +5,10 @@
 # must produce identical bits. Usage: tests/run_consist.sh [./arm64chroot]
 set -u
 EMU=${1:-./arm64chroot}
-AGCC=$(command -v aarch64-linux-gnu-gcc || command -v aarch64-linux-gnu-gcc-13) || {
-    echo "SKIP fpconsist: no aarch64 cross compiler"; exit 0; }
 
 cd "$(dirname "$0")/.."
+. tests/hostenv.sh
+[ -n "$AGCC" ] || { echo "SKIP fpconsist: no aarch64 C compiler"; exit 0; }
 
 "$AGCC" -O2 -static -o tests/fpconsist.bin tests/fpconsist.c || {
     echo "FAIL build fpconsist"; exit 1; }

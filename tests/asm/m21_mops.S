@@ -21,7 +21,8 @@
  *
  * x0=0 on success, else failing-check id. Builds with -DUSERMODE as a Linux
  * user binary (exit code = x0) to validate every constant under
- * qemu-aarch64 -cpu max first. */
+ * qemu-aarch64 -cpu max first.
+ * REQUIRES: mops */
 .arch armv9.3-a
 
 .macro CKX reg, val, id

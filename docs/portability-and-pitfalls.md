@@ -33,9 +33,8 @@ all four targets.
   allow-list or be `__BIONIC__`-gated to a safe alternative (precedent: the
   keyring family returns `-ENOSYS` on Bionic). The rule is checked by `make
   test-seccomp`, which runs the whole differential suite with the emulator under
-  a trap filter for the Oreo-blocked set — a maintainer pre-release gate; the
-  committed CI runs the native x86_64 `make test` (see
-  [android-termux.md](android-termux.md)).
+  a trap filter for the Oreo-blocked set — run by the committed CI on both the
+  x86_64 and the arm64 host (see [android-termux.md](android-termux.md)).
 
 ## Catalog of pitfalls (each is a bug we hit)
 
@@ -125,12 +124,23 @@ architecture-value tests independent of `DCZID`.
 
 ## Testing discipline
 
-The differential suite (`tests/run_tests.sh`) runs each asm/C test under
-`qemu-aarch64` (the oracle) and under `arm64chroot`, requiring identical
-stdout+exit. The committed CI runs it on the native `x86_64` build; before a
-release the maintainer also runs it across the `i386` (native, via `make m32`)
-and `armhf`/`arm64` (cross-built, under `qemu-arm`/`qemu-aarch64`) builds.
-Behaviors qemu does not model — `--fake-id`, interactive job control — are
-self-checking cases instead. The rule that caught most of the bugs above: **a
-green run on x86-64 is necessary but not sufficient;
-the ARM and 32-bit builds are where the memory-model and ILP32 bugs live.**
+The differential suite (`tests/run_tests.sh`) runs each asm/C test under an
+oracle and under `arm64chroot`, requiring identical stdout+exit. What the
+oracle is depends on the host, and `tests/hostenv.sh` is the only place that
+knows: `qemu-aarch64` where the host cannot execute AArch64 code, the CPU
+itself where it can. The committed CI runs the suite on both an `x86_64` and
+an `arm64` runner — the latter with no qemu installed, so it is checked
+against silicon; before a release the maintainer also runs the `i386` (native,
+via `make m32`) and `armhf` (cross-built, under `qemu-arm`) builds. Behaviors
+qemu does not model — `--fake-id`, interactive job control — are self-checking
+cases instead. The rule that caught most of the bugs above: **a green run on
+x86-64 is necessary but not sufficient; the ARM and 32-bit builds are where
+the memory-model and ILP32 bugs live.**
+
+Running against hardware also changes what counts as available: qemu implements
+every optional extension, a real CPU implements some. A test that needs one
+declares it in a `REQUIRES:` marker naming the HWCAP strings the kernel prints
+on the cpuinfo `Features` line, and is skipped — with the missing name
+reported — where the CPU lacks it. Without that, the oracle would take SIGILL
+while the emulator, which implements the extension in software, answered
+correctly, and the diff would look like an emulator bug.

@@ -5,6 +5,7 @@
  * UNDEF'd. Computed on the single low half lane, widening to double / narrowing
  * once. qemu is the oracle; result bits must be byte-identical. Inline asm forces
  * the SIMD-scalar h,h encoding. */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

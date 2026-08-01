@@ -26,4 +26,5 @@ code written for user mode. The core is driven by a predecode direct-threaded
 interpreter and, on AArch64/x86-64 hosts, an optional basic-block JIT (`--jit`);
 neither touches the copied core. The design goal throughout is a single portable
 code path that runs identically on 32- and 64-bit, strongly- and weakly-ordered
-hosts, validated instruction-for-instruction against `qemu-aarch64`.
+hosts, validated instruction-for-instruction against `qemu-aarch64` — or,
+on an AArch64 host, against the CPU itself.

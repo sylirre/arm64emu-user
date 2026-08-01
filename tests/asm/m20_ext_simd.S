@@ -8,7 +8,8 @@
  * ARM ARM pseudocode; the same file builds as a Linux user binary with
  * -DUSERMODE (exit code = x0) to cross-check every value against real
  * hardware semantics under qemu-aarch64 -cpu max before trusting it as the
- * emulator's reference. */
+ * emulator's reference.
+ * REQUIRES: asimdrdm asimddp fcma asimdfhm */
 .arch armv8.5-a+fp16fml
 
 .macro CKX reg, val, id

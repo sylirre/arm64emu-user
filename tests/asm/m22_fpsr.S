@@ -15,7 +15,8 @@
  *
  * x0=0 on success, else failing-check id. Builds with -DUSERMODE as a Linux
  * user binary (exit code = x0) so every expected value is validated under
- * qemu-aarch64 -cpu max first. */
+ * qemu-aarch64 -cpu max first.
+ * REQUIRES: fphp asimdhp jscvt */
 .arch armv8.5-a+fp16
 
 .macro CKX reg, val, id

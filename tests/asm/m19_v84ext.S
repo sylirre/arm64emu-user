@@ -7,7 +7,8 @@
  * else failing-check id. Expected values are hand-computed; the same file
  * builds as a Linux user binary with -DUSERMODE (exit code = x0) to
  * cross-check every value against real hardware semantics under
- * qemu-aarch64 -cpu max before trusting it as the emulator's reference. */
+ * qemu-aarch64 -cpu max before trusting it as the emulator's reference.
+ * REQUIRES: ilrcpc jscvt flagm flagm2 */
 .arch armv8.5-a
 
 .macro CKX reg, val, id

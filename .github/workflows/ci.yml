@@ -84,3 +84,48 @@ jobs:
 
       - name: JIT (64-bit host)
         run: make test-jit
+
+  # The same suite on a real AArch64 machine, which is a different test in two
+  # ways that the x86 job cannot cover however long it runs:
+  #   - the JIT's AArch64 backend is compiled in by host #ifdef, so `make
+  #     test-jit` here is the only thing that ever EXECUTES backend_a64.c;
+  #   - the guest binaries run on the CPU rather than under qemu, so the oracle
+  #     is hardware. Deliberately no qemu-user is installed: that leaves
+  #     tests/hostenv.sh selecting native execution, and the suite is then
+  #     checking the emulator against silicon instead of against a second
+  #     emulator. (Tests that need an optional extension the runner's CPU
+  #     lacks announce it and skip — see the REQUIRES: markers.)
+  # No cross toolchain either: on this host the plain system cc already
+  # targets the guest.
+  build-test-arm64:
+    name: build + test (aarch64 host)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # proot   -> Alpine minirootfs bootstrap + the shell-test oracle. Needs
+      #            no qemu here: proot runs the rootfs binaries natively.
+      # expect  -> interactive job-control (PTY) test
+      - name: Install rootfs bootstrap tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends proot expect
+
+      - name: Build
+        run: make
+
+      - name: Interpreter (aarch64 host, native oracle)
+        run: make test
+
+      - name: Interpreter (aarch64 host, Android seccomp)
+        run: make test-seccomp
+
+      # Reports SKIP: AArch32 at EL0 does not exist on server-class ARM cores,
+      # so the 32-bit-host variant cannot be run here however it is built.
+      - name: Interpreter (32-bit host)
+        run: make test32
+
+      # The one job in which the AArch64 backend actually runs.
+      - name: JIT (aarch64 host)
+        run: make test-jit

@@ -1,4 +1,5 @@
 // Exercise the LSE atomic ops and check results. exit code = #errors.
+// REQUIRES: atomics
     .globl _start
 _start:
     mov x19, #0

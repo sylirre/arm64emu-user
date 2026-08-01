@@ -267,8 +267,15 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
   NaN-gated FMLA.
 - `make test` (interpreter) must stay green: the JIT only adds a run-loop rung
   and leaves the default path untouched.
-- AArch64-host coverage is a cross build (`aarch64-linux-gnu-gcc -static`) run
-  under `qemu-aarch64`; qemu executes the emitted AArch64 code faithfully.
+- AArch64-host coverage means running `make test-jit` on an AArch64 machine —
+  that is the only configuration in which `backend_a64.c` is compiled in and
+  therefore the only one that executes it (CI job `build + test (aarch64
+  host)`). There, guest programs are built by the system `cc` and the
+  differential oracle is the CPU rather than qemu, so the emitted code is
+  checked against the hardware it was written for. A cross build run under
+  `qemu-aarch64` from an x86 host exercises the same emitter, and qemu executes
+  what it emits faithfully, but the ISA it is emitting *for* is then also
+  qemu's.
 
 Debug/bisection knobs (all off by default):
 

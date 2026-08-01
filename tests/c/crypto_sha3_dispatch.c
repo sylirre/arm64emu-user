@@ -14,7 +14,8 @@
  * wanted Rm in {16,17} on the same Ra condition. Both are exercised below,
  * along with the neighbouring register choices that always worked.
  *
- * qemu is the oracle. */
+ * qemu is the oracle.
+ * REQUIRES: sha3 sha512 (a native oracle has to implement both pages) */
 #include <stdio.h>
 #include <stdint.h>
 

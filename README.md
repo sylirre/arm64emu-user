@@ -230,31 +230,48 @@ but not remembered).
 
   Almost everything needed for normal operation of Linux userland.
 
-Validated against `qemu-aarch64` as an oracle: static and dynamic C programs,
-`busybox`, an Alpine (musl) rootfs with `apk`, `bash`, and `openssl`, plus
-threaded and crypto workloads — all byte-for-byte identical.
+Validated against an oracle — `qemu-aarch64`, or on an AArch64 host the CPU
+itself: static and dynamic C programs, `busybox`, an Alpine (musl) rootfs with
+`apk`, `bash`, and `openssl`, plus threaded and crypto workloads — all
+byte-for-byte identical.
 
 ## Building
 
 ```sh
 make                 # native build (./arm64chroot)
-make m32             # 32-bit build via gcc -m32 (native ILP32-host CI on x86_64)
-make test            # differential test suite vs qemu-aarch64
+make m32             # 32-bit build (gcc -m32 on x86-64, armhf on an ARM host)
+make test            # differential test suite
 make test-seccomp    # same suite with the emulator under an Android-Oreo
                      # seccomp mimic (no device needed)
 ```
 
+The suite runs on an x86-64 host and on a real AArch64 one, and works out for
+itself what each provides (`tests/hostenv.sh`):
+
+| | x86-64 host | AArch64 host |
+|---|---|---|
+| guest compiler | `aarch64-linux-gnu-gcc` | the system `cc` |
+| oracle | `qemu-aarch64` | `qemu-aarch64` if installed, else the CPU |
+| `make test32` | `gcc -m32` | armhf cross gcc, or SKIP |
+
+`A64_CC` overrides the compiler and `A64_ORACLE=qemu|native` the oracle.
+Running against hardware is the stricter check of the two — it compares the
+emulator with silicon rather than with a second emulator — and it is the only
+way the JIT's AArch64 backend is executed at all. A test that needs an
+optional extension (FP16, LSE, MOPS, SHA3, ...) declares it in a `REQUIRES:`
+marker and is skipped, with the reason named, on a CPU that lacks it.
+
 `make test` provisions the Alpine (busybox/bash) and glibc rootfs it needs
 from scratch into a repo-local cache (`tests/.cache/`) on first run. The
-glibc tree is built offline from the cross sysroot. The Alpine tree needs
-a one-time network fetch.
+glibc tree is built offline, from the cross sysroot or from the host's own
+runtime. The Alpine tree needs a one-time network fetch.
 
 The suite ends with a differential instruction fuzzer
 (`tests/fixtures/insnfuzz.c`), which runs guest code against a varying
 register/vector state and compares a digest of the result. It has three modes
 because the useful comparisons have different oracles. `conform` replays a
 table of real, allocated encodings one instruction at a time and requires an
-exact match against qemu-aarch64. `chaos` feeds fully random instruction
+exact match against the oracle. `chaos` feeds fully random instruction
 words — where qemu is *not* an oracle, since the emulator still executes some
 unallocated encodings and implements no MTE/SM3/SM4/I8MM — and instead
 requires the decode cache, the plain decoder and the JIT to agree with each
@@ -338,7 +355,8 @@ src/
   thread.h      per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h   arm64 syscall numbers + explicit guest struct layouts
   main.c        CLI, rootfs setup, initial exec
-tests/          asm + C differential tests, run_tests.sh (oracle: qemu-aarch64)
+tests/          asm + C differential tests, run_tests.sh; hostenv.sh picks the
+                compiler and the oracle (qemu-aarch64, or an AArch64 host's CPU)
 ```
 
 **Execution.** Three tiers share one run loop and return contract. By default a

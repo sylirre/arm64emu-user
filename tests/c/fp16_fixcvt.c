@@ -5,6 +5,7 @@
  * (exact: 53 >= 2*11+2). qemu is the oracle; result bits must be byte-identical.
  * The scalar forms use inline asm to force the SIMD-scalar h,h,#n encoding (the
  * GPR-source scalar form lives in exec_fp_scalar and is covered separately). */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

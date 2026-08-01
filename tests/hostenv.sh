@@ -1,0 +1,187 @@
+#!/bin/sh
+# Host-dependent half of the test harness — sourced by run_tests.sh,
+# run_consist.sh and setup_env.sh, never executed on its own.
+#
+# The suite is differential: every guest program runs under a reference and
+# under arm64chroot, and the two must agree. Both the compiler that produces
+# those guest programs and the reference that runs them depend on what the
+# host is, and that is the only thing this file decides.
+#
+#   compiler   A host that is not AArch64 needs a cross gcc. An AArch64 host
+#              already has one: its own cc. A64_CC overrides either.
+#
+#   oracle     qemu-aarch64 where the host cannot execute AArch64 code, which
+#              is the only option on x86-64. Where it can — an AArch64 host,
+#              or any host with binfmt_misc wired up — the binary can simply
+#              be run, and on real ARM that is the stronger of the two
+#              references: hardware rather than a second emulator.
+#              A64_ORACLE=auto|qemu|native chooses; auto prefers qemu when it
+#              is installed, so a run on ARM stays comparable to a run on x86.
+#              Whether the host can run AArch64 code is PROBED, not inferred
+#              from uname, because binfmt_misc makes the answer yes on hosts
+#              where the architecture says no.
+#
+# Sets:     AGCC, ORACLE_KIND (qemu|native|none), ORACLE_QEMU, ORACLE_DESC,
+#           ORACLE_GATE, A64_HOST_ARCH, A64_SYSROOT
+# Provides: oracle_run, oracle_run0, oracle_proot, oracle_proot_ok,
+#           host_missing_features
+
+A64_HOST_ARCH=$(uname -m)
+
+a64_host_arm64() {
+    case "$A64_HOST_ARCH" in aarch64|arm64) return 0 ;; *) return 1 ;; esac
+}
+
+# ---- the guest compiler ------------------------------------------------------
+if [ -n "${A64_CC:-}" ]; then
+    AGCC="$A64_CC"
+else
+    AGCC=$(command -v aarch64-linux-gnu-gcc 2>/dev/null) ||
+    AGCC=$(command -v aarch64-linux-gnu-gcc-13 2>/dev/null) || AGCC=
+    # On an AArch64 host the system compiler already targets the guest, and a
+    # cross-prefixed one is normally not installed at all.
+    if [ -z "$AGCC" ] && a64_host_arm64; then
+        AGCC=$(command -v cc 2>/dev/null) || AGCC=$(command -v gcc 2>/dev/null) || AGCC=
+    fi
+fi
+
+# Where the aarch64 runtime lives, for qemu's dynamic loader and for
+# setup_env.sh's glibc rootfs. On an AArch64 host that is the host's own root.
+if a64_host_arm64; then
+    A64_SYSROOT="${A64_SYSROOT:-/}"
+else
+    A64_SYSROOT="${A64_SYSROOT:-/usr/aarch64-linux-gnu}"
+fi
+export A64_SYSROOT
+
+# ---- the oracle --------------------------------------------------------------
+
+# Can this host execute an AArch64 binary by itself? Probed with a freestanding
+# exit(0) — no libc, so the answer does not depend on a static libc being
+# installed — and cached, since it costs a compile.
+a64_native_exec_works() {
+    if [ -z "${A64_NATIVE_EXEC:-}" ]; then
+        A64_NATIVE_EXEC=0
+        if [ -n "$AGCC" ]; then
+            _probe=$(mktemp 2>/dev/null) || _probe="${TMPDIR:-/tmp}/a64exec.$$"
+            if [ -n "$_probe" ]; then
+                if cat <<'EOF' | "$AGCC" -x c - -static -nostdlib -o "$_probe" 2>/dev/null
+void _start(void) { __asm__ volatile("mov x8, #93\nmov x0, #0\nsvc #0"); }
+EOF
+                then
+                    chmod +x "$_probe" 2>/dev/null
+                    "$_probe" 2>/dev/null && A64_NATIVE_EXEC=1
+                fi
+                rm -f "$_probe"
+            fi
+        fi
+    fi
+    [ "$A64_NATIVE_EXEC" = 1 ]
+}
+
+ORACLE_QEMU=$(command -v qemu-aarch64 2>/dev/null) || ORACLE_QEMU=
+case "${A64_ORACLE:-auto}" in
+    qemu)
+        if [ -n "$ORACLE_QEMU" ]; then ORACLE_KIND=qemu
+        else ORACLE_KIND=none; echo "A64_ORACLE=qemu but qemu-aarch64 is not installed" >&2; fi ;;
+    native)
+        if a64_native_exec_works; then ORACLE_KIND=native
+        else ORACLE_KIND=none; echo "A64_ORACLE=native but this host cannot execute AArch64 binaries" >&2; fi ;;
+    auto)
+        if   [ -n "$ORACLE_QEMU" ];   then ORACLE_KIND=qemu
+        elif a64_native_exec_works;   then ORACLE_KIND=native
+        else ORACLE_KIND=none; fi ;;
+    *)
+        ORACLE_KIND=none
+        echo "A64_ORACLE must be auto, qemu or native (got '$A64_ORACLE')" >&2 ;;
+esac
+
+case "$ORACLE_KIND" in
+    qemu)   ORACLE_DESC="$ORACLE_QEMU" ;;
+    native) ORACLE_DESC="native execution on $A64_HOST_ARCH" ;;
+    *)      ORACLE_DESC="none" ;;
+esac
+
+# Feature gating (see host_missing_features) applies only where the thing
+# executing the reference really is an AArch64 CPU. Under qemu — including
+# native execution that binfmt_misc quietly routes through qemu on an x86
+# host — every optional extension is implemented, so there is nothing to gate.
+if [ "$ORACLE_KIND" = native ] && a64_host_arm64; then ORACLE_GATE=1; else ORACLE_GATE=0; fi
+
+# QEMU_LD_PREFIX is set on both paths on purpose: it is what qemu needs to find
+# the guest's dynamic loader, it is inert on a real AArch64 host, and it is the
+# one thing the native path still needs when "native" is binfmt_misc handing
+# the binary to qemu after all.
+oracle_run() {   # oracle_run <binary> [args...]
+    if [ "$ORACLE_KIND" = qemu ]; then
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
+    else
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$@"
+    fi
+}
+
+# Same, with argv[0] overridden — tests that re-exec argv[0] need it to name a
+# path that resolves in both worlds. qemu takes -0; natively it takes a shell
+# that can set argv[0] across an exec, which is bash (`exec -a`), not POSIX sh.
+oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
+    _a0="$1"; shift
+    if [ "$ORACLE_KIND" = qemu ]; then
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+            "$ORACLE_QEMU" -0 "$_a0" "$@"
+    else
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+            bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@"
+    fi
+}
+
+# The Alpine rootfs is driven through proot, and proot replaces the guest's
+# loader itself — so binfmt_misc, which is what makes a plain execve of an
+# AArch64 binary work on a host that is not AArch64, never gets a say here.
+# Unless the CPU really is AArch64, proot has to be handed the interpreter.
+# (Pinning A64_ORACLE=qemu on an ARM host routes it through qemu as well, so
+# the whole reference stack stays one thing.)
+if a64_host_arm64 && [ "$ORACLE_KIND" != qemu ]; then
+    PROOT_QEMU=
+else
+    PROOT_QEMU=qemu-aarch64-static
+fi
+
+oracle_proot_ok() {
+    command -v proot >/dev/null 2>&1 || return 1
+    [ -z "$PROOT_QEMU" ] || command -v "$PROOT_QEMU" >/dev/null 2>&1
+}
+
+oracle_proot() {   # oracle_proot <proot args...>
+    if [ -n "$PROOT_QEMU" ]; then
+        proot -q "$PROOT_QEMU" "$@"
+    else
+        proot "$@"
+    fi
+}
+
+# ---- optional-extension gating ----------------------------------------------
+# Most of the suite is ARMv8.0-A, which every AArch64 host implements. A few
+# tests deliberately exercise optional extensions (LSE, FP16, MOPS, SHA3, ...),
+# and where the reference is the host CPU rather than qemu, an extension the
+# CPU lacks means the test cannot run here at all — the oracle would take
+# SIGILL while the emulator, which implements it in software, answers
+# correctly. Such a test declares what it needs with a marker line
+#
+#     REQUIRES: <hwcap> [<hwcap> ...]
+#
+# naming the strings the kernel prints on the cpuinfo "Features" line, so the
+# declaration can be checked against this host with no translation table.
+A64_HOST_FEATURES=" $(awk -F: '/^Features/ { print $2; exit }' /proc/cpuinfo 2>/dev/null) "
+
+host_missing_features() {   # host_missing_features <source-file> -> missing names
+    [ "$ORACLE_GATE" = 1 ] || return 0
+    _need=$(grep -m1 -o 'REQUIRES:[a-z0-9 ]*' "$1" 2>/dev/null | sed 's/^REQUIRES://')
+    _miss=
+    for _f in $_need; do
+        case "$A64_HOST_FEATURES" in
+            *" $_f "*) ;;
+            *)         _miss="$_miss $_f" ;;
+        esac
+    done
+    printf '%s' "${_miss# }"
+}

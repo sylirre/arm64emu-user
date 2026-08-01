@@ -6,6 +6,7 @@
  * (fcvt_to_int) and round-mode (fround_mode) helpers as the S/D forms. qemu is the
  * oracle; result bits / integers must be byte-identical. Finite and +-inf inputs
  * only (NaN->int is not modelled, same policy as the other FCVT tests). */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

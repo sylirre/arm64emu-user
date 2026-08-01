@@ -11,7 +11,10 @@
  * architectural, so this is an ordinary differential test. The FPNeg-carrying
  * forms are the interesting ones: FNMUL negates the DefaultNaN, and the fused
  * multiply-add family scans its operands as (addend, n, m) with each carrying
- * the negation its own form applies. */
+ * the negation its own form applies.
+ *
+ * REQUIRES: fphp asimdhp (the half-precision block below is FEAT_FP16, which
+ * a native oracle has to implement too). */
 #include <stdio.h>
 #include <string.h>
 

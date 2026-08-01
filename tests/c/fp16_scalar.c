@@ -5,6 +5,7 @@
  * emulator computes them in double and narrows once to half (exact: double's
  * 53-bit mantissa exceeds 2*11+2). qemu is the oracle; result bits + FCMP flags
  * must be byte-identical. qNaN inputs only (payload/SNaN not modelled). */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

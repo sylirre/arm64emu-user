@@ -4,6 +4,7 @@
  * shared fop_d kernels, and narrows once via f64_to_f16 (exact: 53 >= 2*11+2).
  * qemu is the oracle; result bits must be byte-identical. Inputs are finite: FMLS
  * negates the multiplicand, so a NaN there is not sign-bit-exact (documented). */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

@@ -214,15 +214,15 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 ## Host / build matrix
 
 One portable code path, no per-arch `#if` in the logic. Exercised across these
-targets — the committed CI automates the native x86-64 `make test`; the
+targets — the committed CI automates the x86-64 and arm64 `make test`; the
 maintainer runs the rest before a release:
 
 | Host | How it runs | Status |
 |------|-------------|--------|
 | x86-64 | native | primary; full suite (CI) |
+| arm64 | native | full suite + the only run of the JIT's AArch64 backend (CI) |
 | i386 | native (`make m32`) | ILP32 coverage |
 | armhf (32-bit ARM) | `arm-linux-gnueabihf-gcc -static`, run under `qemu-arm` | full suite |
-| arm64 | `aarch64-linux-gnu-gcc -static`, run under `qemu-aarch64` | full suite |
 
 The `i386` build runs natively on the x86-64 dev host, so 32-bit-host correctness
 (ILP32 struct conversion, `uintptr_t` page-table leaves, wide atomics) is

@@ -154,9 +154,11 @@ runs the **entire differential suite** with the emulator under a
 `SECCOMP_RET_TRAP` filter (`tests/seccomp_wrap.c`) covering the host-arch
 numbers of the full Oreo-blocked set. Any handler that forwards a blocked
 syscall either dies (net regression) or diverges from the unfiltered
-`qemu-aarch64` oracle — so "safe on Android 8" is verifiable on an ordinary Linux
-box with no device. It is a maintainer pre-release gate; the committed CI runs
-the native x86_64 `make test`. A few numbers are deliberately exempt from the
+oracle — so "safe on Android 8" is verifiable on an ordinary Linux box with no
+device. The committed CI runs it on both the x86_64 and the arm64 host; the
+filter is built from the host's own syscall numbers, so it is the same gate on
+either (`AUDIT_ARCH_AARCH64` there, `AUDIT_ARCH_X86_64` here) — and on arm64 it
+is the Android *architecture* as well. A few numbers are deliberately exempt from the
 filter because the *host glibc* issues them before the net is armed or in ways
 Bionic never would (`rseq`, `set_robust_list`, `clone3`, `membarrier`,
 `accept`); the rationale lives in the `seccomp_wrap.c` header. The related

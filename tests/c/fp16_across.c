@@ -6,6 +6,7 @@
  * result bits must be byte-identical. Covers signed-zero ordering and a single
  * propagating qNaN (FMAXV/FMINV keep it; FMAXNMV/FMINNMV ignore it -- both
  * deterministic; these ops do not negate, so no NaN-sign caveat). */
+/* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
 #pragma GCC target ("arch=armv8.2-a+fp16")
 #include <stdio.h>
 #include <stdint.h>

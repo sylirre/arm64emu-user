@@ -1,14 +1,25 @@
 #!/bin/bash
-# Differential test suite: every test runs under qemu-aarch64 (oracle) and
-# under arm64chroot; stdout+exit must match exactly.
+# Differential test suite: every test runs under an oracle and under
+# arm64chroot; stdout+exit must match exactly. The oracle is qemu-aarch64, or
+# on a host that can execute AArch64 code the binary itself — see
+# tests/hostenv.sh, which picks it along with the compiler that builds the
+# guest programs.
 # Usage: tests/run_tests.sh [./arm64chroot]
 set -u
 EMU="${1:-./arm64chroot}"
 cd "$(dirname "$0")/.."
 
-AGCC=$(command -v aarch64-linux-gnu-gcc || command -v aarch64-linux-gnu-gcc-13) || {
-    echo "SKIP: no aarch64 cross compiler"; exit 0; }
-QEMU=$(command -v qemu-aarch64) || { echo "SKIP: no qemu-aarch64"; exit 0; }
+. tests/hostenv.sh
+[ -n "$AGCC" ] || {
+    echo "SKIP: no aarch64 C compiler (install aarch64-linux-gnu-gcc, or set A64_CC)"; exit 0; }
+[ "$ORACLE_KIND" != none ] || {
+    echo "SKIP: no oracle (install qemu-aarch64, or run on a host that executes AArch64 binaries)"
+    exit 0; }
+echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
+# Without a static libc every C test would silently skip its own build and the
+# suite would still report success, just a much smaller one. Say so once.
+printf 'int main(void){return 0;}\n' | "$AGCC" -static -O0 -x c - -o /dev/null 2>/dev/null ||
+    echo "WARN: $AGCC cannot link -static; the C tests will all skip (install the static libc)"
 
 # Provision the Alpine + glibc test rootfs from scratch into a repo-local cache
 # (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
@@ -21,8 +32,9 @@ pass=0 fail=0
 run_diff() {   # run_diff <name> <binary> [args...]
     local name="$1"; shift
     local out_q out_e rc_q rc_e
-    # timeout: a hanging test must FAIL (rc 124 mismatch), not wedge the suite
-    out_q=$(timeout 60 "$QEMU" "$@" 2>/dev/null); rc_q=$?
+    # timeout (inside oracle_run for the reference side): a hanging test must
+    # FAIL (rc 124 mismatch), not wedge the suite
+    out_q=$(oracle_run "$@" 2>/dev/null); rc_q=$?
     out_e=$(timeout 60 "$EMU" / "$@" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS $name"
@@ -32,9 +44,23 @@ run_diff() {   # run_diff <name> <binary> [args...]
     fi
 }
 
+# A test that needs an optional extension (LSE, FP16, MOPS, SHA3, ...) names it
+# in a REQUIRES: marker. That only matters when the oracle is the host CPU
+# itself: qemu implements every extension, and so does the emulator, but real
+# silicon may not — there the oracle would take SIGILL and the diff would
+# report an emulator bug that is really a missing CPU feature.
+skip_unsupported() {   # skip_unsupported <label> <source-file>
+    local miss
+    miss=$(host_missing_features "$2")
+    [ -z "$miss" ] && return 1
+    echo "SKIP $1 (host CPU lacks: $miss)"
+    return 0
+}
+
 # ---- assembly tests (static, nostdlib) ----
 for s in tests/asm/*.S; do
     b="${s%.S}.bin"
+    skip_unsupported "asm/$(basename "$s" .S)" "$s" && continue
     # -DUSERMODE selects the Linux-exit variant of the dual-mode m19-m22
     # batteries shared with the ARM64_Emulator repo (their .arch directives
     # override -march per file); the other tests ignore the define.
@@ -47,6 +73,7 @@ for cfile in tests/c/*.c; do
     base="$(basename "$cfile" .c)"
     bs="tests/c/${base}_static.bin"
     bd="tests/c/${base}_dyn.bin"
+    skip_unsupported "c/${base}" "$cfile" && continue
     "$AGCC" -static -O2 -o "$bs" "$cfile" -lm -lpthread 2>/dev/null || {
         echo "SKIP build $cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
@@ -54,12 +81,12 @@ for cfile in tests/c/*.c; do
     if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" -lm -lpthread 2>/dev/null; then
         # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
-        # us, at host /tmp for qemu. QEMU_LD_PREFIX (unlike -L) survives the
-        # host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
+        # us, at host /tmp for the oracle. QEMU_LD_PREFIX (unlike -L) survives
+        # the host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
         cp "$bd" /tmp/t.bin
-        out_q=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" timeout 60 "$QEMU" -0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX="${A64_SYSROOT:-/usr/aarch64-linux-gnu}" timeout 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        out_q=$(oracle_run0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
@@ -88,7 +115,7 @@ rm -f /tmp/t.bin
 if [ -x tests/c/l2s_rename_static.bin ]; then
     for mode in "" exchange; do
         label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
-        out_q=$(timeout 60 "$QEMU" tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
+        out_q=$(oracle_run tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
         out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS $label"
@@ -107,7 +134,7 @@ fi
 for base in shm_sysv shm_stat; do
     SHMBIN="tests/c/${base}_static.bin"
     [ -x "$SHMBIN" ] || continue
-    out_q=$(timeout 60 "$QEMU" "$SHMBIN" 2>/dev/null); rc_q=$?
+    out_q=$(oracle_run "$SHMBIN" 2>/dev/null); rc_q=$?
     out_e=$(A64_SHM_FORCE_FILE=1 timeout 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(file-tier)"
@@ -119,10 +146,10 @@ done
 
 # ---- Alpine rootfs shell tests (if present) ----
 ALPINE="$A64_TEST_ROOT/alpine"
-if [ -x "$ALPINE/bin/busybox" ] && command -v proot >/dev/null && command -v qemu-aarch64-static >/dev/null; then
+if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok; then
     while IFS= read -r cmd; do
         [ -z "$cmd" ] && continue
-        out_o=$(proot -q qemu-aarch64-static -r "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
+        out_o=$(oracle_proot -r "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
         out_e=$("$EMU" "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_e=$?
         if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS sh: $cmd"
@@ -921,7 +948,7 @@ if [ -n "$HCC" ] && [ "$(od -An -j4 -N1 -tu1 "$EMU" | tr -d ' ')" = "2" ]; then
     fi
 fi
 if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
-    out_q=$("$QEMU" tests/c/statx_static.bin 2>/dev/null); rc_q=$?
+    out_q=$(oracle_run tests/c/statx_static.bin 2>/dev/null); rc_q=$?
     out_e=$("$WRAP" "$EMU" / tests/c/statx_static.bin 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS seccomp: trapped statx -> ENOSYS fallback"
@@ -986,9 +1013,14 @@ done
 if [ -n "$AGCC" ]; then
     ifb=tests/fixtures/insnfuzz.bin
     if "$AGCC" -static -O1 -o "$ifb" tests/fixtures/insnfuzz.c 2>/dev/null; then
-        for seed in 1 7 12345; do
-            run_diff "insnfuzz: conform (seed $seed)" "$ifb" conform "$seed" 15200
-        done
+        # Only conform is oracle-diffed, so only conform cares what the host
+        # CPU implements; chaos and seq compare the three engines with each
+        # other and run entirely inside the emulator.
+        if ! skip_unsupported "insnfuzz: conform" tests/fixtures/insnfuzz.c; then
+            for seed in 1 7 12345; do
+                run_diff "insnfuzz: conform (seed $seed)" "$ifb" conform "$seed" 15200
+            done
+        fi
         c_pd=$(timeout 120 "$EMU" / "$ifb" chaos 1 15000 2>/dev/null)
         c_np=$(timeout 120 "$EMU" --no-predecode / "$ifb" chaos 1 15000 2>/dev/null)
         c_jit=$(timeout 120 "$EMU" --jit / "$ifb" chaos 1 15000 2>/dev/null)
