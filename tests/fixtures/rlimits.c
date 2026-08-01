@@ -37,7 +37,29 @@
 
 extern char **environ;
 
-#define CAP (512ULL << 20)
+/* The window is measured above what is already mapped, never an absolute
+ * figure: how much address space a process holds before main() runs is a
+ * property of its C library. glibc and musl start with a few MB, Bionic
+ * reserves about 8.6 GB (scudo's PROT_NONE primary reserves, which cost no
+ * memory but do count against RLIMIT_AS), so an absolute cap is below current
+ * usage there and every mmap correctly fails -- the same assumption that made
+ * mmapchurn unrunnable on a Termux host. */
+#define WINDOW (512ULL << 20)
+
+static unsigned long long mapped_now(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    unsigned long long total = 0, lo, hi;
+    char line[512];
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2) total += hi - lo;
+    fclose(f);
+    return total;
+}
+
+/* The cap this process installed, so the fork child (which inherits it) and the
+ * exec'd image (which is told it, argv[2]) can both check what they kept. */
+static unsigned long long g_cap;
 
 static unsigned long long limits_line(const char *want) {
     FILE *f = fopen("/proc/self/limits", "r");
@@ -61,10 +83,11 @@ int main(int argc, char **argv) {
 
     /* The exec'd role: the table a kernel hands across execve is the one the
      * caller had, so the cap set below must still be here and still bite. */
-    if (argc > 1) {
+    if (argc > 2) {
+        unsigned long long cap = strtoull(argv[2], NULL, 10);
         getrlimit(RLIMIT_AS, &rl);
-        printf("exec_kept=%d\n", rl.rlim_cur == CAP);
-        printf("exec_limits=%d\n", limits_line("Max address space") == CAP);
+        printf("exec_kept=%d\n", rl.rlim_cur == cap);
+        printf("exec_limits=%d\n", limits_line("Max address space") == cap);
         void *p = mmap(NULL, 4096ULL << 20, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         printf("exec_enforced=%d\n", p == MAP_FAILED && errno == ENOMEM);
@@ -73,17 +96,18 @@ int main(int argc, char **argv) {
     }
 
     if (getrlimit(RLIMIT_AS, &rl) != 0) { printf("getrlimit=fail\n"); return 1; }
-    rl.rlim_cur = CAP;
+    g_cap = mapped_now() + WINDOW;
+    rl.rlim_cur = g_cap;
     printf("set=%d\n", setrlimit(RLIMIT_AS, &rl) == 0);
 
     /* Coherence: every way of asking must give the same answer. */
     memset(&rl, 0, sizeof rl);
     getrlimit(RLIMIT_AS, &rl);
-    printf("readback=%d\n", rl.rlim_cur == CAP);
+    printf("readback=%d\n", rl.rlim_cur == g_cap);
     memset(&rl, 0, sizeof rl);
     printf("prlimit=%d\n",
-           prlimit(0, RLIMIT_AS, NULL, &rl) == 0 && rl.rlim_cur == CAP);
-    printf("procfs=%d\n", limits_line("Max address space") == CAP);
+           prlimit(0, RLIMIT_AS, NULL, &rl) == 0 && rl.rlim_cur == g_cap);
+    printf("procfs=%d\n", limits_line("Max address space") == g_cap);
 
     /* Enforced against the guest's own address space: comfortably under the
      * cap must work, far over it must be refused -- and refused with ENOMEM,
@@ -107,7 +131,7 @@ int main(int argc, char **argv) {
 
     /* A hard limit can only come down without privilege, and must stay down. */
     getrlimit(RLIMIT_AS, &rl);
-    rl.rlim_max = CAP;
+    rl.rlim_max = g_cap;
     setrlimit(RLIMIT_AS, &rl);
     rl.rlim_max = ~0ULL;
     rl.rlim_cur = ~0ULL;
@@ -119,7 +143,7 @@ int main(int argc, char **argv) {
     if (k == 0) {
         struct rlimit c;
         getrlimit(RLIMIT_AS, &c);
-        _exit(c.rlim_cur == CAP ? 0 : 1);
+        _exit(c.rlim_cur == g_cap ? 0 : 1);
     }
     int st = 0;
     waitpid(k, &st, 0);
@@ -127,7 +151,9 @@ int main(int argc, char **argv) {
 
     /* ...and execve carries it across, where the checks above run again. */
     fflush(stdout);
-    char *av[] = { argv[0], (char *)"child", NULL };
+    char capbuf[32];
+    snprintf(capbuf, sizeof capbuf, "%llu", g_cap);
+    char *av[] = { argv[0], (char *)"child", capbuf, NULL };
     execve(argv[0], av, environ);
     printf("exec=fail\n");
     return 1;
