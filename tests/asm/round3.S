@@ -109,24 +109,12 @@ _start:
     mix x2
     ldr x2, [x20, #8]
     mix x2
-    // base-clobber hazard: writeback wins over the loaded value.
-    // rd == rn is CONSTRAINED UNPREDICTABLE, which is the point — the three
-    // engines must agree with each other and with qemu on what it does. Spelled
-    // as raw encodings because clang's integrated assembler refuses to assemble
-    // an unpredictable writeback at all (GNU as only warns), and a test the
-    // Termux/Android toolchain cannot build is a test that never runs there.
-    // The words are exactly what `ldr x2,[x2,#8]!` / `ldr x3,[x3],#16` /
-    // `ldrb w4,[x4],#1` assemble to.
-    str x20, [x20]
-    mov x2, x20
-    .inst 0xf8408c42                // ldr x2, [x2, #8]!   rd == rn pre
-    mix x2
-    mov x3, x20
-    .inst 0xf8410463                // ldr x3, [x3], #16   rd == rn post
-    mix x3
-    mov x4, x20
-    .inst 0x38401484                // ldrb w4, [x4], #1   rd == rn post, sub-word
-    mix x4
+    // The rd == rn base-clobber hazard used to be checked here and is not any
+    // more: it is CONSTRAINED UNPREDICTABLE, so it has no oracle-checkable
+    // answer, and a real CPU resolves it differently from qemu. It moved to
+    // fixtures/cu_writeback.c, where our engines are compared with each other
+    // instead. Everything above is architecturally defined and does match
+    // hardware.
     sect
 
     // ---- section 3: register-offset signed + SIMD, LDRSW literal ----

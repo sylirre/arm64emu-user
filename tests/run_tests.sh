@@ -720,6 +720,36 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- loads whose destination is also their writeback base (rd == rn).
+# Engine-against-engine, never against the oracle: the architecture calls this
+# CONSTRAINED UNPREDICTABLE, so taking the loaded value, taking the writeback
+# address, NOP and UNDEFINED are all permitted, and an oracle has no authority
+# over which one appears. It used to live in asm/round3.S diffed against qemu,
+# agreed with it for as long as qemu was the only oracle, and failed the first
+# time a real CPU was the oracle -- silicon lets the loaded value win where
+# qemu and this emulator let the writeback win. Both are legal. What is worth
+# holding is that the decoder, the decoded-instruction cache and the code
+# generator never disagree with each other about an odd encoding. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O1 -o tests/fixtures/cu_writeback.bin \
+            tests/fixtures/cu_writeback.c $A64_TESTLIBS 2>/dev/null; then
+        cu_i=$(timeout 60 "$EMU" / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        cu_p=$(timeout 60 "$EMU" --no-predecode / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        cu_j=$(timeout 60 "$EMU" --jit / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        if [ -n "$cu_i" ] && [ "$cu_i" = "$cu_p" ] && [ "$cu_i" = "$cu_j" ]; then
+            pass=$((pass+1)); echo "PASS fixture: cu_writeback (engines agree)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: cu_writeback"
+            printf '     interp:       %s\n' "$(echo "$cu_i" | tr '\n' ' ')"
+            printf '     no-predecode: %s\n' "$(echo "$cu_p" | tr '\n' ' ')"
+            printf '     jit:          %s\n' "$(echo "$cu_j" | tr '\n' ' ')"
+        fi
+        rm -f tests/fixtures/cu_writeback.bin
+    else
+        skip_build "fixtures/cu_writeback"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom
