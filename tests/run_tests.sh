@@ -835,7 +835,7 @@ check_fixture() {   # check_fixture <name> <expected>
     fi
     rm -f "tests/fixtures/$name.bin"
 }
-check_fixture robust $'get0 rc=0 len=24 head_set=1\nset_badlen rc=-1 err=22\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
+check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
@@ -843,35 +843,43 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # from the bare kernel here on purpose (that is the feature), so qemu is not an
 # oracle. Run twice -- once over a real netlink socket (the ack rewrite) and
 # once with the AF_UNIX fallback forced (the substituted socket synthesises its
-# own acks) -- because the guest must not be able to tell the tiers apart. Only
-# the ack line differs between the two; empty=/self=/src=/wrdump=/ready= must
-# match, which is what pins the substitute socket's empty-queue, sockaddr_nl,
-# write-driven-request and poll/select/epoll behavior to the real thing. The
-# fixture reports "skip" lines where the host grants no netlink socket. ----
+# own acks) -- because the guest must not be able to tell the tiers apart. That
+# is the assertion: the two runs must agree line for line except for the one
+# line where they are *supposed* to differ.
+#
+# no_netns is that line, and it is the only one the host gets a say in. A guest
+# that never asked for a namespace must see a real kernel's refusal passed
+# through -- an ack there would be one the emulator invented. But where the
+# host grants no netlink socket at all (Android: SELinux denies it), the
+# substitute IS the only tier, and its ack is its own rather than invented. The
+# harness cannot probe which tier ran -- a guest being unable to tell them
+# apart is the whole design -- so both answers are accepted there and nowhere
+# else in the output. ----
 if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
         tests/fixtures/netns_ack.c 2>/dev/null; then
+    nl_common=$'empty=eagain\nself=own\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
     for tier in real af_unix; do
         if [ "$tier" = af_unix ]; then
             # The substituted socket has no kernel behind it, so it acks every
-            # non-dump request whether or not a namespace was faked -- there is
-            # no real refusal to pass through on a host that denies netlink.
-            expect_nl=$'empty=eagain\nself=own\nno_netns=acked\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
+            # non-dump request whether or not a namespace was faked.
+            want_no_netns="acked"
             got=$(A64_NETLINK_FORCE_BLOCK=1 timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         else
-            # A real socket must keep refusing a guest that never asked for a
-            # namespace: an ack here would be one the emulator invented. The
-            # switch must be *absent*, not empty -- these A64_* switches are
+            # The switch must be *absent*, not empty -- these A64_* switches are
             # presence-tested (getenv), so FOO= would select the fallback.
-            expect_nl=$'empty=eagain\nself=own\nno_netns=passed-through\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
+            want_no_netns="passed-through|acked"
             got=$(env -u A64_NETLINK_FORCE_BLOCK timeout 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         fi
-        if [ "$got" = "$expect_nl" ]; then
+        # Fold the one host-dependent line out, then require an exact match on
+        # everything else.
+        folded=$(printf '%s\n' "$got" | sed -E "s/^no_netns=($want_no_netns)\$/NO_NETNS/")
+        if [ "$folded" = "$nl_common" ]; then
             pass=$((pass+1)); echo "PASS fixture: netns_ack ($tier)"
         else
             fail=$((fail+1)); echo "FAIL fixture: netns_ack ($tier)"
-            diff <(echo "$expect_nl") <(echo "$got") | head -6 | sed 's/^/     /'
+            diff <(echo "$nl_common") <(echo "$folded") | head -6 | sed 's/^/     /'
         fi
     done
     rm -f tests/fixtures/netns_ack.bin

@@ -152,7 +152,7 @@ int main(void) {
     sysinfo(&si);
     long long sum1 = -1, sum2 = -1, btime = -1, prunning = -1;
     double sidle = -1;
-    int ncpu = 0;
+    int ncpu = 0, cpuseq = 1;
     fd = open("/proc/stat", O_RDONLY);
     for (int pass = 0; pass < 2 && fd >= 0; pass++) {
         static char sb[1 << 16];
@@ -170,8 +170,22 @@ int main(void) {
         }
         for (char *q = sb; !pass && q; q = strchr(q + 1, '\n')) {
             if (*q == '\n') q++;
-            /* "cpuN" only: %d after "cpu" would eat the aggregate line */
-            if (!strncmp(q, "cpu", 3) && q[3] >= '0' && q[3] <= '9') ncpu++;
+            /* "cpuN" only: %d after "cpu" would eat the aggregate line.
+             * Checked for self-consistency (present, and numbered 0..N-1, which
+             * is what a delta-reader like top indexes by) rather than against
+             * sysconf(_SC_NPROCESSORS_ONLN): where the guest libc gets THAT
+             * number is its own business, and the two libcs disagree. glibc
+             * counts these very lines, so comparing against it was circular;
+             * Bionic reads /sys, which this throwaway rootfs does not have, so
+             * the comparison failed for a reason that says nothing about the
+             * file under test. */
+            if (!strncmp(q, "cpu", 3) && q[3] >= '0' && q[3] <= '9') {
+                int idx = 0;
+                for (const char *d = q + 3; *d >= '0' && *d <= '9'; d++)
+                    idx = idx * 10 + (*d - '0');
+                if (idx != ncpu) cpuseq = 0;
+                ncpu++;
+            }
             sscanf(q, "btime %lld", &btime);
             sscanf(q, "procs_running %lld", &prunning);
         }
@@ -182,7 +196,7 @@ int main(void) {
     }
     long long boot = (long long)time(NULL) - (long long)si.uptime;
     printf("stat ncpu=%d running1=%d btime_ok=%d idle_agree=%d\n",
-           ncpu == (int)sysconf(_SC_NPROCESSORS_ONLN), prunning == 1,
+           ncpu >= 1 && cpuseq, prunning == 1,
            btime >= boot - 3 && btime <= boot + 3,
            sidle >= 0 && idle >= 0 && sidle - idle < 2.0 && idle - sidle < 2.0);
     printf("stat_rewind=%d\n", sum1 > 0 && sum2 > sum1);
