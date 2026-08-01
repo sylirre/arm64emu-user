@@ -46,11 +46,25 @@ provision_glibc_native() {
     [ -n "$AGCC" ] || return 1
     command -v ldd >/dev/null 2>&1 || return 1
     tmpd=$(mktemp -d) || return 1
-    # Links what the C tests link, so ldd reports exactly the set they need.
+    # Links what the C tests link, so ldd reports exactly the set they need --
+    # and has to *call* it at run time, not merely link it. An earlier probe
+    # said `cos(0.0)`, which the compiler folds to a constant at any -O level,
+    # and `pthread_self()`, which has lived in libc since glibc 2.34: between
+    # them the probe's DT_NEEDED came out as libc.so.6 alone, libm.so.6 was
+    # never copied, and every dynamic test that needed it died at 127 with the
+    # loader unable to find it. Hence the volatile argument (unfoldable) and a
+    # real thread.
     cat > "$tmpd/probe.c" <<'EOF'
 #include <math.h>
 #include <pthread.h>
-int main(void) { return (int)(long)pthread_self() + (int)cos(0.0); }
+volatile double a64_probe_x = 0.5;
+static void *thr(void *p) { return p; }
+int main(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, thr, NULL);
+    pthread_join(t, NULL);
+    return (int)cos(a64_probe_x) + (int)log(a64_probe_x);
+}
 EOF
     if ! "$AGCC" -O0 -o "$tmpd/probe" "$tmpd/probe.c" -lm -lpthread 2>/dev/null; then
         rm -rf "$tmpd"; return 1
@@ -66,9 +80,13 @@ EOF
         mkdir -p "$d"
         cp -aL "$so" "$d/" 2>/dev/null
     done
-    # Not in any DT_NEEDED list, but getpwnam/getgrnam load it at run time.
+    # Not in any DT_NEEDED list the probe can produce: getpwnam/getgrnam load
+    # the first two at run time, and libm is here as well so that a glibc which
+    # folds differently, or a compiler that outsmarts the probe again, cannot
+    # quietly leave it out. Each is copied only if it exists, so a future glibc
+    # that merges libm into libc costs nothing.
     libcdir=$(dirname "$(printf '%s\n' $libs | grep -m1 '/libc\.')" 2>/dev/null)
-    for extra in libnss_files.so.2 libresolv.so.2; do
+    for extra in libnss_files.so.2 libresolv.so.2 libm.so.6; do
         [ -n "$libcdir" ] && [ -e "$libcdir/$extra" ] &&
             cp -aL "$libcdir/$extra" "$GLIBC$libcdir/" 2>/dev/null
     done
