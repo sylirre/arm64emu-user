@@ -74,9 +74,11 @@ arm64chroot [options] <rootfs> <program> [args...]
                           (repeatable); append `:ro` for a read-only mount. Host
                           paths may not contain ':'.
   -E, --env VAR=VAL       Set/override a guest environment variable (repeatable).
-                          The guest does not inherit the host environment; only
-                          TERM and COLORTERM are passed through, and -E overrides
-                          them.
+                          The guest does not inherit the host environment: TERM
+                          and COLORTERM are passed through, PATH defaults to
+                          /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+                          /sbin:/bin and HOME to /root, everything else is
+                          dropped. -E overrides any of them.
   -0, --argv0 ARG0        Override argv[0] for the guest program
   -u, --fake-id[=ID]      Present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)

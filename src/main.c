@@ -34,6 +34,17 @@ struct Machine g_machine;
 
 extern char **environ;
 
+/* Did a -E/--env flag already set the key of `kv` ("KEY=" or "KEY=VALUE")? Such
+ * a key is neither inherited from the host nor given a default -- the flag is
+ * the whole answer for it. */
+static int env_set_by_flag(char **extra, int n, const char *kv) {
+    const char *eq = strchr(kv, '=');
+    size_t kl = eq ? (size_t)(eq - kv) + 1 : strlen(kv);
+    for (int j = 0; j < n; j++)
+        if (!strncmp(extra[j], kv, kl)) return 1;
+    return 0;
+}
+
 /* Terse synopsis for argument errors: one line to stderr, exit 2. The full
  * reference lives in help() below, reachable via -h/--help. */
 static void usage(void) {
@@ -237,9 +248,14 @@ static void help(void) {
         {"-b, --bind SRC:DST[:ro]", "Expose host directory SRC at guest path "
                         "DST (repeatable). Append :ro for a read-only mount. "
                         "Host paths may not contain ':'."},
-        {"-E, --env VAR=VAL", "Set a guest environment variable (repeatable). "
-                        "Variables TERM and COLORTERM are inherited from "
-                        "host by default."},
+        {"-E, --env VAR=VAL", "Set a guest environment variable (repeatable), "
+                        "overriding anything below that would set the same "
+                        "name. The guest environment is otherwise built fresh: "
+                        "TERM and COLORTERM are inherited from the host, PATH "
+                        "defaults to "
+                        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
+                        "/sbin:/bin and HOME to /root, and every other host "
+                        "variable is dropped as naming host locations."},
         {"-0, --argv0 ARG0", "Override argv[0] for the guest program"},
         {"-u, --fake-id[=ID]", "Present a fake user identity. Accepts values "
                         "like uid or uid:gid, default 0:0 (root)."},
@@ -667,27 +683,44 @@ int main(int argc, char **argv)
 
     /* Guest environ: a clean environment. Only the host's terminal-appearance
      * variables (TERM, COLORTERM) are inherited; every other host variable
-     * (PATH, HOME, LD_*, XDG_*, ...) refers to the host, not the guest rootfs.
-     * -E/--env entries come first and win: a host var is inherited only when no
-     * -E entry already sets that key. (Emitting both as duplicates is not
-     * enough -- getenv() would return the -E copy but a shell importing envp
-     * keeps the *last* duplicate, i.e. the host value, defeating the override.)
-     * Callers re-add anything else they need with -E. */
+     * (PATH, HOME, LD_*, XDG_*, ...) names host locations, not guest ones, and
+     * is dropped. What the guest gets instead of the dropped PATH and HOME is
+     * a pair of guest-side defaults (guest_default below), not the host's.
+     * -E/--env entries come first and win: a host var is inherited, and a
+     * default supplied, only when no -E entry already sets that key. (Emitting
+     * both as duplicates is not enough -- getenv() would return the -E copy but
+     * a shell importing envp keeps the *last* duplicate, i.e. the other value,
+     * defeating the override.) Callers re-add anything else they need with -E.
+     *
+     * Dropping PATH without replacing it was not neutral: it left the guest with
+     * no PATH at all, which nothing on a real system ever has. Programs that
+     * search it themselves rather than going through execvp(3) then fail before
+     * they exec anything -- gcc's collect2 looks for `ld` over COMPILER_PATH +
+     * $PATH and dies with "cannot find 'ld'", so compiling in a Debian rootfs
+     * needed an explicit -E PATH=... The values are the ones a login would set
+     * for root: login.defs ENV_SUPATH, and root's home -- which is the identity
+     * --fake-id presents, and the only one whose home directory a rootfs can be
+     * assumed to have. */
     static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
+    static const char *const guest_default[] = {
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+    };
     int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
-    char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + 1));
+    int n_def  = (int)(sizeof guest_default / sizeof *guest_default);
+    char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + n_def + 1));
     if (!genv) { perror("arm64chroot: malloc"); exit(127); }
     int ge = 0;
     for (int k = 0; k < n_extra; k++) genv[ge++] = extra_env[k];
     for (int k = 0; k < n_keep; k++) {
+        if (env_set_by_flag(extra_env, n_extra, host_keep[k])) continue;
         size_t kl = strlen(host_keep[k]);
-        int overridden = 0;
-        for (int j = 0; j < n_extra; j++)
-            if (!strncmp(extra_env[j], host_keep[k], kl)) { overridden = 1; break; }
-        if (overridden) continue;                 /* -E already set this key */
         for (char **e = environ; *e; e++)
             if (!strncmp(*e, host_keep[k], kl)) { genv[ge++] = *e; break; }
     }
+    for (int k = 0; k < n_def; k++)
+        if (!env_set_by_flag(extra_env, n_extra, guest_default[k]))
+            genv[ge++] = (char *)guest_default[k];
     genv[ge] = NULL;
 
     as_init(&m->as);

@@ -119,7 +119,7 @@ After intrusion into design of interpreter or JIT it is highly adviced to run re
 * Use Golang toolchain to build a simple hello-world program.
 * Run a Node.js script (e.g. `npm --version`).
 
-Use `-E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` when running real workload test.
+No `-E` is needed for these: the guest gets PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin and HOME=/root by default. Pass `-E` only to test a different environment.
 
 Acceptance criteria:
 

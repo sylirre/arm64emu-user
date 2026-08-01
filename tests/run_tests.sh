@@ -197,7 +197,8 @@ fi
 
 # ---- guest env inheritance (self-checking; qemu-user inherits the full host
 # env by design, so this cannot be differential). Only TERM/COLORTERM are passed
-# through from the host; -E/--env adds and overrides. ----
+# through from the host, PATH and HOME get guest-side defaults, everything else
+# is dropped; -E/--env adds and overrides any of it. ----
 if [ -x "$ALPINE/bin/busybox" ]; then
     check_env() {   # check_env <label> <expected> <got>
         if [ "$3" = "$2" ]; then pass=$((pass+1)); echo "PASS env: $1"
@@ -217,6 +218,35 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     # -E adds a variable the host never had.
     check_env "-E sets a fresh var" "bar" \
         "$("$EMU" -E A64CH_FOO=bar "$ALPINE" /bin/busybox sh -c 'echo "${A64CH_FOO:-none}"' 2>/dev/null)"
+    # PATH and HOME are given guest-side defaults. A guest with no PATH at all
+    # is not something a real system ever presents, and programs that search it
+    # themselves rather than via execvp(3) fail before they exec: gcc's collect2
+    # looks for `ld` over COMPILER_PATH + $PATH and dies "cannot find 'ld'".
+    check_env "PATH defaults" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        "$("$EMU" "$ALPINE" /bin/busybox sh -c 'echo "${PATH:-none}"' 2>/dev/null)"
+    check_env "HOME defaults" "/root" \
+        "$("$EMU" "$ALPINE" /bin/busybox sh -c 'echo "${HOME:-none}"' 2>/dev/null)"
+    # The default is the guest's, not the host's: a host PATH/HOME still must
+    # not reach the guest, it is replaced rather than passed through.
+    check_env "host PATH not leaked" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        "$(PATH=/hostpath "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "$PATH"' 2>/dev/null)"
+    check_env "host HOME not leaked" "/root" \
+        "$(HOME=/hosthome "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "$HOME"' 2>/dev/null)"
+    # -E wins over a default, and can clear one outright.
+    check_env "-E overrides default PATH" "/mypath" \
+        "$("$EMU" -E PATH=/mypath "$ALPINE" /bin/busybox sh -c 'echo "$PATH"' 2>/dev/null)"
+    check_env "-E overrides default HOME" "/myhome" \
+        "$("$EMU" -E HOME=/myhome "$ALPINE" /bin/busybox sh -c 'echo "$HOME"' 2>/dev/null)"
+    check_env "-E can empty a default" "empty" \
+        "$("$EMU" -E PATH= "$ALPINE" /bin/busybox sh -c '[ -z "$PATH" ] && echo empty || echo "$PATH"' 2>/dev/null)"
+    # No duplicates: a shell importing envp keeps the LAST of a repeated name,
+    # so an override emitted alongside the value it replaces would lose. Done
+    # on HOME, not PATH -- overriding PATH would leave the applets this checks
+    # with unreachable tr/grep (an *unset* PATH still works, since execvp(3)
+    # falls back to confstr(_CS_PATH); a wrong one does not).
+    check_env "no duplicate HOME in envp" "1" \
+        "$("$EMU" -E HOME=/myhome "$ALPINE" /bin/busybox sh -c \
+           'tr "\0" "\n" < /proc/self/environ | grep -c "^HOME="' 2>/dev/null)"
 fi
 
 # ---- --bind mounts (self-checking; qemu has no bind-mount concept). Exercises
