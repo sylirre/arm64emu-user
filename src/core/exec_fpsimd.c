@@ -2208,10 +2208,19 @@ static int recip_sqrt_estimate(int input) {    /* input in [128,512) */
     r = (b + 1) >> 1;
     return r;
 }
+/* The fraction these two take always arrives with its MSB at bit 51 -- f64
+ * passes its 52 bits as they are, f32 shifts by 29, f16 by 42 -- which is where
+ * the architecture's pseudocode reads it (frac<51>) when it normalises a
+ * subnormal input. Testing any higher bit tests a bit no format ever sets, so
+ * the "already normalised" arm never runs and the exponent is adjusted for a
+ * shift that did not happen: every subnormal comes out off by a power of two or
+ * worse. Normal inputs never enter these branches, which is why it stayed
+ * hidden -- and why the estimate instructions look right until something feeds
+ * them a subnormal. */
 static u64 call_recip_estimate(int *exp, int exp_off, u64 frac) {
     u32 scaled, estimate; u64 result_frac; int result_exp;
     if (*exp == 0) {
-        if (bf_extract(frac, 63, 1) == 0) { *exp = -1; frac <<= 2; }
+        if (bf_extract(frac, 51, 1) == 0) { *exp = -1; frac <<= 2; }
         else frac <<= 1;
     }
     scaled = (u32)bf_deposit(1 << 8, 0, 8, bf_extract(frac, 44, 8));
@@ -2226,8 +2235,8 @@ static u64 call_recip_estimate(int *exp, int exp_off, u64 frac) {
 static u64 call_recip_sqrt_estimate(int *exp, int exp_off, u64 frac) {
     int estimate; u32 scaled;
     if (*exp == 0) {
-        while (bf_extract(frac, 62, 1) == 0) { frac <<= 1; *exp -= 1; }
-        frac = bf_extract(frac, 0, 62) << 1;
+        while (bf_extract(frac, 51, 1) == 0) { frac <<= 1; *exp -= 1; }
+        frac = bf_extract(frac, 0, 51) << 1;   /* frac<50:0>:'0' */
     }
     if (*exp & 1) scaled = (u32)bf_deposit(1 << 7, 0, 7, bf_extract(frac, 45, 7));
     else          scaled = (u32)bf_deposit(1 << 8, 0, 8, bf_extract(frac, 44, 8));

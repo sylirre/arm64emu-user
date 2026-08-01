@@ -50,5 +50,27 @@ int main(void) {
     printf("fcmge0  %04x %04x %04x\n",      fcmge(0x3c00), fcmge(0x0000), fcmge(0xc000));
     printf("fcmle0  %04x %04x %04x\n",      fcmle(0x3c00), fcmle(0x0000), fcmle(0xc000));
     printf("fcmlt0  %04x %04x %04x\n",      fcmlt(0x3c00), fcmlt(0x0000), fcmlt(0xc000));
+
+    /* The estimate instructions over *subnormal* inputs, which take a
+     * normalisation path the round numbers above never reach -- and which was
+     * wrong in all three precisions until an AArch64 host ran the JIT beside
+     * the interpreter. The whole f16 subnormal range is only 1023 values, so
+     * sweep it exhaustively rather than sampling; f32/f64 are in fpestimate.c.
+     * 0x0400 is the least normal, included as the control that always
+     * worked. */
+    printf("frecpe_d  %04x %04x %04x %04x %04x\n", frecpe(0x0001), frecpe(0x0002),
+           frecpe(0x0200), frecpe(0x03ff), frecpe(0x0400));
+    printf("frsqrte_d %04x %04x %04x %04x %04x\n", frsqrte(0x0001), frsqrte(0x0002),
+           frsqrte(0x0200), frsqrte(0x03ff), frsqrte(0x0400));
+    printf("frecpx_d  %04x %04x %04x\n", frecpx(0x0001), frecpx(0x03ff), frecpx(0x0400));
+    unsigned long long h = 1469598103934665603ULL;
+    for (unsigned v = 0; v <= 0x3ff; v++) {
+        h = (h ^ frecpe((unsigned short)v))  * 1099511628211ULL;
+        h = (h ^ frsqrte((unsigned short)v)) * 1099511628211ULL;
+        h = (h ^ frecpx((unsigned short)v))  * 1099511628211ULL;
+        h = (h ^ frecpe((unsigned short)(v | 0x8000))) * 1099511628211ULL;
+        h = (h ^ frecpx((unsigned short)(v | 0x8000))) * 1099511628211ULL;
+    }
+    printf("est_sweep %016llx\n", h);
     return 0;
 }

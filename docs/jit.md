@@ -276,6 +276,17 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
   `qemu-aarch64` from an x86 host exercises the same emitter, and qemu executes
   what it emits faithfully, but the ISA it is emitting *for* is then also
   qemu's.
+- That run has a second use worth stating outright: **on an AArch64 host the
+  JIT is an oracle for the interpreter.** Wherever the a64 backend replays a
+  native instruction rather than calling a helper — the whole FEAT_FP16 surface,
+  most of the FP arithmetic — a `run_consist.sh` mismatch is the silicon
+  disagreeing with `exec_fpsimd.c`, and the interpreter is as likely to be the
+  wrong side as the JIT. It has been: the subnormal `FRECPE`/`FRSQRTE`
+  normalisation was wrong in all three precisions for as long as it had existed,
+  reachable from x86 only through qemu and never exercised there because the
+  tests reached for round numbers. `A64_JIT_NOFP16=1` splits the two halves
+  apart — if it makes the mismatch go away, the disagreement is in the FP16
+  path, whichever side owns it.
 
 Debug/bisection knobs (all off by default):
 
