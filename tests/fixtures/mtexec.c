@@ -107,17 +107,36 @@ static void *masked_poll(void *a) {
  * and must not find this thread still around. */
 static void *exec_from_thread(void *a) {
     char **argv = a;
-    exec_child(argv[0], self_tid());
+    char tbuf[16];
+    snprintf(tbuf, sizeof tbuf, "%d", self_tid());
+    /* The extra argument asks the new image to report its inherited mask: it is
+     * landing on a thread parked in sigsuspend, which holds a temporary mask
+     * that no delivery frame is going to put back. */
+    char *av[] = { argv[0], (char *)"child", tbuf, (char *)"mask", NULL };
+    execve(argv[0], av, environ);
     printf("secondary_exec_failed=%s\n", strerror(errno));
     fflush(stdout);
     _exit(9);
 }
 
-/* Child role: report that the new image is live, on the right thread, and that
- * the sibling named in argv[2] did not survive the exec. */
+/* Child role: report that the new image is live, on the right thread, that the
+ * sibling named in argv[2] did not survive the exec, and -- when argv[3] asks --
+ * that the signal mask it inherited is the one the guest actually chose. */
 static int child_role(int argc, char **argv) {
     printf("reached_child tid_is_pid=%d\n", self_tid() == (int)getpid());
     if (argc > 2) printf("sibling_gone=%d\n", !tid_live(atoi(argv[2])));
+    if (argc > 3) {
+        /* execve preserves the mask, so this must be what the program started
+         * with -- empty -- and not the temporary one the thread being landed on
+         * had installed for the duration of one sigsuspend. Spelled out rather
+         * than sigisemptyset(), which is not in every libc. */
+        sigset_t now;
+        sigemptyset(&now);
+        sigprocmask(SIG_BLOCK, NULL, &now);
+        int clean = 1;
+        for (int s = 1; s < 65; s++) if (sigismember(&now, s) == 1) clean = 0;
+        printf("mask_clean=%d\n", clean);
+    }
     fflush(stdout);
     return 0;
 }
@@ -202,7 +221,19 @@ static void case_secondary(char **argv) {
     if (read(tidfd[0], &tid, sizeof tid) != sizeof tid) { printf("tid=fail\n"); return; }
     pthread_t e;
     pthread_create(&e, NULL, exec_from_thread, argv);
-    for (;;) pause();     /* the main thread waits here to be handed the image */
+    /* The main thread waits here to be handed the image. Spelled sigsuspend
+     * rather than pause() because pause() is not one syscall: aarch64 has no
+     * SYS_pause, so glibc issues ppoll and Bionic issues rt_sigsuspend, and the
+     * two reach de_thread by entirely different routes -- the first blocks in a
+     * host syscall the kick interrupts, the second waits in the emulator. This
+     * test used to say pause() and so tested whichever route the build host's
+     * libc happened to pick, which is how the second one stayed broken.
+     *
+     * Blocking everything is both the ordinary way to reach this call and what
+     * makes a leaked temporary mask visible to the child. */
+    sigset_t full;
+    sigfillset(&full);
+    for (;;) sigsuspend(&full);
 }
 
 int main(int argc, char **argv) {

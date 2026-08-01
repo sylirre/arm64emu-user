@@ -105,6 +105,30 @@ SYSDEF(rt_sigsuspend) {
      * the check-to-sleep window. On return the run loop delivers to the
      * guest handler. */
     while (!sig_pending_deliverable(c->m)) {
+        /* Called out to a run-loop safepoint (execve's de_thread): stop waiting
+         * and go there. Waiting only for a *guest-deliverable* signal is not
+         * enough -- the call-out is carried by a signal the guest must never
+         * see, so it interrupts the nap below and changes nothing, and a thread
+         * parked here is unreachable however long de_thread waits. It then
+         * times out and refuses an execve that should have worked.
+         *
+         * The temporary mask goes back first. Everywhere else it is a delivery
+         * frame that restores it, and here no handler is going to run; leaving
+         * it installed matters more than usual, because the thread that parks
+         * in this call is typically the main one, and the main thread is
+         * exactly where de_thread lands the new image. It would start life
+         * under a mask its predecessor meant to hold for one sleep.
+         *
+         * That the guest sees EINTR without a signal is the same bargain the
+         * pwait trio strikes (pwait_host_mask, sys_file.c): a wait that ends
+         * early beats a thread group that cannot be dismantled. Callers of this
+         * syscall loop on it by construction -- it has no other return. */
+        if (guest_stop_pending(c->m)) {
+            g_tls.sigmask = g_tls.saved_sigmask;
+            g_tls.have_saved_sigmask = 0;
+            sig_sync_host_mask(c->m);
+            return (u64)(s64)-EINTR;
+        }
         struct timespec ts = { 0, 20 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }

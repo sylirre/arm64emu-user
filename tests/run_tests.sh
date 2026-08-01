@@ -753,11 +753,15 @@ fi
 # address space down while a sibling still walks it killed the *emulator* with
 # a SIGSEGV. The joined-threads case is the other direction -- already-gone
 # threads must cost nothing -- and is a race the fixture's loop is sized to
-# catch (one run in ten before the thread-exit ordering was fixed). ----
+# catch (one run in ten before the thread-exit ordering was fixed). The
+# secondary case additionally parks the receiving thread in sigsuspend and has
+# the new image report its inherited mask: that wait is served inside the
+# emulator rather than by a host syscall, so the kick alone does not end it, and
+# the temporary mask it holds has no delivery frame to put it back. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mtexec.bin \
             tests/fixtures/mtexec.c $A64_TESTLIBS 2>/dev/null; then
-        expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
+        expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nmask_clean=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
         got=$(timeout 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
         else

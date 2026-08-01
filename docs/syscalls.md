@@ -732,10 +732,13 @@ run-loop safepoint, and two things get a thread there:
   guest-directed signal of that number) and does nothing but interrupt the
   syscall. Threads are re-kicked every 10 ms while the rendezvous waits, because
   a thread can enter a *new* blocking syscall after consuming the previous kick.
-  The emulator's own blocking loops — `wait4`/`waitid`, `rt_sigtimedwait`,
-  `signalfd` reads, parked SysV IPC waiters — poll `guest_stop_pending` for the
-  same reason: an interrupted host call there is retried, not returned, so
-  without the check the thread would go straight back to sleep.
+  The emulator's own blocking loops — `wait4`/`waitid`, `rt_sigsuspend`,
+  `rt_sigtimedwait`, `signalfd` reads, parked SysV IPC waiters — poll
+  `guest_stop_pending` for the same reason: an interrupted host call there is
+  retried, not returned, so without the check the thread would go straight back
+  to sleep. The kick can only ever *interrupt* something; it cannot make a wait
+  whose exit condition is "a signal the guest can see" give up, because the kick
+  is precisely the signal the guest must never see.
 
 **The new image lands on the main thread**, whichever guest thread asked for it.
 Guest tid == host tid == pid is relied on throughout (ptrace links,
@@ -770,11 +773,17 @@ where `de_thread` runs only once the binary is known to be loadable.
 
 Reaching a safepoint takes microseconds, so the timeout expires only for a
 thread that cannot be reached at all — one in an uninterruptible host operation,
-or parked at a ptrace stop its tracer never resumes. One case that *would* have
-hit it is handled instead: a guest blocking every signal across
+or parked at a ptrace stop its tracer never resumes. Two cases that *would* have
+hit it are handled instead. A guest blocking every signal across
 `ppoll`/`pselect6`/`epoll_pwait` used to block the kick too, so
 `pwait_host_mask` (`sys_file.c`) holds the reserved control signal out of the
-mask those calls install.
+mask those calls install. And `rt_sigsuspend` waits *inside* the emulator rather
+than in a host call, so the kick had nothing to interrupt that mattered: it
+returns early on `guest_stop_pending`, putting its temporary mask back on the
+way out, since no delivery frame is going to. That one is easy to miss from a
+glibc host — `pause()` is not a single syscall, as aarch64 has no `SYS_pause`,
+so glibc issues `ppoll` and reaches the safepoint by the first route while
+Bionic issues `rt_sigsuspend` and reaches it by the second.
 
 **Nothing else is left running when the new program starts.** A kernel's
 `de_thread` has every other thread *gone* first, and a guest can tell the
