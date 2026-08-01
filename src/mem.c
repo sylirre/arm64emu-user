@@ -514,6 +514,25 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     return 0;
 }
 
+/* Bytes of guest address space currently mapped -- what RLIMIT_AS is measured
+ * against, and what /proc/<pid>/status would call VmSize.
+ *
+ * Summed from the region list rather than carried in a counter on purpose. The
+ * list is the only record that is definitionally right, and the places that
+ * change how much of it is covered are not just insert and delete: region_punch
+ * also trims `start`/`end` in place, and region_split_at rewrites a pair without
+ * changing the total. A counter would need every one of those to agree forever,
+ * and a drifted one is silent -- it either refuses mappings a guest should get
+ * or stops enforcing the limit at all. This walk runs on mmap/mremap/brk only,
+ * never on a fault or an access, and nregions is small. Make it a counter if a
+ * profile ever says so, not before. */
+u64 as_mapped_bytes(AddrSpace *as) {
+    u64 total = 0;
+    for (int i = 0; i < as->nregions; i++)
+        total += as->regions[i].end - as->regions[i].start;
+    return total;
+}
+
 u64 as_find_free_impl(AddrSpace *as, u64 len) {
     len = (len + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK;
     u64 base = as->mmap_next;

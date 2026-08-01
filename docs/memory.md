@@ -99,6 +99,39 @@ waits for `as_destroy`. Without the drain a single-threaded map/unmap loop never
 returned anything: 1.25 GB churned through a 512 MB limit died two-thirds of the
 way in, where the same loop costs qemu 7 MB.
 
+### `RLIMIT_AS` is the guest's, measured against the guest's address space
+
+That 512 MB limit is enforced **here**, not by the host. `RLIMIT_AS`,
+`RLIMIT_DATA` and `RLIMIT_STACK` are held per-process in `Machine.rlim[]`
+(seeded from the host at startup, copied by `fork`, preserved across `execve`)
+and never handed to `setrlimit`, because the host process holding the guest's
+address space is the **emulator**: its JIT code cache, its software page tables
+and its `malloc` all live in the space `RLIMIT_AS` bounds. Passing the guest's
+number through therefore caps the emulator, and the whole process dies where the
+guest expected one `mmap` to fail.
+
+Bionic makes that unmissable rather than merely theoretical: an Android process
+starts about **10 GB** into its address space before `main` runs — a 2 GB CFI
+shadow plus scudo's `PROT_NONE` primary reserves, which cost no memory but do
+count — so a guest `ulimit -v` of a few hundred MB is already an order of
+magnitude *under* the C library's own floor. (qemu-user reached the same
+conclusion about the same three limits and makes `setrlimit` of them a silent
+no-op; it still answers `getrlimit` from the host, so a guest there sees its own
+call succeed and read back `unlimited`. Enforcing them properly is what keeps
+the churn test above meaningful.)
+
+`mmap`, `mremap` and `brk` check a growth against `as_mapped_bytes()`, which
+sums the region list. It is summed rather than carried in a counter on purpose:
+the list is the only definitionally correct record, and coverage changes in more
+places than insert and delete — `region_punch` trims `start`/`end` in place and
+`region_split_at` rewrites a pair without changing the total. A drifted counter
+is silent, and wrong in both directions. The walk runs on those three syscalls
+only, never on a fault or an access.
+
+`/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
+`sys_procfs.c`); passing the host file through would have shown a guest a "Max
+address space" nothing was enforcing while hiding the one that was.
+
 A file mapping may extend past end-of-file, and touching a page wholly beyond it
 is a **bus error**. Those pages are deliberately left out of the page table, so
 the access takes the ordinary translation-fault path; `raise_dabort`

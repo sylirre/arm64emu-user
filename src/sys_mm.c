@@ -42,6 +42,20 @@ static u32 prot_g2pte(int prot) {
  * guest_* helpers re-taking it is fine. munmap/mprotect/madvise are already
  * a single locked call. */
 
+/* Would growing the guest's mapped total by `add` bytes cross its RLIMIT_AS?
+ *
+ * The limit is the guest's own (struct Machine rlim[]) and is measured against
+ * the guest's own address space, because the host process holding that space is
+ * the emulator and its size has nothing to do with the guest's -- see
+ * sys_misc.c. Written to subtract rather than add so a guest naming a huge
+ * length cannot overflow its way past the check. */
+static int as_fits(struct Machine *m, u64 add) {
+    u64 cap = m->rlim[G_RLIMIT_AS].rlim_cur;
+    if (cap == G_RLIM_INFINITY) return 1;
+    if (add > cap) return 0;
+    return as_mapped_bytes(&m->as) <= cap - add;
+}
+
 static u64 brk_locked(CPU *c, u64 a0) {
     AddrSpace *as = &c->m->as;
     u64 newbrk = a0;
@@ -56,6 +70,13 @@ static u64 brk_locked(CPU *c, u64 a0) {
         /* refuse if the range collides with an existing mapping */
         for (u64 va = old_end; va < new_end; va += GUEST_PAGE_SIZE)
             if (as_find_region(as, va)) return as->brk;
+        /* ...or if it would cross RLIMIT_AS, or take the heap past
+         * RLIMIT_DATA. brk(2) reports a refusal as the unchanged break rather
+         * than an errno, which is what malloc reads to fall back on mmap. */
+        u64 dcap = c->m->rlim[G_RLIMIT_DATA].rlim_cur;
+        if (dcap != G_RLIM_INFINITY && new_end - as->brk_start > dcap)
+            return as->brk;
+        if (!as_fits(c->m, new_end - old_end)) return as->brk;
         if (guest_map_anon(as, old_end, new_end - old_end, PTE_R | PTE_W) < 0)
             return as->brk;
     } else if (new_end < old_end) {
@@ -81,6 +102,14 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     if (!len) return (u64)(s64)-EINVAL;
     len = PG_UP(len);
     u32 pte = prot_g2pte(prot);
+
+    /* RLIMIT_AS. A MAP_FIXED over ground the guest already owns replaces it
+     * rather than adding to the total, so this is deliberately checked against
+     * the whole length only for the growing case; the fixed case is let through
+     * and settles at whatever the region list says afterwards. Erring that way
+     * keeps a guest from being refused a mapping it is merely relocating. */
+    if (!(flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) && !as_fits(c->m, len))
+        return (u64)(s64)-ENOMEM;
 
     if (flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) {
         if (addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
@@ -227,6 +256,11 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * stray mapping below the stack. */
     for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
         if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
+    /* Every path below that grows the mapping -- in place, or by allocating
+     * elsewhere and releasing the old -- settles new_len - old_len bytes above
+     * where it started, so one check up here covers them all. */
+    if (new_len > old_len && !as_fits(c->m, new_len - old_len))
+        return (u64)(s64)-ENOMEM;
     if (!(flags & G_MREMAP_FIXED)) {
         /* Staying put: shrink in place, or grow in place when allowed. */
         if (new_len <= old_len) {

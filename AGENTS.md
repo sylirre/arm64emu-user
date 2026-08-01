@@ -63,7 +63,7 @@ src/
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)
   sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style): AF_UNIX fallback when the host denies netlink (probed incl. a write, per-message-type LSM policies), covering read/write and their vector forms as well as the socket calls, replies per-socket and delivered a datagram at a time (NLMSG_DONE on its own), with readiness carried by the self-connected stand-in so poll/select/epoll work, plus rtnetlink-refusal-to-ack rewriting for a guest whose CLONE_NEWNET was faked
-  sys_misc.c                         Misc syscalls: randomness, rlimits, sysinfo, futex basics
+  sys_misc.c                         Misc syscalls: randomness, rlimits (AS/DATA/STACK held per-process and enforced against the guest's own address space, never the host's -- capping the host caps the emulator), sysinfo, futex basics
   sys_procfs.c                       Synthesized guest /proc (maps, cmdline, mounts, stat, writable uid_map/gid_map/setgroups of a faked user namespace -- its own or, the usual arrangement, a child's, per-process status rebuilt line by line so TracerPid/Seccomp/Sig*/Cap* describe the guest and not the emulator, ...)
   sys_ptrace.c                       ptrace(2) syscall shim (arm64 ABI decode onto the ptracetab.c control channel)
   sys_seccomp.c                      seccomp(2): classic-BPF evaluator over guest seccomp_data, run by the dispatcher for every guest syscall (a host filter would see the emulator's own syscalls instead)

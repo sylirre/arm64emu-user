@@ -98,6 +98,9 @@ void seccomp_publish(struct Machine *m);
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
 
+/* sys_misc.c: seed the guest's resource limits from the host's, at startup. */
+void rlim_init(struct Machine *m);
+
 /* sys_ipc.c: System V shm attachment bookkeeping across fork/exec/exit.
  * shm_fork_reattach re-counts every attachment the child inherited (nattch++);
  * shm_detach_all drops them all and clears the list (execve/exit). */

@@ -399,6 +399,29 @@ typedef struct { s64 tv_sec; s64 tv_nsec; } GTimespec;
 typedef struct { s64 tv_sec; s64 tv_usec; } GTimeval;
 typedef struct { u64 rlim_cur; u64 rlim_max; } GRlimit;
 
+/* getrlimit/setrlimit/prlimit64 resource numbers (asm-generic: arm64 and every
+ * host this builds on agree, which is why the guest number is handed to the
+ * host call unchanged where a limit is passed through). RLIM_NLIMITS bounds the
+ * per-process table in struct Machine. */
+#define G_RLIMIT_CPU        0
+#define G_RLIMIT_FSIZE      1
+#define G_RLIMIT_DATA       2
+#define G_RLIMIT_STACK      3
+#define G_RLIMIT_CORE       4
+#define G_RLIMIT_RSS        5
+#define G_RLIMIT_NPROC      6
+#define G_RLIMIT_NOFILE     7
+#define G_RLIMIT_MEMLOCK    8
+#define G_RLIMIT_AS         9
+#define G_RLIMIT_LOCKS      10
+#define G_RLIMIT_SIGPENDING 11
+#define G_RLIMIT_MSGQUEUE   12
+#define G_RLIMIT_NICE       13
+#define G_RLIMIT_RTPRIO     14
+#define G_RLIMIT_RTTIME     15
+#define G_RLIM_NLIMITS      16
+#define G_RLIM_INFINITY     (~0ULL)
+
 /* struct sigevent (LP64, 64 bytes total = SIGEV_MAX_SIZE): the sigval union,
  * signo, notify, then the notify union whose first word is the target tid for
  * SIGEV_THREAD_ID (the SIGEV_THREAD function/attribute pointers never reach

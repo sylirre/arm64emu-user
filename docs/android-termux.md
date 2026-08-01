@@ -60,6 +60,19 @@ unfiltered:
   `loopback_setup()` depends on it. The read-only `SIOCGIF*` interface-query
   ioctls (`ifconfig`/net-tools) are likewise answered in-process from the host
   interface table, so they work even where the socket ioctls return EACCES.
+  `SIOCGIFHWADDR` is denied here even to the emulator (as is `/sys/class/net`),
+  so loopback's `ARPHRD_LOOPBACK` is filled in from the constant every kernel
+  reports and any other interface gets the refusal, never a zeroed answer.
+* **Resource limits.** A guest `ulimit -v` used to kill the emulator outright.
+  `RLIMIT_AS`/`DATA`/`STACK` bound an address space, and the host process
+  holding the guest's is the emulator — but here the gap is not merely
+  unhelpful, it is unsurvivable: a Bionic process starts about **10 GB** into
+  its address space before `main` runs (a 2 GB CFI shadow plus scudo's
+  `PROT_NONE` primary reserves, which cost no memory but do count against
+  `RLIMIT_AS`), so any limit a guest would plausibly set is already far below
+  the C library's own floor. Those three are kept per-process and enforced
+  against the guest's own address space instead; see
+  [memory.md](memory.md#rlimit_as-is-the-guests-measured-against-the-guests-address-space).
 * **Sandbox helpers**: `bubblewrap` and friends run unmodified. Nothing they
   need is privileged here — namespace creation is faked, `mount -t tmpfs` is a
   bind of a fresh host directory (under `$TMPDIR` where Android has no

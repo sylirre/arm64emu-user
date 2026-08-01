@@ -202,8 +202,14 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     size_t strtab = strlen(canon) + 1;
     for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
-    /* The kernel caps argv+envp at RLIMIT_STACK/4 (E2BIG past it). */
-    if (strtab > STACK_SIZE / 4) { free(argvp); free(envpp); return -E2BIG; }
+    /* The kernel caps argv+envp at RLIMIT_STACK/4 (E2BIG past it). The guest's
+     * own limit is what a kernel would measure, but the stack this actually
+     * builds is STACK_SIZE whatever the guest says, so the smaller of the two
+     * governs: a guest that lowered the limit gets the kernel's E2BIG, and one
+     * that raised it (or has none) still cannot outgrow the real stack. */
+    u64 scap = m->rlim[G_RLIMIT_STACK].rlim_cur;
+    if (scap == G_RLIM_INFINITY || scap > STACK_SIZE) scap = STACK_SIZE;
+    if (strtab > scap / 4) { free(argvp); free(envpp); return -E2BIG; }
     u64 sp = STACK_TOP - strtab;
     u64 str = sp;
     for (int i = 0; i < argc; i++) {

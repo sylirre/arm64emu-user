@@ -173,6 +173,8 @@ void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
  * the kernel would refuse (mem.c). */
 void as_file_resized(AddrSpace *as, u64 dev, u64 ino, u64 newsize);
 int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
+/* Bytes of guest address space currently mapped (what RLIMIT_AS bounds). */
+u64  as_mapped_bytes(AddrSpace *as);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
 /* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.

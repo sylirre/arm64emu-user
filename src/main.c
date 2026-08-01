@@ -25,6 +25,7 @@
 #include "jit.h"
 #include "guest_abi.h"
 #include "ptrace.h"
+#include "sys.h"
 
 extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
 
@@ -723,6 +724,8 @@ int main(int argc, char **argv)
             genv[ge++] = (char *)guest_default[k];
     genv[ge] = NULL;
 
+    rlim_init(m);     /* seed the guest's resource limits from the host's,
+                       * before anything can consult or change them */
     as_init(&m->as);
     as_bus_init();   /* host SIGBUS on a file truncated from outside this
                       * address space becomes the guest's own abort */

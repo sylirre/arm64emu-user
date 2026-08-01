@@ -59,7 +59,7 @@ enum {
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
-    PF_OVERFLOWID, PF_STATUS,
+    PF_OVERFLOWID, PF_STATUS, PF_LIMITS,
 };
 
 /* put_mounts format selector. */
@@ -321,6 +321,49 @@ static int overflowid_blocked(int is_gid) {
  * reach, and the readable one passes through when it is not. */
 static void put_overflowid(int fd) {
     dprintf(fd, "65534\n");
+}
+
+/* /proc/<pid>/limits from the guest's own table rather than the host's.
+ *
+ * The host file describes the emulator, and for the three limits that bound an
+ * address space the emulator's are deliberately not the guest's (see struct
+ * Machine rlim[]) -- so passing it through would have shown a guest a "Max
+ * address space" nothing was enforcing and hidden the one that was. Column
+ * layout and wording are the kernel's (fs/proc/base.c), because this is a file
+ * people grep. */
+static void put_limits(int fd, struct Machine *m) {
+    static const struct { const char *name, *unit; } ln[G_RLIM_NLIMITS] = {
+        [G_RLIMIT_CPU]        = { "Max cpu time",           "seconds"   },
+        [G_RLIMIT_FSIZE]      = { "Max file size",          "bytes"     },
+        [G_RLIMIT_DATA]       = { "Max data size",          "bytes"     },
+        [G_RLIMIT_STACK]      = { "Max stack size",         "bytes"     },
+        [G_RLIMIT_CORE]       = { "Max core file size",     "bytes"     },
+        [G_RLIMIT_RSS]        = { "Max resident set",       "bytes"     },
+        [G_RLIMIT_NPROC]      = { "Max processes",          "processes" },
+        [G_RLIMIT_NOFILE]     = { "Max open files",         "files"     },
+        [G_RLIMIT_MEMLOCK]    = { "Max locked memory",      "bytes"     },
+        [G_RLIMIT_AS]         = { "Max address space",      "bytes"     },
+        [G_RLIMIT_LOCKS]      = { "Max file locks",         "locks"     },
+        [G_RLIMIT_SIGPENDING] = { "Max pending signals",    "signals"   },
+        [G_RLIMIT_MSGQUEUE]   = { "Max msgqueue size",      "bytes"     },
+        [G_RLIMIT_NICE]       = { "Max nice priority",      NULL        },
+        [G_RLIMIT_RTPRIO]     = { "Max realtime priority",  NULL        },
+        [G_RLIMIT_RTTIME]     = { "Max realtime timeout",   "us"        },
+    };
+    dprintf(fd, "%-25s %-20s %-20s %-10s\n",
+            "Limit", "Soft Limit", "Hard Limit", "Units");
+    for (int i = 0; i < G_RLIM_NLIMITS; i++) {
+        char cur[24], max[24];
+        if (m->rlim[i].rlim_cur == G_RLIM_INFINITY) strcpy(cur, "unlimited");
+        else snprintf(cur, sizeof cur, "%llu",
+                      (unsigned long long)m->rlim[i].rlim_cur);
+        if (m->rlim[i].rlim_max == G_RLIM_INFINITY) strcpy(max, "unlimited");
+        else snprintf(max, sizeof max, "%llu",
+                      (unsigned long long)m->rlim[i].rlim_max);
+        dprintf(fd, "%-25s %-20s %-20s ", ln[i].name, cur, max);
+        if (ln[i].unit) dprintf(fd, "%-10s\n", ln[i].unit);
+        else            dprintf(fd, "\n");
+    }
 }
 
 static u64 stat_ncpu(void) {
@@ -683,6 +726,7 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     case PF_LOADAVG: put_loadavg(fd);   break;
     case PF_UPTIME:  put_uptime(fd, m); break;
     case PF_STAT:    put_stat(fd, m);   break;
+    case PF_LIMITS:  put_limits(fd, m); break;   /* setrlimit since the open */
     /* Re-read after a write must show what was written -- by us or, for a
      * child's namespace, by whoever set it up. */
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
@@ -1100,6 +1144,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         else if (!strcmp(tail, "mounts"))     kind = PF_MOUNTS;
         else if (!strcmp(tail, "mountinfo"))  kind = PF_MOUNTINFO;
         else if (!strcmp(tail, "mountstats")) kind = PF_MOUNTSTATS;
+        /* Only this process's: another guest's limits live in its own Machine,
+         * which is not shared, and its host file describes its emulator. */
+        else if (!strcmp(tail, "limits"))     kind = PF_LIMITS;
         /* Writable, and only while the guest believes it has a user namespace
          * of its own -- otherwise the host files are the truthful answer. */
         else if (m->fake_userns && !strcmp(tail, "uid_map"))   kind = PF_UIDMAP;
@@ -1149,13 +1196,15 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_VERSION:    put_version(fd); break;
     case PF_STAT:       put_stat(fd, m); break;
     case PF_OVERFLOWID: put_overflowid(fd); break;
+    case PF_LIMITS:     put_limits(fd, m); break;
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
                         put_idmap(fd, m, kind, 0); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
-    if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT || writable)
+    if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT ||
+        kind == PF_LIMITS || writable)
         pf_track(m, fd, kind, 0, 1);   /* time-varying, or written through */
     *ret = fd;
     return 1;

@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <signal.h>
 #include "cpu.h"
+#include "guest_abi.h"
 #include "mmu.h"
 #include "thread.h"
 
@@ -150,6 +151,29 @@ struct Machine {
     u32 auxv_len;
     u64 entry, interp_base, phdr_va;
     int phnum;
+
+    /* The guest's resource limits, seeded from the host's at startup, copied by
+     * fork and preserved across execve, exactly as a kernel's are.
+     *
+     * They are kept here rather than only on the host because the ones that
+     * bound an address space cannot be passed through at all: the guest's
+     * address space is a software page table, the host process holding it is
+     * the *emulator*, and RLIMIT_AS applies to that. A guest asking for a
+     * modest cap therefore caps the emulator's own mappings -- its JIT code
+     * cache, its page tables, its malloc -- and the whole process dies where
+     * the guest expected one mmap to fail. Bionic makes that unmissable: an
+     * Android process starts ~10 GB into its address space before main runs
+     * (a 2 GB CFI shadow plus scudo's PROT_NONE reserves, which cost no memory
+     * but do count), so a guest `ulimit -v` of a few hundred MB is already an
+     * order of magnitude under the C library's own floor.
+     *
+     * So RLIMIT_AS, RLIMIT_DATA and RLIMIT_STACK are answered and enforced from
+     * this table and never reach the host (rlim_virtual, sys_misc.c). The rest
+     * are stored here too -- so the guest reads back one coherent set -- and
+     * also applied to the host, where the host is the thing that enforces them:
+     * RLIMIT_NOFILE above all, since guest fd == host fd and fd allocation
+     * consults the host's (sys_proc.c). */
+    GRlimit rlim[G_RLIM_NLIMITS];
 
     /* Guest signal state (process-wide per POSIX; signal.c). The blocked
      * set is per-thread and lives in g_tls (thread.h). */

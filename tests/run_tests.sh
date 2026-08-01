@@ -694,6 +694,32 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- the resource limits that bound an address space (RLIMIT_AS/DATA/STACK).
+# Self-checking, and it has to be: qemu-user makes setrlimit of these three a
+# silent no-op -- it reached the same conclusion, that handing them to the host
+# caps the emulator -- but still answers getrlimit from the host, so a guest
+# there sees its own setrlimit succeed and read back unlimited. There is no
+# oracle answer to diff; a kernel's behaviour is the specification. Checks that
+# the guest's view is coherent across getrlimit/prlimit64//proc/self/limits,
+# that the cap is enforced against the *guest's* address space, that going over
+# it is an ENOMEM rather than a dead emulator, and that the table survives fork
+# and execve. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/rlimits.bin \
+            tests/fixtures/rlimits.c 2>/dev/null; then
+        got=$(timeout 60 "$EMU" / tests/fixtures/rlimits.bin 2>/dev/null)
+        expect=$'set=1\nreadback=1\nprlimit=1\nprocfs=1\nunder=1\nover=1\nreusable=1\nraise_hard=1\nfork_kept=1\nexec_kept=1\nexec_limits=1\nexec_enforced=1\ndone'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: rlimits"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: rlimits"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/rlimits.bin
+    else
+        skip_build "fixtures/rlimits"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

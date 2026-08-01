@@ -22,42 +22,87 @@ SYSDEF(getrandom) {
     return (u64)n;
 }
 
-static u64 rlim_out(CPU *c, u64 va, const struct rlimit *h) {
-    GRlimit g = {
-        h->rlim_cur == RLIM_INFINITY ? ~0ULL : (u64)h->rlim_cur,
-        h->rlim_max == RLIM_INFINITY ? ~0ULL : (u64)h->rlim_max,
-    };
-    return copy_to_guest(c, va, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+/* Limits that bound an address space are answered and enforced from the guest's
+ * own table and never handed to the host: the host process is the emulator, and
+ * capping *it* to what the guest asked for kills the emulator where the guest
+ * expected one mmap to fail (see struct Machine's rlim[] for the full story and
+ * the Bionic numbers that make it unmissable). Everything else is stored in the
+ * table too -- so the guest reads back one coherent set -- and also applied to
+ * the host, which is what actually enforces those. */
+static int rlim_virtual(int res) {
+    return res == G_RLIMIT_AS || res == G_RLIMIT_DATA || res == G_RLIMIT_STACK;
+}
+
+/* Seed the guest's table from the host's, once, at startup. Every later change
+ * comes through set/prlimit, and fork copies the table with the rest of the
+ * Machine while execve leaves it alone -- which is what a kernel does. */
+void rlim_init(struct Machine *m) {
+    for (int r = 0; r < G_RLIM_NLIMITS; r++) {
+        struct rlimit h;
+        if (getrlimit(r, &h) == 0) {
+            m->rlim[r].rlim_cur = h.rlim_cur == RLIM_INFINITY
+                                      ? G_RLIM_INFINITY : (u64)h.rlim_cur;
+            m->rlim[r].rlim_max = h.rlim_max == RLIM_INFINITY
+                                      ? G_RLIM_INFINITY : (u64)h.rlim_max;
+        } else {
+            m->rlim[r].rlim_cur = m->rlim[r].rlim_max = G_RLIM_INFINITY;
+        }
+    }
+}
+
+/* Apply one guest limit, table first and host after where the host is the one
+ * enforcing it. Returns 0 or -errno; the table is left untouched on refusal. */
+static s64 rlim_set(struct Machine *m, int res, const GRlimit *g) {
+    if (res < 0 || res >= G_RLIM_NLIMITS) return -EINVAL;
+    if (g->rlim_cur > g->rlim_max) return -EINVAL;
+    /* Only privilege can raise a hard limit, and the guest's fake root is not
+     * privilege the host would honour -- so the ceiling is the one it has. */
+    if (g->rlim_max > m->rlim[res].rlim_max) return -EPERM;
+    if (!rlim_virtual(res)) {
+        struct rlimit h = {
+            g->rlim_cur == G_RLIM_INFINITY ? RLIM_INFINITY : (rlim_t)g->rlim_cur,
+            g->rlim_max == G_RLIM_INFINITY ? RLIM_INFINITY : (rlim_t)g->rlim_max,
+        };
+        if (setrlimit(res, &h) < 0) return -errno;
+    }
+    m->rlim[res] = *g;
+    return 0;
 }
 
 SYSDEF(getrlimit) {
-    struct rlimit h;
-    if (getrlimit((int)a0, &h) < 0) return host_err();
-    return rlim_out(c, a1, &h);
+    int res = (int)a0;
+    if (res < 0 || res >= G_RLIM_NLIMITS) return (u64)(s64)-EINVAL;
+    return copy_to_guest(c, a1, &c->m->rlim[res], sizeof(GRlimit)) < 0
+               ? (u64)(s64)-EFAULT : 0;
 }
 
 SYSDEF(setrlimit) {
     GRlimit g;
+    if ((int)a0 < 0 || (int)a0 >= G_RLIM_NLIMITS) return (u64)(s64)-EINVAL;
     if (copy_from_guest(c, &g, a1, sizeof g) < 0) return (u64)(s64)-EFAULT;
-    struct rlimit h = {
-        g.rlim_cur == ~0ULL ? RLIM_INFINITY : (rlim_t)g.rlim_cur,
-        g.rlim_max == ~0ULL ? RLIM_INFINITY : (rlim_t)g.rlim_max,
-    };
-    return setrlimit((int)a0, &h) < 0 ? host_err() : 0;
+    s64 e = rlim_set(c->m, (int)a0, &g);
+    return e < 0 ? (u64)e : 0;
 }
 
 SYSDEF(prlimit64) {
     pid_t pid = (pid_t)(s32)a0;
-    struct rlimit nh, oh, *nhp = NULL;
+    int res = (int)a1;
+    struct Machine *m = c->m;
+    if (res < 0 || res >= G_RLIM_NLIMITS) return (u64)(s64)-EINVAL;
+    /* pid 0 and our own pid mean this process. Another guest process's limits
+     * would have to come from its Machine, which is not shared -- report the
+     * kernel's answer for a pid we cannot act on rather than silently applying
+     * the change here, which is what handing this to the host used to do. */
+    if (pid != 0 && pid != (pid_t)getpid())
+        return (u64)(s64)(proctab_has((s32)pid) ? -EPERM : -ESRCH);
+    GRlimit old = m->rlim[res];
     if (a2) {
         GRlimit g;
         if (copy_from_guest(c, &g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        nh.rlim_cur = g.rlim_cur == ~0ULL ? RLIM_INFINITY : (rlim_t)g.rlim_cur;
-        nh.rlim_max = g.rlim_max == ~0ULL ? RLIM_INFINITY : (rlim_t)g.rlim_max;
-        nhp = &nh;
+        s64 e = rlim_set(m, res, &g);
+        if (e < 0) return (u64)e;
     }
-    if (prlimit(pid, (int)a1, nhp, a3 ? &oh : NULL) < 0) return host_err();
-    if (a3) return rlim_out(c, a3, &oh);
+    if (a3 && copy_to_guest(c, a3, &old, sizeof old) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 
