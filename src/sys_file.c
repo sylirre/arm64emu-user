@@ -484,6 +484,59 @@ static int l2s_rename_out(struct Machine *m, const char *src, const char *dst,
     return 1;
 }
 
+/* Turn a group member's name into an ordinary file *in place*, so whatever the
+ * host is about to do with that name is an operation on a plain file.
+ *
+ * Same policy as l2s_rename_out, expressed for an operation that keeps both
+ * names rather than consuming the source: sharing cannot survive leaving the
+ * directory, because a same-directory target cannot address another one.
+ *   last name  -- move the backing onto the name. Exact: same inode, same
+ *                 contents, st_nlink 1, which is the truth.
+ *   others left -- copy the contents over the name and drop this reference;
+ *                 the names that stay behind keep sharing.
+ *
+ * Returns 1 when it acted (*err = 0 or -errno), 0 when `path` is not a group
+ * member and nothing was needed. */
+static int l2s_detach(struct Machine *m, const char *path, int *err) {
+#define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
+    char data[PATH_MAX];
+    unsigned long count;
+    if (l2s_resolve(path, data, &count) != 1) return 0;   /* not a group member */
+
+    unsigned long long ino;
+    if (!l2s_parse_data(l2s_basename(data), &ino)) return 0;
+    char dir[PATH_MAX];
+    l2s_dirname(data, dir);
+
+    if (count <= 1) {                        /* last name: the backing IS it */
+        if (rename(data, path) < 0) { *err = -errno; return 1; }
+        char mk[PATH_MAX];
+        if (l2s_marker_name(mk, dir, ino, count ? count : 1) == 0) unlink(mk);
+        *err = 0;
+        return 1;
+    }
+
+    /* l2s_materialize creates with O_EXCL, so the symlink has to go first. No
+     * temporary is needed to make that recoverable: every member's target is
+     * the backing's bare basename, so a failed copy can put the link back
+     * exactly as it was. */
+    char tgt[PATH_MAX];
+    if (strlen(l2s_basename(data)) + 1 > sizeof tgt) { *err = -ENAMETOOLONG; return 1; }
+    strcpy(tgt, l2s_basename(data));
+    if (unlink(path) < 0) { *err = -errno; return 1; }
+    int r = l2s_materialize(m, data, path);
+    if (r < 0) {
+        if (symlink(tgt, path) < 0)          /* best effort: the copy already failed */
+            L2SLOG("detach restore symlink('%s'): %s\n", path, strerror(errno));
+        *err = r;
+        return 1;
+    }
+    l2s_decref(data, count);                 /* this name left the group */
+    *err = 0;
+    return 1;
+#undef L2SLOG
+}
+
 /* If `host` resolves to one of our backing files, stat it (a regular file) into
  * *out with st_nlink = live count. Returns 1 (filled), 0 (not ours), -errno. */
 static int l2s_stat(const char *host, struct stat *out) {
@@ -1882,10 +1935,7 @@ SYSDEF(renameat2) {
 #ifdef L2S_ENABLED
     /* RENAME_NOREPLACE is plain rename plus "the destination must not exist",
      * so a group member leaving its directory needs the same handling; the
-     * helper enforces the extra condition itself. RENAME_EXCHANGE is a
-     * different operation (two names swap, each possibly its own group) and
-     * still goes to the host untouched -- a cross-directory exchange of an
-     * l2s symlink remains broken, as it was. */
+     * helper enforces the extra condition itself. */
     if (c->m->link2symlink && (unsigned)a4 == 1 /*RENAME_NOREPLACE*/ &&
         strcmp(h1, h2) != 0) {
         char backing[PATH_MAX]; unsigned long count;
@@ -1895,6 +1945,34 @@ SYSDEF(renameat2) {
             if (lerr < 0) return (u64)(s64)lerr;
             if (isl == 1) l2s_decref(backing, count);
             return 0;
+        }
+    }
+    /* RENAME_EXCHANGE swaps two names, so BOTH end up where the other was, and
+     * a group member among them cannot simply move: its symlink names a bare
+     * same-directory basename, which resolves to nothing in the other
+     * directory. The host reported success and left a dangling name whose
+     * reference the marker still counted, so the backing could never be
+     * reclaimed -- the same pair of symptoms a plain cross-directory rename
+     * used to have. Detach whichever sides are members first; the host then
+     * exchanges two ordinary files.
+     *
+     * Only across directories: every member of a group lives with its backing
+     * (l2s_link materializes a cross-directory hardlink instead of joining
+     * one), so within one directory both targets still resolve after the swap
+     * -- and the two sides of a cross-directory exchange are therefore never
+     * members of the same group. Both must exist for the exchange to be legal,
+     * so a missing side is left to the host's ENOENT rather than paying for a
+     * detach the call was going to fail anyway. */
+    if (c->m->link2symlink && (unsigned)a4 == 2 /*RENAME_EXCHANGE*/ &&
+        strcmp(h1, h2) != 0) {
+        char d1[PATH_MAX], d2[PATH_MAX];
+        struct stat s1, s2;
+        l2s_dirname(h1, d1);
+        l2s_dirname(h2, d2);
+        if (strcmp(d1, d2) != 0 && lstat(h1, &s1) == 0 && lstat(h2, &s2) == 0) {
+            int lerr = 0;
+            if (l2s_detach(c->m, h1, &lerr) && lerr < 0) return (u64)(s64)lerr;
+            if (l2s_detach(c->m, h2, &lerr) && lerr < 0) return (u64)(s64)lerr;
         }
     }
 #endif

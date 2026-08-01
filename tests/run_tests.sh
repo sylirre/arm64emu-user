@@ -78,15 +78,25 @@ rm -f /tmp/t.bin
 # check stays valid either way. qemu is a usable oracle because the test asserts
 # only what both worlds must agree on -- names readable, directories reclaimable
 # -- and not st_nlink, which the scheme reports from its own bookkeeping.
+#
+# The "exchange" mode is run only here, and only with rootfs "/", because
+# renameat2 flags are filesystem-dependent: the dynamic comparison in the C
+# loop puts qemu on the host /tmp (tmpfs, which supports RENAME_EXCHANGE) and
+# the emulator on the rootfs /tmp, which on a stacked filesystem like ecryptfs
+# answers EINVAL — a difference in the filesystem, not in the emulator. Both
+# sides here see the same /tmp.
 if [ -x tests/c/l2s_rename_static.bin ]; then
-    out_q=$(timeout 60 "$QEMU" tests/c/l2s_rename_static.bin 2>/dev/null); rc_q=$?
-    out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin 2>/dev/null); rc_e=$?
-    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
-        pass=$((pass+1)); echo "PASS c/l2s_rename(--link2symlink)"
-    else
-        fail=$((fail+1)); echo "FAIL c/l2s_rename(--link2symlink) (qemu rc=$rc_q, ours rc=$rc_e)"
-        diff <(echo "$out_q") <(echo "$out_e") | head -8 | sed 's/^/     /'
-    fi
+    for mode in "" exchange; do
+        label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
+        out_q=$(timeout 60 "$QEMU" tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
+        out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
+        if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+            pass=$((pass+1)); echo "PASS $label"
+        else
+            fail=$((fail+1)); echo "FAIL $label (qemu rc=$rc_q, ours rc=$rc_e)"
+            diff <(echo "$out_q") <(echo "$out_e") | head -8 | sed 's/^/     /'
+        fi
+    done
 fi
 
 # ---- System V shm: file-backed fallback tier ----

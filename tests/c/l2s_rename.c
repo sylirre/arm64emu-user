@@ -15,6 +15,9 @@
  * Every check prints PASS/FAIL with a name, so the failing case is named
  * rather than inferred from a digest.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +26,11 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
 
 static int fails;
 
@@ -73,7 +81,11 @@ static void mkfile(const char *p, const char *s) {
  * the property a stranded reference breaks. */
 static int dir_reclaimable(const char *d) { return rmdir(d) == 0; }
 
-int main(void) {
+static int exchange_cases(void);
+
+int main(int argc, char **argv) {
+    /* "exchange" selects the RENAME_EXCHANGE cases; see exchange_cases. */
+    if (argc > 1 && !strcmp(argv[1], "exchange")) return exchange_cases();
     char base[] = "/tmp/l2sXXXXXX";
     if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
     char a[64], b[64], p[128], q[128], r[128];
@@ -149,5 +161,62 @@ int main(void) {
 
     rmdir(base);
     printf("l2s_rename: %d failed\n", fails);
+    return fails != 0;
+}
+
+/* RENAME_EXCHANGE cases, run only when asked for by argv[1] (see main).
+ *
+ * The swap moves BOTH names, so a linked one leaves its directory just as a
+ * plain rename does — and left to the host it landed dangling, with its
+ * reference still counted, so the backing could never be reclaimed.
+ *
+ * Kept out of the default run because renameat2 flags are filesystem-dependent
+ * and the two worlds do not share one there: the dynamic comparison runs qemu
+ * against the host /tmp (tmpfs, which supports the flag) and the emulator
+ * against the rootfs /tmp, which on a stacked filesystem such as ecryptfs
+ * answers EINVAL. The caller runs this mode only where both sides see the same
+ * /tmp. */
+static int exchange_cases(void) {
+    char base[] = "/tmp/l2sxXXXXXX";
+    if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
+    char a[64], b[64], p[128], q[128], q2[128], r[128];
+    snprintf(a, sizeof a, "%s/a", base);
+    snprintf(b, sizeof b, "%s/b", base);
+    snprintf(p, sizeof p, "%s/f", a);
+    snprintf(q, sizeof q, "%s/g", a);
+    snprintf(q2, sizeof q2, "%s/h", a);
+    snprintf(r, sizeof r, "%s/g", b);
+
+    /* ---- 6. RENAME_EXCHANGE across directories ---- */
+    mkdir(a, 0755); mkdir(b, 0755);
+    mkfile(p, "XCHG_SRC");
+    mkfile(r, "XCHG_DST");
+    ck("link for exchange", link(p, q) == 0);
+    ck("cross-dir exchange returns 0",
+       syscall(SYS_renameat2, AT_FDCWD, q, AT_FDCWD, r, RENAME_EXCHANGE) == 0);
+    ck("exchanged name has source data", readable_with(r, "XCHG_SRC"));
+    ck("exchanged name has dest data", readable_with(q, "XCHG_DST"));
+    ck("name left behind still readable", readable_with(p, "XCHG_SRC"));
+    ck("cleanup 6", unlink(p) == 0 && unlink(q) == 0 && unlink(r) == 0);
+    ck("exchange source has no leftovers", visible_entries(a) == 0);
+    ck("exchange source reclaimable", dir_reclaimable(a));
+    ck("exchange dest reclaimable", dir_reclaimable(b));
+
+    /* ---- 7. same-directory exchange must be untouched: both symlink targets
+     * still resolve, so nothing may be detached. ---- */
+    mkdir(a, 0755);
+    mkfile(p, "SAME_A");
+    mkfile(q2, "SAME_B");
+    ck("link for same-dir exchange", link(p, q) == 0);
+    ck("same-dir exchange returns 0",
+       syscall(SYS_renameat2, AT_FDCWD, q, AT_FDCWD, q2, RENAME_EXCHANGE) == 0);
+    ck("same-dir exchanged has other data", readable_with(q, "SAME_B"));
+    ck("same-dir exchanged has linked data", readable_with(q2, "SAME_A"));
+    ck("same-dir link still shared", readable_with(p, "SAME_A"));
+    ck("cleanup 7", unlink(p) == 0 && unlink(q) == 0 && unlink(q2) == 0);
+    ck("same-dir exchange reclaimable", dir_reclaimable(a));
+
+    rmdir(base);
+    printf("l2s_exchange: %d failed\n", fails);
     return fails != 0;
 }
