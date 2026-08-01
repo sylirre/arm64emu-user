@@ -17,6 +17,12 @@ LDFLAGS += -lm -lpthread
 # expanded on purpose: the probe then runs when a link needs it, not on every
 # `make`.
 atomic_lib = $(shell echo 'int main(){return 0;}' | $(1) $(CFLAGS) $(2) -latomic -x c - -o /dev/null 2>/dev/null && echo -latomic)
+
+# clang warns that the 16-byte atomics (guest CASP / 128-bit exclusives) are
+# not lock-free. They are deliberate — the guest semantics need a single atomic
+# access of that width — and libatomic's lock is the price. Silenced rather
+# than left to make a clang build noisy; probed because gcc has no such option.
+CFLAGS += $(shell echo 'int main(){return 0;}' | $(CC) -Werror -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null && echo -Wno-atomic-alignment)
 ATOMIC     = $(call atomic_lib,$(CC),)
 ATOMIC32   = $(call atomic_lib,$(M32CC),$(M32FLAGS))
 

@@ -129,3 +129,33 @@ jobs:
       # The one job in which the AArch64 backend actually runs.
       - name: JIT (aarch64 host)
         run: make test-jit
+
+  # The same suite built with clang, because the compiler is part of what is
+  # under test here. The FP core reads the host's exception flags to build the
+  # guest's FPSR, and how much of that survives optimization is a compiler
+  # decision C does not constrain: clang speculates FP ops out of their guards
+  # and compares NaNs quietly where gcc does neither. Every Termux build is a
+  # clang build, so "gcc is green" was never the same statement as "Android is
+  # green" — and for three FPSR bugs it wasn't. Cheap to keep honest: one job.
+  build-test-clang:
+    name: build + test (clang)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain, qemu oracle and rootfs bootstrap tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            qemu-user qemu-user-static proot expect
+
+      - name: Build with clang
+        run: make CC=clang
+
+      - name: Interpreter (clang build)
+        run: make CC=clang test
+
+      - name: JIT (clang build)
+        run: make CC=clang test-jit

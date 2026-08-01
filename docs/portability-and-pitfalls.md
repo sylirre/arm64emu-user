@@ -122,6 +122,34 @@ immediately `Stopped`.
 though both the emulator and libc are self-consistent. Keep such
 architecture-value tests independent of `DCZID`.
 
+### The compiler is part of the FP model (clang hosts, so every Termux build)
+
+The guest's `FPSR` exception bits are the *host's*, accumulated lazily in the
+host status word and folded in on a guest `MRS`/`MSR` (see the block comment in
+`exec_fpsimd.c`). That only works if the compiler emits the FP operations the
+source asks for, in the branches it asks for — and C promises nothing of the
+kind: absent `#pragma STDC FENV_ACCESS ON`, which neither gcc nor clang really
+implements, the compiler may assume the flags are unobservable. gcc is
+conservative in practice. **clang is not**, and three FPSR bugs lived in the
+gap, on every host, for as long as anyone built with it:
+
+- an FP op in a guarded branch gets hoisted and run unconditionally — `FMAX`'s
+  NaN arm returned `n + m`, so `fmax(0.5, denormal)` set `IXC` on an
+  instruction that raises nothing;
+- a C relational becomes the *quiet* host compare — `FCMGT` of a quiet NaN
+  stopped raising `IOC`, which is the whole FCMEQ-vs-FCMGT split;
+- `(u64)double` has no x86-64 instruction, and clang's branchless expansion
+  subtracts 2^63 unconditionally, so an exact `FCVTZU` came back inexact.
+
+Rules that follow. Classify NaNs *before* any relational and raise the flag by
+hand (`fcm_test_*`, `fp_compare_*`); never use an FP op as a flag-raising
+device inside a branch; convert FP→unsigned with integer bit arithmetic
+(`d_to_u64_exact`), not a cast. What none of that can express is an op a
+compiler speculates out of *any* guard, so the escape hatch is to build the FP
+core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which is
+why it is not on by default). CI builds with clang as well as gcc, which is
+what makes the gap visible instead of theoretical.
+
 ## Testing discipline
 
 The differential suite (`tests/run_tests.sh`) runs each asm/C test under an
