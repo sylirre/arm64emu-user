@@ -6,7 +6,11 @@
  * 53-bit mantissa exceeds 2*11+2). qemu is the oracle; result bits + FCMP flags
  * must be byte-identical. qNaN inputs only (payload/SNaN not modelled). */
 /* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
-#pragma GCC target ("arch=armv8.2-a+fp16")
+/* FEAT_FP16 intrinsics. Not a #pragma GCC target: clang does not accept
+ * that as a way to enable a NEON feature ("needs target feature
+ * fullfp16"), so the whole file has to be built with it -- which is what
+ * this asks the harness to do.
+ * BUILDFLAGS: -march=armv8.2-a+fp16 */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>

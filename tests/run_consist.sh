@@ -10,7 +10,8 @@ cd "$(dirname "$0")/.."
 . tests/hostenv.sh
 [ -n "$AGCC" ] || { echo "SKIP fpconsist: no aarch64 C compiler"; exit 0; }
 
-"$AGCC" -O2 -static -o tests/fpconsist.bin tests/fpconsist.c || {
+cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' tests/fpconsist.c | sed 's/^BUILDFLAGS: *//')
+"$AGCC" -O2 -static $cflags -o tests/fpconsist.bin tests/fpconsist.c || {
     echo "FAIL build fpconsist"; exit 1; }
 a=$("$EMU" / tests/fpconsist.bin) || { echo "FAIL fpconsist (interp rc=$?)"; exit 1; }
 b=$("$EMU" --jit / tests/fpconsist.bin) || { echo "FAIL fpconsist (jit rc=$?)"; exit 1; }

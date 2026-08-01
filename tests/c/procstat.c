@@ -5,7 +5,8 @@
  * properties that hold for real and synthesized content alike — including
  * the procps access pattern: open once, then lseek(0)+reread and expect the
  * counters to move (real procfs regenerates on rewind; so must a synthesized
- * file, or top/vmstat freeze). */
+ * file, or top/vmstat freeze).  *
+ * NEEDS-HOST-READ: /proc/stat /proc/uptime */
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>

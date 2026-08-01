@@ -80,11 +80,27 @@ for cfile in tests/c/*.c; do
     bs="tests/c/${base}_static.bin"
     bd="tests/c/${base}_dyn.bin"
     skip_unsupported "c/${base}" "$cfile" && continue
-    "$AGCC" -static -O2 -o "$bs" "$cfile" $A64_TESTLIBS 2>/dev/null || {
+    # Some differential tests read a host file THROUGH the oracle, and where the
+    # host denies it (Android restricts most of /proc) the oracle fails while
+    # the emulator, which synthesizes the file, succeeds -- a difference in the
+    # host's permissions, not in the emulator. Such a test names what it needs.
+    need_read=$(grep -m1 -o 'NEEDS-HOST-READ:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-READ: *//')
+    denied=
+    for nf in $need_read; do
+        head -c1 "$nf" >/dev/null 2>&1 || denied="$denied $nf"
+    done
+    if [ -n "$denied" ]; then
+        skip=$((skip+1)); echo "SKIP c/${base} (host denies:$denied)"; continue
+    fi
+    # A test needing a specific -march says so in a BUILDFLAGS: marker: the two
+    # compilers disagree on how a source file may enable an AArch64 feature, so
+    # it goes on the command line, where both understand it.
+    cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' "$cfile" | sed 's/^BUILDFLAGS: *//')
+    "$AGCC" -static -O2 $cflags -o "$bs" "$cfile" $A64_TESTLIBS 2>/dev/null || {
         skip_build "$cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
     GLIBC_ROOT="$A64_TEST_ROOT/glibc"
-    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null; then
+    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null; then
         # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
         # us, at host /tmp for the oracle. QEMU_LD_PREFIX (unlike -L) survives
@@ -152,7 +168,13 @@ done
 
 # ---- Alpine rootfs shell tests (if present) ----
 ALPINE="$A64_TEST_ROOT/alpine"
-if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok; then
+if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok &&
+   ! oracle_proot -r "$ALPINE" /bin/sh -c 'exit 0' >/dev/null 2>&1; then
+    # proot is the oracle for these, and where proot itself cannot run the
+    # rootfs (it needs ptrace, which some Android kernels refuse an app) every
+    # one of them reports the oracle's empty output as a failure. Say so once.
+    skip=$((skip+1)); echo "SKIP sh: proot cannot run the reference rootfs here"
+elif [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok; then
     while IFS= read -r cmd; do
         [ -z "$cmd" ] && continue
         out_o=$(oracle_proot -r "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
@@ -225,7 +247,9 @@ fi
 # it can't model per-rootfs abstract-namespace tagging). By default a guest's
 # abstract name is tagged per rootfs on the host; --share-abstract-sockets
 # leaves it raw. The probe reads host /proc/net/unix in-process (no race). ----
-if [ -x "$ALPINE/bin/busybox" ] && \
+# The probe reads the host's /proc/net/unix itself, so a host that denies it
+# (Android) makes every answer empty -- nothing to do with the tagging.
+if [ -x "$ALPINE/bin/busybox" ] && head -c1 /proc/net/unix >/dev/null 2>&1 && \
    "$AGCC" -O2 -static -o "$ALPINE/tmp/ci_absprobe" tests/fixtures/absprobe.c 2>/dev/null; then
     check_abs() {   # check_abs <label> <expected> <emu args...>
         local label="$1" expect="$2"; shift 2
@@ -357,13 +381,19 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     check_devproc "no-dev hides node"   ""      --no-dev "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -x zero'
     check_devproc "no-dev node gone"    "no"    --no-dev "$ALPINE" /bin/busybox sh -c '[ -e /dev/zero ] && echo yes || echo no'
     # --no-dev + bind the real host /dev repopulates it (listed natively).
+    # Binding the host's own /dev and /proc only proves anything where the host
+    # lets this user list them; Android does not.
+    if ls /dev >/dev/null 2>&1; then
     check_devproc "no-dev bind /dev"    "zero"  --no-dev --bind /dev:/dev "$ALPINE" /bin/busybox sh -c 'ls /dev | grep -x zero'
+    else skip=$((skip+1)); echo "SKIP devproc: no-dev bind /dev (host denies ls /dev)"; fi
     # /proc: default passthrough shows `self`; --no-proc serves the empty rootfs.
     check_devproc "proc self default"   "self"  "$ALPINE" /bin/busybox sh -c 'ls /proc | grep -x self'
     check_devproc "no-proc hides self"  ""      --no-proc "$ALPINE" /bin/busybox sh -c 'ls /proc | grep -x self'
     check_devproc "no-proc no synth"    "0"     --no-proc "$ALPINE" /bin/busybox sh -c 'cat /proc/version 2>/dev/null | wc -l'
     # --no-proc + bind the real host /proc gives the real view.
+    if head -c5 /proc/version >/dev/null 2>&1; then
     check_devproc "no-proc bind /proc"  "Linux" --no-proc --bind /proc:/proc "$ALPINE" /bin/busybox sh -c 'head -c5 /proc/version'
+    else skip=$((skip+1)); echo "SKIP devproc: no-proc bind /proc (host denies /proc/version)"; fi
 fi
 
 # ---- -w/--work-dir initial working directory (self-checking; qemu-user has no

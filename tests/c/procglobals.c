@@ -3,7 +3,8 @@
  * reports the host kernel in uname; the emulator synthesizes both sides from
  * sysinfo()/fixed constants), so check properties that hold either way:
  * parse shape, agreement with sysinfo(), and version containing the uname
- * release/version strings. */
+ * release/version strings.  *
+ * NEEDS-HOST-READ: /proc/loadavg /proc/uptime /proc/version */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>

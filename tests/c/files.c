@@ -7,12 +7,18 @@
 int main(void) {
     const char *path = "/tmp/arm64emu_test_file";
     int fd = open(path, O_CREAT|O_TRUNC|O_RDWR, 0644);
+    /* A host without a writable /tmp (Android has none) fails here, and every
+     * call below then operated on -1 and printed an UNINITIALIZED struct stat
+     * -- two runs disagreeing on stack garbage, which reads as an emulator bug
+     * and is not one. Report the one fact that is true in both worlds. */
+    if (fd < 0) { printf("no /tmp\n"); return 0; }
     write(fd, "0123456789", 10);
     lseek(fd, 2, SEEK_SET);
     char b[4] = {0};
     read(fd, b, 3);
     printf("read=%s\n", b);
     struct stat st;
+    memset(&st, 0, sizeof st);
     fstat(fd, &st);
     printf("size=%lld mode=%o\n", (long long)st.st_size, st.st_mode & 0777);
     close(fd);

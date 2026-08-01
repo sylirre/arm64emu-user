@@ -5,7 +5,11 @@
  * qemu is the oracle; result bits must be byte-identical. Inputs are finite: FMLS
  * negates the multiplicand, so a NaN there is not sign-bit-exact (documented). */
 /* REQUIRES: fphp asimdhp (a native oracle must implement FEAT_FP16 as well) */
-#pragma GCC target ("arch=armv8.2-a+fp16")
+/* FEAT_FP16 intrinsics. Not a #pragma GCC target: clang does not accept
+ * that as a way to enable a NEON feature ("needs target feature
+ * fullfp16"), so the whole file has to be built with it -- which is what
+ * this asks the harness to do.
+ * BUILDFLAGS: -march=armv8.2-a+fp16 */
 #include <stdio.h>
 #include <stdint.h>
 #include <arm_neon.h>
