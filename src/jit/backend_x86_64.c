@@ -2158,11 +2158,20 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
         case VC_F1: {                            /* FMOV/FABS/FNEG/FSQRT */
             int dbl = ((insn >> 22) & 3) == 1;
             unsigned opc = (insn >> 15) & 0x3f;
-            if (opc == 0x1 || opc == 0x2) materialize_flags(be);
+            u8 *slow = NULL;
+            /* FSQRT needs the flags for its NaN gate below; FABS/FNEG use xor. */
+            if (opc == 0x1 || opc == 0x2 || opc == 0x3) materialize_flags(be);
             if (opc == 0x3) {                    /* FSQRT via SSE */
                 u8 pfx = dbl ? 0xF2 : 0xF3;
                 sse_mem(e, pfx, 0x10, 0, OFF_V(rn));
                 sse_rr(e, pfx, 0x51, 0, 0);      /* sqrtss/sd */
+                /* Same NaN gate as VC_F2: sqrt of a negative is an invalid
+                 * operation, and the host's DefaultNaN has the wrong sign, so
+                 * the answer has to come from the interpreter (exec_fpsimd.c
+                 * fpnan_*). FABS/FNEG below are pure sign bit ops on a value
+                 * that already is what it should be, so they need no gate. */
+                sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);   /* ucomis x0, x0 */
+                slow = jcc_fwd(e, CC_P);
                 if (dbl) { e8(e, 0x66); e8(e, 0x48); e8(e, 0x0F); e8(e, 0x7E); e8(e, 0xC0); }
                 else     { e8(e, 0x66); e8(e, 0x0F); e8(e, 0x7E); e8(e, 0xC0); }
             } else {                             /* pure bit ops on the lane */
@@ -2181,6 +2190,7 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             }
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
+            if (slow) vop_slowpath(be, o, slow, -1);
             break;
         }
         case VC_FCMP: {

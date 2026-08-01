@@ -223,22 +223,19 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
  * printf in jit.c fences itself).
  * Known corners vs the architecture, deliberate. All were measured against
  * qemu by sweeping random FP/SIMD words; the counts are per 30000 words with
- * NaN and Inf excluded from every lane width, so they are the residue after
- * the far larger NaN-payload class below:
+ * NaN and Inf excluded from every lane width:
  *   - tininess is detected after rounding on x86 (ARM: before) — one boundary
  *     ULP of difference in UFC for float/double;
  *   - f64-input fixed-point converts with 2^1000-scale overflow leak host OFC;
- *   - a *generated* NaN (0/0, inf-inf, ...) keeps the host's sign. ARM's
- *     DefaultNaN is positive; x86 produces the negative "real indefinite"
- *     QNaN, so e.g. FDIV of 0/0 yields -NaN where ARM yields +NaN (10/30000).
- *     Distinguishing generated from propagated NaNs per operation is what a
- *     fix needs, so this is not a local change;
  *   - the FP16 widen-compute-narrow pipeline can miss UFC/IXC on a result
  *     that is inexact in half but exact in double (6/30000, FCMLA).
- * Separately and much more common: NaN *payload* propagation is not modelled
- * at all — a NaN result carries the default payload rather than the input's.
- * All of the above are values a guest only sees if it inspects NaN bit
- * patterns or the sticky flags after an exceptional operation. */
+ * These are values a guest only sees if it inspects the sticky flags after an
+ * exceptional operation. NaN *results* used to be a third such corner and are
+ * no longer: both which NaN an operation returns and what a generated one
+ * looks like are decided here rather than inherited from the host — see the
+ * FPProcessNaNs / DefaultNaN block below. FPCR.DN (Default-NaN mode, which
+ * would make even a propagated NaN come back as the default) is still not
+ * modelled; Linux userspace leaves it clear. */
 #define FPSR_IOC 0x01u
 #define FPSR_DZC 0x02u
 #define FPSR_OFC 0x04u
@@ -272,6 +269,83 @@ static int is_snan_s(float v) {
 static double quiet_d(double v) {
     u64 b; memcpy(&b, &v, 8); b |= 0x8000000000000ULL;
     double r; memcpy(&r, &b, 8); return r;
+}
+
+/* ---- NaN results: AArch64 FPProcessNaNs / DefaultNaN --------------------
+ *
+ * Two things the host gets wrong, both only visible in the result's bits.
+ *
+ * GENERATED. An invalid operation whose operands hold no NaN produces the
+ * architecture's DefaultNaN, and on AArch64 that is POSITIVE (0x7ff8.. /
+ * 0x7fc00000). x86 answers with the negative "real indefinite" QNaN, and every
+ * helper here computes in host doubles and floats, so the host's sign came
+ * through: 0.0/0.0 printed as -nan where hardware prints nan, and signbit()
+ * disagreed with it.
+ *
+ * PROPAGATED. AArch64 takes a signalling operand first and quiets it, and
+ * otherwise the first quiet one in the architecture's operand order. x86
+ * returns whichever operand the instruction had as its destination -- which
+ * for a commutative C expression is the compiler's choice, so this used to come
+ * out right only by codegen luck (and stopped being right the moment anything
+ * near it changed). Deciding it here makes it explicit instead.
+ *
+ * Callers pass the operands in the order the architecture scans them, already
+ * carrying any FPNeg the instruction applies -- FPNeg flips a NaN's sign too,
+ * which is why FMSUB of a NaN multiplicand returns it negated. For the fused
+ * multiply-add family that order is (addend, n, m), not (n, m, addend); all of
+ * it measured against hardware.
+ *
+ * On an AArch64 host these are no-ops: the host already produced the
+ * architectural value. The JIT needs no counterpart either -- every FP family
+ * its backends translate natively hands a NaN result back to this interpreter
+ * (vop_slowpath), which is what makes the two engines agree. */
+static double dfl_nan_d(void) {
+    u64 b = 0x7ff8000000000000ULL; double r; memcpy(&r, &b, 8); return r;
+}
+static float dfl_nan_s(void) {
+    u32 b = 0x7fc00000u; float r; memcpy(&r, &b, 4); return r;
+}
+static float quiet_s(float v) {
+    u32 b; memcpy(&b, &v, 4); b |= 0x400000u;
+    float r; memcpy(&r, &b, 4); return r;
+}
+/* `r` is the host's answer, consulted only for whether a NaN arose at all;
+ * one-operand callers (FSQRT) pass their operand twice. */
+static double fpnan_d(double r, double a, double b) {
+    if (!__builtin_isnan(r)) return r;
+    if (is_snan_d(a)) return quiet_d(a);
+    if (is_snan_d(b)) return quiet_d(b);
+    if (__builtin_isnan(a)) return a;
+    if (__builtin_isnan(b)) return b;
+    return dfl_nan_d();
+}
+static float fpnan_s(float r, float a, float b) {
+    if (!__builtin_isnan(r)) return r;
+    if (is_snan_s(a)) return quiet_s(a);
+    if (is_snan_s(b)) return quiet_s(b);
+    if (__builtin_isnan(a)) return a;
+    if (__builtin_isnan(b)) return b;
+    return dfl_nan_s();
+}
+static double fpnan_d3(double r, double a, double b, double c) {
+    if (!__builtin_isnan(r)) return r;
+    if (is_snan_d(a)) return quiet_d(a);
+    if (is_snan_d(b)) return quiet_d(b);
+    if (is_snan_d(c)) return quiet_d(c);
+    if (__builtin_isnan(a)) return a;
+    if (__builtin_isnan(b)) return b;
+    if (__builtin_isnan(c)) return c;
+    return dfl_nan_d();
+}
+static float fpnan_s3(float r, float a, float b, float c) {
+    if (!__builtin_isnan(r)) return r;
+    if (is_snan_s(a)) return quiet_s(a);
+    if (is_snan_s(b)) return quiet_s(b);
+    if (is_snan_s(c)) return quiet_s(c);
+    if (__builtin_isnan(a)) return a;
+    if (__builtin_isnan(b)) return b;
+    if (__builtin_isnan(c)) return c;
+    return dfl_nan_s();
 }
 
 static float f16_to_f32(u16 h) {
@@ -561,7 +635,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x0: fp_wr_h(c, Rd, fp_rd_h(c, Rn)); return;      /* FMOV  */
                 case 0x1: r = __builtin_fabs(x); break;               /* FABS  */
                 case 0x2: r = -x; break;                              /* FNEG  */
-                case 0x3: r = __builtin_sqrt(x); break;               /* FSQRT */
+                case 0x3: r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
                 case 0x8: r = frint_d(x, 0, 0); break;                /* FRINTN */
                 case 0x9: r = frint_d(x, 1, 0); break;                /* FRINTP */
                 case 0xa: r = frint_d(x, 2, 0); break;                /* FRINTM */
@@ -577,15 +651,15 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
             unsigned Rm = BITS(20, 16), opc = BITS(15, 12); double r;
             double a = (double)f16_to_f32(fp_rd_h(c, Rn)), b = (double)f16_to_f32(fp_rd_h(c, Rm));
             switch (opc) {
-                case 0x0: r = a * b; break;                       /* FMUL   */
-                case 0x1: r = a / b; break;                       /* FDIV   */
-                case 0x2: r = a + b; break;                       /* FADD   */
-                case 0x3: r = a - b; break;                       /* FSUB   */
+                case 0x0: r = fpnan_d(a * b, a, b); break;        /* FMUL   */
+                case 0x1: r = fpnan_d(a / b, a, b); break;        /* FDIV   */
+                case 0x2: r = fpnan_d(a + b, a, b); break;        /* FADD   */
+                case 0x3: r = fpnan_d(a - b, a, b); break;        /* FSUB   */
                 case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break; /* FMAX   */
                 case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break; /* FMIN   */
                 case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break; /* FMAXNM */
                 case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break; /* FMINNM */
-                case 0x8: r = -(a * b); break;                    /* FNMUL  */
+                case 0x8: r = -fpnan_d(a * b, a, b); break;       /* FNMUL  */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_h(c, Rd, f64_to_f16(r)); return;
@@ -784,7 +858,11 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x0: if (dbl) fp_wr_d(c, Rd, fp_rd_d(c, Rn)); else fp_wr_s(c, Rd, fp_rd_s(c, Rn)); return; /* FMOV */
                 case 0x1: if (dbl) fp_wr_d(c, Rd, __builtin_fabs(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_fabsf(fp_rd_s(c, Rn))); return; /* FABS */
                 case 0x2: if (dbl) fp_wr_d(c, Rd, -fp_rd_d(c, Rn)); else fp_wr_s(c, Rd, -fp_rd_s(c, Rn)); return; /* FNEG */
-                case 0x3: if (dbl) fp_wr_d(c, Rd, __builtin_sqrt(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_sqrtf(fp_rd_s(c, Rn))); return; /* FSQRT */
+                case 0x3: {                                        /* FSQRT */
+                    if (dbl) { double x = fp_rd_d(c, Rn); fp_wr_d(c, Rd, fpnan_d(__builtin_sqrt(x), x, x)); }
+                    else     { float  x = fp_rd_s(c, Rn); fp_wr_s(c, Rd, fpnan_s(__builtin_sqrtf(x), x, x)); }
+                    return;
+                }
                 case 0x4: if (ftype == 1) fp_wr_s(c, Rd, (float)fp_rd_d(c, Rn)); else fpsimd_undef(c, insn); return;  /* FCVT to single (from double) */
                 case 0x5: if (ftype == 0) fp_wr_d(c, Rd, (double)fp_rd_s(c, Rn)); else fpsimd_undef(c, insn); return; /* FCVT to double (from single) */
                 /* FRINT<mode>: 0x8 N(even), 0x9 P, 0xa M, 0xb Z, 0xc A(away),
@@ -819,30 +897,32 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         if (dbl) {
             double a = fp_rd_d(c, Rn), b = fp_rd_d(c, Rm), r;
             switch (opc) {
-                case 0x0: r = a * b; break;                    /* FMUL */
-                case 0x1: r = a / b; break;                    /* FDIV */
-                case 0x2: r = a + b; break;                    /* FADD */
-                case 0x3: r = a - b; break;                    /* FSUB */
+                case 0x0: r = fpnan_d(a * b, a, b); break;   /* FMUL */
+                case 0x1: r = fpnan_d(a / b, a, b); break;   /* FDIV */
+                case 0x2: r = fpnan_d(a + b, a, b); break;   /* FADD */
+                case 0x3: r = fpnan_d(a - b, a, b); break;   /* FSUB */
                 case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break;  /* FMAX   */
                 case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break;  /* FMIN   */
                 case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break;  /* FMAXNM */
                 case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break;  /* FMINNM */
-                case 0x8: r = -(a * b); break;                 /* FNMUL */
+                /* FPNeg after FPMul, and FPNeg flips a NaN's sign too, so the
+                 * canonical result here is the NEGATIVE default NaN. */
+                case 0x8: r = -fpnan_d(a * b, a, b); break;   /* FNMUL */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_d(c, Rd, r);
         } else {
             float a = fp_rd_s(c, Rn), b = fp_rd_s(c, Rm), r;
             switch (opc) {
-                case 0x0: r = a * b; break;
-                case 0x1: r = a / b; break;
-                case 0x2: r = a + b; break;
-                case 0x3: r = a - b; break;
+                case 0x0: r = fpnan_s(a * b, a, b); break;
+                case 0x1: r = fpnan_s(a / b, a, b); break;
+                case 0x2: r = fpnan_s(a + b, a, b); break;
+                case 0x3: r = fpnan_s(a - b, a, b); break;
                 case 0x4: r = fop_s(FOP_MAX,   a, b, 0.0f); break;  /* FMAX   */
                 case 0x5: r = fop_s(FOP_MIN,   a, b, 0.0f); break;  /* FMIN   */
                 case 0x6: r = fop_s(FOP_MAXNM, a, b, 0.0f); break;  /* FMAXNM */
                 case 0x7: r = fop_s(FOP_MINNM, a, b, 0.0f); break;  /* FMINNM */
-                case 0x8: r = -(a * b); break;
+                case 0x8: r = -fpnan_s(a * b, a, b); break;   /* see above */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_s(c, Rd, r);
@@ -885,7 +965,12 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)       r =  a - n * m;       /* FMSUB  */
         else if (o1 && !o0) r = -a - n * m;       /* FNMADD */
         else                r = -a + n * m;       /* FNMSUB */
-        fp_wr_h(c, Rd, f64_to_f16(r)); return;
+        double pa, pn;
+        if (!o1 && !o0) { pa = a;  pn =  n; }
+        else if (!o1)   { pa = a;  pn = -n; }
+        else if (!o0)   { pa = -a; pn = -n; }
+        else            { pa = -a; pn =  n; }
+        fp_wr_h(c, Rd, f64_to_f16(fpnan_d3(r, pa, pn, m))); return;
     }
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }
     if (ftype == 1) {
@@ -900,14 +985,26 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)   r = __builtin_fma(-n, m,  a);   /* FMSUB  */
         else if (o1 && !o0) r = __builtin_fma(-n, m, -a); /* FNMADD */
         else            r = __builtin_fma( n, m, -a);   /* FNMSUB */
-        fp_wr_d(c, Rd, r);
+        /* Operand order (addend, n, m), each carrying the FPNeg this
+         * form applies -- FMSUB of a NaN multiplicand returns it negated. */
+        double pa, pn;
+        if (!o1 && !o0) { pa = a;  pn =  n; }        /* FMADD  */
+        else if (!o1)   { pa = a;  pn = -n; }        /* FMSUB  */
+        else if (!o0)   { pa = -a; pn = -n; }        /* FNMADD */
+        else            { pa = -a; pn =  n; }        /* FNMSUB */
+        fp_wr_d(c, Rd, fpnan_d3(r, pa, pn, m));
     } else {
         float n = fp_rd_s(c, Rn), m = fp_rd_s(c, Rm), a = fp_rd_s(c, Ra), r;
         if (!o1 && !o0) r = __builtin_fmaf( n, m,  a);
         else if (!o1)   r = __builtin_fmaf(-n, m,  a);
         else if (o1 && !o0) r = __builtin_fmaf(-n, m, -a);
         else            r = __builtin_fmaf( n, m, -a);
-        fp_wr_s(c, Rd, r);
+        float pa, pn;
+        if (!o1 && !o0) { pa = a;  pn =  n; }
+        else if (!o1)   { pa = a;  pn = -n; }
+        else if (!o0)   { pa = -a; pn = -n; }
+        else            { pa = -a; pn =  n; }
+        fp_wr_s(c, Rd, fpnan_s3(r, pa, pn, m));
     }
 }
 
@@ -1169,7 +1266,7 @@ static u16 pmull8(u8 a, u8 b);                      /* defined in the crypto sec
  * FMAXNM/FMINNM return the numeric operand. The FOP_* selectors are declared
  * above (before exec_fp_scalar, their first user). */
 
-static double fop_d(unsigned op, double n, double m, double d) {
+static double fop_d_raw(unsigned op, double n, double m, double d) {
     switch (op) {
         case FOP_ADD: return n + m;
         case FOP_SUB: return n - m;
@@ -1202,16 +1299,16 @@ static double fop_d(unsigned op, double n, double m, double d) {
             if (is_snan_d(n) || is_snan_d(m)) g_fpexc |= FPSR_IOC;
             if (__builtin_isnan(n)) return m;
             if (__builtin_isnan(m)) return n;
-            return fop_d(FOP_MAX, n, m, d);
+            return fop_d_raw(FOP_MAX, n, m, d);
         case FOP_MINNM:
             if (is_snan_d(n) || is_snan_d(m)) g_fpexc |= FPSR_IOC;
             if (__builtin_isnan(n)) return m;
             if (__builtin_isnan(m)) return n;
-            return fop_d(FOP_MIN, n, m, d);
+            return fop_d_raw(FOP_MIN, n, m, d);
     }
     return 0.0;
 }
-static float fop_s(unsigned op, float n, float m, float d) {
+static float fop_s_raw(unsigned op, float n, float m, float d) {
     switch (op) {
         case FOP_ADD: return n + m;
         case FOP_SUB: return n - m;
@@ -1244,14 +1341,37 @@ static float fop_s(unsigned op, float n, float m, float d) {
             if (is_snan_s(n) || is_snan_s(m)) g_fpexc |= FPSR_IOC;
             if (__builtin_isnan(n)) return m;
             if (__builtin_isnan(m)) return n;
-            return fop_s(FOP_MAX, n, m, d);
+            return fop_s_raw(FOP_MAX, n, m, d);
         case FOP_MINNM:
             if (is_snan_s(n) || is_snan_s(m)) g_fpexc |= FPSR_IOC;
             if (__builtin_isnan(n)) return m;
             if (__builtin_isnan(m)) return n;
-            return fop_s(FOP_MIN, n, m, d);
+            return fop_s_raw(FOP_MIN, n, m, d);
     }
     return 0.0f;
+}
+
+/* One chokepoint for NaN results (see fpnan_d): every vector and
+ * scalar caller of the shared FP helpers goes through here. Only MLA/MLS read
+ * the addend, so only they may let a NaN there mark the result propagated --
+ * every other opcode ignores `d`, and callers routinely pass a dummy 0. */
+static double fop_d(unsigned op, double n, double m, double d) {
+    double r = fop_d_raw(op, n, m, d);
+    switch (op) {
+        case FOP_MLA: return fpnan_d3(r, d,  n, m);   /* FPMulAdd(d,  n, m) */
+        case FOP_MLS: return fpnan_d3(r, d, -n, m);   /* FPMulAdd(d, -n, m) */
+        case FOP_ABD: return __builtin_fabs(fpnan_d(r, n, m));  /* FPAbs last */
+        default:      return fpnan_d(r, n, m);
+    }
+}
+static float fop_s(unsigned op, float n, float m, float d) {
+    float r = fop_s_raw(op, n, m, d);
+    switch (op) {
+        case FOP_MLA: return fpnan_s3(r, d,  n, m);
+        case FOP_MLS: return fpnan_s3(r, d, -n, m);
+        case FOP_ABD: return __builtin_fabsf(fpnan_s(r, n, m));
+        default:      return fpnan_s(r, n, m);
+    }
 }
 
 /* AdvSIMD three-same floating-point: opcodes 0x18..0x1f (FADD/FSUB/FMUL/FDIV/
@@ -2132,7 +2252,7 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS  */
             case 0x6f: res = -x; break;                                /* FNEG  */
-            case 0x7f: res = dbl ? __builtin_sqrt(x) : (double)__builtin_sqrtf((float)x); break; /* FSQRT */
+            case 0x7f: res = fpnan_d(dbl ? __builtin_sqrt(x) : (double)__builtin_sqrtf((float)x), x, x); break; /* FSQRT */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
             case 0x38: res = frint_d(x, 1, 0); break;                  /* FRINTP */
             case 0x58: res = frint_d(x, 4, 0); break;                  /* FRINTA */
@@ -2195,7 +2315,7 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS   */
             case 0x6f: res = -x; break;                                /* FNEG   */
-            case 0x7f: res = __builtin_sqrt(x); break;                 /* FSQRT  */
+            case 0x7f: res = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT  */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
             case 0x38: res = frint_d(x, 1, 0); break;                  /* FRINTP */
             case 0x58: res = frint_d(x, 4, 0); break;                  /* FRINTA */
