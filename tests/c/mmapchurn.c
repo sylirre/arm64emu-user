@@ -9,10 +9,19 @@
  * So the backing is quarantined -- and if it is only ever released at process
  * teardown, nothing is reclaimed at all.
  *
- * The loop below churns 1.25 GB through a 512 MB address-space limit, so it
+ * The loop below churns 1.25 GB through a 512 MB address-space *window*, so it
  * can only finish if released mappings are genuinely released. The limit is
  * set from inside the guest, which is what makes this comparable: the oracle
- * is capped exactly the same way. */
+ * is capped exactly the same way.
+ *
+ * A window above what is already mapped, not an absolute 512 MB, because how
+ * much address space a process holds before main() runs is a property of its C
+ * library and nothing else. glibc and musl start with a few MB; Bionic reserves
+ * about 8.6 GB -- scudo's PROT_NONE primary reserves, which cost no memory but
+ * do count against RLIMIT_AS -- so an absolute cap there is far below current
+ * usage and every mmap fails, correctly, before the churn begins. Measuring the
+ * window from /proc/self/maps keeps the thing under test exactly as it was
+ * (1.25 GB through 512 MB) on any libc. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -29,10 +38,22 @@
 
 static void *idle_thread(void *a) { (void)a; for (;;) pause(); return NULL; }
 
+/* Address space this process already holds, summed from /proc/self/maps. */
+static unsigned long long mapped_now(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    unsigned long long total = 0, lo, hi;
+    char line[512];
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2) total += hi - lo;
+    fclose(f);
+    return total;
+}
+
 int main(void) {
     struct rlimit rl;
     getrlimit(RLIMIT_AS, &rl);
-    rlim_t want = (rlim_t)512 * 1024 * 1024;
+    rlim_t want = (rlim_t)(mapped_now() + 512ULL * 1024 * 1024);
     if (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > want) rl.rlim_cur = want;
     else rl.rlim_cur = rl.rlim_max;
     printf("cap=%d\n", setrlimit(RLIMIT_AS, &rl) == 0);
