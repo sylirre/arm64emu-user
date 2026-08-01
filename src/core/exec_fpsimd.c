@@ -599,6 +599,27 @@ static int fcm_test_s(int kind, float x, float y) {
     return fcm_ordered(kind, x < y, x == y, x > y);
 }
 
+/* Integer -> floating point, one conversion per call, behind a call boundary a
+ * compiler will not speculate across. Every one of these used to be written as
+ * a ternary picking between two conversions of the same operand — `U ?
+ * (float)(u32)i : (float)(s32)i`, `x64 ? (double)(s64)r : (double)(s32)r` —
+ * which clang turns into both conversions and a select, so the Inexact of the
+ * conversion NOT performed landed in the guest's FPSR. `scvtf s3, s1` of
+ * 0x80808080 is exact read as a signed 32-bit value (24 significant bits) and
+ * inexact read as an unsigned one, so it came back with IXC set. Selecting the
+ * *integer* first and converting once is the fix; a 32- or 64-bit signed value
+ * and a 32-bit unsigned one all reach the FP conversion as s64, which is exact
+ * for every one of them, so only a 64-bit unsigned source needs its own. */
+#if defined(__GNUC__) || defined(__clang__)
+#define A64_NOSPEC __attribute__((noinline))
+#else
+#define A64_NOSPEC
+#endif
+static A64_NOSPEC double d_from_s64(s64 v) { return (double)v; }
+static A64_NOSPEC double d_from_u64(u64 v) { return (double)v; }
+static A64_NOSPEC float  f_from_s64(s64 v) { return (float)v; }
+static A64_NOSPEC float  f_from_u64(u64 v) { return (float)v; }
+
 /* FSQRT's Invalid-Operation flag, raised here rather than inherited from
  * whatever the host's sqrt() turns out to be. A negative operand is invalid
  * (-0.0 is not, and returns -0.0); a signaling NaN is invalid too. Both come
@@ -762,8 +783,9 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
     if (ftype == 3 && BITS(28, 24) == 0x1e && BIT(21) == 1 && BITS(15, 10) == 0) {
         unsigned sf = BIT(31), rmode = BITS(20, 19), opcode = BITS(18, 16);
         if (opcode == 2 || opcode == 3) {                 /* SCVTF / UCVTF: int -> half */
-            double iv = (opcode == 2) ? (sf ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn))
-                                      : (sf ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
+            u64 rv = reg_x(c, Rn);
+            double iv = (opcode == 2) ? d_from_s64(sf ? (s64)rv : (s32)rv)
+                                      : (sf ? d_from_u64(rv) : d_from_s64((u32)rv));
             fp_wr_h(c, Rd, f64_to_f16(iv)); return;
         }
         if (opcode <= 1 || opcode == 4 || opcode == 5) {  /* FCVT{N,P,M,Z,A}{S,U}: half -> int */
@@ -782,8 +804,9 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         unsigned fbits = 64 - BITS(15, 10);
         u64 pb = (u64)(fbits + 1023) << 52; double pow2; memcpy(&pow2, &pb, 8); /* 2^fbits, exact */
         if (rmode == 0 && (opcode == 2 || opcode == 3)) {       /* SCVTF / UCVTF: fixed -> half */
-            double iv = (opcode == 2) ? (sf ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn))
-                                      : (sf ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
+            u64 rv = reg_x(c, Rn);
+            double iv = (opcode == 2) ? d_from_s64(sf ? (s64)rv : (s32)rv)
+                                      : (sf ? d_from_u64(rv) : d_from_s64((u32)rv));
             fp_wr_h(c, Rd, f64_to_f16(iv / pow2)); return;
         }
         if (rmode == 3 && (opcode == 0 || opcode == 1)) {       /* FCVTZS / FCVTZU: half -> fixed */
@@ -800,12 +823,12 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         bool x64 = sf != 0;
         switch ((rmode << 3) | opcode) {
             case (0 << 3) | 2:  /* SCVTF (signed int -> fp) */
-                if (dbl) fp_wr_d(c, Rd, x64 ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn));
-                else     fp_wr_s(c, Rd, x64 ? (float)(s64)reg_x(c, Rn)  : (float)(s32)reg_x(c, Rn));
+                if (dbl) fp_wr_d(c, Rd, d_from_s64(x64 ? (s64)reg_x(c, Rn) : (s32)reg_x(c, Rn)));
+                else     fp_wr_s(c, Rd, f_from_s64(x64 ? (s64)reg_x(c, Rn) : (s32)reg_x(c, Rn)));
                 return;
             case (0 << 3) | 3:  /* UCVTF (unsigned int -> fp) */
-                if (dbl) fp_wr_d(c, Rd, x64 ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
-                else     fp_wr_s(c, Rd, x64 ? (float)(u64)reg_x(c, Rn)  : (float)(u32)reg_x(c, Rn));
+                if (dbl) fp_wr_d(c, Rd, x64 ? d_from_u64(reg_x(c, Rn)) : d_from_s64((u32)reg_x(c, Rn)));
+                else     fp_wr_s(c, Rd, x64 ? f_from_u64(reg_x(c, Rn)) : f_from_s64((u32)reg_x(c, Rn)));
                 return;
             case (0 << 3) | 6:  /* FMOV (fp -> general) */
                 if (dbl) set_x(c, Rd, c->v[Rn].d[0]); else set_x(c, Rd, c->v[Rn].s[0]);
@@ -885,12 +908,14 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         u64 pb = (u64)(fbits + 1023) << 52; double pow2; memcpy(&pow2, &pb, 8); /* 2^fbits, exact */
         if (rmode == 0 && (opcode == 2 || opcode == 3)) {       /* SCVTF / UCVTF: fixed -> fp */
             if (dbl) {
-                double iv = (opcode == 2) ? (x64 ? (double)(s64)reg_x(c, Rn) : (double)(s32)reg_x(c, Rn))
-                                          : (x64 ? (double)(u64)reg_x(c, Rn) : (double)(u32)reg_x(c, Rn));
+                u64 rv = reg_x(c, Rn);
+                double iv = (opcode == 2) ? d_from_s64(x64 ? (s64)rv : (s32)rv)
+                                          : (x64 ? d_from_u64(rv) : d_from_s64((u32)rv));
                 fp_wr_d(c, Rd, iv / pow2);
             } else {
-                float iv = (opcode == 2) ? (x64 ? (float)(s64)reg_x(c, Rn) : (float)(s32)reg_x(c, Rn))
-                                         : (x64 ? (float)(u64)reg_x(c, Rn) : (float)(u32)reg_x(c, Rn));
+                u64 rv = reg_x(c, Rn);
+                float iv = (opcode == 2) ? f_from_s64(x64 ? (s64)rv : (s32)rv)
+                                         : (x64 ? f_from_u64(rv) : f_from_s64((u32)rv));
                 fp_wr_s(c, Rd, iv / (float)pow2);
             }
             return;
@@ -2374,8 +2399,8 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
             case 0x39: res = frint_d(x, 3, 0); break;                  /* FRINTZ */
             case 0x59: case 0x79:                                      /* FRINTX/FRINTI: FPCR.RMode */
                 res = frint_d(x, (c->fpcr >> 22) & 3, key == 0x59); break;
-            case 0x1d: res = x; if (dbl) res = (double)(s64)vn.d[i]; else res = (double)(s32)vn.s[i]; break; /* SCVTF */
-            case 0x5d: if (dbl) res = (double)(u64)vn.d[i]; else res = (double)(u32)vn.s[i]; break;          /* UCVTF */
+            case 0x1d: res = d_from_s64(dbl ? (s64)vn.d[i] : (s32)vn.s[i]); break;                        /* SCVTF */
+            case 0x5d: res = dbl ? d_from_u64(vn.d[i]) : d_from_s64((u32)vn.s[i]); break;                    /* UCVTF */
             case 0x1a: case 0x3a: case 0x1b: case 0x3b: case 0x1c:     /* FCVT*S (signed) */
             case 0x5a: case 0x7a: case 0x5b: case 0x7b: case 0x5c: {   /* FCVT*U (unsigned) */
                 int rmode = (opc == 0x1a) ? (hsz ? 1 : 0) : (opc == 0x1b) ? (hsz ? 3 : 2) : 4;
@@ -2613,8 +2638,8 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
     bool dbl = (sz == 1);
 
     if (o2 == 0 && opcode == 0x1d) {                 /* SCVTF / UCVTF: int -> fp */
-        if (dbl) { u64 i = c->v[Rn].d[0]; fp_wr_d(c, Rd, U ? (double)(u64)i : (double)(s64)i); }
-        else     { u32 i = c->v[Rn].s[0]; fp_wr_s(c, Rd, U ? (float)(u32)i  : (float)(s32)i);  }
+        if (dbl) { u64 i = c->v[Rn].d[0]; fp_wr_d(c, Rd, U ? d_from_u64(i) : d_from_s64((s64)i)); }
+        else     { u32 i = c->v[Rn].s[0]; fp_wr_s(c, Rd, f_from_s64(U ? (s64)(u32)i : (s64)(s32)i)); }
         return;
     }
     if (opcode == 0x1a || opcode == 0x1b || (opcode == 0x1c && o2 == 0)) { /* FCVT* fp->int */
@@ -2750,7 +2775,7 @@ static void simd_shift_imm(CPU *c, u32 insn) {
         if (size == 1) {                                  /* FP16 lanes: int16 <-> half / 2^fbits */
             for (unsigned i = 0; i < n; i++) {
                 if (opc == 0x1c)                          /* fixed -> half */
-                    r.h[i] = f64_to_f16((U ? (double)(u16)c->v[Rn].h[i] : (double)(s16)c->v[Rn].h[i]) / pw);
+                    r.h[i] = f64_to_f16(d_from_s64(U ? (u16)c->v[Rn].h[i] : (s16)c->v[Rn].h[i]) / pw);
                 else                                      /* half -> fixed (trunc, saturating) */
                     r.h[i] = fcvt_fixed16((double)f16_to_f32(c->v[Rn].h[i]) * pw, U == 0);
             }
@@ -2758,8 +2783,8 @@ static void simd_shift_imm(CPU *c, u32 insn) {
         }
         for (unsigned i = 0; i < n; i++) {
             if (opc == 0x1c) {                            /* fixed -> FP */
-                if (dbl) vset_d(&r, i, (U ? (double)(u64)c->v[Rn].d[i] : (double)(s64)c->v[Rn].d[i]) / pw);
-                else     vset_s(&r, i, (U ? (float)(u32)c->v[Rn].s[i] : (float)(s32)c->v[Rn].s[i]) / (float)pw);
+                if (dbl) vset_d(&r, i, (U ? d_from_u64(c->v[Rn].d[i]) : d_from_s64((s64)c->v[Rn].d[i])) / pw);
+                else     vset_s(&r, i, f_from_s64(U ? (s64)(u32)c->v[Rn].s[i] : (s64)(s32)c->v[Rn].s[i]) / (float)pw);
             } else {                                      /* FP -> fixed (trunc, saturating) */
                 double x = (dbl ? vget_d(&c->v[Rn], i) : (double)vget_s(&c->v[Rn], i)) * pw;
                 u64 iv = fcvt_fixed(x, U == 0, dbl);
@@ -2848,14 +2873,14 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
         V128 r; r.d[0] = r.d[1] = 0;
         if (size == 1) {                              /* FP16: int16 <-> half / 2^fbits */
             if (opc == 0x1c)                          /* fixed -> half */
-                r.h[0] = f64_to_f16((U ? (double)(u16)c->v[Rn].h[0] : (double)(s16)c->v[Rn].h[0]) / pw);
+                r.h[0] = f64_to_f16(d_from_s64(U ? (u16)c->v[Rn].h[0] : (s16)c->v[Rn].h[0]) / pw);
             else                                      /* half -> fixed (trunc, saturating) */
                 r.h[0] = fcvt_fixed16((double)f16_to_f32(c->v[Rn].h[0]) * pw, U == 0);
             c->v[Rd] = r; return;
         }
         if (opc == 0x1c) {                            /* fixed -> FP */
-            if (dbl) vset_d(&r, 0, (U ? (double)(u64)c->v[Rn].d[0] : (double)(s64)c->v[Rn].d[0]) / pw);
-            else     vset_s(&r, 0, (U ? (float)(u32)c->v[Rn].s[0]  : (float)(s32)c->v[Rn].s[0])  / (float)pw);
+            if (dbl) vset_d(&r, 0, (U ? d_from_u64(c->v[Rn].d[0]) : d_from_s64((s64)c->v[Rn].d[0])) / pw);
+            else     vset_s(&r, 0, f_from_s64(U ? (s64)(u32)c->v[Rn].s[0] : (s64)(s32)c->v[Rn].s[0]) / (float)pw);
         } else {                                      /* FP -> fixed (trunc, saturating) */
             double x = (dbl ? vget_d(&c->v[Rn], 0) : (double)vget_s(&c->v[Rn], 0)) * pw;
             u64 iv = fcvt_fixed(x, U == 0, dbl);
