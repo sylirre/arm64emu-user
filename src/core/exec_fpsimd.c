@@ -599,6 +599,22 @@ static int fcm_test_s(int kind, float x, float y) {
     return fcm_ordered(kind, x < y, x == y, x > y);
 }
 
+/* FSQRT's Invalid-Operation flag, raised here rather than inherited from
+ * whatever the host's sqrt() turns out to be. A negative operand is invalid
+ * (-0.0 is not, and returns -0.0); a signaling NaN is invalid too. Both come
+ * for free when __builtin_sqrt inlines to the hardware instruction, and not at
+ * all when it becomes a libm call that answers a negative input with a
+ * ready-made NaN — Bionic's does, so on Termux `fsqrt d0, #-1.0` raised
+ * nothing. The result is already host-independent (fpnan_* below). */
+static void fsqrt_raise_d(double x) {
+    if (x != x) { if (is_snan_d(x)) g_fpexc |= FPSR_IOC; return; }
+    if (x < 0.0) g_fpexc |= FPSR_IOC;
+}
+static void fsqrt_raise_s(float x) {
+    if (x != x) { if (is_snan_s(x)) g_fpexc |= FPSR_IOC; return; }
+    if (x < 0.0f) g_fpexc |= FPSR_IOC;
+}
+
 /* Set NZCV from an FP compare of a vs b (ordered), per the architecture. */
 static void fp_set_flags(CPU *c, int cmp /* -1 lt, 0 eq, 1 gt, 2 unordered */) {
     u32 n = 0;
@@ -692,7 +708,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x0: fp_wr_h(c, Rd, fp_rd_h(c, Rn)); return;      /* FMOV  */
                 case 0x1: r = __builtin_fabs(x); break;               /* FABS  */
                 case 0x2: r = -x; break;                              /* FNEG  */
-                case 0x3: r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
+                case 0x3: fsqrt_raise_d(x); r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
                 case 0x8: r = frint_d(x, 0, 0); break;                /* FRINTN */
                 case 0x9: r = frint_d(x, 1, 0); break;                /* FRINTP */
                 case 0xa: r = frint_d(x, 2, 0); break;                /* FRINTM */
@@ -916,8 +932,8 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x1: if (dbl) fp_wr_d(c, Rd, __builtin_fabs(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_fabsf(fp_rd_s(c, Rn))); return; /* FABS */
                 case 0x2: if (dbl) fp_wr_d(c, Rd, -fp_rd_d(c, Rn)); else fp_wr_s(c, Rd, -fp_rd_s(c, Rn)); return; /* FNEG */
                 case 0x3: {                                        /* FSQRT */
-                    if (dbl) { double x = fp_rd_d(c, Rn); fp_wr_d(c, Rd, fpnan_d(__builtin_sqrt(x), x, x)); }
-                    else     { float  x = fp_rd_s(c, Rn); fp_wr_s(c, Rd, fpnan_s(__builtin_sqrtf(x), x, x)); }
+                    if (dbl) { double x = fp_rd_d(c, Rn); fsqrt_raise_d(x); fp_wr_d(c, Rd, fpnan_d(__builtin_sqrt(x), x, x)); }
+                    else     { float  x = fp_rd_s(c, Rn); fsqrt_raise_s(x); fp_wr_s(c, Rd, fpnan_s(__builtin_sqrtf(x), x, x)); }
                     return;
                 }
                 case 0x4: if (ftype == 1) fp_wr_s(c, Rd, (float)fp_rd_d(c, Rn)); else fpsimd_undef(c, insn); return;  /* FCVT to single (from double) */
@@ -2349,7 +2365,8 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS  */
             case 0x6f: res = -x; break;                                /* FNEG  */
-            case 0x7f: res = fpnan_d(dbl ? __builtin_sqrt(x) : (double)__builtin_sqrtf((float)x), x, x); break; /* FSQRT */
+            case 0x7f: fsqrt_raise_d(x);
+                       res = fpnan_d(dbl ? __builtin_sqrt(x) : (double)__builtin_sqrtf((float)x), x, x); break; /* FSQRT */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
             case 0x38: res = frint_d(x, 1, 0); break;                  /* FRINTP */
             case 0x58: res = frint_d(x, 4, 0); break;                  /* FRINTA */
@@ -2412,7 +2429,8 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS   */
             case 0x6f: res = -x; break;                                /* FNEG   */
-            case 0x7f: res = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT  */
+            case 0x7f: fsqrt_raise_d(x);
+                       res = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT  */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
             case 0x38: res = frint_d(x, 1, 0); break;                  /* FRINTP */
             case 0x58: res = frint_d(x, 4, 0); break;                  /* FRINTA */

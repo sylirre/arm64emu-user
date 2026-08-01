@@ -6,7 +6,12 @@ CFLAGS  ?= -O2
 # and merged run loop landed, but those capture the same cross-TU seam in
 # source; on top of them LTO measures slightly slower, so it is off by default.
 LTO     ?=
-CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+# -fno-math-errno: the FP core wants __builtin_sqrt to BE the hardware
+# instruction (exec_fpsimd.c says so, and its exception flags are the guest's).
+# Without it the compiler must keep a libm call for a possibly-negative operand
+# just to set errno, which nothing here reads — and whether that call raises
+# Invalid is then the libc's business, not ours.
+CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno \
            -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
            -Isrc -Isrc/core -Isrc/jit $(LTO)
 LDFLAGS ?=
