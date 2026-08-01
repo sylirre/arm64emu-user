@@ -89,6 +89,12 @@ for cfile in tests/c/*.c; do
     for nf in $need_read; do
         head -c1 "$nf" >/dev/null 2>&1 || denied="$denied $nf"
     done
+    # Same idea for an ioctl the host can refuse the oracle while the emulator
+    # answers it (Android and SIOCGIFHWADDR).
+    need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
+    for ni in $need_ioctl; do
+        a64_oracle_ioctl_ok "$ni" || denied="$denied $ni"
+    done
     if [ -n "$denied" ]; then
         skip=$((skip+1)); echo "SKIP c/${base} (host denies:$denied)"; continue
     fi

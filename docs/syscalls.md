@@ -320,6 +320,15 @@ host-struct bounce), so the marshalling is correct on 64-bit and 32-bit hosts
 alike. Write (`SIOCSIF*`) ioctls are not emulated. Like `SIOCGIFINDEX`, the
 family is ungated (it does not depend on the host actually blocking netlink).
 
+`SIOCGIFHWADDR` is the one query a host can refuse outright — Android denies it,
+and `/sys/class/net` with it, to an unprivileged app — so "best-effort" needs a
+rule for what to do when the effort fails. **Loopback is filled in regardless**
+(`ARPHRD_LOOPBACK`, all-zero address): that is not a host fact to be discovered,
+every kernel answers the same, and the synthesized-interface fallback above
+already assumes it. For anything else the refusal is **reported**, because the
+alternative is to invent one — this used to return success with `sa_family` 0, a
+value no kernel produces and a guest cannot tell from a real answer.
+
 **`AF_NETLINK` / `NETLINK_ROUTE`** (`src/sys_netlink.c`, ported from Termux
 PRoot) is emulated in two independent tiers, because two different things can
 go wrong:

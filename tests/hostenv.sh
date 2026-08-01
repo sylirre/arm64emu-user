@@ -24,7 +24,7 @@
 # Sets:     AGCC, ORACLE_KIND (qemu|native|none), ORACLE_QEMU, ORACLE_DESC,
 #           ORACLE_GATE, A64_HOST_ARCH, A64_SYSROOT
 # Provides: oracle_run, oracle_run0, oracle_proot, oracle_proot_ok,
-#           host_missing_features
+#           host_missing_features, a64_oracle_ioctl_ok
 
 A64_HOST_ARCH=$(uname -m)
 
@@ -211,4 +211,47 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
         esac
     done
     printf '%s' "${_miss# }"
+}
+
+# ---- host-capability gating -------------------------------------------------
+# A differential test can also be blocked by what the host permits rather than
+# by what its CPU implements. Where the emulator synthesizes an answer the host
+# would deny -- Android refuses SIOCGIFHWADDR, and /sys/class/net with it, to an
+# unprivileged app -- the oracle fails while the emulator succeeds, and the diff
+# reads as an emulator bug. Such a test declares what the ORACLE has to be able
+# to do with a marker line
+#
+#     NEEDS-HOST-IOCTL: <name> [<name> ...]
+#
+# and is skipped, naming the refusal, where it cannot. Asked rather than
+# assumed, and asked through the oracle itself, since that is the process whose
+# answer the test is compared against.
+a64_oracle_ioctl_ok() {   # a64_oracle_ioctl_ok <name> -> 0 if the oracle can
+    [ "$1" = SIOCGIFHWADDR ] || return 0   # unknown name: nothing to gate on
+    if [ -z "${A64_IOCTL_HWADDR:-}" ]; then
+        A64_IOCTL_HWADDR=0
+        if [ -n "$AGCC" ] && [ "$ORACLE_KIND" != none ]; then
+            _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64ioc.$$"
+            if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+int main(void) {
+    struct ifreq r;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 1;
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "lo");
+    return ioctl(s, SIOCGIFHWADDR, &r) == 0 ? 0 : 1;
+}
+EOF
+            then
+                chmod +x "$_p" 2>/dev/null
+                oracle_run "$_p" >/dev/null 2>&1 && A64_IOCTL_HWADDR=1
+            fi
+            rm -f "$_p"
+        fi
+    fi
+    [ "$A64_IOCTL_HWADDR" = 1 ]
 }

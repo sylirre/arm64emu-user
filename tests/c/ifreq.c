@@ -51,9 +51,9 @@ int main(void) {
     if (ioctl(s, SIOCGIFMTU, &ifr) == 0)
         printf("mtu=%d\n", ifr.ifr_mtu);
 
-    set_lo(&ifr);
-    if (ioctl(s, SIOCGIFHWADDR, &ifr) == 0)
-        printf("hwfam=%d\n", ifr.ifr_hwaddr.sa_family);
+    /* SIOCGIFHWADDR lives in ifhwaddr.c: it is the one query in this family a
+     * host can deny (Android does), and there the oracle fails while we answer,
+     * so it needs a gate the rest of these do not. */
 
     memset(&ifr, 0, sizeof ifr);
     ifr.ifr_ifindex = 1;

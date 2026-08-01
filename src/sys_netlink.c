@@ -1386,6 +1386,7 @@ struct ifq {
     uint16_t     hwtype;     /* ARPHRD_* */
     uint8_t      hwaddr[8];
     uint8_t      hwlen;
+    int          hwerr;      /* why the host would not say, when hwlen == 0 */
     uint32_t     addr, netmask, broadaddr, dstaddr;
     int          have_addr;
 };
@@ -1473,8 +1474,24 @@ static int gather_ifq(const char *name, struct ifq *q)
                 q->hwtype = ifr.ifr_hwaddr.sa_family;
                 memcpy(q->hwaddr, ifr.ifr_hwaddr.sa_data, 6);
                 q->hwlen = 6;
+            } else {
+                q->hwerr = errno;   /* Android denies this one to an app */
             }
         }
+    }
+
+    /* Loopback's hardware address is not a host fact to be discovered: every
+     * kernel answers ARPHRD_LOOPBACK with an all-zero address. Filling it in
+     * here matters because Android denies both this ioctl and /sys/class/net to
+     * an unprivileged app, so an interface we can otherwise see completely
+     * would have no type at all -- and the caller used to report that as a
+     * successful lookup with sa_family 0, a value no kernel returns. (The
+     * whole-interface synthesis below covers only the case where lo is not
+     * found; on Android it is found, just not fully described.) */
+    if (q->found && q->hwlen == 0 && (q->flags & IFF_LOOPBACK)) {
+        q->hwtype = ARPHRD_LOOPBACK;
+        q->hwlen = 6;                /* six zero bytes, as the kernel reports */
+        q->hwerr = 0;
     }
     if (sock >= 0)
         close(sock);
@@ -1563,10 +1580,19 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
         memcpy(out, &si, sizeof si); outlen = sizeof si; break;
     }
     case 0x8927: { /* SIOCGIFHWADDR: sockaddr(sa_family=hwtype, sa_data=hwaddr) */
+        /* Loopback is filled in by gather_ifq whatever the host says, so a zero
+         * length here means a real interface whose address the host refused to
+         * reveal. Report that refusal. Returning success with sa_family 0 --
+         * which is what this did -- invents an answer no kernel gives, and a
+         * guest cannot tell it from a real one. */
+        if (q.hwlen == 0) {
+            *ret = (u64)(s64) -(q.hwerr ? q.hwerr : EINVAL);
+            return 1;
+        }
         struct sockaddr sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_family = q.hwtype;
-        memcpy(sa.sa_data, q.hwaddr, q.hwlen ? q.hwlen : 6);
+        memcpy(sa.sa_data, q.hwaddr, q.hwlen);
         memcpy(out, &sa, sizeof sa); outlen = sizeof sa; break;
     }
     case 0x8970:   /* SIOCGIFMAP: struct ifmap, zero-filled (out already zeroed) */
