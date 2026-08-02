@@ -3,7 +3,7 @@
  * arm64chroot must answer the read-only interface-query family from the host's
  * own interface table instead of warning and returning -ENOTTY. Differential vs
  * qemu-aarch64, scoped to the loopback interface -- identical on every Linux
- * host (index 1, 127.0.0.1/8, MTU 65536, ARPHRD_LOOPBACK) so both worlds match
+ * host (index 1, 127.0.0.1/8, a versioned MTU constant, ARPHRD_LOOPBACK) so both worlds match
  * byte for byte. Tests run with rootfs "/", so the emulator's getifaddrs sees
  * the same host "lo" the kernel hands qemu. */
 #define _GNU_SOURCE
@@ -49,7 +49,10 @@ int main(void) {
 
     set_lo(&ifr);
     if (ioctl(s, SIOCGIFMTU, &ifr) == 0)
-        printf("mtu=%d\n", ifr.ifr_mtu);
+        /* Loopback's MTU is a kernel constant, but a versioned one: 65536
+         * since 3.12, 16436 before. Assert it is one of the two so a recorded
+         * oracle from a modern host still referees an old-kernel replay. */
+        printf("mtu_ok=%d\n", ifr.ifr_mtu == 65536 || ifr.ifr_mtu == 16436);
 
     /* SIOCGIFHWADDR lives in ifhwaddr.c: it is the one query in this family a
      * host can deny (Android does), and there the oracle fails while we answer,

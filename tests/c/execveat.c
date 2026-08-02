@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* execveat (nr 281): error paths first, then a chained self-exec --
  * AT_EMPTY_PATH by fd (stage2), then a plain path (stage3). The exec chain
  * runs only when statically linked: a successful exec of a *dynamic* guest

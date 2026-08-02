@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* AF_UNIX/SOCK_STREAM roundtrip through an absolute path in a mkdir'd /tmp
  * subdir. Regression for rootfs containment of sun_path: the emulator must
  * resolve the bind/connect path into the rootfs (like every other filesystem

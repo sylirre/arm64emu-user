@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* mknodat(2) coverage: mkfifo(3) is the reported use-case (`mkfifo fifo`),
  * plus a plain mknod() of a regular file. Both are creatable unprivileged, so
  * qemu (oracle) and arm64chroot must agree on rc and the resulting st_mode. */

@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* statx: basic fields only. btime, ctime, blocks and the raw stx_mask are
  * deliberately not printed — they legitimately differ between the kernel
  * fast path and the emulator's stat-synthesized fallback (or between runs).

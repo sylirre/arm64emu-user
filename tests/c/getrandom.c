@@ -22,7 +22,12 @@ int main(void) {
     printf("len512=%ld\n", gr(b, 512, 0));
     printf("nonblock=%ld\n", gr(b, 16, 0x1 /* GRND_NONBLOCK */));
     printf("insecure=%ld\n", gr(b, 16, 0x4 /* GRND_INSECURE */));
-    printf("rnd_nb=%ld\n", gr(b, 16, 0x2 | 0x1 /* GRND_RANDOM|NONBLOCK */));
+    /* The random source is entropy-limited: a modern kernel answers 16, an
+     * old one (< 5.6, where /dev/random still blocks) may answer -EAGAIN when
+     * the pool is low. Both are that source's own semantics, so the probe
+     * asserts the relationship, not the host's entropy level. */
+    long rn = gr(b, 16, 0x2 | 0x1 /* GRND_RANDOM|NONBLOCK */);
+    printf("rnd_nb_ok=%d\n", rn == 16 || rn == -11);
     printf("badflag=%ld\n", gr(b, 16, 0x100));
     printf("conflict=%ld\n", gr(b, 16, 0x2 | 0x4 /* RANDOM|INSECURE */));
     gr(b, 64, 0);

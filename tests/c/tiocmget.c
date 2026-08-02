@@ -1,3 +1,4 @@
+/* SAME-HOST-ONLY: the controlling terminal's modem state is the host's. */
 #define _XOPEN_SOURCE 600
 #include <stdio.h>
 #include <stdlib.h>

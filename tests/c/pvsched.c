@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* preadv/pwritev (nr 69/70) and the sched_* family (118-120, 122, 125-127).
  * sched_rr_get_interval's raw value is scheduler state (fair-class timeslice),
  * so only rc and sanity bounds are printed. */

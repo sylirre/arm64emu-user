@@ -244,9 +244,11 @@ tests (compared against the recorded answers), the dynamic-linking tests
 (fake-id, binds, mount/chroot/pivot_root, ptrace, seccomp fixtures), and the
 `insnfuzz` chaos/seq modes, which referee three engines against each other
 and never needed an oracle. What skips, by design: tests marked
-`NEEDS-HOST-READ`/`NEEDS-HOST-IOCTL` (they compare against the *recording*
-host's state), the proot-driven Alpine shell comparison, and anything whose
-binary or recording is missing from the pack — each named in the output.
+`NEEDS-HOST-READ`/`NEEDS-HOST-IOCTL`/`SAME-HOST-ONLY` (their answers depend
+on the *recording* host's state — files it reads, a `/tmp` to build fixtures
+in, syscall and filesystem vintages), the proot-driven Alpine shell
+comparison, and anything whose binary or recording is missing from the
+pack — each named in the output.
 
 ## On-device smoke-test checklist
 

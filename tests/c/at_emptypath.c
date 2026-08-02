@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* Empty-pathname *at() syscalls on an O_PATH fd. systemd-tmpfiles opens each
  * object with O_PATH (O_NOFOLLOW for symlinks) and then operates on the fd via
  * an empty path -- readlinkat(fd,"") reads the symlink (Linux >= 2.6.39), and

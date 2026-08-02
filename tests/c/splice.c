@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* splice (76) and copy_file_range (285): both forward to the host, so qemu
  * (oracle) and the emulator produce identical output. Regression for the GNU
  * grep pipeline that reported "(standard input): Function not implemented" when

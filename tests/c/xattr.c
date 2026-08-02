@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* Exercise the xattr syscall family (set/get/list/remove, path/fd/l variants).
  * Differential test: qemu-aarch64 and arm64chroot both run against the same host
  * filesystem, so the output matches whether or not the fs supports user xattrs

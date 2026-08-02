@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* A mapped file truncated from OUTSIDE this address space.
  *
  * Pages of a file mapping past end-of-file must fault as SIGBUS/BUS_ADRERR,

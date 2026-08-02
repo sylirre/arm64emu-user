@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* eventfd2 (19), epoll_create1/ctl/pwait (20/21/22) and sync_file_range (84):
  * all match qemu. The epoll data tag round-trips, exercising the guest-vs-host
  * epoll_event layout marshalling. Regression for syscalls event loops hit. */

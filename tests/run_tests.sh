@@ -94,10 +94,15 @@ for cfile in tests/c/*.c; do
     # host's permissions, not in the emulator. Such a test names what it needs.
     need_read=$(grep -m1 -o 'NEEDS-HOST-READ:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-READ: *//')
     need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
-    # Either marker means the test compares against THIS host's state, which a
-    # recorded oracle — the answers of another host — cannot referee.
-    if [ "$ORACLE_KIND" = recorded ] && [ -n "$need_read$need_ioctl" ]; then
-        skip=$((skip+1)); echo "SKIP c/${base} (compares host state; the recorded oracle ran elsewhere)"; continue
+    # Any of these markers means the test's answers depend on THIS host's
+    # state — files it reads, a /tmp to build fixtures in, syscalls or ioctls
+    # of a given vintage, filesystem behavior. A live oracle shares all of
+    # that with the emulator, so the comparison holds; a recorded oracle is
+    # another host's answers, and the comparison compares hosts, not
+    # emulators. SAME-HOST-ONLY names the dependency in the test itself.
+    if [ "$ORACLE_KIND" = recorded ] &&
+       { [ -n "$need_read$need_ioctl" ] || grep -qm1 'SAME-HOST-ONLY' "$cfile"; }; then
+        skip=$((skip+1)); echo "SKIP c/${base} (same-host-only; the recorded oracle ran elsewhere)"; continue
     fi
     denied=
     for nf in $need_read; do
@@ -922,7 +927,12 @@ fi
 # native oracle cannot demonstrate the Linux behaviour the emulator provides --
 # it serves such paths from the fd itself, and this output is the same on every
 # host. ----
-if [ -n "$AGCC" ]; then
+if [ "$ORACLE_KIND" = recorded ]; then
+    # The fixture's whole subject is a guest memfd re-opened through
+    # /proc/self/fd, and guest memfd_create is ENOSYS where the replay host's
+    # kernel lacks it (< 3.17) — a host capability, not an emulator property.
+    skip=$((skip+1)); echo "SKIP fixture: ownfdexec (needs guest memfd_create on the replay host)"
+elif [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/ownfdexec.bin \
             tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null; then
         expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'

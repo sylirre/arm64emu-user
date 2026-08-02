@@ -1,3 +1,4 @@
+/* SAME-HOST-ONLY: the starting nice level is inherited host state. */
 /* tid-addressed syscalls on a secondary thread. Guest threads carry
  * synthetic tids (clone), so the emulator must map them to the host thread
  * carrying them: passing the raw value addresses whatever the tid collides

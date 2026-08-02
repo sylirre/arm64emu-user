@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* preadv2/pwritev2 (nr 286/287) and sched_getparam (nr 121). */
 #define _GNU_SOURCE
 #include <stdio.h>

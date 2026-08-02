@@ -1,3 +1,5 @@
+/* SAME-HOST-ONLY: needs guest memfd_create, which is ENOSYS where the replay
+ * host's kernel lacks it (< 3.17). */
 /* FS_IOC_GETFLAGS/SETFLAGS (0x80086601 / 0x40086602): inode attribute flags,
  * as read by lsattr and by systemd-tmpfiles (to preserve attributes). The old
  * emulator had no whitelist entry -> "unhandled ioctl 0x80086601" and -ENOTTY,

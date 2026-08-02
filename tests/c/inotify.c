@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* inotify_init1/add_watch/rm_watch (nr 26-28) on a private directory. */
 #define _GNU_SOURCE
 #include <stdio.h>

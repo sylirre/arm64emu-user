@@ -1,3 +1,6 @@
+/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
+ * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
+ * legitimately answers differently. */
 /* -link2symlink: renaming an emulated hardlink out of its directory.
  *
  * The scheme points every "hardlink" name at a hidden backing file through a

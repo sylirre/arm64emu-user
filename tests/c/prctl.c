@@ -1,3 +1,5 @@
+/* SAME-HOST-ONLY: the capability bounding set is real host state (Android
+ * drops caps an x86 host keeps). */
 /* prctl: capability bounding set + keepcaps are passed straight through to
  * the host kernel (sys_proc.c), so emulator output must match qemu-aarch64
  * exactly -- both are real syscalls against the same host kernel. */
