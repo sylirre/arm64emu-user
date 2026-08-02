@@ -20,7 +20,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <linux/filter.h>    /* sock_fprog/sock_filter (SO_ATTACH_FILTER) */
 #include <linux/netlink.h>   /* AF_NETLINK, NETLINK_ROUTE, NETLINK_AUDIT */
+
+#ifndef SO_ATTACH_REUSEPORT_CBPF   /* pre-4.5 host kernel headers */
+#define SO_ATTACH_REUSEPORT_CBPF 51
+#endif
 
 #include "sys.h"
 #include "sys_netlink.h"
@@ -333,11 +338,53 @@ SYSDEF(shutdown) {
     return shutdown((int)a0, (int)a1) < 0 ? host_err() : 0;
 }
 
+/* SO_ATTACH_FILTER / SO_ATTACH_REUSEPORT_CBPF: the optval is not a byte blob
+ * but a struct sock_fprog whose second field is a POINTER to the classic-BPF
+ * program. Passed through raw, the kernel dereferences the guest VA as an
+ * emulator address -- attaching a filter built from unrelated emulator memory,
+ * or failing with EFAULT -- and on ILP32 hosts the guest's 16-byte fprog is
+ * not even the host's 8-byte one. Bounce the program (sock_filter is 8 bytes
+ * of plain integers on every ABI) and rebuild the fprog host-side. A NULL
+ * program is handed through unbounced so the kernel keeps its own error
+ * order: a SO_LOCK_FILTERed socket answers EPERM before the NULL's EINVAL. */
+static u64 sockopt_attach_fprog(CPU *c, int fd, int optname, const u8 *gopt,
+                                size_t glen) {
+    if (glen != 16) return (u64)(s64)-EINVAL;   /* kernel: optlen == sizeof(fprog) */
+    u16 flen; u64 fva;
+    memcpy(&flen, gopt, 2);
+    memcpy(&fva, gopt + 8, 8);
+    struct sock_fprog h = { .len = flen, .filter = NULL };
+    struct sock_filter *prog = NULL;
+    if (fva) {
+        size_t fsize = (size_t)flen * sizeof *prog;
+        prog = malloc(fsize ? fsize : 1);
+        if (!prog) return (u64)(s64)-ENOMEM;
+        if (copy_from_guest(c, prog, fva, fsize) < 0) {
+            free(prog);
+            return (u64)(s64)-EFAULT;
+        }
+        h.filter = prog;
+    }
+    int r = setsockopt(fd, SOL_SOCKET, optname, &h, sizeof h);
+    u64 ret = r < 0 ? host_err() : 0;
+    free(prog);
+    return ret;
+}
+
 SYSDEF(setsockopt) {
     size_t len = (size_t)a4;
     if (len > 4096) return (u64)(s64)-EINVAL;
     u8 buf[4096];
     if (len && copy_from_guest(c, buf, a3, len) < 0) return (u64)(s64)-EFAULT;
+    /* Literal guest option values (asm-generic; the host macros match on x86
+     * and arm, but the guest ABI is what is being decoded here). */
+    if ((int)a1 == SOL_SOCKET &&
+        ((int)a2 == 26 /*SO_ATTACH_FILTER*/ ||
+         (int)a2 == 51 /*SO_ATTACH_REUSEPORT_CBPF*/))
+        return sockopt_attach_fprog(c, (int)a0,
+                                    (int)a2 == 26 ? SO_ATTACH_FILTER
+                                                  : SO_ATTACH_REUSEPORT_CBPF,
+                                    buf, len);
     return setsockopt((int)a0, (int)a1, (int)a2, buf, (socklen_t)len) < 0 ? host_err() : 0;
 }
 
