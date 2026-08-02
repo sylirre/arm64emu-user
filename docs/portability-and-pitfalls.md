@@ -106,7 +106,28 @@ Match the **guest's literal** command numbers, then translate to the host macro
 when calling libc.
 
 *Visible on:* i386, armhf. Symptom: `adduser: can't lock '/etc/passwd': Bad
-address`.
+address`. `F_SETLK` is not alone: on a time64 32-bit libc (musl 1.2+) the
+`SO_RCVTIMEO`/`SO_SNDTIMEO` macros are renumbered the same way, with an 8-byte
+host `struct timeval` against the guest's 16 — same rule, match the guest's
+literal values and re-issue via the host macro and struct (see
+[syscalls.md](syscalls.md)).
+
+### The host libc wrapper's contract is per-libc (Bionic)
+
+Forwarding a guest's *flags* argument to a host libc **wrapper** assumes the
+wrapper hands it to the kernel. Nothing promises that: glibc's `faccessat()`
+emulates `AT_EACCESS`/`AT_SYMLINK_NOFOLLOW` in userspace and so accepts them,
+while **Bionic rejects any non-zero flags with `EINVAL`** — so a `faccessat2`
+forwarded through host `faccessat()` failed only on Android, and the failure
+surfaced absurdly far away: dash implements `test -r` via
+`faccessat2(..., AT_EACCESS)`, apt-key read the `EINVAL` as "keyring not
+readable" and silently verified every archive against `/dev/null`. Handle
+guest flags in the emulator (`AT_EACCESS` is a no-op host-side — the emulator
+never changes host ids, so real-check equals effective-check there) and give a
+wrapper only what every libc's version of it accepts.
+
+*Visible on:* Bionic/Termux only. Symptom: `apt update` reports NO_PUBKEY for
+every archive key.
 
 ### vfork mistaken for a thread
 

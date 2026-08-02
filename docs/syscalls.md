@@ -65,7 +65,7 @@ the *same tested code*.
 Build flags `-D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64` make the 32-bit host's libc
 present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
 
-**Two marshalling gotchas worth knowing (both are real bugs we hit):**
+**Marshalling gotchas worth knowing (every one is a real bug we hit):**
 
 - *Explicit offsets, not host struct alignment.* A guest LP64 struct with an
   `s64` member has that member 8-byte aligned; a host C struct on an ILP32 host
@@ -86,6 +86,25 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   `-D_FILE_OFFSET_BITS=64`, the host `F_SETLK` *macro* becomes `F_SETLK64` (13) on
   ILP32 hosts, but the guest sends arm64's `F_SETLK` (6). Match the **guest's
   literal** command values, then translate to the host macro when calling libc.
+- *An optval is not always opaque bytes.* `setsockopt` passes most option
+  buffers through unchanged, but `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`
+  take a `struct sock_fprog` whose second field is a **pointer** to the
+  classic-BPF program — the pass-through handed the kernel a guest VA as if it
+  were an emulator address, attaching a filter built from unrelated emulator
+  memory (traffic silently dropped; a DHCP client is the typical victim) or
+  failing with `EFAULT`. The program is bounced through `copy_from_guest` and
+  re-issued via a host-side `sock_fprog` (itself half the guest's size on an
+  ILP32 host). A NULL program still goes through un-bounced, preserving the
+  kernel's error order: a locked filter answers `EPERM` before the NULL
+  answers `EINVAL` (`tests/c/sockfilter.c`).
+- *`SO_RCVTIMEO`/`SO_SNDTIMEO` carry a `struct timeval`* — 16 bytes in the
+  guest's LP64 ABI but 8 in an ILP32 host's old-style one, and a time64 32-bit
+  libc (musl 1.2+) renumbers the option macros outright (66/67). Both
+  directions re-issue through the host libc's **own** macro and
+  `struct timeval`, which by definition agree with the host kernel; on an LP64
+  host the gate folds to a compile-time identity and the raw pass-through
+  stays. One kernel detail worth pinning: an out-of-range `tv_usec` answers
+  **`EDOM`**, not `EINVAL` (`tests/c/socktimeo.c`).
 
 ## Rootfs path containment (`src/path.c`)
 

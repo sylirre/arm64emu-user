@@ -386,8 +386,9 @@ wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
 - `DCZID_EL0` advertises a 64-byte DC ZVA block (self-consistent with the
   implementation); it differs from QEMU's advertised value but libc memset works.
-- FPSR cumulative exception flags are best-effort; NaN-payload propagation and
-  denormal flushing are not bit-exact (normal values match).
+- FPCR flush-to-zero (`FZ`) is not implemented — denormals compute at full
+  precision — and FPSR cumulative exception flags stay best-effort in denormal
+  corners; normal values and NaN generation/propagation match hardware.
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
 - Big-endian hosts are not supported (the SIMD register union is little-endian).
 
