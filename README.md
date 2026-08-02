@@ -254,12 +254,24 @@ itself what each provides (`tests/hostenv.sh`):
 | oracle | `qemu-aarch64` | `qemu-aarch64` if installed, else the CPU |
 | `make test32` | `gcc -m32` | armhf cross gcc, or SKIP |
 
-`A64_CC` overrides the compiler and `A64_ORACLE=qemu|native` the oracle.
-Running against hardware is the stricter check of the two — it compares the
-emulator with silicon rather than with a second emulator — and it is the only
-way the JIT's AArch64 backend is executed at all. A test that needs an
-optional extension (FP16, LSE, MOPS, SHA3, ...) declares it in a `REQUIRES:`
-marker and is skipped, with the reason named, on a CPU that lacks it.
+`A64_CC` overrides the compiler and `A64_ORACLE=qemu|native|recorded` the
+oracle. Running against hardware is the stricter check of the two live modes
+— it compares the emulator with silicon rather than with a second emulator —
+and it is the only way the JIT's AArch64 backend is executed at all. A test
+that needs an optional extension (FP16, LSE, MOPS, SHA3, ...) declares it in
+a `REQUIRES:` marker and is skipped, with the reason named, on a CPU that
+lacks it.
+
+A host that can neither build the guest programs nor run any oracle — a
+32-bit ARM device, whose CPU cannot execute AArch64 and for which no
+`qemu-aarch64` exists (qemu-user cannot fit a 64-bit guest address space
+into a 32-bit host one) — replays a **recorded** oracle instead:
+`make test-pack` on a dev box runs the suite once with every oracle answer
+captured and bundles it with the built test binaries; unpacked on the target
+at the same commit, `A64_ORACLE=recorded make test` runs everything portable
+against the recorded answers (tests that compare live host state skip, with
+the reason named). See
+[docs/android-termux.md](docs/android-termux.md).
 
 `make test` provisions the Alpine (busybox/bash) and glibc rootfs it needs
 from scratch into a repo-local cache (`tests/.cache/`) on first run. The

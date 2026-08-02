@@ -15,6 +15,10 @@ tests/c/*.bin
 tests/*.bin
 tests/fixtures/*.bin
 tests/bench/*.bin
+tests/ptrace/*.bin
+
+# recorded-oracle test pack (make test-pack)
+/arm64chroot-testpack.tar.gz
 
 # provisioned test rootfs (Alpine + glibc) built by tests/setup_env.sh
 tests/.cache/

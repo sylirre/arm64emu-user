@@ -211,6 +211,43 @@ works with the `LD_PRELOAD` shim disabled — and when the shim *is* enabled,
 emulator nor the oracle ever executes under it and both configurations test
 the same thing.
 
+## A 32-bit ARM device: the recorded oracle
+
+On an armv7 (armhf) device the differential suite has no way to run live:
+the CPU cannot execute AArch64 code, Termux's armhf repo has no
+aarch64-Linux toolchain, and `qemu-user` cannot help — its design maps guest
+addresses into host addresses directly, and a 64-bit guest's address space
+cannot fit inside a 32-bit host's, which is why distros ship no
+`qemu-aarch64` for armhf (and also exactly the gap this emulator's software
+page table exists to fill). The suite covers this host class from a 64-bit
+box instead: the answers travel, not the oracle.
+
+```sh
+make test-pack        # on the x86-64 (or arm64) dev box, qemu installed
+```
+
+runs one full suite pass with every oracle answer recorded, then bundles the
+built guest binaries, the recordings and the small glibc test rootfs into
+`arm64chroot-testpack.tar.gz`. Transfer it to the device, unpack it in the
+repo root **at the same commit** (the pack carries the commit id; replay
+warns on a mismatch), and run:
+
+```sh
+tar xzf arm64chroot-testpack.tar.gz
+ln -s ~/alpine-rootfs tests/.cache/rootfs/alpine   # any aarch64 rootfs with busybox
+A64_ORACLE=recorded make CC=clang test
+```
+
+Everything portable runs for real on the device — the asm and C differential
+tests (compared against the recorded answers), the dynamic-linking tests
+(against the packed glibc rootfs), the emulator-only self-checking blocks
+(fake-id, binds, mount/chroot/pivot_root, ptrace, seccomp fixtures), and the
+`insnfuzz` chaos/seq modes, which referee three engines against each other
+and never needed an oracle. What skips, by design: tests marked
+`NEEDS-HOST-READ`/`NEEDS-HOST-IOCTL` (they compare against the *recording*
+host's state), the proot-driven Alpine shell comparison, and anything whose
+binary or recording is missing from the pack — each named in the output.
+
 ## On-device smoke-test checklist
 
 Manual sanity pass for a real device (Debian/Ubuntu arm64 rootfs under

@@ -35,9 +35,17 @@ skip_build() {   # skip_build <what>
     skip=$((skip+1)); echo "SKIP build $1"
 }
 
+# Test binaries are deleted after use in a normal run; a pack-recording run
+# must keep every one (they ARE the pack), and a replay run must not eat the
+# pack it is running from. hostenv.sh sets A64_KEEP_TESTBINS for both.
+fx_rm() { [ "${A64_KEEP_TESTBINS:-0}" = 1 ] || rm -f "$@"; }
+
 run_diff() {   # run_diff <name> <binary> [args...]
     local name="$1"; shift
     local out_q out_e rc_q rc_e
+    if ! rec_have "$@"; then
+        skip=$((skip+1)); echo "SKIP $name (not in the test pack)"; return
+    fi
     # timeout (inside oracle_run for the reference side): a hanging test must
     # FAIL (rc 124 mismatch), not wedge the suite
     out_q=$(oracle_run "$@" 2>/dev/null); rc_q=$?
@@ -85,13 +93,18 @@ for cfile in tests/c/*.c; do
     # the emulator, which synthesizes the file, succeeds -- a difference in the
     # host's permissions, not in the emulator. Such a test names what it needs.
     need_read=$(grep -m1 -o 'NEEDS-HOST-READ:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-READ: *//')
+    need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
+    # Either marker means the test compares against THIS host's state, which a
+    # recorded oracle — the answers of another host — cannot referee.
+    if [ "$ORACLE_KIND" = recorded ] && [ -n "$need_read$need_ioctl" ]; then
+        skip=$((skip+1)); echo "SKIP c/${base} (compares host state; the recorded oracle ran elsewhere)"; continue
+    fi
     denied=
     for nf in $need_read; do
         head -c1 "$nf" >/dev/null 2>&1 || denied="$denied $nf"
     done
     # Same idea for an ioctl the host can refuse the oracle while the emulator
     # answers it (Android and SIOCGIFHWADDR).
-    need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
     for ni in $need_ioctl; do
         a64_oracle_ioctl_ok "$ni" || denied="$denied $ni"
     done
@@ -106,13 +119,18 @@ for cfile in tests/c/*.c; do
         skip_build "$cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
     GLIBC_ROOT="$A64_TEST_ROOT/glibc"
-    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null; then
+    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null &&
+       { rec_have0 /tmp/t.bin "$bd" ||
+         { skip=$((skip+1)); echo "SKIP c/${base}(dyn) (not in the test pack)"; false; }; }; then
         # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
         # us, at host /tmp for the oracle. QEMU_LD_PREFIX (unlike -L) survives
         # the host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
+        # (A replaying host may have no /tmp — Android — and no live oracle to
+        # need the copy; the rootfs staging is the one that matters there.)
+        mkdir -p "$GLIBC_ROOT/tmp"
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
-        cp "$bd" /tmp/t.bin
+        cp "$bd" /tmp/t.bin 2>/dev/null || true
         out_q=$(oracle_run0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
         out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
@@ -143,6 +161,8 @@ rm -f /tmp/t.bin
 if [ -x tests/c/l2s_rename_static.bin ]; then
     for mode in "" exchange; do
         label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
+        rec_have tests/c/l2s_rename_static.bin $mode || {
+            skip=$((skip+1)); echo "SKIP $label (not in the test pack)"; continue; }
         out_q=$(oracle_run tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
         out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
@@ -162,6 +182,8 @@ fi
 for base in shm_sysv shm_stat; do
     SHMBIN="tests/c/${base}_static.bin"
     [ -x "$SHMBIN" ] || continue
+    rec_have "$SHMBIN" || {
+        skip=$((skip+1)); echo "SKIP c/${base}(file-tier) (not in the test pack)"; continue; }
     out_q=$(oracle_run "$SHMBIN" 2>/dev/null); rc_q=$?
     out_e=$(A64_SHM_FORCE_FILE=1 timeout 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
@@ -178,7 +200,9 @@ done
 # from /dev/urandom / /dev/random -- the tier a host kernel without getrandom
 # (Android 7's 3.x) is served by -- and require identical semantics.
 GRBIN="tests/c/getrandom_static.bin"
-if [ -x "$GRBIN" ]; then
+if [ -x "$GRBIN" ] && ! rec_have "$GRBIN"; then
+    skip=$((skip+1)); echo "SKIP c/getrandom(dev-tier) (not in the test pack)"
+elif [ -x "$GRBIN" ]; then
     out_q=$(oracle_run "$GRBIN" 2>/dev/null); rc_q=$?
     out_e=$(A64_GETRANDOM_FORCE_DEV=1 timeout 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
@@ -263,11 +287,12 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         sh -c 'sleep 5 & p=$!; sleep 0.3; awk "/^Uid:/{print \$2}" /proc/$p/status; kill $p'
     # vfork+exec+wait must reap the child (regression: vfork treated as a thread
     # broke wait4 with ECHILD and corrupted the shared image).
-    "$AGCC" -O1 -static -o "$ALPINE/tmp/ci_vfork" tests/fixtures/vfork.c 2>/dev/null &&
+    "$AGCC" -O1 -static -o tests/fixtures/vfork.bin tests/fixtures/vfork.c 2>/dev/null &&
+        cp tests/fixtures/vfork.bin "$ALPINE/tmp/ci_vfork" &&
         check_fakeid "vfork+exec+wait" "child-echo
 vfork child=1 waited=1 exited=1 status=0
 fork done rc=0" "$ALPINE" /tmp/ci_vfork
-    rm -f "$ALPINE/tmp/ci_vfork"
+    rm -f "$ALPINE/tmp/ci_vfork"; fx_rm tests/fixtures/vfork.bin
     # adduser exercises vfork+exec of helpers under fake-root.
     check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
         --fake-id "$ALPINE" /bin/sh -c \
@@ -281,7 +306,8 @@ fi
 # The probe reads the host's /proc/net/unix itself, so a host that denies it
 # (Android) makes every answer empty -- nothing to do with the tagging.
 if [ -x "$ALPINE/bin/busybox" ] && head -c1 /proc/net/unix >/dev/null 2>&1 && \
-   "$AGCC" -O2 -static -o "$ALPINE/tmp/ci_absprobe" tests/fixtures/absprobe.c 2>/dev/null; then
+   "$AGCC" -O2 -static -o tests/fixtures/absprobe.bin tests/fixtures/absprobe.c 2>/dev/null && \
+   cp tests/fixtures/absprobe.bin "$ALPINE/tmp/ci_absprobe"; then
     check_abs() {   # check_abs <label> <expected> <emu args...>
         local label="$1" expect="$2"; shift 2
         local got; got=$("$EMU" "$@" 2>/dev/null)
@@ -290,7 +316,7 @@ if [ -x "$ALPINE/bin/busybox" ] && head -c1 /proc/net/unix >/dev/null 2>&1 && \
     }
     check_abs "isolated per rootfs by default" "abstract=tag" "$ALPINE" /tmp/ci_absprobe
     check_abs "shared via opt-out flag"        "abstract=raw" --share-abstract-sockets "$ALPINE" /tmp/ci_absprobe
-    rm -f "$ALPINE/tmp/ci_absprobe"
+    rm -f "$ALPINE/tmp/ci_absprobe"; fx_rm tests/fixtures/absprobe.bin
 fi
 
 # ---- guest env inheritance (self-checking; qemu-user inherits the full host
@@ -594,8 +620,9 @@ fi
 # alpine rootfs, chroots in, and checks containment; the end-to-end case runs the
 # `chroot` command with busybox reached through bind mounts. Gated on --fake-id. ----
 if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
-    if "$AGCC" -static -O2 -o "$ALPINE/tmp/chroot_probe.bin" \
-            tests/fixtures/chroot_probe.c 2>/dev/null; then
+    if "$AGCC" -static -O2 -o tests/fixtures/chroot_probe.bin \
+            tests/fixtures/chroot_probe.c 2>/dev/null &&
+       cp tests/fixtures/chroot_probe.bin "$ALPINE/tmp/chroot_probe.bin"; then
         rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
         got=$("$EMU" --fake-id "$ALPINE" /tmp/chroot_probe.bin 2>/dev/null)
         expect=$'chroot rc=0\ncwd=/\nread=inside\nescape_dotdot=contained\noutside_visible=no'
@@ -606,7 +633,7 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
         got=$("$EMU" "$ALPINE" /tmp/chroot_probe.bin 2>/dev/null | head -1)
         if [ "$got" = "chroot rc=-1 err=1" ]; then pass=$((pass+1)); echo "PASS chroot: unprivileged EPERM"
         else fail=$((fail+1)); echo "FAIL chroot: unprivileged EPERM (got '$got')"; fi
-        rm -f "$ALPINE/tmp/chroot_probe.bin"
+        rm -f "$ALPINE/tmp/chroot_probe.bin"; fx_rm tests/fixtures/chroot_probe.bin
         rm -rf "$ALPINE/croottest" "$ALPINE/outside_marker"
     else
         skip_build "fixtures/chroot_probe"
@@ -690,7 +717,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: seccomp_probe"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/seccomp_probe.bin
+        fx_rm tests/fixtures/seccomp_probe.bin
     else
         skip_build "fixtures/seccomp_probe"
     fi
@@ -713,7 +740,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: status_probe"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/status_probe.bin
+        fx_rm tests/fixtures/status_probe.bin
     else
         skip_build "fixtures/status_probe"
     fi
@@ -739,7 +766,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: rlimits"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/rlimits.bin
+        fx_rm tests/fixtures/rlimits.bin
     else
         skip_build "fixtures/rlimits"
     fi
@@ -769,7 +796,7 @@ if [ -n "$AGCC" ]; then
             printf '     no-predecode: %s\n' "$(echo "$cu_p" | tr '\n' ' ')"
             printf '     jit:          %s\n' "$(echo "$cu_j" | tr '\n' ' ')"
         fi
-        rm -f tests/fixtures/cu_writeback.bin
+        fx_rm tests/fixtures/cu_writeback.bin
     else
         skip_build "fixtures/cu_writeback"
     fi
@@ -785,8 +812,9 @@ fi
 # a child's namespace for real. Gated on --fake-id, like the mount and chroot
 # emulation itself. ----
 if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
-    if "$AGCC" -static -O2 -o "$ALPINE/tmp/sandbox_probe.bin" \
-            tests/fixtures/sandbox_probe.c 2>/dev/null; then
+    if "$AGCC" -static -O2 -o tests/fixtures/sandbox_probe.bin \
+            tests/fixtures/sandbox_probe.c 2>/dev/null &&
+       cp tests/fixtures/sandbox_probe.bin "$ALPINE/tmp/sandbox_probe.bin"; then
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
         got=$("$EMU" --fake-id "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null)
         expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\numap_sg=4\numap_empty=[]\numap_gid=8\numap_sg_late=1\numap_uid=8\numap_junk=1\numap_back=         0       1000          1\numap_child_uid=         0       1000          1\numap_child_gid=         0       1000          1\numap_child_sg=deny\numap_child_twice=1\numap_inherit=         0       1000          1\numap_status=0\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\nouter_root=1'
@@ -800,7 +828,7 @@ if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
         got=$("$EMU" "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null | head -1)
         if [ "$got" = "tmpfs=-1" ]; then pass=$((pass+1)); echo "PASS sandbox: unprivileged EPERM"
         else fail=$((fail+1)); echo "FAIL sandbox: unprivileged EPERM (got '$got')"; fi
-        rm -f "$ALPINE/tmp/sandbox_probe.bin"
+        rm -f "$ALPINE/tmp/sandbox_probe.bin"; fx_rm tests/fixtures/sandbox_probe.bin
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
     else
         skip_build "fixtures/sandbox_probe"
@@ -825,7 +853,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: userns_race"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/userns_race.bin
+        fx_rm tests/fixtures/userns_race.bin
     else
         skip_build "fixtures/userns_race"
     fi
@@ -855,7 +883,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: mtexec"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/mtexec.bin
+        fx_rm tests/fixtures/mtexec.bin
     else
         skip_build "fixtures/mtexec"
     fi
@@ -879,7 +907,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: mainexit"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/mainexit.bin
+        fx_rm tests/fixtures/mainexit.bin
     else
         skip_build "fixtures/mainexit"
     fi
@@ -901,7 +929,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/ownfdexec.bin
+        fx_rm tests/fixtures/ownfdexec.bin
     else
         skip_build "fixtures/ownfdexec"
     fi
@@ -926,7 +954,7 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: procfs_hostleak"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/procfs_hostleak.bin
+        fx_rm tests/fixtures/procfs_hostleak.bin
     else
         skip_build "fixtures/procfs_hostleak"
     fi
@@ -938,8 +966,9 @@ fi
 # needs a writable fd, so a plain read-only open used to be enough to reach the
 # host file behind the bind and change its metadata. ----
 if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
-    if "$AGCC" -static -O2 -o "$ALPINE/tmp/robind.bin" \
-            tests/fixtures/robind.c 2>/dev/null; then
+    if "$AGCC" -static -O2 -o tests/fixtures/robind.bin \
+            tests/fixtures/robind.c 2>/dev/null &&
+       cp tests/fixtures/robind.bin "$ALPINE/tmp/robind.bin"; then
         ROSRC="$A64_TEST_ROOT/robind_src"
         rm -rf "$ROSRC"; mkdir -p "$ROSRC"; echo content > "$ROSRC/f"
         chmod 644 "$ROSRC/f"
@@ -957,7 +986,7 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
         else
             fail=$((fail+1)); echo "FAIL bind: host file untouched through :ro (mode=$hmode)"
         fi
-        rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin"
+        rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin"; fx_rm tests/fixtures/robind.bin
     else
         skip_build "fixtures/robind"
     fi
@@ -976,7 +1005,7 @@ check_fixture() {   # check_fixture <name> <expected>
         fail=$((fail+1)); echo "FAIL fixture: $name"
         diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
     fi
-    rm -f "tests/fixtures/$name.bin"
+    fx_rm "tests/fixtures/$name.bin"
 }
 check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
@@ -1025,7 +1054,7 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             diff <(echo "$nl_common") <(echo "$folded") | head -6 | sed 's/^/     /'
         fi
     done
-    rm -f tests/fixtures/netns_ack.bin
+    fx_rm tests/fixtures/netns_ack.bin
 else
     skip_build "fixtures/netns_ack"
 fi
@@ -1083,7 +1112,7 @@ overflowuid=65534 overflowgid=65534'
         else fail=$((fail+1)); echo "FAIL procfs: overflowids passthrough (want '$want', got '$got')"; fi
     fi
     rm -rf "$PFROOT"
-    rm -f tests/fixtures/procfs_fidelity.bin
+    fx_rm tests/fixtures/procfs_fidelity.bin
 else
     skip_build "fixtures/procfs_fidelity"
 fi
@@ -1104,7 +1133,10 @@ if [ -n "$HCC" ] && [ "$(od -An -j4 -N1 -tu1 "$EMU" | tr -d ' ')" = "2" ]; then
         wrap_ok=1
     fi
 fi
-if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
+if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ] &&
+   ! rec_have tests/c/statx_static.bin; then
+    echo "SKIP seccomp-mimic (statx not in the test pack)"; skip=$((skip+1))
+elif [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
     out_q=$(oracle_run tests/c/statx_static.bin 2>/dev/null); rc_q=$?
     out_e=$("$WRAP" "$EMU" / tests/c/statx_static.bin 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
@@ -1123,7 +1155,7 @@ if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
             fail=$((fail+1)); echo "FAIL seccomp: trapped keyring -> ENOSYS"
             echo "$out" | head -4 | sed 's/^/     /'
         fi
-        rm -f tests/fixtures/keyring_enosys.bin
+        fx_rm tests/fixtures/keyring_enosys.bin
     fi
 else
     echo "SKIP seccomp-mimic (needs LP64 build, host cc, seccomp)"
@@ -1148,7 +1180,7 @@ for pt in tests/ptrace/*.c; do
             fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$out')"
         fi
     done
-    rm -f "$ptbin"
+    fx_rm "$ptbin"
 done
 
 # ---- differential instruction fuzzer (tests/fixtures/insnfuzz.c) ----
@@ -1206,7 +1238,7 @@ if [ -n "$AGCC" ]; then
             diff <(echo "$s_pd") <(echo "$s_np") | head -4 | sed 's/^/     pd-vs-decoder /'
             diff <(echo "$s_pd") <(echo "$s_jit") | head -4 | sed 's/^/     pd-vs-jit     /'
         fi
-        rm -f "$ifb"
+        fx_rm "$ifb"
     else
         skip_build "fixtures/insnfuzz"
     fi

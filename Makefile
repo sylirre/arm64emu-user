@@ -135,6 +135,25 @@ test-env:
 test: arm64chroot
 	bash tests/run_tests.sh ./arm64chroot
 
+# Record a portable test pack: one full suite run under the qemu oracle with
+# every oracle answer captured (A64_RECORD=1), then the built guest binaries,
+# the recordings and the small glibc test rootfs bundled into a tarball. A
+# host that can neither build the guests nor run any oracle — a 32-bit ARM
+# device: its CPU cannot execute AArch64, and qemu-user cannot map a 64-bit
+# guest into a 32-bit address space at all — unpacks it in the repo root (at
+# the SAME commit; the pack carries the id and the replay warns on mismatch)
+# and replays with `A64_ORACLE=recorded make test`. The Alpine-backed
+# self-checking sections additionally want an aarch64 rootfs with busybox at
+# tests/.cache/rootfs/alpine — a symlink to any existing rootfs is fine.
+test-pack: arm64chroot
+	rm -rf tests/.cache/recorded
+	A64_ORACLE=qemu A64_RECORD=1 bash tests/run_tests.sh ./arm64chroot
+	git rev-parse HEAD > tests/.cache/recorded/COMMIT
+	tar czf arm64chroot-testpack.tar.gz \
+	    $$(find tests/asm tests/c tests/fixtures tests/ptrace -name '*.bin') \
+	    tests/.cache/recorded tests/.cache/rootfs/glibc
+	@ls -lh arm64chroot-testpack.tar.gz
+
 # The ILP32-host variant needs a 32-bit toolchain for THIS host *and* a 32-bit
 # runtime able to execute what it produces: gcc -m32 plus multilib on x86-64,
 # an armhf cross compiler plus armhf libraries on an AArch64 host — and there,
@@ -193,4 +212,4 @@ clean:
 clean-testenv:
 	rm -rf tests/.cache
 
-.PHONY: m32 test-env test test32 test-jit test-android-sim test-seccomp clean clean-testenv
+.PHONY: m32 test-env test test-pack test32 test-jit test-android-sim test-seccomp clean clean-testenv

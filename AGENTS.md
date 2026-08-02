@@ -116,8 +116,13 @@ Basic testing which enough for most cases to ensure no regressions:
 * `make test32`: suite against the 32-bit ILP32-host build (skips, with the reason named, where the host has no runnable 32-bit toolchain).
 
 The oracle is `qemu-aarch64`, or on an AArch64 host the CPU itself when qemu
-is not installed; `A64_ORACLE=qemu|native` pins it and `A64_CC` overrides the
-compiler. Against hardware, a test needing an optional extension the CPU lacks
+is not installed; `A64_ORACLE=qemu|native|recorded` pins it and `A64_CC`
+overrides the compiler. `make test-pack` records a full run (binaries + every
+oracle answer) into `arm64chroot-testpack.tar.gz`; a host with no toolchain
+and no possible oracle — a 32-bit ARM device — unpacks it at the same commit
+and replays with `A64_ORACLE=recorded make test` (host-state tests skip; the
+Alpine-backed sections want any aarch64 rootfs symlinked at
+tests/.cache/rootfs/alpine). Against hardware, a test needing an optional extension the CPU lacks
 skips instead of failing — it declares what it needs in a `REQUIRES:` marker
 naming HWCAP strings (see `tests/hostenv.sh`). Add one to any new test that
 uses an instruction outside ARMv8.0-A.

@@ -41,7 +41,12 @@ a64_host_arm64() {
 }
 
 # ---- the guest compiler ------------------------------------------------------
-if [ -n "${A64_CC:-}" ]; then
+if [ "${A64_ORACLE:-auto}" = recorded ]; then
+    # Replaying a test pack: no toolchain is needed (or available). The
+    # stand-in succeeds exactly when the -o target is already in the pack, so
+    # every compile-or-skip site keeps its meaning without building anything.
+    AGCC="tests/replay_cc.sh"
+elif [ -n "${A64_CC:-}" ]; then
     AGCC="$A64_CC"
 else
     AGCC=$(command -v aarch64-linux-gnu-gcc 2>/dev/null) ||
@@ -87,6 +92,33 @@ EOF
     [ "$A64_NATIVE_EXEC" = 1 ]
 }
 
+# Recorded-oracle support: make test-pack runs the suite with A64_RECORD=1,
+# saving every oracle answer keyed by its invocation (binary + args) next to
+# the built test binaries. A host that can neither build the guests nor run
+# any oracle — a 32-bit ARM device: the CPU cannot execute AArch64, and
+# qemu-user cannot map a 64-bit guest into a 32-bit address space at all —
+# unpacks that in the repo root and replays it with A64_ORACLE=recorded.
+# Recordings are only valid where the oracle's output does not depend on the
+# recording host; tests that compare host state (the NEEDS-HOST-* markers)
+# are skipped by run_tests.sh in this mode.
+A64_RECORD_DIR="${A64_RECORD_DIR:-tests/.cache/recorded}"
+
+rec_key() { printf '%s' "$*" | tr '/ ' '__'; }
+rec_have() {   # rec_have <oracle_run args...> — false only in replay mode with no recording
+    [ "$ORACLE_KIND" != recorded ] || [ -f "$A64_RECORD_DIR/$(rec_key "$@").out" ]
+}
+rec_have0() { _r0="$1"; shift; rec_have "argv0=$_r0" "$@"; }
+rec_save() {   # rec_save <key> <rc> <output>
+    mkdir -p "$A64_RECORD_DIR"
+    printf '%s' "$3" > "$A64_RECORD_DIR/$1.out"
+    printf '%s\n' "$2" > "$A64_RECORD_DIR/$1.rc"
+}
+rec_replay() {   # rec_replay <key>; a missing recording answers rc 213
+    [ -f "$A64_RECORD_DIR/$1.out" ] && [ -f "$A64_RECORD_DIR/$1.rc" ] || return 213
+    cat "$A64_RECORD_DIR/$1.out"
+    return "$(cat "$A64_RECORD_DIR/$1.rc")"
+}
+
 ORACLE_QEMU=$(command -v qemu-aarch64 2>/dev/null) || ORACLE_QEMU=
 case "${A64_ORACLE:-auto}" in
     qemu)
@@ -95,20 +127,41 @@ case "${A64_ORACLE:-auto}" in
     native)
         if a64_native_exec_works; then ORACLE_KIND=native
         else ORACLE_KIND=none; echo "A64_ORACLE=native but this host cannot execute AArch64 binaries" >&2; fi ;;
+    recorded)
+        if [ -d "$A64_RECORD_DIR" ]; then
+            ORACLE_KIND=recorded
+            if [ -f "$A64_RECORD_DIR/COMMIT" ] &&
+               _hc=$(git rev-parse HEAD 2>/dev/null) && [ -n "$_hc" ] &&
+               [ "$_hc" != "$(cat "$A64_RECORD_DIR/COMMIT")" ]; then
+                echo "WARN: test pack recorded at commit $(cut -c1-12 "$A64_RECORD_DIR/COMMIT"), tree is at $(printf '%.12s' "$_hc") — regenerate with make test-pack if tests changed" >&2
+            fi
+        else
+            ORACLE_KIND=none
+            echo "A64_ORACLE=recorded but $A64_RECORD_DIR is missing (unpack a test pack in the repo root first)" >&2
+        fi ;;
     auto)
         if   [ -n "$ORACLE_QEMU" ];   then ORACLE_KIND=qemu
         elif a64_native_exec_works;   then ORACLE_KIND=native
         else ORACLE_KIND=none; fi ;;
     *)
         ORACLE_KIND=none
-        echo "A64_ORACLE must be auto, qemu or native (got '$A64_ORACLE')" >&2 ;;
+        echo "A64_ORACLE must be auto, qemu, native or recorded (got '$A64_ORACLE')" >&2 ;;
 esac
 
 case "$ORACLE_KIND" in
-    qemu)   ORACLE_DESC="$ORACLE_QEMU" ;;
-    native) ORACLE_DESC="native execution on $A64_HOST_ARCH" ;;
-    *)      ORACLE_DESC="none" ;;
+    qemu)     ORACLE_DESC="$ORACLE_QEMU" ;;
+    native)   ORACLE_DESC="native execution on $A64_HOST_ARCH" ;;
+    recorded) ORACLE_DESC="recorded oracle answers ($A64_RECORD_DIR)" ;;
+    *)        ORACLE_DESC="none" ;;
 esac
+
+# A pack-recording run must keep every test binary it builds (they ARE the
+# pack), and a replay run must not delete the pack it is running from.
+if [ -n "${A64_RECORD:-}" ] || [ "$ORACLE_KIND" = recorded ]; then
+    A64_KEEP_TESTBINS=1
+else
+    A64_KEEP_TESTBINS="${A64_KEEP_TESTBINS:-0}"
+fi
 
 # Feature gating (see host_missing_features) applies only where the thing
 # executing the reference really is an AArch64 CPU. Under qemu — including
@@ -121,6 +174,21 @@ if [ "$ORACLE_KIND" = native ] && a64_host_arm64; then ORACLE_GATE=1; else ORACL
 # one thing the native path still needs when "native" is binfmt_misc handing
 # the binary to qemu after all.
 oracle_run() {   # oracle_run <binary> [args...]
+    if [ "$ORACLE_KIND" = recorded ]; then
+        rec_replay "$(rec_key "$@")"
+        return
+    fi
+    if [ -n "${A64_RECORD:-}" ]; then
+        if [ "$ORACLE_KIND" = qemu ]; then
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@")
+        else
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$@")
+        fi
+        _rr=$?
+        rec_save "$(rec_key "$@")" "$_rr" "$_ro"
+        printf '%s' "$_ro"
+        return $_rr
+    fi
     if [ "$ORACLE_KIND" = qemu ]; then
         QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
     else
@@ -133,6 +201,23 @@ oracle_run() {   # oracle_run <binary> [args...]
 # that can set argv[0] across an exec, which is bash (`exec -a`), not POSIX sh.
 oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
     _a0="$1"; shift
+    if [ "$ORACLE_KIND" = recorded ]; then
+        rec_replay "$(rec_key "argv0=$_a0" "$@")"
+        return
+    fi
+    if [ -n "${A64_RECORD:-}" ]; then
+        if [ "$ORACLE_KIND" = qemu ]; then
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+                "$ORACLE_QEMU" -0 "$_a0" "$@")
+        else
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+                bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@")
+        fi
+        _rr=$?
+        rec_save "$(rec_key "argv0=$_a0" "$@")" "$_rr" "$_ro"
+        printf '%s' "$_ro"
+        return $_rr
+    fi
     if [ "$ORACLE_KIND" = qemu ]; then
         QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
             "$ORACLE_QEMU" -0 "$_a0" "$@"
