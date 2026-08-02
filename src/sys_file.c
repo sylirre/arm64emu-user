@@ -2193,11 +2193,24 @@ SYSDEF(fdatasync) { return fdatasync((int)a0) < 0 ? host_err() : 0; }
 
 SYSDEF(sync) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sync(); return 0; }
 
-/* syncfs/readahead: Bionic only declares these wrappers on newer API levels,
- * so issue the raw syscalls there -- both numbers are on the Android 8
- * seccomp allow-list, and Android hosts are LP64 so the 64-bit readahead
- * offset passes in a single register. glibc's wrappers handle the ILP32
- * argument split. */
+/* syncfs/readahead/sync_file_range: Bionic only declares these wrappers on
+ * newer API levels, so issue the raw syscalls there -- all three numbers are on
+ * the Android 8 seccomp allow-list.  Termux also builds for 32-bit ARM, and
+ * there an argument the guest passed in one register needs two of the host's,
+ * so the halves have to be handed over one at a time: syscall(3) is variadic,
+ * and giving it an s64 would let the ABI's own 8-byte varargs alignment insert
+ * padding between the words that the kernel is not expecting. glibc's and
+ * musl's wrappers do all of this themselves. */
+#if __SIZEOF_LONG__ == 4
+/* A 64-bit syscall argument as the two words an ILP32 register pair holds,
+ * lower-numbered register first. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define SC_ARG64(x) (long)(u32)((u64)(x) >> 32), (long)(u32)(u64)(x)
+#else
+#define SC_ARG64(x) (long)(u32)(u64)(x), (long)(u32)((u64)(x) >> 32)
+#endif
+#endif
+
 SYSDEF(syncfs) {
 #ifdef __BIONIC__
     return syscall(SYS_syncfs, (int)a0) < 0 ? host_err() : 0;
@@ -2217,17 +2230,25 @@ SYSDEF(readahead) {
 }
 
 SYSDEF(sync_file_range) {
-    /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic.
-     * glibc's wrapper maps to the host's sync_file_range/sync_file_range2 ABI,
-     * including 64-bit arg marshalling on ILP32.  Bionic (Termux) doesn't
-     * declare the wrapper, so issue the raw syscall there; Android hosts are
-     * LP64, so the 64-bit offset/nbytes pass in single registers. */
+    /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic,
+     * but the syscall carrying them is not. 32-bit ARM has no
+     * __NR_sync_file_range at all: it carries sync_file_range2, which takes the
+     * flags second precisely so that the two 64-bit arguments each start on an
+     * even-numbered register and need no padding of their own. Reaching for the
+     * undeclared wrapper there was the whole bug -- a Termux arm build did not
+     * compile. */
     (void)a4; (void)a5;
     long r;
-#if defined(__BIONIC__) && defined(SYS_sync_file_range)
-    r = syscall(SYS_sync_file_range, (int)a0, (s64)a1, (s64)a2, (unsigned)a3);
-#else
+#if !defined(__BIONIC__)
     r = sync_file_range((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (unsigned)a3);
+#elif __SIZEOF_LONG__ == 8
+    r = syscall(SYS_sync_file_range, (int)a0, (s64)a1, (s64)a2, (unsigned)a3);
+#elif defined(SYS_sync_file_range2)
+    r = syscall(SYS_sync_file_range2, (int)a0, (unsigned)a3,
+                SC_ARG64(a1), SC_ARG64(a2));
+#else
+    r = syscall(SYS_sync_file_range, (int)a0, SC_ARG64(a1), SC_ARG64(a2),
+                (unsigned)a3);
 #endif
     return r < 0 ? host_err() : 0;
 }
