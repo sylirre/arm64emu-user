@@ -11,16 +11,11 @@
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK)
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
 
-/* Anonymous memfd backing a MAP_SHARED|MAP_ANONYMOUS region. Bionic declares the
- * wrapper only on newer API levels; the raw syscall is on the Android allow-list
- * (as in proctab.c). */
-static int anon_memfd(void) {
-#if defined(__BIONIC__) && defined(SYS_memfd_create)
-    return (int)syscall(SYS_memfd_create, "a64shared", 1 /* MFD_CLOEXEC */);
-#else
-    return memfd_create("a64shared", MFD_CLOEXEC);
-#endif
-}
+/* Anonymous backing for a MAP_SHARED|MAP_ANONYMOUS region. a64_anonfd falls
+ * back to an unlinked temp file on hosts whose kernel predates memfd_create
+ * (< 3.17 — Android 7): a nameless shared region must still stay shared
+ * across fork() there. */
+static int anon_memfd(void) { return a64_anonfd("a64shared"); }
 
 /* Guest mmap flag values (asm-generic == x86 for these). */
 #define G_MAP_SHARED    0x01

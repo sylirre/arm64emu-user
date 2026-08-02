@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -451,6 +452,36 @@ static const char *tmpfs_base(void) {
     if (access("/data/local/tmp", W_OK) == 0) return "/data/local/tmp";
     if (access("/tmp", W_OK) == 0) return "/tmp";
     return NULL;
+}
+
+/* Anonymous backing fd: a memfd where the host has one, else an unlinked temp
+ * file from the writable-dir chain above. A host kernel below 3.17 (Android 7
+ * devices run 3.x) has no memfd_create at all, and the internal users of one
+ * -- the synthesized /proc views, the MAP_SHARED|MAP_ANONYMOUS backing --
+ * silently degraded there: every synthesized /proc open fell through to the
+ * HOST file, so a guest under --fake-id read the emulator's own Uid, mount
+ * table and environment. The Bionic raw-syscall split mirrors proctab.c (the
+ * wrapper is only declared on newer API levels; the number is on the Android
+ * allow-list), and a seccomp-trapped call comes back ENOSYS through the
+ * SIGSYS net, landing in the same fallback. The name is a debugging label,
+ * exactly as it is for a memfd. */
+int a64_anonfd(const char *name) {
+    int fd;
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    fd = (int)syscall(SYS_memfd_create, name, 1 /* MFD_CLOEXEC */);
+#else
+    fd = memfd_create(name, MFD_CLOEXEC);
+#endif
+    if (fd >= 0 || errno != ENOSYS) return fd;
+    const char *base = tmpfs_base();
+    if (!base) return -1;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/a64-%s.XXXXXX", base, name);
+    fd = mkstemp(p);
+    if (fd < 0) return -1;
+    unlink(p);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
 }
 
 /* "<base>/arm64chroot-tmpfs.<uid>.<root pid>": the root pid (high half of the

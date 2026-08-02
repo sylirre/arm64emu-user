@@ -21,6 +21,10 @@ typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
  * values are identical on x86, x86_64, arm and arm64, so this is a sign flip. */
 static inline u64 host_err(void) { return (u64)(s64)(-errno); }
 
+/* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
+ * the host kernel predates it (< 3.17 — Android 7 devices). */
+int a64_anonfd(const char *name);
+
 /* Copy a guest path string and resolve it against the rootfs.
  * rflags: PATH_NOFOLLOW_LAST etc. Returns 0 or -errno. */
 static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,

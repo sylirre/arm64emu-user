@@ -749,15 +749,12 @@ out:
     pthread_mutex_unlock(&pf_lock);
 }
 
-/* Anonymous backing for a synthesized /proc view. Bionic only declares the
- * wrapper on newer API levels; the raw syscall is on the Android 8 allow-list. */
-static int synth_memfd(void) {
-#if defined(__BIONIC__) && defined(SYS_memfd_create)
-    return (int)syscall(SYS_memfd_create, "proc-synth", 1 /* MFD_CLOEXEC */);
-#else
-    return memfd_create("proc-synth", MFD_CLOEXEC);
-#endif
-}
+/* Anonymous backing for a synthesized /proc view. a64_anonfd falls back to an
+ * unlinked temp file on hosts whose kernel predates memfd_create (< 3.17 —
+ * Android 7): without that, every synthesized open here silently fell through
+ * to the HOST file, and a guest read the emulator's own Uid lines, mount
+ * table and environment. */
+static int synth_memfd(void) { return a64_anonfd("proc-synth"); }
 
 /* Which spelling of "status" canon names, if any: PS_SELF for this process
  * (self / own-pid / thread-self / one of our own threads' task dirs), PS_OTHER
