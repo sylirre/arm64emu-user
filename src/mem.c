@@ -664,9 +664,45 @@ static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool 
  * A fault inside JIT-*generated* code is the one case that is not recoverable
  * -- guest registers cached in host registers would be lost -- so it is
  * declined and stays fatal. */
-__thread sigjmp_buf g_bus_jb;
+__thread BusJmpBuf g_bus_jb;
 __thread int g_bus_armed;
 static __thread CPU *g_bus_cpu;
+
+#if defined(__arm__) && defined(__BIONIC__)
+/* See mmu.h: libc sigsetjmp on this target parks a cookie-mangled value in
+ * the live sp register while it saves, and an async signal delivered in that
+ * window is fatal. These save the same callee-saved state (plus fpscr, which
+ * libc setjmp also carries) without ever writing a non-pointer to sp: the
+ * only sp write is longjmp's single `mov sp, r2` of the saved value. Thumb2
+ * and ARM encodings both exist for every instruction used. */
+__attribute__((naked)) int bus_setjmp(BusJmpBuf *jb) {
+    __asm__ volatile(
+        "mov    r1, sp\n\t"
+        "stmia  r0!, {r4-r11}\n\t"
+        "str    r1, [r0], #4\n\t"
+        "str    lr, [r0], #4\n\t"
+        "vmrs   r1, fpscr\n\t"
+        "str    r1, [r0], #4\n\t"
+        "vstmia r0!, {d8-d15}\n\t"
+        "movs   r0, #0\n\t"
+        "bx     lr\n\t");
+}
+__attribute__((naked)) void bus_longjmp(BusJmpBuf *jb, int val) {
+    __asm__ volatile(
+        "ldmia  r0!, {r4-r11}\n\t"
+        "ldr    r2, [r0], #4\n\t"
+        "ldr    lr, [r0], #4\n\t"
+        "mov    sp, r2\n\t"
+        "ldr    r2, [r0], #4\n\t"
+        "vmsr   fpscr, r2\n\t"
+        "vldmia r0!, {d8-d15}\n\t"
+        "movs   r0, r1\n\t"
+        "bne    1f\n\t"
+        "movs   r0, #1\n\t"
+        "1:\n\t"
+        "bx     lr\n\t");
+}
+#endif
 
 void as_bus_arm(CPU *c) { g_bus_cpu = c; g_bus_armed = 1; }
 void as_bus_disarm(void) { g_bus_armed = 0; }
@@ -675,7 +711,7 @@ void as_bus_disarm(void) { g_bus_armed = 0; }
  * emulated-TLS access -- which mallocs -- can happen inside the handler. */
 void bus_tls_prewarm(void) {
     (void)*(volatile int *)&g_bus_armed;
-    (void)*(volatile char *)g_bus_jb;
+    (void)*(volatile char *)&g_bus_jb;
     (void)*(volatile CPU *volatile *)&g_bus_cpu;
 }
 
@@ -764,12 +800,12 @@ static void bus_catcher(int sig, siginfo_t *si, void *uc) {
         cpu_raise_sync(g_bus_cpu,
                        esr_make(EC_DABORT_LOWER, iss_dabort(false, FSC_EXTERNAL)),
                        far);
-        sigset_t only;                   /* delivery blocked it; siglongjmp
+        sigset_t only;                   /* delivery blocked it; bus_longjmp
                                           * (savemask 0) will not put it back */
         sigemptyset(&only);
         sigaddset(&only, SIGBUS);
         sigprocmask(SIG_UNBLOCK, &only, NULL);
-        siglongjmp(g_bus_jb, 1);
+        bus_longjmp(&g_bus_jb, 1);
     }
     /* Not ours, or not recoverable from here: restore the default so the
      * retried access kills us exactly as it did before. */

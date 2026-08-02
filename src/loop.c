@@ -71,13 +71,16 @@ int emu_loop(CPU *c) {
         /* Bus-error recovery bracket (mem.c). A file truncated from outside
          * this address space leaves PTEs pointing at host pages the kernel now
          * refuses; the handler records the guest abort and unwinds to here,
-         * where the sigsetjmp returns nonzero and the engines are skipped so
+         * where the bus_setjmp returns nonzero and the engines are skipped so
          * the pending exception below is delivered. Cheap: once per run-loop
          * round trip, not per instruction, and savemask 0 keeps it a pure
          * register save (the handler unblocks SIGBUS itself before unwinding).
-         * Deliberately does NOT cover syscall dispatch further down: a handler
-         * may hold locks that an unwind would strand. */
-        if (sigsetjmp(g_bus_jb, 0) == 0) {
+         * On arm32 Bionic bus_setjmp is our own save, not libc sigsetjmp,
+         * which parks a mangled value in the live sp -- fatal under this
+         * loop's async-signal traffic (mmu.h has the story). Deliberately
+         * does NOT cover syscall dispatch further down: a handler may hold
+         * locks that an unwind would strand. */
+        if (bus_setjmp(&g_bus_jb) == 0) {
         as_bus_arm(c);
         if (UNLIKELY(g_debug_hooks)) {
             /* Full step: keeps every per-instruction debug facility

@@ -63,12 +63,33 @@ void tlb_flush_all(void);
  * A file truncated from outside this address space leaves PTEs pointing at
  * host pages the kernel now refuses; the resulting SIGBUS lands on the
  * emulator rather than the guest. as_bus_init installs the handler, and the
- * run loop brackets the execution engines with sigsetjmp(g_bus_jb, 0) +
+ * run loop brackets the execution engines with bus_setjmp(&g_bus_jb) +
  * as_bus_arm/as_bus_disarm so a recoverable fault can unwind to a point where
  * the CPU struct is the whole guest state. Arm ONLY around the engines: a
- * syscall handler may hold locks that an unwind would strand. */
+ * syscall handler may hold locks that an unwind would strand.
+ *
+ * On 32-bit ARM Bionic the bracket must not use libc sigsetjmp: that
+ * implementation cookie-mangles the LIVE sp register in place (eor sp, sp,
+ * cookie ... stores ... eor back), so for a dozen instructions per call the
+ * thread's stack pointer names unmapped memory. The bracket runs once per
+ * run-loop iteration, and the ptrace kick net makes async signals constant
+ * traffic, so a delivery inside that window was a per-minute event on an
+ * armv7 Android 7 device -- and its kernel answered by killing the process
+ * with a forced SIGSEGV (SI_KERNEL, fault addr 0: the signal-frame write
+ * has nowhere to go). bus_setjmp/bus_longjmp are a plain callee-saved
+ * save/restore that keeps a real stack pointer in sp at every instruction;
+ * everywhere else they are libc sigsetjmp/siglongjmp with savemask 0. */
 struct CPU;
-extern __thread sigjmp_buf g_bus_jb;
+#if defined(__arm__) && defined(__BIONIC__)
+typedef struct { u64 raw[14]; } BusJmpBuf;  /* r4-r11, sp, lr, fpscr, d8-d15 */
+int bus_setjmp(BusJmpBuf *jb);
+void bus_longjmp(BusJmpBuf *jb, int val) __attribute__((noreturn));
+#else
+typedef sigjmp_buf BusJmpBuf;
+#define bus_setjmp(jb)       sigsetjmp(*(jb), 0)
+#define bus_longjmp(jb, val) siglongjmp(*(jb), val)
+#endif
+extern __thread BusJmpBuf g_bus_jb;
 extern __thread int g_bus_armed;
 void as_bus_init(void);
 void as_bus_arm(struct CPU *c);
