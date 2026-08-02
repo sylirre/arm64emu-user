@@ -891,10 +891,22 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     else scknown = proctab_seccomp_get(tid, &scmode, &scfilters);
     int fakeroot = self && m->fake_id && m->cred.euid == 0 && capfull[0];
 
+    /* A host kernel older than a key is a host file without its line:
+     * NoNewPrivs is 4.10, Seccomp 3.8, Seccomp_filters 5.9. The guest ABI
+     * (uname says a modern kernel) promises all three, and a fixture that
+     * greps for one reads its absence as 0 -- so lines the loop below never
+     * saw are appended after it. Appended rather than spliced into the
+     * kernel's exact position: every reader keys on the line name. */
+    int saw_nnp = 0, saw_sec = 0, saw_scflt = 0;
+
     for (char *p = buf; *p; ) {
         char *nl = strchr(p, '\n');
         char *next = nl ? nl + 1 : NULL;
         if (nl) *nl = 0;               /* one NUL-terminated line at a time */
+
+        if (is_key(p, "NoNewPrivs")) saw_nnp = 1;
+        else if (is_key(p, "Seccomp_filters")) saw_scflt = 1;
+        else if (is_key(p, "Seccomp")) saw_sec = 1;
 
         if (!strncmp(p, "x86_", 4)) goto next_line;
 
@@ -955,6 +967,10 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
         if (!next) break;
         p = next;
     }
+    if (self && !saw_nnp)
+        dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0);
+    if (scknown && !saw_sec) dprintf(fd, "Seccomp:\t%u\n", scmode);
+    if (scknown && !saw_scflt) dprintf(fd, "Seccomp_filters:\t%u\n", scfilters);
     free(buf);
     return 0;
 }
