@@ -991,12 +991,24 @@ SYSDEF(faccessat) {
 }
 
 SYSDEF(faccessat2) {
+    /* The flags never reach the host libc. AT_SYMLINK_NOFOLLOW is already
+     * honored by the resolver, and AT_EACCESS means nothing at host level --
+     * the emulator never changes its host ids, so the host's real-id and
+     * effective-id checks are the same check; the guest-visible difference
+     * exists only under --fake-id, where access_fake_root answers. Passing
+     * them through made every faccessat2 fail EINVAL on Bionic, whose
+     * faccessat wrapper rejects ANY flags -- dash's `test -r` uses
+     * AT_EACCESS, so apt-key read the Debian archive keyring as unreadable,
+     * silently verified against /dev/null instead, and every InRelease
+     * signature came back NO_PUBKEY. */
     unsigned gf = (unsigned)a3;
+    if (gf & ~(unsigned)(G_AT_SYMLINK_NOFOLLOW | G_AT_EACCESS))
+        return (u64)(s64)-EINVAL;
     char host[PATH_MAX];
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (faccessat(AT_FDCWD, host, (int)a2, (int)(gf & ~0x100u)) == 0) return 0;
+    if (faccessat(AT_FDCWD, host, (int)a2, 0) == 0) return 0;
     return access_fake_root(c->m, host, (int)a2);
 }
 

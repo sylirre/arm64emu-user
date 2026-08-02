@@ -47,6 +47,7 @@ enum {
     AT_MAPFLAGS,   /* mmap flags */
     AT_MSFLAGS,    /* mount(2) flags */
     AT_ATFLAGS,    /* AT_* (…at) flags */
+    AT_ACCFLAGS,   /* faccessat2 flags: 0x200 is AT_EACCESS here, not REMOVEDIR */
     AT_UMOUNTFLAGS,/* umount2(2) flags */
     AT_SIG,        /* signal number → name */
     AT_WHENCE,     /* lseek whence */
@@ -112,7 +113,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_linkat,    { AT_DIRFD, AT_STR, AT_DIRFD, AT_STR, AT_ATFLAGS }, 0 },
     { G_NR_symlinkat, { AT_STR, AT_DIRFD, AT_STR }, 0 },
     { G_NR_faccessat, { AT_DIRFD, AT_STR, AT_INT }, 0 },
-    { G_NR_faccessat2,{ AT_DIRFD, AT_STR, AT_INT, AT_ATFLAGS }, 0 },
+    { G_NR_faccessat2,{ AT_DIRFD, AT_STR, AT_INT, AT_ACCFLAGS }, 0 },
     { G_NR_fchmodat,  { AT_DIRFD, AT_STR, AT_MODE }, 0 },
     { G_NR_fchmod,    { AT_FD, AT_MODE }, 0 },
     { G_NR_fchownat,  { AT_DIRFD, AT_STR, AT_INT, AT_INT, AT_ATFLAGS }, 0 },
@@ -378,6 +379,12 @@ static const struct flagname at_tab[] = {
     { 0x100, "AT_SYMLINK_NOFOLLOW" }, { 0x200, "AT_REMOVEDIR" },
     { 0x400, "AT_SYMLINK_FOLLOW" }, { 0x800, "AT_NO_AUTOMOUNT" },
     { 0x1000, "AT_EMPTY_PATH" }, { 0x4000, "AT_STATX_FORCE_SYNC" },
+    { 0, NULL }
+};
+/* faccessat2 reuses 0x200 as AT_EACCESS; sharing at_tab printed it as
+ * AT_REMOVEDIR, which sent this investigation the wrong way once. */
+static const struct flagname acc_tab[] = {
+    { 0x100, "AT_SYMLINK_NOFOLLOW" }, { 0x200, "AT_EACCESS" },
     { 0, NULL }
 };
 static const struct flagname ms_tab[] = {
@@ -829,6 +836,7 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_MAPFLAGS:    fmt_flags(s, v, map_tab, NULL); break;
     case AT_MSFLAGS:     fmt_flags(s, v, ms_tab, NULL); break;
     case AT_ATFLAGS:     fmt_flags(s, v, at_tab, NULL); break;
+    case AT_ACCFLAGS:    fmt_flags(s, v, acc_tab, NULL); break;
     case AT_UMOUNTFLAGS: fmt_flags(s, v, umount_tab, NULL); break;
     case AT_SIG:         fmt_enum(s, v, sig_tab); break;
     case AT_WHENCE:      fmt_enum(s, v, whence_tab); break;
