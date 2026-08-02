@@ -255,6 +255,123 @@ int main(void) {
             MIX(r0); MIX(r1);
         }
 
+        /* The promoted families (scalar FRINT, vector two-misc FP, pairwise,
+         * by-element, FMULX/FRECPS/FRSQRTS, the estimates, vector FMLA/FMLS):
+         * raw bit patterns — NaNs, infinities, denormals — drive every NaN
+         * gate and the FMA fusion paths. */
+        __asm__("frintn %d0, %d1" : "=w"(r) : "w"(a));
+        __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+        __asm__("frintp %d0, %d1" : "=w"(r) : "w"(b));
+        __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+        __asm__("frintm %s0, %s1" : "=w"(fr) : "w"(fa));
+        __asm__("fmov %w0, %s1" : "=r"(wi) : "w"(fr)); MIX(wi);
+        __asm__("frintz %s0, %s1" : "=w"(fr) : "w"(fb));
+        __asm__("fmov %w0, %s1" : "=r"(wi) : "w"(fr)); MIX(wi);
+        __asm__("frinta %d0, %d1" : "=w"(r) : "w"(c));
+        __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+        __asm__("frintx %s0, %s1" : "=w"(fr) : "w"(fc));
+        __asm__("fmov %w0, %s1" : "=r"(wi) : "w"(fr)); MIX(wi);
+        __asm__("frinti %d0, %d1" : "=w"(r) : "w"(a));
+        __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+        {
+            /* FRINTX/I under a non-RN FPCR.RMode: the JIT fast path must
+             * bail through its rounding-mode gate; both engines then use
+             * the software rounding. */
+            uint64_t oldfpcr;
+            __asm__("mrs %0, fpcr" : "=r"(oldfpcr));
+            __asm__("msr fpcr, %0" :: "r"(oldfpcr | (2ULL << 22)));  /* RM */
+            __asm__("frintx %d0, %d1" : "=w"(r) : "w"(b));
+            __asm__("fmov %0, %d1" : "=r"(xi) : "w"(r)); MIX(xi);
+            __asm__("frinti %s0, %s1" : "=w"(fr) : "w"(fa));
+            __asm__("fmov %w0, %s1" : "=r"(wi) : "w"(fr)); MIX(wi);
+            __asm__("msr fpcr, %0" :: "r"(oldfpcr));
+        }
+        {
+            uint64_t va0 = rnd(), va1 = rnd(), vb0 = rnd(), vb1 = rnd(), r0, r1;
+#define V3(insn) \
+    __asm__("fmov d0,%2\n\tmov v0.d[1],%3\n\tfmov d1,%4\n\tmov v1.d[1],%5\n\t" \
+            insn "\n\tfmov %0,d2\n\tmov %1,v2.d[1]" : "=r"(r0), "=r"(r1) \
+            : "r"(va0), "r"(va1), "r"(vb0), "r"(vb1) : "v0", "v1", "v2"); \
+    MIX(r0); MIX(r1)
+#define V3ACC(insn) \
+    __asm__("fmov d0,%2\n\tmov v0.d[1],%3\n\tfmov d1,%4\n\tmov v1.d[1],%5\n\t" \
+            "fmov d2,%6\n\tmov v2.d[1],%2\n\t" \
+            insn "\n\tfmov %0,d2\n\tmov %1,v2.d[1]" : "=r"(r0), "=r"(r1) \
+            : "r"(va0), "r"(va1), "r"(vb0), "r"(vb1), "r"(nc) \
+            : "v0", "v1", "v2"); \
+    MIX(r0); MIX(r1)
+#define V2(insn) \
+    __asm__("fmov d0,%2\n\tmov v0.d[1],%3\n\t" insn "\n\tfmov %0,d2\n\tmov %1,v2.d[1]" \
+            : "=r"(r0), "=r"(r1) : "r"(va0), "r"(va1) : "v0", "v2"); \
+    MIX(r0); MIX(r1)
+            /* vector two-misc FP: sign ops, sqrt, compares, FRINT, estimates */
+            V2("fabs v2.4s, v0.4s");     V2("fneg v2.2d, v0.2d");
+            V2("fsqrt v2.4s, v0.4s");    V2("fsqrt v2.2d, v0.2d");
+            V2("fsqrt v2.2s, v0.2s");    V2("fabs v2.2s, v0.2s");
+            V2("fcmeq v2.4s, v0.4s, #0.0"); V2("fcmgt v2.2d, v0.2d, #0.0");
+            V2("fcmge v2.4s, v0.4s, #0.0"); V2("fcmle v2.2s, v0.2s, #0.0");
+            V2("fcmlt v2.4s, v0.4s, #0.0");
+            V2("frintn v2.4s, v0.4s");   V2("frintm v2.2d, v0.2d");
+            V2("frintp v2.2s, v0.2s");   V2("frintz v2.4s, v0.4s");
+            V2("frinta v2.2d, v0.2d");   V2("frintx v2.4s, v0.4s");
+            V2("frinti v2.2d, v0.2d");
+            V2("frecpe v2.4s, v0.4s");   V2("frecpe v2.2d, v0.2d");
+            V2("frsqrte v2.4s, v0.4s");  V2("frsqrte v2.2d, v0.2d");
+            V2("frecpe v2.2s, v0.2s");   V2("frsqrte v2.2s, v0.2s");
+            /* vector FMLA/FMLS (fused) + FMULX/FRECPS/FRSQRTS + FADDP */
+            V3ACC("fmla v2.2d, v0.2d, v1.2d");
+            V3ACC("fmls v2.4s, v0.4s, v1.4s");
+            V3ACC("fmls v2.2s, v0.2s, v1.2s");
+            V3("fmulx v2.4s, v0.4s, v1.4s");  V3("fmulx v2.2d, v0.2d, v1.2d");
+            V3("frecps v2.4s, v0.4s, v1.4s"); V3("frecps v2.2d, v0.2d, v1.2d");
+            V3("frsqrts v2.4s, v0.4s, v1.4s"); V3("frsqrts v2.2s, v0.2s, v1.2s");
+            V3("faddp v2.4s, v0.4s, v1.4s");  V3("faddp v2.2d, v0.2d, v1.2d");
+            V3("faddp v2.2s, v0.2s, v1.2s");
+            /* by-element (vector and scalar) */
+            V3ACC("fmla v2.4s, v0.4s, v1.s[3]");
+            V3ACC("fmla v2.2d, v0.2d, v1.d[1]");
+            V3ACC("fmls v2.4s, v0.4s, v1.s[0]");
+            V3ACC("fmls v2.2s, v0.2s, v1.s[2]");
+            V3("fmul v2.4s, v0.4s, v1.s[1]");  V3("fmul v2.2d, v0.2d, v1.d[0]");
+            V3("fmul v2.2s, v0.2s, v1.s[3]");
+            V3("fmulx v2.4s, v0.4s, v1.s[2]"); V3("fmulx v2.2d, v0.2d, v1.d[1]");
+            V3ACC("fmla s2, s0, v1.s[3]");     V3ACC("fmla d2, d0, v1.d[1]");
+            V3ACC("fmls s2, s0, v1.s[1]");     V3("fmul s2, s0, v1.s[2]");
+            V3("fmul d2, d0, v1.d[0]");        V3("fmulx s2, s0, v1.s[0]");
+            /* scalar pairwise + scalar three-same FP + scalar two-misc */
+            V2("faddp s2, v0.2s");  V2("faddp d2, v0.2d");  V2("addp d2, v0.2d");
+            V3("fmulx s2, s0, s1");  V3("fmulx d2, d0, d1");
+            V3("frecps s2, s0, s1"); V3("frecps d2, d0, d1");
+            V3("frsqrts s2, s0, s1"); V3("frsqrts d2, d0, d1");
+            V3("fabd s2, s0, s1");   V3("fabd d2, d0, d1");
+            V3("fcmeq s2, s0, s1");  V3("fcmge d2, d0, d1");
+            V3("fcmgt s2, s0, s1");  V3("facge d2, d0, d1");
+            V3("facgt s2, s0, s1");
+            V2("frecpe s2, s0");   V2("frecpe d2, d0");
+            V2("frsqrte s2, s0");  V2("frsqrte d2, d0");
+            V2("frecpx s2, s0");   V2("frecpx d2, d0");
+            /* FP16: the three-same extras, FRINT, and the by-element form */
+            V3ACC("fmla v2.8h, v0.8h, v1.8h");
+            V3ACC("fmls v2.4h, v0.4h, v1.4h");
+            V3("frecps v2.8h, v0.8h, v1.8h");
+            V3("frsqrts v2.4h, v0.4h, v1.4h");
+            V3("faddp v2.8h, v0.8h, v1.8h");  V3("faddp v2.4h, v0.4h, v1.4h");
+            V2("frintn v2.8h, v0.8h");  V2("frintm v2.4h, v0.4h");
+            V2("frintp v2.8h, v0.8h");  V2("frintz v2.4h, v0.4h");
+            V2("frinta v2.8h, v0.8h");  V2("frintx v2.8h, v0.8h");
+            V2("frinti v2.4h, v0.4h");
+            V3ACC("fmla v2.8h, v0.8h, v1.h[5]");
+            V3ACC("fmls v2.4h, v0.4h, v1.h[2]");
+            V3("fmul v2.8h, v0.8h, v1.h[7]");
+            V3("fmulx v2.4h, v0.4h, v1.h[0]");
+            {
+                uint32_t hr;
+                HOP1("frinta", na); HOP1("frintx", nb); HOP1("frinti", nc);
+                HOP1("frintn", nb); HOP1("frintz", na);
+                HOP1("frecpe", na); HOP1("frsqrte", nb); HOP1("frecpx", nc);
+            }
+        }
+
         /* FCMP + FCCMP + FCSEL chain, flags observed via cset */
         __asm__("fcmp %d1, %d2\n\t"
                 "fccmp %d3, %d1, #5, gt\n\t"

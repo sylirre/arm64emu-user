@@ -834,7 +834,17 @@ int be_vop_ok(unsigned vclass, u32 insn) {
         }
         case VC_VH3: case VC_VHCM: case VC_VH2M: /* vector half: FEAT_FP16 */
         case VC_VHMULX: case VC_VHEST:           /* FMULX / FRECPE / FRSQRTE */
+        case VC_VH3X:                            /* FMLA/FMLS, steps, FADDP */
             return cpu_has_fp16();
+        case VC_VMISCF: case VC_FX3: case VC_FS3:
+        case VC_FPAIRS: case VC_FSELEM:
+            return 1;                            /* S/D native replay */
+        case VC_FRINTS:                          /* half form needs FEAT_FP16 */
+            return (((insn >> 22) & 3) == 3) ? cpu_has_fp16() : 1;
+        case VC_FELEM:                           /* .4h/.8h needs FEAT_FP16 */
+            return (((insn >> 22) & 3) == 0) ? cpu_has_fp16() : 1;
+        case VC_FSMISC:                          /* half page needs FEAT_FP16 */
+            return (((insn >> 17) & 0x1f) == 0x1c) ? cpu_has_fp16() : 1;
         case VC_F2: {
             /* FMAX/FMIN/FMAXNM/FMINNM (opc 4-7): keep the interpreter helper,
              * whose fop_d/fop_s carry ARM's NaN propagation and +0/-0 ordering
@@ -976,11 +986,13 @@ static void vop_dst(BE *be, unsigned scratch, unsigned vn) {
  * the insn and handles events). Mirrors emit_atomic's slow path. */
 /* res >= 0: the slow arm converges with the interpreter's committed
  * c->v[rd] reloaded into host v`res`, so a post-merge vop_dst commits the
- * same value on both paths. */
-static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res) {
+ * same value on both paths. slow2 is an optional second entry (a pre-op
+ * gate like the FRINTX/I rounding-mode check). */
+static void vop_slowpath2(BE *be, const IROp *o, u8 *slow, u8 *slow2, int res) {
     Emit *e = be->e;
     u8 *done = b_fwd(e);
     fwd_here(e, slow);
+    fwd_here(e, slow2);
     slow_store_dirty(be);
     ei(e, enc_mov(1, 0, 28));                    /* jit_exec1(c, pc, insn) */
     emit_imm64(e, 1, o->imm2pc);
@@ -995,6 +1007,57 @@ static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res) {
     if (res >= 0)
         ei(e, enc_ldq((unsigned)res, 28, (unsigned)OFF_V((u32)o->imm & 31)));
     fwd_here(e, done);
+}
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res) {
+    vop_slowpath2(be, o, slow, NULL, res);
+}
+
+#define OFF_FPCR ((s32)offsetof(CPU, fpcr))
+
+/* FRINTX/FRINTI gate: the interpreter honors guest FPCR.RMode in software
+ * while native replay runs in the host's (never-changed) round-to-nearest.
+ * A nonzero RMode takes the helper. Returns the branch to patch into the
+ * slow path; clobbers w16/w17, leaves NZCV alone. */
+static u8 *rmode_gate(BE *be) {
+    Emit *e = be->e;
+    ei(e, enc_ldr(2, 16, 28, (unsigned)OFF_FPCR));
+    /* ubfx w17, w16, #22, #2 */
+    ei(e, 0x53000000u | (22u << 16) | (23u << 10) | (16u << 5) | 17);
+    return cbnz_fwd(e, 0, 17);
+}
+
+/* Shared tail of the NaN-result-gated vector replays: after the result
+ * lands in v2, v16 = per-lane (v2 == v2) — a zero lane is a NaN and
+ * re-runs the insn in the interpreter. `cmeq` is the arrangement-correct
+ * FCMEQ v16, v2, v2 word; Q=0 forms only check the low half. */
+static void vop_nan_tail(BE *be, const IROp *o, unsigned rd, int Q,
+                         u32 cmeq, u8 *slow2) {
+    Emit *e = be->e;
+    ei(e, cmeq);
+    ei(e, 0x9E660000u | (16u << 5) | 16);            /* fmov x16, d16 */
+    if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17);   /* fmov x17, v16.d[1] */
+             ei(e, 0x8A110210u); }                   /* and x16, x16, x17 */
+    ei(e, 0xB100041Fu | (16u << 5));                 /* cmn x16, #1 */
+    u8 *slow = bcond_fwd(e, 1);                      /* b.ne: NaN lane */
+    icount_add(be, 1);
+    vop_slowpath2(be, o, slow, slow2, 2);
+    vop_dst(be, 2, rd);
+}
+/* FCMEQ v16, v2, v2 words for the tail: S/D by sz, and the half form. */
+#define CMEQ_SD(Q, sz) (0x0E20E400u | ((u32)(Q) << 30) | ((u32)(sz) << 22) | \
+                        (2u << 16) | (2u << 5) | 16)
+#define CMEQ_H(Q)      (0x0E402400u | ((u32)(Q) << 30) | (2u << 16) | \
+                        (2u << 5) | 16)
+
+/* Scalar flavor of the same tail: fcmp v2, v2 -> V set means NaN. */
+static void vop_nan_tail_sc(BE *be, const IROp *o, unsigned rd, u32 ftype,
+                            u8 *slow2) {
+    Emit *e = be->e;
+    ei(e, 0x1E202008u | (ftype << 22) | (2u << 16) | (2u << 5));
+    u8 *slow = bcond_fwd(e, 6);                      /* b.vs: NaN result */
+    icount_add(be, 1);
+    vop_slowpath2(be, o, slow, slow2, 2);
+    vop_dst(be, 2, rd);
 }
 
 static void emit_vop(BE *be, const IROp *o) {
@@ -1077,11 +1140,10 @@ static void emit_vop(BE *be, const IROp *o) {
              * result exposes the interpreter's compiler-chosen NaN operand
              * priority, so re-run those in the interpreter. */
             unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
-            /* FMLA/FMLS (opc3 0x19) do not currently reach here — the
-             * frontend leaves them on the helper for the x86 backend's sake,
-             * whose only option is an unfused mul+add. Native replay makes
-             * them correct on this host, so the accumulate path is kept
-             * ready rather than deleted. */
+            /* FMLA/FMLS (opc3 0x19) replay natively — fused, exactly the
+             * interpreter's __builtin_fma — with Vd preloaded as the
+             * accumulator. FADDP (U1 opc3 0x1a) is a plain replay like the
+             * rest. */
             int mla = (((insn >> 11) & 0x1f) == 0x19);
             materialize_flags(be);               /* cmn below */
             vop_src(be, 0, rn);
@@ -1104,39 +1166,35 @@ static void emit_vop(BE *be, const IROp *o) {
             vop_dst(be, 2, rd);
             break;
         }
-        case VC_F2: case VC_F3: {
-            /* Scalar FP arithmetic, self-counting. The interpreter computes
-             * these as C expressions whose both-NaN operand priority (and,
-             * for the FMA family, gcc's CSE of n*m across the four forms —
-             * which defeats -ffp-contract) is a codegen artifact, so:
-             * compute UNFUSED in any order and NaN-gate the result; a NaN
-             * re-runs the insn in the interpreter (vop_slowpath). */
+        case VC_F2: {
+            /* Scalar FP 2-source arithmetic, self-counting: replay on
+             * v0/v1 -> v2 and NaN-gate the result — the interpreter's
+             * both-NaN operand priority is a codegen artifact, so a NaN
+             * re-runs the insn there (vop_slowpath). */
             unsigned ft = (insn >> 22) & 1;      /* 0 = S, 1 = D */
-            u32 f = ft << 22;
             materialize_flags(be);               /* fcmp below */
             vop_src(be, 0, rn);
             vop_src(be, 1, rm);
-            if (vclass == VC_F3) {
-                unsigned ra = (insn >> 10) & 31;
-                int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
-                vop_src(be, 3, ra);
-                ei(e, 0x1E200800u | f | (1u << 16) | (0u << 5) | 2);  /* fmul */
-                if (o1)                                   /* fneg a */
-                    ei(e, 0x1E214000u | f | (3u << 5) | 3);
-                /* v2 = a +- n*m (fadd/fsub v2, v3, v2) */
-                ei(e, (o0 == o1 ? 0x1E202800u : 0x1E203800u) | f |
-                      (2u << 16) | (3u << 5) | 2);
-            } else {
-                /* replay the 2-source op itself on v0/v1 -> v2 */
-                u32 w2 = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
-                         (1u << 16) | (0u << 5) | 2;
-                ei(e, w2);
-            }
-            ei(e, 0x1E202008u | f | (2u << 16) | (2u << 5));  /* fcmp v2,v2 */
-            u8 *slow = bcond_fwd(e, 6);          /* b.vs: NaN result */
-            icount_add(be, 1);
-            vop_slowpath(be, o, slow, 2);
-            vop_dst(be, 2, rd);
+            ei(e, (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            vop_nan_tail_sc(be, o, rd, ft, NULL);
+            break;
+        }
+        case VC_F3: {
+            /* Scalar FMADD family: replay the guest word itself — fused,
+             * exactly the interpreter's __builtin_fma (a hardware fmadd on
+             * this host) — and NaN-gate the result for the operand-priority
+             * NaN selection. */
+            unsigned ft = (insn >> 22) & 1;
+            unsigned ra = (insn >> 10) & 31;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            vop_src(be, 3, ra);
+            ei(e, (insn & ~((0x1Fu << 16) | (0x1Fu << 10) | (0x1Fu << 5) |
+                            0x1Fu)) |
+                  (1u << 16) | (3u << 10) | (0u << 5) | 2);
+            vop_nan_tail_sc(be, o, rd, ft, NULL);
             break;
         }
         case VC_FCVTH: {
@@ -1262,13 +1320,16 @@ static void emit_vop(BE *be, const IROp *o) {
             vop_dst(be, 2, rd);
             break;
         }
-        case VC_VH2M: {   /* vector half two-reg misc: FABS/FNEG/FSQRT (replay
-                           * + NaN gate) or FCMxx#0 (replay, mask, no gate). */
+        case VC_VH2M: {   /* vector half two-reg misc: FABS/FNEG/FSQRT/FRINT*
+                           * (replay + NaN gate; FRINTX/I also gate on
+                           * FPCR.RMode == RN, see rmode_gate) or FCMxx#0
+                           * (replay, mask, no gate). */
             unsigned Q = (insn >> 30) & 1;
             unsigned key = (((insn >> 29) & 1) << 6) | (((insn >> 23) & 1) << 5) |
                            ((insn >> 12) & 0x1f);
             int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
                           key == 0x6d || key == 0x2e);
+            u8 *slow2 = NULL;
             vop_src(be, 0, rn);
             u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
             if (is_cmp) {                                /* FCMxx#0: no gate */
@@ -1278,15 +1339,9 @@ static void emit_vop(BE *be, const IROp *o) {
                 break;
             }
             materialize_flags(be);
-            ei(e, w);                                    /* v2 = fabs/fneg/fsqrt */
-            ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
-            ei(e, 0x9E660000u | (16u << 5) | 16);
-            if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
-            ei(e, 0xB100041Fu | (16u << 5));
-            u8 *slow = bcond_fwd(e, 1);
-            icount_add(be, 1);
-            vop_slowpath(be, o, slow, 2);
-            vop_dst(be, 2, rd);
+            if (key == 0x59 || key == 0x79) slow2 = rmode_gate(be);
+            ei(e, w);                                    /* v2 = replayed op */
+            vop_nan_tail(be, o, rd, (int)Q, CMEQ_H(Q), slow2);
             break;
         }
         case VC_VHEST: {  /* vector half FRECPE/FRSQRTE: replay native estimate
@@ -1296,16 +1351,191 @@ static void emit_vop(BE *be, const IROp *o) {
             unsigned Q = (insn >> 30) & 1;
             materialize_flags(be);
             vop_src(be, 0, rn);
+            ei(e, (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2);
+            vop_nan_tail(be, o, rd, (int)Q, CMEQ_H(Q), NULL);
+            break;
+        }
+        case VC_VMISCF: {
+            /* Vector two-misc FP (S/D page): replay. The compares need no
+             * gate (NaN -> false on both engines, IOC via host flags); the
+             * rest are NaN-gated — the interpreter computes the single forms
+             * through double, quieting SNaNs the native op preserves, and
+             * the estimates canonicalize, so a NaN result re-runs there.
+             * FRINTX/I additionally bail unless FPCR.RMode is RN. */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            unsigned key = (((insn >> 29) & 1) << 6) | (((insn >> 23) & 1) << 5) |
+                           ((insn >> 12) & 0x1f);
+            int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
+                          key == 0x6d || key == 0x2e);
+            u8 *slow2 = NULL;
+            vop_src(be, 0, rn);
             u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
-            ei(e, w);                                    /* v2 = frecpe/frsqrte v0 */
-            ei(e, 0x0E402400u | ((u32)Q << 30) | (2u << 16) | (2u << 5) | 16);
-            ei(e, 0x9E660000u | (16u << 5) | 16);        /* fmov x16, d16 */
-            if (Q) { ei(e, 0x9EAE0000u | (16u << 5) | 17); ei(e, 0x8A110210u); }
-            ei(e, 0xB100041Fu | (16u << 5));             /* cmn x16, #1 */
-            u8 *slow = bcond_fwd(e, 1);
-            icount_add(be, 1);
-            vop_slowpath(be, o, slow, 2);
-            vop_dst(be, 2, rd);
+            if (is_cmp) {
+                ei(e, w);                                /* v2 = fcmxx v0,#0 */
+                icount_add(be, 1);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            materialize_flags(be);
+            if (key == 0x59 || key == 0x79) slow2 = rmode_gate(be);
+            ei(e, w);                                    /* v2 = replayed op */
+            vop_nan_tail(be, o, rd, (int)Q, CMEQ_SD(Q, sz), slow2);
+            break;
+        }
+        case VC_FRINTS: {
+            /* Scalar FRINT: native replay (every mode exists as an
+             * instruction); NaN-gated, and the FPCR.RMode-driven modes (X/I)
+             * take the helper when the guest mode is not RN. */
+            unsigned ftype = (insn >> 22) & 3;
+            unsigned opc = (insn >> 15) & 0x3f;
+            u8 *slow2 = NULL;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            if (opc == 0xe || opc == 0xf) slow2 = rmode_gate(be);
+            ei(e, (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2);
+            vop_nan_tail_sc(be, o, rd, ftype, slow2);
+            break;
+        }
+        case VC_FX3: {
+            /* FMULX/FRECPS/FRSQRTS (S/D vector): native replay + result NaN
+             * gate. The interpreter's fused step and the 0*inf special cases
+             * match hardware; only NaN propagation (the sign of a negated
+             * NaN operand) can differ, and NaN in means NaN out, so the
+             * result gate covers it. */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            ei(e, (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            vop_nan_tail(be, o, rd, (int)Q, CMEQ_SD(Q, sz), NULL);
+            break;
+        }
+        case VC_FS3: {
+            /* AdvSIMD scalar three-same FP: FMULX/FRECPS/FRSQRTS/FABD
+             * (NaN-gated) and the mask compares (exact, flags via host). */
+            unsigned sz = (insn >> 22) & 1;
+            unsigned opc3s = (insn >> 11) & 0x1f;
+            int is_cmp = (opc3s == 0x1c || opc3s == 0x1d);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            u32 w = (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                    (1u << 16) | (0u << 5) | 2;
+            if (is_cmp) {
+                ei(e, w);
+                icount_add(be, 1);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            materialize_flags(be);
+            ei(e, w);
+            vop_nan_tail_sc(be, o, rd, sz, NULL);
+            break;
+        }
+        case VC_FPAIRS: {
+            /* Scalar pairwise: ADDP.d (integer, exact) / FADDP (NaN-gated). */
+            unsigned U = (insn >> 29) & 1, sz = (insn >> 22) & 1;
+            vop_src(be, 0, rn);
+            u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
+            if (!U) {                                    /* ADDP.d */
+                ei(e, w);
+                icount_add(be, 1);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            materialize_flags(be);
+            ei(e, w);
+            vop_nan_tail_sc(be, o, rd, sz, NULL);
+            break;
+        }
+        case VC_FELEM: {
+            /* Vector FP by-element: replay. The half form's Vm field is
+             * only 4 bits (bit 20 carries part of the index) — preserve it.
+             * Vd is the accumulator for FMLA/FMLS. */
+            unsigned Q = (insn >> 30) & 1, size = (insn >> 22) & 3;
+            unsigned opce = (insn >> 12) & 0xf;
+            unsigned rmm = (size == 0) ? ((insn >> 16) & 0xf) : rm;
+            u32 rmmask = (size == 0) ? (0xFu << 16) : (0x1Fu << 16);
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rmm);
+            if (opce == 0x1 || opce == 0x5) vop_src(be, 2, rd);
+            ei(e, (insn & ~(rmmask | (0x1Fu << 5) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            vop_nan_tail(be, o, rd, (int)Q,
+                         (size == 0) ? CMEQ_H(Q) : CMEQ_SD(Q, size & 1),
+                         NULL);
+            break;
+        }
+        case VC_FSELEM: {
+            /* Scalar FP by-element (S/D): replay; Vd is the accumulator for
+             * FMLA/FMLS. */
+            unsigned size = (insn >> 22) & 3;
+            unsigned opce = (insn >> 12) & 0xf;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            if (opce == 0x1 || opce == 0x5) vop_src(be, 2, rd);
+            ei(e, (insn & ~((0x1Fu << 16) | (0x1Fu << 5) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            vop_nan_tail_sc(be, o, rd, size & 1, NULL);
+            break;
+        }
+        case VC_FSMISC: {
+            /* Scalar estimates + FRECPX (S/D and half pages). The estimates
+             * are result-NaN-gated as usual. FRECPX gates on the SOURCE, in
+             * the integer domain: the interpreter raises no flag for it, so
+             * a signaling NaN must never reach the native op (which would
+             * raise IOC) — and an FP-compare gate would raise it too. */
+            int half = ((insn >> 17) & 0x1f) == 0x1c;
+            unsigned ft = half ? 3u : (((insn >> 22) & 1) ? 1u : 0u);
+            unsigned opcm = (insn >> 12) & 0x1f;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            if (opcm == 0x1f) {                          /* FRECPX */
+                /* NaN iff (operand << (1|17)) unsigned-> above the shifted
+                 * exponent mask: S 0xff000000, D 0xffe0000000000000, H
+                 * 0xf8000000 (half read via the S view, garbage shifted out). */
+                if (ft == 1) {
+                    ei(e, 0x9E660000u | (0u << 5) | 16);         /* fmov x16, d0 */
+                    ei(e, 0xD3400000u | (63u << 16) | (62u << 10) |
+                          (16u << 5) | 16);                      /* lsl x16, #1 */
+                    ei(e, enc_movz(1, 17, 0xffe0, 3));           /* x17 = mask */
+                    ei(e, 0xEB11021Fu);                          /* cmp x16, x17 */
+                } else {
+                    unsigned sh = (ft == 3) ? 17u : 1u;
+                    ei(e, 0x1E260000u | (0u << 5) | 16);         /* fmov w16, s0 */
+                    ei(e, 0x53000000u | ((32u - sh) << 16) |
+                          ((31u - sh) << 10) | (16u << 5) | 16); /* lsl w16, #sh */
+                    ei(e, enc_movz(0, 17, (ft == 3) ? 0xf800 : 0xff00, 1));
+                    ei(e, 0x6B11021Fu);                          /* cmp w16, w17 */
+                }
+                u8 *slow = bcond_fwd(e, 8);                      /* b.hi: NaN */
+                ei(e, (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2);
+                icount_add(be, 1);
+                vop_slowpath2(be, o, slow, NULL, 2);
+                vop_dst(be, 2, rd);
+                break;
+            }
+            ei(e, (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2);
+            vop_nan_tail_sc(be, o, rd, ft, NULL);
+            break;
+        }
+        case VC_VH3X: {
+            /* FP16 three-same extras: FMLA/FMLS (Vd accumulates; native
+             * half fmla matches the interpreter's compute-in-double, see
+             * ir.h), FRECPS/FRSQRTS (fused step, hardware-exact special
+             * cases), FADDP. Replay + result NaN gate. */
+            unsigned Q = (insn >> 30) & 1;
+            unsigned keyh = (((insn >> 29) & 1) << 4) | (((insn >> 23) & 1) << 3) |
+                            ((insn >> 11) & 7);
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            if (keyh == 0x01 || keyh == 0x09) vop_src(be, 2, rd);
+            ei(e, (insn & ~((0x1Fu << 5) | (0x1Fu << 16) | 0x1Fu)) |
+                  (1u << 16) | (0u << 5) | 2);
+            vop_nan_tail(be, o, rd, (int)Q, CMEQ_H(Q), NULL);
             break;
         }
         default: {

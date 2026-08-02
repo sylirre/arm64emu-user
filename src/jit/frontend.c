@@ -286,30 +286,87 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
              * self-counting; the mask compares are exact as-is. */
             unsigned key = (U << 6) | (((insn >> 23) & 1) << 5) | opc;
             switch (key) {
-                /* FMLA/FMLS (0x19/0x39) deliberately stay on the exec_a64
-                 * helper: the interpreter fuses them (single rounding via
-                 * __builtin_fma), but the inline emit here is an unfused
-                 * mul+add, so translating them would diverge from the
-                 * interpreter. The helper re-runs the fused reference. */
+                /* FMLA/FMLS join VC_VF3S but only fuse-capable backends take
+                 * them (be_vop_ok: a64 always, x86 iff FMA3) — the interpreter
+                 * fuses via __builtin_fma, so an unfused mul+add would
+                 * diverge and is never emitted. */
+                case 0x19: case 0x39:            /* FMLA / FMLS (fused) */
                 case 0x1a: case 0x3a:            /* FADD / FSUB */
                 case 0x5b: case 0x5f: case 0x7a: /* FMUL / FDIV / FABD */
+                case 0x5a:                       /* FADDP (pairwise) */
                     vclass = VC_VF3S; break;
                 case 0x1c: case 0x5c: case 0x7c: /* FCMEQ / FCMGE / FCMGT */
                 case 0x5d: case 0x7d:            /* FACGE / FACGT */
                     vclass = VC_VFCM; break;
-                default: break;
+                case 0x1b:                       /* FMULX */
+                case 0x1f: case 0x3f:            /* FRECPS / FRSQRTS */
+                    vclass = VC_FX3; break;      /* a64-only (fused step) */
+                default: break;                  /* FMAX/FMIN(NM) + the MAX/
+                                                  * MIN pairwise stay helpers */
             }
         }
     } else if ((insn & 0xDF200400u) == 0x5E200400u) {
         /* AdvSIMD scalar three-same (bit28 set): the D-form integer ADD/SUB
-         * and compares — size==3 only. The other sizes and opcodes are the
-         * saturating/rounding families, which keep the helper (and its
-         * undefined-instruction behavior). */
+         * and compares — size==3 only — plus the allocated FP subset
+         * (FMULX/FRECPS/FRSQRTS/FABD and the mask compares; a64-only). The
+         * saturating/rounding families, and the unallocated FP keys the
+         * interpreter quirk-computes as FADD, keep the helper. */
         unsigned opc = (insn >> 11) & 0x1f;
         unsigned size3 = (insn >> 22) & 3;
         if (size3 == 3 &&
             (opc == 0x10 || opc == 0x11 || opc == 0x06 || opc == 0x07))
             vclass = VC_S3S;
+        else if (opc >= 0x18) {
+            unsigned U = (insn >> 29) & 1;
+            switch ((U << 6) | (((insn >> 23) & 1) << 5) | opc) {
+                case 0x1b:                       /* FMULX */
+                case 0x1f: case 0x3f:            /* FRECPS / FRSQRTS */
+                case 0x7a:                       /* FABD */
+                case 0x1c: case 0x5c: case 0x7c: /* FCMEQ / FCMGE / FCMGT */
+                case 0x5d: case 0x7d:            /* FACGE / FACGT */
+                    vclass = VC_FS3; break;
+                default: break;
+            }
+        }
+    } else if ((insn & 0xDF3E0C00u) == 0x5E300800u) {
+        /* AdvSIMD scalar pairwise (bits 21:17 = 11000, 11:10 = 10): ADDP.d
+         * and FADDP Sd/Dd. The MAX/MIN-flavored reductions stay helpers with
+         * the FMAX family; so do the lenient encodings the interpreter
+         * accepts (ADDP with size != 3, FADDP with bit23 set). */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 12) & 0x1f;
+        if ((U == 0 && opc == 0x1b && ((insn >> 22) & 3) == 3) ||
+            (U == 1 && opc == 0x0d && !((insn >> 23) & 1)))
+            vclass = VC_FPAIRS;
+    } else if ((insn & 0xDF3E0C00u) == 0x5E200800u) {
+        /* AdvSIMD scalar two-reg misc (S/D page): FRECPE/FRSQRTE/FRECPX.
+         * The lane converts and compares-with-zero stay helpers. */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 12) & 0x1f;
+        if (((insn >> 23) & 1) == 1 &&
+            (opc == 0x1d || (opc == 0x1f && U == 0)))
+            vclass = VC_FSMISC;
+    } else if ((insn & 0xDF7E0C00u) == 0x5E780800u) {
+        /* AdvSIMD scalar two-reg misc, FP16 page: the half estimates. */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 12) & 0x1f;
+        if (opc == 0x1d || (opc == 0x1f && U == 0))
+            vclass = VC_FSMISC;
+    } else if ((insn & 0x9F000400u) == 0x0F000000u) {
+        /* AdvSIMD vector x indexed element (bit10=0). The FP subset —
+         * FMLA(0x1)/FMLS(0x5) U=0, FMUL/FMULX(0x9) — in .2s/.4s/.2d and the
+         * FEAT_FP16 .4h/.8h form (size==0). size==1 is unallocated and the
+         * integer multiplies keep the helper. U=1 opc 1/5 is FCMLA. */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 12) & 0xf;
+        unsigned size = (insn >> 22) & 3;
+        if ((opc == 0x9 || (!U && (opc == 0x1 || opc == 0x5))) &&
+            (size >= 2 || size == 0))
+            vclass = VC_FELEM;
+    } else if ((insn & 0xDF000400u) == 0x5F000000u) {
+        /* AdvSIMD scalar x indexed element (bit10=0): the FP subset in S/D.
+         * The half form is not implemented by the interpreter (UNDEF), and
+         * the saturating integer families keep the helper. */
+        unsigned U = (insn >> 29) & 1, opc = (insn >> 12) & 0xf;
+        unsigned size = (insn >> 22) & 3;
+        if ((opc == 0x9 || (!U && (opc == 0x1 || opc == 0x5))) && size >= 2)
+            vclass = VC_FSELEM;
     } else if ((insn & 0xDF800400u) == 0x5F000400u &&
                ((insn >> 19) & 0xf) != 0) {
         /* AdvSIMD scalar shift-imm: the D-form same-width shifts (immh<3>
@@ -327,6 +384,29 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
          * undefined-instruction behavior). */
         unsigned U = (insn >> 29) & 1, Q = (insn >> 30) & 1;
         unsigned size = (insn >> 22) & 3;
+        unsigned opc17 = (insn >> 12) & 0x1f;
+        /* The FP page of the group (simd_two_misc_fp: opcodes 0x0c-0x0f and
+         * 0x16+, keyed U:hsz:opc). Guard sz==1 && Q==0: a replayed .1d word
+         * is UNDEFINED on real silicon while the interpreter's quirk is to
+         * compute one lane — the helper keeps the engines agreeing there.
+         * The int<->FP converts and URECPE/URSQRTE stay helpers. */
+        if (((opc17 >= 0x0c && opc17 <= 0x0f) || opc17 >= 0x16) &&
+            !(opc17 == 0x16 || opc17 == 0x17)) {
+            if (!((size & 1) && !Q)) {
+                switch ((U << 6) | (((insn >> 23) & 1) << 5) | opc17) {
+                    case 0x2f: case 0x6f: case 0x7f: /* FABS/FNEG/FSQRT */
+                    case 0x18: case 0x38: case 0x58: /* FRINTN/P/A */
+                    case 0x19: case 0x39:            /* FRINTM/Z */
+                    case 0x59: case 0x79:            /* FRINTX/I (RMode gate) */
+                    case 0x2c: case 0x6c: case 0x2d: /* FCMGT/GE/EQ #0 */
+                    case 0x6d: case 0x2e:            /* FCMLE/LT #0 */
+                    case 0x3d: case 0x7d:            /* FRECPE/FRSQRTE (a64) */
+                        vclass = VC_VMISCF; break;
+                    default: break;
+                }
+            }
+            if (vclass == ~0u) return 0;         /* FP page: nothing else */
+        }
         switch ((U << 5) | ((insn >> 12) & 0x1f)) {
             case 0x00:                           /* REV64 */
                 if (size <= 2) vclass = VC_2MISC;
@@ -367,8 +447,9 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
     } else if ((insn & 0x9F60C400u) == 0x0E400400u) {
         /* AdvSIMD three-same, FP16 page (bit22=1, bit21=0, bits[15:14]=0,
          * bit10=1). Its own encoding; key = (U<<4)|(a<<3)|op3. Arith is
-         * NaN-gated/self-counting; compares are exact masks. FMLA/FMLS (FMA),
-         * FMULX/FRECPS/FRSQRTS (Phase 5), FMAX/FMIN(NM) + pairwise stay helpers. */
+         * NaN-gated/self-counting; compares are exact masks. FMAX/FMIN(NM)
+         * element-wise and pairwise stay helpers (policy: the whole FMAX
+         * family keeps the interpreter's NaN/±0 ordering). */
         unsigned U = (insn >> 29) & 1, a = (insn >> 23) & 1;
         unsigned op3 = (insn >> 11) & 7;
         switch ((U << 4) | (a << 3) | op3) {
@@ -377,20 +458,25 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
             case 0x04: case 0x14: case 0x1c: case 0x15: case 0x1d:
                 vclass = VC_VHCM; break;         /* FCMEQ/GE/GT, FACGE/GT */
             case 0x03: vclass = VC_VHMULX; break;/* FMULX (a64 only) */
-            default: break;                      /* FRECPS/FRSQRTS: helper
-                                                  * (fused step + 0*inf special
-                                                  * case live in fop_d/fop_s) */
+            case 0x01: case 0x09:                /* FMLA / FMLS (fused) */
+            case 0x07: case 0x0f:                /* FRECPS / FRSQRTS */
+            case 0x12:                           /* FADDP */
+                vclass = VC_VH3X; break;         /* a64-only native replay */
+            default: break;
         }
     } else if ((insn & 0x9F7E0C00u) == 0x0E780800u) {
         /* AdvSIMD two-reg misc, FP16 page (bit22=1, bits[21:17]=11100,
-         * bit11=1, bit10=0). key = (U<<6)|(hsz<<5)|opc. FABS/FNEG/FSQRT +
-         * FCMxx#0; FRINT, int converts, FRECPE/FRSQRTE stay helpers. */
+         * bit11=1, bit10=0). key = (U<<6)|(hsz<<5)|opc. FABS/FNEG/FSQRT,
+         * FRINT* + FCMxx#0; the int converts stay helpers. */
         unsigned U = (insn >> 29) & 1, hsz = (insn >> 23) & 1;
         unsigned opc = (insn >> 12) & 0x1f;
         switch ((U << 6) | (hsz << 5) | opc) {
             case 0x2f: case 0x6f: case 0x7f:     /* FABS/FNEG/FSQRT */
             case 0x2c: case 0x6c: case 0x2d:     /* FCMGT/GE/EQ #0 */
             case 0x6d: case 0x2e:                /* FCMLE/LT #0 */
+            case 0x18: case 0x38: case 0x58:     /* FRINTN/P/A (a64 only) */
+            case 0x19: case 0x39:                /* FRINTM/Z */
+            case 0x59: case 0x79:                /* FRINTX/I (RMode gate) */
                 vclass = VC_VH2M; break;
             case 0x3d: case 0x7d:                /* FRECPE / FRSQRTE (a64 only) */
                 vclass = VC_VHEST; break;
@@ -461,13 +547,14 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
         }
     } else if ((insn & 0xFF000000u) == 0x1F000000u) {
         /* scalar FP data-processing 3-source: FMADD/FMSUB/FNMADD/FNMSUB.
-         * exec_fp_dp3 now fuses (single rounding via __builtin_fma), so the
-         * single/double family stays on the exec_a64 helper — the inline emit
-         * would be an unfused mul+add and diverge. Half (ftype==3) is computed
-         * in double from an exact half product, so its inline matches the
-         * interpreter bit-for-bit and stays native. */
+         * exec_fp_dp3 fuses (single rounding via __builtin_fma), so VC_F3
+         * is taken only by fuse-capable backends (a64 replays fmadd, x86
+         * needs FMA3) — an unfused mul+add would diverge and is never
+         * emitted. Half (ftype==3) is computed in double from an exact half
+         * product, so its inline matches the interpreter bit-for-bit. */
         unsigned ftype = (insn >> 22) & 3;
         if (ftype == 3) vclass = VC_H3;          /* half FMADD family */
+        else if (ftype <= 1) vclass = VC_F3;     /* S/D: fused replay */
     } else if ((insn & 0x7F000000u) == 0x1E000000u) {
         /* scalar FP */
         unsigned ftype = (insn >> 22) & 3, o2 = (insn >> 10) & 3;
@@ -521,6 +608,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                     vclass = VC_FCVT;            /* FCVT S<->D (plain casts) */
                 else if (opc == 0x7)
                     vclass = VC_FCVTH;           /* FCVT Hd, Sn/Dn (narrow) */
+                else if (opc >= 0x8 && opc <= 0xf && opc != 0xd)
+                    vclass = VC_FRINTS;          /* FRINT N/P/M/Z/A/X/I */
             } else if (o2 == 2) {                            /* 2-source */
                 unsigned opc = (insn >> 12) & 0xf;
                 if (opc <= 0x8) vclass = VC_F2;  /* +FNMUL, +FMAX..FMINNM */
@@ -554,6 +643,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
                 if (opc <= 0x3) vclass = VC_H1;  /* FMOV/FABS/FNEG/FSQRT */
                 else if (opc == 0x4 || opc == 0x5)
                     vclass = VC_FCVTH;           /* FCVT Sd/Dd, Hn (widen) */
+                else if (opc >= 0x8 && opc <= 0xf && opc != 0xd)
+                    vclass = VC_FRINTS;          /* half FRINT (FEAT_FP16) */
             } else if (o2 == 2) {                            /* 2-source */
                 unsigned opc = (insn >> 12) & 0xf;
                 if (opc <= 0x8) vclass = VC_H2;  /* +FNMUL, +FMAX..FMINNM */
@@ -577,11 +668,17 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
      * would show — re-run there). Those classes follow the atomics'
      * self-counting discipline: not in ninsns, the fast path bumps icount
      * inline. */
-    if (vclass != VC_F2 && vclass != VC_F3 && vclass != VC_VF3S &&
-        vclass != VC_FCVTH && vclass != VC_H1 && vclass != VC_H2 &&
-        vclass != VC_H3 && vclass != VC_VH3 && vclass != VC_VH2M &&
-        vclass != VC_VHMULX && vclass != VC_VHEST)
-        ir->ninsns++;
+    switch (vclass) {
+        case VC_F2: case VC_F3: case VC_VF3S: case VC_FCVTH:
+        case VC_H1: case VC_H2: case VC_H3: case VC_VH3: case VC_VH2M:
+        case VC_VHMULX: case VC_VHEST:
+        case VC_VMISCF: case VC_FRINTS: case VC_FX3: case VC_FS3:
+        case VC_FPAIRS: case VC_FELEM: case VC_FSELEM: case VC_FSMISC:
+        case VC_VH3X:
+            break;                               /* self-counting */
+        default:
+            ir->ninsns++;
+    }
     return 1;
 }
 

@@ -159,17 +159,40 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
 - **scalar AdvSIMD** (`0x5E`/`0x7E` D-form): integer ADD/SUB and the six
   compares, and the shifts SHL/SSHR/USHR plus the accumulating SSRA/USRA —
   glibc/gcc emit `add d,d,d` + `usra` shapes in hash/checksum loops.
-- **vector FP**: FADD/FSUB/FMUL/FDIV/FABD/FMLA/FMLS (NaN-gated) and the
-  mask compares FCMEQ/FCMGE/FCMGT/FACGE/FACGT.
+- **vector FP**: FADD/FSUB/FMUL/FDIV/FABD and FADDP (NaN-gated), FMLA/FMLS
+  fused exactly like the interpreter's `__builtin_fma` (AArch64 replays the
+  word; x86-64 needs **FMA3** — `vfmadd231ps` — and declines to the helper
+  without it), the mask compares FCMEQ/FCMGE/FCMGT/FACGE/FACGT, and the
+  FMULX/FRECPS/FRSQRTS step family (AArch64-only: the fused step and its
+  `0·∞` special cases match hardware; x86-64 keeps the helper). The
+  two-register-misc FP page inlines too: FABS/FNEG (pure sign ops for the
+  double form; the single form is gated because the interpreter's
+  widen-through-double quiets SNaN lanes), FSQRT, the FCMxx-#0 masks, every
+  FRINT mode (x86-64 via SSE4.1 `roundps`, except FRINTA — no ties-away
+  encoding — and with FRINTX/FRINTI gated on `FPCR.RMode == RN`, since the
+  interpreter honors the guest mode in software while native code runs in
+  the host's round-to-nearest), and FRECPE/FRSQRTE (AArch64-only,
+  architected-table exact). The by-element forms FMLA/FMLS/FMUL/FMULX
+  inline as well: AArch64 replays; x86-64 broadcasts the element with
+  `pshufd` and uses `mulps`/FMA3, declining FMULX.
 - **scalar FP**: FADD/FSUB/FMUL/FDIV/FNMUL, the FMADD/FMSUB/FNMADD/FNMSUB
-  family (computed unfused on both hosts, matching the interpreter),
-  FSQRT/FABS/FNEG/FMOV(+imm, +gpr), FMAX/FMIN(NM) (x86-64: `maxsd` *is* the
-  interpreter's ternary), FCMP/FCMPE, FCCMP/FCCMPE, FCSEL, and the
-  conversions SCVTF/UCVTF, FCVTZS/FCVTZU and FCVT S↔D. On x86-64 FCVTZS/FCVTZU
+  family — fused (AArch64 replays `fmadd`; x86-64 uses FMA3 231-forms with
+  the addend preloaded, helper without FMA3), FSQRT/FABS/FNEG/FMOV(+imm,
+  +gpr), FMAX/FMIN(NM) (x86-64: `maxsd` *is* the interpreter's ternary),
+  FCMP/FCMPE, FCCMP/FCCMPE, FCSEL, every scalar FRINT mode (same FRINTA and
+  RMode rules as the vector forms), and the conversions SCVTF/UCVTF,
+  FCVTZS/FCVTZU and FCVT S↔D. On x86-64 FCVTZS/FCVTZU
   NaN-gate to 0 before the saturation clamps, matching the interpreter's
   architectural `FPToFixed(NaN) = 0` (the a64 backend replays the native
   convert, which already returns 0). The rounding-variant conversions
   (FCVTNS/…), fixed-point forms and everything saturating stay helpers.
+  The scalar AdvSIMD FP pages inline on AArch64 (x86-64 inlines only where
+  noted): three-same FMULX/FRECPS/FRSQRTS/FABD and its mask compares,
+  pairwise ADDP.d and FADDP (both hosts), the FRECPE/FRSQRTE/FRECPX
+  two-misc page (FRECPX gates on a source NaN in the integer domain — the
+  interpreter raises no flag for it, so an SNaN must not reach the native
+  op), and the S/D by-element forms (x86-64: element load by offset +
+  `mulss`/FMA3, FMULX declined).
 - **half-precision (FP16)**: the FCVT half↔single/double converts (and
   FCVTL/FCVTN) inline on the base ISA, always. The half arithmetic surface —
   scalar and vector FADD/FSUB/FMUL/FDIV, the FMULX/FRECPE/FRSQRTE estimates, the
@@ -178,13 +201,22 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   FPHP+ASIMDHP HWCAP pair; `cpu_has_fp16`, `A64_JIT_NOFP16` forces the helper),
   while the x86-64 backend widens each half operand to single through **F16C**,
   computes, and narrows back (`cpu_has_f16c`, disabled together with the rest of
-  the SSE surface by `A64_JIT_SSE=2`). As with the s/d forms, half `FMAX/FMIN(NM)`
-  stay interpreter helpers so ARM's NaN propagation and ±0 ordering are exact.
+  the SSE surface by `A64_JIT_SSE=2`). The AArch64 backend additionally
+  replays vector half FMLA/FMLS (native half `fmla` matches the
+  interpreter's compute-in-double: within half's finite range an addend is
+  never below half a double-ULP of the product, so the 53→11-bit double
+  rounding never diverges), FRECPS/FRSQRTS, FADDP, the FRINT modes (RMode
+  gate as above), the half by-element forms, and the scalar half FRINT and
+  FRECPE/FRSQRTE/FRECPX pages — all x86-64-declined. As with the s/d forms,
+  half `FMAX/FMIN(NM)` and the MIN/MAX-flavored pairwise reductions
+  stay interpreter helpers so ARM's NaN propagation and ±0 ordering are
+  exact.
 
 The AArch64 backend re-emits the guest word itself with the register fields
 renumbered onto the V-register cache's host registers, so its semantics are the
-guest's by construction; the scalar-FP arithmetic classes instead emit
-explicit unfused sequences (see the NaN gate above).
+guest's by construction — including the fused families, the steps and the
+estimates; only the NaN-result (and, for FRINTX/I, rounding-mode) gates wrap
+the replay.
 
 **Finding what still falls back.** `A64_JIT_STATS=1` (or `=/path/to/file`)
 counts every instruction executed through the `exec_a64` helper and dumps the

@@ -175,7 +175,9 @@ enum {
                              * CNT, CLZ/CLS, XTN(2), REV*, SHLL, S/UADDLP */
     VC_ACROSS,              /* across lanes: ADDV, S/UMAXV, S/UMINV */
     VC_VF3S,                /* vector FP 3-same arith: FADD/FSUB/FMUL/FDIV/
-                             * FABD/FMLA/FMLS (NaN-gated, self-counting) */
+                             * FABD/FADDP, and FMLA/FMLS where the backend can
+                             * fuse (a64 native; x86 FMA3, else declined).
+                             * NaN-gated, self-counting. */
     VC_VFCM,                /* vector FP 3-same compares: FCMEQ/FCMGE/FCMGT/
                              * FACGE/FACGT (mask result, no gate) */
     VC_MOVI,                /* modified-imm MOVI/MVNI/FMOV/ORR/BIC: imm is
@@ -184,7 +186,10 @@ enum {
     VC_F2,                  /* scalar FMUL/FDIV/FADD/FSUB/FNMUL (S/D), and
                              * FMAX/FMIN/FMAXNM/FMINNM (opc 4-7, per-host) */
     VC_F1,                  /* scalar FMOV/FABS/FNEG/FSQRT (S/D) */
-    VC_F3,                  /* scalar FMADD/FMSUB/FNMADD/FNMSUB (S/D) */
+    VC_F3,                  /* scalar FMADD/FMSUB/FNMADD/FNMSUB (S/D), fused
+                             * like the interpreter's __builtin_fma: a64
+                             * replays fmadd, x86 needs FMA3 (else declined).
+                             * NaN-gated, self-counting. */
     VC_FCMP,                /* FCMP/FCMPE (reg or #0.0): writes NZCV */
     VC_FCCMP,               /* FCCMP/FCCMPE: reads AND writes NZCV */
     VC_FCSEL,               /* reads NZCV */
@@ -212,12 +217,56 @@ enum {
                              * FDIV/FABD (.4h/.8h). NaN-gated, self-counting. */
     VC_VHCM,                /* vector half three-same compares: FCMEQ/GE/GT,
                              * FACGE/GT -> per-lane mask (no gate). */
-    VC_VH2M,                /* vector half two-reg misc: FABS/FNEG/FSQRT
-                             * (NaN-gated) + FCMxx#0 (mask). Self-counting. */
+    VC_VH2M,                /* vector half two-reg misc: FABS/FNEG/FSQRT and
+                             * FRINT* (NaN-gated; FRINTX/I also gate on
+                             * FPCR.RMode == RN, a64-only) + FCMxx#0 (mask).
+                             * Self-counting. */
     VC_VHMULX,              /* vector half FMULX (three-same). a64-only (native
                              * replay + result NaN gate); x86 declines. */
     VC_VHEST,               /* vector half FRECPE/FRSQRTE (two-misc estimate).
                              * a64-only (native replay + NaN gate); x86 declines. */
+    VC_VMISCF,              /* vector two-misc FP (S/D page): FABS/FNEG/FSQRT,
+                             * FRINT* (X/I gated on FPCR.RMode == RN), FCMxx#0
+                             * masks, FRECPE/FRSQRTE (a64-only). NaN-gated
+                             * except the compares; self-counting. */
+    VC_FRINTS,              /* scalar FRINT N/P/M/Z/A/X/I, S/D/H. X and I gate
+                             * on FPCR.RMode == RN (the interpreter honors the
+                             * guest mode in software; native runs host-RN).
+                             * a64 replays all; x86 does S/D via SSE4.1 roundss
+                             * and declines FRINTA (no ties-away) and half.
+                             * NaN-gated, self-counting. */
+    VC_FX3,                 /* vector FP 3-same extras: FMULX/FRECPS/FRSQRTS
+                             * (S/D). a64-only native replay + result NaN gate
+                             * (the fused step and its 0*inf special case live
+                             * in fop_d/fop_s and match hardware). */
+    VC_FS3,                 /* AdvSIMD scalar 3-same FP: FMULX/FRECPS/FRSQRTS/
+                             * FABD (gated) + FCMEQ/GE/GT/FACGE/FACGT masks
+                             * (no gate). a64-only replay; self-counting. */
+    VC_FPAIRS,              /* AdvSIMD scalar pairwise: ADDP.d (integer, exact)
+                             * and FADDP Sd/Dd (NaN-gated). Self-counting.
+                             * The MAX/MIN-flavored pairwise reductions stay
+                             * helpers with the rest of the FMAX family. */
+    VC_FELEM,               /* vector FP by-element FMLA/FMLS/FMUL/FMULX
+                             * (.h/.s/.d). a64 replays all (half behind
+                             * FEAT_FP16); x86 broadcasts + mulps for FMUL and
+                             * FMA3 for FMLA/FMLS (S/D), declining FMULX and
+                             * half. NaN-gated, self-counting. */
+    VC_FSELEM,              /* scalar FP by-element FMLA/FMLS/FMUL/FMULX (S/D).
+                             * a64 replays; x86 loads the element by offset and
+                             * uses mulss / FMA3, declining FMULX. NaN-gated,
+                             * self-counting. */
+    VC_FSMISC,              /* AdvSIMD scalar two-misc: FRECPE/FRSQRTE/FRECPX,
+                             * S/D and half pages. a64-only replay; FRECPX is
+                             * source-NaN-gated (the interpreter raises no IOC
+                             * for it, so the native op must not run on NaN),
+                             * the estimates result-NaN-gated. Self-counting. */
+    VC_VH3X,                /* vector half three-same extras: FMLA/FMLS (native
+                             * half fmla matches the interpreter's compute-in-
+                             * double: within half's finite range an addend is
+                             * never below half-ulp53 of the product, so the
+                             * 53->11 double rounding never diverges), FRECPS/
+                             * FRSQRTS, FADDP. a64-only + FEAT_FP16; NaN-gated,
+                             * self-counting. */
 };
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */

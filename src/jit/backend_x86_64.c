@@ -1141,6 +1141,41 @@ static int cpu_has_f16c(void) {
     if (v < 0) v = __builtin_cpu_supports("f16c");
     return v && !sse_forced_baseline();
 }
+/* FMA3: the gate for inlining the fused-multiply families (scalar FMADD,
+ * vector FMLA/FMLS, the by-element forms). The interpreter computes them
+ * with __builtin_fma — correctly rounded no matter how libm gets there —
+ * and vfmadd* is the same unique answer for finite results; NaNs are gated.
+ * Without it those encodings stay interpreter helpers. */
+static int cpu_has_fma(void) {
+    static int v = -1;
+    if (v < 0) v = __builtin_cpu_supports("fma");
+    return v && !sse_forced_baseline();
+}
+
+/* SSE4.1 three-byte-opcode 0F 3A form (roundss/sd/ps/pd): 66 0F 3A opc /r ib */
+static void sse3a_rr(Emit *e, u8 opc, int xdst, int xsrc, u8 imm) {
+    e8(e, 0x66);
+    u8 r = (u8)(0x40 | ((xdst >> 3) << 2) | (xsrc >> 3));
+    if (r != 0x40) e8(e, r);
+    e8(e, 0x0F); e8(e, 0x3A); e8(e, opc);
+    e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc & 7)));
+    e8(e, imm);
+}
+
+/* FMA3 231-form (VEX.DDS.128.66.0F38): xdst = ±(xsrc1 * xsrc2) ± xdst per
+ * the opcode (B8/B9 fmadd, BA/BB fmsub, BC/BD fnmadd, BE/BF fnmsub; even =
+ * packed, odd = scalar). W selects double. Only emitted behind
+ * cpu_has_fma(); FMA implies AVX, hence VEX. */
+static void fma231_rr(Emit *e, u8 opc, int W, int xdst, int xsrc1, int xsrc2) {
+    e8(e, 0xC4);
+    e8(e, (u8)((((xdst >> 3) & 1) ? 0 : 0x80) |  /* R = ~reg[3]  */
+               0x40 |                            /* X = 1 (unused) */
+               (((xsrc2 >> 3) & 1) ? 0 : 0x20) | /* B = ~rm[3]   */
+               0x02));                           /* map 0F38 */
+    e8(e, (u8)(((W & 1) << 7) | ((~xsrc1 & 0xf) << 3) | 0x01)); /* L=0 pp=66 */
+    e8(e, opc);
+    e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc2 & 7)));
+}
 
 /* SSE op xmm, [r15+disp] (JitEnv-relative). */
 static void sse_mem15(Emit *e, u8 pfx, u8 opc, int xreg, s32 disp) {
@@ -1277,10 +1312,14 @@ int be_vop_ok(unsigned vclass, u32 insn) {
     unsigned opc3 = (insn >> 11) & 0x1f;
     switch (vclass) {
         case VC_BITW: case VC_ADDSUB: case VC_MOVI: case VC_COPY:
-        case VC_F1: case VC_F3:
+        case VC_F1:
         case VC_FCSEL: case VC_FMOVI: case VC_FMOVG:
         case VC_CVTIF: case VC_FCVT:
             return 1;
+        case VC_F3:
+            /* scalar FMADD family: fused only — vfmadd231; an unfused
+             * mul+add would diverge from the interpreter's __builtin_fma */
+            return cpu_has_fma();
         case VC_CVTFI:
             /* FCVTZS/FCVTZU inline branches AROUND cvttsd2si on the NaN and
              * saturation paths (and loads 0 for small-negative unsigned), so
@@ -1306,8 +1345,18 @@ int be_vop_ok(unsigned vclass, u32 insn) {
              * a double-rounding error (a tiny addend lost below half a single
              * ULP on a half-midpoint product). Keep the interpreter helper. */
             return 0;
-        case VC_VH3: case VC_VHCM: case VC_VH2M: /* vector half: F16C */
+        case VC_VH3: case VC_VHCM:               /* vector half: F16C */
             return cpu_has_f16c();
+        case VC_VH2M: {
+            /* the FRINT keys the frontend now sends are a64-only (native
+             * half replay); the widen/op/narrow recipe covers the rest */
+            unsigned hkey = (U << 6) | (((insn >> 23) & 1) << 5) |
+                            ((insn >> 12) & 0x1f);
+            if (hkey == 0x18 || hkey == 0x38 || hkey == 0x58 ||
+                hkey == 0x19 || hkey == 0x39 || hkey == 0x59 || hkey == 0x79)
+                return 0;
+            return cpu_has_f16c();
+        }
         case VC_F2: {
             /* FMUL/FDIV/FADD/FSUB/FNMUL inline; FMAX/FMIN/FMAXNM/FMINNM (opc
              * 4-7) keep the interpreter helper — maxss/minss get ARM's NaN
@@ -1371,8 +1420,50 @@ int be_vop_ok(unsigned vclass, u32 insn) {
                 default:
                     return 0;                    /* CLZ/CLS/SHLL */
             }
-        case VC_VF3S: case VC_VFCM:
+        case VC_VF3S:
+            if (opc3 == 0x19 && !U) return cpu_has_fma();  /* FMLA/FMLS */
+            return 1;                            /* arith, FADDP, compares */
+        case VC_VFCM:
             return 1;
+        case VC_VMISCF: {
+            /* FABS/FNEG/FSQRT/FCM#0 are SSE2; FRINT* needs roundps (SSE4.1)
+             * and FRINTA has no ties-away encoding; the estimates are
+             * a64-only (architected table). */
+            unsigned key = (U << 6) | (((insn >> 23) & 1) << 5) |
+                           ((insn >> 12) & 0x1f);
+            switch (key) {
+                case 0x2f: case 0x6f: case 0x7f:
+                case 0x2c: case 0x6c: case 0x2d: case 0x6d: case 0x2e:
+                    return 1;
+                case 0x18: case 0x38: case 0x19: case 0x39:
+                case 0x59: case 0x79:
+                    return cpu_has_sse41();
+                default:                         /* FRINTA, FRECPE/FRSQRTE */
+                    return 0;
+            }
+        }
+        case VC_FRINTS: {
+            /* roundss/sd; FRINTA (opc 0xc) has no ties-away imm and the
+             * half form has no native op — both stay helpers. */
+            unsigned ropc = (insn >> 15) & 0x3f;
+            if (((insn >> 22) & 3) == 3 || ropc == 0xc) return 0;
+            return cpu_has_sse41();
+        }
+        case VC_FPAIRS:
+            return 1;                            /* ADDP.d / FADDP: SSE2 */
+        case VC_FELEM: {
+            /* FMUL by element: pshufd broadcast + mulps. FMLA/FMLS need
+             * FMA3. FMULX (0*inf special case) and the half form decline. */
+            unsigned eopc = (insn >> 12) & 0xf;
+            if (((insn >> 22) & 3) == 0) return 0;
+            if (eopc == 0x9) return U ? 0 : 1;   /* FMULX : FMUL */
+            return cpu_has_fma();                /* FMLA / FMLS */
+        }
+        case VC_FSELEM: {
+            unsigned eopc = (insn >> 12) & 0xf;
+            if (eopc == 0x9) return U ? 0 : 1;   /* FMULX : FMUL */
+            return cpu_has_fma();                /* FMLA / FMLS */
+        }
         case VC_PAIRI:
             if (opc3 == 0x17) return 1;          /* ADDP, all sizes */
             if (size == 0) return 1;             /* byte min/max: SSE2 */
@@ -1399,11 +1490,14 @@ int be_vop_ok(unsigned vclass, u32 insn) {
 /* res_scratch >= 0: a cached (V-allocated) NaN-gated class converges with
  * its result in that scratch register — the slow arm reloads it from the
  * interpreter's committed c->v[rd] so the post-merge vop_dst commits the
- * same value on both paths. */
-static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res_scratch) {
+ * same value on both paths. slow2 is an optional second entry (a pre-op
+ * gate like the FRINTX/I rounding-mode check). */
+static void vop_slowpath2(BE *be, const IROp *o, u8 *slow, u8 *slow2,
+                          int res_scratch) {
     Emit *e = be->e;
     u8 *done = jmp_fwd(e);
     fwd_here(e, slow);
+    fwd_here(e, slow2);
     slow_store_dirty(be);
     mov_rr(e, 1, RDI, R14);                      /* jit_exec1(c, pc, insn) */
     rex(e, 1, 0, 0, RSI); e8(e, (u8)(0xB8 | RSI)); e64(e, o->imm2pc);
@@ -1419,6 +1513,19 @@ static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res_scratch) {
         vld_q(be, res_scratch, (u32)o->imm & 31);
     fwd_here(e, done);
 }
+static void vop_slowpath(BE *be, const IROp *o, u8 *slow, int res_scratch) {
+    vop_slowpath2(be, o, slow, NULL, res_scratch);
+}
+
+/* FRINTX/FRINTI gate: the interpreter honors guest FPCR.RMode in software
+ * while the inline roundss below hardwires round-to-nearest (MXCSR never
+ * changes). A nonzero RMode takes the helper. Clobbers eax and EFLAGS. */
+static u8 *rmode_gate(BE *be) {
+    Emit *e = be->e;
+    ld32(e, RAX, R14, (s32)offsetof(CPU, fpcr));
+    alu_ri32(e, 0, 4, RAX, 3u << 22);            /* and eax, RMode mask */
+    return jcc_fwd(e, CC_NE);
+}
 
 /* Which classes run with cached operands/results (full-vector recipes with
  * the result in one scratch register)? The rest — lane and GPR-crossing
@@ -1430,7 +1537,7 @@ static int vop_cached(const IROp *o) {
     switch (VC(o->aux)) {
         case VC_BITW: case VC_ADDSUB: case VC_CM3: case VC_MINMAX:
         case VC_MUL3: case VC_SSHIFTI: case VC_S3S:
-        case VC_VF3S: case VC_VFCM:
+        case VC_VF3S: case VC_VFCM: case VC_VMISCF: case VC_FELEM:
             return 1;
         case VC_SHIFTI:
             return ((insn >> 11) & 0x1f) != 0x10;    /* SHRN(2): legacy */
@@ -2269,13 +2376,31 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             materialize_flags(be);
             vop_src(be, 0, rn);
             vop_src(be, 1, rm);
-            /* No FMLA/FMLS (opc3 0x19) recipe here on purpose. The frontend
-             * never classifies them VC_VF3S because the interpreter fuses
-             * them through __builtin_fma (single rounding) and anything this
-             * backend can emit is an unfused mul+add — a different result,
-             * not a slower one. If they are ever inlined, the emit has to
-             * come from an FMA-capable path, not from mulps + addps. */
-            if (opc3 == 0x1a && !U) {            /* FADD / FSUB */
+            if (opc3 == 0x19) {                  /* FMLA / FMLS: FMA3 fused —
+                                                  * be_vop_ok declined us if
+                                                  * the host has none */
+                vop_src(be, 2, rd);              /* Vd is the accumulator */
+                fma231_rr(e, a23 ? 0xBC : 0xB8, (int)sz, 2, 0, 1);
+                res = 2;
+            } else if (opc3 == 0x1a && U && !a23) { /* FADDP (a23 set is FABD):
+                                                  * fold pairs — even lanes of
+                                                  * n:m + odd lanes */
+                sse_rr(e, 0x66, 0x6F, 2, 0);     /* x2 = n */
+                if (sz) {
+                    sse_rr(e, 0x66, 0xC6, 2, 1); e8(e, 0);   /* [n0, m0] */
+                    sse_rr(e, 0x66, 0xC6, 0, 1); e8(e, 3);   /* [n1, m1] */
+                    sse_rr(e, pfx, 0x58, 2, 0);              /* addpd */
+                } else {
+                    sse_rr(e, 0, 0xC6, 2, 1); e8(e, 0x88);   /* evens */
+                    sse_rr(e, 0, 0xC6, 0, 1); e8(e, 0xDD);   /* odds */
+                    sse_rr(e, pfx, 0x58, 2, 0);              /* addps */
+                    if (!Q) {                    /* .2s: sums sit in lanes
+                                                  * 0 and 2 — compact them */
+                        sse_rr(e, 0x66, 0x70, 2, 2); e8(e, 0xF8);
+                    }
+                }
+                res = 2;
+            } else if (opc3 == 0x1a && !U) {     /* FADD / FSUB */
                 sse_rr(e, pfx, a23 ? 0x5C : 0x58, 0, 1);
             } else if (opc3 == 0x1b) {           /* FMUL */
                 sse_rr(e, pfx, 0x59, 0, 1);
@@ -2324,6 +2449,229 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                 sse_rr(e, pfx, 0xC2, 1, 0); e8(e, a23 ? 1 : 2);
                 res = 1;
             }
+            vop_dst(be, res, rd, (int)Q);
+            break;
+        }
+        case VC_F3: {
+            /* Scalar FMADD family: FMA3 231-form with the addend preloaded
+             * into the destination — fused exactly like the interpreter's
+             * __builtin_fma; a NaN result re-runs there (the operand-
+             * priority NaN selection and canonical generated NaN live in
+             * fpnan_*). */
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned ra = (insn >> 10) & 31;
+            int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
+            u8 pfx = dbl ? 0xF2 : 0xF3;
+            materialize_flags(be);
+            sse_mem(e, pfx, 0x10, 0, OFF_V(rn));         /* n */
+            sse_mem(e, pfx, 0x10, 1, OFF_V(rm));         /* m */
+            sse_mem(e, pfx, 0x10, 2, OFF_V(ra));         /* addend */
+            /* FMADD  a + nm -> vfmadd231; FMSUB  a - nm -> vfnmadd231;
+             * FNMADD -a - nm -> vfnmsub231; FNMSUB -a + nm -> vfmsub231 */
+            fma231_rr(e, !o1 ? (!o0 ? 0xB9 : 0xBD) : (!o0 ? 0xBF : 0xBB),
+                      dbl, 2, 0, 1);
+            sse_rr(e, dbl ? 0x66 : 0, 0x2E, 2, 2);       /* ucomis x2,x2 */
+            u8 *slow = jcc_fwd(e, CC_P);
+            icount_add(be, 1);
+            movq_rax_x(e, dbl, 2);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        case VC_VMISCF: {
+            /* Vector two-misc FP (S/D): FABS/FNEG are sign-mask bit ops
+             * (exact, ungated), FSQRT is sqrtps + NaN gate, the compares
+             * with #0 are cmpps predicates whose NaN/IE behavior is the
+             * interpreter's exactly (like VC_VFCM), and FRINT* is roundps —
+             * NaN-gated, with FRINTX/I bailing unless FPCR.RMode is RN.
+             * FRINTA and the estimates were declined by be_vop_ok. */
+            unsigned Q = (insn >> 30) & 1, sz = (insn >> 22) & 1;
+            unsigned key = (((insn >> 29) & 1) << 6) | (((insn >> 23) & 1) << 5) |
+                           ((insn >> 12) & 0x1f);
+            u8 pfx = sz ? 0x66 : 0;
+            u8 *slow2 = NULL;
+            int res = 0, gated = 1;
+            materialize_flags(be);
+            if (key == 0x59 || key == 0x79) slow2 = rmode_gate(be);
+            vop_src(be, 0, rn);
+            switch (key) {
+                case 0x2f:                       /* FABS: clear sign bits */
+                    sse_rr(e, 0x66, 0x76, 1, 1);
+                    sse_shift_i(e, sz ? 0x73 : 0x72, 2, 1, 1);
+                    sse_rr(e, 0x66, 0xDB, 0, 1);
+                    /* the single form is NOT a pure bit op in the
+                     * interpreter: its widen-through-double quiets SNaN
+                     * lanes (and raises IOC) — keep the gate there. The
+                     * double form reads the lane directly and is pure. */
+                    gated = !sz;
+                    break;
+                case 0x6f:                       /* FNEG: flip sign bits */
+                    sse_rr(e, 0x66, 0x76, 1, 1);
+                    sse_shift_i(e, sz ? 0x73 : 0x72, 6, 1, sz ? 63 : 31);
+                    sse_rr(e, 0x66, 0xEF, 0, 1);
+                    gated = !sz;                 /* same SNaN-quiet rule */
+                    break;
+                case 0x7f:                       /* FSQRT */
+                    sse_rr(e, pfx, 0x51, 0, 0);
+                    break;
+                case 0x2c:                       /* FCMGT #0: 0 < x */
+                case 0x6c:                       /* FCMGE #0: 0 <= x */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, pfx, 0xC2, 1, 0); e8(e, key == 0x2c ? 1 : 2);
+                    res = 1; gated = 0;
+                    break;
+                case 0x2d:                       /* FCMEQ #0 */
+                case 0x6d:                       /* FCMLE #0: x <= 0 */
+                case 0x2e:                       /* FCMLT #0: x < 0 */
+                    sse_rr(e, 0x66, 0xEF, 1, 1);
+                    sse_rr(e, pfx, 0xC2, 0, 1);
+                    e8(e, key == 0x2d ? 0 : key == 0x6d ? 2 : 1);
+                    gated = 0;
+                    break;
+                default: {                       /* FRINT N/M/P/Z/X/I */
+                    u8 imm = key == 0x18 ? 0x8   /* N: even, PE off */
+                           : key == 0x38 ? 0xA   /* P: +inf */
+                           : key == 0x19 ? 0x9   /* M: -inf */
+                           : key == 0x39 ? 0xB   /* Z: trunc */
+                           : key == 0x59 ? 0x0   /* X: even, PE on */
+                           : 0x8;                /* I: even (RMode gated) */
+                    sse3a_rr(e, sz ? 0x09 : 0x08, 0, 0, imm);
+                    break;
+                }
+            }
+            if (!gated) {
+                icount_add(be, 1);
+                vop_dst(be, res, rd, (int)Q);
+                break;
+            }
+            sse_rr(e, 0x66, 0x6F, 1, res);       /* copy for the NaN check */
+            sse_rr(e, pfx, 0xC2, 1, 1); e8(e, 3);
+            sse_rr(e, pfx, 0x50, RAX, 1);        /* movmskps/pd */
+            if (!sz && !Q) alu_ri32(e, 0, 4, RAX, 0x3);
+            op_rr(e, 0, 0x85, RAX, RAX);
+            u8 *slow = jcc_fwd(e, CC_NE);
+            icount_add(be, 1);
+            vop_slowpath2(be, o, slow, slow2, res);
+            vop_dst(be, res, rd, (int)Q);
+            break;
+        }
+        case VC_FRINTS: {
+            /* Scalar FRINT S/D via roundss/sd (SSE4.1); half and FRINTA
+             * were declined. X and I run only under guest RN. */
+            int dbl = ((insn >> 22) & 3) == 1;
+            unsigned ropc = (insn >> 15) & 0x3f;
+            u8 pfx = dbl ? 0xF2 : 0xF3;
+            u8 *slow2 = NULL;
+            materialize_flags(be);
+            if (ropc == 0xe || ropc == 0xf) slow2 = rmode_gate(be);
+            sse_mem(e, pfx, 0x10, 0, OFF_V(rn));
+            {
+                u8 imm = ropc == 0x8 ? 0x8 : ropc == 0x9 ? 0xA
+                       : ropc == 0xa ? 0x9 : ropc == 0xb ? 0xB
+                       : ropc == 0xe ? 0x0 : 0x8;    /* X reports PE */
+                sse3a_rr(e, dbl ? 0x0B : 0x0A, 0, 0, imm);
+            }
+            sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);       /* ucomis x0,x0 */
+            u8 *slow = jcc_fwd(e, CC_P);
+            icount_add(be, 1);
+            movq_rax_x(e, dbl, 0);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath2(be, o, slow, slow2, -1);
+            break;
+        }
+        case VC_FPAIRS: {
+            /* Scalar pairwise: ADDP.d is an exact integer fold; FADDP folds
+             * the two low lanes with a NaN gate. */
+            unsigned U = (insn >> 29) & 1, sz = (insn >> 22) & 1;
+            sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));        /* movdqu Vn */
+            if (!U) {                                    /* ADDP.d */
+                sse_rr(e, 0x66, 0x70, 1, 0); e8(e, 0x4E);/* swap halves */
+                sse_rr(e, 0x66, 0xD4, 0, 1);             /* paddq */
+                icount_add(be, 1);
+                movq_rax_x(e, 1, 0);
+                st64(e, RAX, R14, OFF_V(rd));
+                st_imm_r14(e, OFF_V(rd) + 8, 0);
+                break;
+            }
+            materialize_flags(be);
+            if (sz) {
+                sse_rr(e, 0x66, 0x70, 1, 0); e8(e, 0x4E);/* x1 = [n1, n0] */
+                sse_rr(e, 0xF2, 0x58, 0, 1);             /* addsd */
+            } else {
+                sse_rr(e, 0x66, 0x70, 1, 0); e8(e, 0x01);/* x1 lane0 = n1 */
+                sse_rr(e, 0xF3, 0x58, 0, 1);             /* addss */
+            }
+            sse_rr(e, sz ? 0x66 : 0, 0x2E, 0, 0);        /* ucomis x0,x0 */
+            u8 *slow = jcc_fwd(e, CC_P);
+            icount_add(be, 1);
+            movq_rax_x(e, (int)sz, 0);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        case VC_FSELEM: {
+            /* Scalar FP by-element: the element is a compile-time lane, so
+             * load it straight from c->v[rm] by offset; FMLA/FMLS preload
+             * the addend and use FMA3 (be_vop_ok gated). */
+            int dbl = ((insn >> 22) & 3) == 3;
+            unsigned eopc = (insn >> 12) & 0xf;
+            unsigned H = (insn >> 11) & 1, L = (insn >> 21) & 1;
+            unsigned idx = dbl ? H : ((H << 1) | L);
+            u8 pfx = dbl ? 0xF2 : 0xF3;
+            int res = 0;
+            materialize_flags(be);
+            sse_mem(e, pfx, 0x10, 0, OFF_V(rn));
+            sse_mem(e, pfx, 0x10, 1, OFF_V(rm) + (s32)(idx << (dbl ? 3 : 2)));
+            if (eopc == 0x9) {                           /* FMUL */
+                sse_rr(e, pfx, 0x59, 0, 1);
+            } else {                                     /* FMLA / FMLS */
+                sse_mem(e, pfx, 0x10, 2, OFF_V(rd));
+                fma231_rr(e, eopc == 0x5 ? 0xBD : 0xB9, dbl, 2, 0, 1);
+                res = 2;
+            }
+            sse_rr(e, dbl ? 0x66 : 0, 0x2E, res, res);
+            u8 *slow = jcc_fwd(e, CC_P);
+            icount_add(be, 1);
+            movq_rax_x(e, dbl, res);
+            st64(e, RAX, R14, OFF_V(rd));
+            st_imm_r14(e, OFF_V(rd) + 8, 0);
+            vop_slowpath(be, o, slow, -1);
+            break;
+        }
+        case VC_FELEM: {
+            /* Vector FP by-element: pshufd-broadcast the element, then
+             * mulps or FMA3 into the preloaded accumulator; NaN-gated like
+             * VC_VF3S. The half form was declined. */
+            unsigned Q = (insn >> 30) & 1;
+            int dbl = ((insn >> 22) & 3) == 3;
+            unsigned eopc = (insn >> 12) & 0xf;
+            unsigned H = (insn >> 11) & 1, L = (insn >> 21) & 1;
+            unsigned idx = dbl ? H : ((H << 1) | L);
+            u8 pfx = dbl ? 0x66 : 0;
+            int res = 0;
+            materialize_flags(be);
+            vop_src(be, 0, rn);
+            vop_src(be, 1, rm);
+            sse_rr(e, 0x66, 0x70, 1, 1);                 /* broadcast elem */
+            e8(e, dbl ? (idx ? 0xEE : 0x44) : (u8)(idx * 0x55));
+            if (eopc == 0x9) {                           /* FMUL */
+                sse_rr(e, pfx, 0x59, 0, 1);
+            } else {                                     /* FMLA / FMLS */
+                vop_src(be, 2, rd);
+                fma231_rr(e, eopc == 0x5 ? 0xBC : 0xB8, dbl, 2, 0, 1);
+                res = 2;
+            }
+            sse_rr(e, 0x66, 0x6F, 1, res);               /* NaN check copy */
+            sse_rr(e, pfx, 0xC2, 1, 1); e8(e, 3);
+            sse_rr(e, pfx, 0x50, RAX, 1);
+            if (!dbl && !Q) alu_ri32(e, 0, 4, RAX, 0x3);
+            op_rr(e, 0, 0x85, RAX, RAX);
+            u8 *slow = jcc_fwd(e, CC_NE);
+            icount_add(be, 1);
+            vop_slowpath(be, o, slow, res);
             vop_dst(be, res, rd, (int)Q);
             break;
         }
@@ -2451,38 +2799,6 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             if (Q) { vcvtps2ph_r(e, 5, 1, 0); movq_rax_x(e, 1, 5);
                      st64(e, RAX, R14, OFF_V(rd) + 8); }
             else st_imm_r14(e, OFF_V(rd) + 8, 0);
-            vop_slowpath(be, o, slow, -1);
-            break;
-        }
-        case VC_F3: {
-            /* FMADD family (a +- n*m, unfused; self-counting class). The
-             * arithmetic is order-independent for every non-NaN result;
-             * NaN results are re-run in the interpreter (vop_slowpath), so
-             * gcc's operand-order NaN propagation never has to be mirrored. */
-            int dbl = ((insn >> 22) & 3) == 1;
-            unsigned ra = (insn >> 10) & 31;
-            int o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
-            u8 pfx = dbl ? 0xF2 : 0xF3;
-            materialize_flags(be);                       /* ucomis below */
-            sse_mem(e, pfx, 0x10, 0, OFF_V(rn));         /* xmm0 = n */
-            sse_mem(e, pfx, 0x10, 1, OFF_V(rm));         /* xmm1 = m */
-            sse_mem(e, pfx, 0x10, 2, OFF_V(ra));         /* xmm2 = a */
-            sse_rr(e, pfx, 0x59, 0, 1);                  /* xmm0 = n*m */
-            if (o1) {                                    /* -a forms */
-                mov_ri(e, 1, RAX,
-                       dbl ? 0x8000000000000000ULL : 0x80000000ULL);
-                movq_xr(e, 1, RAX);                      /* xmm1 = signmask */
-                sse_rr(e, 0x66, 0x57, 2, 1);             /* xorpd xmm2, xmm1 */
-            }
-            if (o0 == o1) sse_rr(e, pfx, 0x58, 0, 2);    /* +-a + n*m */
-            else          sse_rr(e, pfx, 0x5C, 2, 0);    /* +-a - n*m */
-            int res = (o0 == o1) ? 0 : 2;
-            sse_rr(e, dbl ? 0x66 : 0, 0x2E, res, res);   /* NaN result? */
-            u8 *slow = jcc_fwd(e, CC_P);
-            icount_add(be, 1);
-            movq_rax_x(e, dbl, res);
-            st64(e, RAX, R14, OFF_V(rd));
-            st_imm_r14(e, OFF_V(rd) + 8, 0);
             vop_slowpath(be, o, slow, -1);
             break;
         }
