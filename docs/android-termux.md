@@ -191,6 +191,17 @@ Bionic-keyring code paths at compile time, and compiles in the
 forcing it to be taken even though the build host allows real hardlinks —
 otherwise that scheme would only ever be exercised on a device.
 
+## Running the suite on the device itself
+
+`make test` / `make test-jit` run on Termux directly (the AArch64 CPU is the
+oracle; see the README). Neither depends on **termux-exec**: every test
+script is started through an explicit interpreter and the generated wrapper
+scripts carry the running `sh`'s absolute path as their shebang, so the suite
+works with the `LD_PRELOAD` shim disabled — and when the shim *is* enabled,
+`tests/hostenv.sh` unsets `LD_PRELOAD` for the whole run, so neither the
+emulator nor the oracle ever executes under it and both configurations test
+the same thing.
+
 ## On-device smoke-test checklist
 
 Manual sanity pass for a real device (Debian/Ubuntu arm64 rootfs under

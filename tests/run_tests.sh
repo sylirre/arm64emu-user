@@ -23,7 +23,7 @@ echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
 # (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
 # offline, Alpine needs a one-time network fetch and otherwise degrades to SKIP.
 export A64_TEST_ROOT="${A64_TEST_ROOT:-$PWD/tests/.cache/rootfs}"
-tests/setup_env.sh || true
+bash tests/setup_env.sh || true
 
 pass=0 fail=0 skip=0
 
@@ -181,10 +181,18 @@ if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok &&
     # one of them reports the oracle's empty output as a failure. Say so once.
     skip=$((skip+1)); echo "SKIP sh: proot cannot run the reference rootfs here"
 elif [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok; then
+    # proot hands the guest the HOST environment, and the emulator gives its
+    # guests the fixed default PATH + HOME=/root. On a host whose own PATH is
+    # meaningless inside the rootfs (Termux: $PREFIX/bin) every non-builtin
+    # then failed 127 on the oracle side only. Pin the guest env to the
+    # emulator's defaults through the rootfs's own env(1) so the two sides
+    # always agree, whatever the host environment looks like. The emulator
+    # side is bounded like every other test (-k: a hang that blocks TERM).
+    GUESTENV="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
     while IFS= read -r cmd; do
         [ -z "$cmd" ] && continue
-        out_o=$(oracle_proot -r "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
-        out_e=$("$EMU" "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_e=$?
+        out_o=$(oracle_proot -r "$ALPINE" /usr/bin/env -i $GUESTENV /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
+        out_e=$(timeout -k 5 60 "$EMU" "$ALPINE" /bin/sh -c "$cmd" 2>/dev/null); rc_e=$?
         if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS sh: $cmd"
         else

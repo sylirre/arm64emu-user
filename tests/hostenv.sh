@@ -26,6 +26,14 @@
 # Provides: oracle_run, oracle_run0, oracle_proot, oracle_proot_ok,
 #           host_missing_features, a64_oracle_ioctl_ok
 
+# The suite must behave the same whether or not the host injects an execve
+# shim through LD_PRELOAD (Termux's termux-exec, when enabled, rewrites
+# shebang paths for every child). Nothing here relies on that rewriting --
+# scripts are invoked through explicit interpreters and generated wrappers
+# carry absolute shebangs -- so drop the shim outright: the emulator and the
+# oracle run with the environment the kernel gives them, not a patched one.
+unset LD_PRELOAD
+
 A64_HOST_ARCH=$(uname -m)
 
 a64_host_arm64() {
@@ -156,10 +164,13 @@ oracle_proot_ok() {
 }
 
 oracle_proot() {   # oracle_proot <proot args...>
+    # Bounded: proot is ptrace-based and can wedge on hosts that half-support
+    # it; a hanging oracle must fail the test, not the whole run. -k covers a
+    # tracee parked with every signal blocked, where TERM alone never lands.
     if [ -n "$PROOT_QEMU" ]; then
-        proot -q "$PROOT_QEMU" "$@"
+        timeout -k 5 60 proot -q "$PROOT_QEMU" "$@"
     else
-        proot "$@"
+        timeout -k 5 60 proot "$@"
     fi
 }
 

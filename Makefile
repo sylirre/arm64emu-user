@@ -123,11 +123,17 @@ m32: arm64chroot32
 # Provision the Alpine + glibc test rootfs from scratch (repo-local cache under
 # tests/.cache). run_tests.sh also does this automatically on first run; this is
 # an explicit pre-provision step. Wiped by clean-testenv, not by clean.
+#
+# Every test script is invoked through an explicit interpreter, never through
+# its shebang: on Termux without the termux-exec LD_PRELOAD shim there is no
+# /bin/sh or /bin/bash for the kernel to find, and the exec fails with
+# "No such file or directory". The generated wrapper scripts get the running
+# sh's own absolute path as their shebang for the same reason.
 test-env:
-	tests/setup_env.sh
+	bash tests/setup_env.sh
 
 test: arm64chroot
-	tests/run_tests.sh ./arm64chroot
+	bash tests/run_tests.sh ./arm64chroot
 
 # The ILP32-host variant needs a 32-bit toolchain for THIS host *and* a 32-bit
 # runtime able to execute what it produces: gcc -m32 plus multilib on x86-64,
@@ -141,7 +147,7 @@ test32:
 	     $(M32CC) $(CFLAGS) $(M32FLAGS) -x c - -o $$t/probe 2>/dev/null && \
 	   $$t/probe >/dev/null 2>&1; then \
 	    rm -rf $$t; \
-	    $(MAKE) --no-print-directory arm64chroot32 && tests/run_tests.sh ./arm64chroot32; \
+	    $(MAKE) --no-print-directory arm64chroot32 && bash tests/run_tests.sh ./arm64chroot32; \
 	else \
 	    rm -rf $$t; \
 	    echo "SKIP test32: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
@@ -153,17 +159,17 @@ test32:
 # semantics are host-C by design and have no external oracle. On an AArch64
 # host this is also the only thing that ever executes backend_a64.c.
 test-jit: arm64chroot
-	tests/run_consist.sh ./arm64chroot
-	printf '#!/bin/sh\nexec ./arm64chroot --jit "$$@"\n' > tests/jit_emu.sh
+	sh tests/run_consist.sh ./arm64chroot
+	printf '#!%s\nexec ./arm64chroot --jit "$$@"\n' "$$(command -v sh)" > tests/jit_emu.sh
 	chmod +x tests/jit_emu.sh
-	tests/run_tests.sh tests/jit_emu.sh
+	bash tests/run_tests.sh tests/jit_emu.sh
 	rm -f tests/jit_emu.sh
 
 # Android-behavior simulation on the dev host: force the statx ENOSYS
 # fallback and the Bionic keyring gate, then require the differential suite
 # to still match the oracle.
 test-android-sim: arm64chroot_asim
-	tests/run_tests.sh ./arm64chroot_asim
+	bash tests/run_tests.sh ./arm64chroot_asim
 
 # Android-seccomp regression gate: the ENTIRE differential suite with the
 # emulator under a SECCOMP_RET_TRAP filter for the full Oreo-blocked set
@@ -171,9 +177,9 @@ test-android-sim: arm64chroot_asim
 # the SIGSYS net covers the rest. Needs host seccomp (any normal Linux).
 test-seccomp: arm64chroot
 	$(CC) $(CFLAGS) -o tests/seccomp_wrap.bin tests/seccomp_wrap.c
-	printf '#!/bin/sh\nexec tests/seccomp_wrap.bin ./arm64chroot "$$@"\n' > tests/seccomp_emu.sh
+	printf '#!%s\nexec tests/seccomp_wrap.bin ./arm64chroot "$$@"\n' "$$(command -v sh)" > tests/seccomp_emu.sh
 	chmod +x tests/seccomp_emu.sh
-	tests/run_tests.sh tests/seccomp_emu.sh
+	bash tests/run_tests.sh tests/seccomp_emu.sh
 	rm -f tests/seccomp_emu.sh
 
 clean:
