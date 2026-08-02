@@ -1378,10 +1378,29 @@ static double fop_d_raw(unsigned op, double n, double m, double d) {
             if ((n == 0.0 && __builtin_isinf(m)) ||   /* 0*inf -> 2.0, no IOC */
                 (__builtin_isinf(n) && m == 0.0)) return 2.0;
             return __builtin_fma(-n, m, 2.0);
-        case FOP_RSQRTS:                      /* FPRSqrtStepFused: 0*inf -> 1.5 */
+        case FOP_RSQRTS: {                    /* FPRSqrtStepFused: 0*inf -> 1.5 */
             if ((n == 0.0 && __builtin_isinf(m)) ||
                 (__builtin_isinf(n) && m == 0.0)) return 1.5;
+            /* (3 - n*m) / 2 with a SINGLE rounding (the pseudocode's halved
+             * fused subtract): fold the halving into an operand — fma(-n/2,
+             * m, 1.5) — so it stays one rounding. fma-then-divide rounds
+             * twice, which shows at the overflow boundary (the fma saturates
+             * to inf where the halved value is still representable; found by
+             * the a64 JIT's native replay on real silicon, where frsqrts is
+             * the reference) and in the subnormal range. Halving is exact
+             * only above the bottom exponent, so pick the operand it cannot
+             * clip (checked in the integer domain — an FP probe would raise
+             * flags the guest never asked for); when both sit at the very
+             * bottom the product is far below 3's significance and the old
+             * shape is exact, with the right IXC. */
+            u64 nb; memcpy(&nb, &n, 8);
+            if (((nb >> 52) & 0x7ff) >= 2)
+                return __builtin_fma(-(0.5 * n), m, 1.5);
+            memcpy(&nb, &m, 8);
+            if (((nb >> 52) & 0x7ff) >= 2)
+                return __builtin_fma(-n, 0.5 * m, 1.5);
             return __builtin_fma(-n, m, 3.0) / 2.0;
+        }
         case FOP_MULX:
             if ((__builtin_isinf(n) && m == 0.0) || (__builtin_isinf(m) && n == 0.0))
                 return (__builtin_signbit(n) ^ __builtin_signbit(m)) ? -2.0 : 2.0;
@@ -1434,10 +1453,18 @@ static float fop_s_raw(unsigned op, float n, float m, float d) {
             if ((n == 0.0f && __builtin_isinf(m)) ||      /* 0*inf -> 2.0, no IOC */
                 (__builtin_isinf(n) && m == 0.0f)) return 2.0f;
             return __builtin_fmaf(-n, m, 2.0f);
-        case FOP_RSQRTS:
+        case FOP_RSQRTS: {
             if ((n == 0.0f && __builtin_isinf(m)) ||      /* 0*inf -> 1.5 */
                 (__builtin_isinf(n) && m == 0.0f)) return 1.5f;
+            /* single-rounded (3 - n*m)/2 — see fop_d_raw */
+            u32 nb; memcpy(&nb, &n, 4);
+            if (((nb >> 23) & 0xff) >= 2)
+                return __builtin_fmaf(-(0.5f * n), m, 1.5f);
+            memcpy(&nb, &m, 4);
+            if (((nb >> 23) & 0xff) >= 2)
+                return __builtin_fmaf(-n, 0.5f * m, 1.5f);
             return __builtin_fmaf(-n, m, 3.0f) / 2.0f;
+        }
         case FOP_MULX:
             if ((__builtin_isinf(n) && m == 0.0f) || (__builtin_isinf(m) && n == 0.0f))
                 return (__builtin_signbit(n) ^ __builtin_signbit(m)) ? -2.0f : 2.0f;
