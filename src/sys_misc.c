@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,14 +13,70 @@
 
 #include "sys.h"
 
+/* Guest GRND_* values (identical on every architecture). Guest literals, not
+ * host macros: an old host libc has no GRND_INSECURE to borrow. */
+#define G_GRND_NONBLOCK 0x1
+#define G_GRND_RANDOM   0x2
+#define G_GRND_INSECURE 0x4
+
 SYSDEF(getrandom) {
     size_t len = (size_t)a1;
+    unsigned flags = (unsigned)a2;
     if (len > 65536) len = 65536;
     u8 buf[65536];
-    ssize_t n = syscall(SYS_getrandom, buf, len, (unsigned)a2);
-    if (n < 0) return host_err();
-    if (copy_to_guest(c, a0, buf, (size_t)n) < 0) return (u64)(s64)-EFAULT;
-    return (u64)n;
+    if (!getenv("A64_GETRANDOM_FORCE_DEV")) {
+        ssize_t n = syscall(SYS_getrandom, buf, len, flags);
+        if (n >= 0) {
+            if (copy_to_guest(c, a0, buf, (size_t)n) < 0)
+                return (u64)(s64)-EFAULT;
+            return (u64)n;
+        }
+        if (errno != ENOSYS) return host_err();
+    }
+    /* The host kernel predates getrandom(2) (< 3.17 -- Android 7 devices run
+     * 3.x), or a seccomp filter blocked it (the SIGSYS net answers ENOSYS).
+     * The guest ABI still has the syscall: uname presents a modern kernel,
+     * and OpenSSL's seeding *skips* its /dev/urandom fallback on anything
+     * >= 4.8 precisely because getrandom must exist there -- so forwarding
+     * the host's ENOSYS leaves TLS software with no entropy source at all
+     * (apk update died dereferencing the NULL SSL object that came of it).
+     * Serve the call from the host's random devices, with the kernel's own
+     * flag rules. */
+    if (flags & ~(G_GRND_NONBLOCK | G_GRND_RANDOM | G_GRND_INSECURE))
+        return (u64)(s64)-EINVAL;
+    if ((flags & (G_GRND_RANDOM | G_GRND_INSECURE)) ==
+        (G_GRND_RANDOM | G_GRND_INSECURE))
+        return (u64)(s64)-EINVAL;
+    /* GRND_INSECURE asks for the urandom source without the seeded wait; a
+     * pre-4.8 host never blocks urandom reads anyway, so both flavors read
+     * urandom. GRND_RANDOM keeps its own device and its blocking rules. */
+    int rnd = (flags & G_GRND_RANDOM) != 0;
+    int fd = open(rnd ? "/dev/random" : "/dev/urandom",
+                  O_RDONLY | O_CLOEXEC |
+                      ((flags & G_GRND_NONBLOCK) ? O_NONBLOCK : 0));
+    if (fd < 0) return host_err();
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf + got, len - got);
+        if (r > 0) {
+            got += (size_t)r;
+            /* The random source is entropy-limited and may return short, as
+             * getrandom(GRND_RANDOM) does; urandom serves the full request. */
+            if (rnd || got >= len) break;
+        } else if (r < 0 && errno == EINTR) {
+            if (got) break;                 /* getrandom returns what it has */
+        } else {
+            if (!got) {
+                u64 e = r < 0 ? host_err() : 0;   /* len==0 lands here as 0 */
+                close(fd);
+                return e;
+            }
+            break;
+        }
+    }
+    close(fd);
+    if (copy_to_guest(c, a0, buf, got) < 0) return (u64)(s64)-EFAULT;
+    return (u64)got;
 }
 
 /* Limits that bound an address space are answered and enforced from the guest's

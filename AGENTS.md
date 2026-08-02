@@ -171,6 +171,7 @@ Behavior fallbacks:
 * `A64_OVERFLOWID_FORCE_SYNTH`: forces the synthetic /proc/sys/kernel/overflow{u,g}id fallback.
 * `A64_NETLINK_FORCE_BLOCK`: forces the netlink fallback path.
 * `A64_SHM_FORCE_FILE`: forces System V shm segments onto file backing (a file in the first writable dir) instead of an anonymous memfd, exercising the fallback tier.
+* `A64_GETRANDOM_FORCE_DEV`: forces guest getrandom(2) onto the /dev/urandom / /dev/random fallback — the tier a host kernel without getrandom(2) (< 3.17, e.g. Android 7's 3.x) is served by.
 
 Tuning:
 

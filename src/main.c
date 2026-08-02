@@ -294,6 +294,9 @@ static void help(void) {
         {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "
                         "tier)."},
+        {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2) onto the /dev/urandom"
+                        " / /dev/random fallback (the tier a host kernel "
+                        "without getrandom is served by)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",

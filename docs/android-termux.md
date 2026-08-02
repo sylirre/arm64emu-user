@@ -39,6 +39,15 @@ unfiltered:
 * **`statx` fallback**: when host `statx` fails with `ENOSYS` (Android 8.0/8.1,
   old kernels), the result is synthesized from `fstatat` with `STATX_BTIME`
   cleared from the mask.
+* **`getrandom` fallback**: when the host kernel has no `getrandom(2)` at all
+  (< 3.17 — Android 7 devices run 3.x kernels; a seccomp-trapped call lands
+  here too via the SIGSYS net), the guest call is served from the host's
+  `/dev/urandom` / `/dev/random` with the kernel's flag rules, instead of
+  forwarding `ENOSYS`. The guest ABI presents a modern kernel, and OpenSSL's
+  seeding *skips* its own device fallback on anything ≥ 4.8 precisely because
+  `getrandom` must exist there — forwarding the host's `ENOSYS` left TLS
+  software with no entropy source at all (`apk update` crashed on a NULL SSL
+  object). `A64_GETRANDOM_FORCE_DEV` forces this tier for testing.
 * **Never-forwarded set**: the keyring family returns `-ENOSYS` on Bionic;
   `set_robust_list`/`get_robust_list` are answered from per-thread emulator
   state; guest probes of post-Oreo syscalls (`rseq`, `clone3`, `openat2`, …)

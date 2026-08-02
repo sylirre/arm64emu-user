@@ -172,6 +172,23 @@ for base in shm_sysv shm_stat; do
     fi
 done
 
+# ---- getrandom: /dev-backed fallback tier ----
+# The C loop above ran tests/c/getrandom.c against the host's real
+# getrandom(2). Re-run it with A64_GETRANDOM_FORCE_DEV=1 so the answer comes
+# from /dev/urandom / /dev/random -- the tier a host kernel without getrandom
+# (Android 7's 3.x) is served by -- and require identical semantics.
+GRBIN="tests/c/getrandom_static.bin"
+if [ -x "$GRBIN" ]; then
+    out_q=$(oracle_run "$GRBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_GETRANDOM_FORCE_DEV=1 timeout 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/getrandom(dev-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/getrandom(dev-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+fi
+
 # ---- Alpine rootfs shell tests (if present) ----
 ALPINE="$A64_TEST_ROOT/alpine"
 if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok &&
