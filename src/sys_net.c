@@ -123,7 +123,7 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
     if (ss->ss_family != AF_UNIX) return 0;
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
-    if (*sl <= poff) return 0;                 /* unnamed / autobind */
+    if ((size_t)*sl <= poff) return 0;         /* unnamed / autobind */
     if (un->sun_path[0] == '\0') {             /* abstract namespace */
         abs_tag_in(c, un, sl, poff);
         return 0;
@@ -234,7 +234,7 @@ static u64 addr_out(CPU *c, u64 addr_va, u64 len_va, struct sockaddr_storage *ss
     unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
     u32 glen;
     if (copy_from_guest(c, &glen, len_va, 4) < 0) return (u64)(s64)-EFAULT;
-    u32 out = sl < glen ? sl : glen;
+    u32 out = (u32)sl < glen ? (u32)sl : glen;
     if (out && copy_to_guest(c, addr_va, ss, out) < 0) return (u64)(s64)-EFAULT;
     u32 real = sl;
     if (copy_to_guest(c, len_va, &real, 4) < 0) return (u64)(s64)-EFAULT;
