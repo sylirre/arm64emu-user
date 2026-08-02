@@ -45,7 +45,13 @@ if [ "${A64_ORACLE:-auto}" = recorded ]; then
     # Replaying a test pack: no toolchain is needed (or available). The
     # stand-in succeeds exactly when the -o target is already in the pack, so
     # every compile-or-skip site keeps its meaning without building anything.
-    AGCC="tests/replay_cc.sh"
+    # Generated with the running sh's absolute path as its shebang, like the
+    # jit/seccomp wrapper scripts: Android has no /bin/sh, so the committed
+    # script cannot be exec'd there directly.
+    AGCC="tests/.cache/replay_cc"
+    mkdir -p tests/.cache
+    { printf '#!%s\n' "$(command -v sh)"; sed 1d tests/replay_cc.sh; } > "$AGCC"
+    chmod +x "$AGCC"
 elif [ -n "${A64_CC:-}" ]; then
     AGCC="$A64_CC"
 else

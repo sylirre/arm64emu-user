@@ -158,7 +158,10 @@ rm -f /tmp/t.bin
 # the emulator on the rootfs /tmp, which on a stacked filesystem like ecryptfs
 # answers EINVAL — a difference in the filesystem, not in the emulator. Both
 # sides here see the same /tmp.
-if [ -x tests/c/l2s_rename_static.bin ]; then
+if [ -x tests/c/l2s_rename_static.bin ] && [ ! -w /tmp ]; then
+    # Both worlds work in the same host /tmp here; Android has none.
+    skip=$((skip+1)); echo "SKIP c/l2s_rename(--link2symlink) (no writable /tmp on this host)"
+elif [ -x tests/c/l2s_rename_static.bin ]; then
     for mode in "" exchange; do
         label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
         rec_have tests/c/l2s_rename_static.bin $mode || {
