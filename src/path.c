@@ -168,6 +168,28 @@ const char *proc_other_tail(const char *canon, s32 *pid) {
     return tail;
 }
 
+/* The fd number when `host` names one of THIS process's own open fds --
+ * /proc/self/fd/N and the own-pid / thread-self / task/<tid> spellings (guest
+ * fd == host fd, so the number is the guest's too); -1 for anything else.
+ *
+ * Callers use it to serve a request from the fd itself when the host refuses
+ * the path form: Android's SELinux policy denies re-opening a memfd through
+ * /proc/self/fd (sealed or not, EACCES), and apk-tools >= 3.0 executes every
+ * install trigger exactly that way -- script into a sealed memfd, then
+ * execve("/proc/self/fd/N"). */
+int proc_own_fd_path(const char *host) {
+    const char *tail = proc_self_tail(host);
+    if (!tail || strncmp(tail, "fd/", 3)) return -1;
+    const char *p = tail + 3;
+    if (*p < '0' || *p > '9') return -1;
+    long fd = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        fd = fd * 10 + (*p - '0');
+        if (fd > 0x7fffffff) return -1;
+    }
+    return *p ? -1 : (int)fd;
+}
+
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
  * state (our binary, the host cwd, the host root). Following or reading them raw
  * would leak host paths, and root/… would escape the rootfs entirely, so the

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -566,6 +567,53 @@ static void l2s_fix_fd(int fd, struct stat *st) {
 }
 #endif /* L2S_ENABLED */
 
+/* Fallback when the host refuses to re-open one of our own fds by path:
+ * Android's SELinux denies opening /proc/self/fd/N when N is a memfd (sealed
+ * or not, EACCES), and apk-tools' triggers are scripts in a sealed memfd that
+ * the interpreter re-opens exactly that way. Read access can still be granted
+ * faithfully: snapshot the contents into a fresh memfd and seal it, so writes
+ * keep failing (EPERM, as they would on apk's own sealed original). Gated on
+ * the link target actually naming a memfd -- a plain file's EACCES stays the
+ * host's answer, keeping normal permission semantics intact. Returns the new
+ * fd, or -1 with errno for host_err(). */
+static int own_memfd_reopen(int own, int gflags) {
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS (1024 + 9)
+#endif
+    char link[64], tgt[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", own);
+    ssize_t tn = readlink(link, tgt, sizeof tgt - 1);
+    if (tn < 8 || memcmp(tgt, "/memfd:", 7)) { errno = EACCES; return -1; }
+    if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & G_O_DIRECTORY)) {
+        errno = EACCES;
+        return -1;
+    }
+    struct stat st;
+    if (fstat(own, &st) < 0 || !S_ISREG(st.st_mode)) { errno = EACCES; return -1; }
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    int nfd = (int)syscall(SYS_memfd_create, "fdreopen", 2 /* MFD_ALLOW_SEALING */);
+#else
+    int nfd = memfd_create("fdreopen", MFD_ALLOW_SEALING);
+#endif
+    if (nfd < 0) { errno = EACCES; return -1; }
+    char buf[65536];
+    off_t off = 0;
+    for (;;) {
+        ssize_t rd = pread(own, buf, sizeof buf, off);
+        if (rd == 0) break;
+        if (rd < 0 || pwrite(nfd, buf, (size_t)rd, off) != rd) {
+            close(nfd);
+            errno = EACCES;
+            return -1;
+        }
+        off += rd;
+    }
+    /* Seal best-effort: still a correct read-only view if the kernel refuses. */
+    fcntl(nfd, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
+    if (gflags & O_CLOEXEC) fcntl(nfd, F_SETFD, FD_CLOEXEC);
+    return nfd;   /* offset 0, like the re-open the host denied */
+}
+
 SYSDEF(openat) {
     char host[PATH_MAX], canon[PATH_MAX];
     int gflags = (int)a2;
@@ -595,6 +643,12 @@ SYSDEF(openat) {
         if (procfs_open(c, pcanon, gflags, &pf)) return (u64)pf;
     }
     int fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
+        int own = proc_own_fd_path(host);
+        if (own >= 0) fd = own_memfd_reopen(own, gflags);
+        else errno = e;
+    }
     return fd < 0 ? host_err() : (u64)fd;
 }
 

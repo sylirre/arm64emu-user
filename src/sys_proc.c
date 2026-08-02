@@ -1010,11 +1010,22 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }
         int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, host, canon);
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
-        FILE *f = fopen(host, "rb");
-        if (!f) { free_strvec(argv); return (u64)(s64)-ENOENT; }
         unsigned char hdr[256];
-        size_t n = fread(hdr, 1, sizeof hdr, f);
-        fclose(f);
+        size_t n;
+        FILE *f = fopen(host, "rb");
+        if (f) {
+            n = fread(hdr, 1, sizeof hdr, f);
+            fclose(f);
+        } else {
+            /* The path names one of our own fds and the host refused the
+             * re-open (Android denies it for memfds — apk's triggers): read
+             * the header through the fd itself. pread leaves the guest's
+             * offset alone. */
+            int ofd = proc_own_fd_path(host);
+            ssize_t pn = ofd >= 0 ? pread(ofd, hdr, sizeof hdr, 0) : -1;
+            if (pn < 0) { free_strvec(argv); return (u64)(s64)-ENOENT; }
+            n = (size_t)pn;
+        }
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
             /* shebang: rebuild argv = [interp, (arg), script, argv[1..]] */
             hdr[n < sizeof hdr ? n : sizeof hdr - 1] = 0;

@@ -560,7 +560,15 @@ then make the consequences the caller depends on true:
   changes as a process runs, so `status` is refreshed on `lseek(0)`+reread like
   the time-varying files above. `/proc/self/fd/N` open/stat stays
   host-passthrough deliberately: host fd == guest fd, and reopen semantics
-  (including O_TMPFILE publishing) must keep working.
+  (including O_TMPFILE publishing) must keep working. When the host *refuses*
+  the re-open of one of the process's own fds — Android denies it for memfds,
+  sealed or not, with EACCES, and apk-tools ≥ 3.0 executes every install
+  trigger as a script in a sealed memfd via `execve("/proc/self/fd/N")` — the
+  request is served from the fd itself: `execve`/`execveat` load the image
+  through `pread`/a `dup` (the offset the guest owns never moves), and an
+  `O_RDONLY` `open` of a memfd-backed path returns a sealed-memfd snapshot of
+  its contents (writes keep failing, as they would on the sealed original;
+  `proc_own_fd_path` in `src/path.c`, fallback in `sys_file.c` openat).
 
   Those files and `comm` cover **this** process; the cross-process view that
   `ps`/`top` build of *other* processes needs more, because every guest process

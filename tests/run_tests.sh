@@ -860,6 +860,28 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- exec and re-open through /proc/self/fd/N when N is a memfd, the way
+# apk-tools >= 3.0 runs its install triggers. Self-checking, not oracle-diffed:
+# Android denies path re-opens of memfds outright (EACCES, sealed or not), so a
+# native oracle cannot demonstrate the Linux behaviour the emulator provides --
+# it serves such paths from the fd itself, and this output is the same on every
+# host. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/ownfdexec.bin \
+            tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null; then
+        expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'
+        got=$(timeout 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: ownfdexec"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f tests/fixtures/ownfdexec.bin
+    else
+        skip_build "fixtures/ownfdexec"
+    fi
+fi
+
 # ---- nothing under ANOTHER guest process's /proc may hand back the emulator's
 # own state. Self-checking: qemu has no guest PID registry, so it cannot be the
 # oracle -- the fixture compares every file against what it sees for itself,

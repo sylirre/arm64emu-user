@@ -154,7 +154,17 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     if (r < 0) return r;
 
     int fd = open(host_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -errno;
+    if (fd < 0) {
+        /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
+         * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --
+         * Android denies it for memfds. Everything below reads by pread, which
+         * never moves the shared offset, so a plain dup of the guest's fd is a
+         * faithful stand-in for the re-open. */
+        int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
+        int ownfd = proc_own_fd_path(host_path);
+        if (ownfd >= 0) fd = fcntl(ownfd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) return ownfd >= 0 ? -errno : -e;
+    }
 
     LoadInfo exe = {0}, interp = {0};
     /* ET_EXEC ignores the base; ET_DYN main executables load at the fixed

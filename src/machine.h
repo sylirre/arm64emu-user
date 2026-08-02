@@ -525,6 +525,11 @@ const char *proc_self_tail(const char *canon);
  * own task/<tid>/ sub-path (same per-process files); *pid gets the pid. NULL
  * if canon does not name "/proc/<digits>/...". */
 const char *proc_other_tail(const char *canon, s32 *pid);
+/* The fd number when `host` names one of this process's own open fds
+ * (/proc/self/fd/N and its own-pid / thread-self spellings), -1 otherwise.
+ * Lets exec and open serve the request from the fd itself where the host
+ * denies the path re-open (Android refuses it for memfds). */
+int proc_own_fd_path(const char *host);
 
 /* A namespace-absolute guest path as the guest sees it: subtract the chroot /
  * pivot_root base. out >= PATH_MAX. */

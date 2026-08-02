@@ -115,6 +115,16 @@ unfiltered:
   get the same try-host-first treatment (65534, the kernel's own default, when
   the host denies them) — reading them is the first thing bubblewrap does, and
   it dies outright if it cannot.
+* **Re-opening a memfd through `/proc/self/fd/N`** is denied by Android's
+  SELinux policy (EACCES, sealed or not) — and that is exactly how apk-tools
+  ≥ 3.0 runs install triggers: the script goes into a sealed memfd and the
+  child does `execve("/proc/self/fd/N")`, then the shebang interpreter
+  re-opens the same path to read it. Both are served from the fd itself when
+  the host refuses the path form: exec loads via `pread`/`dup` (never moving
+  the guest's offset), and an `O_RDONLY` open of a memfd path returns a
+  sealed snapshot of its contents (details in
+  [syscalls.md](syscalls.md)). Without this, `apk upgrade` of `apk-tools`
+  itself fails its busybox trigger with `execve: No such file or directory`.
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
