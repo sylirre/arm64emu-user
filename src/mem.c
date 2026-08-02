@@ -671,6 +671,14 @@ static __thread CPU *g_bus_cpu;
 void as_bus_arm(CPU *c) { g_bus_cpu = c; g_bus_armed = 1; }
 void as_bus_disarm(void) { g_bus_armed = 0; }
 
+/* bus_catcher's share of sig_tls_prewarm (signal.c): make sure no first
+ * emulated-TLS access -- which mallocs -- can happen inside the handler. */
+void bus_tls_prewarm(void) {
+    (void)*(volatile int *)&g_bus_armed;
+    (void)*(volatile char *)g_bus_jb;
+    (void)*(volatile CPU *volatile *)&g_bus_cpu;
+}
+
 #if defined(__x86_64__)
 #define BUS_FAULT_PC(uc) ((const void *)(uintptr_t) \
     ((ucontext_t *)(uc))->uc_mcontext.gregs[REG_RIP])

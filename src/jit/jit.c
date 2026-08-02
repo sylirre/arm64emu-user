@@ -152,7 +152,13 @@ void jit_notify_mapping_change(void) {
 }
 
 void jit_signal_interrupt(void) {
-    g_jit_env.interrupt = 1;        /* own-thread TLS store: signal-safe */
+    g_jit_env.interrupt = 1;        /* own-thread TLS store: signal-safe --
+                                     * provided jit_tls_prewarm ran first on
+                                     * this thread (Bionic emulated TLS) */
+}
+
+void jit_tls_prewarm(void) {
+    (void)*(volatile char *)&g_jit_env;
 }
 
 /* ---- optional helper-call profiler (A64_JIT_STATS=1) ----

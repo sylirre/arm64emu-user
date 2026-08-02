@@ -85,6 +85,31 @@ static int sig_remap_to_guest(int sig) {
     return sig;
 }
 
+/* Touch, from ordinary context, every __thread variable a signal handler can
+ * reach. On Bionic the toolchain lowers __thread to emulated TLS, and the
+ * FIRST access a thread makes to each such variable goes through
+ * __emutls_get_address, which calls malloc for the thread's slot -- so a
+ * handler must never be a thread's first toucher. It was: the first SIGCHLD a
+ * guest shell's process ever captured could land inside fork(2), where
+ * Bionic's atfork prepare holds the allocator lock, and host_catcher's ring
+ * access then parked the thread on scudo's futex forever, every signal masked
+ * and the children left as zombies (found by the Alpine sh tests on Termux;
+ * the busybox pipeline hung on the spot). glibc's native TLS makes all of
+ * these plain register-relative loads, so other hosts never see it -- and
+ * this function is a few loads there. Called before the handlers are
+ * installed (main) and by every new host thread before it runs guest code
+ * (thread_entry); fork children inherit the forker's already-warmed slots. */
+void sig_tls_prewarm(void) {
+    (void)*(volatile sig_atomic_t *)&sigq_head;
+    (void)*(volatile sig_atomic_t *)&sigq_tail;
+    (void)*(volatile int *)&sigq[0].signo;
+    (void)*(volatile sig_atomic_t *)&g_sig_npend;
+    (void)*(volatile sig_atomic_t *)&g_ptrace_kick;   /* sig_kick_net */
+    (void)*(volatile s32 *)&g_tls.tid;                /* handlers read g_tls */
+    bus_tls_prewarm();   /* mem.c: bus_catcher's g_bus_jb/g_bus_armed/g_bus_cpu */
+    jit_tls_prewarm();   /* jit.c: g_jit_env, jit_signal_interrupt's target */
+}
+
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     (void)uctx;
     int next = (sigq_head + 1) % SIGQ_LEN;

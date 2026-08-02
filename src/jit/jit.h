@@ -43,6 +43,10 @@ void jit_notify_mapping_change(void);
  * one TLS store): make generated code exit at the next block entry so the
  * run loop can deliver the guest signal promptly. */
 void jit_signal_interrupt(void);
+/* Pre-touch g_jit_env from ordinary context: jit_signal_interrupt writes it
+ * from signal handlers, and on Bionic (emulated TLS) a thread's first access
+ * mallocs -- which a handler must never do (see sig_tls_prewarm). */
+void jit_tls_prewarm(void);
 
 /* execve tears the address space down (as_destroy): drop everything. */
 void jit_execve_flush(void);

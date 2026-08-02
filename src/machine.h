@@ -492,6 +492,13 @@ void sig_reset_for_exec(struct Machine *m);
 /* Mirror the calling thread's guest block-state of terminal job-control
  * signals to the host process mask. */
 void sig_sync_host_mask(struct Machine *m);
+/* Touch every handler-reachable __thread variable from ordinary context: on
+ * Bionic (emulated TLS) the first access mallocs, and a signal handler must
+ * never be the one doing it. Run by main() before handlers install and by
+ * every new host thread before guest code. bus_tls_prewarm is mem.c's share
+ * (bus_catcher's state), called from sig_tls_prewarm. */
+void sig_tls_prewarm(void);
+void bus_tls_prewarm(void);
 int  sig_on_altstack(u64 sp);   /* the kernel's on_sig_stack(): SP-range test */
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);

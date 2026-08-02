@@ -35,6 +35,19 @@ all four targets.
   test-seccomp`, which runs the whole differential suite with the emulator under
   a trap filter for the Oreo-blocked set — run by the committed CI on both the
   x86_64 and the arm64 host (see [android-termux.md](android-termux.md)).
+- **A signal handler must never be a thread's first access to a `__thread`
+  variable.** On Bionic the toolchain lowers `__thread` to *emulated TLS*:
+  every access goes through `__emutls_get_address`, and the first one a
+  thread makes to each variable **calls `malloc`** for its slot. glibc's
+  native TLS makes the same access a register-relative load, so nothing shows
+  up on the dev hosts — but on Termux the first SIGCHLD a process ever
+  captured could land inside `fork(2)` (Bionic's atfork prepare holds the
+  allocator lock) and park the handler on scudo's futex forever, every signal
+  masked, children left as zombies. `sig_tls_prewarm()` (signal.c) touches
+  every handler-reachable `__thread` variable from ordinary context — called
+  in `main()` before any handler installs and by every new host thread
+  (`thread_entry`) — and any new handler-visible `__thread` state must be
+  added to it.
 
 ## Catalog of pitfalls (each is a bug we hit)
 

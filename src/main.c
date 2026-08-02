@@ -727,6 +727,10 @@ int main(int argc, char **argv)
     rlim_init(m);     /* seed the guest's resource limits from the host's,
                        * before anything can consult or change them */
     as_init(&m->as);
+    /* Before any handler is installed or can fire: on Bionic (emulated TLS)
+     * the first access to a __thread variable mallocs, and a signal handler
+     * must never be the first toucher (sig_tls_prewarm). */
+    sig_tls_prewarm();
     as_bus_init();   /* host SIGBUS on a file truncated from outside this
                       * address space becomes the guest's own abort */
     m->cpu.m = m;

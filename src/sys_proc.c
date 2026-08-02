@@ -296,6 +296,8 @@ static void futex_wake_addr(CPU *c, u64 va) {
 
 static void *thread_entry(void *arg) {
     GThread *t = arg;
+    sig_tls_prewarm();   /* before any handler can fire on this thread: a
+                          * first emulated-TLS access mallocs (Bionic) */
     s32 tid = (s32)syscall(SYS_gettid);
     t->tid = tid;
     g_tls.tid = tid;
