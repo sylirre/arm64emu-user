@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>    /* struct timeval (SO_RCVTIMEO/SO_SNDTIMEO) */
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -385,12 +386,55 @@ SYSDEF(setsockopt) {
                                     (int)a2 == 26 ? SO_ATTACH_FILTER
                                                   : SO_ATTACH_REUSEPORT_CBPF,
                                     buf, len);
+    /* SO_RCVTIMEO / SO_SNDTIMEO (guest 20/21) carry a struct timeval: 16
+     * bytes in the guest's LP64 ABI, but an ILP32 host's old-style timeval
+     * is 8 -- and a time64 32-bit libc (musl 1.2+) renumbers the option to
+     * the 64-bit variant outright. Re-issue the option through the host
+     * libc's own macro and struct so every host tier parses what the guest
+     * sent. On LP64 hosts macro and layout already match the guest and the
+     * branch folds away. The usec range check must run before the width
+     * narrowing: the kernel answers EDOM, and truncation could turn an
+     * out-of-range value into a valid one. */
+    if ((SO_RCVTIMEO != 20 || sizeof(struct timeval) != 16) &&
+        (int)a1 == SOL_SOCKET && ((int)a2 == 20 || (int)a2 == 21)) {
+        if (len < 16) return (u64)(s64)-EINVAL;   /* kernel: optlen < sizeof(tv) */
+        s64 gsec, gusec;
+        memcpy(&gsec, buf, 8);
+        memcpy(&gusec, buf + 8, 8);
+        if (gusec < 0 || gusec >= 1000000) return (u64)(s64)-EDOM;
+        struct timeval tv;
+        s64 smax = (s64)((1ULL << (sizeof tv.tv_sec * 8 - 1)) - 1);
+        tv.tv_sec = (time_t)(gsec > smax ? smax : gsec < -smax - 1 ? -smax - 1 : gsec);
+        tv.tv_usec = (suseconds_t)gusec;
+        return setsockopt((int)a0, SOL_SOCKET,
+                          (int)a2 == 20 ? SO_RCVTIMEO : SO_SNDTIMEO,
+                          &tv, sizeof tv) < 0 ? host_err() : 0;
+    }
     return setsockopt((int)a0, (int)a1, (int)a2, buf, (socklen_t)len) < 0 ? host_err() : 0;
 }
 
 SYSDEF(getsockopt) {
     u32 glen = 0;
     if (a4 && copy_from_guest(c, &glen, a4, 4) < 0) return (u64)(s64)-EFAULT;
+    /* The reverse of setsockopt's SO_RCVTIMEO/SO_SNDTIMEO conversion: on a
+     * host whose timeval is not the guest's 16-byte one the kernel would
+     * write 8 bytes where the guest expects 16, read back as a garbage
+     * tv_sec. Same macro-renumbering note as there. */
+    if ((SO_RCVTIMEO != 20 || sizeof(struct timeval) != 16) &&
+        (int)a1 == SOL_SOCKET && ((int)a2 == 20 || (int)a2 == 21)) {
+        struct timeval tv;
+        socklen_t tl = sizeof tv;
+        if (getsockopt((int)a0, SOL_SOCKET,
+                       (int)a2 == 20 ? SO_RCVTIMEO : SO_SNDTIMEO, &tv, &tl) < 0)
+            return host_err();
+        u8 g[16];
+        s64 v = (s64)tv.tv_sec;  memcpy(g, &v, 8);
+        v = (s64)tv.tv_usec;     memcpy(g + 8, &v, 8);
+        u32 outl = glen < 16 ? glen : 16;   /* kernel: len = min(len, lv) */
+        if (a3 && outl && copy_to_guest(c, a3, g, outl) < 0) return (u64)(s64)-EFAULT;
+        if (a4 && copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
+        return 0;
+    }
     if (glen > 4096) glen = 4096;
     u8 buf[4096];
     socklen_t sl = glen;
