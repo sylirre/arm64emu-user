@@ -2221,10 +2221,19 @@ SYSDEF(syncfs) {
 
 SYSDEF(readahead) {
     ssize_t n;
-#ifdef __BIONIC__
-    n = syscall(SYS_readahead, (int)a0, (off_t)a1, (size_t)a2);
-#else
+#if !defined(__BIONIC__)
     n = readahead((int)a0, (off_t)a1, (size_t)a2);
+#elif __SIZEOF_LONG__ == 8
+    n = syscall(SYS_readahead, (int)a0, (off_t)a1, (size_t)a2);
+#elif defined(__ARM_EABI__)
+    /* What decides the register layout is the kernel's own prototype --
+     * (int fd, loff_t offset, size_t count) -- compiled for this ABI, which
+     * starts a 64-bit argument on an even-numbered register. So the offset
+     * skips one and the count lands a register further out than its position
+     * suggests. The dummy word is the padding the compiler would emit. */
+    n = syscall(SYS_readahead, (int)a0, 0L, SC_ARG64(a1), (long)(size_t)a2);
+#else
+    n = syscall(SYS_readahead, (int)a0, SC_ARG64(a1), (long)(size_t)a2);
 #endif
     return n < 0 ? host_err() : (u64)n;
 }
