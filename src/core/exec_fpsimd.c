@@ -615,10 +615,37 @@ static int fcm_test_s(int kind, float x, float y) {
 #else
 #define A64_NOSPEC
 #endif
-static A64_NOSPEC double d_from_s64(s64 v) { return (double)v; }
-static A64_NOSPEC double d_from_u64(u64 v) { return (double)v; }
-static A64_NOSPEC float  f_from_s64(s64 v) { return (float)v; }
-static A64_NOSPEC float  f_from_u64(u64 v) { return (float)v; }
+/* The conversion's Inexact flag, decided here rather than read from the
+ * host: a 32-bit ARM host has no 64-bit-int -> FP instruction, so these
+ * casts lower to soft libcalls (__aeabi_l2f and friends) that never touch
+ * the host FPSCR -- the result is still correctly rounded, but the flag is
+ * lost, and since every integer source funnels through these four helpers,
+ * ALL of SCVTF/UCVTF stopped raising IXC there (x86-64 uses cvtsi2ss, i386
+ * reaches x87 through fildll, and AArch64 replays scvtf, so only the armv7
+ * host ever showed it). An integer is exact in precision p exactly when its
+ * significant span -- top set bit down to bottom set bit -- fits in p bits;
+ * raising by hand is idempotent beside a host flag where one does fire. */
+static void i2f_inexact(u64 mag, int prec) {
+    if (!mag) return;
+    if ((63 - __builtin_clzll(mag)) - __builtin_ctzll(mag) + 1 > prec)
+        g_fpexc |= FPSR_IXC;
+}
+static A64_NOSPEC double d_from_s64(s64 v) {
+    i2f_inexact(v < 0 ? -(u64)v : (u64)v, 53);
+    return (double)v;
+}
+static A64_NOSPEC double d_from_u64(u64 v) {
+    i2f_inexact(v, 53);
+    return (double)v;
+}
+static A64_NOSPEC float  f_from_s64(s64 v) {
+    i2f_inexact(v < 0 ? -(u64)v : (u64)v, 24);
+    return (float)v;
+}
+static A64_NOSPEC float  f_from_u64(u64 v) {
+    i2f_inexact(v, 24);
+    return (float)v;
+}
 
 /* FSQRT's Invalid-Operation flag, raised here rather than inherited from
  * whatever the host's sqrt() turns out to be. A negative operand is invalid
