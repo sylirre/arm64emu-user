@@ -107,14 +107,39 @@ void as_unlock(void) { pthread_mutex_unlock(&g_as_lock); }
 
 /* ---- page table ---- */
 
+/* Every field except nthreads: shared with as_reinit_live, which must leave
+ * that word alone (other threads sample it lock-free at any instant). */
+static void as_fields_init(AddrSpace *as) {
+    as->l1 = calloc(L1_SIZE, sizeof(uintptr_t *));
+    if (!as->l1) { perror("arm64chroot: calloc"); exit(127); }
+    as->regions = NULL;
+    as->nregions = as->cap_regions = 0;
+    as->retired = NULL;
+    as->nretired = as->cap_retired = 0;
+    as->brk_start = as->brk = 0;
+    as->mmap_next = 0x6000000000ULL;
+    as->stack_top = 0;
+}
+
 void as_init(AddrSpace *as) {
     static int lock_ready;
     if (!lock_ready) { as_lock_init(); lock_ready = 1; }
     memset(as, 0, sizeof *as);
-    as->l1 = calloc(L1_SIZE, sizeof(uintptr_t *));
-    if (!as->l1) { perror("arm64chroot: calloc"); exit(127); }
-    as->mmap_next = 0x6000000000ULL;
+    as_fields_init(as);
     as->nthreads = 1;
+}
+
+/* execve's in-place reload: identical to as_init except as->nthreads is
+ * NEVER written, not even transiently. The last-thread-out checks in
+ * thread_entry and exit(2) (sys_proc.c) read that word lock-free from other
+ * threads, and the memset(0)-then-restore that used to live in do_execve
+ * left a window in which a joined thread's late host tail sampled 0 and
+ * took the whole process down mid-exec -- observed on the single-core armv7
+ * device as an exec'd image that never ran while wait4 still reported a
+ * clean exit 0. Not writing the count also means a concurrent decrement
+ * (that same dying tail) can no longer be overwritten and lost. */
+void as_reinit_live(AddrSpace *as) {
+    as_fields_init(as);
 }
 
 /* A guest thread joining or leaving this address space. The count gates the
@@ -570,7 +595,16 @@ void as_destroy(AddrSpace *as) {
     free(as->retired);
     for (size_t i = 0; i < L1_SIZE; i++) free(as->l1[i]);
     free(as->l1);
-    memset(as, 0, sizeof *as);
+    /* Null out what was freed -- but leave as->nthreads alone. Its only
+     * caller is execve's reload (as_reinit_live follows), and the count word
+     * is sampled lock-free by the last-thread-out checks in other threads:
+     * the memset that used to sit here zeroed it, and a dying sibling's host
+     * tail reading that 0 tore the process down mid-exec. */
+    as->l1 = NULL;
+    as->regions = NULL;
+    as->nregions = as->cap_regions = 0;
+    as->retired = NULL;
+    as->nretired = as->cap_retired = 0;
     jit_execve_flush();
     as_gen_bump();
     tlb_flush_all();

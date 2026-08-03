@@ -172,6 +172,10 @@ typedef struct AddrSpace {
 } AddrSpace;
 
 void as_init(AddrSpace *as);
+/* as_init for execve's in-place reload: resets everything EXCEPT nthreads,
+ * which lock-free readers in other threads may sample at any instant (a
+ * transient 0 there ends the process; see the definition). */
+void as_reinit_live(AddrSpace *as);
 /* Tear down all guest mappings and host backing (execve, exit). */
 void as_destroy(AddrSpace *as);
 

@@ -355,8 +355,12 @@ static void *thread_entry(void *arg) {
     /* Last thread of a group whose main thread has already parked: nobody else
      * is left to tear the process down or carry its status out. The count can
      * only reach zero that way -- a live main thread is always counted, and it
-     * exits through process_exit rather than through here. */
-    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(m);
+     * exits through process_exit rather than through here -- so demand the
+     * parked leader explicitly: if the count word ever again reads a bogus
+     * zero (an execve reload transient did, before as_reinit_live), the wrong
+     * outcome is a leaked zombie, not a live process torn down. */
+    if (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(m);
     return NULL;
 }
 
@@ -1106,16 +1110,17 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                               * below closes the fds); SEM_UNDO lists and
                               * m->sem_undo_used survive exec */
     ptimers_exec_clear();    /* POSIX timers do not survive execve */
-    /* as_init starts a fresh address space at one thread, which is right for a
-     * new process but not for a reload: the threads de_thread left alive go on
-     * sharing this one. Carry the count across, or the next thread to leave
-     * looks like the last of the group and takes the process down with it --
-     * which is what happened when a *live* main thread was carrying the image,
-     * because then two threads survive and the reset forgot one. */
-    int live = __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE);
+    /* Reload the address space in place, leaving as.nthreads untouched: the
+     * threads de_thread left alive go on sharing this one (as_init's fresh
+     * count of 1 forgot the parked leader once), and the count word is read
+     * lock-free by the last-thread-out checks in other threads. The old
+     * save/memset/restore here passed that word through 0 -- a joined
+     * thread's late host tail sampling it in exactly that window called
+     * process_exit and killed the fresh image while wait4 still reported a
+     * clean exit 0 (armv7 device, mtexec case 1) -- and could likewise
+     * overwrite a decrement that landed between the save and the restore. */
     as_destroy(&m->as);
-    as_init(&m->as);
-    __atomic_store_n(&m->as.nthreads, live, __ATOMIC_RELEASE);
+    as_reinit_live(&m->as);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
