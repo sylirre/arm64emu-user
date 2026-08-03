@@ -2646,8 +2646,12 @@ static u64 call_recip_sqrt_estimate(int *exp, int exp_off, u64 frac) {
 static u32 recpe_f32(u32 v) {
     u32 sbit = v & 0x80000000u, frac = v & 0x7fffff; int exp = (v >> 23) & 0xff;
     if (exp == 0xff) {                                             /* nan / inf->0 */
-        if (frac && !(frac & 0x400000)) g_fpexc |= FPSR_IOC;       /* signaling */
-        return frac ? 0x7fc00000u : sbit;
+        if (frac) {                       /* FPProcessNaN: the operand itself,
+                                           * quieted -- sign and payload kept */
+            if (!(frac & 0x400000)) g_fpexc |= FPSR_IOC;           /* signaling */
+            return v | 0x400000u;
+        }
+        return sbit;
     }
     if (exp == 0 && frac == 0) {                                   /* 0 -> inf */
         g_fpexc |= FPSR_DZC;
@@ -2664,7 +2668,7 @@ static u32 rsqrte_f32(u32 v) {
     u32 sbit = v & 0x80000000u, frac = v & 0x7fffff; int exp = (v >> 23) & 0xff;
     if (exp == 0xff && frac) {                                     /* nan */
         if (!(frac & 0x400000)) g_fpexc |= FPSR_IOC;
-        return 0x7fc00000u;
+        return v | 0x400000u;             /* propagated quieted, sign kept */
     }
     if (exp == 0 && frac == 0) {                                   /* 0 -> inf */
         g_fpexc |= FPSR_DZC;
@@ -2679,8 +2683,11 @@ static u64 recpe_f64(u64 v) {
     u64 sbit = v & 0x8000000000000000ULL, frac = v & 0xfffffffffffffULL;
     int exp = (v >> 52) & 0x7ff;
     if (exp == 0x7ff) {
-        if (frac && !(frac & 0x8000000000000ULL)) g_fpexc |= FPSR_IOC;
-        return frac ? 0x7ff8000000000000ULL : sbit;
+        if (frac) {
+            if (!(frac & 0x8000000000000ULL)) g_fpexc |= FPSR_IOC;
+            return v | 0x8000000000000ULL;
+        }
+        return sbit;
     }
     if (exp == 0 && frac == 0) {
         g_fpexc |= FPSR_DZC;
@@ -2698,7 +2705,7 @@ static u64 rsqrte_f64(u64 v) {
     int exp = (v >> 52) & 0x7ff;
     if (exp == 0x7ff && frac) {
         if (!(frac & 0x8000000000000ULL)) g_fpexc |= FPSR_IOC;
-        return 0x7ff8000000000000ULL;
+        return v | 0x8000000000000ULL;
     }
     if (exp == 0 && frac == 0) {
         g_fpexc |= FPSR_DZC;
@@ -2715,8 +2722,11 @@ static u64 rsqrte_f64(u64 v) {
 static u16 recpe_f16(u16 v) {
     u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
     if (exp == 0x1f) {                                             /* nan / inf -> 0 */
-        if (frac && !(frac & 0x200)) g_fpexc |= FPSR_IOC;
-        return frac ? 0x7e00 : sbit;
+        if (frac) {
+            if (!(frac & 0x200)) g_fpexc |= FPSR_IOC;
+            return v | 0x200;
+        }
+        return sbit;
     }
     if (exp == 0 && frac == 0) { g_fpexc |= FPSR_DZC; return sbit | 0x7c00; } /* 0 -> inf */
     if ((v & 0x7fff) < (1u << 8)) {                                /* |x| < 2^-16 -> inf */
@@ -2730,7 +2740,7 @@ static u16 rsqrte_f16(u16 v) {
     u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
     if (exp == 0x1f && frac) {                                     /* nan */
         if (!(frac & 0x200)) g_fpexc |= FPSR_IOC;
-        return 0x7e00;
+        return v | 0x200;
     }
     if (exp == 0 && frac == 0) { g_fpexc |= FPSR_DZC; return sbit | 0x7c00; } /* 0 -> inf */
     if (sbit) { g_fpexc |= FPSR_IOC; return 0x7e00; }              /* negative -> nan */
@@ -2742,7 +2752,10 @@ static u16 rsqrte_f16(u16 v) {
  * exponent ones-complemented (0x1e for a subnormal input). Mirrors the s/d form. */
 static u16 frecpx_f16(u16 x) {
     u16 sign = x & 0x8000; unsigned exp = (x >> 10) & 0x1f, mant = x & 0x3ff;
-    if (exp == 0x1f && mant) return x | 0x0200;                    /* NaN -> quiet */
+    if (exp == 0x1f && mant) {                                     /* NaN -> quiet */
+        if (!(mant & 0x200)) g_fpexc |= FPSR_IOC;                  /* signaling */
+        return x | 0x0200;
+    }
     return sign | ((u16)((exp == 0) ? 0x1e : (~exp & 0x1f)) << 10);
 }
 
@@ -3090,12 +3103,18 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         if (dbl) {
             u64 x = c->v[Rn].d[0], sign = x & (1ULL << 63);
             unsigned exp = (x >> 52) & 0x7ff; u64 mant = x & 0xfffffffffffffULL;
-            if (exp == 0x7ff && mant) r.d[0] = x | (1ULL << 51);                 /* NaN -> quiet */
+            if (exp == 0x7ff && mant) {                                          /* NaN -> quiet */
+                if (!(mant & (1ULL << 51))) g_fpexc |= FPSR_IOC;
+                r.d[0] = x | (1ULL << 51);
+            }
             else r.d[0] = sign | ((u64)((exp == 0) ? 0x7fe : (~exp & 0x7ff)) << 52);
         } else {
             u32 x = c->v[Rn].s[0], sign = x & 0x80000000u;
             unsigned exp = (x >> 23) & 0xff, mant = x & 0x7fffffu;
-            if (exp == 0xff && mant) r.s[0] = x | (1u << 22);                     /* NaN -> quiet */
+            if (exp == 0xff && mant) {                                            /* NaN -> quiet */
+                if (!(mant & (1u << 22))) g_fpexc |= FPSR_IOC;
+                r.s[0] = x | (1u << 22);
+            }
             else r.s[0] = sign | ((u32)((exp == 0) ? 0xfe : (~exp & 0xff)) << 23);
         }
         c->v[Rd] = r; return;
