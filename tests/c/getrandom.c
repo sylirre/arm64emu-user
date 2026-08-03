@@ -23,11 +23,18 @@ int main(void) {
     printf("nonblock=%ld\n", gr(b, 16, 0x1 /* GRND_NONBLOCK */));
     printf("insecure=%ld\n", gr(b, 16, 0x4 /* GRND_INSECURE */));
     /* The random source is entropy-limited: a modern kernel answers 16, an
-     * old one (< 5.6, where /dev/random still blocks) may answer -EAGAIN when
-     * the pool is low. Both are that source's own semantics, so the probe
-     * asserts the relationship, not the host's entropy level. */
+     * old one (< 5.6, where /dev/random still blocks) answers -EAGAIN when
+     * the pool is empty -- or a SHORT count when it holds some-but-not-16
+     * bytes' worth, which is getrandom(2)'s documented GRND_RANDOM behavior
+     * ("may return less than requested"). All are that source's own
+     * semantics, so the probe asserts the relationship, not the host's
+     * entropy level: 1..16 bytes or a clean EAGAIN, and nothing else (a
+     * zero return, an over-return or any other errno still fails). The
+     * armv7 kernel-3.1 device caught the short-read case live: mid-suite
+     * I/O had credited the pool a few bytes and the replay diverged on the
+     * one run that landed there. */
     long rn = gr(b, 16, 0x2 | 0x1 /* GRND_RANDOM|NONBLOCK */);
-    printf("rnd_nb_ok=%d\n", rn == 16 || rn == -11);
+    printf("rnd_nb_ok=%d\n", (rn >= 1 && rn <= 16) || rn == -11);
     printf("badflag=%ld\n", gr(b, 16, 0x100));
     printf("conflict=%ld\n", gr(b, 16, 0x2 | 0x4 /* RANDOM|INSECURE */));
     gr(b, 64, 0);
