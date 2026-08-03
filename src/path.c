@@ -484,6 +484,24 @@ int a64_anonfd(const char *name) {
     return fd;
 }
 
+/* The memfd_create fallback tier's backing file (sys_misc.c): the plain
+ * unlinked-file half of a64_anonfd, without the memfd attempt (the caller
+ * only comes here once the host has answered ENOSYS or the tier is forced)
+ * and with the guest's MFD_CLOEXEC choice instead of an unconditional one --
+ * this fd IS the guest's fd, so its close-on-exec disposition is guest
+ * policy, not ours. */
+int a64_mfdfile(int cloexec) {
+    const char *base = tmpfs_base();
+    if (!base) return -1;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/a64-memfd.XXXXXX", base);
+    int fd = mkstemp(p);
+    if (fd < 0) return -1;
+    unlink(p);
+    if (cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
 /* "<base>/arm64chroot-tmpfs.<uid>.<root pid>": the root pid (high half of the
  * session nonce, seeded in main and fork-inherited) both scopes the directory
  * to this invocation and lets a later run test whether it is still alive. */

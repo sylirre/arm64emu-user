@@ -200,10 +200,14 @@ static int region_insert(AddrSpace *as, Region r) {
             (size_t)(as->nregions - i) * sizeof(Region));
     as->regions[i] = r;
     as->nregions++;
+    if (r.mfdcnt)                         /* a split copied a counted region */
+        mfdbroker_mapadj(&g_machine, r.dev, r.ino, +1);
     return i;
 }
 
 static void region_delete(AddrSpace *as, int i) {
+    if (as->regions[i].mfdcnt)
+        mfdbroker_mapadj(&g_machine, as->regions[i].dev, as->regions[i].ino, -1);
     free(as->regions[i].path);
     memmove(&as->regions[i], &as->regions[i + 1],
             (size_t)(as->nregions - i - 1) * sizeof(Region));
@@ -586,6 +590,9 @@ void as_destroy(AddrSpace *as) {
     /* Unref every region; each allocation lands on the retired list exactly
      * once (at its last reference) and is munmapped in the drain below. */
     for (int i = 0; i < as->nregions; i++) {
+        if (as->regions[i].mfdcnt)     /* exec/exit retires its map census */
+            mfdbroker_mapadj(&g_machine, as->regions[i].dev,
+                             as->regions[i].ino, -1);
         hmap_unref(as, as->regions[i].hmap);
         free(as->regions[i].path);
     }

@@ -53,6 +53,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -336,7 +337,19 @@ enum {                        /* BReq.op */
     REQ_MSGGET, REQ_MSGSND,   /* msgsnd payload: size bytes (mtype in BReq) */
     REQ_MSGRCV,               /* grant reply payload: ret bytes (mtype in BResp) */
     REQ_MSGCTL,
-    REQ_CANCEL                /* on a parked connection: abandon the wait */
+    REQ_CANCEL,               /* on a parked connection: abandon the wait */
+    /* memfd_create fallback tier (appended: a persistent daemon from an older
+     * build answers unknown ops -EINVAL, which the client treats as
+     * tier-unavailable rather than misdispatching) */
+    REQ_MFDREG,               /* register a backing file: fd rides SCM_RIGHTS,
+                               * val = initial seals, size = name length
+                               * (name payload follows the BReq) */
+    REQ_MFDLOOK,              /* mtype/size = dev/ino -> ret = seals,
+                               * resp.size = name length (name payload
+                               * follows the BResp) */
+    REQ_MFDSEAL,              /* mtype/size = dev/ino, val = mask to add */
+    REQ_MFDMAP                /* mtype/size = dev/ino, val = +1/-1 writable
+                               * MAP_SHARED mappings held by q->pid */
 };
 
 struct BReq {
@@ -397,6 +410,109 @@ struct Seg {
 
 static struct Seg g_seg[SHM_SEG_MAX];
 static s32 g_next_shmid = 1;
+
+/* ---- guest memfd_create fallback tier: the seal registry ----------------
+ * On a host whose kernel predates memfd_create the guest syscall is served
+ * by an unlinked file (sys_misc.c), but seals are an inode property the
+ * host cannot hold: they must survive execve and be visible to every
+ * process the fd reaches by fork or SCM_RIGHTS. So they live here, keyed
+ * by the backing file's (dev,ino) -- and the daemon keeps a dup of each
+ * backing fd, which pins the inode so its number cannot be recycled into
+ * an unrelated file while the entry can still match it. wr[] counts live
+ * writable MAP_SHARED mappings per process (the VM_MAYWRITE criterion),
+ * which is what F_ADD_SEALS(F_SEAL_WRITE) must refuse with EBUSY; the
+ * per-pid start-time rows let a SIGKILL'd mapper's count be reclaimed the
+ * same way shm attach rows are. Entries live until the daemon retires --
+ * once no emulator process is left, no guest fd can exist either. */
+#define MFD_TAB_MAX   256   /* MFD_NAME_MAX comes from machine.h */
+#define MFD_WR_TRACK  32
+struct MfdWr { s32 pid; u64 start; u32 n; };
+struct Mfd {
+    int used;
+    u64 dev, ino;
+    u32 seals;                /* F_SEAL_* accumulated (monotonic) */
+    int fd;                   /* daemon-held dup: pins the inode */
+    char name[MFD_NAME_MAX];  /* guest-visible memfd name, for /proc views */
+    struct MfdWr wr[MFD_WR_TRACK];
+    int nwr;
+};
+static struct Mfd g_mfd[MFD_TAB_MAX];
+
+static struct Mfd *mfd_find(u64 dev, u64 ino) {
+    for (int i = 0; i < MFD_TAB_MAX; i++)
+        if (g_mfd[i].used && g_mfd[i].dev == dev && g_mfd[i].ino == ino)
+            return &g_mfd[i];
+    return NULL;
+}
+static s32 mfd_do_reg(struct BReq *q, int rfd, int cfd) {
+    char name[MFD_NAME_MAX];
+    size_t nlen = q->size < sizeof name - 1 ? (size_t)q->size : sizeof name - 1;
+    memset(name, 0, sizeof name);
+    if (q->size > 0) {
+        char buf[256];
+        size_t want = q->size <= sizeof buf ? (size_t)q->size : sizeof buf;
+        if (read_full(cfd, buf, want) != 0) return -EINVAL;
+        memcpy(name, buf, nlen);
+    }
+    if (rfd < 0) return -EINVAL;
+    struct stat st;
+    if (fstat(rfd, &st) < 0) return -EINVAL;
+    struct Mfd *e = mfd_find(st.st_dev, st.st_ino);
+    if (!e) {
+        for (int i = 0; i < MFD_TAB_MAX && !e; i++)
+            if (!g_mfd[i].used) e = &g_mfd[i];
+        if (!e) return -ENFILE;
+    } else if (e->fd >= 0)
+        close(e->fd);                    /* re-register: shouldn't happen */
+    memset(e, 0, sizeof *e);
+    e->used = 1; e->dev = st.st_dev; e->ino = st.st_ino;
+    e->seals = (u32)q->val;
+    e->fd = dup(rfd);                    /* the pin (caller closes rfd) */
+    memcpy(e->name, name, sizeof e->name);
+    return 0;
+}
+static void mfd_wr_reclaim(struct Mfd *e) {
+    for (int i = 0; i < e->nwr; ) {
+        if (proc_starttime(e->wr[i].pid) != e->wr[i].start)
+            e->wr[i] = e->wr[--e->nwr];  /* mapper died: its count with it */
+        else i++;
+    }
+}
+static s32 mfd_do_seal(struct BReq *q) {
+    struct Mfd *e = mfd_find((u64)q->mtype, q->size);
+    if (!e) return -EINVAL;
+    u32 mask = (u32)q->val & 0x3f;
+    if (e->seals & 0x1 /* F_SEAL_SEAL */) return -EPERM;
+    if (mask & 0x8 /* F_SEAL_WRITE */) {
+        mfd_wr_reclaim(e);
+        for (int i = 0; i < e->nwr; i++)
+            if (e->wr[i].n) return -EBUSY;
+    }
+    e->seals |= mask;
+    return 0;
+}
+static s32 mfd_do_map(struct BReq *q) {
+    struct Mfd *e = mfd_find((u64)q->mtype, q->size);
+    if (!e) return 0;                    /* entry gone: nothing to count */
+    int i;
+    for (i = 0; i < e->nwr; i++)
+        if (e->wr[i].pid == q->pid) break;
+    if (q->val > 0) {
+        if (i == e->nwr) {
+            if (e->nwr == MFD_WR_TRACK) { mfd_wr_reclaim(e); }
+            if (e->nwr == MFD_WR_TRACK) return 0;   /* full: EBUSY errs safe */
+            e->wr[e->nwr].pid = q->pid;
+            e->wr[e->nwr].start = proc_starttime(q->pid);
+            e->wr[e->nwr].n = 0;
+            i = e->nwr++;
+        }
+        e->wr[i].n++;
+    } else if (i < e->nwr) {
+        if (e->wr[i].n) e->wr[i].n--;
+        if (!e->wr[i].n) e->wr[i] = e->wr[--e->nwr];
+    }
+    return 0;
+}
 
 static struct Seg *shm_find(s32 shmid) {
     if (shmid <= 0) return NULL;
@@ -1443,7 +1559,7 @@ static int msg_any_live(void) {
  * blocking semop/msgsnd/msgrcv that must sleep, which is parked instead.
  * Returns 1 if the connection was parked (caller must not close it), else 0.
  * `proctab_memfd` is the daemon's proctab table fd (or -1 if shm-only). */
-static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd) {
+static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
     if (q->op == REQ_PROCTAB) {
         char ok = 'F';
         if (proctab_memfd >= 0) broker_send(cfd, &ok, 1, proctab_memfd);
@@ -1452,6 +1568,7 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd) {
     struct BResp r;
     memset(&r, 0, sizeof r);
     int outfd = -1;
+    const char *mfd_name = NULL;
     switch (q->op) {
     case REQ_SHMGET:  r.ret = shm_do_get(q); break;
     case REQ_SHMAT:   r.ret = shm_do_at(q, &r, &outfd); break;
@@ -1583,9 +1700,23 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd) {
         break;
     }
 
+    case REQ_MFDREG:  r.ret = mfd_do_reg(q, reqfd, cfd); break;
+    case REQ_MFDLOOK: {
+        struct Mfd *e = mfd_find((u64)q->mtype, q->size);
+        if (!e) { r.ret = -ENOENT; break; }
+        r.ret = (s32)e->seals;
+        r.size = strlen(e->name);
+        mfd_name = e->name;              /* payload follows the BResp */
+        break;
+    }
+    case REQ_MFDSEAL: r.ret = mfd_do_seal(q); break;
+    case REQ_MFDMAP:  r.ret = mfd_do_map(q); break;
+
     default: r.ret = -EINVAL; break;   /* incl. REQ_CANCEL on a fresh connection */
     }
     broker_send(cfd, &r, sizeof r, outfd);
+    if (mfd_name && r.size)
+        broker_send(cfd, mfd_name, (size_t)r.size, -1);
     return 0;
 }
 
@@ -1677,9 +1808,10 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
                     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
                     struct BReq q;
                     memset(&q, 0, sizeof q);   /* never dispatch on stack junk */
-                    int parked = 0;
-                    if (broker_recv(c, &q, sizeof q, NULL) == 0)
-                        parked = ipc_serve(c, &q, memfd);
+                    int parked = 0, reqfd = -1;
+                    if (broker_recv(c, &q, sizeof q, &reqfd) == 0)
+                        parked = ipc_serve(c, &q, memfd, reqfd);
+                    if (reqfd >= 0) close(reqfd);   /* REG dups; others ignore */
                     if (!parked) close(c);
                 }
             }
@@ -2375,6 +2507,64 @@ s32 shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st) {
         st->atime = r.atime; st->dtime = r.dtime; st->ctime = r.ctime;
     }
     return r.ret;
+}
+
+/* ---- memfd tier client wrappers (see the Mfd registry above) ----------- */
+static int mfd_rpc(struct Machine *m, struct BReq *q, struct BResp *r,
+                   int sendfd, const void *payload, size_t paylen,
+                   char *name_out) {
+    breq_stamp(m, q);
+    int s = shm_connect(m);
+    if (s < 0) return -1;
+    int ok = -1;
+    if (broker_send(s, q, sizeof *q, sendfd) == 0 &&
+        (!paylen || broker_send(s, payload, paylen, -1) == 0) &&
+        broker_recv(s, r, sizeof *r, NULL) == 0) {
+        ok = 0;
+        if (name_out) {
+            name_out[0] = 0;
+            size_t n = r->size < MFD_NAME_MAX - 1 ? (size_t)r->size : MFD_NAME_MAX - 1;
+            if (r->ret >= 0 && n > 0 &&
+                broker_recv(s, name_out, n, NULL) == 0)
+                name_out[n] = 0;
+        }
+    }
+    close(s);
+    return ok;
+}
+
+int mfdbroker_reg(struct Machine *m, int fd, u32 seals0, const char *name) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    size_t nlen = strlen(name);
+    q.op = REQ_MFDREG; q.val = (s32)seals0; q.size = nlen;
+    struct BResp r;
+    if (mfd_rpc(m, &q, &r, fd, name, nlen, NULL) < 0) return -ENOSPC;
+    return r.ret;
+}
+
+s32 mfdbroker_lookup(struct Machine *m, u64 dev, u64 ino, char *name_out) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_MFDLOOK; q.mtype = (s64)dev; q.size = ino;
+    struct BResp r;
+    char nb[MFD_NAME_MAX];
+    if (mfd_rpc(m, &q, &r, -1, NULL, 0, nb) < 0) return -ENOENT;
+    if (r.ret >= 0 && name_out) memcpy(name_out, nb, MFD_NAME_MAX);
+    return r.ret;
+}
+
+s32 mfdbroker_addseals(struct Machine *m, u64 dev, u64 ino, u32 mask) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_MFDSEAL; q.mtype = (s64)dev; q.size = ino; q.val = (s32)mask;
+    struct BResp r;
+    if (mfd_rpc(m, &q, &r, -1, NULL, 0, NULL) < 0) return -EINVAL;
+    return r.ret;
+}
+
+void mfdbroker_mapadj(struct Machine *m, u64 dev, u64 ino, int delta) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_MFDMAP; q.mtype = (s64)dev; q.size = ino; q.val = delta;
+    struct BResp r;
+    mfd_rpc(m, &q, &r, -1, NULL, 0, NULL);   /* best-effort, like shmdt */
 }
 
 /* ---- System V sem/msg broker: client side --------------------------------- */

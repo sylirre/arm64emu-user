@@ -1,5 +1,7 @@
-/* SAME-HOST-ONLY: needs guest memfd_create, which is ENOSYS where the replay
- * host's kernel lacks it (< 3.17). */
+/* SAME-HOST-ONLY: FS_IOC_GETFLAGS on a memfd answers the backing
+ * filesystem's own inode flags -- tmpfs for a native memfd, but whatever
+ * filesystem holds the fallback tier's backing file on a host without
+ * memfd_create -- so a recorded oracle from another host is not comparable. */
 /* FS_IOC_GETFLAGS/SETFLAGS (0x80086601 / 0x40086602): inode attribute flags,
  * as read by lsattr and by systemd-tmpfiles (to preserve attributes). The old
  * emulator had no whitelist entry -> "unhandled ioctl 0x80086601" and -ENOTTY,

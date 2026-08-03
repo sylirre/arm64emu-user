@@ -547,6 +547,19 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
         size_t gstep = (size_t)GCMSG_ALIGN(gel);
         if (gstep > avail) gstep = avail;      /* last element: no room to pad */
         s32 level = ch.cmsg_level, type = ch.cmsg_type;
+        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
+            /* Arriving descriptors may be another process's tier memfds: the
+             * classification cache must stop assuming these numbers are
+             * plain files (full element, not the possibly truncated copy --
+             * the fds are installed either way). */
+            size_t nfd = (clen - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < nfd; i++) {
+                int rfd;
+                memcpy(&rfd, hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) +
+                             i * sizeof(int), sizeof rfd);
+                mfd_track_recv(rfd);
+            }
+        }
         memset(gb + goff, 0, gstep);
         memcpy(gb + goff, &gel, 8);
         memcpy(gb + goff + 8, &level, 4);

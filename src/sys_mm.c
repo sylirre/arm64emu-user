@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Memory-management syscalls over the guest address space (mem.c). */
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -152,8 +153,64 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         }
     } else {
         if (off & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-        r = guest_map_file(as, addr, len, pte, fd, off,
-                           (flags & G_MAP_SHARED) ? 1 : 0, NULL);
+        int shared = (flags & G_MAP_SHARED) ? 1 : 0;
+        /* memfd tier: the backing file has no seals the host could apply, so
+         * mmap asks the registry. F_SEAL_WRITE refuses any shared mapping
+         * that is or could become writable (the kernel's VM_MAYWRITE test:
+         * a read-only PROT on a write-open fd still counts); FUTURE_WRITE
+         * lets an already-open read view through but strips wr_ok, which is
+         * exactly the existing mprotect-to-EACCES lever. A writable shared
+         * mapping of an unsealed tier memfd joins the broker census that
+         * F_ADD_SEALS(F_SEAL_WRITE) must answer EBUSY for. */
+        int is_mfd = 0, fdwr = 0;
+        u32 mseals = 0; u64 mdev = 0, mino = 0;
+        char mname[MFD_NAME_MAX];
+        s32 msl = mfd_resolve(c, fd, &mdev, &mino, mname);
+        if (msl >= 0) {
+            is_mfd = 1; mseals = (u32)msl;
+            int fl = fcntl(fd, F_GETFL);
+            fdwr = fl >= 0 && (fl & O_ACCMODE) != O_RDONLY;
+            if (shared &&
+                (mseals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE)) &&
+                (pte & PTE_W))
+                return (u64)(s64)-EPERM;
+            /* A read-only MAP_SHARED stays legal on a sealed memfd -- the
+             * kernel admits it with VM_MAYWRITE stripped, which below turns
+             * into wr_ok = 0 (mprotect to writable answers EACCES). */
+        }
+        r = guest_map_file(as, addr, len, pte, fd, off, shared, NULL);
+        if (r == 0 && !is_mfd) {
+            /* A NATIVE memfd deserves its kernel name in the synthesized
+             * maps too (regions are otherwise named only for ELF images;
+             * plain files stay nameless, and widening that would shift
+             * recorded /proc outputs). */
+            char lnk[48], tgt[MFD_NAME_MAX + 24];
+            snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
+            ssize_t tn = readlink(lnk, tgt, sizeof tgt - 1);
+            if (tn > 7 && !memcmp(tgt, "/memfd:", 7)) {
+                tgt[tn] = 0;
+                Region *reg = (Region *)as_find_region(as, addr);
+                if (reg && !reg->path) reg->path = strdup(tgt);
+            }
+        }
+        if (r == 0 && is_mfd) {
+            Region *reg = (Region *)as_find_region(as, addr);
+            if (reg) {
+                if (shared &&
+                    (mseals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE)))
+                    reg->wr_ok = 0;
+                if (!reg->path) {
+                    char nb[MFD_NAME_MAX + 24];
+                    snprintf(nb, sizeof nb, "/memfd:%s (deleted)", mname);
+                    reg->path = strdup(nb);
+                }
+                if (shared && fdwr &&
+                    !(mseals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE))) {
+                    reg->mfdcnt = 1;
+                    mfdbroker_mapadj(c->m, mdev, mino, +1);
+                }
+            }
+        }
     }
     return r < 0 ? (u64)(s64)r : addr;
 }

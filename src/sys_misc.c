@@ -3,10 +3,12 @@
 /* Miscellaneous syscalls: randomness, rlimits, sysinfo, futex basics. */
 #include <fcntl.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
@@ -267,6 +269,167 @@ SYSDEF(getcpu) {
     return 0;
 }
 
+/* ---- memfd_create fallback tier ------------------------------------------
+ * A host kernel without memfd_create (< 3.17: the Android 7 devices) answers
+ * ENOSYS, but the guest ABI promises the syscall -- apk-tools 3 writes every
+ * install trigger into a sealed memfd and execs it. The tier serves the call
+ * from an unlinked file in the session's tmpfs backing dir (a64_mfdfile) and
+ * moves what the host cannot hold -- the seals, which live on the inode and
+ * must survive execve, fork and SCM_RIGHTS -- into the broker's seal
+ * registry (proctab.c), which also pins the inode with a daemon-held dup so
+ * its number cannot recycle into an unrelated file under a live entry.
+ *
+ * Enforcement is the emulator's job too (the backing file is sealless to the
+ * host): the write family, ftruncate, fallocate and mmap ask this cache
+ * first. Classification is free for ordinary fds: the ONLY ways a tier
+ * memfd's fd number can appear in a process are memfd_create itself, an
+ * SCM_RIGHTS receipt, and dup -- each marks the slot, everything else stays
+ * class 0 and never pays a lookup (guest execve reloads in-process, so the
+ * cache survives it; the CLOEXEC walk closes through mfd_track_close).
+ * Seals only ever accumulate, so a cached RESTRICTIVE bit is trusted after
+ * an identity fstat, while a permissive answer re-asks the broker -- another
+ * process may have sealed the inode since. A64_MEMFD_FORCE_FILE forces the
+ * tier on any host, which is how it is differentially tested against the
+ * qemu oracle on machines whose kernel has the real thing. */
+#define G_MFD_CLOEXEC        0x1u
+#define G_MFD_ALLOW_SEALING  0x2u
+#define G_MFD_HUGETLB        0x4u
+#define G_MFD_NOEXEC_SEAL    0x8u
+#define G_MFD_EXEC           0x10u
+
+#define MFDC_N 1024
+static u8  mfdc_cls[MFDC_N];      /* 0 plain (default), 1 tier memfd, 2 check */
+static u64 mfdc_dev[MFDC_N], mfdc_ino[MFDC_N];
+static u32 mfdc_hint[MFDC_N];     /* seal bits already seen (monotonic) */
+static int mfdc_any;              /* some slot ever left class 0 */
+
+void mfd_track_create(int fd, u64 dev, u64 ino) {
+    mfdc_any = 1;
+    if (fd < 0 || fd >= MFDC_N) return;
+    mfdc_cls[fd] = 1; mfdc_dev[fd] = dev; mfdc_ino[fd] = ino; mfdc_hint[fd] = 0;
+}
+void mfd_track_recv(int fd) {
+    mfdc_any = 1;
+    if (fd < 0 || fd >= MFDC_N) return;
+    mfdc_cls[fd] = 2; mfdc_hint[fd] = 0;
+}
+void mfd_track_dup(int oldfd, int newfd) {
+    if (!mfdc_any || newfd < 0 || newfd >= MFDC_N) return;
+    if (oldfd < 0 || oldfd >= MFDC_N) { mfdc_cls[newfd] = 2; mfdc_hint[newfd] = 0; return; }
+    mfdc_cls[newfd] = mfdc_cls[oldfd]; mfdc_dev[newfd] = mfdc_dev[oldfd];
+    mfdc_ino[newfd] = mfdc_ino[oldfd]; mfdc_hint[newfd] = mfdc_hint[oldfd];
+}
+void mfd_track_close(int fd) {
+    if (!mfdc_any || fd < 0 || fd >= MFDC_N) return;
+    mfdc_cls[fd] = 0; mfdc_hint[fd] = 0;
+}
+
+/* fd -> current seals (>= 0) with backing identity, or -1 if not a tier
+ * memfd. One fstat when the slot claims (or might claim) memfd-hood; one
+ * broker exchange when the answer needs the CURRENT mask. */
+s32 mfd_resolve(CPU *c, int fd, u64 *dev, u64 *ino, char *name_out) {
+    if (!mfdc_any || fd < 0) return -1;
+    int idx = fd < MFDC_N ? fd : -1;
+    if (idx >= 0 && mfdc_cls[idx] == 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        if (idx >= 0) mfdc_cls[idx] = 0;
+        return -1;
+    }
+    if (idx >= 0 && mfdc_cls[idx] == 1 &&
+        (mfdc_dev[idx] != (u64)st.st_dev || mfdc_ino[idx] != (u64)st.st_ino))
+        mfdc_cls[idx] = 2;               /* number reused behind our back */
+    s32 seals = mfdbroker_lookup(c->m, (u64)st.st_dev, (u64)st.st_ino, name_out);
+    if (seals < 0) {
+        if (idx >= 0) mfdc_cls[idx] = 0;
+        return -1;
+    }
+    if (idx >= 0) {
+        mfdc_cls[idx] = 1;
+        mfdc_dev[idx] = (u64)st.st_dev; mfdc_ino[idx] = (u64)st.st_ino;
+        mfdc_hint[idx] |= (u32)seals;
+    }
+    if (dev) *dev = (u64)st.st_dev;
+    if (ino) *ino = (u64)st.st_ino;
+    return seals;
+}
+
+int mfd_write_denied(CPU *c, int fd) {
+    if (!mfdc_any || fd < 0) return 0;
+    if (fd < MFDC_N) {
+        if (mfdc_cls[fd] == 0) return 0;             /* the whole fast path */
+        if (mfdc_cls[fd] == 1 &&
+            (mfdc_hint[fd] & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE))) {
+            struct stat st;                          /* identity, not seals */
+            if (fstat(fd, &st) == 0 && (u64)st.st_dev == mfdc_dev[fd] &&
+                (u64)st.st_ino == mfdc_ino[fd])
+                return 1;
+        }
+    }
+    s32 seals = mfd_resolve(c, fd, NULL, NULL, NULL);
+    return seals >= 0 && (seals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE));
+}
+
+int mfd_ftruncate_denied(CPU *c, int fd, u64 newsize) {
+    if (!mfdc_any || fd < 0) return 0;
+    if (fd < MFDC_N && mfdc_cls[fd] == 0) return 0;
+    s32 seals = mfd_resolve(c, fd, NULL, NULL, NULL);
+    if (seals < 0 || !(seals & (G_F_SEAL_SHRINK | G_F_SEAL_GROW))) return 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0) return 0;
+    if ((seals & G_F_SEAL_SHRINK) && newsize < (u64)st.st_size) return 1;
+    if ((seals & G_F_SEAL_GROW) && newsize > (u64)st.st_size) return 1;
+    return 0;
+}
+
+int mfd_fallocate_denied(CPU *c, int fd, int mode, u64 off, u64 len) {
+    if (!mfdc_any || fd < 0) return 0;
+    if (fd < MFDC_N && mfdc_cls[fd] == 0) return 0;
+    s32 seals = mfd_resolve(c, fd, NULL, NULL, NULL);
+    if (seals < 0) return 0;
+    if ((mode & 0x2 /* FALLOC_FL_PUNCH_HOLE */) &&
+        (seals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE))) return 1;
+    if ((seals & G_F_SEAL_GROW) && !(mode & 0x1 /* KEEP_SIZE */)) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && off + len > (u64)st.st_size) return 1;
+    }
+    return 0;
+}
+
+/* F_ADD_SEALS / F_GET_SEALS for a tier memfd; anything else falls through to
+ * the host (a native memfd gets the kernel's own answer, and on the old host
+ * a plain fd keeps its historical EINVAL). */
+int mfd_fcntl(CPU *c, int fd, int cmd, u64 arg, u64 *ret) {
+    if (cmd != 1033 /* F_ADD_SEALS */ && cmd != 1034 /* F_GET_SEALS */)
+        return 0;
+    u64 dev, ino;
+    s32 seals = mfd_resolve(c, fd, &dev, &ino, NULL);
+    if (seals < 0) return 0;
+    if (cmd == 1034) { *ret = (u64)(u32)seals; return 1; }
+    u32 mask = (u32)arg;
+    if (mask & ~G_F_SEAL_ALL) { *ret = (u64)(s64)-EINVAL; return 1; }
+    s32 rc = mfdbroker_addseals(c->m, dev, ino, mask);
+    if (rc == 0 && fd < MFDC_N && mfdc_cls[fd] == 1) mfdc_hint[fd] |= mask;
+    *ret = rc < 0 ? (u64)(s64)rc : 0;
+    return 1;
+}
+
+/* Guest readlink of a /proc fd entry whose target is one of the tier's
+ * backing files: the real target would leak a host path the guest has no
+ * business seeing (and none it could use -- the file is unlinked). Present
+ * the kernel's own spelling instead. The basename test keeps every ordinary
+ * link out of the stat+lookup. */
+int mfd_link_rewrite(CPU *c, const char *hostlink, char *buf) {
+    if (!strstr(buf, "/a64-memfd.")) return 0;
+    struct stat st;
+    if (stat(hostlink, &st) < 0) return 0;
+    char name[MFD_NAME_MAX];
+    if (mfdbroker_lookup(c->m, (u64)st.st_dev, (u64)st.st_ino, name) < 0)
+        return 0;
+    snprintf(buf, PATH_MAX, "/memfd:%s (deleted)", name);
+    return 1;
+}
+
 SYSDEF(memfd_create) {
     /* MFD_* flag values are arch-uniform, the fd is 1:1. The kernel caps the
      * name at 249 chars, so a string that overflows the buffer would be its
@@ -276,13 +439,48 @@ SYSDEF(memfd_create) {
     long n = copy_str_from_guest(c, name, a0, sizeof name);
     if (n == -ENAMETOOLONG) return (u64)(s64)-EINVAL;
     if (n < 0) return (u64)(s64)n;
-    int r;
+    int r = -1;
+    if (!getenv("A64_MEMFD_FORCE_FILE")) {
 #if defined(__BIONIC__) && defined(SYS_memfd_create)
-    r = (int)syscall(SYS_memfd_create, name, (unsigned)a1);
+        r = (int)syscall(SYS_memfd_create, name, (unsigned)a1);
 #else
-    r = memfd_create(name, (unsigned)a1);
+        r = memfd_create(name, (unsigned)a1);
 #endif
-    return r < 0 ? host_err() : (u64)r;
+        if (r >= 0) {
+            struct stat st;                  /* class the native fd too: its */
+            if (fstat(r, &st) == 0)          /* number may shadow a stale    */
+                mfd_track_close(r);          /* tier slot from a reuse       */
+            return (u64)r;
+        }
+        if (errno != ENOSYS) return host_err();
+    }
+    /* The tier (see the block comment above). Kernel flag rules first. */
+    unsigned gf = (unsigned)a1;
+    if (n - 1 > 249) return (u64)(s64)-EINVAL;
+    if (gf & ~(G_MFD_CLOEXEC | G_MFD_ALLOW_SEALING | G_MFD_HUGETLB |
+               G_MFD_NOEXEC_SEAL | G_MFD_EXEC))
+        return (u64)(s64)-EINVAL;
+    if ((gf & G_MFD_NOEXEC_SEAL) && (gf & G_MFD_EXEC)) return (u64)(s64)-EINVAL;
+    if (gf & G_MFD_HUGETLB)     /* nothing to build hugetlb from on this host */
+        return (u64)(s64)-EINVAL;
+    u32 seals0 = 0;
+    unsigned eff = gf;
+    if (gf & G_MFD_NOEXEC_SEAL) {           /* implies sealing, per the kernel */
+        eff |= G_MFD_ALLOW_SEALING;
+        seals0 |= G_F_SEAL_EXEC;
+    }
+    if (!(eff & G_MFD_ALLOW_SEALING)) seals0 |= G_F_SEAL_SEAL;
+    int fd = a64_mfdfile((gf & G_MFD_CLOEXEC) != 0);
+    if (fd < 0) return (u64)(s64)-ENOMEM;
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return (u64)(s64)-ENOMEM; }
+    if (mfdbroker_reg(c->m, fd, seals0, name) < 0) {
+        close(fd);                /* no registry, no seals: fail loud rather
+                                   * than hand out a memfd that forgets them */
+        return (u64)(s64)-ENOMEM;
+    }
+    mfd_track_create(fd, (u64)st.st_dev, (u64)st.st_ino);
+    return (u64)fd;
 }
 
 SYSDEF(sethostname) {

@@ -147,6 +147,10 @@ typedef struct Region {
     u32  hostmap;             /* backed by a real host mapping OF THE FILE, so a
                                * page past end-of-file faults; the private
                                * pread-into-anonymous fallback sets this to 0 */
+    u32  mfdcnt;              /* counted in the memfd tier's writable-shared
+                               * mapping census (F_SEAL_WRITE's EBUSY check):
+                               * region_insert/-delete keep the broker's count
+                               * in step as splits copy and unmaps retire it */
 } Region;
 
 /* Host backing whose guest mapping is gone but whose munmap is deferred:

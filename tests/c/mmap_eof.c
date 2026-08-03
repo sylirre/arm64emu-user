@@ -1,5 +1,3 @@
-/* SAME-HOST-ONLY: needs guest memfd_create, which is ENOSYS where the replay
- * host's kernel lacks it (< 3.17). */
 /* Accessing a file mapping past end-of-file, against the qemu-aarch64 oracle.
  *
  * mmap does not object to a mapping that reaches beyond the file; touching a

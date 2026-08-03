@@ -649,6 +649,14 @@ SYSDEF(openat) {
         if (own >= 0) fd = own_memfd_reopen(own, gflags);
         else errno = e;
     }
+    if (fd >= 0) {
+        mfd_track_close(fd);   /* fresh number: drop any stale class */
+        /* A path re-open of a tier memfd (through a /proc fd link) hands
+         * back a new fd to the sealed inode; the host would let write(2)
+         * through where a real memfd's seal forbids it, so class the fd for
+         * the enforcement checks. */
+        if (strstr(host, "/a64-memfd.")) mfd_track_recv(fd);
+    }
     return fd < 0 ? host_err() : (u64)fd;
 }
 
@@ -656,6 +664,7 @@ SYSDEF(close) {
     nl_unmark_fd(c->m, (int)a0);   /* drop any fake-netlink bookkeeping for this fd */
     procfs_unmark_fd(c->m, (int)a0);
     sigfd_unmark_fd(c->m, (int)a0);
+    mfd_track_close((int)a0);
     return close((int)a0) < 0 ? host_err() : 0;
 }
 
@@ -692,6 +701,7 @@ SYSDEF(write) {
      * `ip` sends its dump requests that way), and the AF_UNIX substitute has no
      * default destination to write to -- it would answer ENOTCONN. */
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -751,6 +761,7 @@ SYSDEF(readv) {
 
 SYSDEF(writev) {
     if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, a2);   /* as in write */
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
@@ -798,6 +809,7 @@ SYSDEF(pread64) {
 }
 
 SYSDEF(pwrite64) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     size_t len = (size_t)a2;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
@@ -847,6 +859,7 @@ SYSDEF(preadv2) {
 }
 
 SYSDEF(pwritev2) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
@@ -899,6 +912,7 @@ SYSDEF(preadv) {
 }
 
 SYSDEF(pwritev) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
     u8 *bounce;
     int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
@@ -1051,6 +1065,8 @@ SYSDEF(readlinkat) {
          * rootfs-contained file carry the rootfs prefix; strip it. */
         if (!strncmp(host, "/proc/", 6)) {
             buf[rn] = 0;
+            if (mfd_link_rewrite(c, host, buf))   /* tier memfd: no host leak */
+                rn = (ssize_t)strlen(buf);
             path_strip_rootfs(c->m, buf);
             rn = (ssize_t)strlen(buf);
         }
@@ -1574,7 +1590,16 @@ SYSDEF(fcntl) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC: {
             int r = fcntl(fd, cmd, (int)a2);
-            if (r >= 0) sigfd_track_dup(c->m, fd, r);   /* as dup(2) above */
+            if (r >= 0) { sigfd_track_dup(c->m, fd, r); mfd_track_dup(fd, r); }
+            return r < 0 ? host_err() : (u64)r;         /* as dup(2) above */
+        }
+        case 1033: case 1034: {   /* F_ADD_SEALS / F_GET_SEALS: a tier memfd's
+                                   * seals live in the broker registry, not on
+                                   * the host inode; anything else forwards
+                                   * (native memfd, or the old host's EINVAL) */
+            u64 ret;
+            if (mfd_fcntl(c, fd, cmd, a2, &ret)) return ret;
+            int r = fcntl(fd, cmd, (int)a2);
             return r < 0 ? host_err() : (u64)r;
         }
         case F_GETFD:
@@ -1667,8 +1692,8 @@ SYSDEF(fcntl) {
 
 SYSDEF(dup) {
     int r = dup((int)a0);
-    if (r >= 0) sigfd_track_dup(c->m, (int)a0, r);   /* a signalfd's second name */
-    return r < 0 ? host_err() : (u64)r;
+    if (r >= 0) { sigfd_track_dup(c->m, (int)a0, r); mfd_track_dup((int)a0, r); }
+    return r < 0 ? host_err() : (u64)r;             /* a signalfd's second name */
 }
 
 SYSDEF(dup3) {
@@ -1676,8 +1701,9 @@ SYSDEF(dup3) {
     sigfd_unmark_fd(c->m, (int)a1);
     procfs_unmark_fd(c->m, (int)a1);
     nl_unmark_fd(c->m, (int)a1);
+    mfd_track_close((int)a1);
     int r = dup3((int)a0, (int)a1, oflags_g2h((int)a2));
-    if (r >= 0) sigfd_track_dup(c->m, (int)a0, r);
+    if (r >= 0) { sigfd_track_dup(c->m, (int)a0, r); mfd_track_dup((int)a0, r); }
     return r < 0 ? host_err() : (u64)r;
 }
 
@@ -2100,6 +2126,7 @@ static void note_resize(CPU *c, int fd, s64 newsize) {
 
 SYSDEF(ftruncate) {
     if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    if (mfd_ftruncate_denied(c, (int)a0, a1)) return (u64)(s64)-EPERM;
     if (ftruncate((int)a0, (off_t)(s64)a1) < 0) return host_err();
     note_resize(c, (int)a0, (s64)a1);
     return 0;
@@ -2263,6 +2290,7 @@ SYSDEF(sync_file_range) {
 }
 
 SYSDEF(sendfile) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;   /* out_fd */
     off_t off, *offp = NULL;
     if (a2) {
         s64 g;
@@ -2281,6 +2309,7 @@ SYSDEF(sendfile) {
 
 SYSDEF(fallocate) {
     if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    if (mfd_fallocate_denied(c, (int)a0, (int)a1, a2, a3)) return (u64)(s64)-EPERM;
     if (fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0)
         return host_err();
     /* FALLOC_FL_PUNCH_HOLE / COLLAPSE_RANGE can shrink a file, and the plain
@@ -2568,6 +2597,7 @@ SYSDEF(splice) {
      * I/O error ("(standard input): Function not implemented") -- so we forward
      * to the host rather than stub. */
     loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
     ssize_t n;
@@ -2587,6 +2617,7 @@ SYSDEF(copy_file_range) {
      * marshalling as splice; forwarded so callers that don't fall back on ENOSYS
      * (like splice's grep case) keep working. */
     loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
     ssize_t n;

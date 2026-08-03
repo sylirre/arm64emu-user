@@ -24,6 +24,32 @@ static inline u64 host_err(void) { return (u64)(s64)(-errno); }
 /* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
  * the host kernel predates it (< 3.17 — Android 7 devices). */
 int a64_anonfd(const char *name);
+int a64_mfdfile(int cloexec);
+
+/* ---- memfd_create fallback tier (sys_misc.c) ----------------------------
+ * Client side of the broker seal registry: a per-process fd classification
+ * cache plus the seal policy the host kernel cannot apply. The cache's only
+ * writers are the sites that can introduce a tier memfd into this process --
+ * creation, SCM_RIGHTS receipt, dup -- so a process that never sees one pays
+ * a single flag test. mfd_resolve answers the fd's CURRENT seal mask (>= 0)
+ * with its backing identity, or -1 for anything that is not a tier memfd. */
+#define G_F_SEAL_SEAL         0x1u
+#define G_F_SEAL_SHRINK       0x2u
+#define G_F_SEAL_GROW         0x4u
+#define G_F_SEAL_WRITE        0x8u
+#define G_F_SEAL_FUTURE_WRITE 0x10u
+#define G_F_SEAL_EXEC         0x20u
+#define G_F_SEAL_ALL          0x3fu
+s32  mfd_resolve(CPU *c, int fd, u64 *dev, u64 *ino, char *name_out /*MFD_NAME_MAX or NULL*/);
+void mfd_track_create(int fd, u64 dev, u64 ino);
+void mfd_track_recv(int fd);            /* SCM_RIGHTS arrival: class unknown */
+void mfd_track_dup(int oldfd, int newfd);
+void mfd_track_close(int fd);
+int  mfd_write_denied(CPU *c, int fd);  /* write-family: F_SEAL_WRITE|FUTURE_WRITE */
+int  mfd_ftruncate_denied(CPU *c, int fd, u64 newsize);
+int  mfd_fallocate_denied(CPU *c, int fd, int mode, u64 off, u64 len);
+int  mfd_fcntl(CPU *c, int fd, int cmd, u64 arg, u64 *ret); /* 1 = handled */
+int  mfd_link_rewrite(CPU *c, const char *hostlink, char *buf /*PATH_MAX*/);
 
 /* Copy a guest path string and resolve it against the rootfs.
  * rflags: PATH_NOFOLLOW_LAST etc. Returns 0 or -errno. */

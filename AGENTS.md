@@ -177,6 +177,7 @@ Behavior fallbacks:
 * `A64_NETLINK_FORCE_BLOCK`: forces the netlink fallback path.
 * `A64_SHM_FORCE_FILE`: forces System V shm segments onto file backing (a file in the first writable dir) instead of an anonymous memfd, exercising the fallback tier.
 * `A64_GETRANDOM_FORCE_DEV`: forces guest getrandom(2) onto the /dev/urandom / /dev/random fallback — the tier a host kernel without getrandom(2) (< 3.17, e.g. Android 7's 3.x) is served by.
+* `A64_MEMFD_FORCE_FILE`: forces guest memfd_create(2) onto the unlinked-file fallback tier with broker-held seals (what a host kernel without memfd_create is served by); the suite's `(memfd-tier)` rows run over it.
 
 Tuning:
 

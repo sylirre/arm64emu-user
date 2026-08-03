@@ -124,6 +124,12 @@ unfiltered:
   get the same try-host-first treatment (65534, the kernel's own default, when
   the host denies them) — reading them is the first thing bubblewrap does, and
   it dies outright if it cannot.
+* **`memfd_create` on pre-3.17 kernels** (Android 7 class devices) is served
+  by the fallback tier documented in `docs/syscalls.md`: an unlinked file in
+  the app-writable backing dir plus broker-held seals, so apk-tools 3's
+  sealed install triggers work even where the host kernel has no memfd at
+  all.
+
 * **Re-opening a memfd through `/proc/self/fd/N`** is denied by Android's
   SELinux policy (EACCES, sealed or not) — and that is exactly how apk-tools
   ≥ 3.0 runs install triggers: the script goes into a sealed memfd and the

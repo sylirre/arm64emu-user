@@ -297,6 +297,10 @@ static void help(void) {
         {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2) onto the /dev/urandom"
                         " / /dev/random fallback (the tier a host kernel "
                         "without getrandom is served by)."},
+        {"A64_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
+                        "unlinked-file fallback tier with broker-held seals "
+                        "(what a host kernel without memfd_create is served "
+                        "by)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",

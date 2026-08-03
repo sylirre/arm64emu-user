@@ -721,6 +721,20 @@ void shmbroker_fork(struct Machine *m, s32 shmid);
  * IPC_RMID. Returns 0 or -errno. */
 s32  shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st);
 
+/* memfd_create fallback tier (sys_misc.c): the broker daemon holds each
+ * backing file's seal state keyed by (dev,ino), plus a dup of the backing fd
+ * that pins the inode against number reuse. reg sends the fd (SCM_RIGHTS)
+ * with the initial seal mask and guest-visible name; lookup answers the
+ * current seals (or -ENOENT) and, when name_out is non-NULL, copies the name
+ * (MFD_NAME_MAX bytes); addseals enforces F_SEAL_SEAL (EPERM) and the
+ * no-writable-shared-mappings precondition of F_SEAL_WRITE (EBUSY); mapadj
+ * tracks this process's writable MAP_SHARED mapping count for that check. */
+#define MFD_NAME_MAX 80
+int  mfdbroker_reg(struct Machine *m, int fd, u32 seals0, const char *name);
+s32  mfdbroker_lookup(struct Machine *m, u64 dev, u64 ino, char *name_out);
+s32  mfdbroker_addseals(struct Machine *m, u64 dev, u64 ino, u32 mask);
+void mfdbroker_mapadj(struct Machine *m, u64 dev, u64 ino, int delta);
+
 /* System V semaphores and message queues live entirely in the broker daemon:
  * every operation below is one request/response exchange; the blocking ones
  * (semop, msgsnd, msgrcv) park their connection in the daemon until granted,

@@ -921,31 +921,51 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- memfd_create: unlinked-file fallback tier ----
+# The C loop above ran the memfd tests against the host's real memfd_create.
+# Re-run them with A64_MEMFD_FORCE_FILE=1 so creation, sealing, enforcement
+# and the /proc spellings come from the fallback tier -- what a host kernel
+# without memfd_create (Android 7's 3.x) is served by -- and require
+# identical semantics.
+for base in memfd_seals mfdsync mmap_eof; do
+    MBIN="tests/c/${base}_static.bin"
+    [ -x "$MBIN" ] || continue
+    rec_have "$MBIN" || {
+        skip=$((skip+1)); echo "SKIP c/${base}(memfd-tier) (not in the test pack)"; continue; }
+    out_q=$(oracle_run "$MBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_MEMFD_FORCE_FILE=1 timeout 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/${base}(memfd-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/${base}(memfd-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+done
+
 # ---- exec and re-open through /proc/self/fd/N when N is a memfd, the way
 # apk-tools >= 3.0 runs its install triggers. Self-checking, not oracle-diffed:
 # Android denies path re-opens of memfds outright (EACCES, sealed or not), so a
 # native oracle cannot demonstrate the Linux behaviour the emulator provides --
 # it serves such paths from the fd itself, and this output is the same on every
 # host. ----
-if [ "$ORACLE_KIND" = recorded ]; then
-    # The fixture's whole subject is a guest memfd re-opened through
-    # /proc/self/fd, and guest memfd_create is ENOSYS where the replay host's
-    # kernel lacks it (< 3.17) — a host capability, not an emulator property.
-    skip=$((skip+1)); echo "SKIP fixture: ownfdexec (needs guest memfd_create on the replay host)"
-elif [ -n "$AGCC" ]; then
-    if "$AGCC" -static -O2 -o tests/fixtures/ownfdexec.bin \
-            tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null; then
-        expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'
-        got=$(timeout 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
-        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: ownfdexec"
-        else
-            fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
-            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
-        fi
-        fx_rm tests/fixtures/ownfdexec.bin
+# A replay host without memfd_create is served by the emulator's fallback
+# tier (sys_misc.c), so the fixture runs everywhere -- from the pack's binary
+# where there is no compiler to rebuild it.
+if [ ! -x tests/fixtures/ownfdexec.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/ownfdexec.bin \
+        tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/ownfdexec.bin ]; then
+    expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'
+    got=$(timeout 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: ownfdexec"
     else
-        skip_build "fixtures/ownfdexec"
+        fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
     fi
+    fx_rm tests/fixtures/ownfdexec.bin
+else
+    skip_build "fixtures/ownfdexec"
 fi
 
 # ---- nothing under ANOTHER guest process's /proc may hand back the emulator's

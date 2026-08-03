@@ -736,6 +736,44 @@ crashing guest can never corrupt IPC state.
   the whole rootfs/session goes idle, everything is garbage-collected — the
   same bounded deviation from kernel-persistent SysV objects that shm has.
 
+## `memfd_create` and file sealing
+
+On a host whose kernel has `memfd_create` the guest call is forwarded 1:1 and
+seals are the kernel's own. A host without it (< 3.17 — the Android 7 class
+of device) is served by a fallback tier (`sys_misc.c`): the fd comes from an
+unlinked file in the session's tmpfs backing dir, and everything the host
+cannot hold moves into the IPC broker daemon's **seal registry**
+(`proctab.c`), keyed by the backing file's `(dev,ino)` — seals are an inode
+property that must survive `execve` and reach every process the fd gets to
+by `fork` or `SCM_RIGHTS`, and the daemon also keeps a dup of each backing
+fd so the inode number cannot be recycled into an unrelated file while its
+entry lives.
+
+Enforcement is the emulator's: `write`/`pwrite*`/`writev`/`pwritev*`,
+`sendfile`/`copy_file_range` (out-fd), `ftruncate`, `fallocate` and `mmap`
+consult a per-process classification cache first (`sys_misc.c`). Only the
+sites that can introduce a tier memfd into a process mark the cache —
+creation, an `SCM_RIGHTS` receipt, `dup`, and a path re-open through a
+`/proc` fd link — so ordinary descriptors never pay a lookup. Seals only
+accumulate, so a cached restrictive bit is trusted after an identity
+`fstat`, while a permissive answer re-asks the broker (another process may
+have sealed the inode meanwhile). `F_ADD_SEALS` honors `F_SEAL_SEAL`
+(`EPERM`) and refuses `F_SEAL_WRITE` while any process holds a writable
+`MAP_SHARED` mapping (`EBUSY`) — mapping counts ride the region records
+(`region_insert`/`region_delete` in `mem.c` adjust the broker's census as
+splits copy and unmaps retire them, and dead mappers are reclaimed by
+start-time like shm attach rows). A writable shared `mmap` of a sealed
+memfd answers `EPERM`; a read-only one is admitted with `wr_ok` stripped,
+which is what turns a later `mprotect(PROT_WRITE)` into `EACCES`, exactly
+the kernel's stripped-`VM_MAYWRITE` behaviour (`F_SEAL_FUTURE_WRITE`
+grandfathers mappings that existed before the seal). `/proc` keeps the
+kernel's spelling: fd links and `maps` show `/memfd:name (deleted)` instead
+of leaking the backing path. `A64_MEMFD_FORCE_FILE=1` forces the tier on
+any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
+oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
+(`(memfd-tier)` rows). `MFD_HUGETLB` is refused (`EINVAL`) on the tier —
+there is nothing to build a hugetlb mapping from on such a host.
+
 ## `execve`
 
 `do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, handles a

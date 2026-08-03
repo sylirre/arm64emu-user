@@ -1,5 +1,3 @@
-/* SAME-HOST-ONLY: needs guest memfd_create, which is ENOSYS where the replay
- * host's kernel lacks it (< 3.17). */
 /* memfd_create (nr 279), sync/syncfs (81/267), readahead (213). readahead
  * targets the memfd so both runs hit the same (tmpfs-backed) filesystem
  * regardless of where the rootfs lives. mlock2 lives in a self-checking
