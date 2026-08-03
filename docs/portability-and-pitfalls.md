@@ -184,6 +184,22 @@ core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which is
 why it is not on by default). CI builds with clang as well as gcc, which is
 what makes the gap visible instead of theoretical.
 
+The fused multiply-adds have their own host trap, and on armv7 it is libm
+itself. VFPv3 has no fused instruction, so `__builtin_fma` becomes a call
+into Bionic's software fma/fmaf (FreeBSD msun's) — which raises Inexact from
+its internal double-double arithmetic even when the fused result is exact,
+and whose `fmaf` **mis-rounds**: when its double-domain sum lands exactly on
+a float halfway pattern with the true value below it, the fixup path answers
+one ulp high (`fmaf(1.5, 1+2^-23, -2^-60)` → `0x3fc00002`, probed native on
+the device; round-to-nearest is `0x3fc00001`). So on `__arm__` hosts the
+fused sites trust libm for nothing: `a64_fma`/`a64_fmaf` compute both the
+round-to-nearest result and the flags from an exact integer decomposition
+(`fused_eval` in `exec_fpsimd.c`), with no libm or fenv call at all.
+Building any host with `-DA64_FMA_DERIVE_FORCE` routes the fused sites
+through the same path, which is how it is validated: the full suite over the
+qemu oracle, plus `tests/fixtures/fusedfuzz.c` (byte-match required) and a
+16M-case differential against x86-64 FMA hardware.
+
 ## Testing discipline
 
 The differential suite (`tests/run_tests.sh`) runs each asm/C test under an
