@@ -942,6 +942,26 @@ for base in memfd_seals mfdsync mmap_eof; do
     fi
 done
 
+# ---- grown file mappings: pipe-probe fallback tier ----
+# A page a file has since grown into is filled lazily, and whether the kernel
+# will hand it over is asked without faulting -- process_vm_readv normally,
+# a pipe write on a host too old to have it (< 3.2, e.g. Android 7's 3.1).
+# Re-run the mapping test with A64_PAGEPROBE_FORCE_PIPE=1 so the fallback is
+# exercised on every host, not only on such a device.
+MEBIN="tests/c/mmap_eof_static.bin"
+if [ -x "$MEBIN" ] && ! rec_have "$MEBIN"; then
+    skip=$((skip+1)); echo "SKIP c/mmap_eof(pipe-probe) (not in the test pack)"
+elif [ -x "$MEBIN" ]; then
+    out_q=$(oracle_run "$MEBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_PAGEPROBE_FORCE_PIPE=1 timeout 60 "$EMU" / "$MEBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/mmap_eof(pipe-probe)"
+    else
+        fail=$((fail+1)); echo "FAIL c/mmap_eof(pipe-probe) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+fi
+
 # ---- exec and re-open through /proc/self/fd/N when N is a memfd, the way
 # apk-tools >= 3.0 runs its install triggers. Self-checking, not oracle-diffed:
 # Android denies path re-opens of memfds outright (EACCES, sealed or not), so a

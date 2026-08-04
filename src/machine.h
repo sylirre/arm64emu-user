@@ -689,6 +689,7 @@ int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err)
  * it). Only the owner writes. _get returns 1 if the registry knows the pid --
  * mode 0 is the real answer "no seccomp", not "unknown". */
 void proctab_seccomp_set(u8 mode, u32 nfilters);
+void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters); /* pre-fork */
 int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);
 
 /* proctab.c: System V shared-memory broker (client side). The unified IPC

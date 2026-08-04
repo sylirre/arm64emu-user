@@ -200,6 +200,22 @@ through the same path, which is how it is validated: the full suite over the
 qemu oracle, plus `tests/fixtures/fusedfuzz.c` (byte-match required) and a
 16M-case differential against x86-64 FMA hardware.
 
+A file mapping's pages past end-of-file are kept out of the page table so
+that touching one becomes the guest's `SIGBUS` rather than the emulator's.
+When the file later *grows*, those pages have to come back — and the question
+"will the kernel hand this page over now?" must be answered without touching
+it, since a load here would be a host `SIGBUS` in the middle of a
+translation. `process_vm_readv` answers it (EFAULT for a page the kernel
+would refuse) and is the fast path, but it is a **Linux 3.2** syscall: on the
+armv7 Android 7 device (3.1) it is `ENOSYS`, so every grown page stayed
+unreachable and a guest that extended a file it had mapped took a spurious
+`SIGBUS`. `host_page_readable` (`mem.c`) falls back to a pipe — `write(2)`
+copies from the address in kernel space and reports the same `EFAULT` — with
+the two descriptors created and closed inside the call, because guest fd ==
+host fd here and an fd held across guest execution would be guest-visible.
+`A64_PAGEPROBE_FORCE_PIPE=1` selects the fallback anywhere, which is how the
+suite covers it off-device (`c/mmap_eof(pipe-probe)`).
+
 ## Testing discipline
 
 The differential suite (`tests/run_tests.sh`) runs each asm/C test under an

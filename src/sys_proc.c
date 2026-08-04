@@ -461,6 +461,16 @@ SYSDEF(clone) {
      * child that had just unshared the namespace it left. */
     if (flags & G_CLONE_NEWUSER) proctab_userns_seed(rsv, 1);
     else if (m->fake_userns)     proctab_userns_seed(rsv, 0);
+    /* Seccomp is inherited across fork and the timing argument is the same:
+     * the child republishes it below, but the parent can return from fork(2)
+     * and read /proc/<child>/status before the child has run a single
+     * instruction, and a real kernel answers that read with the inherited
+     * state, never a blank. */
+    if (m->seccomp_mode) {
+        u32 nf = 0;
+        u8 md = (u8)seccomp_status(m, &nf);
+        proctab_seccomp_seed(rsv, md, nf);
+    }
 
     pid_t pid = fork();
     if (pid < 0) { proctab_release(rsv); return host_err(); }

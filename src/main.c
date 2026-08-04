@@ -297,6 +297,9 @@ static void help(void) {
         {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2) onto the /dev/urandom"
                         " / /dev/random fallback (the tier a host kernel "
                         "without getrandom is served by)."},
+        {"A64_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
+                        "with a pipe instead of process_vm_readv (the tier a "
+                        "host kernel older than 3.2 is served by)."},
         {"A64_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "

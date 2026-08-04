@@ -636,14 +636,52 @@ static int __attribute__((cold)) va_is_file_hole(CPU *c, u64 va) {
     return hole;
 }
 
+/* Will the kernel hand this host page over right now? The question has to be
+ * answered WITHOUT touching the page: a load of a page past end-of-file is a
+ * SIGBUS on the EMULATOR, in the middle of a translation, which is exactly
+ * what the caller exists to avoid.
+ *
+ * process_vm_readv is the one-syscall way -- it reports EFAULT for a page the
+ * kernel would refuse -- but it arrived in Linux 3.2 and the emulator runs on
+ * older hosts than that (an Android 7 device is on 3.1, where it is ENOSYS).
+ * There the probe falls back to a pipe: write(2) copies from the address in
+ * kernel space and reports the same EFAULT. Its two descriptors are created
+ * and closed inside this call rather than kept: guest fd == host fd here, so
+ * an fd held across guest execution would be visible to the guest. Both paths
+ * are cold -- only a page the walk already found missing gets here. */
+static int __attribute__((cold)) host_page_readable(const u8 *hp) {
+    /* -1 undecided, 0 process_vm_readv works, 1 pipe only. A64_PAGEPROBE_
+     * FORCE_PIPE selects the fallback on a host that has the syscall, which
+     * is how the pipe path is tested anywhere but on a pre-3.2 kernel. */
+    static int no_pvr = -1;
+    if (no_pvr < 0)
+        __atomic_store_n(&no_pvr, getenv("A64_PAGEPROBE_FORCE_PIPE") ? 1 : 0,
+                         __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&no_pvr, __ATOMIC_RELAXED)) {
+        u8 probe;
+        struct iovec loc = { &probe, 1 };
+        struct iovec rem = { (void *)(uintptr_t)hp, 1 };
+        if (process_vm_readv(getpid(), &loc, 1, &rem, 1, 0) == 1) return 1;
+        if (errno == EFAULT) return 0;          /* the answer, not a failure */
+        /* ENOSYS (< 3.2), or a policy that denies even same-process access:
+         * this method cannot answer on this host, and never will. */
+        __atomic_store_n(&no_pvr, 1, __ATOMIC_RELAXED);
+    }
+    int pf[2];
+    if (pipe2(pf, O_CLOEXEC) < 0) return 0;
+    ssize_t n;
+    do { n = write(pf[1], hp, 1); } while (n < 0 && errno == EINTR);
+    close(pf[0]);
+    close(pf[1]);
+    return n == 1;
+}
+
 /* Fill a page the walk found missing, if the file has grown into it since the
  * mapping was made. The host backing is already there -- the mapping covers the
  * whole range, it was only end-of-file that made these pages untouchable -- so
- * the question is just whether the kernel will hand the page over now.
- *
- * process_vm_readv answers it without faulting: it reports EFAULT for a page
- * the kernel would refuse, where a plain load would raise SIGBUS on the
- * emulator. Cold, and only on a page that is genuinely missing. */
+ * the question is just whether the kernel will hand the page over now
+ * (host_page_readable, which answers without faulting). Cold, and only on a
+ * page that is genuinely missing. */
 static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
     AddrSpace *as = cpu_as(c);
     uintptr_t pte = 0;
@@ -652,9 +690,7 @@ static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
     if (r && r->hostmap) {
         u64 page = va & ~(u64)GUEST_PAGE_MASK;
         u8 *hp = r->host + (page - r->start);
-        u8 probe;
-        struct iovec loc = { &probe, 1 }, rem = { hp, 1 };
-        if (process_vm_readv(getpid(), &loc, 1, &rem, 1, 0) == 1) {
+        if (host_page_readable(hp)) {
             pte_set_range(as, page, GUEST_PAGE_SIZE, hp, r->prot);
             pte = (uintptr_t)hp | r->prot;
         }
@@ -692,7 +728,7 @@ static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool 
  * The handler below is deliberately narrow. It acts only on a fault whose
  * address lies inside the host backing of one of this process's file mappings;
  * every other bus error keeps the old fatal behaviour. It then drops that
- * region's PTEs -- as_fault_fill re-probes each page with process_vm_readv,
+ * region's PTEs -- as_fault_fill re-probes each page (host_page_readable),
  * which reports the shrink without faulting, so pages that are gone stay
  * unmapped and pages still there come back -- records the guest abort, and
  * longjmps to the bracket loop.c wraps around the execution engines.

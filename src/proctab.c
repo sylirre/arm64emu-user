@@ -2384,6 +2384,21 @@ void proctab_seccomp_set(u8 mode, u32 nfilters) {
     __atomic_store_n(&e->seccomp, ((u32)mode << 16) | nfilters, __ATOMIC_RELEASE);
 }
 
+/* Seed a reservation with the seccomp state the child is about to inherit --
+ * the same pre-fork write, and for the same reason, as proctab_userns_seed.
+ * The child republishes this itself once it runs, but "once it runs" is too
+ * late: fork(2) hands the parent a pid whose /proc/<pid>/status the kernel
+ * can answer IMMEDIATELY, seccomp lines included, and a reader that got
+ * there first (the parent itself, or ps) saw the zeroed reservation and
+ * reported an unfiltered child. Writing it here closes the window, because
+ * while the slot is reserved the child does not exist to race with. */
+void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return;
+    if (nfilters > 0xffff) nfilters = 0xffff;
+    __atomic_store_n(&g_tab[slot].seccomp, ((u32)mode << 16) | nfilters,
+                     __ATOMIC_RELEASE);
+}
+
 /* Read a process's mode + filter count. Returns 1 when the registry knows the
  * process at all -- mode 0 is a real answer ("no seccomp"), so the caller has
  * to tell that apart from "no slot", where the host file's own line stands. */
