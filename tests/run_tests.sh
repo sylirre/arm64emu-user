@@ -810,6 +810,47 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- instruction accounting across the NaN gate. The gated FP classes are
+# self-counting (out of ninsns, the fast path bumps icount inline) precisely so
+# the slow arm's jit_exec1 is the only counter; a class that is both gated and
+# in ninsns retires once and counts twice. Nothing the guest can read exposes
+# icount, and the engines-agree checks above compare guest stdout, so this one
+# reads the icount the HLT diagnostic prints on stderr.
+#
+# Two builds of one source, differing only in whether the FSQRT operand makes
+# the gate fire, executing the same instructions either way: each engine must
+# report the same icount for both. Per engine, not engine against engine — the
+# JIT does not count the trailing HLT block, and that constant offset is not
+# what this is about. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -nostdlib -static -o tests/fixtures/icount_plain.bin \
+            tests/fixtures/icount_gate.S 2>/dev/null &&
+       "$AGCC" -nostdlib -static -DNANGATE -o tests/fixtures/icount_nan.bin \
+            tests/fixtures/icount_gate.S 2>/dev/null; then
+        ic_of() {  # $1 = emulator flags, $2 = image
+            timeout 60 "$EMU" $1 / "$2" 2>&1 >/dev/null \
+                | sed -n 's/.*icount=\([0-9]*\).*/\1/p' | tail -1
+        }
+        ic_bad=""
+        for eng in "" "--no-predecode" "--jit"; do
+            a=$(ic_of "$eng" tests/fixtures/icount_plain.bin)
+            b=$(ic_of "$eng" tests/fixtures/icount_nan.bin)
+            [ -n "$a" ] && [ "$a" = "$b" ] ||
+                ic_bad="$ic_bad ${eng:-interp}(ungated=$a gated=$b)"
+        done
+        if [ -z "$ic_bad" ]; then
+            pass=$((pass+1)); echo "PASS fixture: icount_gate (gate does not add counts)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: icount_gate"
+            printf '    %s\n' "$ic_bad"
+        fi
+        fx_rm tests/fixtures/icount_plain.bin
+        fx_rm tests/fixtures/icount_nan.bin
+    else
+        skip_build "fixtures/icount_gate"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

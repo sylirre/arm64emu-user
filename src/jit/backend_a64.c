@@ -1539,6 +1539,14 @@ static void emit_vop(BE *be, const IROp *o) {
             break;
         }
         default: {
+            /* VC_F1's FSQRT is self-counted (ir.h): the x86 backend has to
+             * NaN-gate it, so the frontend keeps it out of ninsns for every
+             * host. This backend replays the guest fsqrt natively and needs
+             * no gate, but it still owes the inline count. x16 is the only
+             * register icount_add touches and nothing below has claimed it
+             * yet. VC_F1 is the sole self-counted class reaching `default`;
+             * the rest have their own cases above, which count there. */
+            if (vop_self_counted(vclass, insn)) icount_add(be, 1);
             /* Renumber-and-replay. Vector sources -> v0 (Rn), v1 (Rm);
              * Vd preloaded into the result reg v2 for the read-modify
              * forms (BSL/BIT/BIF, INS). GPR-linked forms use x16. */

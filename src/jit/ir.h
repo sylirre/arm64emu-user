@@ -268,6 +268,37 @@ enum {
                              * FRSQRTS, FADDP. a64-only + FEAT_FP16; NaN-gated,
                              * self-counting. */
 };
+
+/* The NaN-gated vector classes follow a "self-counting" discipline: the
+ * frontend keeps them out of IRBlock.ninsns and the backend's fast path bumps
+ * c->icount inline instead. That is what stops a gated instruction being
+ * counted twice — the slow arm re-runs it through jit_exec1, and jit_exec1
+ * counts whatever it executes, so a class that is also in ninsns gets counted
+ * a second time when the exit stub adds ninsns.
+ *
+ * VC_F1 is the one class where only part of the encoding space is gated:
+ * FSQRT is (a negative operand is an invalid operation, and the host's
+ * DefaultNaN has the wrong sign, so the result has to come from exec_fpsimd's
+ * fpnan_*), while FMOV/FABS/FNEG are pure sign-bit ops that never need the
+ * interpreter. So the predicate takes the instruction word, not just the
+ * class, and the frontend and both backends ask it rather than each carrying
+ * their own copy — they have to agree or icount drifts. */
+static inline int vop_self_counted(unsigned vclass, u32 insn) {
+    switch (vclass) {
+        case VC_F2: case VC_F3: case VC_VF3S: case VC_FCVTH:
+        case VC_H1: case VC_H2: case VC_H3: case VC_VH3: case VC_VH2M:
+        case VC_VHMULX: case VC_VHEST:
+        case VC_VMISCF: case VC_FRINTS: case VC_FX3: case VC_FS3:
+        case VC_FPAIRS: case VC_FELEM: case VC_FSELEM: case VC_FSMISC:
+        case VC_VH3X:
+            return 1;
+        case VC_F1:
+            return ((insn >> 15) & 0x3f) == 0x3;     /* FSQRT only */
+        default:
+            return 0;
+    }
+}
+
 #define VF_READF (1u << 6)  /* consumes guest NZCV (FCSEL) */
 #define VF_SETF  (1u << 7)  /* defines guest NZCV (FCMP) */
 #define VC(a)    ((a) & 0x3f)

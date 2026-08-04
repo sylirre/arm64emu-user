@@ -665,20 +665,11 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
     o->imm2pc = pc;
     /* FP arithmetic results are NaN-gated (a NaN result means the
      * compiler's operand-order-dependent NaN propagation in the interpreter
-     * would show — re-run there). Those classes follow the atomics'
-     * self-counting discipline: not in ninsns, the fast path bumps icount
-     * inline. */
-    switch (vclass) {
-        case VC_F2: case VC_F3: case VC_VF3S: case VC_FCVTH:
-        case VC_H1: case VC_H2: case VC_H3: case VC_VH3: case VC_VH2M:
-        case VC_VHMULX: case VC_VHEST:
-        case VC_VMISCF: case VC_FRINTS: case VC_FX3: case VC_FS3:
-        case VC_FPAIRS: case VC_FELEM: case VC_FSELEM: case VC_FSMISC:
-        case VC_VH3X:
-            break;                               /* self-counting */
-        default:
-            ir->ninsns++;
-    }
+     * would show — re-run there). Those follow the atomics' self-counting
+     * discipline: not in ninsns, the fast path bumps icount inline. The
+     * predicate is shared with the backends (ir.h) so the two cannot drift. */
+    if (!vop_self_counted(vclass, insn))
+        ir->ninsns++;
     return 1;
 }
 

@@ -2297,7 +2297,14 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             }
             st64(e, RAX, R14, OFF_V(rd));
             st_imm_r14(e, OFF_V(rd) + 8, 0);
-            if (slow) vop_slowpath(be, o, slow, -1);
+            /* FSQRT is the gated arm, so it is the self-counted one (ir.h):
+             * count it here on the fast path, because the slow arm's
+             * jit_exec1 counts it and ninsns no longer does. FABS/FNEG/FMOV
+             * never gate and stay in the block's ninsns. */
+            if (slow) {
+                icount_add(be, 1);
+                vop_slowpath(be, o, slow, -1);
+            }
             break;
         }
         case VC_FCMP: {

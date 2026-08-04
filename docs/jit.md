@@ -143,6 +143,17 @@ the equivalence robust against toolchain changes; `tests/run_consist.sh`
 (random bit patterns through every inline FP class, jit vs. interpreter on
 the same host) enforces it on both backends.
 
+Being NaN-gated and being in `IRBlock.ninsns` are mutually exclusive. The
+slow arm re-runs the instruction through `jit_exec1`, which counts what it
+executes, so a gated class that is *also* in `ninsns` has the exit stub count
+it a second time — it retires once and counts twice. `vop_self_counted()`
+(`ir.h`) is the single predicate the frontend and both backends consult, and
+it takes the instruction word rather than just the class because `VC_F1` is
+only partly gated: FSQRT is (a negative operand is an invalid operation and
+the host's DefaultNaN has the wrong sign), FMOV/FABS/FNEG are pure sign-bit
+ops that never need the interpreter. `tests/fixtures/icount_gate.S` pins it,
+built twice from one source so the only difference is whether the gate fires.
+
 Inlined per a per-host fidelity table (`be_vop_ok`):
 
 - **integer vectors**: bitwise (AND/BIC/ORR/EOR/BSL/BIT/BIF), ADD/SUB, MUL,
