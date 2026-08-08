@@ -449,30 +449,51 @@ byte 2 to 30 and byte 3 to 31, and every cross term lands outside the
 after N/C/V are captured. `ADC/SBC` seed the host carry straight out of the
 architectural word with `bt [ebp+nzcv], 29`, which needs no register at all.
 
+**Inline softmmu.** Loads and stores probe the D-TLB inline, the same scheme as
+the 64-bit backends: index from the *first* byte's page, tag compared against the
+*last* byte's, which folds the page-cross gate into the tag mismatch (a crossing
+access indexes one entry and compares a different page, and every entry's page is
+congruent to its own index, so it cannot accidentally agree — a TBI-tagged
+pointer misses for the same reason). The fast path touches nothing but scratch
+registers; the slow branch recomputes the address, calls the helper with the
+faulting pc baked in, and converges on the registers the fast path would have
+left a loaded value in, so one post-merge commit serves both.
+
+The probe is ~20 instructions rather than the 64-bit hosts' 8, and the whole
+difference is that the tag is a guest *page number* — 64-bit — so it takes two
+compares and a `shrd` to assemble. Register budget: the entry offset must survive
+three memory references, so it takes one pool register, computed as
+`(va & 0x3ff000) >> 8` (the ×16 entry stride folded into the shift); `eax` then
+carries the host pointer into the access and `edx` shuttles the data, which is
+why an 8-byte load reads its *high* word first — the second load is what finally
+overwrites the pointer. Byte stores route through `edx` because `esi`/`edi` have
+no 8-bit form on this ISA. Vector accesses move `c->v[rt]` a word at a time
+through the same probe.
+
 **Not inlined on i686 yet.** All FP/SIMD: `be_vop_ok` declines every class, so
 the frontend keeps its `exec_fpsimd` helper calls. The atomics re-run the whole
 instruction through `jit_exec1` (correct for icount by construction —
 `IRO_ATOMIC` is excluded from `IRBlock.ninsns` and `jit_exec1` counts what it
-executes). Memory accesses go through the same `jit_ld`/`jit_st`/`jit_ldv`/
-`jit_stv` helpers the 64-bit backends fall back to, which is why there are no
-bus-fault fixups to register: generated code here never dereferences guest
-memory itself.
+executes). Nor is there any probe sharing across a run of same-base accesses yet
+(`jit_mem_run_len` goes unused), which on this host would pay more than it does
+on a 64-bit one precisely because the probe is longer.
 
 **Measured payoff** (`tests/bench/run_bench.sh ./arm64chroot32`), i686 JIT vs
 the i686 interpreter:
 
 | kernel   | speedup | |
 |----------|---------|--|
-| int_alu  | ~5.7×   | register-bound ALU: the pair model at its best |
-| calls    | ~2.5×   | block chaining and the jump cache carry it |
-| lockping | ~1.6×   | atomics still re-run through the interpreter |
+| lockping | ~7.3×   | pthread mutex ping-pong; the frame traffic went inline |
+| calls    | ~7.3×   | recursion: block chaining, the jump cache, inline `stp`/`ldp` |
+| int_alu  | ~5.5×   | register-bound ALU: the pair model at its best |
 | fpvec    | ~1.6×   | FP is entirely helper calls |
-| strops   | ~1.2×   | memory-bound, and every access is a helper call |
-| memops   | ~1.2×   | likewise |
+| memops   | ~1.4×   | pointer chase: one 20-instruction probe per access |
+| strops   | ~1.2×   | glibc's string routines are SIMD, i.e. helper calls |
 
-The bottom four are where the inline softmmu and the lazy-flag windows have to
-land; the shape of the table says plainly that on this host the remaining win is
-in memory and flags, not in more ALU coverage.
+What the two ends of that table say is that the remaining wins here are the
+FP/SIMD tier (`strops`, `fpvec`) and the flag windows — not more integer
+coverage. `memops` is bounded by the probe length itself, which is where probe
+sharing across a same-base run would come in.
 
 **ARM32, still to do.** The design above is deliberately host-neutral in
 everything except the emitter, so the second backend inherits it. ARM32 is the

@@ -433,12 +433,6 @@ static void sync_all(BE *be) {
 static void inval_all(BE *be) {
     for (int hv = 0; hv < NHV; hv++) ra_unmap(be, hv);
 }
-static void inval_v(BE *be, int v) {             /* one guest register's pair */
-    if (v == VREG_ZERO) return;
-    ra_unmap(be, HV(v, 0));
-    ra_unmap(be, HV(v, 1));
-    be->zero[HV(v, 0)] = be->zero[HV(v, 1)] = 0;
-}
 /* A C call keeps ebx/esi/edi but not ecx: reload whatever lived there. Runs
  * after sync_all, so every mapping is clean and the home is the truth.
  *
@@ -830,33 +824,176 @@ static void shift_imm_pair(BE *be, int op, Pair p, unsigned amt) {
     }
 }
 
-/* ---- memory (helper-only in this backend) ----
- * Every access calls the same slow-path helper the 64-bit backends fall back
- * to. The homes are made current first because the helper commits its result
- * there and because a fault exits the block; afterwards only the destination's
- * mapping is dropped (the helper writes nothing else) plus whatever lived in
- * the caller-clobbered ecx. */
+/* ---- inline softmmu ----
+ * The fast path is probe + access: nothing but scratch registers is touched and
+ * no guest state is written, so all the sync cost lives in the slow branch —
+ * which calls the same jit_ld/jit_st/jit_ldv/jit_stv helper the 64-bit backends
+ * fall back to, with the faulting pc baked in, and converges with a loaded value
+ * in the same registers the fast path leaves it in.
+ *
+ * The probe is longer here than on a 64-bit host for exactly one reason: the tag
+ * is a guest page number, which is 64-bit, so it takes two compares. Everything
+ * else is the established scheme. The index comes from the FIRST byte's page and
+ * the compared tag from the LAST byte's, which folds the page-cross gate into
+ * the tag mismatch: a crossing access indexes one entry and compares against a
+ * different page, and every entry's page is congruent to its own index, so it
+ * cannot accidentally agree. A TBI-tagged pointer mismatches the same way, since
+ * the interpreter stores the top-byte-stripped page.
+ *
+ * Register budget: the entry offset needs to survive three memory references,
+ * so it takes one pool register; eax and edx are the rest. eax carries the host
+ * pointer into the access and edx shuttles the data, which is why an 8-byte load
+ * reads its high word first — the second load is what finally overwrites the
+ * pointer. */
+#define FR_VLO FR_S(0)          /* the probe parks va's low word here */
+
+static u32 cache_off(BE *be) {
+    return (u32)(be->e->rx - be->env->cache_rx);
+}
+
+/* [eax] / [eax + disp] */
+static Mem M_at(s32 d) { return M_reg(EAX, d); }
+
 static void emit_mem(BE *be, const IROp *o) {
     Emit *e = be->e;
-    int is_st = (o->op == IRO_ST);
+    int is_st = (o->op == IRO_ST || o->op == IRO_STV);
+    int is_v  = (o->op == IRO_LDV || o->op == IRO_STV);
+    unsigned desc = o->aux;
+    unsigned szlog = is_v ? MDESC_VSZL(desc) : (unsigned)o->cc;
+    unsigned sz = 1u << szlog;
+    int need = is_st ? 2 /*PTE_W*/ : 1 /*PTE_R*/;
+
+    /* The homes must be current before the paths split: the helper commits its
+     * result there, and a fault exits the block from the slow arm. */
     sync_all(be);
 
-    /* arg1 = va = base + offset, as a pair in eax:edx */
-    mov_rs(e, EAX, src_hv(be, HV(o->a, 0)));
-    mov_rs(e, EDX, src_hv(be, HV(o->a, 1)));
+    /* Take the probe's pool register BEFORE locating the operands: eviction can
+     * spill the base's own register, and a Src captured earlier would then name
+     * a register that no longer holds it. Both arms see it unmapped. */
+    int t = ra_alloc(be);
+    ra_evict(be, t);
+    ra_lock(be, t);
+    Src blo = src_hv(be, HV(o->a, 0)), bhi = src_hv(be, HV(o->a, 1));
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL, *slow3 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = jmp_fwd(e);                      /* bisection: helper always */
+        goto fast;
+    }
+    /* va -> (eax, edx) */
+    mov_rs(e, EAX, blo);
+    mov_rs(e, EDX, bhi);
+    if (o->imm) {
+        alu_ri(e, AL_ADD, EAX, (u32)o->imm);
+        alu_ri(e, AL_ADC, EDX, (u32)(o->imm >> 32));
+    }
+    st_r(e, EAX, M_esp(FR_VLO));                 /* for the page offset below */
+    /* entry byte offset = ((va >> 12) & 1023) * 16 == (va & 0x3ff000) >> 8 */
+    mov_rr(e, t, EAX);
+    alu_ri(e, AL_AND, t, 0x003FF000u);
+    shift_ri(e, SH_SHR, t, 8);
+    if (sz > 1) {                                /* the access's last byte */
+        alu_ri(e, AL_ADD, EAX, sz - 1);
+        alu_ri(e, AL_ADC, EDX, 0);
+    }
+    shrd_ri(e, EAX, EDX, 12);                    /* tag, low word */
+    shift_ri(e, SH_SHR, EDX, 12);                /* tag, high word */
+    u32 tlb = (u32)(uintptr_t)be->env->dtlb;
+    op_rm(e, 0x3B, EAX, RM_M(M_absx(tlb, t, 0)));         /* cmp against page */
+    slow1 = jcc_fwd(e, CC_NE);
+    op_rm(e, 0x3B, EDX, RM_M(M_absx(tlb + 4, t, 0)));
+    slow2 = jcc_fwd(e, CC_NE);
+    ld_r(e, EAX, M_absx(tlb + 8, t, 0));                  /* pte */
+    e8(e, 0xA8); e8(e, (u8)need);                         /* test al, need */
+    slow3 = jcc_fwd(e, CC_E);
+    alu_ri(e, AL_AND, EAX, 0xFFFFFFF8u);         /* strip PTE_FLAGS */
+    ld_r(e, EDX, M_esp(FR_VLO));
+    alu_ri(e, AL_AND, EDX, GUEST_PAGE_MASK);
+    op_rr(e, 0x03, EAX, EDX);                    /* eax = host pointer */
+
+fast:;
+    u32 fix_fast = cache_off(be);
+    if (!is_v) {
+        if (is_st) {
+            /* A byte store needs a byte-addressable source, which esi and edi
+             * are not on this ISA, so the value always goes through edx. */
+            mov_rs(e, EDX, src_hv(be, HV(o->b, 0)));
+            if (szlog == 0)      op_rm(e, 0x88, EDX, RM_M(M_at(0)));
+            else if (szlog == 1) { e8(e, 0x66); op_rm(e, 0x89, EDX, RM_M(M_at(0))); }
+            else                 op_rm(e, 0x89, EDX, RM_M(M_at(0)));
+            if (szlog == 3) {
+                mov_rs(e, EDX, src_hv(be, HV(o->b, 1)));
+                op_rm(e, 0x89, EDX, RM_M(M_at(4)));
+            }
+        } else {
+            int sign = MDESC_SIGN(desc);
+            if (szlog == 3) {
+                ld_r(e, EDX, M_at(4));           /* high word first: the second
+                                                  * load overwrites the pointer */
+                ld_r(e, EAX, M_at(0));
+            } else {
+                if (szlog == 2) ld_r(e, EAX, M_at(0));
+                else op0f_rm(e, (u8)(sign ? (szlog ? 0xBF : 0xBE)
+                                          : (szlog ? 0xB7 : 0xB6)),
+                             EAX, RM_M(M_at(0)));   /* movsx / movzx */
+                if (o->w) {
+                    if (sign && szlog < 3) {     /* sign-fill the high word */
+                        mov_rr(e, EDX, EAX);
+                        shift_ri(e, SH_SAR, EDX, 31);
+                    } else {
+                        mov_ri(e, EDX, 0);
+                    }
+                }
+            }
+        }
+    } else {
+        /* Vector accesses work on c->v[rt] directly, a word at a time; the
+         * pointer stays in eax throughout. */
+        unsigned vd = MDESC_RT(desc);
+        unsigned words = sz >= 4 ? sz / 4 : 1;
+        for (unsigned k = 0; k < words; k++) {
+            if (is_st) {
+                ld_r(e, EDX, M_ebp(OFF_V(vd) + 4 * (s32)k));
+                if (k == 0 && szlog == 0)      op_rm(e, 0x88, EDX, RM_M(M_at(0)));
+                else if (k == 0 && szlog == 1) { e8(e, 0x66);
+                                                 op_rm(e, 0x89, EDX, RM_M(M_at(0))); }
+                else op_rm(e, 0x89, EDX, RM_M(M_at(4 * (s32)k)));
+            } else {
+                if (szlog == 0)      op0f_rm(e, 0xB6, EDX, RM_M(M_at(0)));
+                else if (szlog == 1) op0f_rm(e, 0xB7, EDX, RM_M(M_at(0)));
+                else                 ld_r(e, EDX, M_at(4 * (s32)k));
+                st_r(e, EDX, M_ebp(OFF_V(vd) + 4 * (s32)k));
+            }
+        }
+        if (!is_st && sz < 16) {                 /* jit_ldv zero-extends */
+            mov_ri(e, EDX, 0);
+            for (unsigned k = words; k < 4; k++)
+                st_r(e, EDX, M_ebp(OFF_V(vd) + 4 * (s32)k));
+        }
+    }
+    u8 *done = jmp_fwd(e);
+
+    /* ---- slow path ---- */
+    fwd_here(e, slow0);
+    fwd_here(e, slow1);
+    fwd_here(e, slow2);
+    fwd_here(e, slow3);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
+    mov_rs(e, EAX, blo);                         /* the probe consumed va */
+    mov_rs(e, EDX, bhi);
     if (o->imm) {
         alu_ri(e, AL_ADD, EAX, (u32)o->imm);
         alu_ri(e, AL_ADC, EDX, (u32)(o->imm >> 32));
     }
     arg_cpu(be, 0);
     arg_pair_regs(be, 1, EAX, EDX);
-    if (is_st) {                                 /* jit_st(c, va, val, pc, desc) */
+    if (o->op == IRO_ST) {                       /* jit_st(c, va, val, pc, desc) */
         arg_hv64(be, 3, o->b);
         arg_imm64(be, 5, o->imm2pc);
-        arg_imm(be, 7, o->aux);
+        arg_imm(be, 7, desc);
     } else {                                     /* (c, va, pc, desc) */
         arg_imm64(be, 3, o->imm2pc);
-        arg_imm(be, 5, o->aux);
+        arg_imm(be, 5, desc);
     }
     call_c(e, o->op == IRO_LD  ? (const void *)jit_ld
             : o->op == IRO_ST  ? (const void *)jit_st
@@ -864,10 +1001,20 @@ static void emit_mem(BE *be, const IROp *o) {
                                : (const void *)jit_stv);
     op_rr(e, 0x85, EAX, EAX);                    /* test eax, eax */
     u8 *ok = jcc_fwd(e, CC_E);
-    exit_plain(be, o->icnt);                     /* faulted */
+    exit_plain(be, o->icnt);                     /* faulted: leave the block */
     fwd_here(e, ok);
     reload_clobbered(be);
-    if (o->op == IRO_LD) inval_v(be, o->dst);    /* helper wrote the home */
+    if (o->op == IRO_LD && o->dst != VREG_ZERO) {
+        /* The helper committed to the home; converge on the registers the fast
+         * path would have left the value in. */
+        ld_r(e, EAX, hv_home(be, HV(o->dst, 0)));
+        if (o->w) ld_r(e, EDX, hv_home(be, HV(o->dst, 1)));
+    }
+    fwd_here(e, done);
+
+    /* ---- merge ---- */
+    if (o->op == IRO_LD && o->dst != VREG_ZERO)
+        commit_pair(be, o->dst, o->w, EAX, EDX);
 }
 
 /* ---- one guest instruction through the interpreter ----
