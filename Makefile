@@ -90,12 +90,22 @@ $(shell mkdir -p $(BUILDDIR); \
         cmp -s $(BUILDDIR)/.cfg.tmp $(BUILDCFG) 2>/dev/null \
           || mv $(BUILDDIR)/.cfg.tmp $(BUILDCFG); \
         rm -f $(BUILDDIR)/.cfg.tmp)
+# The ILP32 tree needs a stamp of its own: M32CC/M32FLAGS are overridable and
+# name a *different compiler for a different architecture* (an armhf cross gcc
+# instead of gcc -m32), so without this, switching them would silently link
+# objects for one ISA against objects for another.
+M32CFG := $(BUILDDIR)/.m32cfg
+$(shell mkdir -p $(BUILDDIR); \
+        printf '%s\n' '$(M32CC) $(CFLAGS) $(M32FLAGS)' > $(BUILDDIR)/.m32.tmp; \
+        cmp -s $(BUILDDIR)/.m32.tmp $(M32CFG) 2>/dev/null \
+          || mv $(BUILDDIR)/.m32.tmp $(M32CFG); \
+        rm -f $(BUILDDIR)/.m32.tmp)
 
 $(BUILDDIR)/native/%.o: %.c $(BUILDCFG)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(BUILDDIR)/m32/%.o: %.c $(BUILDCFG)
+$(BUILDDIR)/m32/%.o: %.c $(M32CFG)
 	@mkdir -p $(@D)
 	$(M32CC) $(CFLAGS) $(M32FLAGS) $(DEPFLAGS) -c $< -o $@
 
