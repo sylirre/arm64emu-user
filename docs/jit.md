@@ -470,36 +470,84 @@ overwrites the pointer. Byte stores route through `edx` because `esi`/`edi` have
 no 8-bit form on this ISA. Vector accesses move `c->v[rt]` a word at a time
 through the same probe.
 
-**Not inlined on i686 yet.** All FP/SIMD: `be_vop_ok` declines every class, so
-the frontend keeps its `exec_fpsimd` helper calls. The atomics re-run the whole
+A run of consecutive same-base constant-offset integer accesses — `LDP`/`STP`,
+prologue and epilogue spill runs — **shares one span-checked probe**, which is
+worth more here than on a 64-bit host precisely because the probe is longer. The
+span check folds into the same tag compare, and the bail path re-runs each access
+through its helper in program order. One thing differs from the 64-bit backends:
+they pre-map the load destinations to registers outside the branch so both arms
+agree on allocator state, which four pool registers cannot do for a run carrying
+up to eight destination halves. Agreement is reached the other way round instead
+— the fast path writes the same *homes* the helpers would, and both arms then
+drop the mappings. That costs a reload per value later and saves a whole probe;
+measured, it makes a call-heavy kernel ~6% faster and the emitted code for a real
+program ~10% smaller. `A64_JIT_NOFUSE=1` disables it.
+
+**Not inlined on i686.** All FP/SIMD: `be_vop_ok` declines every class, so the
+frontend keeps its `exec_fpsimd` helper calls. The atomics re-run the whole
 instruction through `jit_exec1` (correct for icount by construction —
 `IRO_ATOMIC` is excluded from `IRBlock.ninsns` and `jit_exec1` counts what it
-executes). Nor is there any probe sharing across a run of same-base accesses yet
-(`jit_mem_run_len` goes unused), which on this host would pay more than it does
-on a 64-bit one precisely because the probe is longer.
+executes).
+
+**Why there is no lazy-flag window here** (it was built and measured, so that it
+is not rebuilt). On a 64-bit host an S-op can leave its result in the host flags
+and let the next op read the condition directly. That does not pay on ILP32, for
+a structural reason: `fe_liveness` treats NZCV as live-out of every block, so the
+architectural word must reach `c->nzcv` before *any* exit, and the four `setcc`
+captures are therefore a floor no deferral can remove. What is left to save is
+only the read-back at the consumer. Worse, the dominant consumer is a conditional
+branch — a block terminal — so finishing the word would have to happen in *both*
+exit stubs, duplicating it onto whichever arm runs instead of removing it; on a
+data-dependent branch loop that measured slower than building the word once
+before the branch. Restricting the deferral to non-terminal consumers (`CSEL`,
+`CCMP`, the `ADC`/`SBC` carry) is sound and does shorten those, but they are rare
+enough that the emitted code for a flag-heavy program changed by 0.06% and the
+timing difference was drift. A 64-bit producer also declines whenever the
+condition reads Z, since the host's ZF describes the high word alone — which is
+most compares. The eager recipe stands.
 
 **Measured payoff** (`tests/bench/run_bench.sh ./arm64chroot32`), i686 JIT vs
 the i686 interpreter:
 
 | kernel   | speedup | |
 |----------|---------|--|
-| lockping | ~7.3×   | pthread mutex ping-pong; the frame traffic went inline |
-| calls    | ~7.3×   | recursion: block chaining, the jump cache, inline `stp`/`ldp` |
-| int_alu  | ~5.5×   | register-bound ALU: the pair model at its best |
-| fpvec    | ~1.6×   | FP is entirely helper calls |
-| memops   | ~1.4×   | pointer chase: one 20-instruction probe per access |
+| lockping | ~7.6×   | pthread mutex ping-pong; the frame traffic went inline |
+| calls    | ~7.3×   | recursion: block chaining, the jump cache, fused `stp`/`ldp` |
+| int_alu  | ~5.9×   | register-bound ALU: the pair model at its best |
+| fpvec    | ~1.7×   | FP is entirely helper calls |
+| memops   | ~1.5×   | pointer chase: one 20-instruction probe per access, nothing to fuse |
 | strops   | ~1.2×   | glibc's string routines are SIMD, i.e. helper calls |
 
-What the two ends of that table say is that the remaining wins here are the
-FP/SIMD tier (`strops`, `fpvec`) and the flag windows — not more integer
-coverage. `memops` is bounded by the probe length itself, which is where probe
-sharing across a same-base run would come in.
+What the two ends of that table say is that the remaining win here is the
+FP/SIMD tier: `strops` is glibc's SIMD string routines and `fpvec` is FP, so both
+are bounded by `exec_fpsimd` helper calls rather than by anything the integer
+side does. `memops` is bounded by the probe itself and is a pointer chase, so it
+has no runs to fuse and nothing short of a shorter probe will move it.
 
 **ARM32, still to do.** The design above is deliberately host-neutral in
 everything except the emitter, so the second backend inherits it. ARM32 is the
 more comfortable target: ~13 usable GPRs (so `CPU*` and `JitEnv*` can both be
-pinned and ~3 guest 64-bit values stay resident), `adds/adc` and `ubfx` fit the
-pair model directly, and its NEON(32) unit can carry the `V128` file when a
-vector tier lands. It has no CI that can execute it — the AArch64 runners do not
-implement AArch32 at EL0 — so its gate is `make test32-jit` under `qemu-arm`
-plus a real armv7 device.
+pinned — it has no absolute addressing mode — and ~2-3 guest 64-bit values stay
+resident), `adds`/`adc` and `ubfx` fit the pair model directly, `cmp`/`cmpeq`
+does a 64-bit tag compare in two instructions, and its NEON(32) unit can carry
+the `V128` file when a vector tier lands. Guest flags are the striking
+difference: `mrs Rd, APSR` yields N/Z/C/V *already in the guest's own bit
+positions*, and `msr APSR_nzcvq, Rn` puts them back, so materializing `c->nzcv`
+is 3 instructions instead of 7 and a condition needs no derivation table at all
+— the guest condition code *is* the host one. That is the same trick
+`backend_a64.c` uses.
+
+It has no CI that can execute it — the AArch64 runners do not implement AArch32
+at EL0 — so its gate is `make test32-jit` pointed at an armhf toolchain, plus a
+real armv7 device. On an x86-64 development host that gate runs through
+binfmt/`qemu-arm`:
+
+```sh
+QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf \
+  make M32CC=arm-linux-gnueabihf-gcc M32FLAGS= test32-jit
+```
+
+The emulator is then ARM32 code under `qemu-arm` while the oracle
+(`qemu-aarch64`) still runs natively, so the differential comparison is intact;
+what it cannot check is that the *silicon* agrees with the emitted ARM32, which
+is what the device run is for.

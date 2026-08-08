@@ -167,7 +167,7 @@ JIT debugging environment variables:
 * `A64_JIT_DUMP=PREFIX`: writes each translated block to a sparse code-cache image `PREFIX.<pid>.<tid>.code` plus a .map, so you can disassemble the native code the JIT produced.
 * `A64_JIT_PDMAX=N`: forces predecode ops with id > N through the interpreter helper. This is the bisection knob: sweep N to pin a codegen bug down to one instruction class.
 * `A64_JIT_SLOWMEM`: forces every inline memory access down its slow helper branch, isolating fast-path memory codegen bugs.
-* `A64_JIT_NOFUSE`: disables instruction / D-TLB-probe fusion (both backends).
+* `A64_JIT_NOFUSE`: disables instruction / D-TLB-probe fusion (all backends).
 * `A64_JIT_NOFP16`: disables FP16 native codegen on the AArch64 backend (falls back to helper).
 * `A64_JIT_NOVRA`: disables the V-register cache/allocator.
 * `A64_JIT_SSE=2`: forces SSE2-baseline capability answers on x86-64 hosts (test lower-ISA codegen paths).

@@ -433,6 +433,12 @@ static void sync_all(BE *be) {
 static void inval_all(BE *be) {
     for (int hv = 0; hv < NHV; hv++) ra_unmap(be, hv);
 }
+static void inval_v(BE *be, int v) {             /* one guest register's pair */
+    if (v == VREG_ZERO) return;
+    ra_unmap(be, HV(v, 0));
+    ra_unmap(be, HV(v, 1));
+    be->zero[HV(v, 0)] = be->zero[HV(v, 1)] = 0;
+}
 /* A C call keeps ebx/esi/edi but not ecx: reload whatever lived there. Runs
  * after sync_all, so every mapping is clean and the home is the truth.
  *
@@ -1015,6 +1021,179 @@ fast:;
     /* ---- merge ---- */
     if (o->op == IRO_LD && o->dst != VREG_ZERO)
         commit_pair(be, o->dst, o->w, EAX, EDX);
+}
+
+/* ---- fused runs: one probe for a whole same-base run ----
+ * jit_mem_run_len finds consecutive integer loads or stores off the same
+ * unclobbered base with constant offsets whose whole span fits one guest page.
+ * They share ONE span-checked probe: the tag compare uses the span's last byte
+ * against the tag stored for the first's page, so any crossing of the run
+ * mismatches and takes the bail route, where the accesses re-run through their
+ * helpers in program order — a fault at access j leaves accesses < j committed
+ * and j's destination unwritten, exactly the interpreter's rule.
+ *
+ * This is worth more here than on a 64-bit host precisely because the probe is
+ * longer: an LDP/STP pair or a prologue spill run pays it once instead of twice
+ * to eight times.
+ *
+ * Loads commit to their destinations' memory HOMES rather than to registers. A
+ * 64-bit backend pre-maps the destinations outside the branch so both arms agree
+ * on the allocator state; here there are four pool registers and a run can carry
+ * eight destination halves, so agreement is reached the other way round — the
+ * fast path writes the same homes the helpers would, and both arms then drop the
+ * mappings. The cost is a reload per value later; the saving is a whole probe. */
+static int fuse_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("A64_JIT_NOFUSE") == NULL;
+    return v;
+}
+
+/* base -> eax:edx, read from its home. A Src naming a register is not safe
+ * across the bail path: the first helper call clobbers ecx. sync_all made the
+ * home current, and no access in a run may write the base. */
+static void bail_base(BE *be, int v) {
+    if (v == VREG_ZERO) { mov_ri(be->e, EAX, 0); mov_ri(be->e, EDX, 0); return; }
+    ld_r(be->e, EAX, hv_home(be, HV(v, 0)));
+    ld_r(be->e, EDX, hv_home(be, HV(v, 1)));
+}
+/* A store value as a u64 argument, likewise straight from its home. */
+static void arg_hv64_home(BE *be, int slot, int v) {
+    for (int half = 0; half < 2; half++) {
+        if (v == VREG_ZERO) { arg_imm(be, slot + half, 0); continue; }
+        ld_r(be->e, EAX, hv_home(be, HV(v, half)));
+        st_r(be->e, EAX, M_esp(FR_ARG(slot + half)));
+    }
+}
+
+static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
+    Emit *e = be->e;
+    const IROp *o = &ir->ops[i];
+    int is_st = (o->op == IRO_ST);
+    int need = is_st ? 2 : 1;
+
+    s64 lo = (s64)o->imm, hi = lo + (s64)(1u << o->cc);
+    for (int t = 1; t < k; t++) {
+        s64 plo = (s64)ir->ops[i + t].imm;
+        s64 phi = plo + (s64)(1u << ir->ops[i + t].cc);
+        if (plo < lo) lo = plo;
+        if (phi > hi) hi = phi;
+    }
+
+    sync_all(be);
+    int t_reg = ra_alloc(be);
+    ra_evict(be, t_reg);
+    ra_lock(be, t_reg);
+    Src blo = src_hv(be, HV(o->a, 0)), bhi = src_hv(be, HV(o->a, 1));
+
+    u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL, *slow3 = NULL;
+    if (UNLIKELY(be->env->slowmem)) {
+        slow0 = jmp_fwd(e);
+        goto fast;
+    }
+    mov_rs(e, EAX, blo);                         /* va0 = base + lo */
+    mov_rs(e, EDX, bhi);
+    if (lo) {
+        alu_ri(e, AL_ADD, EAX, (u32)(u64)lo);
+        alu_ri(e, AL_ADC, EDX, (u32)((u64)lo >> 32));
+    }
+    st_r(e, EAX, M_esp(FR_VLO));
+    mov_rr(e, t_reg, EAX);
+    alu_ri(e, AL_AND, t_reg, 0x003FF000u);
+    shift_ri(e, SH_SHR, t_reg, 8);
+    if (hi - lo > 1) {                           /* the span's last byte */
+        alu_ri(e, AL_ADD, EAX, (u32)(hi - lo - 1));
+        alu_ri(e, AL_ADC, EDX, 0);
+    }
+    shrd_ri(e, EAX, EDX, 12);
+    shift_ri(e, SH_SHR, EDX, 12);
+    u32 tlb = (u32)(uintptr_t)be->env->dtlb;
+    op_rm(e, 0x3B, EAX, RM_M(M_absx(tlb, t_reg, 0)));
+    slow1 = jcc_fwd(e, CC_NE);
+    op_rm(e, 0x3B, EDX, RM_M(M_absx(tlb + 4, t_reg, 0)));
+    slow2 = jcc_fwd(e, CC_NE);
+    ld_r(e, EAX, M_absx(tlb + 8, t_reg, 0));
+    e8(e, 0xA8); e8(e, (u8)need);                /* test al, need */
+    slow3 = jcc_fwd(e, CC_E);
+    alu_ri(e, AL_AND, EAX, 0xFFFFFFF8u);
+    ld_r(e, EDX, M_esp(FR_VLO));
+    alu_ri(e, AL_AND, EDX, GUEST_PAGE_MASK);
+    op_rr(e, 0x03, EAX, EDX);                    /* eax = host pointer of va0 */
+
+fast:;
+    u32 fix_fast = cache_off(be);
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        s32 d = (s32)((s64)p->imm - lo);
+        unsigned szlog = p->cc;
+        if (is_st) {
+            mov_rs(e, EDX, src_hv(be, HV(p->b, 0)));
+            if (szlog == 0)      op_rm(e, 0x88, EDX, RM_M(M_at(d)));
+            else if (szlog == 1) { e8(e, 0x66); op_rm(e, 0x89, EDX, RM_M(M_at(d))); }
+            else                 op_rm(e, 0x89, EDX, RM_M(M_at(d)));
+            if (szlog == 3) {
+                mov_rs(e, EDX, src_hv(be, HV(p->b, 1)));
+                op_rm(e, 0x89, EDX, RM_M(M_at(d + 4)));
+            }
+        } else if (p->dst != VREG_ZERO) {
+            int sign = MDESC_SIGN(p->aux);
+            if (szlog == 3) {
+                ld_r(e, EDX, M_at(d));
+                st_r(e, EDX, hv_home(be, HV(p->dst, 0)));
+                ld_r(e, EDX, M_at(d + 4));
+                st_r(e, EDX, hv_home(be, HV(p->dst, 1)));
+            } else {
+                if (szlog == 2) ld_r(e, EDX, M_at(d));
+                else op0f_rm(e, (u8)(sign ? (szlog ? 0xBF : 0xBE)
+                                          : (szlog ? 0xB7 : 0xB6)),
+                             EDX, RM_M(M_at(d)));
+                st_r(e, EDX, hv_home(be, HV(p->dst, 0)));
+                if (p->w && sign) {              /* sign-fill the high word */
+                    shift_ri(e, SH_SAR, EDX, 31);
+                    st_r(e, EDX, hv_home(be, HV(p->dst, 1)));
+                } else {
+                    mov_mi(e, hv_home(be, HV(p->dst, 1)), 0);
+                }
+            }
+        }
+    }
+    u8 *done = jmp_fwd(e);
+
+    /* ---- bail: the helpers, in program order ---- */
+    fwd_here(e, slow0);
+    fwd_here(e, slow1);
+    fwd_here(e, slow2);
+    fwd_here(e, slow3);
+    be_fixup_add(be->env, fix_fast, cache_off(be));
+    for (int t = 0; t < k; t++) {
+        const IROp *p = &ir->ops[i + t];
+        bail_base(be, o->a);
+        if (p->imm) {
+            alu_ri(e, AL_ADD, EAX, (u32)p->imm);
+            alu_ri(e, AL_ADC, EDX, (u32)(p->imm >> 32));
+        }
+        arg_cpu(be, 0);
+        arg_pair_regs(be, 1, EAX, EDX);
+        if (is_st) {
+            arg_hv64_home(be, 3, p->b);
+            arg_imm64(be, 5, p->imm2pc);
+            arg_imm(be, 7, p->aux);
+        } else {
+            arg_imm64(be, 3, p->imm2pc);
+            arg_imm(be, 5, p->aux);
+        }
+        call_c(e, is_st ? (const void *)jit_st : (const void *)jit_ld);
+        op_rr(e, 0x85, EAX, EAX);
+        u8 *okk = jcc_fwd(e, CC_E);
+        exit_plain(be, p->icnt);
+        fwd_here(e, okk);
+    }
+    reload_clobbered(be);
+    fwd_here(e, done);
+
+    /* Both arms left every loaded value in its home; drop the mappings so the
+     * next use reloads, which is the state each arm agrees on. */
+    if (!is_st)
+        for (int t = 0; t < k; t++) inval_v(be, ir->ops[i + t].dst);
 }
 
 /* ---- one guest instruction through the interpreter ----
@@ -1633,7 +1812,13 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             break;
         }
 
-        case IRO_LD: case IRO_ST: case IRO_LDV: case IRO_STV:
+        case IRO_LD: case IRO_ST: {
+            int k = fuse_enabled() ? jit_mem_run_len(ir, i) : 1;
+            if (k >= 2) { emit_mem_run(be, ir, i, k); return k; }
+            emit_mem(be, o);
+            break;
+        }
+        case IRO_LDV: case IRO_STV:
             emit_mem(be, o);
             break;
         case IRO_ATOMIC:
