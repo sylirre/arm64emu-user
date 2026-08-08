@@ -177,12 +177,33 @@ gap, on every host, for as long as anyone built with it:
 
 Rules that follow. Classify NaNs *before* any relational and raise the flag by
 hand (`fcm_test_*`, `fp_compare_*`); never use an FP op as a flag-raising
-device inside a branch; convert FP→unsigned with integer bit arithmetic
-(`d_to_u64_exact`), not a cast. What none of that can express is an op a
-compiler speculates out of *any* guard, so the escape hatch is to build the FP
-core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which is
-why it is not on by default). CI builds with clang as well as gcc, which is
+device inside a branch; and perform no FP→int conversion with a cast at all —
+the whole family goes through `d_to_u64_exact` / `d_to_s64_exact` and raises its
+own `IXC`/`IOC` from the pre-round operand. What none of that can express is an
+op a compiler speculates out of *any* guard, so the escape hatch is to build the
+FP core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which
+is why it is not on by default). CI builds with clang as well as gcc, which is
 what makes the gap visible instead of theoretical.
+
+FP→int has a second host trap, and this one is nobody's codegen quirk — it is
+the *libcall*, and it is why the rule above says "no cast" rather than "no cast
+to unsigned". No 32-bit host has a double→64-bit-int instruction, so the
+conversion becomes `__aeabi_d2lz`, and libgcc's ARM assembly and compiler-rt's
+hard-float C split the operand the same way: `hi = (u32)(r * 2^-32)` with a
+**truncating** `vcvt`, inexact for every operand that is not a multiple of
+2^32. That Inexact lands in the live `FPSCR`, the sticky accumulation folds it,
+and the guest reads it back as belonging to its own instruction — `fcvtzs x0,
+d0` of `2.0` set `IXC`, and so did `fjcvtzs`. It stays invisible wherever the
+conversion is one direct instruction — AArch64 `fcvtzs`, x86-64 `cvttsd2si`,
+and even i686, where gcc reaches x87 `fistpll` through an `fldcw` round-toward-
+zero window — which is why an ILP32-on-ARM build was the only tier that ever
+showed it. i686 is not structurally safe, though, only lucky: glibc's i386
+`fetestexcept` ORs the x87 status word into its answer, so an x87 helper that
+rounded internally would leak just as well. The
+check is mechanical, so use it after touching this code — in an armhf
+`exec_fpsimd.o`, no `vcvt` from `.f32`/`.f64` to an integer type and no
+`__aeabi_*2*z` helper may appear (the reverse direction, `__aeabi_l2d` and
+friends, is expected, and its flags are handled by `i2f_inexact`).
 
 The fused multiply-adds have their own host trap, and on armv7 it is libm
 itself. VFPv3 has no fused instruction, so `__builtin_fma` becomes a call

@@ -598,16 +598,31 @@ The emulator is then ARM32 code under `qemu-arm` while the oracle
 what it cannot check is that the *silicon* agrees with the emitted ARM32, which
 is what the device run is for.
 
-Read that gate against a baseline, not against zero: **this tier fails ~54 tests
-with the JIT off**, and the measurement that matters is that the `--jit` failure
-set is a *subset* of the interpreter's (measured: 52 vs 54, the interpreter
-additionally losing two flaky `procview` races). Three causes, none of them the
-translator. Most are the ~20x slowdown of running the emulator under emulation:
-every `ptrace:` test times out or misses its first stop, and the tests that start
-a `sleep` child and read its `/proc` race. Three are FP: `asm/m22_fpsr` and
-`c/fcvt_scalar` (hence `insnfuzz: conform`, which shares those encodings) — a
-64-bit-result `fcvt*` of an exactly-representable value sets IXC where the oracle
-sets none, on this armhf-glibc tier only; the i686 ILP32 build is clean and real
-armv7 silicon passes `m22_fpsr`, so suspect qemu-arm's VFP flag emulation, but it
-is not pinned. `insnfuzz: chaos` and `seq` do pass, and they are the checks that
-referee the engines against *each other* rather than against an oracle.
+Read that gate against a baseline, not against zero: **this tier fails ~46 tests
+with the JIT off** (measured 46 interpreter / 47 `--jit`), and the measurement
+that matters is that the two failure sets agree once the tier's own flaky rows
+are set aside. Every one of them is the ~20x slowdown of running the emulator
+under emulation, not the translator: 40 `ptrace:` tests time out or miss their
+first stop, the multi-iteration `fixture:` races (`mtexec`, `mainexit`) run out
+of their timeouts, the two tests that start a `sleep` child and read its `/proc`
+lose the race, and `c/timers` misses its intervals. The one row that separated
+the two runs above was `procview: other-pid cwd`, which is flaky on this tier in
+*both* engines and on a pre-fix binary alike (~10%: `readlink /proc/<self>/cwd`
+intermittently answers ENOENT, which the test's trailing `:` turns into empty
+output rather than a non-zero status) — a real armhf-tier defect of its own, not
+a JIT one, and not reproducible on an x86-64 host.
+
+This tier used to fail three FP tests as well, and why it no longer does is
+worth more than the numbers. `asm/m22_fpsr`, `c/fcvt_scalar` and `insnfuzz:
+conform` (which shares those encodings) were filed here against qemu-arm's VFP
+flag emulation and left unpinned. None of it was qemu's doing: a 64-bit FP→int
+convert has no ARM instruction, so it became `__aeabi_d2lz`, whose internal
+*truncating* `vcvt` leaked Inexact into the live `FPSCR` and from there into the
+guest's `FPSR`. It is fixed by giving the whole convert family raise-free
+integer arithmetic — see the FP→int discussion in
+[portability-and-pitfalls.md](portability-and-pitfalls.md). Worth remembering
+that this tier, the slowest and least convenient one in the tree, was the *only*
+gate able to see that class of bug: every other host converts in a single exact
+instruction and is structurally blind to it. `insnfuzz: chaos` and `seq` pass
+too, and they are the checks that referee the engines against *each other*
+rather than against an oracle.
