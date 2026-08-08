@@ -152,7 +152,7 @@ while comparing the interpreter with itself.
 The optional `--jit` inserts one more rung above `pd_run`: `jit_run`
 (`src/jit/`) executes native translations of guest basic blocks and honors the
 same return contract, handing control back to `emu_loop` on the same rare
-events. It is off by default and only compiled-in for AArch64/x86-64/i686 hosts; the
+events. It is off by default and only compiled-in for AArch64/x86-64/i686/ARM32 hosts; the
 debug ladder still wins, so `-d` forces the interpreter. See [jit.md](jit.md).
 
 ### One syscall (the run loop, `src/loop.c`)
@@ -194,7 +194,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/sys_procfs.c` | Synthesized guest `/proc` views (`maps`, `cmdline`, `mounts`/`mountinfo`, `stat`, `loadavg`/`uptime`/`version`, and the lines of per-process `status` that would otherwise describe the emulator). |
 | `src/sys_netlink.c` | In-process `NETLINK_ROUTE` emulation for hosts that deny `AF_NETLINK` (Android/SELinux), reached from the socket calls in `sys_net.c` and from `read`/`write`/`readv`/`writev` in `sys_file.c`; also answers the read-only `SIOCGIF*` interface-query ioctls (ifconfig/net-tools) from the host interface table. |
 | `src/proctab.c` | Shared-memory guest-PID registry powering the cross-process `ps`/`top` and hidden-process views, and holding the id maps of a faked user namespace (which a parent writes for its child) and each process's seccomp state. |
-| `src/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` / `backend_x86_32.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
+| `src/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` / `backend_x86_32.c` / `backend_arm32.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
 | `src/signal.c` | Host signal capture → guest `rt_sigframe`; `rt_sigreturn`; job-control mask mirroring. |
 | `src/thread.h` | Per-thread state (`g_tls`): pending exception, tid, syscall-restart bookkeeping. |
 | `src/machine.h` | `struct Machine` = the shared per-process task state. |

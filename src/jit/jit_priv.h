@@ -32,6 +32,16 @@
 #endif
 #define JIT_BLOCK_MAX_BYTES (JIT_MAX_BLOCK_INSNS * JIT_INSN_MAX_BYTES + 256)
 
+/* Largest per-thread code cache a host's direct branch can span, in MiB: the
+ * exit stubs and the chain patches are plain branches from anywhere in the cache
+ * to anywhere else. x86 rel32 covers any size; AArch64's B imm26 reaches
+ * +-128 MiB; ARM32's imm24 only +-32 MiB. */
+#if defined(__arm__)
+#define JIT_CACHE_MAX_MB 32
+#else
+#define JIT_CACHE_MAX_MB 128
+#endif
+
 #define JIT_HASH_BITS 14                      /* block table buckets/thread */
 #define JIT_HASH_SIZE (1u << JIT_HASH_BITS)
 #define JIT_PAGE_BITS 12                      /* page->blocks index buckets */

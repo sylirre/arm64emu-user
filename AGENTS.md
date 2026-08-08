@@ -33,6 +33,22 @@ used when installed; `A64_ORACLE=native` forces hardware). `make test32` there
 wants an armhf cross compiler and an AArch64 CPU that implements AArch32 at
 EL0, and skips with a reason when either is missing.
 
+The ARM32 code generator has no CI (the AArch64 runners do not implement
+AArch32 at EL0), so on an x86_64 host it is exercised through binfmt/qemu-arm
+with an armhf cross compiler — the emulator is ARM32 code under emulation while
+the oracle still runs natively, so the differential comparison is intact:
+
+```sh
+make M32CC=arm-linux-gnueabihf-gcc "M32FLAGS=-static" test32-jit
+```
+
+Static matters: `QEMU_LD_PREFIX` is contended between the aarch64 guest sysroot
+(which the suite needs for the dyn tests) and the armhf one (which a dynamic
+armhf emulator needs); a static emulator needs neither. That checks the emitter;
+only a real armv7 device checks that the silicon agrees with what it emits, and
+that tier's gate is a *baseline* comparison — see docs/jit.md, the interpreter
+itself fails ~54 tests there for reasons unrelated to the JIT.
+
 ## Project structure
 
 ```
@@ -46,11 +62,11 @@ src/
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen)
   predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
-  jit/                               Optional --jit translator (AArch64, x86-64 & i686 hosts):
+  jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
     ir.h frontend.c                  Per-block decode -> linear IR -> liveness / flag fusion
     backend_a64.c backend_x86_64.c   Register-allocating single-pass emitters
-    backend_x86_32.c                 ILP32 emitter: guest 64-bit values as host register-pair halves
+    backend_x86_32.c backend_arm32.c ILP32 emitters: guest 64-bit values as host register-pair halves
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver, bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases

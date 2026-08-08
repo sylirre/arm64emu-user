@@ -51,7 +51,8 @@ int g_jit;                          /* -jit (main.c) */
 __thread JitEnv g_jit_env;
 
 /* ---- backend stubs for hosts without a code generator ---- */
-#if !defined(__x86_64__) && !defined(__aarch64__) && !defined(__i386__)
+#if !defined(__x86_64__) && !defined(__aarch64__) && !defined(__i386__) && \
+    !defined(__arm__)
 int  be_available(void) { return 0; }
 void be_emit_thunks(Emit *e, JitEnv *env) { (void)e; (void)env; }
 int  be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
@@ -365,7 +366,9 @@ static size_t jit_cache_size(void) {
     const char *s = getenv("A64_JIT_MB");
     long mb = s ? atol(s) : 32;
     if (mb < 1) mb = 1;
-    if (mb > 128) mb = 128;   /* AArch64 B imm26 (+-128 MiB) must span the cache */
+    /* A backend's direct branch must span the whole cache (block -> epilogue,
+     * and one block -> another when chained). */
+    if (mb > JIT_CACHE_MAX_MB) mb = JIT_CACHE_MAX_MB;
     return (size_t)mb << 20;
 }
 

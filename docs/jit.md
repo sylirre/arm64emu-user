@@ -2,7 +2,7 @@
 
 The emulator is an interpreter by default. Passing **`--jit`** turns on a
 translating JIT that compiles guest AArch64 basic blocks to native host code.
-It exists for AArch64, x86-64 and i686 hosts; on any other host (or under a
+It exists for AArch64, x86-64, i686 and ARM32 hosts; on any other host (or under a
 per-instruction debug flag) `--jit` prints a notice and the interpreter runs
 instead. Everything below describes the 64-bit backends unless it says
 otherwise; what an ILP32 host does differently is its own section at the end. The interpreter stays the source of truth: anything the translator
@@ -362,9 +362,9 @@ Debug/bisection knobs (all off by default):
 
 ## 32-bit hosts (i686 / ARM32)
 
-**i686 has a backend** (`backend_x86_32.c`); ARM32 does not yet and still runs
-the interpreter with a `--jit` notice. `make test32-jit` is the gate: the whole
-differential suite against the oracle, on the ILP32 build, with `--jit` on.
+Both have backends: `backend_x86_32.c` and `backend_arm32.c`. `make test32-jit`
+is the gate for either — the whole differential suite against the oracle, on the
+ILP32 build, with `--jit` on.
 
 **What already carries over unchanged.** The entire runtime — per-thread code
 caches, block table, chaining and the incoming-edge unpatch list, the jump
@@ -524,30 +524,90 @@ are bounded by `exec_fpsimd` helper calls rather than by anything the integer
 side does. `memops` is bounded by the probe itself and is a pointer chase, so it
 has no runs to fuse and nothing short of a shorter probe will move it.
 
-**ARM32, still to do.** The design above is deliberately host-neutral in
-everything except the emitter, so the second backend inherits it. ARM32 is the
-more comfortable target: ~13 usable GPRs (so `CPU*` and `JitEnv*` can both be
-pinned — it has no absolute addressing mode — and ~2-3 guest 64-bit values stay
-resident), `adds`/`adc` and `ubfx` fit the pair model directly, `cmp`/`cmpeq`
-does a 64-bit tag compare in two instructions, and its NEON(32) unit can carry
-the `V128` file when a vector tier lands. Guest flags are the striking
-difference: `mrs Rd, APSR` yields N/Z/C/V *already in the guest's own bit
-positions*, and `msr APSR_nzcvq, Rn` puts them back, so materializing `c->nzcv`
-is 3 instructions instead of 7 and a condition needs no derivation table at all
-— the guest condition code *is* the host one. That is the same trick
-`backend_a64.c` uses.
+### ARM32 (`backend_arm32.c`)
 
-It has no CI that can execute it — the AArch64 runners do not implement AArch32
+The model above is host-neutral except for the emitter, so the second ILP32
+backend inherits all of it: halves as the unit of allocation with the known-zero
+third state, only destinations allocated, scratch-and-commit for recipes that can
+alias, and no allocator action inside a conditional region. What differs is all
+in this host's favour.
+
+**Registers.** `r10` = `CPU*`, `r11` = `JitEnv*` — unlike i686 this one has to be
+pinned, because ARM has no absolute addressing mode. `r0`-`r3` and `r12` are
+scratch (also the AAPCS argument registers and the return pair), and `r4`-`r8`
+are the allocatable pool. All five pool registers are callee-saved, so *nothing
+needs reloading after a helper call*: the i686 backend's `reload_clobbered` has
+no counterpart here. `r9` is left alone (a platform register under some ABIs).
+`sp` holds a fixed frame for the same three reasons as on i686.
+
+**Flags are nearly free.** `mrs Rd, APSR` yields N/Z/C/V *already in the guest's
+own bit positions*, and `msr APSR_nzcvq, Rn` puts a word back, so materializing
+`c->nzcv` is three instructions instead of i686's seven, and a guest condition
+needs no derivation table at all — the AArch64 condition encoding *is* the ARM32
+one, so the guest's 4-bit code goes straight into the instruction (only NV, which
+ARM32 lacks, folds to AL). That is the same trick `backend_a64.c` uses, and it is
+why this backend never wanted a lazy-flag window either. Two wrinkles: a 64-bit Z
+still has to come from the pair, because the host's Z describes the high word
+alone; and AArch64's logical S-forms define C = 0 and V = 0 where ARM32's leave
+both untouched, so a logical capture masks them off. The arithmetic forms need no
+adjustment — the two architectures agree on the carry and overflow senses of add
+and subtract, which is also why `adds`/`adc` and `subs`/`sbc` are the pair model
+expressed directly.
+
+**Predication instead of branches.** `CSEL`/`CSINC`/`CSINV`/`CSNEG` need no
+conditional region at all: `f(b)` is computed into scratch and `a` is then
+selected with predicated moves. The ordering is load-bearing and was a real bug
+before it was: `f(b)` must be computed **unpredicated and first**, because the
+64-bit increment and negate are carry chains (`adds`/`adc`, `rsbs`/`rsc`) and a
+*predicated flag-setter would destroy the very condition* the next predicated
+instruction tests. Only after `f(b)` is in place are the guest flags loaded.
+
+**Still helper-based.** Memory accesses go through `jit_ld`/`jit_st`/`jit_ldv`/
+`jit_stv`, so there are no bus-fault fixups to register — generated code never
+dereferences guest memory itself. FP/SIMD and the atomics are declined exactly as
+on i686. The inline probe is the next step, and ARM32 should do it in fewer
+instructions than i686 does: `ubfx` extracts the D-TLB index in one instruction,
+and `cmp` followed by `cmpeq` compares a 64-bit tag in two.
+
+**One host limit the runtime had to learn.** ARM32's `B imm24` reaches only
+±32 MiB, and every exit stub and chain patch is a plain branch from anywhere in
+the code cache to anywhere else, so `JIT_CACHE_MAX_MB` now names the largest
+cache a host's direct branch can span (32 on ARM32, 128 elsewhere) instead of
+`jit_cache_size` hardcoding AArch64's `imm26` range. Being a fixed-width ISA also
+makes chaining simpler than on x86: the patch site is one instruction, so
+`JBlock::stub_word0` restores it verbatim.
+
+**Testing.** No CI can execute it — the AArch64 runners do not implement AArch32
 at EL0 — so its gate is `make test32-jit` pointed at an armhf toolchain, plus a
 real armv7 device. On an x86-64 development host that gate runs through
 binfmt/`qemu-arm`:
 
 ```sh
-QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf \
-  make M32CC=arm-linux-gnueabihf-gcc M32FLAGS= test32-jit
+make M32CC=arm-linux-gnueabihf-gcc "M32FLAGS=-static" test32-jit
 ```
+
+Build it **static**, and not for tidiness: `QEMU_LD_PREFIX` is contended. The
+suite points it at the aarch64 guest sysroot for the dynamically-linked guest
+tests, while a dynamically-linked *armhf emulator* needs it pointing at the armhf
+sysroot at the same moment. A static emulator needs no loader prefix at all, so
+the two uses stop fighting. (Symptom of getting it wrong: every `(dyn)` test
+fails rc=255 with empty output while every static one passes.)
 
 The emulator is then ARM32 code under `qemu-arm` while the oracle
 (`qemu-aarch64`) still runs natively, so the differential comparison is intact;
 what it cannot check is that the *silicon* agrees with the emitted ARM32, which
 is what the device run is for.
+
+Read that gate against a baseline, not against zero: **this tier fails ~54 tests
+with the JIT off**, and the measurement that matters is that the `--jit` failure
+set is a *subset* of the interpreter's (measured: 52 vs 54, the interpreter
+additionally losing two flaky `procview` races). Three causes, none of them the
+translator. Most are the ~20x slowdown of running the emulator under emulation:
+every `ptrace:` test times out or misses its first stop, and the tests that start
+a `sleep` child and read its `/proc` race. Three are FP: `asm/m22_fpsr` and
+`c/fcvt_scalar` (hence `insnfuzz: conform`, which shares those encodings) — a
+64-bit-result `fcvt*` of an exactly-representable value sets IXC where the oracle
+sets none, on this armhf-glibc tier only; the i686 ILP32 build is clean and real
+armv7 silicon passes `m22_fpsr`, so suspect qemu-arm's VFP flag emulation, but it
+is not pinned. `insnfuzz: chaos` and `seq` do pass, and they are the checks that
+referee the engines against *each other* rather than against an oracle.

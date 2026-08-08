@@ -237,8 +237,8 @@ static void help(void) {
                         "symbolic flags, quoted strings, structs, errno returns."},
         {"-d, --debug", "Per-instruction trace. Very verbose, disables JIT."},
         {"-j, --jit",   "Translate hot basic blocks to native code on AArch64, "
-                        "x86-64 and i686 hosts. Falls back to the interpreter "
-                        "elsewhere."},
+                        "x86-64, i686 and ARM32 hosts. Falls back to the "
+                        "interpreter elsewhere."},
         {"    --no-predecode", "Disable the decoded-instruction cache "
                         "(diagnostic, slower)."},
         {"-l, --link2symlink", "Emulate hardlinks with tracked symlinks where "

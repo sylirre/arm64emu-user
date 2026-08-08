@@ -17,7 +17,7 @@ Emulator has 2 modes:
 
 * Interpreter: very slow, doesn't use translation to host machine code and
   therefore is portable.
-* JIT: fast, available only for AArch64, x86-64 and i686 hosts. If SELinux restricts
+* JIT: fast, available only for AArch64, x86-64, i686 and ARM32 hosts. If SELinux restricts
   execmem, emulator falls back to memfd dual-mapping or to the interpreter.
 
 If you are interested in a system-mode emulator that can actually boot
@@ -60,8 +60,8 @@ arm64chroot [options] <rootfs> <program> [args...]
                           (symbolic flags, quoted strings, structs, errno)
   -d, --debug             Per-instruction trace (very verbose)
   -j, --jit               Translate hot basic blocks to native code (AArch64 /
-                          x86-64 / i686 hosts; falls back to the interpreter
-                          elsewhere)
+                          x86-64 / i686 / ARM32 hosts; falls back to the
+                          interpreter elsewhere)
       --no-predecode      Disable the decoded-instruction cache (diagnostic; slower)
   -l, --link2symlink      Emulate hardlinks with tracked symlinks where the host
                           forbids link() (Android/SELinux -> EXDEV)
@@ -342,11 +342,11 @@ src/
                 the thread call-out safepoint (stop_gen)
   predecode.c   decoded-instruction cache: direct-threaded fast path over ~200
                 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
-  jit/          optional --jit translator (AArch64, x86-64 & i686 hosts):
+  jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     ir.h frontend.c   per-block decode -> linear IR -> liveness / flag fusion
     backend_a64.c backend_x86_64.c   register-allocating single-pass emitters
-    backend_x86_32.c  ILP32 emitter: guest 64-bit values as host register-pair
-                halves, only destinations allocated
+    backend_x86_32.c backend_arm32.c   ILP32 emitters: guest 64-bit values as
+                host register-pair halves, only destinations allocated
     jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c        rootfs containment resolver, bind table (runtime mount/umount/
@@ -380,7 +380,7 @@ tests/          asm + C differential tests, run_tests.sh; hostenv.sh picks the
 a per-thread, per-PC cache of the *decoded* form that self-validates against the
 fetched word, so self-modifying/remapped code needs no flush — and everything else
 falls back to `exec_a64`. `--no-predecode` and any per-instruction debug flag select
-the plain `exec_a64` step. The optional `--jit` (`src/jit/`, AArch64, x86-64 and i686 hosts
+the plain `exec_a64` step. The optional `--jit` (`src/jit/`, AArch64, x86-64, i686 and ARM32 hosts
 only) adds a translating tier above both: it compiles guest basic blocks to native
 host code and falls back to `exec_a64` for anything it does not emit. It is off by
 default and the interpreter stays the source of truth. See
