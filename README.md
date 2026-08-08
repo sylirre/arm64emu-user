@@ -253,6 +253,7 @@ itself what each provides (`tests/hostenv.sh`):
 | guest compiler | `aarch64-linux-gnu-gcc` | the system `cc` |
 | oracle | `qemu-aarch64` | `qemu-aarch64` if installed, else the CPU |
 | `make test32` | `gcc -m32` | armhf cross gcc, or SKIP |
+| `make test32-jit` | the same, with `--jit` | the same, with `--jit` |
 
 `A64_CC` overrides the compiler and `A64_ORACLE=qemu|native|recorded` the
 oracle. Running against hardware is the stricter check of the two live modes

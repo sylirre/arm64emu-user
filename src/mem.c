@@ -48,7 +48,10 @@ __thread FetchCache g_fcache;
  * every thread's cached translations at their next access. */
 #define DTLB_BITS 10                       /* 1024 entries x 16 B = 16 KB/thread */
 #define DTLB_SIZE (1u << DTLB_BITS)
-typedef struct { u64 page; uintptr_t pte; } DTlbEntry;
+/* 16 bytes on every host: the JIT's inline probe turns the index into a byte
+ * offset with a shift (and, on x86, a scaled-index addressing mode), so an
+ * entry that shrank to 12 on ILP32 would need a multiply in the hot path. */
+typedef struct { u64 page; uintptr_t pte; A64_HOST_PTRPAD } DTlbEntry;
 static __thread DTlbEntry g_dtlb[DTLB_SIZE];
 static __thread unsigned long g_dtlb_gen;  /* generation g_dtlb reflects; 0 = flushed */
 static unsigned long g_as_gen = 1;         /* never 0; word-sized: lock-free on ILP32 */
@@ -67,9 +70,7 @@ void tlb_flush_all(void) {
 
 /* ---- JIT D-TLB seam (see mmu.h) ---- */
 _Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
-#if defined(__x86_64__) || defined(__aarch64__)   /* hosts with a backend */
 _Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
-#endif
 void *jit_dtlb_base(void) { return g_dtlb; }
 void jit_dtlb_reset(void) {
     /* The interpreter empties lazily on a generation mismatch; the JIT's

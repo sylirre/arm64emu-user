@@ -15,9 +15,20 @@
 /* Basic-block budget: capped length, and a translation never crosses a 4 KB
  * guest page boundary (invalidation is page-granular). JIT_INSN_MAX_BYTES is
  * the worst-case emitted host bytes per guest instruction across backends;
- * translate() reserves the full budget up front so emission cannot overrun. */
+ * translate() reserves the full budget up front so emission cannot overrun.
+ * An ILP32 backend legalizes every 64-bit guest op into 32-bit register pairs
+ * and its inline memory probe compares a 64-bit tag in two halves, so the same
+ * guest instruction emits several times the code — DC ZVA (an address mask plus
+ * DCZVA_STORES stores, each with a helper bail arm) is the outlier that sets
+ * the bound. Reserving too little does not truncate a block: emission latches
+ * overflow and translate() retries with half the instructions, and a single
+ * instruction that cannot fit disables the JIT outright. */
 #define JIT_MAX_BLOCK_INSNS 128
+#if A64_HOST_ILP32
+#define JIT_INSN_MAX_BYTES  192
+#else
 #define JIT_INSN_MAX_BYTES  64
+#endif
 #define JIT_BLOCK_MAX_BYTES (JIT_MAX_BLOCK_INSNS * JIT_INSN_MAX_BYTES + 256)
 
 #define JIT_HASH_BITS 14                      /* block table buckets/thread */
@@ -100,7 +111,9 @@ typedef struct JitEnv {
      * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */
 #define JIT_JC_BITS 12
 #define JIT_JC_SIZE (1u << JIT_JC_BITS)
-    struct JCEnt { u64 pc; const u8 *code; } jcache[JIT_JC_SIZE];
+    /* 16 bytes on every host, for the same reason as DTlbEntry: the inline
+     * probe scales the index by a shift. */
+    struct JCEnt { u64 pc; const u8 *code; A64_HOST_PTRPAD } jcache[JIT_JC_SIZE];
 
     const u8 *epilogue_rx;      /* generated blocks jump here to exit */
     u32 (*enter)(struct JitEnv *env, const u8 *code_rx);   /* returns exit id */
@@ -142,6 +155,8 @@ typedef struct JitEnv {
  * every host rather than a miscompile on one. */
 _Static_assert(offsetof(JitEnv, jcache) < 4096,
                "JitEnv fields before jcache must stay in ADD/LDR imm12 reach");
+_Static_assert(sizeof(struct JCEnt) == 16,
+               "the jump cache is indexed by generated code with a shift");
 _Static_assert(offsetof(CPU, v) + 16 * 32 <= 65520 &&
                offsetof(CPU, icount) <= 32760,
                "CPU fields generated code touches must stay in imm12 reach");

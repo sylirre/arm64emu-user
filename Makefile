@@ -160,16 +160,38 @@ test-pack: arm64chroot
 # an AArch64 CPU that still implements AArch32 at EL0, which the server cores
 # do not. Both halves are probed, because a machine that cannot run the variant
 # should say so rather than fail a build the rest of the suite never needs.
+# Shared by test32 and test32-jit; the whole thing is one shell list whose
+# status is the final test's, so it can drive an `if`.
+m32_runnable = t=$$(mktemp -d) || exit 1; \
+	       printf 'int main(void){return 0;}' | \
+	         $(M32CC) $(CFLAGS) $(M32FLAGS) -x c - -o $$t/probe 2>/dev/null && \
+	         $$t/probe >/dev/null 2>&1; \
+	       rc=$$?; rm -rf $$t; [ $$rc = 0 ]
+
 test32:
-	@t=$$(mktemp -d) || exit 1; \
-	if printf 'int main(void){return 0;}' | \
-	     $(M32CC) $(CFLAGS) $(M32FLAGS) -x c - -o $$t/probe 2>/dev/null && \
-	   $$t/probe >/dev/null 2>&1; then \
-	    rm -rf $$t; \
+	@if $(m32_runnable); then \
 	    $(MAKE) --no-print-directory arm64chroot32 && bash tests/run_tests.sh ./arm64chroot32; \
 	else \
-	    rm -rf $$t; \
 	    echo "SKIP test32: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
+	fi
+
+# The ILP32 build with --jit on: the gate for the 32-bit code generators, shaped
+# exactly like test-jit (FP consistency against the interpreter on this host
+# first, then the entire differential suite through a --jit wrapper). Where the
+# 32-bit build has no code generator yet this still runs end to end and checks
+# the other half of the contract — that --jit says so and the interpreter takes
+# over — which nothing else covers, since both 64-bit hosts have a backend.
+test32-jit:
+	@if $(m32_runnable); then \
+	    set -e; \
+	    $(MAKE) --no-print-directory arm64chroot32; \
+	    sh tests/run_consist.sh ./arm64chroot32; \
+	    printf '#!%s\nexec ./arm64chroot32 --jit "$$@"\n' "$$(command -v sh)" > tests/jit32_emu.sh; \
+	    chmod +x tests/jit32_emu.sh; \
+	    bash tests/run_tests.sh tests/jit32_emu.sh; \
+	    rm -f tests/jit32_emu.sh; \
+	else \
+	    echo "SKIP test32-jit: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
 	fi
 
 # The ENTIRE differential suite with the JIT enabled (same wrapper trick as
@@ -205,11 +227,12 @@ clean:
 	rm -rf $(BUILDDIR)
 	rm -f arm64chroot arm64chroot32 arm64chroot_asim
 	rm -f tests/asm/*.bin tests/c/*.bin tests/*.bin tests/fixtures/*.bin tests/bench/*.bin tests/ptrace/*.bin
-	rm -f tests/seccomp_emu.sh tests/jit_emu.sh
+	rm -f tests/seccomp_emu.sh tests/jit_emu.sh tests/jit32_emu.sh
 
 # Separate from clean: removing the provisioned test rootfs forces a fresh
 # Alpine download, so keep it out of the fast rebuild path.
 clean-testenv:
 	rm -rf tests/.cache
 
-.PHONY: m32 test-env test test-pack test32 test-jit test-android-sim test-seccomp clean clean-testenv
+.PHONY: m32 test-env test test-pack test32 test32-jit test-jit test-android-sim \
+        test-seccomp clean clean-testenv

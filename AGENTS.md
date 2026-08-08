@@ -114,6 +114,7 @@ Basic testing which enough for most cases to ensure no regressions:
 * `make test`: full suite vs the oracle, interpreter mode.
 * `make test-jit`: FP jit-vs-interpreter consistency + entire suite with --jit.
 * `make test32`: suite against the 32-bit ILP32-host build (skips, with the reason named, where the host has no runnable 32-bit toolchain).
+* `make test32-jit`: the same build with `--jit` — the gate for the 32-bit code generators (and, where there is none yet, for the interpreter fallback).
 
 The oracle is `qemu-aarch64`, or on an AArch64 host the CPU itself when qemu
 is not installed; `A64_ORACLE=qemu|native|recorded` pins it and `A64_CC`

@@ -308,6 +308,11 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
   the ADC/SBC family through every x86 flag state, and fused-run page
   straddles). `tests/fpconsist.c` additionally exercises cached-operand
   NaN-gated FMLA.
+- `make test32-jit` is the same pair for the ILP32-host build (`arm64chroot32`).
+  It skips, naming the reason, where the host has no runnable 32-bit toolchain.
+  Until a 32-bit code generator exists it still runs end to end and covers the
+  other half of the `--jit` contract — the notice plus the interpreter takeover
+  — which nothing else does, since both 64-bit hosts have a backend.
 - `make test` (interpreter) must stay green: the JIT only adds a run-loop rung
   and leaves the default path untouched.
 - AArch64-host coverage means running `make test-jit` on an AArch64 machine —
@@ -374,6 +379,15 @@ addressing. The one memory helper subtlety — a load result being a `u64` — i
 handled by the existing helper contract (the helper writes the `CPU` struct and
 returns only a faulted flag), so nothing returns a pointer-in-`u64`.
 
+Two things the runtime had to be told, because generated code indexes them:
+the D-TLB entry (`DTlbEntry`, `mem.c`) and the indirect-branch jump cache
+(`struct JCEnt`) both pair a `u64` with a host pointer, which is 16 bytes on
+LP64 and would be 12 on ILP32 — a multiply in the hot path instead of a shift.
+Both carry an explicit ILP32 tail word (`A64_HOST_PTRPAD`) so the layout is
+16 bytes on every host, asserted at compile time. `JIT_INSN_MAX_BYTES` also
+grows on ILP32: pair legalization multiplies the host bytes a guest
+instruction emits, and the per-block reservation is derived from it.
+
 **What a 32-bit backend must add.** A legalization pass that lowers every
 64-bit IR op to 32-bit register pairs: `add/adc`, `sub/sbb`, per-half logicals,
 three-instruction variable shifts, `mul` via `umull` plus cross terms, and
@@ -395,6 +409,8 @@ path still pays off because it removes the dispatch and the helper call, not
 because of register width.
 
 **Recommendation.** Do it after the 64-bit backends stabilize. The v1 design
-deliberately blocks nothing: keep `make m32` linking the JIT sources with the
-stub backend as the standing CI guard that no 64-bit-host assumption has crept
-into the runtime or IR.
+deliberately blocks nothing: `make m32` links the JIT sources with the stub
+backend as the standing CI guard that no 64-bit-host assumption has crept into
+the runtime or IR, and `make test32-jit` runs the whole differential suite
+through that build with `--jit` on, so a backend can be grown against it one
+instruction class at a time.

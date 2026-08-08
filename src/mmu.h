@@ -219,6 +219,19 @@ const Region *as_find_region(AddrSpace *as, u64 va);
  * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
 
+/* True on hosts where a pointer is 4 bytes (i686, ARM32). Tables whose entries
+ * hold a host pointer AND are indexed by generated code are padded to the same
+ * size on every host (see A64_HOST_PTRPAD), so an emitter can turn an index
+ * into an offset with a shift instead of a multiply. */
+#define A64_HOST_ILP32 (UINTPTR_MAX == 0xffffffffu)
+/* Tail padding that keeps {u64, uintptr_t} 16 bytes wide on both widths: LP64
+ * already is, ILP32 is 12 without it. */
+#if A64_HOST_ILP32
+#define A64_HOST_PTRPAD u32 pad_;
+#else
+#define A64_HOST_PTRPAD
+#endif
+
 /* ---- JIT data-TLB seam ----
  * The interpreter's per-thread direct-mapped D-TLB (mem.c) whose entry format
  * the JIT inlines: 16-byte {u64 page; uintptr_t pte}, page = (va & TBI) >> 12,
