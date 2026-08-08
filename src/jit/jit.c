@@ -51,7 +51,7 @@ int g_jit;                          /* -jit (main.c) */
 __thread JitEnv g_jit_env;
 
 /* ---- backend stubs for hosts without a code generator ---- */
-#if !defined(__x86_64__) && !defined(__aarch64__)
+#if !defined(__x86_64__) && !defined(__aarch64__) && !defined(__i386__)
 int  be_available(void) { return 0; }
 void be_emit_thunks(Emit *e, JitEnv *env) { (void)e; (void)env; }
 int  be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {

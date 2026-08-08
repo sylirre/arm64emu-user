@@ -25,7 +25,8 @@
  * instruction that cannot fit disables the JIT outright. */
 #define JIT_MAX_BLOCK_INSNS 128
 #if A64_HOST_ILP32
-#define JIT_INSN_MAX_BYTES  192
+#define JIT_INSN_MAX_BYTES  384   /* measured: ~84 B/insn average, worst block
+                                   * ~232, and a retry costs a re-translation */
 #else
 #define JIT_INSN_MAX_BYTES  64
 #endif

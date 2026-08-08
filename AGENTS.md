@@ -46,10 +46,11 @@ src/
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen)
   predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
-  jit/                               Optional --jit translator (AArch64 & x86-64 hosts):
+  jit/                               Optional --jit translator (AArch64, x86-64 & i686 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
     ir.h frontend.c                  Per-block decode -> linear IR -> liveness / flag fusion
     backend_a64.c backend_x86_64.c   Register-allocating single-pass emitters
+    backend_x86_32.c                 ILP32 emitter: guest 64-bit values as host register-pair halves
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver, bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases

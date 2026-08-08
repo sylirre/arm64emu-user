@@ -85,6 +85,12 @@ jobs:
       - name: JIT (64-bit host)
         run: make test-jit
 
+      # The i686 code generator is compiled in by host #ifdef, so this job is
+      # the only thing anywhere that EXECUTES backend_x86_32.c: the AArch64
+      # runner's 32-bit build is armhf, whose CPU cannot run AArch32 at EL0.
+      - name: JIT (32-bit host)
+        run: make test32-jit
+
   # The same suite on a real AArch64 machine, which is a different test in two
   # ways that the x86 job cannot cover however long it runs:
   #   - the JIT's AArch64 backend is compiled in by host #ifdef, so `make

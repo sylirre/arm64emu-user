@@ -2,9 +2,10 @@
 
 The emulator is an interpreter by default. Passing **`--jit`** turns on a
 translating JIT that compiles guest AArch64 basic blocks to native host code.
-It exists for AArch64 and x86-64 hosts; on any other host (or under a
+It exists for AArch64, x86-64 and i686 hosts; on any other host (or under a
 per-instruction debug flag) `--jit` prints a notice and the interpreter runs
-instead. The interpreter stays the source of truth: anything the translator
+instead. Everything below describes the 64-bit backends unless it says
+otherwise; what an ILP32 host does differently is its own section at the end. The interpreter stays the source of truth: anything the translator
 does not handle natively is executed by calling `exec_a64`, and the whole
 differential test suite must pass with `--jit` on (`make test-jit`).
 
@@ -359,12 +360,11 @@ Debug/bisection knobs (all off by default):
   also disables the F16C half-precision path). Each isolates its feature's
   codegen from the rest, and the full suite must pass under every one.
 
-## 32-bit hosts (ARM32 / i686): feasibility
+## 32-bit hosts (i686 / ARM32)
 
-There is **no 32-bit backend today** — `make m32` builds and links the JIT
-sources with an inert stub backend, and `--jit` on i686/ARM32 warns and runs the
-interpreter. The design keeps the door open, and the analysis below is the plan
-for adding one.
+**i686 has a backend** (`backend_x86_32.c`); ARM32 does not yet and still runs
+the interpreter with a `--jit` notice. `make test32-jit` is the gate: the whole
+differential suite against the oracle, on the ILP32 build, with `--jit` on.
 
 **What already carries over unchanged.** The entire runtime — per-thread code
 caches, block table, chaining and the incoming-edge unpatch list, the jump
@@ -388,29 +388,97 @@ Both carry an explicit ILP32 tail word (`A64_HOST_PTRPAD`) so the layout is
 grows on ILP32: pair legalization multiplies the host bytes a guest
 instruction emits, and the per-block reservation is derived from it.
 
-**What a 32-bit backend must add.** A legalization pass that lowers every
-64-bit IR op to 32-bit register pairs: `add/adc`, `sub/sbb`, per-half logicals,
-three-instruction variable shifts, `mul` via `umull` plus cross terms, and
-helper calls for `udiv`/`sdiv`/`{s,u}mulh`. A guest 64-bit value then occupies
-two host registers, and `NZCV` derivation from paired results needs explicit
-recipes (both hosts can still use their native condition flags for the low/high
-halves). None of this touches the runtime or the frontend.
+**Register pairs.** Everything else in a 32-bit backend follows from one fact:
+a guest 64-bit value does not fit a host register. The i686 backend therefore
+allocates **halves**, not registers — vreg `v` contributes `HV(v,0)` (its low
+word) and `HV(v,1)` (its high word), 72 in all, and each is independently
+*resident* in a host register, *live only in its CPU-struct home*, or **known
+zero** with a stale home. That third state is what makes the model cheap rather
+than merely correct: every 32-bit-wide guest write zero-extends, which is most
+writes, and recording "this half is zero" costs no register and no store until
+something reads it (`sync_all` then stores the constant, `use_hv` materializes
+it). 64-bit ops become the host's `add/adc`, `sub/sbb`, per-half logicals, and
+`shld`/`shrd` funnels for the constant shifts; the ones with no short pair form
+— 64-bit divide, the high half of a 64×64 multiply, `RBIT`, variable 64-bit
+shifts — call a small C helper in the backend file, with the guest's own
+`/0 = 0` and `INT_MIN/-1` rules baked in.
 
-**Register pressure.** i686 has ~7 usable GPRs; pinning one for `CPU*` and one
-for `JitEnv*` leaves five, so ~two live guest 64-bit values fit in registers
-and the allocator spills often — workable (the old i386 TCG backend proved it),
-just spill-heavy. ARM32 is far more comfortable (~13 usable GPRs), and its
-NEON(32) unit can carry the `V128` file when the vector tier lands.
+**Only destinations are allocated.** A source is read wherever its value
+already is: an allocated register, its memory home, or an immediate zero. That
+is not a shortcut, it is the thing that makes a four-register pool workable —
+x86 takes a memory operand on the same instruction, so `add lo, [ebp+x1]` needs
+no register at all, and pressure is bounded by the number of live *definitions*
+rather than by operand count. Two consequences are load-bearing:
 
-**Expected payoff.** Roughly **3–6×** over the interpreter (vs. ~6–12× on
-64-bit hosts): pair legalization about doubles the instruction count on
-64-bit-heavy guest code, and i686 spills eat into the rest. The softmmu fast
-path still pays off because it removes the dispatch and the helper call, not
-because of register width.
+- A destination half that is *also* a source must not have its register claimed
+  before the value has been read (`csel x3, x3, x2` where x3 is not yet
+  resident would otherwise read an unloaded register). Recipes that can alias
+  compute into `eax`/`edx` and commit after; the in-place ones (`prime_pair`)
+  load through `mod_hv` when `dst == a` and reject `dst == b` by commuting or
+  routing through scratch.
+- Nothing may change allocator state inside a conditional region: the two
+  runtime paths of a `CSEL` or a `CCMP` have to agree on where every value
+  lives. Both arms move between already-resolved locations, and the commit
+  happens after they merge.
 
-**Recommendation.** Do it after the 64-bit backends stabilize. The v1 design
-deliberately blocks nothing: `make m32` links the JIT sources with the stub
-backend as the standing CI guard that no 64-bit-host assumption has crept into
-the runtime or IR, and `make test32-jit` runs the whole differential suite
-through that build with `--jit` on, so a backend can be grown against it one
-instruction class at a time.
+**Registers.** `ebp` = `CPU*`; `eax`/`edx` scratch; `ebx`, `esi`, `edi`, `ecx`
+allocatable, with `ecx` last because it is the only one a C call does not
+preserve. `JitEnv` is *not* pinned: it is a `__thread` object and generated code
+is per-thread, so its address is a translate-time constant that x86 reaches as
+an absolute displacement for free — which is also how the jump cache is probed
+(`[jcache + idx*4]`, the entry's 16-byte stride folded into the SIB scale), and
+how the D-TLB will be. Helpers are called by direct `call rel32`, since on a
+32-bit host every target is in reach.
+
+`esp` holds a **fixed frame** that generated code never moves. It buys three
+things at once: outgoing call arguments live at `[esp+k]` so no push/pop
+disturbs the stack, every call site is 16-byte aligned by construction (the
+i386 psABI requires it and the helpers are SSE-compiled C), and a host bus
+fault inside an inline access can resume at a slow path with the frame intact.
+Scratch memory in that frame is what replaces the registers a 64-bit host would
+have had — the `EXTR` funnel parks its finished low word there, the 64×64
+multiply keeps its partial products there.
+
+**Guest NZCV** is materialized into `c->nzcv` at every S-op; there is no lazy
+window yet. The recipe captures the host flags with `setcc` into four
+consecutive frame bytes (V C Z N) and folds them into the architectural word
+with a single multiply — `0x10204080` shifts byte 0 to bit 28, byte 1 to 29,
+byte 2 to 30 and byte 3 to 31, and every cross term lands outside the
+`0xF0000000` mask. A 64-bit `Z` is the one bit the host's flags cannot supply
+(its ZF describes the high half only), so it is derived from both result halves
+after N/C/V are captured. `ADC/SBC` seed the host carry straight out of the
+architectural word with `bt [ebp+nzcv], 29`, which needs no register at all.
+
+**Not inlined on i686 yet.** All FP/SIMD: `be_vop_ok` declines every class, so
+the frontend keeps its `exec_fpsimd` helper calls. The atomics re-run the whole
+instruction through `jit_exec1` (correct for icount by construction —
+`IRO_ATOMIC` is excluded from `IRBlock.ninsns` and `jit_exec1` counts what it
+executes). Memory accesses go through the same `jit_ld`/`jit_st`/`jit_ldv`/
+`jit_stv` helpers the 64-bit backends fall back to, which is why there are no
+bus-fault fixups to register: generated code here never dereferences guest
+memory itself.
+
+**Measured payoff** (`tests/bench/run_bench.sh ./arm64chroot32`), i686 JIT vs
+the i686 interpreter:
+
+| kernel   | speedup | |
+|----------|---------|--|
+| int_alu  | ~5.7×   | register-bound ALU: the pair model at its best |
+| calls    | ~2.5×   | block chaining and the jump cache carry it |
+| lockping | ~1.6×   | atomics still re-run through the interpreter |
+| fpvec    | ~1.6×   | FP is entirely helper calls |
+| strops   | ~1.2×   | memory-bound, and every access is a helper call |
+| memops   | ~1.2×   | likewise |
+
+The bottom four are where the inline softmmu and the lazy-flag windows have to
+land; the shape of the table says plainly that on this host the remaining win is
+in memory and flags, not in more ALU coverage.
+
+**ARM32, still to do.** The design above is deliberately host-neutral in
+everything except the emitter, so the second backend inherits it. ARM32 is the
+more comfortable target: ~13 usable GPRs (so `CPU*` and `JitEnv*` can both be
+pinned and ~3 guest 64-bit values stay resident), `adds/adc` and `ubfx` fit the
+pair model directly, and its NEON(32) unit can carry the `V128` file when a
+vector tier lands. It has no CI that can execute it — the AArch64 runners do not
+implement AArch32 at EL0 — so its gate is `make test32-jit` under `qemu-arm`
+plus a real armv7 device.
