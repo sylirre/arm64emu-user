@@ -110,12 +110,11 @@ struct ProcEnt {
 static struct ProcEnt *g_tab;    /* MAP_SHARED, or NULL if unavailable */
 static int g_tab_n;              /* PROCTAB_MAX, or 0 */
 
-/* starttime (field 22 of /proc/<pid>/stat): the token after the last ')' skips
+/* starttime (field 22 of a /proc stat file): the token after the last ')' skips
  * the comm (which may contain spaces/parens), then starttime is the 20th
  * whitespace-delimited field. 0 if the process is gone or unreadable. */
-static u64 proc_starttime(s32 pid) {
-    char path[64], buf[512];
-    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+static u64 starttime_read(const char *path) {
+    char buf[512];
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     ssize_t n = read(fd, buf, sizeof buf - 1);
@@ -132,6 +131,34 @@ static u64 proc_starttime(s32 pid) {
         while (*p && *p != ' ') p++;
     }
     return 0;
+}
+
+/* A pid's starttime, the token that decides whether a registry slot still
+ * belongs to the process that wrote it (PID reuse otherwise goes unnoticed).
+ *
+ * Asked through the task/<tid> spelling rather than /proc/<pid>/stat, because
+ * the answer has to be the same whoever asks: the owner records it about
+ * itself, every reader re-checks it from outside. Anything that virtualizes
+ * "my own /proc" breaks that symmetry, and qemu-user does exactly that --
+ * is_proc_myself() claims both /proc/self/... and /proc/<getpid()>/... and
+ * answers a synthesized stat (mostly zeroes, comm from the emulated binary)
+ * whose starttime it computes itself and which lands a tick off the kernel's
+ * often enough to matter, while every other process reading that same pid gets
+ * the kernel's. A guest process therefore registered a value no reader could
+ * reproduce: proctab_get called the entry stale, /proc/<pid>/{exe,cwd} answered
+ * ENOENT for a running process, and re-registration cleared id maps it should
+ * have kept. Reproduced ~10% of runs on an armhf emulator under qemu-arm.
+ *
+ * The task/ spelling is not intercepted, and on a real kernel it is the very
+ * same field: for pid == tid, /proc/P/task/P/stat and /proc/P/stat report the
+ * one task's start_time. Fall back for a /proc too old to have task/. */
+static u64 proc_starttime(s32 pid) {
+    char path[80];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, pid);
+    u64 t = starttime_read(path);
+    if (t) return t;
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    return starttime_read(path);
 }
 
 /* fnv1a32 (per-rootfs registry key) lives in machine.h, shared with the

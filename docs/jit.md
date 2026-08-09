@@ -598,19 +598,22 @@ The emulator is then ARM32 code under `qemu-arm` while the oracle
 what it cannot check is that the *silicon* agrees with the emitted ARM32, which
 is what the device run is for.
 
-Read that gate against a baseline, not against zero: **this tier fails ~46 tests
-with the JIT off** (measured 46 interpreter / 47 `--jit`), and the measurement
-that matters is that the two failure sets agree once the tier's own flaky rows
-are set aside. Every one of them is the ~20x slowdown of running the emulator
-under emulation, not the translator: 40 `ptrace:` tests time out or miss their
+Read that gate against a baseline, not against zero: **this tier fails 44 tests,
+and the same 44 with the JIT on** — the two failure sets are now identical, so
+anything the `--jit` run fails that the interpreter run does not is the
+translator's and worth chasing. Every one of the 44 is the ~20x slowdown of
+running the emulator under emulation: 40 `ptrace:` tests time out or miss their
 first stop, the multi-iteration `fixture:` races (`mtexec`, `mainexit`) run out
-of their timeouts, the two tests that start a `sleep` child and read its `/proc`
-lose the race, and `c/timers` misses its intervals. The one row that separated
-the two runs above was `procview: other-pid cwd`, which is flaky on this tier in
-*both* engines and on a pre-fix binary alike (~10%: `readlink /proc/<self>/cwd`
-intermittently answers ENOENT, which the test's trailing `:` turns into empty
-output rather than a non-zero status) — a real armhf-tier defect of its own, not
-a JIT one, and not reproducible on an x86-64 host.
+of their timeouts, and `c/timers` (static and dyn) misses its intervals.
+
+The `procview:` and `shared-proc:` rows used to be in that list, blamed on a
+`sleep` child losing a race. They were not racing. Under `qemu-arm` a process
+that read *its own* `/proc/<pid>/stat` got qemu's synthesized answer rather than
+the kernel's, so the starttime it registered as its identity token was one no
+other process could reproduce, and the PID registry declared a live process
+stale — see the `proc_starttime` comment in `src/proctab.c`. `other-pid cmdline`
+failed 30/30 before the fix and 0/30 after. A test that "flakes only on the slow
+tier" is worth one measurement before it is written off as timing.
 
 This tier used to fail three FP tests as well, and why it no longer does is
 worth more than the numbers. `asm/m22_fpsr`, `c/fcvt_scalar` and `insnfuzz:

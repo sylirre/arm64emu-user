@@ -156,6 +156,26 @@ immediately `Stopped`.
 though both the emulator and libc are self-consistent. Keep such
 architecture-value tests independent of `DCZID`.
 
+### Your own `/proc` may not be the kernel's (any host under an interposer)
+
+`/proc/self/X` and `/proc/<getpid()>/X` are not guaranteed to be the file every
+*other* process sees at that path. `qemu-user` claims both spellings for a set
+of names — `stat`, `maps`, `cmdline`, `auxv` — and answers a synthesized file:
+its `stat` is mostly zeroes, carries the emulated binary's `comm`, and reports a
+`starttime` of qemu's own computing that lands a tick off the kernel's often
+enough to matter. `/proc/<pid>/task/<tid>/...` is *not* claimed.
+
+That asymmetry is only a problem for a value the owner records about itself and
+others re-check from outside, which is exactly what `proc_starttime` in
+`src/proctab.c` is: the PID registry's identity token, the thing that catches
+PID reuse. Registering the faked number made every reader see a live process as
+stale, so `/proc/<pid>/{exe,cwd,cmdline}` answered `ENOENT` for a running guest
+and a re-registering process had its recorded id maps cleared. So: **read a
+process's own `/proc` through a spelling an interposer does not special-case**
+(the `task/<tid>` form here), or have another process read it for you. And when
+a test fails only on an emulated tier, measure before blaming timing — this one
+was written off as a `sleep`-child race and was in fact deterministic.
+
 ### The compiler is part of the FP model (clang hosts, so every Termux build)
 
 The guest's `FPSR` exception bits are the *host's*, accumulated lazily in the
