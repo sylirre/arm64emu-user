@@ -188,18 +188,29 @@ what makes the gap visible instead of theoretical.
 FP→int has a second host trap, and this one is nobody's codegen quirk — it is
 the *libcall*, and it is why the rule above says "no cast" rather than "no cast
 to unsigned". No 32-bit host has a double→64-bit-int instruction, so the
-conversion becomes `__aeabi_d2lz`, and libgcc's ARM assembly and compiler-rt's
-hard-float C split the operand the same way: `hi = (u32)(r * 2^-32)` with a
-**truncating** `vcvt`, inexact for every operand that is not a multiple of
-2^32. That Inexact lands in the live `FPSCR`, the sticky accumulation folds it,
-and the guest reads it back as belonging to its own instruction — `fcvtzs x0,
-d0` of `2.0` set `IXC`, and so did `fjcvtzs`. It stays invisible wherever the
-conversion is one direct instruction — AArch64 `fcvtzs`, x86-64 `cvttsd2si`,
-and even i686, where gcc reaches x87 `fistpll` through an `fldcw` round-toward-
-zero window — which is why an ILP32-on-ARM build was the only tier that ever
-showed it. i686 is not structurally safe, though, only lucky: glibc's i386
-`fetestexcept` ORs the x87 status word into its answer, so an x87 helper that
-rounded internally would leak just as well. The
+conversion becomes `__aeabi_d2lz` — and libgcc's ARM assembly splits the operand
+as `hi = (u32)(r * 2^-32)` with a **truncating** `vcvt`, inexact for every
+operand that is not a multiple of 2^32. That Inexact lands in the live `FPSCR`,
+the sticky accumulation folds it, and the guest reads it back as belonging to
+its own instruction — `fcvtzs x0, d0` of `1.0` set `IXC`, and so did `fjcvtzs`.
+
+Which implementation you get is a **link-time accident**, not a property of the
+compiler, and that is the part worth remembering. compiler-rt's hard-float
+`__fixunsdfdi` is the same algorithm as libgcc's; but Android's `/system/lib/
+libm.so` exports its own soft-float `__aeabi_d2lz`/`__aeabi_d2ulz` (integer-only
+— zero FP instructions, verified by disassembly), and those win for anything
+linking `-lm`, which the emulator does. So the Termux armv7 device never
+exhibited this and armhf-glibc did, on the very same source. A standalone probe
+that does *not* link `-lm` on that device statically links compiler-rt's
+version instead and raises `IXC` — which is exactly how the hazard could be
+present on a host and invisible in the test you write to look for it.
+
+Everywhere else the conversion is one direct instruction and nothing leaks:
+AArch64 `fcvtzs`, x86-64 `cvttsd2si`, and even i686, where gcc reaches x87
+`fistpll` through an `fldcw` round-toward-zero window. i686 is not
+*structurally* safe though, only lucky — glibc's i386 `fetestexcept` ORs the x87
+status word into its answer, so an x87 helper that rounded internally would leak
+just as well. The
 check is mechanical, so use it after touching this code — in an armhf
 `exec_fpsimd.o`, no `vcvt` from `.f32`/`.f64` to an integer type and no
 `__aeabi_*2*z` helper may appear (the reverse direction, `__aeabi_l2d` and

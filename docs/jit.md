@@ -622,7 +622,11 @@ guest's `FPSR`. It is fixed by giving the whole convert family raise-free
 integer arithmetic — see the FP→int discussion in
 [portability-and-pitfalls.md](portability-and-pitfalls.md). Worth remembering
 that this tier, the slowest and least convenient one in the tree, was the *only*
-gate able to see that class of bug: every other host converts in a single exact
-instruction and is structurally blind to it. `insnfuzz: chaos` and `seq` pass
+gate able to see that class of bug. Every other host converts in a single exact
+instruction and is structurally blind to it — including, it turns out, the real
+armv7 device, whose Bionic libm supplies a raise-free soft-float
+`__aeabi_d2lz` and so quietly passed `m22_fpsr` throughout (verified on the
+device, both before and after the fix). An emulated tier caught what the
+hardware tier could not. `insnfuzz: chaos` and `seq` pass
 too, and they are the checks that referee the engines against *each other*
 rather than against an oracle.

@@ -2495,12 +2495,16 @@ static void simd_across(CPU *c, u32 insn) {
  *   - clang's branchless double->u64 evaluates `r - 2^63` on EVERY conversion,
  *     inexact for small values, so an exact FCVTZU came back with IXC set (gcc
  *     branches, and only subtracts when it must);
- *   - on armv7 both directions are libcalls, and __aeabi_d2lz just negates into
- *     __aeabi_d2ulz, which splits the operand as `hi = (u32)(r * 2^-32)` with a
- *     *truncating* vcvt — inexact for every r that is not a multiple of 2^32.
- *     `fcvtzs x0, d0` of 2.0 raised IXC, and so did FJCVTZS. libgcc's ARM
- *     assembly and compiler-rt's hard-float C agree on that algorithm, so a
- *     clang host is no more exempt than a gcc one.
+ *   - on armv7 both directions are libcalls, and libgcc's __aeabi_d2lz just
+ *     negates into __aeabi_d2ulz, which splits the operand as
+ *     `hi = (u32)(r * 2^-32)` with a *truncating* vcvt — inexact for every r
+ *     that is not a multiple of 2^32. `fcvtzs x0, d0` of 1.0 raised IXC on the
+ *     armhf-glibc tier, and so did FJCVTZS. Which implementation you get is a
+ *     link-time accident and not a property of the compiler: compiler-rt's
+ *     hard-float __fixunsdfdi is the same algorithm, but Android's libm
+ *     exports its own soft-float __aeabi_d2lz/__aeabi_d2ulz (integer-only,
+ *     raise-free) and wins for anything linking -lm, which is why the Termux
+ *     armv7 device never showed this and armhf-glibc did.
  * A 32- or 16-bit result does lower to one instruction on every host we build
  * for, but it goes through the same helpers anyway, so that "this file performs
  * no FP->int cast" is an invariant one can grep for — and check in the object,
