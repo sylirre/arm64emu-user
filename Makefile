@@ -156,12 +156,18 @@ test: arm64chroot
 # and replays with `A64_ORACLE=recorded make test`. The Alpine-backed
 # self-checking sections additionally want an aarch64 rootfs with busybox at
 # tests/.cache/rootfs/alpine — a symlink to any existing rootfs is fine.
+# fpconsist is built here rather than left to test-jit, because a replay host
+# has no compiler and the check needs no oracle — it referees the two engines
+# against each other, which is the whole point of running it on silicon the
+# code generator has never been validated against.
 test-pack: arm64chroot
 	rm -rf tests/.cache/recorded
 	A64_ORACLE=qemu A64_RECORD=1 bash tests/run_tests.sh ./arm64chroot
+	sh tests/run_consist.sh ./arm64chroot
 	git rev-parse HEAD > tests/.cache/recorded/COMMIT
 	tar czf arm64chroot-testpack.tar.gz \
 	    $$(find tests/asm tests/c tests/fixtures tests/ptrace -name '*.bin') \
+	    $$(ls tests/fpconsist.bin 2>/dev/null) \
 	    tests/.cache/recorded tests/.cache/rootfs/glibc
 	@ls -lh arm64chroot-testpack.tar.gz
 

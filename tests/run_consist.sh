@@ -12,6 +12,15 @@ cd "$(dirname "$0")/.."
 
 cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' tests/fpconsist.c | sed 's/^BUILDFLAGS: *//')
 "$AGCC" -O2 -static $cflags -o tests/fpconsist.bin tests/fpconsist.c || {
+    # Replaying a pack, $AGCC is the stand-in that succeeds only for binaries
+    # the pack shipped, so a failure here means the pack predates fpconsist
+    # being packed -- an inventory gap, not a broken build, and not a reason
+    # to abort the run before the suite proper. Any real compiler failing is
+    # still a failure.
+    if [ "${A64_ORACLE:-auto}" = recorded ]; then
+        echo "SKIP fpconsist: not in this test pack (re-record with make test-pack)"
+        exit 0
+    fi
     echo "FAIL build fpconsist"; exit 1; }
 a=$("$EMU" / tests/fpconsist.bin) || { echo "FAIL fpconsist (interp rc=$?)"; exit 1; }
 b=$("$EMU" --jit / tests/fpconsist.bin) || { echo "FAIL fpconsist (jit rc=$?)"; exit 1; }

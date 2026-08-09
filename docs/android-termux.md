@@ -256,6 +256,15 @@ in, syscall and filesystem vintages), the proot-driven Alpine shell
 comparison, and anything whose binary or recording is missing from the
 pack — each named in the output.
 
+`A64_ORACLE=recorded make test-jit` replays the same pack with the
+translator on, and on a 32-bit ARM device that is the *only* check that the
+silicon agrees with what the ARM32 code generator emits — the qemu-arm tier
+on the dev box exercises the emitter, not the CPU, and the AArch64 CI
+runners do not implement AArch32 at EL0. It begins with `fpconsist`, the
+random-input FP comparison between the two engines, which needs no oracle
+and rides along in the pack. A pack recorded before it was packed skips that
+one row with a named reason instead of failing the run.
+
 ## On-device smoke-test checklist
 
 Manual sanity pass for a real device (Debian/Ubuntu arm64 rootfs under
