@@ -786,6 +786,10 @@ int main(int argc, char **argv)
     /* What execve's CLOEXEC sweep may not close: read now, while the limit is
      * still the one this process started with and no guest code has run. */
     guest_fd_ceiling_init();
+    /* Likewise for the host tasks in our thread group that are not ours: name
+     * them now, while "this process has one thread" is still a fact. Everything
+     * that reads the host task list as the guest thread list depends on it. */
+    proc_foreign_sample();
 
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */

@@ -481,6 +481,13 @@ SYSDEF(clone) {
          * unfiltered fork, which is nearly every fork. */
         if (m->seccomp_mode) seccomp_publish(m);
         g_tls.tid = getpid();             /* new process: tid == pid */
+        /* Only our own thread came across, so anything else the host lists in
+         * our thread group is not a guest thread. Re-sampled rather than
+         * inherited because an interposer gives the child a thread of its own,
+         * under a tid the parent's set does not name -- and done here, before
+         * anything else, so no reader of /proc/<child>/task meets the phantom
+         * in the window before we have named it. */
+        proc_foreign_sample();
         /* Only the forking thread exists here: fork(2) duplicates the calling
          * thread alone, so the inherited count -- which gates the retired-
          * backing drain (mem.c) -- has to come back to one, or a child of a
@@ -763,14 +770,9 @@ static void dethread_kick(s32 tid) {
             PTRACE_KICKSIG, &si);
 }
 
-/* How many host threads this process still has. Guest tid == host tid, so this
- * is exactly the thread group the guest can see -- what /proc/<pid>/task and
- * Threads: report, and what tgkill can still find. It outlives as.nthreads by a
- * little: a guest thread stops counting there when it leaves the run loop, but
- * its host thread lingers for a few frees after that, and a kernel's de_thread
- * has every other thread *gone* before the new program runs. Returns -1 without
- * /proc, which the callers treat as "cannot tell". */
-static int host_task_count(void) {
+/* What /proc/self/task lists, verbatim. Returns -1 without /proc, which the
+ * callers treat as "cannot tell". */
+static int host_task_count_raw(void) {
     DIR *d = opendir("/proc/self/task");
     if (!d) return -1;
     int n = 0;
@@ -778,6 +780,77 @@ static int host_task_count(void) {
     while ((e = readdir(d))) if (e->d_name[0] != '.') n++;
     closedir(d);
     return n;
+}
+
+/* Host tasks in this process's thread group that are NOT guest threads.
+ *
+ * "Guest tid == host tid, and the emulator spawns no host threads of its own"
+ * is relied on all over this codebase: the host task list *is* the guest thread
+ * list, which is why de_thread kicks siblings by walking /proc/self/task and
+ * why the guest's own task directory can be the host's. Something else in the
+ * process can break that premise, and one thing routinely does -- a user-mode
+ * emulator underneath us keeps a thread of its own alive for the process
+ * lifetime (qemu-user does, and gives the fork children one each). Left
+ * unaccounted it is a phantom guest thread: de_thread waits forever for it to
+ * leave, and the guest sees a tid in its own thread group that it never
+ * created and cannot attach to.
+ *
+ * They are identified by exclusion, at the only two moments when this process
+ * provably has exactly one thread of its own -- main() before any guest code,
+ * and a fork child, which the kernel gives the calling thread alone. Anything
+ * else in the listing then is not ours. On every host we ship on the set is
+ * empty and all of this costs one readdir per process. */
+static s32 g_foreign[PROCTAB_FOREIGN];
+static int g_nforeign;
+
+void proc_foreign_sample(void) {
+    g_nforeign = 0;
+    s32 self = (s32)getpid();
+    DIR *d = opendir("/proc/self/task");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            s32 t = (s32)atoi(e->d_name);
+            if (t > 0 && t != self && g_nforeign < PROCTAB_FOREIGN)
+                g_foreign[g_nforeign++] = t;
+        }
+        closedir(d);
+    }
+    /* Into the registry for everyone else. A no-op from main(), where this
+     * process has no entry yet -- proctab_register_at publishes it there. */
+    proctab_foreign_publish(g_foreign, g_nforeign);
+}
+
+/* Our own set, for the registration path. */
+int proc_foreign_self(const s32 **out) { *out = g_foreign; return g_nforeign; }
+
+static int is_foreign_task(s32 tid) {
+    for (int i = 0; i < g_nforeign; i++) if (g_foreign[i] == tid) return 1;
+    return 0;
+}
+
+/* The set for any guest pid: ours first-hand (it is also the one answer that
+ * survives a registry the host would not give us), anyone else's from the
+ * shared registry, where each process publishes its own. */
+int proc_foreign_tasks(s32 pid, s32 *out, int max) {
+    if (pid == (s32)getpid()) {
+        int n = g_nforeign < max ? g_nforeign : max;
+        for (int i = 0; i < n; i++) out[i] = g_foreign[i];
+        return n;
+    }
+    return proctab_foreign_tasks(pid, out, max);
+}
+
+/* How many host threads this process still has *of its own*. Guest tid == host
+ * tid, so this is exactly the thread group the guest can see -- what
+ * /proc/<pid>/task and Threads: report, and what tgkill can still find. It
+ * outlives as.nthreads by a little: a guest thread stops counting there when it
+ * leaves the run loop, but its host thread lingers for a few frees after that,
+ * and a kernel's de_thread has every other thread *gone* before the new program
+ * runs. */
+static int host_task_count(void) {
+    int n = host_task_count_raw();
+    return (n < 0) ? n : (n > g_nforeign ? n - g_nforeign : 1);
 }
 
 /* Kick every thread of this process but `self`. Guest tid == host tid, so the
@@ -790,7 +863,9 @@ static void dethread_kick_all(s32 self) {
     struct dirent *de;
     while ((de = readdir(d))) {
         s32 tid = (s32)atoi(de->d_name);
-        if (tid > 0 && tid != self) dethread_kick(tid);
+        if (tid <= 0 || tid == self) continue;
+        if (is_foreign_task(tid)) continue;   /* not ours to interrupt */
+        dethread_kick(tid);
     }
     closedir(d);
 }
@@ -996,16 +1071,29 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
      * /proc/self/task) would otherwise catch a victim in the act of leaving. */
     __atomic_store_n(&m->dethread_state, DT_COMMIT, __ATOMIC_RELEASE);
     int want = *carrier_is_me ? 1 : 2;   /* this thread, plus the carrier */
+    int guest_gone = 0;
     for (int ms = 0; ms < DT_TIMEOUT_MS; ms++) {
         int tasks = host_task_count();
-        if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want &&
-            (tasks < 0 || tasks <= want))
-            return 0;
+        guest_gone = __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want;
+        if (guest_gone && (tasks < 0 || tasks <= want)) return 0;
         dt_nap(1000);
     }
-    /* Not reachable in practice: what a committed thread has left to do is a
-     * few frees and cannot block. Hand the main thread its old image back
-     * rather than tear down an address space someone may still be inside. */
+    /* The two conditions are not equally binding, and the difference decides
+     * what a timeout means.
+     *
+     * `as.nthreads` is the load-bearing one: while it is above `want` a guest
+     * thread is still executing, and replacing the address space under it is
+     * not survivable. The host task count is fidelity -- it is there so a
+     * program that looks (tgkill, /proc/self/task) cannot catch a victim in the
+     * act of leaving -- and a host that reports it late, or reports it wrong,
+     * must not be able to turn a working execve into ENOSYS. So proceed on the
+     * guest count alone: a task entry that outlives its guest thread by a
+     * moment is a far smaller lie than a syscall that fails. */
+    if (guest_gone) return 0;
+    /* Otherwise a committed thread never left, which is not reachable in
+     * practice: what it has left to do is a few frees and cannot block. Hand
+     * the main thread its old image back rather than tear down an address space
+     * someone may still be inside. */
     __atomic_store_n(&m->dethread_done, -1, __ATOMIC_RELEASE);
     __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
     fprintf(stderr, "arm64chroot: execve(%s): guest threads did not finish "

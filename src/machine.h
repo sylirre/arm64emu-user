@@ -426,6 +426,17 @@ u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
  * initial exec, since the guest may lower its own limit afterwards. */
 void guest_fd_ceiling_init(void);
 int  guest_fd_ceiling(void);
+/* Host tasks in a guest process's thread group that are NOT guest threads.
+ * "Guest tid == host tid and the emulator spawns no host threads of its own"
+ * is assumed wherever the host task list stands in for the guest thread list --
+ * de_thread's sibling walk, the guest's own /proc/<pid>/task and Threads: --
+ * and an interposer between us and the kernel can hold a thread there that
+ * breaks it. Sampled by exclusion where this process provably has one thread
+ * of its own: main(), and the fork child. Empty on every host we ship on.
+ * (PROCTAB_FOREIGN, with the other registry caps, bounds the published set.) */
+void proc_foreign_sample(void);              /* main() and the fork child */
+int  proc_foreign_self(const s32 **tids);    /* ours, for the registry publish */
+int  proc_foreign_tasks(s32 pid, s32 *out, int max);   /* count written */
 
 /* Run-loop safepoint: called out of line when m->stop_gen no longer matches
  * this thread's copy. Adopts a newly exec'd image, joins a de_thread
@@ -642,6 +653,7 @@ int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
 #define PROCTAB_ENVIRON  2048    /* per-entry environ cap (truncated beyond) */
 #define PROCTAB_PATH     1024    /* per-entry exe/cwd path cap (truncated beyond) */
 #define PROCTAB_AUXV      512    /* per-entry auxv cap (elf.c emits 320 bytes) */
+#define PROCTAB_FOREIGN     4    /* per-entry non-guest host tasks (proc_foreign_sample) */
 
 /* One seqlock-consistent read of a registry entry's mutable payload. Byte
  * counts, not NUL-terminated (callers append a terminator where needed). */
@@ -697,6 +709,12 @@ int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err)
 void proctab_seccomp_set(u8 mode, u32 nfilters);
 void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters); /* pre-fork */
 int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);
+
+/* The owner's non-guest host tasks (proc_foreign_sample), in the registry for
+ * the same reason: another process has to strike them out of what the guest
+ * sees of this one, and it cannot reach its Machine. Only the owner writes. */
+void proctab_foreign_publish(const s32 *tids, int n);
+int  proctab_foreign_tasks(s32 pid, s32 *out, int max);     /* count written */
 
 /* proctab.c: System V shared-memory broker (client side). The unified IPC
  * daemon (an extension of the proctab broker) is the authoritative registry:

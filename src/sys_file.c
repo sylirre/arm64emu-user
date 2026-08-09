@@ -1223,6 +1223,12 @@ SYSDEF(getdents64) {
      * takes the PID-namespace filter, unless --no-proc disabled /proc). */
     char gdir[PATH_MAX];
     int have_gdir = 0, via_bind = 0, is_proc = 0;
+    /* /proc/<pid>/task of a guest process: its entries are that process's guest
+     * threads, except for any host task in its thread group that is not one --
+     * an interposer's own thread, which the guest must not be able to see, name
+     * or ptrace. Each process publishes its own set (proc_foreign_sample). */
+    s32 foreign[PROCTAB_FOREIGN];
+    int nforeign = 0;
     {
         char link[64], hpath[PATH_MAX];
         snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
@@ -1231,6 +1237,11 @@ SYSDEF(getdents64) {
             hpath[ln] = 0;
             is_proc = !c->m->no_proc && !strcmp(hpath, "/proc");
             have_gdir = host_fd_guest_path(c->m, hpath, gdir, &via_bind) == 0;
+            int tp = 0, adv = 0;
+            if (!c->m->no_proc &&
+                sscanf(hpath, "/proc/%d/task%n", &tp, &adv) == 1 &&
+                adv > 0 && hpath[adv] == 0 && tp > 0)
+                nforeign = proc_foreign_tasks((s32)tp, foreign, PROCTAB_FOREIGN);
         }
     }
 
@@ -1255,7 +1266,7 @@ SYSDEF(getdents64) {
 #endif
 
     long n;
-    if (is_proc || l2s) {
+    if (is_proc || l2s || nforeign) {
         /* Re-read if a whole batch is filtered away (0 would look like EOF). */
         for (;;) {
             n = syscall(SYS_getdents64, (int)a0, buf, len);
@@ -1271,6 +1282,11 @@ SYSDEF(getdents64) {
                 if (l2s && l2s_hidden(nm)) keep = 0;
 #endif
                 if (keep && is_proc && !proc_keep_name(nm)) keep = 0;
+                if (keep && nforeign) {
+                    s32 t = (s32)atoi(nm);
+                    for (int i = 0; i < nforeign; i++)
+                        if (foreign[i] == t) { keep = 0; break; }
+                }
                 if (keep) {
                     if (w != o) memmove(buf + w, buf + o, reclen);
                     w += reclen;

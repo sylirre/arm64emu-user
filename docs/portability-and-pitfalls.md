@@ -205,6 +205,41 @@ where there is no hole to find.
 syscall) is not a capability until something has crossed the boundary on it.
 Prefer one round trip at startup over a channel that fails silently forever.
 
+### `/proc/self/task` may list threads that are not yours (any host under an interposer)
+
+"Guest tid == host tid, and the emulator spawns no host threads of its own" is
+load-bearing in several places: it is why `execve`'s de_thread can find its
+siblings by walking `/proc/self/task`, and why the guest's own task directory
+can be the host's, passed straight through. The second half of that sentence is
+a promise the emulator keeps about itself — and cannot keep on another process's
+behalf. `qemu-user` holds a thread of its own for the process lifetime, giving
+each fork child one too, so the listing reads `guest threads + 1`.
+
+Every consequence of that is a phantom guest thread. `execve` waited for it to
+leave and refused with `ENOSYS` when it never did. The guest saw a tid in its own
+thread group it had not created: `Threads: 3` where the kernel says 2, and — the
+sharp end — `strace -p`-style code that enumerates a target's threads and
+attaches each one would attach a task that runs no guest code and then wait
+forever for a stop.
+
+So the emulator names them. At the one moment a process provably has a single
+thread of its own — `main` before any guest code, and a fork child, which the
+kernel gives the calling thread alone — everything *else* in the listing is, by
+exclusion, not ours (`proc_foreign_sample`). Each process publishes its own set
+to the shared PID registry, because the process that needs to filter a listing
+is usually not the one it describes, and the three consumers subtract it: the
+`/proc/<pid>/task` listing, `Threads:`, and de_thread's wait. On every host we
+ship on the set is empty and none of it fires.
+
+Two smaller lessons came with it. The `execve` wait now distinguishes its two
+conditions — the guest thread count *must* be satisfied (a thread still
+executing makes replacing the address space unsurvivable) while the host task
+count is fidelity, so its timeout proceeds rather than failing the syscall. And
+identifying by exclusion has one caveat worth stating: if such a task ever
+exited and its tid were later reused by a real guest thread, that thread would
+be hidden. Nothing in practice does — the interposer's thread outlives the
+process it rides.
+
 ### The compiler is part of the FP model (clang hosts, so every Termux build)
 
 The guest's `FPSR` exception bits are the *host's*, accumulated lazily in the

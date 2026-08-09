@@ -853,12 +853,13 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     /* Pass 1 for the two values a rewrite needs but does not carry: the tid
      * (Pid: names the thread the file describes, so it is right for every
      * spelling of the path) and the host kernel's own full capability set. */
-    s32 tid = 0;
+    s32 tid = 0, tgid = 0;
     char capfull[48] = "";
     for (char *p = buf; *p; ) {
         char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
         if (is_key(p, "Pid")) tid = (s32)strtol(p + 4, NULL, 10);
+        else if (is_key(p, "Tgid")) tgid = (s32)strtol(p + 5, NULL, 10);
         else if (is_key(p, "CapBnd")) {
             const char *v = p + 7;
             while (*v == ' ' || *v == '\t') v++;
@@ -890,6 +891,13 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     if (self) { scmode = (u8)seccomp_status(m, &scfilters); scknown = 1; }
     else scknown = proctab_seccomp_get(tid, &scmode, &scfilters);
     int fakeroot = self && m->fake_id && m->cred.euid == 0 && capfull[0];
+    /* Threads: counts host tasks, and a host task in this process's thread
+     * group need not be a guest thread -- an interposer between us and the
+     * kernel can hold one (proc_foreign_sample). The guest is told what it has,
+     * which is the same number its /proc/<pid>/task listing is filtered down to
+     * (sys_file.c). Zero on every host we ship on, where the line stands. */
+    s32 ftmp[PROCTAB_FOREIGN];
+    int nforeign = tgid > 0 ? proc_foreign_tasks(tgid, ftmp, PROCTAB_FOREIGN) : 0;
 
     /* A host kernel older than a key is a host file without its line:
      * NoNewPrivs is 4.10, Seccomp 3.8, Seccomp_filters 5.9. The guest ABI
@@ -912,6 +920,11 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
 
         if (is_key(p, "TracerPid")) {
             dprintf(fd, "TracerPid:\t%d\n", (int)ptrace_tracer_of(tid));
+            goto next_line;
+        }
+        if (nforeign && is_key(p, "Threads")) {
+            int t = (int)strtol(p + 8, NULL, 10) - nforeign;
+            dprintf(fd, "Threads:\t%d\n", t > 0 ? t : 1);
             goto next_line;
         }
         if (scknown && is_key(p, "Seccomp")) {

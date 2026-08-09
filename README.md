@@ -361,8 +361,10 @@ src/
                 run by the dispatcher for every guest syscall
   proctab.c     shared-memory guest-PID registry (cross-process ps/top view,
                 the id maps of a faked user namespace, so a parent can write
-                its child's, and each process's seccomp state, which its
-                status is read for) + unified IPC broker: portable System V IPC
+                its child's, each process's seccomp state, which its status is
+                read for, and the host tasks in its thread group that are not
+                guest threads, which the guest must not be shown)
+                + unified IPC broker: portable System V IPC
                 — memfd-backed shared memory, semaphores (blocking semop,
                 SEM_UNDO), message queues
   ptracetab.c   cross-process ptrace(2): tracer<->tracee link registry + futex

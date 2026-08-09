@@ -598,22 +598,55 @@ The emulator is then ARM32 code under `qemu-arm` while the oracle
 what it cannot check is that the *silicon* agrees with the emitted ARM32, which
 is what the device run is for.
 
-Read that gate against a baseline, not against zero: **this tier fails 44 tests,
-and the same 44 with the JIT on** — the two failure sets are now identical, so
-anything the `--jit` run fails that the interpreter run does not is the
-translator's and worth chasing. Every one of the 44 is the ~20x slowdown of
-running the emulator under emulation: 40 `ptrace:` tests time out or miss their
-first stop, the multi-iteration `fixture:` races (`mtexec`, `mainexit`) run out
-of their timeouts, and `c/timers` (static and dyn) misses its intervals.
+**The gate is zero failures in both engines**, so anything either run fails is
+worth chasing — but how the baseline got to zero is worth more than the number.
+This tier used to fail 44 tests, every one of them filed as the ~20x slowdown of
+running the emulator under emulation: 40 `ptrace:` rows "timing out", the
+multi-iteration `fixture:` races (`mtexec`, `mainexit`) "running out of their
+timeouts", `c/timers` "missing its intervals". None of it was slowness.
+`ptrace: basic` spent five minutes of wall time using 0.116 s of CPU — a
+deadlock, and the first measurement anyone took of it said so.
 
-The `procview:` and `shared-proc:` rows used to be in that list, blamed on a
+Three emulator defects were behind all 44, each of them trusting something the
+host was not obliged to be honest about:
+
+- The emulator reserves three host RT signals for itself — the control-channel
+  kick (a tracer's attach, a tracee's wake out of a blocking `wait4`, `execve`'s
+  de_thread call-out) and the two carriers for guest signals 32/33 — and took
+  the top three at compile time. `qemu-user` reserves host RT signals and shifts
+  the guest's range up, so those three have no host number left to land on:
+  `sigaction` succeeds, `kill` returns `ESRCH`, `rt_sigqueueinfo` `EINVAL`.
+  Every user of those numbers is a wake-up, so losing them looks like a hang
+  rather than an error. `sig_probe_reserved` now asks the host which numbers it
+  can deliver. That was the 40 `ptrace:` rows.
+- `execve`'s de_thread waits for the last sibling to be gone, on the guest
+  thread count *and* the host `/proc/self/task` listing. `qemu-user` keeps a
+  thread of its own in that listing for the process lifetime, so the second
+  condition could never be met and a working `execve` returned `ENOSYS`. That
+  was `c/timers` (static and dyn) and `fixture: mtexec`.
+- The same thread was visible to the *guest*, in its own `/proc/<pid>/task` and
+  `Threads:`. That was `fixture: mainexit`, and `ptrace: thread_attach`, which
+  enumerates a target's threads the way `strace -p` does and tried to attach a
+  task that runs no guest code.
+
+The last two are one idea: a process names the host tasks in its thread group
+that are not guest threads, at the moment it provably has one thread of its own,
+and publishes them so nothing — the emulator's own waits included — mistakes one
+for a guest thread. See *`/proc/self/task` may list threads that are not yours*
+in [portability-and-pitfalls.md](portability-and-pitfalls.md).
+
+The `procview:` and `shared-proc:` rows were in that list too, blamed on a
 `sleep` child losing a race. They were not racing. Under `qemu-arm` a process
 that read *its own* `/proc/<pid>/stat` got qemu's synthesized answer rather than
 the kernel's, so the starttime it registered as its identity token was one no
 other process could reproduce, and the PID registry declared a live process
 stale — see the `proc_starttime` comment in `src/proctab.c`. `other-pid cmdline`
-failed 30/30 before the fix and 0/30 after. A test that "flakes only on the slow
-tier" is worth one measurement before it is written off as timing.
+failed 30/30 before the fix and 0/30 after.
+
+Four separate emulator bugs, then, no other tier in the tree could see, all of
+them sitting behind one wrong explanation for years of runs. **A test that
+misbehaves only on an emulated tier gets one measurement before it is written
+off as timing.**
 
 This tier used to fail three FP tests as well, and why it no longer does is
 worth more than the numbers. `asm/m22_fpsr`, `c/fcvt_scalar` and `insnfuzz:

@@ -98,7 +98,28 @@ struct ProcEnt {
      * One word, stored and loaded atomically, so a reader always sees a mode
      * and a count that were true together. */
     u32 seccomp;                 /* mode << 16 | filter count */
+
+    /* Host tasks in the owner's thread group that are NOT guest threads, so
+     * that another process can strike them out of what the guest sees of this
+     * one (sys_file.c's task-directory listing, sys_procfs.c's Threads:).
+     * Owner-written like `seccomp`, and published tids-first, count-last so a
+     * reader either sees the whole set or none of it -- worst case it filters
+     * nothing for an instant, never the wrong tid. See proc_foreign_sample. */
+    s32 foreign[PROCTAB_FOREIGN];
+    u8  nforeign;                /* published last (release) */
 };
+
+/* Store a process's non-guest host tasks into its entry: tids first, count
+ * last, so a concurrent reader sees either the whole set or an empty one --
+ * worst case it filters nothing for an instant, never the wrong tid. */
+static void foreign_write(struct ProcEnt *e, const s32 *tids, int n) {
+    if (n > PROCTAB_FOREIGN) n = PROCTAB_FOREIGN;
+    if (n < 0) n = 0;
+    __atomic_store_n(&e->nforeign, 0, __ATOMIC_RELEASE);
+    for (int i = 0; i < n; i++)
+        __atomic_store_n(&e->foreign[i], tids[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&e->nforeign, (u8)n, __ATOMIC_RELEASE);
+}
 
 /* A slot claimed for a process that does not exist yet (proctab_reserve): not a
  * pid and not 0, so no scan matches it and the free-slot CAS will not take it.
@@ -192,11 +213,12 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v4 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v6 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
      * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
-     * faked user namespace's id maps; v5 the owner's seccomp state.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v5.%u.%08x",
+     * faked user namespace's id maps; v5 the owner's seccomp state; v6 its
+     * non-guest host tasks.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v6.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;
@@ -236,19 +258,19 @@ static int proctab_memfd(void) {
  * shm). leading NUL => no filesystem entry. `session` != 0 keys it per-invocation
  * (shm without --shared-proc, scoped to one launch's process tree); session == 0
  * keys it per-rootfs by `key_hash` (proctab, and --shared-proc shm, so every
- * invocation of the same rootfs and uid meets at one broker). The "ipc.v3"
+ * invocation of the same rootfs and uid meets at one broker). The "a64ipc.vN"
  * version tag guarantees a differently-versioned build never joins a daemon
  * speaking an incompatible request protocol -- or, for proctab, one holding a
- * memfd sized for an older struct ProcEnt, which this build would map past its
- * end. Returns the sockaddr length. */
+ * memfd laid out for an older struct ProcEnt, which this build would read the
+ * wrong fields out of. Returns the sockaddr length. */
 static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     memset(a, 0, sizeof *a);
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v4.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v5.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v4.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v5.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2023,6 +2045,7 @@ int proctab_reserve(void) {
         __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->seccomp, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->nforeign, 0, __ATOMIC_RELAXED);
         return i;
     }
     return -1;
@@ -2145,6 +2168,17 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     if (cwd_len)           memcpy(e->cwd, cwd, cwd_len);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* even: write done */
+    /* Our non-guest host tasks: sampled in main() before we had a slot to put
+     * them in, and unchanged by an execve (they belong to whatever is running
+     * the emulator, not to the program). Written before the pid below, so no
+     * reader ever pairs this pid with the set of whoever held the slot last. A
+     * parent registering its CHILD's slot leaves the field alone -- that set is
+     * the child's own, and the child publishes it itself. */
+    if (pid == (s32)getpid()) {
+        const s32 *ft;
+        int nft = proc_foreign_self(&ft);   /* sequenced: ft is set by the call */
+        foreign_write(e, ft, nft);
+    }
     /* Built: publish the slot under its real pid (see the claim above). */
     if (claimed || reserved) __atomic_store_n(&e->pid, pid, __ATOMIC_RELEASE);
     if (pid == (s32)getpid()) g_own_slot = slot;
@@ -2436,6 +2470,28 @@ int proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters) {
     if (mode) *mode = (u8)(w >> 16);
     if (nfilters) *nfilters = w & 0xffff;
     return 1;
+}
+
+/* Publish this process's non-guest host tasks, so that another process can
+ * strike them out of what the guest sees of us. Written into our own slot --
+ * including one still held as our parent's reservation, which is the fork
+ * child's case: its set is its own (the interposer gives the child a fresh
+ * thread of its own) and its parent cannot know it. */
+void proctab_foreign_publish(const s32 *tids, int n) {
+    struct ProcEnt *e = own_entry();
+    if (e) foreign_write(e, tids, n);
+}
+
+/* That set for any guest pid. Returns how many tids were written to `out`. */
+int proctab_foreign_tasks(s32 pid, s32 *out, int max) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e) return 0;
+    int n = (int)__atomic_load_n(&e->nforeign, __ATOMIC_ACQUIRE);
+    if (n > PROCTAB_FOREIGN) n = PROCTAB_FOREIGN;   /* torn/garbage guard */
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++)
+        out[i] = __atomic_load_n(&e->foreign[i], __ATOMIC_RELAXED);
+    return n;
 }
 
 /* ---- System V shm broker: client side (drives the daemon above) ---------- */

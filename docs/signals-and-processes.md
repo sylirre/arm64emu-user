@@ -272,6 +272,14 @@ One host thread per guest thread over the shared `Machine`/address space:
   `/proc/<pid>/task` lists exactly the guest tids, and tid-keyed shared state
   (the ptrace registry) cannot collide across processes. The main thread's tid
   equals the pid;
+- that listing being *exactly* the guest tids depends on the emulator spawning
+  no host thread of its own, which it does not — but something underneath it
+  can. Each process therefore names, at the one moment it provably has a single
+  thread (`main`, and a fork child), every other host task in its thread group,
+  publishes that set to the PID registry, and strikes it out of what the guest
+  is shown: the `/proc/<pid>/task` listing, `Threads:`, and `execve`'s wait for
+  the last sibling to leave. The set is empty on every host we ship on, and one
+  entry under `qemu-user`. See `proc_foreign_sample` (`src/sys_proc.c`);
 - exclusives and LSE atomics are SMP-correct host CAS, and guest barriers are host
   fences (see [memory.md](memory.md)) — this is what makes pthread mutexes/condvars
   and lock-free code correct even on weakly-ordered ARM hosts;

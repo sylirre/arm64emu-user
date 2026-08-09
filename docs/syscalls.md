@@ -865,7 +865,18 @@ difference (`tgkill`, `/proc/self/task`), so the commit phase waits on the host
 thread count as well as the guest one, and the carrier waits for the thread that
 handed it the image — which by construction cannot have left before publishing
 the hand-over. The first of those is defensive; the second is not, and a program
-caught the difference before it was added. The reload also carries the live
+caught the difference before it was added.
+
+The two counts are not equally binding, and that decides what a *commit-phase*
+timeout means. While the guest count is above the target a guest thread is still
+executing, and replacing the address space under it is not survivable — that one
+must be satisfied. The host task count is fidelity, so a host that reports it
+late, or reports it wrong, must not be able to turn a working `execve` into
+`ENOSYS`: the wait proceeds on the guest count alone. Reporting it wrong is not
+hypothetical — a user-mode emulator underneath us keeps a thread of its own in
+`/proc/self/task` for the process lifetime, which is why the listing is read
+against the set of host tasks known not to be guest threads
+(`proc_foreign_sample`, below). The reload also carries the live
 thread count across `as_init`, which otherwise resets it to one and makes the
 next thread to leave look like the last of the group.
 
