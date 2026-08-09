@@ -244,10 +244,10 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
  * *libgcc* expansion of the same conversion leaking Inexact on armv7 (see
  * there; that one is not a clang quirk, and gcc has it too). What the source
  * cannot express is an FP op a compiler speculates out of ANY guard —
- * FPRecipStepFused's 0*inf arm, say. No compiler
- * we build with does that today, m22_fpsr pins it, and the escape hatch if one
- * starts is to compile this file with -ffp-exception-behavior=strict (clang;
- * measured ~7% on the FP path, which is why it is not on by default).
+ * FPRecipStepFused's 0*inf arm, say. No compiler we build with does that
+ * today, m22_fpsr pins it, and the escape hatch if one starts is to compile
+ * this file with -ffp-exception-behavior=strict (clang; measured ~7% on the
+ * FP path, which is why it is not on by default).
  * Known corners vs the architecture, deliberate. All were measured against
  * qemu by sweeping random FP/SIMD words; the counts are per 30000 words with
  * NaN and Inf excluded from every lane width:
@@ -1362,17 +1362,17 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         if (dbl) {
             double a = fp_rd_d(c, Rn), b = fp_rd_d(c, Rm), r;
             switch (opc) {
-                case 0x0: r = fpnan_d(a * b, a, b); break;   /* FMUL */
-                case 0x1: r = fpnan_d(a / b, a, b); break;   /* FDIV */
-                case 0x2: r = fpnan_d(a + b, a, b); break;   /* FADD */
-                case 0x3: r = fpnan_d(a - b, a, b); break;   /* FSUB */
+                case 0x0: r = fpnan_d(a * b, a, b); break;     /* FMUL */
+                case 0x1: r = fpnan_d(a / b, a, b); break;     /* FDIV */
+                case 0x2: r = fpnan_d(a + b, a, b); break;     /* FADD */
+                case 0x3: r = fpnan_d(a - b, a, b); break;     /* FSUB */
                 case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break;  /* FMAX   */
                 case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break;  /* FMIN   */
                 case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break;  /* FMAXNM */
                 case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break;  /* FMINNM */
                 /* FPNeg after FPMul, and FPNeg flips a NaN's sign too, so the
                  * canonical result here is the NEGATIVE default NaN. */
-                case 0x8: r = -fpnan_d(a * b, a, b); break;   /* FNMUL */
+                case 0x8: r = -fpnan_d(a * b, a, b); break;    /* FNMUL */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_d(c, Rd, r);
@@ -1387,7 +1387,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x5: r = fop_s(FOP_MIN,   a, b, 0.0f); break;  /* FMIN   */
                 case 0x6: r = fop_s(FOP_MAXNM, a, b, 0.0f); break;  /* FMAXNM */
                 case 0x7: r = fop_s(FOP_MINNM, a, b, 0.0f); break;  /* FMINNM */
-                case 0x8: r = -fpnan_s(a * b, a, b); break;   /* see above */
+                case 0x8: r = -fpnan_s(a * b, a, b); break;    /* see above */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_s(c, Rd, r);
@@ -1430,11 +1430,13 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)       r =  a - n * m;       /* FMSUB  */
         else if (o1 && !o0) r = -a - n * m;       /* FNMADD */
         else                r = -a + n * m;       /* FNMSUB */
+        /* Operand order (addend, n, m), each carrying the FPNeg this
+         * form applies -- FMSUB of a NaN multiplicand returns it negated. */
         double pa, pn;
-        if (!o1 && !o0) { pa = a;  pn =  n; }
-        else if (!o1)   { pa = a;  pn = -n; }
-        else if (!o0)   { pa = -a; pn = -n; }
-        else            { pa = -a; pn =  n; }
+        if (!o1 && !o0) { pa = a;  pn =  n; }        /* FMADD  */
+        else if (!o1)   { pa = a;  pn = -n; }        /* FMSUB  */
+        else if (!o0)   { pa = -a; pn = -n; }        /* FNMADD */
+        else            { pa = -a; pn =  n; }        /* FNMSUB */
         fp_wr_h(c, Rd, f64_to_f16(fpnan_muladd_d(r, pa, pn, m))); return;
     }
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }
@@ -1443,17 +1445,17 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
          * FNMSUB. a64_fma is __builtin_fma on hosts whose flags can be trusted
          * (it inlines to a hardware FMA on AArch64 always and x86 with -mfma,
          * and otherwise calls libm's fma — the build links -lm); on armv7 it
-         * derives the flags by hand because Bionic's software fma leaks its
-         * internal Inexact (see the fused_flags block above). The JIT inlines
-         * this family only where the backend can fuse (native fmadd on
-         * AArch64, FMA3 on x86-64); a host without one keeps the exec_a64
-         * helper and still matches bit-for-bit (any correctly-rounded FMA is
-         * the same unique answer). */
+         * derives both result and flags by hand because Bionic's software fma
+         * leaks its internal Inexact and its fmaf mis-rounds ties (see the
+         * fused_eval block above). The JIT inlines this family only where the
+         * backend can fuse (native fmadd on AArch64, FMA3 on x86-64); a host
+         * without one keeps the exec_a64 helper and still matches bit-for-bit
+         * (any correctly-rounded FMA is the same unique answer). */
         double n = fp_rd_d(c, Rn), m = fp_rd_d(c, Rm), a = fp_rd_d(c, Ra), r;
-        if (!o1 && !o0) r = a64_fma( n, m,  a);         /* FMADD  */
-        else if (!o1)   r = a64_fma(-n, m,  a);         /* FMSUB  */
-        else if (o1 && !o0) r = a64_fma(-n, m, -a);     /* FNMADD */
-        else            r = a64_fma( n, m, -a);         /* FNMSUB */
+        if (!o1 && !o0) r = a64_fma( n, m,  a);   /* FMADD  */
+        else if (!o1)   r = a64_fma(-n, m,  a);   /* FMSUB  */
+        else if (o1 && !o0) r = a64_fma(-n, m, -a); /* FNMADD */
+        else            r = a64_fma( n, m, -a);   /* FNMSUB */
         /* Operand order (addend, n, m), each carrying the FPNeg this
          * form applies -- FMSUB of a NaN multiplicand returns it negated. */
         double pa, pn;
@@ -1468,11 +1470,13 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)   r = a64_fmaf(-n, m,  a);
         else if (o1 && !o0) r = a64_fmaf(-n, m, -a);
         else            r = a64_fmaf( n, m, -a);
+        /* Operand order (addend, n, m), each carrying the FPNeg this
+         * form applies -- FMSUB of a NaN multiplicand returns it negated. */
         float pa, pn;
-        if (!o1 && !o0) { pa = a;  pn =  n; }
-        else if (!o1)   { pa = a;  pn = -n; }
-        else if (!o0)   { pa = -a; pn = -n; }
-        else            { pa = -a; pn =  n; }
+        if (!o1 && !o0) { pa = a;  pn =  n; }        /* FMADD  */
+        else if (!o1)   { pa = a;  pn = -n; }        /* FMSUB  */
+        else if (!o0)   { pa = -a; pn = -n; }        /* FNMADD */
+        else            { pa = -a; pn =  n; }        /* FNMSUB */
         fp_wr_s(c, Rd, fpnan_muladd_s(r, pa, pn, m));
     }
 }
@@ -1489,6 +1493,11 @@ static u64 sat_s(s64 v, unsigned e) {
     else if (v < min) { v = min; g_fpexc |= FPSR_QC; }
     return (u64)v;
 }
+/* Clamp an unsigned value to an element mask, flagging the clamp. */
+static u64 sat_umask(u64 v, u64 emask) {
+    if (v > emask) { g_fpexc |= FPSR_QC; return emask; }
+    return v;
+}
 static u64 sat_u(s64 v, unsigned e) {
     u64 max = (e >= 64) ? ~0ULL : (((u64)1 << e) - 1);
     if (v < 0) { g_fpexc |= FPSR_QC; return 0; }
@@ -1504,11 +1513,6 @@ static u64 sat_u(s64 v, unsigned e) {
 static u64 sat_neg(s64 v, unsigned e) {
     if (e >= 64 && v == INT64_MIN) { g_fpexc |= FPSR_QC; return (u64)INT64_MAX; }
     return sat_s(-v, e);
-}
-/* Clamp an unsigned value to an element mask, flagging the clamp. */
-static u64 sat_umask(u64 v, u64 emask) {
-    if (v > emask) { g_fpexc |= FPSR_QC; return emask; }
-    return v;
 }
 static u64 ssat_add(s64 a, s64 b, unsigned e) {
     if (e < 64) return sat_s(a + b, e);
@@ -1538,11 +1542,6 @@ static u64 usat_add(u64 a, u64 b, unsigned e) {
     if (r < a) { g_fpexc |= FPSR_QC; return ~0ULL; }
     return r;
 }
-static u64 usat_sub(u64 a, u64 b, unsigned e) {
-    (void)e;
-    if (a < b) { g_fpexc |= FPSR_QC; return 0; }
-    return a - b;
-}
 /* USQADD: unsigned accumulator + SIGNED addend, clamped to the unsigned
  * range. The magnitude is formed unsigned so that sa == INT64_MIN (whose
  * negation is not representable) stays well defined. */
@@ -1551,6 +1550,11 @@ static u64 usqadd_sat(u64 d, s64 sa, unsigned e) {
     u64 mag = (u64)0 - (u64)sa;
     if (d < mag) { g_fpexc |= FPSR_QC; return 0; }
     return d - mag;
+}
+static u64 usat_sub(u64 a, u64 b, unsigned e) {
+    (void)e;
+    if (a < b) { g_fpexc |= FPSR_QC; return 0; }
+    return a - b;
 }
 
 /* FEAT_RDM SQRDMLAH/SQRDMLSH core, shared by the vector, scalar and by-element
@@ -3005,7 +3009,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
             u64 src = velem_get(&c->v[Rn], size + 1, i), nv;
             if (opc == 0x12)  nv = sat_u(sx(src, 2*esz), esz);          /* SQXTUN: signed->unsigned */
             else if (U == 0)  nv = sat_s(sx(src, 2*esz), esz);          /* SQXTN: signed */
-            else              nv = sat_umask(src, emask);              /* UQXTN: unsigned */
+            else              nv = sat_umask(src, emask);               /* UQXTN: unsigned */
             velem_set(&r, size, base + i, nv & emask);
         }
         c->v[Rd] = r; return;
@@ -3043,7 +3047,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
                 v = usqadd_sat(d, sx(a, esize), esize); } break;
             case (0 << 5) | 0x07: { s64 s = sx(a, esize);                      /* SQABS */
                 v = (s < 0) ? sat_neg(s, esize) : sat_s(s, esize); } break;
-            case (1 << 5) | 0x07: v = sat_neg(sx(a, esize), esize); break;      /* SQNEG */
+            case (1 << 5) | 0x07: v = sat_neg(sx(a, esize), esize); break;     /* SQNEG */
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
