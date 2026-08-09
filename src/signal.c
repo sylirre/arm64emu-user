@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -73,9 +74,17 @@ __thread volatile sig_atomic_t g_sig_npend;
  * exactly this) is instead created with a reserved high host RT signal and
  * translated back to the guest number at capture time. Armed on first use so
  * a guest that never touches 32/33 keeps the host numbers for itself. */
-#define SIG_REMAP32_HOST (SIGRTMAX - 1)   /* host carrier for guest signal 32 */
-#define SIG_REMAP33_HOST (SIGRTMAX - 2)   /* host carrier for guest signal 33 */
+static int g_sig_remap_host[2];           /* host carriers for guest 32, 33 */
+#define SIG_REMAP32_HOST g_sig_remap_host[0]
+#define SIG_REMAP33_HOST g_sig_remap_host[1]
 static int g_sig_remap_armed[2];          /* [0]: 32, [1]: 33 (atomic flags) */
+
+/* The third reserved number: the ptrace attach / de_thread call-out kick
+ * (PTRACE_KICKSIG, ptrace.h). It lives here because all three are picked
+ * together -- see sig_probe_reserved, which main() calls before anything can
+ * read any of them (SIGRTMAX is a function call on glibc, so none of the three
+ * can carry its default as a static initializer). */
+int g_sig_kicksig;
 
 static int sig_remap_to_guest(int sig) {
     if (sig == SIG_REMAP32_HOST &&
@@ -83,6 +92,91 @@ static int sig_remap_to_guest(int sig) {
     if (sig == SIG_REMAP33_HOST &&
         __atomic_load_n(&g_sig_remap_armed[1], __ATOMIC_ACQUIRE)) return 33;
     return sig;
+}
+
+/* ---- picking the three reserved host signals ----
+ *
+ * The emulator needs three host signal numbers of its own: the control-channel
+ * kick and the two carriers above. The top of the RT range is the natural
+ * choice -- nothing in practice sends SIGRTMAX, and the host libcs reserve from
+ * the *bottom* (32/33) -- but choosing them at compile time assumed something
+ * that is not always true: that the host can deliver the number we picked.
+ *
+ * Under a user-mode emulator it may not. qemu-user reserves host RT signals for
+ * itself and shifts the guest's range up, so the top three *target* RT signals
+ * have no host number left to map onto: sigaction on them succeeds, and then
+ * kill fails with ESRCH and rt_sigqueueinfo with EINVAL. That is a silent trap,
+ * because every user of these signals is a wake-up whose absence looks like a
+ * hang rather than an error -- a tracer blocked in wait4 that the tracee can no
+ * longer knock out of it, an execve waiting for siblings that never hear the
+ * call-out, a guest POSIX timer that never fires. The whole ptrace tier of the
+ * suite deadlocked exactly this way on an armhf-under-qemu-arm host.
+ *
+ * So probe instead of assume: take the three highest RT numbers this host will
+ * actually deliver to itself. On a host with nothing in the way that is
+ * SIGRTMAX, SIGRTMAX-1, SIGRTMAX-2 -- the three these numbers were fixed at
+ * before -- so this changes nothing where nothing is wrong. The kick is
+ * assigned first, being the one whose loss deadlocks the emulator itself.
+ *
+ * A64_SIGRT_MAX=N caps the search, which is how the fallback gets exercised on
+ * a host that has no hole of its own. */
+static volatile sig_atomic_t sig_probe_hit;   /* not __thread: see sig_tls_prewarm */
+
+static void sig_probe_catcher(int sig, siginfo_t *si, void *uctx) {
+    (void)sig; (void)si; (void)uctx;
+    sig_probe_hit = 1;
+}
+
+/* Can this host both queue `sig` to us and run a handler for it? Delivery is
+ * synchronous on the unblocking below, so one round trip answers it. */
+static int sig_deliverable(int sig) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sig_probe_catcher;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(sig, &sa, &old) != 0) return 0;
+
+    sigset_t one, prev;
+    sigemptyset(&one);
+    sigaddset(&one, sig);
+    sigprocmask(SIG_UNBLOCK, &one, &prev);   /* an inherited block would hide it */
+
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = sig;
+    si.si_code = SI_QUEUE;                   /* the form every kick uses */
+    si.si_pid = getpid();
+    si.si_uid = (int)getuid();
+    si.si_value.sival_int = 0;
+    sig_probe_hit = 0;
+    int ok = syscall(SYS_rt_sigqueueinfo, (pid_t)getpid(), sig, &si) == 0 &&
+             sig_probe_hit;
+
+    sigprocmask(SIG_SETMASK, &prev, NULL);
+    sigaction(sig, &old, NULL);
+    return ok;
+}
+
+void sig_probe_reserved(void) {
+    int *slot[3] = { &g_sig_kicksig, &g_sig_remap_host[0], &g_sig_remap_host[1] };
+    g_sig_kicksig = SIGRTMAX;                 /* the defaults, in case the host */
+    g_sig_remap_host[0] = SIGRTMAX - 1;       /* answers nothing below */
+    g_sig_remap_host[1] = SIGRTMAX - 2;
+
+    const char *cap = getenv("A64_SIGRT_MAX");
+    int top = SIGRTMAX;
+    if (cap && *cap) {
+        int n = atoi(cap);
+        if (n > 0 && n < top) top = n;
+    }
+    int n = 0;
+    for (int s = top; s >= SIGRTMIN && n < 3; s--) {
+        if (s == 32 || s == 33) continue;     /* host-libc internal rt signals */
+        if (sig_deliverable(s)) *slot[n++] = s;
+    }
+    /* Fewer than three usable numbers leaves the rest at their defaults: there
+     * is nothing better to pick, and it is what this code did before. */
 }
 
 /* Touch, from ordinary context, every __thread variable a signal handler can

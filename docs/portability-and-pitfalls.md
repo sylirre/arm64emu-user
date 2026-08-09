@@ -176,6 +176,35 @@ process's own `/proc` through a spelling an interposer does not special-case**
 a test fails only on an emulated tier, measure before blaming timing — this one
 was written off as a `sleep`-child race and was in fact deterministic.
 
+### A signal the host accepts is not a signal the host delivers (any host under an interposer)
+
+The emulator reserves three host signal numbers for itself: the control-channel
+kick — a tracer's attach, a tracee's wake, `execve`'s de_thread call-out — and
+the two carriers that stand in for guest signals 32/33, whose numbers belong to
+the *host* libc. The top of the RT range is the natural place for them, and it
+used to be a compile-time choice.
+
+`qemu-user` reserves host RT signals for itself and shifts the target range up,
+so the **top three target RT signals have no host number left to map onto**.
+`sigaction` on them still succeeds; `kill` then fails with `ESRCH` and
+`rt_sigqueueinfo` with `EINVAL`. Nothing reports an error, because every user of
+these numbers is a wake-up, and a wake-up that never arrives looks like a hang:
+a tracer blocked in `wait4` that its tracee can no longer knock out of it, an
+`execve` waiting for siblings that never hear the call-out, a guest POSIX timer
+that never fires. The entire `ptrace:` tier of the suite deadlocked this way on
+the armhf-under-`qemu-arm` host, for months, filed as "the tier is 20× slower,
+these time out". They were not slow — they used 0.1 s of CPU in 5 minutes.
+
+So `sig_probe_reserved` (`src/signal.c`) **asks**: queue each candidate to
+ourselves and check a handler runs. It takes the three highest RT numbers that
+answer, which on a host with nothing in the way are the three it used to
+hardcode. `A64_SIGRT_MAX=N` caps the search so the low-RT tier is exercised
+where there is no hole to find.
+
+*The general rule:* a number the host hands you (a signal, an fd class, a
+syscall) is not a capability until something has crossed the boundary on it.
+Prefer one round trip at startup over a channel that fails silently forever.
+
 ### The compiler is part of the FP model (clang hosts, so every Termux build)
 
 The guest's `FPSR` exception bits are the *host's*, accumulated lazily in the

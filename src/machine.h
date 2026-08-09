@@ -503,6 +503,12 @@ int  sig_on_altstack(u64 sp);   /* the kernel's on_sig_stack(): SP-range test */
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
 void sig_install_kick_net(void);
+/* Pick the three host signal numbers the emulator reserves for itself (the
+ * control-channel kick and the two guest-32/33 carriers) by asking the host
+ * which of them it can actually deliver. Run by main() before the nets install
+ * and before the first fork; every process of a session reaches the same
+ * answer, so the numbers agree across the session without being shared. */
+void sig_probe_reserved(void);
 
 /* elf.c: load `guest_path` (canonical guest path) into the address space and
  * prepare the initial stack. Returns 0 or -errno. */

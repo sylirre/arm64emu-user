@@ -34,8 +34,14 @@ extern __thread volatile sig_atomic_t g_ptrace_kick;
  * guest-directed signal of the same number (which it forwards). PT_WAKE_MAGIC
  * is the tracee->tracer wake: its handler is a pure no-op whose only purpose is
  * the EINTR it inflicts on a tracer blocked in a host wait4/waitid, making it
- * re-check the registry (sig_kick_net owns the signal in every process). */
-#define PTRACE_KICKSIG   SIGRTMAX
+ * re-check the registry (sig_kick_net owns the signal in every process).
+ *
+ * Which number that is gets *probed* rather than assumed: a host that accepts
+ * sigaction on it but cannot deliver it turns every one of these wake-ups into
+ * a deadlock. sig_probe_reserved (signal.c) picks it, and every process of a
+ * session picks the same one because the answer is a property of the host. */
+extern int g_sig_kicksig;
+#define PTRACE_KICKSIG   g_sig_kicksig
 #define PT_KICK_MAGIC    0x50544b21   /* "PTK!" */
 #define PT_WAKE_MAGIC    0x50545721   /* "PTW!" */
 

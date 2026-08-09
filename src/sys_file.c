@@ -2500,8 +2500,8 @@ static int pwait_mask_enter(CPU *c, u64 gmask) {
  * while the guest has it blocked and is inside one of these three calls: it is
  * still queued in the capture ring (not lost, and delivered once the guest
  * unblocks it), but the wait returns EINTR where a kernel would have kept
- * waiting. Nothing sends SIGRTMAX in practice; being unable to reach our own
- * threads is the worse failure of the two. */
+ * waiting. Nothing sends the top of the RT range in practice; being unable to
+ * reach our own threads is the worse failure of the two. */
 static void pwait_host_mask(sigset_t *ss, u64 gmask) {
     sigemptyset(ss);
     for (int i = 1; i <= 64; i++)

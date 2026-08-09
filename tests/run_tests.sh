@@ -1274,8 +1274,43 @@ for pt in tests/ptrace/*.c; do
             fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$out')"
         fi
     done
-    fx_rm "$ptbin"
+    [ "$pt" = tests/ptrace/basic.c ] || fx_rm "$ptbin"
 done
+
+# ---- reserved host signals: the low-RT fallback tier ----
+# The emulator keeps three host signal numbers for itself -- the control-channel
+# kick (a tracer's attach, a tracee's wake, execve's de_thread call-out) and the
+# two carriers that stand in for guest signals 32/33 -- and normally takes the
+# top of the RT range. A host that accepts sigaction on those numbers but cannot
+# deliver them (qemu-user reserves host RT signals and shifts the guest's range,
+# so the top three have nowhere to land) turns every one of those wake-ups into a
+# deadlock, so the emulator probes and drops to lower numbers instead.
+# A64_SIGRT_MAX forces that tier on a host with no hole of its own: one ptrace
+# test for the kick, the timer test for the carriers.
+if [ -x tests/ptrace/basic.bin ]; then
+    out=$(A64_SIGRT_MAX=48 timeout 30 "$EMU" / tests/ptrace/basic.bin 2>/dev/null); rc=$?
+    if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
+        pass=$((pass+1)); echo "PASS ptrace: basic(low-rt-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL ptrace: basic(low-rt-tier) (rc=$rc, out='$out')"
+    fi
+    fx_rm tests/ptrace/basic.bin
+else
+    skip_build "ptrace/basic(low-rt-tier)"
+fi
+TMBIN="tests/c/timers_static.bin"
+if [ -x "$TMBIN" ] && ! rec_have "$TMBIN"; then
+    skip=$((skip+1)); echo "SKIP c/timers(low-rt-tier) (not in the test pack)"
+elif [ -x "$TMBIN" ]; then
+    out_q=$(oracle_run "$TMBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_SIGRT_MAX=48 timeout 60 "$EMU" / "$TMBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/timers(low-rt-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/timers(low-rt-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+fi
 
 # ---- differential instruction fuzzer (tests/fixtures/insnfuzz.c) ----
 # Two comparisons, because they have different oracles.

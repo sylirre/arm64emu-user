@@ -156,9 +156,9 @@ One wrinkle: guest signals **32/33** are the *guest* libc's internal numbers
 (its `SIGTIMER`/`SIGCANCEL` — the glibc/musl `SIGEV_THREAD` helper arms a
 `SIGEV_THREAD_ID` timer on 32), but the *host* libc owns those same numbers, so
 they can never be raised as host signals. A timer armed with guest 32/33 is
-created with a reserved high host RT carrier (`SIGRTMAX-1`/`SIGRTMAX-2`)
-instead, translated back to the guest number when the capture handler queues
-it. The same carrier carries a guest signal 32/33 sent *directly* —
+created with one of the emulator's two reserved host RT carriers instead
+(normally `SIGRTMAX-1`/`SIGRTMAX-2` — see *the three reserved numbers* below),
+translated back to the guest number when the capture handler queues it. The same carrier carries a guest signal 32/33 sent *directly* —
 `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo` all route through `sig_send_host_nr`
 — which is what makes `pthread_cancel` (musl and glibc send `SIGCANCEL` = 32)
 and glibc's `setuid` broadcast (33 to every thread) work at all: raised raw,
@@ -173,6 +173,27 @@ never reaches the syscall level (guest libc implements it in userspace), and is
 rejected with `-EINVAL` like the kernel does — critically so, since letting it
 reach the *host* wrapper would spawn a host helper thread on a junk guest
 function pointer.
+
+### The three reserved numbers, and why they are probed
+
+Three host signal numbers belong to the emulator rather than the guest: the two
+carriers above, and the control-channel kick (`PTRACE_KICKSIG` — a tracer's
+attach, a tracee's wake out of a blocking `wait4`, `execve`'s de_thread
+call-out). They are taken from the top of the RT range because nothing in
+practice sends `SIGRTMAX` and the host libcs reserve from the bottom (32/33).
+
+Which three is a question for the host, not a constant. `sig_probe_reserved`
+(`src/signal.c`, called by `main` before any handler is installed or any process
+is forked) queues each candidate to itself and checks a handler runs, then takes
+the three highest that answer — the kick first, since losing it deadlocks the
+emulator rather than the guest. On a host with nothing in the way those are
+`SIGRTMAX`, `SIGRTMAX-1`, `SIGRTMAX-2`, exactly what used to be compiled in; the
+probe only matters where a number can be installed but not delivered, which is
+what `qemu-user` does to the top three (see *A signal the host accepts is not a
+signal the host delivers* in `docs/portability-and-pitfalls.md`). Every process
+of a session reaches the same answer without sharing it, because the answer is a
+property of the host. `A64_SIGRT_MAX=N` caps the search, which is how the suite
+exercises the low-RT tier on a host that has no hole of its own.
 
 ### Blocked signals are held, not applied
 

@@ -305,6 +305,10 @@ static void help(void) {
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "
                         "by)."},
+        {"A64_SIGRT_MAX=N", "Reserve the emulator's own host signals below N "
+                        "instead of at the top of the RT range (exercises the "
+                        "tier a host that cannot deliver its top RT signals is "
+                        "served by)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",
@@ -750,6 +754,11 @@ int main(int argc, char **argv)
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */
     sig_install_sigsys_net();
+    /* Which RT signals this host will let us reserve, before anything installs
+     * a handler on one or sends one. A number the host accepts but never
+     * delivers would turn the kick below -- and every other wake-up riding it
+     * -- into a hang, so it is measured rather than assumed. */
+    sig_probe_reserved();
     /* Arm the ptrace attach stop-kick net (reserved RT signal) so a later
      * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
     sig_install_kick_net();
