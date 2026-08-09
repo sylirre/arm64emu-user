@@ -45,9 +45,10 @@ make M32CC=arm-linux-gnueabihf-gcc "M32FLAGS=-static" test32-jit
 Static matters: `QEMU_LD_PREFIX` is contended between the aarch64 guest sysroot
 (which the suite needs for the dyn tests) and the armhf one (which a dynamic
 armhf emulator needs); a static emulator needs neither. That checks the emitter;
-only a real armv7 device checks that the silicon agrees with what it emits, and
-that tier's gate is a *baseline* comparison — see docs/jit.md, the interpreter
-itself fails ~54 tests there for reasons unrelated to the JIT.
+only a real armv7 device checks that the silicon agrees with what it emits.
+**Both tiers gate at zero failures in either engine** — the qemu-arm one used to
+be read against a ~44-failure baseline, but every one of those turned out to be
+an emulator bug rather than the tier's slowness (see docs/jit.md).
 
 ## Project structure
 
