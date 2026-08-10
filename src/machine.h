@@ -414,6 +414,20 @@ void guest_terminate_by_signal(CPU *c, int sig);
 
 /* syscall.c */
 void syscall_dispatch(CPU *c);
+/* Undo a syscall the emulator's own control signal interrupted: rewind to the
+ * SVC so it runs again, as the kernel resumes a syscall it stopped a task in
+ * (syscall.c has the story). A no-op unless the last dispatch really did end in
+ * EINTR with the PC still just past that SVC, so it is safe to call at any
+ * boundary that has just serviced one of those interruptions. */
+void syscall_restart_internal(CPU *c);
+/* For a blocking handler, called with the host-form *relative* timeout in hand
+ * just before it sleeps: shrinks it by what earlier attempts at this same call
+ * already waited, so restarting the call does not restart its timeout. NULL /
+ * non-positive starts the stopwatch alone -- an untimed wait, or a caller whose
+ * timeout a host timespec cannot hold. Absolute deadlines are already exact
+ * under a restart and need neither. */
+void syscall_wait_begin(struct timespec *ts);
+void syscall_wait_begin_ms(int *ms);
 
 /* sys_proc.c: resolve+load a program (shebang-aware); returns 0 or -errno.
  * Does not take ownership of argv/envp. */
@@ -456,6 +470,10 @@ int  guest_stop_pending(struct Machine *m);
 /* signal.c */
 /* Host-caught signals queued on this thread (per-thread ring; see signal.c). */
 extern __thread volatile sig_atomic_t g_sig_npend;
+/* Set when the reserved signal arrived on the emulator's own business (see
+ * sig_kick_net): the EINTR it inflicted is ours, not the guest's, and the
+ * syscall it hit is restarted rather than reported. */
+extern __thread volatile sig_atomic_t g_sig_selfintr;
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
 /* Re-mirror every disposition (call when a process becomes / stops being a ptrace

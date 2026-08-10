@@ -233,6 +233,24 @@ SYSDEF(futex) {
     }
     long r;
     if (have_ts) {
+        /* Only plain FUTEX_WAIT takes its timeout as a duration; every other op
+         * that takes one (WAIT_BITSET, the PI family, WAIT_REQUEUE_PI) takes an
+         * absolute deadline, which needs no adjusting when we restart the call.
+         * A duration does: it must not start over (syscall.c).
+         *
+         * Only when there is something to subtract, though -- the guest's
+         * timespec holds 64-bit seconds, and a 32-bit host's time_t would
+         * truncate them on the way out to a host struct timespec and back. */
+        if (op == 0) {
+            if (g_tls.sc_waited_ns) {
+                struct timespec rel = { (time_t)gts.tv_sec, (long)gts.tv_nsec };
+                syscall_wait_begin(&rel);
+                gts.tv_sec = (s64)rel.tv_sec;
+                gts.tv_nsec = (s64)rel.tv_nsec;
+            } else {
+                syscall_wait_begin(NULL);   /* nothing to shrink: only start the clock */
+            }
+        }
         /* GTimespec is exactly struct __kernel_timespec, so the guest's timeout
          * needs no conversion -- but on a 32-bit host it must not go to plain
          * SYS_futex, whose timespec is two 32-bit words there. It would read

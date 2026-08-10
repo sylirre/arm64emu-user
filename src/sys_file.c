@@ -2557,6 +2557,7 @@ SYSDEF(ppoll) {
         if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
     }
     sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
+    syscall_wait_begin(tsp);   /* see syscall.c: a restart keeps the deadline */
     int r = ppoll(pf, nfds, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     if (r < 0) return host_err();
@@ -2595,6 +2596,7 @@ SYSDEF(pselect6) {
         }
     }
     sigfd_sync(c->m);
+    syscall_wait_begin(tsp);
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     if (rr < 0) return host_err();
@@ -2726,7 +2728,9 @@ SYSDEF(epoll_pwait) {
     struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
     if (!evs) { if (ssp) pwait_mask_leave(c); return (u64)(s64)-ENOMEM; }
     sigfd_sync(c->m);
-    int r = epoll_pwait((int)a0, evs, maxevents, (int)a3, ssp);
+    int tmo = (int)a3;
+    syscall_wait_begin_ms(&tmo);
+    int r = epoll_pwait((int)a0, evs, maxevents, tmo, ssp);
     if (ssp) pwait_mask_leave(c);
     if (r < 0) { free(evs); return host_err(); }
     for (int i = 0; i < r; i++) {

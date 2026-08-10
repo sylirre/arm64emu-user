@@ -880,18 +880,15 @@ static void dethread_kick_all(s32 self) {
     closedir(d);
 }
 
-/* A cancelled de_thread must be invisible to the guest. The kick that called
- * this thread out interrupted whatever host syscall it was blocked in, and no
- * guest signal is being delivered to account for the EINTR -- so rewind to the
- * SVC and let the syscall run again, as the kernel does for its own internal
- * wakeups. The PC test is what separates "just returned from that syscall"
- * from a stale flag left by an EINTR the guest has already seen. */
-static void dethread_restart_syscall(CPU *c) {
-    if (!g_tls.sc_ret_eintr || c->pc != g_tls.sc_svc_pc + 4) return;
-    c->pc = g_tls.sc_svc_pc;
-    c->x[0] = g_tls.sc_orig_x0;
-    g_tls.sc_ret_eintr = 0;
-}
+/* A cancelled de_thread must be invisible to the guest, so the syscall the
+ * call-out interrupted runs again (syscall_restart_internal, src/syscall.c).
+ *
+ * The kick itself is already covered there, at the run-loop boundary. This is
+ * for the handlers that never see the kick at all: the ones that wait in short
+ * naps and poll guest_stop_pending themselves (rt_sigtimedwait, sigfd_fill, the
+ * IPC broker wait), which return EINTR for the call-out on their own account,
+ * with no interruption flagged against this dispatch. */
+static void dethread_restart_syscall(CPU *c) { syscall_restart_internal(c); }
 
 /* Sibling side of the rendezvous: park until the exec'ing thread commits or
  * gives up. Reached from the safepoint, with no guest translation held -- which

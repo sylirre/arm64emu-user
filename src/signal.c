@@ -67,6 +67,15 @@ static __thread PendSig sigq[SIGQ_LEN];
 static __thread volatile sig_atomic_t sigq_head, sigq_tail;
 __thread volatile sig_atomic_t g_sig_npend;
 
+/* Set by sig_kick_net for every one of the emulator's OWN uses of the reserved
+ * signal -- a tracer's attach/INTERRUPT kick, a tracee's wake of its tracer,
+ * execve's de_thread call-out. All three are deliberately delivered without
+ * SA_RESTART so they interrupt whatever host syscall the thread is blocked in;
+ * this flag is what lets the dispatcher tell that EINTR apart from one the guest
+ * is entitled to see, and restart the call instead of reporting it
+ * (syscall_restart_internal). Cleared per dispatch. */
+__thread volatile sig_atomic_t g_sig_selfintr;
+
 /* Guest rt-signal remap: guest signals 32/33 are the *guest* libc's internal
  * numbers (its SIGTIMER/SIGCANCEL) but collide with the *host* libc's own
  * internal handlers, so they can never be raised as host signals. A POSIX
@@ -413,21 +422,26 @@ void sig_install_sigsys_net(void) {
 static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_KICK_MAGIC) {
         g_ptrace_kick = 1;
+        g_sig_selfintr = 1;         /* ours: the guest must not see this EINTR */
         g_sig_npend = 1;            /* make the run loop exit its fast path */
         jit_signal_interrupt();
         return;
     }
-    if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_WAKE_MAGIC)
+    if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_WAKE_MAGIC) {
+        g_sig_selfintr = 1;
         return;   /* tracee->tracer wake: the EINTR on a blocked host
-                     wait4/waitid is the whole effect; no flags, invisible
-                     to the guest */
+                     wait4/waitid is the whole effect; no other flags, and
+                     invisible to the guest -- including the EINTR, which
+                     restarts whatever else of ours it landed on */
+    }
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == DETHREAD_MAGIC) {
-        /* execve's de_thread call-out. Nothing to record: the run loop's
+        /* execve's de_thread call-out. Nothing else to record: the run loop's
          * stop_gen check already knows what to do, and the EINTR this inflicts
          * on a blocked host syscall is the whole point -- it is what gets a
          * parked thread back to the loop to see it. The lever below is only
          * how a thread running guest code leaves the interpreter/JIT fast
          * path, which never returns for the counter's sake alone. */
+        g_sig_selfintr = 1;
         g_sig_npend = 1;
         jit_signal_interrupt();
         return;

@@ -200,6 +200,14 @@ int emu_loop(CPU *c) {
          * fast path above). Near-always-zero, like the signal check. */
         if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
 
+        /* Our own control signal interrupted a host syscall to get this thread
+         * here (the attach kick above, a tracee's wake of its tracer, execve's
+         * de_thread call-out). The kernel resumes a syscall it stops a task in;
+         * so must we, or the guest sees a wait that ended early for no reason it
+         * can observe. After the delivery above, so a guest signal's own
+         * disposition -- frame, or SA_RESTART rewind -- decides first. */
+        if (UNLIKELY(g_sig_selfintr)) syscall_restart_internal(c);
+
         /* PTRACE_SINGLESTEP: trap after exactly one stepped instruction. Gated
          * on `stepped` so arming single-step from within a stop (which resumes
          * mid-iteration) does not trap before an instruction has run. */

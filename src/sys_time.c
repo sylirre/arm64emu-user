@@ -42,6 +42,9 @@ SYSDEF(clock_nanosleep) {
     struct timespec req, rem;
     int r = ts_in(c, a2, &req);
     if (r < 0) return (u64)(s64)r;
+    /* An absolute deadline survives a restart untouched; a relative one has to
+     * be told what an earlier attempt already slept (syscall.c). */
+    syscall_wait_begin((a1 & 1 /*TIMER_ABSTIME*/) ? NULL : &req);
     int e = clock_nanosleep((clockid_t)a0, (int)a1, &req, &rem);
     if (e) {
         if (e == EINTR && a3 && !(a1 & 1 /*TIMER_ABSTIME*/)) ts_out(c, a3, &rem);
@@ -54,6 +57,7 @@ SYSDEF(nanosleep) {
     struct timespec req, rem;
     int r = ts_in(c, a0, &req);
     if (r < 0) return (u64)(s64)r;
+    syscall_wait_begin(&req);   /* a restart must not sleep the whole span again */
     if (nanosleep(&req, &rem) < 0) {
         if (errno == EINTR && a1) ts_out(c, a1, &rem);
         return host_err();

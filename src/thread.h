@@ -33,9 +33,16 @@ typedef struct {
      * thread belongs to, and a stale one means an execve replaced it. */
     u32 stop_gen;
     u32 image_gen;
-    /* Syscall-restart bookkeeping (SA_RESTART on EINTR). */
+    /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
+     * internal wakeups -- syscall_restart_internal, src/syscall.c). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;
     int sc_ret_eintr;
+    int sc_restarted;         /* this dispatch re-runs the SVC we rewound to */
+    u64 sc_wait_t0;           /* CLOCK_MONOTONIC ns this attempt began to wait
+                               * (syscall_wait_begin); 0 = not a timed wait */
+    u64 sc_waited_ns;         /* how long earlier attempts at this same call
+                               * already waited, so its timeout does not start
+                               * over every time we restart it */
     int tid;                  /* thread id (main thread tid == pid) */
     /* Alternate signal stack: per-thread, as POSIX sigaltstack(2) is a
      * thread-local attribute. Storing it process-wide corrupts delivery under

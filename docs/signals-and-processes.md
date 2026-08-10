@@ -51,6 +51,45 @@ and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`).
 
+#### The emulator's own interruptions are invisible to the guest
+
+The same rewind serves a second, less obvious purpose. The emulator reserves one
+host signal as a **control channel** (`PTRACE_KICKSIG`: a tracer's
+`ATTACH`/`SEIZE`/`INTERRUPT` kick, a tracee's wake of its tracer, `execve`'s
+`de_thread` call-out) and installs it *without* `SA_RESTART` on purpose —
+interrupting whatever host syscall a thread is blocked in is precisely how it
+gets that thread to a run-loop boundary where the request can be served.
+
+The kernel does the same to a task it stops, and then **resumes** the syscall.
+Handing the guest the `EINTR` instead makes the emulator's internals observable:
+a `sleep` cut short the moment `strace -p` attached (busybox `sleep` does not
+loop on `EINTR`, so it just exited), a `poll` that returned early, a `read` of
+nothing. Measured against the native host, the same binary under
+`SEIZE`+`INTERRUPT` saw `nanosleep -> -1 EINTR rem=2.699` where the host,
+restarting via `ERESTART_RESTARTBLOCK`, returned `0`.
+
+So `sig_kick_net` flags every one of its *own* uses of that signal
+(`g_sig_selfintr`), and a dispatch that ended in `EINTR` with that flag set
+rewinds instead of reporting (`syscall_restart_internal`, `src/syscall.c`),
+after signal delivery so a real guest signal's own disposition — a frame, or the
+`SA_RESTART` rewind above — decides first. The PC test distinguishes "just
+returned from that syscall" from a stale flag.
+
+A restarted call must not restart its **timeout** as well, or a 5 s `poll`
+interrupted at 4 s would wait 9 s. The kernel restarts against the original
+deadline, so time the task spent stopped counts against the wait; the same is
+achieved by having each timed wait declare its relative timeout
+(`syscall_wait_begin`, and `_ms` for the `poll`/`epoll` millisecond form), which
+shrinks it by however long earlier attempts already waited. Absolute deadlines —
+`clock_nanosleep(TIMER_ABSTIME)`, `FUTEX_WAIT_BITSET` and the PI futex ops — are
+exact under a plain restart and declare nothing. Handlers that instead wait in
+short naps and poll for themselves (`rt_sigsuspend`, `rt_sigtimedwait`,
+`sigfd_fill`, the IPC broker wait) never see the kick as an `EINTR` at all; the
+`de_thread` call-out they *do* report is restarted where it is cancelled
+(`dethread_restart_syscall`). Covered by `tests/ptrace/attach_no_eintr.c`, which
+asserts both halves: the sleep returns `0`, and it still ends when the guest
+asked rather than one interruption-point later.
+
 ### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
 
 `sig_timedwait` consumes one pending signal from the calling thread's capture
@@ -549,7 +588,10 @@ could land on any thread. The handler recognizes a tracer kick by a magic
 setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick` adopts
 the pending attach on the kicked thread's own link (becomes a tracee; `ATTACH`
 also reports an initial `SIGSTOP`, `SEIZE` attaches silently) or, for
-`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. A guest-directed signal of
+`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. The syscall the kick
+interrupted is then **restarted**, so attaching does not perturb the tracee —
+see "The emulator's own interruptions are invisible to the guest" above. A
+guest-directed signal of
 the same number is forwarded to the normal capture queue, so the guest keeps
 full use of it. `wait4` collects the stop from the registry (the tracee is not
 the tracer's host child), and the tracee's stop already sends the tracer a

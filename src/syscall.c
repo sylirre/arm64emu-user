@@ -6,6 +6,7 @@
  * -ENOSYS set that libcs probe and fall back from). */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include "sys.h"
@@ -434,6 +435,84 @@ static void table_init(void) {
 
 void syscall_return(CPU *c, u64 ret) { c->x[0] = ret; }
 
+/* ---- restarting a syscall the guest must not see interrupted --------------
+ *
+ * The emulator reserves one host signal for its own control channel (a tracer's
+ * ATTACH/SEIZE/INTERRUPT kick, a tracee's wake of its tracer, execve's de_thread
+ * call-out) and installs it *without* SA_RESTART on purpose: interrupting
+ * whatever host syscall a thread is blocked in is how it gets that thread back
+ * to a run-loop boundary where the request can be served.
+ *
+ * The kernel does the same thing to a task it stops -- and then resumes the
+ * syscall. Handing the guest the EINTR instead makes the emulator's internals
+ * observable: a `sleep` cut short the moment `strace -p` attached (busybox sleep
+ * does not loop on EINTR, so it just exited), a poll that returned early, a read
+ * of nothing. Measured against the native host, the same binary under
+ * SEIZE+INTERRUPT saw `nanosleep -> -1 EINTR rem=2.699` where the host, which
+ * restarts via ERESTART_RESTARTBLOCK, returned 0.
+ *
+ * So a dispatch that ended in EINTR *because of our own signal*, with no guest
+ * signal delivered to account for it, rewinds to the SVC and runs again. The PC
+ * test is what separates "just returned from that syscall" from a stale flag: a
+ * guest signal delivered at this same boundary has either built a frame (PC =
+ * handler) or already rewound for SA_RESTART (PC = the SVC), and in both cases
+ * the guest's own disposition decides, not this.
+ *
+ * A restarted call must not restart its *timeout* as well, or a 5 s poll
+ * interrupted at 4 s would wait 9 s. syscall_wait_begin lets a timed wait
+ * subtract what earlier attempts already spent; g_tls.sc_waited_ns accumulates
+ * that across however many times we rewind, and resets on the first dispatch
+ * that is not a restart. */
+void syscall_restart_internal(CPU *c) {
+    g_sig_selfintr = 0;
+    if (!g_tls.sc_ret_eintr || c->pc != g_tls.sc_svc_pc + 4) return;
+    /* Charge this attempt's wait to the accumulator before rewinding. */
+    if (g_tls.sc_wait_t0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        u64 t1 = (u64)now.tv_sec * 1000000000ULL + (u64)now.tv_nsec;
+        if (t1 > g_tls.sc_wait_t0) g_tls.sc_waited_ns += t1 - g_tls.sc_wait_t0;
+        g_tls.sc_wait_t0 = 0;
+    }
+    c->pc = g_tls.sc_svc_pc;
+    c->x[0] = g_tls.sc_orig_x0;
+    g_tls.sc_ret_eintr = 0;
+    g_tls.sc_restarted = 1;
+}
+
+/* Called by a blocking handler once it has the host-form timeout in hand, just
+ * before it sleeps. Shrinks a *relative* timeout by what earlier attempts at
+ * this same call already waited, and starts this attempt's stopwatch. Pass NULL
+ * to start the stopwatch alone -- an untimed wait, or a caller doing its own
+ * arithmetic on a timeout this cannot represent. Absolute deadlines need none of
+ * this (re-reading the same deadline is already exact) and do not call it. */
+void syscall_wait_begin(struct timespec *ts) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        g_tls.sc_wait_t0 = (u64)now.tv_sec * 1000000000ULL + (u64)now.tv_nsec;
+    if (!ts || !g_tls.sc_waited_ns) return;
+    u64 want = (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
+    u64 left = want > g_tls.sc_waited_ns ? want - g_tls.sc_waited_ns : 0;
+    ts->tv_sec = (time_t)(left / 1000000000ULL);
+    ts->tv_nsec = (long)(left % 1000000000ULL);
+}
+
+/* The same, for the millisecond timeouts of poll/epoll_wait. A negative value
+ * is "wait forever" and a zero one "do not wait": neither is shrinkable, and
+ * zero must stay zero or a restart would turn a poll into a sleep. */
+void syscall_wait_begin_ms(int *ms) {
+    struct timespec ts;
+    if (!ms || *ms <= 0) { syscall_wait_begin(NULL); return; }
+    ts.tv_sec = *ms / 1000;
+    ts.tv_nsec = (long)(*ms % 1000) * 1000000L;
+    syscall_wait_begin(&ts);
+    /* Round the remainder up: coming back a millisecond early is the very thing
+     * this machinery exists to stop. */
+    u64 left = ((u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec + 999999ULL)
+               / 1000000ULL;
+    *ms = (int)left;
+}
+
 void syscall_dispatch(CPU *c) {
     static int initialized;
     if (!initialized) { table_init(); initialized = 1; }
@@ -456,6 +535,15 @@ void syscall_dispatch(CPU *c) {
     g_tls.sc_svc_pc = c->pc - 4;
     g_tls.sc_orig_x0 = a0;
     g_tls.sc_nr = nr;
+    /* Only an interruption that lands from here on interrupted *this* call; one
+     * already flagged was serviced, or is about to be, at a boundary. */
+    g_sig_selfintr = 0;
+    g_tls.sc_wait_t0 = 0;
+    /* A call reached by rewinding keeps the wait it has already served; any
+     * other dispatch is a fresh call, including the next turn of a guest loop
+     * around this very SVC. */
+    if (g_tls.sc_restarted) g_tls.sc_restarted = 0;
+    else                    g_tls.sc_waited_ns = 0;
 
     /* --strace-full: snapshot string/array args before the handler runs, since
      * execve/execveat replace the address space on success. strace_pre fills in
@@ -496,9 +584,6 @@ void syscall_dispatch(CPU *c) {
         ret = (u64)(s64)-ENOSYS;
     }
 
-    /* Note EINTR so a pending signal with SA_RESTART can rewind the SVC. */
-    g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
-
     /* ptrace syscall-exit stop: publish the result in x0 so the tracer's
      * GETREGSET sees it, then let it inspect or override the return value. An
      * auto-attached fork child skips one exit stop (the clone it was born from,
@@ -512,6 +597,12 @@ void syscall_dispatch(CPU *c) {
             ret = c->x[0];
         }
     }
+
+    /* Note EINTR so a pending signal with SA_RESTART -- or one of the emulator's
+     * own interruptions (syscall_restart_internal) -- can rewind the SVC. Read
+     * after the exit stop above, so a tracer that overrode the return value
+     * decides whether this still counts as interrupted. */
+    g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
 
     if (m->strace) {
         char namebuf[32];
