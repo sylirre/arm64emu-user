@@ -521,6 +521,19 @@ void sig_install_kick_net(void);
  * answer, so the numbers agree across the session without being shared. */
 void sig_probe_reserved(void);
 
+/* Register each module's pthread_atfork triple, so a mutex a sibling thread
+ * holds when the guest forks does not cross into the child locked and
+ * ownerless. Called once by main(), before any second thread exists; the
+ * registrations are inherited by every process of the session. Each module
+ * implements its own (mem.c carries the reasoning); order between them does
+ * not matter, because no two of these locks are ever held at once across
+ * module boundaries -- where locks do nest, they nest inside one module and
+ * that module's handler takes them outermost-first. */
+void mem_atfork_init(void);
+void sig_atfork_init(void);
+void netlink_atfork_init(void);
+void procfs_atfork_init(void);
+
 /* elf.c: load `guest_path` (canonical guest path) into the address space and
  * prepare the initial stack. Returns 0 or -errno. */
 int load_elf(struct Machine *m, const char *guest_path,

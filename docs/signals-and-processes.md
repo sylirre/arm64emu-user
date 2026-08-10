@@ -240,6 +240,41 @@ A fork-shaped `clone` maps to a host `fork()`; the entire interpreter state (pag
 table → host pages, fd table, register file, credentials) is inherited by copy.
 `CLONE_CHILD_SETTID`/`CLEARTID`/`PARENT_SETTID` bookkeeping is applied.
 
+#### Every process-local mutex must be fork-safe
+
+`fork(2)` duplicates **the calling thread alone**. A mutex some *other* guest
+thread held at that instant therefore crosses into the child locked, owned by a
+thread that does not exist there, and the next acquirer waits forever. This is
+not theoretical: `tests/c/timers.c` forks while a 5 ms timer is live and libc's
+`SIGEV_THREAD` helper thread is running, and the child wedged in
+`mem_ifetch_slow` → `translate()` → `as_lock()` on a lock its vanished sibling
+still owned — intermittently, roughly one run in fifteen, and only on a host
+slow enough to widen the window.
+
+So every module owning a process-local mutex registers a `pthread_atfork`
+triple (`main()` calls them once, before a second thread can exist):
+
+* **prepare** takes the lock. Not only so the child inherits it free — it also
+  guarantees no sibling is *mid-mutation*, so what the child inherits is a
+  settled page table rather than a half-rewritten one.
+* **parent** releases it.
+* **child** re-*initializes* it. It must not simply unlock: `fork` gives the
+  surviving thread a new tid, so a recursive mutex's recorded owner no longer
+  matches the only thread there.
+
+Where two of these locks nest, both belong to one module and that module's
+handler takes them **outermost-first** (`casp16` before `as_lock` in `mem.c`, a
+CASP retry being able to miss the D-TLB; `pf_lock` before `est_lock` in
+`sys_procfs.c`). Stating the order in one handler is deliberate — splitting them
+across two registrations would leave it to the reverse-of-registration rule.
+
+Two consequences worth keeping in mind. A fork now costs seven uncontended lock
+round-trips, which is small but not free on fork-heavy guests. And **no code
+path may fork while already holding one of these locks**: `prepare` would block
+on the non-recursive ones forever. Nothing does today — the guest's `fork`
+syscall is dispatched with none of them held — but a new one would fail this
+way, silently and only under load.
+
 ### vfork vs threads — the distinguishing flag is `CLONE_THREAD`
 
 A guest thread and a vfork both set `CLONE_VM`, so `CLONE_VM` alone cannot decide

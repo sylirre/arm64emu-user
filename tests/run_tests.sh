@@ -47,9 +47,13 @@ run_diff() {   # run_diff <name> <binary> [args...]
         skip=$((skip+1)); echo "SKIP $name (not in the test pack)"; return
     fi
     # timeout (inside oracle_run for the reference side): a hanging test must
-    # FAIL (rc 124 mismatch), not wedge the suite
+    # FAIL (rc 124 mismatch), not wedge the suite. -k is what makes that true:
+    # the emulator catches every signal it can, to forward it to the guest, so
+    # a wedged one absorbs the SIGTERM and plain `timeout` then waits on it
+    # forever -- which is how one deadlocked c/timers(dyn) child stopped a
+    # whole device run instead of failing one row.
     out_q=$(oracle_run "$@" 2>/dev/null); rc_q=$?
-    out_e=$(timeout 60 "$EMU" / "$@" 2>/dev/null); rc_e=$?
+    out_e=$(timeout -k 5 60 "$EMU" / "$@" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS $name"
     else
@@ -137,7 +141,7 @@ for cfile in tests/c/*.c; do
         cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
         cp "$bd" /tmp/t.bin 2>/dev/null || true
         out_q=$(oracle_run0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
@@ -172,7 +176,7 @@ elif [ -x tests/c/l2s_rename_static.bin ]; then
         rec_have tests/c/l2s_rename_static.bin $mode || {
             skip=$((skip+1)); echo "SKIP $label (not in the test pack)"; continue; }
         out_q=$(oracle_run tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
-        out_e=$(timeout 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
+        out_e=$(timeout -k 5 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS $label"
         else
@@ -193,7 +197,7 @@ for base in shm_sysv shm_stat; do
     rec_have "$SHMBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(file-tier) (not in the test pack)"; continue; }
     out_q=$(oracle_run "$SHMBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_SHM_FORCE_FILE=1 timeout 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
+    out_e=$(A64_SHM_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(file-tier)"
     else
@@ -212,7 +216,7 @@ if [ -x "$GRBIN" ] && ! rec_have "$GRBIN"; then
     skip=$((skip+1)); echo "SKIP c/getrandom(dev-tier) (not in the test pack)"
 elif [ -x "$GRBIN" ]; then
     out_q=$(oracle_run "$GRBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_GETRANDOM_FORCE_DEV=1 timeout 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
+    out_e=$(A64_GETRANDOM_FORCE_DEV=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/getrandom(dev-tier)"
     else
@@ -566,7 +570,7 @@ fi
 # the registry is shared across the two invocations.
 if [ -x "$ALPINE/bin/busybox" ]; then
     rm -f "$ALPINE/tmp/apid"
-    timeout 60 "$EMU" --shared-proc "$ALPINE" /bin/busybox sh -c \
+    timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" /bin/busybox sh -c \
         'sleep 30 & echo $! > /tmp/apid; wait' &
     sp_bg=$!
     apid=""; n=0
@@ -741,7 +745,7 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/status_probe.bin \
             tests/fixtures/status_probe.c 2>/dev/null; then
-        got=$(timeout 60 "$EMU" / tests/fixtures/status_probe.bin 2>/dev/null)
+        got=$(timeout -k 5 60 "$EMU" / tests/fixtures/status_probe.bin 2>/dev/null)
         expect=$'ign_hup=1 cgt_hup=0 cgt_term=1 ign_term=0\nblk_usr1=1 blk_usr2=0 pnd_usr1=1 pnd_usr2=0 shd_usr1=0\nunblk_usr1=0\nuntraced=0\ntracer_is_me=1\nnnp0=0\nnnp1=1\nsec0=0 f0=0\ninstall1=0\nsec1=2 f1=1\ninstall2=0\nsec2=2 f2=2\nkid_sec=2 kid_f=2\nx86lines=0\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: status_probe"
         else
@@ -767,7 +771,7 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/rlimits.bin \
             tests/fixtures/rlimits.c 2>/dev/null; then
-        got=$(timeout 60 "$EMU" / tests/fixtures/rlimits.bin 2>/dev/null)
+        got=$(timeout -k 5 60 "$EMU" / tests/fixtures/rlimits.bin 2>/dev/null)
         expect=$'set=1\nreadback=1\nprlimit=1\nprocfs=1\nunder=1\nover=1\nreusable=1\nraise_hard=1\nfork_kept=1\nexec_kept=1\nexec_limits=1\nexec_enforced=1\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: rlimits"
         else
@@ -793,9 +797,9 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O1 -o tests/fixtures/cu_writeback.bin \
             tests/fixtures/cu_writeback.c $A64_TESTLIBS 2>/dev/null; then
-        cu_i=$(timeout 60 "$EMU" / tests/fixtures/cu_writeback.bin 2>/dev/null)
-        cu_p=$(timeout 60 "$EMU" --no-predecode / tests/fixtures/cu_writeback.bin 2>/dev/null)
-        cu_j=$(timeout 60 "$EMU" --jit / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        cu_i=$(timeout -k 5 60 "$EMU" / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        cu_p=$(timeout -k 5 60 "$EMU" --no-predecode / tests/fixtures/cu_writeback.bin 2>/dev/null)
+        cu_j=$(timeout -k 5 60 "$EMU" --jit / tests/fixtures/cu_writeback.bin 2>/dev/null)
         if [ -n "$cu_i" ] && [ "$cu_i" = "$cu_p" ] && [ "$cu_i" = "$cu_j" ]; then
             pass=$((pass+1)); echo "PASS fixture: cu_writeback (engines agree)"
         else
@@ -828,7 +832,7 @@ if [ -n "$AGCC" ]; then
        "$AGCC" -nostdlib -static -DNANGATE -o tests/fixtures/icount_nan.bin \
             tests/fixtures/icount_gate.S 2>/dev/null; then
         ic_of() {  # $1 = emulator flags, $2 = image
-            timeout 60 "$EMU" $1 / "$2" 2>&1 >/dev/null \
+            timeout -k 5 60 "$EMU" $1 / "$2" 2>&1 >/dev/null \
                 | sed -n 's/.*icount=\([0-9]*\).*/\1/p' | tail -1
         }
         ic_bad=""
@@ -896,7 +900,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/userns_race.bin \
             tests/fixtures/userns_race.c 2>/dev/null; then
         expect=$'R1 ok=1\nR2 ok=1\nR3 ok=1\nR4 ok=1'
-        got=$(timeout 120 "$EMU" / tests/fixtures/userns_race.bin 2>/dev/null)
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/userns_race.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: userns_race"
         else
             fail=$((fail+1)); echo "FAIL fixture: userns_race"
@@ -926,7 +930,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mtexec.bin \
             tests/fixtures/mtexec.c $A64_TESTLIBS 2>/dev/null; then
         expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nmask_clean=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
-        got=$(timeout 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/mtexec.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
         else
             fail=$((fail+1)); echo "FAIL fixture: mtexec"
@@ -950,7 +954,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/mainexit.bin \
             tests/fixtures/mainexit.c $A64_TESTLIBS 2>/dev/null; then
         expect=$'tasks=1 threads=1 leader_signalable=1\nview_exit=1\nexec_after_leader=1\ngroup_after_leader=1\nstress_exit=1 stress_exec=1\ndone'
-        got=$(timeout 300 "$EMU" / tests/fixtures/mainexit.bin 2>/dev/null)
+        got=$(timeout -k 5 300 "$EMU" / tests/fixtures/mainexit.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mainexit"
         else
             fail=$((fail+1)); echo "FAIL fixture: mainexit"
@@ -974,7 +978,7 @@ for base in memfd_seals mfdsync mmap_eof; do
     rec_have "$MBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(memfd-tier) (not in the test pack)"; continue; }
     out_q=$(oracle_run "$MBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_MEMFD_FORCE_FILE=1 timeout 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
+    out_e=$(A64_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(memfd-tier)"
     else
@@ -994,7 +998,7 @@ if [ -x "$MEBIN" ] && ! rec_have "$MEBIN"; then
     skip=$((skip+1)); echo "SKIP c/mmap_eof(pipe-probe) (not in the test pack)"
 elif [ -x "$MEBIN" ]; then
     out_q=$(oracle_run "$MEBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_PAGEPROBE_FORCE_PIPE=1 timeout 60 "$EMU" / "$MEBIN" 2>/dev/null); rc_e=$?
+    out_e=$(A64_PAGEPROBE_FORCE_PIPE=1 timeout -k 5 60 "$EMU" / "$MEBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/mmap_eof(pipe-probe)"
     else
@@ -1018,7 +1022,7 @@ if [ ! -x tests/fixtures/ownfdexec.bin ] && [ -n "$AGCC" ]; then
 fi
 if [ -x tests/fixtures/ownfdexec.bin ]; then
     expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'
-    got=$(timeout 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: ownfdexec"
     else
         fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
@@ -1041,7 +1045,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/procfs_hostleak.bin \
             tests/fixtures/procfs_hostleak.c 2>/dev/null; then
         expect=$'no_host_view=1\naddrspace_denied=1\ndone'
-        got=$(SECRET=emulator-only timeout 300 "$EMU" / \
+        got=$(SECRET=emulator-only timeout -k 5 300 "$EMU" / \
               tests/fixtures/procfs_hostleak.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_hostleak"
         else
@@ -1129,13 +1133,13 @@ if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
             # The substituted socket has no kernel behind it, so it acks every
             # non-dump request whether or not a namespace was faked.
             want_no_netns="acked"
-            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout 60 "$EMU" / \
+            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout -k 5 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         else
             # The switch must be *absent*, not empty -- these A64_* switches are
             # presence-tested (getenv), so FOO= would select the fallback.
             want_no_netns="passed-through|acked"
-            got=$(env -u A64_NETLINK_FORCE_BLOCK timeout 60 "$EMU" / \
+            got=$(env -u A64_NETLINK_FORCE_BLOCK timeout -k 5 60 "$EMU" / \
                   tests/fixtures/netns_ack.bin 2>/dev/null)
         fi
         # Fold the one host-dependent line out, then require an exact match on
@@ -1267,7 +1271,7 @@ for pt in tests/ptrace/*.c; do
     fi
     for eng in "" "--jit"; do
         lbl="ptrace: $(basename "$pt" .c)${eng:+ (jit)}"
-        out=$(timeout 30 "$EMU" $eng / "$ptbin" 2>/dev/null); rc=$?
+        out=$(timeout -k 5 30 "$EMU" $eng / "$ptbin" 2>/dev/null); rc=$?
         if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
             pass=$((pass+1)); echo "PASS $lbl"
         else
@@ -1288,7 +1292,7 @@ done
 # A64_SIGRT_MAX forces that tier on a host with no hole of its own: one ptrace
 # test for the kick, the timer test for the carriers.
 if [ -x tests/ptrace/basic.bin ]; then
-    out=$(A64_SIGRT_MAX=48 timeout 30 "$EMU" / tests/ptrace/basic.bin 2>/dev/null); rc=$?
+    out=$(A64_SIGRT_MAX=48 timeout -k 5 30 "$EMU" / tests/ptrace/basic.bin 2>/dev/null); rc=$?
     if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
         pass=$((pass+1)); echo "PASS ptrace: basic(low-rt-tier)"
     else
@@ -1303,7 +1307,7 @@ if [ -x "$TMBIN" ] && ! rec_have "$TMBIN"; then
     skip=$((skip+1)); echo "SKIP c/timers(low-rt-tier) (not in the test pack)"
 elif [ -x "$TMBIN" ]; then
     out_q=$(oracle_run "$TMBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_SIGRT_MAX=48 timeout 60 "$EMU" / "$TMBIN" 2>/dev/null); rc_e=$?
+    out_e=$(A64_SIGRT_MAX=48 timeout -k 5 60 "$EMU" / "$TMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/timers(low-rt-tier)"
     else
@@ -1339,9 +1343,9 @@ if [ -n "$AGCC" ]; then
                 run_diff "insnfuzz: conform (seed $seed)" "$ifb" conform "$seed" 15200
             done
         fi
-        c_pd=$(timeout 120 "$EMU" / "$ifb" chaos 1 15000 2>/dev/null)
-        c_np=$(timeout 120 "$EMU" --no-predecode / "$ifb" chaos 1 15000 2>/dev/null)
-        c_jit=$(timeout 120 "$EMU" --jit / "$ifb" chaos 1 15000 2>/dev/null)
+        c_pd=$(timeout -k 5 120 "$EMU" / "$ifb" chaos 1 15000 2>/dev/null)
+        c_np=$(timeout -k 5 120 "$EMU" --no-predecode / "$ifb" chaos 1 15000 2>/dev/null)
+        c_jit=$(timeout -k 5 120 "$EMU" --jit / "$ifb" chaos 1 15000 2>/dev/null)
         if [ -n "$c_pd" ] && [ "$c_pd" = "$c_np" ] && [ "$c_pd" = "$c_jit" ]; then
             pass=$((pass+1)); echo "PASS insnfuzz: chaos (engines agree)"
         else
@@ -1357,9 +1361,9 @@ if [ -n "$AGCC" ]; then
         # stub can exercise. Each block gets a fresh page so the JIT's
         # self-modifying-code thrash guard does not quietly demote it to the
         # interpreter and leave the comparison comparing nothing.
-        s_pd=$(timeout 180 "$EMU" / "$ifb" seq 3 6000 2>/dev/null)
-        s_np=$(timeout 180 "$EMU" --no-predecode / "$ifb" seq 3 6000 2>/dev/null)
-        s_jit=$(timeout 180 "$EMU" --jit / "$ifb" seq 3 6000 2>/dev/null)
+        s_pd=$(timeout -k 5 180 "$EMU" / "$ifb" seq 3 6000 2>/dev/null)
+        s_np=$(timeout -k 5 180 "$EMU" --no-predecode / "$ifb" seq 3 6000 2>/dev/null)
+        s_jit=$(timeout -k 5 180 "$EMU" --jit / "$ifb" seq 3 6000 2>/dev/null)
         if [ -n "$s_pd" ] && [ "$s_pd" = "$s_np" ] && [ "$s_pd" = "$s_jit" ]; then
             pass=$((pass+1)); echo "PASS insnfuzz: seq (engines agree)"
         else

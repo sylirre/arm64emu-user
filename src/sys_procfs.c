@@ -77,6 +77,26 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Fork safety, as in mem.c. Both of this file's locks go in one triple and in
+ * this order because they nest -- an estimate writer on the refresh path
+ * already holds pf_lock -- so `prepare` has to take the outer one first or it
+ * can deadlock against a thread coming the other way. */
+static void pf_atfork_prepare(void) {
+    pthread_mutex_lock(&pf_lock);
+    pthread_mutex_lock(&est_lock);
+}
+static void pf_atfork_parent(void) {
+    pthread_mutex_unlock(&est_lock);
+    pthread_mutex_unlock(&pf_lock);
+}
+static void pf_atfork_child(void) {
+    pthread_mutex_init(&est_lock, NULL);
+    pthread_mutex_init(&pf_lock, NULL);
+}
+void procfs_atfork_init(void) {
+    pthread_atfork(pf_atfork_prepare, pf_atfork_parent, pf_atfork_child);
+}
+
 /* Tail after any "this process" spelling -- self, own pid, thread-self, or one
  * of our threads' task/<tid> -- else NULL. See proc_self_tail (path.c). */
 static const char *self_tail(const char *canon) {

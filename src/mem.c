@@ -103,8 +103,55 @@ static void as_lock_init(void) {
     pthread_mutex_init(&g_as_lock, &a);
     pthread_mutexattr_destroy(&a);
 }
+/* First caller wins; both callers (as_init and the atfork registration) run
+ * before this process has a second thread. */
+static void as_init_lock_once(void) {
+    static int lock_ready;
+    if (!lock_ready) { as_lock_init(); lock_ready = 1; }
+}
 void as_lock(void)   { pthread_mutex_lock(&g_as_lock); }
 void as_unlock(void) { pthread_mutex_unlock(&g_as_lock); }
+
+/* ---- fork safety ----
+ *
+ * fork(2) duplicates the calling thread alone, so a mutex a *sibling* held at
+ * that instant crosses into the child locked, owned by a thread that does not
+ * exist there -- and the next acquirer waits forever. It cost a real hang:
+ * tests/c/timers.c forks while a 5 ms timer is live and libc's SIGEV_THREAD
+ * helper thread is running, and the child wedged in mem_ifetch_slow ->
+ * translate() -> as_lock() on a lock its dead sibling still owned.
+ *
+ * The cure is the standard pthread_atfork triple, one per module that owns a
+ * process-local mutex. `prepare` takes the lock, which also guarantees no
+ * sibling is mid-mutation, so the child inherits consistent state and not just
+ * a free lock. The child *re-initializes* rather than unlocks: fork gives the
+ * surviving thread a new tid, so a recursive mutex's recorded owner no longer
+ * matches it and unlocking is not ours to do.
+ *
+ * Both of this file's locks are handled here, in one triple, because they
+ * nest: a CASP retry can miss the D-TLB and take as_lock underneath
+ * casp16_mutex_lock. Acquiring them outermost-first is what keeps `prepare`
+ * from deadlocking against a thread holding casp16 and waiting for as_lock,
+ * and doing it in one handler states that order instead of leaving it to the
+ * reverse-of-registration rule between two separate ones. */
+static void mem_atfork_prepare(void) {
+    pthread_mutex_lock(&g_casp16_lock);
+    as_lock();
+}
+static void mem_atfork_parent(void) {
+    as_unlock();
+    pthread_mutex_unlock(&g_casp16_lock);
+}
+static void mem_atfork_child(void) {
+    as_lock_init();
+    pthread_mutex_init(&g_casp16_lock, NULL);
+}
+void mem_atfork_init(void) {
+    /* as_init() installs g_as_lock lazily and main() may register before the
+     * first address space exists, so make sure there is a lock to take. */
+    as_init_lock_once();
+    pthread_atfork(mem_atfork_prepare, mem_atfork_parent, mem_atfork_child);
+}
 
 /* ---- page table ---- */
 
@@ -123,8 +170,7 @@ static void as_fields_init(AddrSpace *as) {
 }
 
 void as_init(AddrSpace *as) {
-    static int lock_ready;
-    if (!lock_ready) { as_lock_init(); lock_ready = 1; }
+    as_init_lock_once();
     memset(as, 0, sizeof *as);
     as_fields_init(as);
     as->nthreads = 1;

@@ -762,6 +762,15 @@ int main(int argc, char **argv)
     /* Arm the ptrace attach stop-kick net (reserved RT signal) so a later
      * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
     sig_install_kick_net();
+    /* Make every process-local mutex fork-safe before there is a second thread
+     * to hold one. A guest that forks while a sibling thread is inside one of
+     * these would otherwise hand the child a locked, ownerless mutex; mem.c
+     * carries the full story and the hang it cost. */
+    mem_atfork_init();
+    sig_atfork_init();
+    netlink_atfork_init();
+    procfs_atfork_init();
+    jit_atfork_init();
 
 #ifndef ANDROID_JNI
     // Suppress seccomp notice on Android JNI component builds.

@@ -180,6 +180,17 @@ static JStat g_jstat[JSTAT_SLOTS];
 static u64 g_jstat_lost, g_jstat_icount;
 static pthread_mutex_t g_jstat_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Fork safety, as in mem.c. Only A64_JIT_STATS runs takes this, but a lock
+ * held by a sibling at fork is inherited locked and ownerless whether or not
+ * it is on a hot path, and a wedged child under the one env var that exists to
+ * diagnose the JIT would be a poor place to find that out. */
+static void jstat_atfork_prepare(void) { pthread_mutex_lock(&g_jstat_mu); }
+static void jstat_atfork_parent(void)  { pthread_mutex_unlock(&g_jstat_mu); }
+static void jstat_atfork_child(void)   { pthread_mutex_init(&g_jstat_mu, NULL); }
+void jit_atfork_init(void) {
+    pthread_atfork(jstat_atfork_prepare, jstat_atfork_parent, jstat_atfork_child);
+}
+
 static void jstat_add(JStat *tab, u32 insn, u64 n, u64 *lost) {
     u32 h = (insn ^ (insn >> 13) ^ (insn >> 25)) & (JSTAT_SLOTS - 1);
     for (u32 i = 0; i < 8; i++) {

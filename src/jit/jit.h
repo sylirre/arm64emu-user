@@ -73,4 +73,8 @@ const void *jit_fault_fixup(const void *pc);
  * flush the A64_JIT_STATS report if it is enabled. No-op otherwise. */
 void jit_stats_flush(void);
 
+/* Register this file's pthread_atfork triple (the A64_JIT_STATS lock); see the
+ * note beside the others in machine.h. */
+void jit_atfork_init(void);
+
 #endif /* A64_JIT_H */

@@ -270,6 +270,17 @@ SYSDEF(tgkill) {
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 static u64 sfd_next_id = 1;   /* under sfd_lock; identifies a description */
 
+/* Fork safety: a lock a sibling thread held when the guest forked crosses into
+ * the child locked and ownerless. See the long note in mem.c -- prepare takes
+ * it (so the child also inherits a settled table, not a half-written one), the
+ * child re-initializes rather than unlocks. */
+static void sfd_atfork_prepare(void) { pthread_mutex_lock(&sfd_lock); }
+static void sfd_atfork_parent(void)  { pthread_mutex_unlock(&sfd_lock); }
+static void sfd_atfork_child(void)   { pthread_mutex_init(&sfd_lock, NULL); }
+void sig_atfork_init(void) {
+    pthread_atfork(sfd_atfork_prepare, sfd_atfork_parent, sfd_atfork_child);
+}
+
 /* Slot of a live signalfd, or -1. A slot whose fd number was reused behind our
  * back is detected by the recorded inode and dropped, so an innocent fd is not
  * intercepted. This check is weaker than it looks -- every anon_inode file

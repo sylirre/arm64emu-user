@@ -186,9 +186,9 @@ oracle_run() {   # oracle_run <binary> [args...]
     fi
     if [ -n "${A64_RECORD:-}" ]; then
         if [ "$ORACLE_KIND" = qemu ]; then
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@")
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@")
         else
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$@")
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@")
         fi
         _rr=$?
         rec_save "$(rec_key "$@")" "$_rr" "$_ro"
@@ -196,9 +196,9 @@ oracle_run() {   # oracle_run <binary> [args...]
         return $_rr
     fi
     if [ "$ORACLE_KIND" = qemu ]; then
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
     else
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" "$@"
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@"
     fi
 }
 
@@ -213,10 +213,10 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
     fi
     if [ -n "${A64_RECORD:-}" ]; then
         if [ "$ORACLE_KIND" = qemu ]; then
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
                 "$ORACLE_QEMU" -0 "$_a0" "$@")
         else
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
                 bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@")
         fi
         _rr=$?
@@ -225,10 +225,10 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
         return $_rr
     fi
     if [ "$ORACLE_KIND" = qemu ]; then
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
             "$ORACLE_QEMU" -0 "$_a0" "$@"
     else
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout "${ORACLE_TIMEOUT:-60}" \
+        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
             bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@"
     fi
 }
