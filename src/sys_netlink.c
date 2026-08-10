@@ -68,14 +68,12 @@ static pthread_mutex_t nl_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Fork safety, as in mem.c: prepare takes the lock so the child inherits it
  * free and the fd table settled; the child re-initializes it, because after
  * fork the surviving thread's tid no longer matches the recorded owner. */
-/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
- * the held-lock mask must not move (machine.h, "fork safety"). */
-static void nl_atfork_prepare(void) { pthread_mutex_lock(&nl_lock); }
-static void nl_atfork_parent(void)  { pthread_mutex_unlock(&nl_lock); }
-static void nl_atfork_child(void)   { pthread_mutex_init(&nl_lock, NULL); }
-void netlink_atfork_init(void) {
-    pthread_atfork(nl_atfork_prepare, nl_atfork_parent, nl_atfork_child);
-}
+/* Raw pthread calls on purpose: main()'s atfork handlers call these from
+ * inside fork(), where the held-lock mask must not move (machine.h,
+ * "fork safety"). */
+void netlink_locks_take(void)   { pthread_mutex_lock(&nl_lock); }
+void netlink_locks_drop(void)   { pthread_mutex_unlock(&nl_lock); }
+void netlink_locks_reinit(void) { pthread_mutex_init(&nl_lock, NULL); }
 
 /* --- fake-fd table (call with nl_lock held) --- */
 

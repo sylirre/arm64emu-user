@@ -539,24 +539,35 @@ void sig_install_kick_net(void);
  * answer, so the numbers agree across the session without being shared. */
 void sig_probe_reserved(void);
 
-/* Register each module's pthread_atfork triple, so a mutex a sibling thread
- * holds when the guest forks does not cross into the child locked and
- * ownerless. Called once by main(), before any second thread exists; the
- * registrations are inherited by every process of the session. Each module
- * implements its own (mem.c carries the reasoning).
+/* Fork safety, part one: a mutex a sibling thread holds when the guest forks
+ * must not cross into the child locked and ownerless. main() installs ONE
+ * pthread_atfork triple whose handlers walk these per-module entry points in an
+ * explicit order -- take them outermost-first, drop them innermost-first,
+ * re-initialize in the child (see emu_atfork_prepare in main.c, and mem.c for
+ * the reasoning and the hang it cost).
  *
- * The ORDER of these calls is load-bearing, so do not sort them. prepare
- * handlers run in reverse order of registration, so registering mem first is
- * what makes its handler take as_lock *last* -- and as_lock is the innermost of
- * the seven: it is taken *under* nl_lock (and any other) whenever a critical
- * section touches guest memory, because copy_to/from_guest -> translate() takes
- * it on a D-TLB miss. sys_netlink.c's nl_take_request does exactly that.
- * Acquiring as_lock earlier in prepare would invert that order and let a fork
- * deadlock against a sibling holding nl_lock and waiting for as_lock. */
-void mem_atfork_init(void);      /* first: as_lock is the innermost lock */
-void sig_atfork_init(void);
-void netlink_atfork_init(void);
-void procfs_atfork_init(void);
+ * The order is the lock hierarchy and belongs to the whole emulator, not to any
+ * one module, which is why it is written once in main.c rather than left to
+ * emerge from the sequence of five registrations: `pthread_atfork` runs prepare
+ * handlers in *reverse* order of registration, so five separate triples encoded
+ * the hierarchy in the order of five adjacent calls, where sorting them was
+ * enough to deadlock a fork. as_lock is the innermost lock of all -- any
+ * critical section that touches guest memory takes it underneath its own lock,
+ * because copy_to/from_guest -> translate() takes it on a D-TLB miss, which
+ * sys_netlink.c's nl_take_request does on every guest request. */
+void mem_locks_init(void);       /* create g_as_lock before the registration */
+void mem_locks_take(void);       /* casp16 then as_lock: the innermost pair */
+void mem_locks_drop(void);
+void mem_locks_reinit(void);
+void sig_locks_take(void);       /* sfd_lock */
+void sig_locks_drop(void);
+void sig_locks_reinit(void);
+void netlink_locks_take(void);   /* nl_lock */
+void netlink_locks_drop(void);
+void netlink_locks_reinit(void);
+void procfs_locks_take(void);    /* pf_lock then est_lock */
+void procfs_locks_drop(void);
+void procfs_locks_reinit(void);
 
 /* ---- fork safety: the rule those triples impose --------------------------
  *

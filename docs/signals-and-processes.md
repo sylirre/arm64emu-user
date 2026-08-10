@@ -290,8 +290,9 @@ not theoretical: `tests/c/timers.c` forks while a 5 ms timer is live and libc's
 still owned — intermittently, roughly one run in fifteen, and only on a host
 slow enough to widen the window.
 
-So every module owning a process-local mutex registers a `pthread_atfork`
-triple (`main()` calls them once, before a second thread can exist):
+So `main()` installs one `pthread_atfork` triple, once, before a second thread
+can exist; its handlers walk every module's locks (`mem_locks_take()`,
+`sig_locks_take()`, … in `machine.h`):
 
 * **prepare** takes the lock. Not only so the child inherits it free — it also
   guarantees no sibling is *mid-mutation*, so what the child inherits is a
@@ -301,33 +302,41 @@ triple (`main()` calls them once, before a second thread can exist):
   surviving thread a new tid, so a recursive mutex's recorded owner no longer
   matches the only thread there.
 
-Where two locks of one module nest, that module's handler takes them
-**outermost-first** in a single triple (`casp16` before `as_lock` in `mem.c`, a
-CASP retry being able to miss the D-TLB; `pf_lock` before `est_lock` in
-`sys_procfs.c`). Stating the order in one handler is deliberate — splitting them
-across two registrations would leave it to the reverse-of-registration rule.
+##### One triple, because the order is the lock hierarchy
 
-##### The order of the registrations is load-bearing
+`prepare` must acquire in an order compatible with the order real code nests
+these locks in, or a fork deadlocks against a sibling coming the other way:
+`prepare` holds an inner lock and waits for an outer one while the sibling holds
+the outer and waits for the inner. So the acquisition order *is* the emulator's
+lock hierarchy, and `emu_atfork_prepare` in `main.c` is the one place it is
+written down:
 
-Nesting is **not** confined to a single module, and the arrangement that makes
-that safe is easy to destroy by accident. `as_lock` is the innermost of the
-seven: any critical section that touches guest memory takes it underneath its
-own lock, because `copy_to/from_guest` → `translate()` takes it on a D-TLB miss.
-`sys_netlink.c`'s `nl_take_request` does exactly that — it builds the reply while
-holding `nl_lock`, reading the guest's request out of guest memory — and a
-sibling thread mapping or unmapping anything bumps the address-space generation,
-which invalidates that thread's D-TLB and *guarantees* the miss.
+```
+jit stats  →  pf_lock → est_lock  →  nl_lock  →  sfd_lock  →  casp16 → as_lock
+outermost                                                            innermost
+```
 
-`pthread_atfork` runs prepare handlers in **reverse** order of registration, so
-registering `mem` **first** in `main()` is what makes its handler take `as_lock`
-**last**, matching the order real code uses. Registering it later inverts that:
-`prepare` would hold `as_lock` and wait for `nl_lock` while the netlink thread
-holds `nl_lock` and waits for `as_lock`, and the fork deadlocks. Sorting those
-five adjacent `*_atfork_init()` calls is enough to do it, which is why they carry
-a comment saying not to. `tests/fixtures/forklock.c` pins both this and the
-missing-triple case; verified by breaking each in turn — inverted order hangs at
-0.2 s of CPU for a 15 s wall clock, and removing `mem`'s triple hangs 3 of 3
-runs, where `timers.c` caught the same bug about one run in fifteen.
+`as_lock` is innermost because **any** critical section that touches guest memory
+takes it underneath its own lock: `copy_to/from_guest` → `translate()` takes it
+on a D-TLB miss, and `sys_netlink.c`'s `nl_take_request` does that on every guest
+request while holding `nl_lock` — a sibling mapping or unmapping anything bumps
+the address-space generation, which invalidates that thread's D-TLB and
+*guarantees* the miss. `casp16` sits just above it (a CASP retry can miss the
+D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`).
+
+This began as five separate triples, one per module. That worked, but it encoded
+the hierarchy in the *reverse* order of five adjacent `*_atfork_init()` calls —
+`pthread_atfork` runs prepare handlers in reverse order of registration — so
+sorting five lines that looked like a list of equals was enough to deadlock every
+fork, with nothing at the call site to say so. One triple states the order
+outright instead.
+
+`tests/fixtures/forklock.c` is the guard, and it earns that description: with
+`mem`'s locks left out of the walk it hangs 3 runs of 3 — where `timers.c` caught
+the same bug about one run in fifteen — and with the walk inverted it deadlocks in
+5 runs of 6 (15 s of wall clock for 0.2 s of CPU, the signature of a deadlock
+rather than a slow test). One run in six passing is why the suite runs it in
+twelve slots: six tiers times two engines.
 
 ##### No code path may fork while holding one of these locks
 

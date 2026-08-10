@@ -152,40 +152,43 @@ void as_unlock(void) { g_emu_as_depth--; pthread_mutex_unlock(&g_as_lock); }
  * helper thread is running, and the child wedged in mem_ifetch_slow ->
  * translate() -> as_lock() on a lock its dead sibling still owned.
  *
- * The cure is the standard pthread_atfork triple, one per module that owns a
- * process-local mutex. `prepare` takes the lock, which also guarantees no
- * sibling is mid-mutation, so the child inherits consistent state and not just
- * a free lock. The child *re-initializes* rather than unlocks: fork gives the
- * surviving thread a new tid, so a recursive mutex's recorded owner no longer
- * matches it and unlocking is not ours to do.
+ * The cure is a pthread_atfork triple. `prepare` takes the lock, which also
+ * guarantees no sibling is mid-mutation, so the child inherits consistent state
+ * and not just a free lock. The child *re-initializes* rather than unlocks: fork
+ * gives the surviving thread a new tid, so a recursive mutex's recorded owner no
+ * longer matches it and unlocking is not ours to do.
  *
- * Both of this file's locks are handled here, in one triple, because they
- * nest: a CASP retry can miss the D-TLB and take as_lock underneath
- * casp16_mutex_lock. Acquiring them outermost-first is what keeps `prepare`
- * from deadlocking against a thread holding casp16 and waiting for as_lock,
- * and doing it in one handler states that order instead of leaving it to the
- * reverse-of-registration rule between two separate ones. */
-/* Raw pthread calls, not casp16_mutex_lock()/as_lock(): these run inside fork(),
- * where the per-thread held-lock mask describes the state emu_fork_check()
- * already vetted and must not move under it (the child re-initializes both locks
- * below, so there is nothing for a count to describe there either). */
-static void mem_atfork_prepare(void) {
+ * There is one triple for the whole emulator, in main.c, because the order the
+ * locks are taken in is a property of the emulator's lock hierarchy rather than
+ * of any module: main.c calls the three entry points below in their place in
+ * that order. This file owns the two innermost locks and they nest with each
+ * other -- a CASP retry can miss the D-TLB and take as_lock underneath
+ * casp16_mutex_lock -- so mem_locks_take() takes casp16 first, and as_lock,
+ * innermost of all seven, last of all.
+ *
+ * Raw pthread calls, not casp16_mutex_lock()/as_lock(): these are called from
+ * inside fork(), where the per-thread held-lock mask describes the state
+ * emu_fork_check() already vetted and must not move under it (the child
+ * re-initializes both locks anyway, so there is nothing for a count to describe
+ * there either). */
+void mem_locks_take(void) {
     pthread_mutex_lock(&g_casp16_lock);
     pthread_mutex_lock(&g_as_lock);
 }
-static void mem_atfork_parent(void) {
+void mem_locks_drop(void) {
     pthread_mutex_unlock(&g_as_lock);
     pthread_mutex_unlock(&g_casp16_lock);
 }
-static void mem_atfork_child(void) {
+void mem_locks_reinit(void) {
     as_lock_init();
     pthread_mutex_init(&g_casp16_lock, NULL);
 }
-void mem_atfork_init(void) {
-    /* as_init() installs g_as_lock lazily and main() may register before the
-     * first address space exists, so make sure there is a lock to take. */
+void mem_locks_init(void) {
+    /* as_init() installs g_as_lock lazily and the registration in main() runs
+     * before the first address space exists, so make sure there is a lock to
+     * take. Called from ordinary context, before a second thread: as_lock_init
+     * is not something the fork path could do safely for itself. */
     as_init_lock_once();
-    pthread_atfork(mem_atfork_prepare, mem_atfork_parent, mem_atfork_child);
 }
 
 /* ---- page table ---- */

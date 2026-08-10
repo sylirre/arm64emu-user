@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -463,6 +464,56 @@ static void add_bind(struct Machine *m, const char *spec) {
     }
 }
 
+/* ---- fork safety: the emulator's lock hierarchy, written down once --------
+ *
+ * fork(2) duplicates the calling thread alone, so a mutex a *sibling* held at
+ * that instant crosses into the child locked and owned by a thread that does
+ * not exist there. One pthread_atfork triple settles all of them: prepare takes
+ * every lock (which also means no sibling is mid-mutation, so the child
+ * inherits a settled page table rather than a half-rewritten one), parent
+ * releases them, and the child re-initializes rather than unlocks, because fork
+ * gives the surviving thread a new tid and a recursive mutex's recorded owner no
+ * longer matches it.
+ *
+ * The order below IS the emulator's lock hierarchy, outermost first, and this is
+ * the only place it is stated. It must agree with the order real code nests
+ * them in, or a fork deadlocks against a sibling coming the other way: prepare
+ * would hold an inner lock and wait for an outer one while the sibling holds the
+ * outer and waits for the inner. as_lock is innermost because any critical
+ * section that touches guest memory takes it underneath its own lock —
+ * copy_to/from_guest → translate() takes it on a D-TLB miss, and
+ * nl_take_request does that on every guest netlink request while holding
+ * nl_lock. casp16 sits just above it (a CASP retry can miss the D-TLB), and
+ * pf_lock above est_lock (the refresh path already holds pf_lock).
+ *
+ * This used to be five separate registrations, one per module, which encoded the
+ * same hierarchy in the *reverse* order of five adjacent calls — sorting them
+ * was enough to deadlock every fork. tests/fixtures/forklock.c is the guard. */
+static void emu_atfork_prepare(void) {
+    jit_locks_take();        /* jit stats  — outermost */
+    procfs_locks_take();     /* pf_lock, then est_lock */
+    netlink_locks_take();    /* nl_lock    — taken above as_lock by real code */
+    sig_locks_take();        /* sfd_lock */
+    mem_locks_take();        /* casp16, then as_lock — innermost */
+}
+static void emu_atfork_parent(void) {
+    mem_locks_drop();        /* innermost first, mirroring prepare */
+    sig_locks_drop();
+    netlink_locks_drop();
+    procfs_locks_drop();
+    jit_locks_drop();
+}
+static void emu_atfork_child(void) {
+    mem_locks_reinit();
+    sig_locks_reinit();
+    netlink_locks_reinit();
+    procfs_locks_reinit();
+    jit_locks_reinit();
+}
+static void emu_atfork_init(void) {
+    pthread_atfork(emu_atfork_prepare, emu_atfork_parent, emu_atfork_child);
+}
+
 /* Sandbox diagnosis: report an inherited seccomp filter (Seccomp: 2 in
  * /proc/self/status — the Android app sandbox is the common case). Under one,
  * a blocked host syscall raises SIGSYS instead of returning ENOSYS; the net
@@ -763,14 +814,9 @@ int main(int argc, char **argv)
      * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
     sig_install_kick_net();
     /* Make every process-local mutex fork-safe before there is a second thread
-     * to hold one. A guest that forks while a sibling thread is inside one of
-     * these would otherwise hand the child a locked, ownerless mutex; mem.c
-     * carries the full story and the hang it cost. */
-    mem_atfork_init();
-    sig_atfork_init();
-    netlink_atfork_init();
-    procfs_atfork_init();
-    jit_atfork_init();
+     * to hold one (mem.c carries the full story and the hang it cost). */
+    mem_locks_init();
+    emu_atfork_init();
 
 #ifndef ANDROID_JNI
     // Suppress seccomp notice on Android JNI component builds.

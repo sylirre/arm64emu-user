@@ -184,14 +184,12 @@ static pthread_mutex_t g_jstat_mu = PTHREAD_MUTEX_INITIALIZER;
  * held by a sibling at fork is inherited locked and ownerless whether or not
  * it is on a hot path, and a wedged child under the one env var that exists to
  * diagnose the JIT would be a poor place to find that out. */
-/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
- * the held-lock mask must not move (machine.h, "fork safety"). */
-static void jstat_atfork_prepare(void) { pthread_mutex_lock(&g_jstat_mu); }
-static void jstat_atfork_parent(void)  { pthread_mutex_unlock(&g_jstat_mu); }
-static void jstat_atfork_child(void)   { pthread_mutex_init(&g_jstat_mu, NULL); }
-void jit_atfork_init(void) {
-    pthread_atfork(jstat_atfork_prepare, jstat_atfork_parent, jstat_atfork_child);
-}
+/* Raw pthread calls on purpose: main()'s atfork handlers call these from
+ * inside fork(), where the held-lock mask must not move (machine.h,
+ * "fork safety"). */
+void jit_locks_take(void)   { pthread_mutex_lock(&g_jstat_mu); }
+void jit_locks_drop(void)   { pthread_mutex_unlock(&g_jstat_mu); }
+void jit_locks_reinit(void) { pthread_mutex_init(&g_jstat_mu, NULL); }
 
 static void jstat_add(JStat *tab, u32 insn, u64 n, u64 *lost) {
     u32 h = (insn ^ (insn >> 13) ^ (insn >> 25)) & (JSTAT_SLOTS - 1);
