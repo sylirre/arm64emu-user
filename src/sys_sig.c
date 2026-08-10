@@ -274,6 +274,8 @@ static u64 sfd_next_id = 1;   /* under sfd_lock; identifies a description */
  * the child locked and ownerless. See the long note in mem.c -- prepare takes
  * it (so the child also inherits a settled table, not a half-written one), the
  * child re-initializes rather than unlocks. */
+/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
+ * the held-lock mask must not move (machine.h, "fork safety"). */
 static void sfd_atfork_prepare(void) { pthread_mutex_lock(&sfd_lock); }
 static void sfd_atfork_parent(void)  { pthread_mutex_unlock(&sfd_lock); }
 static void sfd_atfork_child(void)   { pthread_mutex_init(&sfd_lock, NULL); }
@@ -323,22 +325,22 @@ static void sfd_remask(struct Machine *m) {
 
 int sigfd_tracked(struct Machine *m, int fd) {
     if (!m->sfd_fds_count || fd < 0) return 0;   /* unlocked fast path */
-    pthread_mutex_lock(&sfd_lock);
+    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     int r = sfd_slot(m, fd) >= 0;
-    pthread_mutex_unlock(&sfd_lock);
+    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
     return r;
 }
 
 void sigfd_unmark_fd(struct Machine *m, int fd) {
     if (!m->sfd_fds_count) return;
-    pthread_mutex_lock(&sfd_lock);
+    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     for (int i = 0; i < m->sfd_fds_count; i++)
         if (m->sfd_fds[i].fd == fd) {
             m->sfd_fds[i] = m->sfd_fds[--m->sfd_fds_count];
             sfd_remask(m);
             break;
         }
-    pthread_mutex_unlock(&sfd_lock);
+    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
 }
 
 /* Re-level every signalfd against the ring: arm the eventfd of one whose mask
@@ -346,7 +348,7 @@ void sigfd_unmark_fd(struct Machine *m, int fd) {
  * The counter is only ever 0 or 1, so the writes and drains cannot block. */
 void sigfd_sync(struct Machine *m) {
     if (!m->sfd_fds_count) return;   /* unlocked fast path */
-    pthread_mutex_lock(&sfd_lock);
+    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     for (int i = 0; i < m->sfd_fds_count; i++) {
         int dup_of = -1;   /* one eventfd counter per description, not per fd */
         for (int j = 0; j < i; j++)
@@ -360,7 +362,7 @@ void sigfd_sync(struct Machine *m) {
             if (read(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 0;
         }
     }
-    pthread_mutex_unlock(&sfd_lock);
+    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
 }
 
 /* A second fd for an existing signalfd (dup/dup2/dup3, fcntl F_DUPFD): the
@@ -369,14 +371,14 @@ void sigfd_sync(struct Machine *m) {
  * synced it, so the guest simply blocked forever. */
 void sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
     if (!m->sfd_fds_count || oldfd == newfd) return;   /* unlocked fast path */
-    pthread_mutex_lock(&sfd_lock);
+    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     int i = sfd_slot(m, oldfd);
     if (i >= 0 && m->sfd_fds_count < SFD_MAX_FDS) {
         m->sfd_fds[m->sfd_fds_count] = m->sfd_fds[i];
         m->sfd_fds[m->sfd_fds_count].fd = newfd;
         m->sfd_fds_count++;
     }
-    pthread_mutex_unlock(&sfd_lock);
+    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
 }
 
 /* read(2) on a signalfd: fill `out` with as many signalfd_siginfo records as
@@ -390,10 +392,10 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
     int fl = fcntl(fd, F_GETFL);
     int nonblock = fl >= 0 && (fl & O_NONBLOCK);
     for (;;) {
-        pthread_mutex_lock(&sfd_lock);
+        EMU_LOCK(&sfd_lock, EMU_LK_SFD);
         int i = sfd_slot(m, fd);
         u64 mask = i >= 0 ? m->sfd_fds[i].mask : 0;
-        pthread_mutex_unlock(&sfd_lock);
+        EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
         if (i < 0) return -EBADF;   /* raced with a close: no longer ours */
         size_t n = 0;
         while (n < want &&
@@ -427,10 +429,10 @@ SYSDEF(signalfd4) {
     mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     int fd = (int)(s32)a0;
     if (fd >= 0) {
-        pthread_mutex_lock(&sfd_lock);
+        EMU_LOCK(&sfd_lock, EMU_LK_SFD);
         int i = sfd_slot(m, fd);
         if (i >= 0) { sfd_set_mask(m, m->sfd_fds[i].id, mask); sfd_remask(m); }
-        pthread_mutex_unlock(&sfd_lock);
+        EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
         if (i < 0) return (u64)(s64)-EINVAL;
         sigfd_sync(m);
         return (u64)(s32)fd;
@@ -442,9 +444,9 @@ SYSDEF(signalfd4) {
     if (nfd < 0) return host_err();
     struct stat st;
     if (fstat(nfd, &st) != 0) { close(nfd); return host_err(); }
-    pthread_mutex_lock(&sfd_lock);
+    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     if (m->sfd_fds_count >= SFD_MAX_FDS) {
-        pthread_mutex_unlock(&sfd_lock);
+        EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
         close(nfd);
         return (u64)(s64)-EMFILE;   /* table full: better than a silent lie */
     }
@@ -455,7 +457,7 @@ SYSDEF(signalfd4) {
     m->sfd_fds[m->sfd_fds_count].id = sfd_next_id++;
     m->sfd_fds_count++;
     sfd_remask(m);
-    pthread_mutex_unlock(&sfd_lock);
+    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
     sigfd_sync(m);   /* a matching signal may already be queued */
     return (u64)(s32)nfd;
 }

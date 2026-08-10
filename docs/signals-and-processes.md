@@ -301,18 +301,59 @@ triple (`main()` calls them once, before a second thread can exist):
   surviving thread a new tid, so a recursive mutex's recorded owner no longer
   matches the only thread there.
 
-Where two of these locks nest, both belong to one module and that module's
-handler takes them **outermost-first** (`casp16` before `as_lock` in `mem.c`, a
+Where two locks of one module nest, that module's handler takes them
+**outermost-first** in a single triple (`casp16` before `as_lock` in `mem.c`, a
 CASP retry being able to miss the D-TLB; `pf_lock` before `est_lock` in
 `sys_procfs.c`). Stating the order in one handler is deliberate — splitting them
 across two registrations would leave it to the reverse-of-registration rule.
 
-Two consequences worth keeping in mind. A fork now costs seven uncontended lock
-round-trips, which is small but not free on fork-heavy guests. And **no code
-path may fork while already holding one of these locks**: `prepare` would block
-on the non-recursive ones forever. Nothing does today — the guest's `fork`
-syscall is dispatched with none of them held — but a new one would fail this
-way, silently and only under load.
+##### The order of the registrations is load-bearing
+
+Nesting is **not** confined to a single module, and the arrangement that makes
+that safe is easy to destroy by accident. `as_lock` is the innermost of the
+seven: any critical section that touches guest memory takes it underneath its
+own lock, because `copy_to/from_guest` → `translate()` takes it on a D-TLB miss.
+`sys_netlink.c`'s `nl_take_request` does exactly that — it builds the reply while
+holding `nl_lock`, reading the guest's request out of guest memory — and a
+sibling thread mapping or unmapping anything bumps the address-space generation,
+which invalidates that thread's D-TLB and *guarantees* the miss.
+
+`pthread_atfork` runs prepare handlers in **reverse** order of registration, so
+registering `mem` **first** in `main()` is what makes its handler take `as_lock`
+**last**, matching the order real code uses. Registering it later inverts that:
+`prepare` would hold `as_lock` and wait for `nl_lock` while the netlink thread
+holds `nl_lock` and waits for `as_lock`, and the fork deadlocks. Sorting those
+five adjacent `*_atfork_init()` calls is enough to do it, which is why they carry
+a comment saying not to. `tests/fixtures/forklock.c` pins both this and the
+missing-triple case; verified by breaking each in turn — inverted order hangs at
+0.2 s of CPU for a 15 s wall clock, and removing `mem`'s triple hangs 3 of 3
+runs, where `timers.c` caught the same bug about one run in fifteen.
+
+##### No code path may fork while holding one of these locks
+
+`prepare` takes all seven, so the forking thread must hold none of them. Six are
+non-recursive and `prepare` would block on them forever; the seventh, `as_lock`,
+is recursive and fails *quietly* instead — `prepare` succeeds, and the child's
+handler re-initializes the mutex under the surviving thread, which goes on
+believing it holds it.
+
+The fork surface is wider than the guest's `fork` syscall, which is the part
+easiest to miss: a System V IPC call whose broker daemon has idled out respawns
+it with a double `fork` (`proctab_spawn_broker`), so holding a lock across a
+broker exchange breaks the rule too. `shmat` and `shmdt` drop `as_lock` before
+their `shmbroker_dt` calls for precisely this reason — one line's difference from
+a wedge.
+
+Rather than leave that to convention, every acquisition records itself in a
+per-thread mask (`EMU_LOCK`/`EMU_UNLOCK`, and a depth count for the recursive
+`as_lock`), and both fork sites call `emu_fork_check()`, which names the offending
+lock and aborts. Aborting beats wedging: a wedged emulator absorbs the `SIGTERM`
+sent to kill it, which is why the harness needs `timeout -k`. The atfork handlers
+themselves keep the raw `pthread` calls — they run *inside* `fork()`, where the
+mask describes the state already vetted and must not move.
+
+One cost worth keeping in mind: a fork pays seven uncontended lock round-trips,
+small but not free on fork-heavy guests.
 
 ### vfork vs threads — the distinguishing flag is `CLONE_THREAD`
 

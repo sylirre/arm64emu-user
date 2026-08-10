@@ -1924,6 +1924,11 @@ static void proctab_close_inherited(void) {
  * proctab+shm daemon, 0 for the lazily-spawned shm-only daemon. */
 static void proctab_spawn_broker(struct sockaddr_un *a, socklen_t al, size_t size,
                                  int serve_proctab) {
+    /* Reached from any System V IPC syscall whose broker has idled out, i.e. from
+     * far more places than the guest's fork(2) -- and every one of them must be
+     * holding no emulator lock (machine.h, "fork safety"). shmat/shmdt drop
+     * as_lock before their broker calls for exactly this reason. */
+    emu_fork_check("the System V IPC broker spawn");
     pid_t p = fork();
     if (p < 0) return;
     if (p > 0) { waitpid(p, NULL, 0); return; }   /* reap the middle child */

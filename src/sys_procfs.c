@@ -81,6 +81,8 @@ static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
  * this order because they nest -- an estimate writer on the refresh path
  * already holds pf_lock -- so `prepare` has to take the outer one first or it
  * can deadlock against a thread coming the other way. */
+/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
+ * the held-lock mask must not move (machine.h, "fork safety"). */
 static void pf_atfork_prepare(void) {
     pthread_mutex_lock(&pf_lock);
     pthread_mutex_lock(&est_lock);
@@ -409,14 +411,14 @@ static void stat_estimate(struct Machine *m, u64 ncpu, u64 *busy_j, u64 *idle_j)
     u64 cap = ncpu << 16;
     if (l1 > cap) l1 = cap;
     if (l15 > cap) l15 = cap;
-    pthread_mutex_lock(&est_lock);
+    EMU_LOCK(&est_lock, EMU_LK_EST);
     if (!m->stat_last_ns)
         m->stat_busy = up_j * l15 >> 16;
     else if (now > m->stat_last_ns)
         m->stat_busy += (now - m->stat_last_ns) / 10000000 * l1 >> 16;
     m->stat_last_ns = now;
     u64 busy = m->stat_busy;
-    pthread_mutex_unlock(&est_lock);
+    EMU_UNLOCK(&est_lock, EMU_LK_EST);
     u64 total = up_j * ncpu;
     if (busy > total) busy = total;
     *busy_j = busy;
@@ -609,20 +611,20 @@ static int idmap_format(const char *in, size_t len, char *out, size_t outsz) {
 int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *ret) {
     struct Machine *m = c->m;
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
-    pthread_mutex_lock(&pf_lock);
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
     int i;
     for (i = 0; i < m->pf_fds_count; i++)
         if (m->pf_fds[i].fd == fd) break;
-    if (i == m->pf_fds_count) { pthread_mutex_unlock(&pf_lock); return 0; }
+    if (i == m->pf_fds_count) { EMU_UNLOCK(&pf_lock, EMU_LK_PF); return 0; }
     struct stat st;
     if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino) {
         m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
-        pthread_mutex_unlock(&pf_lock);
+        EMU_UNLOCK(&pf_lock, EMU_LK_PF);
         return 0;
     }
     int kind = m->pf_fds[i].kind;
     s32 tpid = m->pf_fds[i].pid ? m->pf_fds[i].pid : (s32)getpid();
-    pthread_mutex_unlock(&pf_lock);
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
     if (kind != PF_UIDMAP && kind != PF_GIDMAP && kind != PF_SETGROUPS) return 0;
     if (off < 0) off = lseek(fd, 0, SEEK_CUR);
     if (off != 0) { *ret = -EINVAL; return 1; }
@@ -702,7 +704,7 @@ static void pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
     u64 ino = (u64)st.st_ino;
-    pthread_mutex_lock(&pf_lock);
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
     if (m->pf_fds_count < PF_MAX_FDS) {
         m->pf_fds[m->pf_fds_count].fd = fd;
         m->pf_fds[m->pf_fds_count].kind = (u8)kind;
@@ -711,24 +713,24 @@ static void pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
         m->pf_fds[m->pf_fds_count].ino = ino;
         m->pf_fds_count++;
     }
-    pthread_mutex_unlock(&pf_lock);
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
 }
 
 void procfs_unmark_fd(struct Machine *m, int fd) {
     if (!m->pf_fds_count) return;
-    pthread_mutex_lock(&pf_lock);
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
     for (int i = 0; i < m->pf_fds_count; i++)
         if (m->pf_fds[i].fd == fd) {
             m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
             break;
         }
-    pthread_mutex_unlock(&pf_lock);
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
 }
 
 void procfs_pre_read(CPU *c, int fd, s64 off) {
     struct Machine *m = c->m;
     if (!m->pf_fds_count) return;   /* unlocked fast path; benign race */
-    pthread_mutex_lock(&pf_lock);
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
     int i;
     for (i = 0; i < m->pf_fds_count; i++)
         if (m->pf_fds[i].fd == fd) break;
@@ -766,7 +768,7 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     }
     lseek(fd, 0, SEEK_SET);
 out:
-    pthread_mutex_unlock(&pf_lock);
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
 }
 
 /* Anonymous backing for a synthesized /proc view. a64_anonfd falls back to an

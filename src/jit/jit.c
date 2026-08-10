@@ -184,6 +184,8 @@ static pthread_mutex_t g_jstat_mu = PTHREAD_MUTEX_INITIALIZER;
  * held by a sibling at fork is inherited locked and ownerless whether or not
  * it is on a hot path, and a wedged child under the one env var that exists to
  * diagnose the JIT would be a poor place to find that out. */
+/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
+ * the held-lock mask must not move (machine.h, "fork safety"). */
 static void jstat_atfork_prepare(void) { pthread_mutex_lock(&g_jstat_mu); }
 static void jstat_atfork_parent(void)  { pthread_mutex_unlock(&g_jstat_mu); }
 static void jstat_atfork_child(void)   { pthread_mutex_init(&g_jstat_mu, NULL); }
@@ -212,14 +214,14 @@ static void jstat_bump(u32 insn) {
 /* Fold the calling thread's table into the global one. */
 static void jstat_merge(u64 icount) {
     if (!t_jstat) return;
-    pthread_mutex_lock(&g_jstat_mu);
+    EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
     for (u32 i = 0; i < JSTAT_SLOTS; i++)
         if (t_jstat[i].count)
             jstat_add(g_jstat, t_jstat[i].word, t_jstat[i].count,
                       &g_jstat_lost);
     g_jstat_lost += t_jstat_lost;
     g_jstat_icount += icount;
-    pthread_mutex_unlock(&g_jstat_mu);
+    EMU_UNLOCK(&g_jstat_mu, EMU_LK_JSTAT);
     free(t_jstat);
     t_jstat = NULL;
     t_jstat_lost = 0;
@@ -246,7 +248,7 @@ static void jstat_dump(void) {
     if (done) return;
     done = 1;
     jstat_merge(g_jit_env.active ? g_jit_env.c->icount : 0);
-    pthread_mutex_lock(&g_jstat_mu);
+    EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
     u64 total = g_jstat_lost;
     for (u32 i = 0; i < JSTAT_SLOTS; i++) total += g_jstat[i].count;
     /* The guest may have closed stderr (fd 2 is shared with it): write to
@@ -278,7 +280,7 @@ static void jstat_dump(void) {
                     (unsigned long long)g_jstat_lost);
     }
     if (g_jstat_path && fd >= 0) close(fd);
-    pthread_mutex_unlock(&g_jstat_mu);
+    EMU_UNLOCK(&g_jstat_mu, EMU_LK_JSTAT);
 }
 
 /* ---- optional per-block code dump (A64_JIT_DUMP=<prefix> or =1) ----
@@ -459,7 +461,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_stv = (void *)jit_stv;
     env->dtlb = jit_dtlb_base();
     env->slowmem = getenv("A64_JIT_SLOWMEM") != NULL;
-    pthread_mutex_lock(&g_jstat_mu);
+    EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
     if (g_jit_stats < 0) {
         const char *s = getenv("A64_JIT_STATS");
         g_jit_stats = s != NULL;
@@ -475,7 +477,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
         if (d) g_jdump_prefix = (d[0] && strcmp(d, "1") != 0)
                                     ? d : "a64jit-dump";
     }
-    pthread_mutex_unlock(&g_jstat_mu);
+    EMU_UNLOCK(&g_jstat_mu, EMU_LK_JSTAT);
     if (cache_alloc(env) < 0) return -1;
     env->hash = calloc(JIT_HASH_SIZE, sizeof *env->hash);
     env->pages = calloc(JIT_PAGE_TBL, sizeof *env->pages);

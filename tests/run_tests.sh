@@ -784,6 +784,33 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- fork safety of the emulator's own mutexes: a guest that forks in a loop
+# while sibling threads keep nl_lock, as_lock and pf_lock hot. Catches a missing
+# pthread_atfork triple (the child inherits a locked, ownerless mutex) and an
+# atfork prepare order inverted against the nl_lock -> as_lock nesting (the fork
+# itself deadlocks). Both are hangs, and a deadlocked emulator thread never
+# reaches the boundary where a guest alarm could fire, so `timeout -k 5` is the
+# backstop that turns them into a failure -- checked by breaking each invariant
+# in turn: order inverted 15 s at 0.2 s CPU, mem triple removed 3/3 hangs. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/forklock.bin \
+            tests/fixtures/forklock.c $A64_TESTLIBS 2>/dev/null; then
+        for eng in "" "--jit"; do
+            lbl="fixture: forklock${eng:+ (jit)}"
+            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout -k 5 90 "$EMU" $eng / \
+                      tests/fixtures/forklock.bin 2>/dev/null); rc=$?
+            if [ "$got" = "OK" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$got')"
+            fi
+        done
+        fx_rm tests/fixtures/forklock.bin
+    else
+        skip_build "fixtures/forklock"
+    fi
+fi
+
 # ---- loads whose destination is also their writeback base (rd == rn).
 # Engine-against-engine, never against the oracle: the architecture calls this
 # CONSTRAINED UNPREDICTABLE, so taking the loaded value, taking the writeback

@@ -543,14 +543,57 @@ void sig_probe_reserved(void);
  * holds when the guest forks does not cross into the child locked and
  * ownerless. Called once by main(), before any second thread exists; the
  * registrations are inherited by every process of the session. Each module
- * implements its own (mem.c carries the reasoning); order between them does
- * not matter, because no two of these locks are ever held at once across
- * module boundaries -- where locks do nest, they nest inside one module and
- * that module's handler takes them outermost-first. */
-void mem_atfork_init(void);
+ * implements its own (mem.c carries the reasoning).
+ *
+ * The ORDER of these calls is load-bearing, so do not sort them. prepare
+ * handlers run in reverse order of registration, so registering mem first is
+ * what makes its handler take as_lock *last* -- and as_lock is the innermost of
+ * the seven: it is taken *under* nl_lock (and any other) whenever a critical
+ * section touches guest memory, because copy_to/from_guest -> translate() takes
+ * it on a D-TLB miss. sys_netlink.c's nl_take_request does exactly that.
+ * Acquiring as_lock earlier in prepare would invert that order and let a fork
+ * deadlock against a sibling holding nl_lock and waiting for as_lock. */
+void mem_atfork_init(void);      /* first: as_lock is the innermost lock */
 void sig_atfork_init(void);
 void netlink_atfork_init(void);
 void procfs_atfork_init(void);
+
+/* ---- fork safety: the rule those triples impose --------------------------
+ *
+ * prepare takes every one of these locks, so a thread that forks while already
+ * holding one deadlocks against itself on the six non-recursive ones -- and on
+ * the recursive as_lock it does something quieter and worse: prepare succeeds,
+ * then the child's handler re-initializes the mutex under the surviving thread,
+ * which goes on believing it holds it. Neither failure appears anywhere near
+ * the code that caused it, and the fork surface is wider than the guest's
+ * fork(2): a System V IPC call whose broker has idled out respawns it with a
+ * double fork (proctab.c), so holding a lock across a broker exchange breaks
+ * the rule too. Each acquisition therefore records itself in a per-thread mask
+ * and every fork site asserts that the mask is empty.
+ *
+ * The atfork handlers deliberately keep the raw pthread calls: they run *inside*
+ * fork(), where the mask describes the pre-fork state and must not move (the
+ * child re-initializes its locks regardless). as_lock is counted rather than
+ * flagged because it legitimately nests -- translate() takes it on a D-TLB miss
+ * under whatever mm syscall is already holding it. */
+enum {
+    EMU_LK_CASP16 = 1u << 0,   /* mem.c        */
+    EMU_LK_SFD    = 1u << 1,   /* sys_sig.c    */
+    EMU_LK_NL     = 1u << 2,   /* sys_netlink.c */
+    EMU_LK_PF     = 1u << 3,   /* sys_procfs.c */
+    EMU_LK_EST    = 1u << 4,   /* sys_procfs.c */
+    EMU_LK_JSTAT  = 1u << 5,   /* jit/jit.c    */
+};
+extern __thread unsigned g_emu_lk_held;   /* the six non-recursive locks */
+extern __thread int g_emu_as_depth;       /* as_lock, which nests: a count */
+#define EMU_LOCK(mtx, bit) \
+    do { pthread_mutex_lock(mtx); g_emu_lk_held |= (unsigned)(bit); } while (0)
+#define EMU_UNLOCK(mtx, bit) \
+    do { g_emu_lk_held &= ~(unsigned)(bit); pthread_mutex_unlock(mtx); } while (0)
+/* Called before every fork(2) in the emulator. Names the held lock and aborts:
+ * the alternative is a wedged process that absorbs the SIGTERM sent to kill it
+ * (see c2fe3ad). `site` describes what was about to fork. */
+void emu_fork_check(const char *site);
 
 /* elf.c: load `guest_path` (canonical guest path) into the address space and
  * prepare the initial stack. Returns 0 or -errno. */

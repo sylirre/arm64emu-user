@@ -68,6 +68,8 @@ static pthread_mutex_t nl_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Fork safety, as in mem.c: prepare takes the lock so the child inherits it
  * free and the fd table settled; the child re-initializes it, because after
  * fork the surviving thread's tid no longer matches the recorded owner. */
+/* Raw pthread calls on purpose: an atfork handler runs inside fork(), where
+ * the held-lock mask must not move (machine.h, "fork safety"). */
 static void nl_atfork_prepare(void) { pthread_mutex_lock(&nl_lock); }
 static void nl_atfork_parent(void)  { pthread_mutex_unlock(&nl_lock); }
 static void nl_atfork_child(void)   { pthread_mutex_init(&nl_lock, NULL); }
@@ -96,9 +98,9 @@ bool nl_is_fd(struct Machine *m, int fd)
      * non-zero was raised by the same thread's own socket(2). */
     if (!m->nl_fds_count || fd < 0)
         return false;
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     bool r = nl_slot(m, fd) >= 0;
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
     return r;
 }
 
@@ -228,7 +230,7 @@ void nl_mark_fd(struct Machine *m, int fd)
 {
     bool ready = fd >= 0 && nl_selfconnect(fd);
 
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     if (fd >= 0 && nl_slot(m, fd) < 0 && m->nl_fds_count < NL_MAX_FDS) {
         m->nl_fds[m->nl_fds_count].fd = fd;
         m->nl_fds[m->nl_fds_count].reply = NULL;
@@ -238,7 +240,7 @@ void nl_mark_fd(struct Machine *m, int fd)
         m->nl_fds[m->nl_fds_count].armed = 0;
         m->nl_fds_count++;
     }
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
 /* A fork child keeps its parent's substituted sockets -- they are its fds too --
@@ -261,7 +263,7 @@ void nl_unmark_fd(struct Machine *m, int fd)
     /* Unlocked fast path (see nl_is_fd): close(2) calls this for every fd. */
     if (!m->nl_fds_count && !m->nlr_fds_count && !m->nl_ack_pending)
         return;
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(m, fd);
     if (i >= 0) {
         free(m->nl_fds[i].reply);
@@ -277,7 +279,7 @@ void nl_unmark_fd(struct Machine *m, int fd)
     }
     if (m->nl_ack_pending && m->nl_ack_fd == fd)
         m->nl_ack_pending = 0;
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
 /* --- faked net namespace: ack what the host refuses (proot 87af48f5) ------
@@ -312,7 +314,7 @@ static bool nlr_is_netns_fd(struct Machine *m, int fd)
 
 void nlr_mark_fd(struct Machine *m, int fd)
 {
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     if (fd >= 0 && m->nlr_fds_count < NLR_MAX_FDS) {
         bool present = false;
         for (int i = 0; i < m->nlr_fds_count; i++)
@@ -320,7 +322,7 @@ void nlr_mark_fd(struct Machine *m, int fd)
         if (!present)
             m->nlr_fds[m->nlr_fds_count++] = fd;
     }
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
 void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
@@ -338,13 +340,13 @@ void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
     if (!nlr_type_reconfigures(hdr.nlmsg_type))
         return;
 
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     if (nlr_is_netns_fd(m, fd)) {
         m->nl_ack_pending = 1;
         m->nl_ack_fd = fd;
         m->nl_ack_seq = hdr.nlmsg_seq;
     }
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
 int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
@@ -356,9 +358,9 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
      * reconfiguring request is awaiting its refusal. */
     if (!m->nl_ack_pending)
         return 0;
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     if (!m->nl_ack_pending || m->nl_ack_fd != fd) {
-        pthread_mutex_unlock(&nl_lock);
+        EMU_UNLOCK(&nl_lock, EMU_LK_NL);
         return 0;
     }
     /* Walk the datagram's messages for the NLMSG_ERROR carrying our sequence
@@ -391,7 +393,7 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
      * consumes it. */
     if (!peek)
         m->nl_ack_pending = 0;
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
     return fixed;
 }
 
@@ -1191,15 +1193,15 @@ static size_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
  * can strand a later read. */
 static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
 {
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(c->m, fd);
-    if (i < 0) { pthread_mutex_unlock(&nl_lock); return (u64)(s64)-EBADF; }
+    if (i < 0) { EMU_UNLOCK(&nl_lock, EMU_LK_NL); return (u64)(s64)-EBADF; }
     if (!c->m->nl_fds[i].reply)
         c->m->nl_fds[i].reply = malloc(NL_REPLY_MAX);
     if (!c->m->nl_fds[i].reply) {
         /* Refuse the send rather than swallow it: a request with no reply
          * behind it leaves the read that follows waiting forever. */
-        pthread_mutex_unlock(&nl_lock);
+        EMU_UNLOCK(&nl_lock, EMU_LK_NL);
         return (u64)(s64)-ENOBUFS;
     }
     c->m->nl_fds[i].reply_off = 0;
@@ -1208,7 +1210,7 @@ static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
     /* The reply is ready now, so the socket must read as readable now: a caller
      * that waits for POLLIN before receiving is the common shape. */
     nl_sync_ready(c->m, i);
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
     return (u64)blen;
 }
 
@@ -1277,11 +1279,11 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
 {
     const uint8_t *reply = NULL;
 
-    pthread_mutex_lock(&nl_lock);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(c->m, fd);
     *datagram = nl_pending_datagram(c->m, i, &reply);
     if (*datagram == 0) {
-        pthread_mutex_unlock(&nl_lock);
+        EMU_UNLOCK(&nl_lock, EMU_LK_NL);
         return 0;
     }
     *taken = 0;
@@ -1300,7 +1302,7 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
         nl_consume_datagram(c->m, i, *datagram);
         nl_sync_ready(c->m, i);
     }
-    pthread_mutex_unlock(&nl_lock);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
     return 1;
 }
 

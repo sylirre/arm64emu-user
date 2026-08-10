@@ -87,8 +87,39 @@ void jit_dtlb_reset(void) {
  * correctness over speed. */
 #include <pthread.h>
 static pthread_mutex_t g_casp16_lock = PTHREAD_MUTEX_INITIALIZER;
-void casp16_mutex_lock(void)   { pthread_mutex_lock(&g_casp16_lock); }
-void casp16_mutex_unlock(void) { pthread_mutex_unlock(&g_casp16_lock); }
+void casp16_mutex_lock(void)   { EMU_LOCK(&g_casp16_lock, EMU_LK_CASP16); }
+void casp16_mutex_unlock(void) { EMU_UNLOCK(&g_casp16_lock, EMU_LK_CASP16); }
+
+/* ---- fork-safety bookkeeping (machine.h states the rule) ---- */
+__thread unsigned g_emu_lk_held;
+__thread int g_emu_as_depth;
+
+static const char *emu_lk_name(void) {
+    if (g_emu_as_depth) return "as_lock";
+    static const struct { unsigned bit; const char *name; } n[] = {
+        { EMU_LK_CASP16, "casp16_lock" }, { EMU_LK_SFD, "sfd_lock" },
+        { EMU_LK_NL, "nl_lock" },         { EMU_LK_PF, "pf_lock" },
+        { EMU_LK_EST, "est_lock" },       { EMU_LK_JSTAT, "jit stats lock" },
+    };
+    for (size_t i = 0; i < sizeof n / sizeof *n; i++)
+        if (g_emu_lk_held & n[i].bit) return n[i].name;
+    return "?";
+}
+
+void emu_fork_check(const char *site) {
+    if (LIKELY(!g_emu_lk_held && !g_emu_as_depth)) return;
+    fprintf(stderr,
+            "arm64chroot: internal error: %s forks while holding %s.\n"
+            "  Every one of the emulator's process-local mutexes is taken by a\n"
+            "  pthread_atfork prepare handler, so this fork would deadlock here (or,\n"
+            "  for the recursive as_lock, hand the child a lock whose owner is gone).\n"
+            "  Release it before forking -- docs/signals-and-processes.md, \"fork\n"
+            "  safety\". Aborting rather than wedging: a wedged emulator absorbs the\n"
+            "  SIGTERM sent to kill it.\n",
+            site, emu_lk_name());
+    fflush(stderr);
+    abort();
+}
 
 /* Serializes address-space mutations (mmap/munmap/mprotect/brk and the page
  * table) across guest threads that share this address space. D-TLB-hit reads
@@ -109,8 +140,8 @@ static void as_init_lock_once(void) {
     static int lock_ready;
     if (!lock_ready) { as_lock_init(); lock_ready = 1; }
 }
-void as_lock(void)   { pthread_mutex_lock(&g_as_lock); }
-void as_unlock(void) { pthread_mutex_unlock(&g_as_lock); }
+void as_lock(void)   { pthread_mutex_lock(&g_as_lock); g_emu_as_depth++; }
+void as_unlock(void) { g_emu_as_depth--; pthread_mutex_unlock(&g_as_lock); }
 
 /* ---- fork safety ----
  *
@@ -134,12 +165,16 @@ void as_unlock(void) { pthread_mutex_unlock(&g_as_lock); }
  * from deadlocking against a thread holding casp16 and waiting for as_lock,
  * and doing it in one handler states that order instead of leaving it to the
  * reverse-of-registration rule between two separate ones. */
+/* Raw pthread calls, not casp16_mutex_lock()/as_lock(): these run inside fork(),
+ * where the per-thread held-lock mask describes the state emu_fork_check()
+ * already vetted and must not move under it (the child re-initializes both locks
+ * below, so there is nothing for a count to describe there either). */
 static void mem_atfork_prepare(void) {
     pthread_mutex_lock(&g_casp16_lock);
-    as_lock();
+    pthread_mutex_lock(&g_as_lock);
 }
 static void mem_atfork_parent(void) {
-    as_unlock();
+    pthread_mutex_unlock(&g_as_lock);
     pthread_mutex_unlock(&g_casp16_lock);
 }
 static void mem_atfork_child(void) {
@@ -837,6 +872,9 @@ void bus_tls_prewarm(void) {
     (void)*(volatile int *)&g_bus_armed;
     (void)*(volatile char *)&g_bus_jb;
     (void)*(volatile CPU *volatile *)&g_bus_cpu;
+    /* The repair below takes as_lock, which counts itself in these two. */
+    (void)*(volatile int *)&g_emu_as_depth;
+    (void)*(volatile unsigned *)&g_emu_lk_held;
 }
 
 #if defined(__x86_64__)
@@ -885,11 +923,13 @@ static int as_bus_repair(const void *hostaddr, u64 *far) {
      * balances on unlock. Held by ANOTHER thread, we simply skip the repair --
      * the guest still gets its signal, and the next access faults again. */
     if (pthread_mutex_trylock(&g_as_lock) != 0) return 0;
+    g_emu_as_depth++;                     /* counted like as_lock: we hold it now */
     Region *r = region_by_host_locked(as, hostaddr);
     if (r) {
         *far = r->start + (u64)((const u8 *)hostaddr - r->host);
         pte_drop_existing(as, r->start, r->end - r->start);
     }
+    g_emu_as_depth--;
     pthread_mutex_unlock(&g_as_lock);
     if (!r) return 0;
     jit_dtlb_reset();     /* the JIT reads these entries without a gen check */

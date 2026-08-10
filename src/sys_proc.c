@@ -482,6 +482,7 @@ SYSDEF(clone) {
         proctab_seccomp_seed(rsv, md, nf);
     }
 
+    emu_fork_check("the guest fork/clone syscall");
     pid_t pid = fork();
     if (pid < 0) { proctab_release(rsv); return host_err(); }
     if (pid == 0) {
