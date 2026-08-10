@@ -49,8 +49,12 @@ extern int g_sig_kicksig;
 void ptrace_init(void);
 /* clone() fork child. `event` (0 or a PTRACE_EVENT_FORK/VFORK/CLONE code) says
  * whether the parent's tracer is following this creation: nonzero auto-attaches
- * the child to that tracer with an initial stop, zero leaves it untraced. */
-void ptrace_fork_child(CPU *c, int event);
+ * the child to that tracer with an initial stop, zero leaves it untraced.
+ * `tracer`/`options`/`seize` are what the child inherits, sampled by the parent
+ * BEFORE the fork with the ptrace_self_* accessors below -- exactly as the
+ * thread path samples them before pthread_create. The child must not read them
+ * out of the parent's link, which by then may be detached and reclaimed. */
+void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize);
 /* Is the calling thread a tracee, and what are its inherited PTRACE_O_*
  * options / tracer pid / SEIZE flag? (Used by clone to decide whether/which
  * fork or clone event to report and what a followed new thread inherits.) */

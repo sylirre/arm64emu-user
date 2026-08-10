@@ -438,7 +438,16 @@ thread-local `g_ptrace_*` int gates the hot paths):
   `PTRACE_GETEVENTMSG`, and the new child **auto-attaches to the same tracer**
   (inheriting its options and attach flavor: the initial stop is `SIGSTOP` for an
   `ATTACH`-flavored relationship, `PTRACE_EVENT_STOP` for a `SEIZE`'d one, as
-  the kernel reports them). The child is a separate host process, so its exit —
+  the kernel reports them). What it inherits — tracer, options, flavor — is
+  sampled by the parent **before** the fork and handed to the child as arguments,
+  never read by the child out of the parent's registry link. The kernel fixes a
+  child's tracer atomically at clone time; here the child may not run until after
+  the parent has published its event stop, and a tracer that answers that stop
+  with `PTRACE_DETACH` frees the parent's link — leaving a child that reads it a
+  detached tracer at best, and, once the freed slot has been re-claimed, a
+  *stranger's* tracer under which it would park in a stop nobody resumes. The
+  thread path below samples the same three values in the creator for the same
+  reason. The child is a separate host process, so its exit —
   which the tracer cannot `waitpid` since it is not the child's host parent — is
   published as a synthetic exit in the registry for the tracer's wait to collect
   (its real host parent still reaps the zombie). The one exit stop the
@@ -463,7 +472,15 @@ thread-local `g_ptrace_*` int gates the hot paths):
   publishes nothing at all — nothing of it runs — so the mailbox wait also
   checks the host task itself after a slice with no answer, and reports
   `-ESRCH` for a task that is gone or a zombie; every request that needs a
-  round-trip surfaces that as ptrace's own `ESRCH`, as the kernel does.
+  round-trip surfaces that as ptrace's own `ESRCH`, as the kernel does. Each
+  round-trip also re-checks that the link still carries the **tid it resolved**,
+  before the post and on every wake: a freed slot goes to the next task that
+  needs one (claims scan from index 0, and an `strace -f` session recycles low
+  slots constantly), and posting into a re-claimed link would hand a `POKE` or a
+  `RESUME` to a stranger parked in its own stop, who would carry it out on
+  itself. A link that is no longer ours is also never written to — its
+  `result` field belongs to someone else now — so `-ESRCH` from a round-trip
+  means the caller must not read anything back out of it.
 
 **`wait4` reporting.** A cooperative stop is *not* a host-visible child stop (the
 tracee is a running host process parked in its service loop), so a **tracer's**
@@ -574,6 +591,22 @@ poll (above) would hang. Two mechanisms close this:
   tracee's every link is reaped) and synthesizes `WIFSIGNALED(SIGKILL)`. Since
   every *catchable* fatal signal is mediated and reports its real status, a silent
   death is a `SIGKILL`, so the synthesized signal is accurate.
+
+**Death of a tracer.** The mirror case, and the one that can wedge a guest: the
+kernel's `exit_ptrace` detaches a dying tracer's tracees, but nothing here runs
+in the tracer to do that — a tracer is not a tracee, so it holds no link of its
+own to publish anything on. Each parked tracee therefore checks for itself, once
+per service-loop slice, and **auto-detaches and runs free** when its tracer is
+gone. The liveness test has to be the same one `ptrace_reap_dead` applies in the
+other direction and for the same reason: `kill(tracer, 0)` succeeds on a
+**zombie** tracer — one whose own parent has not reaped it yet — so a tracee that
+trusted `kill` alone stayed parked for as long as the corpse lingered, re-kicking
+a tracer that would never wait for it again. That is a guest process wedged in a
+stop with nothing left to resume it, burning no CPU (`tests/ptrace/tracer_zombie.c`
+holds the line). The two directions do take opposite views of an unreadable
+`/proc`: the tracer-side test has already waited out a mailbox timeout, so
+unreadable means dead, while the tracee-side one must answer "not a zombie" or a
+host without a readable `/proc` would detach every tracee on sight.
 
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,

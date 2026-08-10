@@ -339,6 +339,11 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
 }
 
 /* ---- tracee: service loop + stop core ---- */
+/* Host-task liveness, defined with the rest of the tracer side at the bottom:
+ * the parked tracee below needs the zombie test, pt_cmd the dead one. */
+static int pt_task_zombie(s32 t);
+static int pt_task_dead(s32 t);
+
 static void pt_self_detach(void) {
     PtLink *e = g_self_link;
     int was = g_ptrace_active;
@@ -361,9 +366,15 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
         while (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) == seen) {
             fx_wait(&e->cmd_seq, seen, 500);
             if (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) != seen) break;
-            /* Tracer vanished while we were parked: auto-detach and run free. */
+            /* Tracer vanished while we were parked: auto-detach and run free, as
+             * the kernel's exit_ptrace releases a dead tracer's tracees. kill(2)
+             * alone does not see all of "vanished": it succeeds on a ZOMBIE
+             * tracer -- one whose own parent has not reaped it yet -- which left
+             * us parked in this stop for as long as the corpse lingered,
+             * re-kicking something that will never wait for us again. */
             s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
-            if (tr <= 0 || (kill(tr, 0) != 0 && errno == ESRCH)) {
+            if (tr <= 0 || (kill(tr, 0) != 0 && errno == ESRCH) ||
+                pt_task_zombie(tr)) {
                 pt_self_detach();
                 return 0;
             }
@@ -714,11 +725,20 @@ void ptrace_report_event(CPU *c, int event, u64 msg) {
 /* Child side of a clone/fork. `event` is nonzero when the parent's tracer is
  * following this creation (PTRACE_O_TRACE{FORK,VFORK,CLONE}); the child then
  * auto-attaches to the same tracer and reports an initial (SIGSTOP) stop.
- * Otherwise it runs untraced. Called in the freshly forked child, which has
- * inherited the parent's g_self_link pointer (valid: the registry is shared at
- * the same address). */
-void ptrace_fork_child(CPU *c, int event) {
-    PtLink *parent = g_self_link;          /* inherited: the parent's link */
+ * Otherwise it runs untraced.
+ *
+ * What it inherits -- tracer, options, attach flavor -- arrives as arguments,
+ * sampled by the parent before the fork, and NOT read here out of the inherited
+ * g_self_link pointer. The pointer itself stays valid (the registry is shared at
+ * the same address), but what it points at does not: by the time the child runs,
+ * the parent has published its own fork event stop, and a tracer that answers it
+ * with PTRACE_DETACH frees that link. Reading it then yields tracer 0 at best --
+ * a followed fork silently losing its child, where the kernel fixes the child's
+ * tracer atomically at clone time -- and, once the freed slot is re-claimed (a
+ * strace -f session recycles low slots constantly), a *stranger's* tracer and
+ * options, under which this child parks in an initial stop nobody will resume.
+ * The thread path has always sampled these in the creator for the same reason. */
+void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
     /* The inherited traced-thread count describes the parent's threads; only
      * the forking thread exists here, untraced until the adopt below. If the
      * parent had traced threads, re-mirror the (also inherited) catcher
@@ -729,24 +749,20 @@ void ptrace_fork_child(CPU *c, int event) {
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
     g_ptrace_skip_syscall_stop = 0;
-    if (!event || !parent) {
+    /* A kick the parent's handler had flagged but not yet serviced: it was aimed
+     * at the parent's link, which is not ours. Everything else about a pending
+     * kick (the queued signal itself) is not inherited across fork anyway. */
+    g_ptrace_kick = 0;
+    if (!event || tracer <= 0) {
         if (inherited) sig_trace_update_all(c->m);
         return;                            /* not followed: a fresh untraced pid */
-    }
-
-    s32 tracer = __atomic_load_n(&parent->tracer, __ATOMIC_ACQUIRE);
-    u32 opts = __atomic_load_n(&parent->options, __ATOMIC_ACQUIRE);
-    u32 seize = parent->seize;             /* the attach flavor is inherited */
-    if (tracer <= 0) {
-        if (inherited) sig_trace_update_all(c->m);
-        return;
     }
     PtLink *e = pt_claim(getpid(), getpid());
     if (!e) {
         if (inherited) sig_trace_update_all(c->m);
         return;                            /* registry full: degrade to untraced */
     }
-    __atomic_store_n(&e->options, opts, __ATOMIC_RELAXED);  /* options are inherited */
+    __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);  /* options are inherited */
     e->seize = seize;
     __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
@@ -811,13 +827,23 @@ static long ptrace_traceme(CPU *c) {
 }
 
 /* ---- tracer: mailbox round-trip to a stopped tracee ---- */
-static int pt_task_dead(s32 t);
-
-/* Post a command to a stopped tracee's mailbox and wait for its answer.
- * Returns 0 once answered (the result is in e->result), or -ESRCH if the tracee
- * vanished instead -- which the caller must surface as ptrace's own ESRCH, the
- * kernel's answer for a tracee that is no longer there. */
-static int pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
+/* Post a command to tracee `tid`'s mailbox (its link `e`) and wait for its
+ * answer. Returns 0 once answered (the result is in e->result), or -ESRCH if the
+ * tracee vanished instead -- which the caller must surface as ptrace's own
+ * ESRCH, the kernel's answer for a tracee that is no longer there. On -ESRCH the
+ * link may no longer be ours at all, so a caller must check this return before
+ * it reads anything back out of e. */
+static int pt_cmd(PtLink *e, s32 tid, u32 cmd, u64 addr, u64 arg) {
+    /* The link must still be the one we resolved. A slot freed by a detach or by
+     * a collected exit is handed to the next task that needs one (pt_claim scans
+     * from index 0, and a strace -f session recycles low slots constantly), and
+     * posting into a re-claimed link would hand our command -- a POKE, a RESUME
+     * -- to a stranger parked in its own stop, who would carry it out on itself.
+     * The tracee tid is the identity to check: it is what pt_find matched, and
+     * pt_claim publishes it last, after the rest of the link is built. Checked
+     * before the post and again on every wake, since a reclaim can land at
+     * either point. */
+    if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) != tid) return -ESRCH;
     e->cmd = cmd;
     e->addr = addr;
     e->arg = arg;
@@ -825,16 +851,21 @@ static int pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
     __atomic_add_fetch(&e->cmd_seq, 1, __ATOMIC_RELEASE);
     fx_wake(&e->cmd_seq);
     while (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d) {
-        /* Tracee gone while we waited -- its slot freed (detached), or its exit
-         * published (a sibling thread's exit_group fan-out flips a parked
-         * thread's link to EXITED without it ever answering): bail so ptrace
-         * doesn't hang. Each bail re-reads done_seq first, so an answer that
-         * landed between the loop test and the check is never discarded. */
+        /* Tracee gone while we waited -- its slot freed (detached) or already
+         * re-claimed by another task, or its exit published (a sibling thread's
+         * exit_group fan-out flips a parked thread's link to EXITED without it
+         * ever answering): bail so ptrace doesn't hang. A bail on a link still
+         * ours re-reads done_seq first, so an answer that landed between the loop
+         * test and the check is never discarded -- and only such a link is
+         * written to, since e->result in a re-claimed one is someone else's. */
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
-        if (t <= 0 ||
+        int ours = (t == tid);
+        if (!ours ||
             __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
-            if (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) != d) break;
-            e->result = -ESRCH;
+            if (ours) {
+                if (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) != d) break;
+                e->result = -ESRCH;
+            }
             return -ESRCH;
         }
         fx_wait(&e->done_seq, d, 500);
@@ -844,8 +875,9 @@ static int pt_cmd(PtLink *e, u32 cmd, u64 addr, u64 arg) {
          * host task itself. Only after a timeout, so the normal round-trip --
          * which the tracee answers immediately -- never touches /proc. */
         if (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d &&
-            pt_task_dead(t)) {
-            e->result = -ESRCH;
+            pt_task_dead(tid)) {
+            if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) == tid)
+                e->result = -ESRCH;
             return -ESRCH;
         }
     }
@@ -970,12 +1002,12 @@ long ptrace_vm_block(s32 pid, u64 rva, u8 *buf, size_t len, int write) {
     while (done < len) {
         size_t chunk = len - done;
         if (chunk > PT_MBOX) chunk = PT_MBOX;
-        if (write) {
-            memcpy(e->data, buf + done, chunk);
-            pt_cmd(e, PT_CMD_WRITE, rva + done, chunk);
-        } else {
-            pt_cmd(e, PT_CMD_READ, rva + done, chunk);
-        }
+        /* A staged payload the round-trip below then refuses to post (the link
+         * was re-claimed) is inert: nobody reads mailbox data without a command. */
+        if (write) memcpy(e->data, buf + done, chunk);
+        if (pt_cmd(e, pid, write ? PT_CMD_WRITE : PT_CMD_READ,
+                   rva + done, chunk) < 0)
+            return done ? (long)done : -ESRCH;   /* e is not ours to read now */
         if (e->result < 0) return done ? (long)done : (long)e->result;
         size_t got = (size_t)e->result;      /* bytes the tracee actually crossed */
         if (!write && got) memcpy(buf + done, e->data, got);
@@ -1089,23 +1121,23 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     switch (req) {
     case G_PTRACE_PEEKTEXT:
     case G_PTRACE_PEEKDATA:
-        if (pt_cmd(e, PT_CMD_PEEK, addr, 0) < 0) return -ESRCH;
+        if (pt_cmd(e, pid, PT_CMD_PEEK, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EIO;
         return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
     case G_PTRACE_PEEKUSR:
-        if (pt_cmd(e, PT_CMD_PEEKUSR, addr, 0) < 0) return -ESRCH;
+        if (pt_cmd(e, pid, PT_CMD_PEEKUSR, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EIO;
         return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
     case G_PTRACE_POKETEXT:
     case G_PTRACE_POKEDATA:
-        if (pt_cmd(e, PT_CMD_POKE, addr, data) < 0) return -ESRCH;
+        if (pt_cmd(e, pid, PT_CMD_POKE, addr, data) < 0) return -ESRCH;
         return e->result < 0 ? -EIO : 0;
     case G_PTRACE_POKEUSR:
         return -EIO;   /* user-area writes not modelled (gdb uses SETREGSET) */
     case G_PTRACE_GETREGSET: {
         GIovec iov;
         if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
-        if (pt_cmd(e, PT_CMD_GETREGS, addr, 0) < 0) return -ESRCH;
+        if (pt_cmd(e, pid, PT_CMD_GETREGS, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EINVAL;
         u32 n = e->rlen;
         if (iov.iov_len < n) n = (u32)iov.iov_len;
@@ -1122,19 +1154,19 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         u32 n = iov.iov_len > PT_MBOX ? PT_MBOX : (u32)iov.iov_len;
         if (n && copy_from_guest(c, e->data, iov.iov_base, n) < 0) return -EFAULT;
         e->rlen = n;
-        if (pt_cmd(e, PT_CMD_SETREGS, addr, 0) < 0) return -ESRCH;
+        if (pt_cmd(e, pid, PT_CMD_SETREGS, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return (long)e->result;
         if (e->rlen < iov.iov_len) iov.iov_len = e->rlen;   /* clamped, as above */
         return copy_to_guest(c, data, &iov, sizeof iov) < 0 ? -EFAULT : 0;
     }
     case G_PTRACE_CONT:
-        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);
+        return pt_cmd(e, pid, PT_CMD_RESUME, data, PT_RES_CONT);
     case G_PTRACE_SYSCALL:
-        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SYSCALL);
+        return pt_cmd(e, pid, PT_CMD_RESUME, data, PT_RES_SYSCALL);
     case G_PTRACE_SINGLESTEP:
-        return pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SINGLESTEP);
+        return pt_cmd(e, pid, PT_CMD_RESUME, data, PT_RES_SINGLESTEP);
     case G_PTRACE_DETACH:
-        return pt_cmd(e, PT_CMD_DETACH, data, 0);
+        return pt_cmd(e, pid, PT_CMD_DETACH, data, 0);
     case G_PTRACE_LISTEN:
         /* Only on a SEIZE'd tracee currently in an EVENT_STOP (a group-stop or a
          * PTRACE_INTERRUPT stop). Keep it parked-but-listening: it does not resume;
@@ -1229,25 +1261,42 @@ int ptrace_have_tracee(s32 wpid) {
     return 0;
 }
 
-/* Is host task `t` dead to a tracer -- its host process gone or a zombie? A tracee
- * killed by an uncatchable SIGKILL runs no guest code, so it publishes no exit and
- * leaves a zombie its real parent has not reaped (kill(t,0) still succeeds); the
- * /proc state distinguishes a zombie from a live one. */
-static int pt_task_dead(s32 t) {
+/* Single-letter state of host task `t` from /proc/<t>/stat. 0 when the file
+ * cannot be opened at all -- the task is gone, or this host has no readable
+ * /proc -- and '?' when it opened but could not be parsed; the two callers below
+ * want opposite answers for those, so they are kept distinguishable. */
+static char pt_task_state(s32 t) {
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/stat", (int)t);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 1;                       /* gone (already reaped) */
+    if (fd < 0) return 0;
     char buf[256];
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
-    if (n <= 0) return 0;
+    if (n <= 0) return '?';
     buf[n] = 0;
     char *rp = strrchr(buf, ')');               /* comm may hold spaces/parens */
-    if (!rp || !rp[1]) return 0;
-    char st = (rp[1] == ' ') ? rp[2] : rp[1];   /* "...) S ..." */
-    return st == 'Z' || st == 'X' || st == 'x';
+    if (!rp || !rp[1]) return '?';
+    return (rp[1] == ' ') ? rp[2] : rp[1];      /* "...) S ..." */
 }
+
+static int pt_state_is_dead(char st) { return st == 'Z' || st == 'X' || st == 'x'; }
+
+/* Is host task `t` dead to a tracer -- its host process gone or a zombie? A tracee
+ * killed by an uncatchable SIGKILL runs no guest code, so it publishes no exit and
+ * leaves a zombie its real parent has not reaped (kill(t,0) still succeeds); the
+ * /proc state distinguishes a zombie from a live one. Unopenable counts as dead:
+ * the caller has already waited out a mailbox timeout on it. */
+static int pt_task_dead(s32 t) {
+    char st = pt_task_state(t);
+    return st ? pt_state_is_dead(st) : 1;
+}
+
+/* Is host task `t` a zombie -- dead, but still there because its own parent has
+ * not reaped it? Deliberately conservative in the other direction: anything this
+ * cannot read answers "no", so the parked-tracee check that pairs it with kill(2)
+ * (pt_service_loop) never turns an unreadable /proc into a spurious detach. */
+static int pt_task_zombie(s32 t) { return pt_state_is_dead(pt_task_state(t)); }
 
 /* Backstop for a tracee that vanished at the host level without publishing an exit
  * -- an uncatchable SIGKILL (every catchable fatal signal is mediated and reports

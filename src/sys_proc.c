@@ -438,6 +438,8 @@ SYSDEF(clone) {
      * is CLONE, else FORK. The child then auto-attaches; the parent reports the
      * event stop below. */
     int pt_ev = 0;
+    s32 pt_tracer = 0;
+    u32 pt_options = 0, pt_seize = 0;
     if (ptrace_self_active()) {
         u32 o = ptrace_self_options();
         if (flags & G_CLONE_VFORK)
@@ -446,6 +448,14 @@ SYSDEF(clone) {
             pt_ev = (o & G_PTRACE_O_TRACECLONE) ? G_PTRACE_EVENT_CLONE : 0;
         else
             pt_ev = (o & G_PTRACE_O_TRACEFORK) ? G_PTRACE_EVENT_FORK : 0;
+        /* What a followed child auto-attaches to, sampled HERE rather than read
+         * out of our registry link in the child: we report the event stop below,
+         * and a tracer that answers it with PTRACE_DETACH frees that link while
+         * the child may not have run yet. Same capture, and for the same reason,
+         * as the thread path above does before pthread_create. */
+        pt_tracer = ptrace_self_tracer();
+        pt_options = o;
+        pt_seize = ptrace_self_seize();
     }
 
     /* The child's registry slot, taken before it exists so that both sides know
@@ -552,7 +562,7 @@ SYSDEF(clone) {
         /* Auto-attach to the parent's tracer + initial stop when followed;
          * otherwise drop the inherited tracee-self state (a fresh untraced pid).
          * Last, so the child is fully set up before it parks for the tracer. */
-        ptrace_fork_child(c, pt_ev);
+        ptrace_fork_child(c, pt_ev, pt_tracer, pt_options, pt_seize);
         return 0;
     }
     /* A plain fork does not re-run load_elf, so the child needs publishing (with
