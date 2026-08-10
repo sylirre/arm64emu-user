@@ -148,6 +148,21 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data);
 long ptrace_vm_block(s32 pid, u64 rva, u8 *buf, size_t len, int write);
 
 /* ---- wait4/waitid tracer integration ---- */
+/* Resource usage of a stopped/dead tracee, published with its stop event.
+ * wait4/waitid fill their rusage argument at a ptrace stop as well as at a
+ * death (the kernel's wait_task_stopped() ends in getrusage(p, RUSAGE_BOTH)),
+ * and that is where `strace -c` gets the system time it charges to each
+ * syscall. A cooperative stop is not a host wait event, so the tracer has no
+ * host rusage to marshal and cannot read another process's accounting either;
+ * the tracee stamps its own into the registry instead (see pt_ru_stamp).
+ * Fixed-width fields: the registry is shared between processes and its layout
+ * must not depend on the host's `long`. */
+typedef struct {
+    s64 utime_sec, utime_usec;   /* normalized: usec in [0, 1000000) */
+    s64 stime_sec, stime_usec;
+    s64 maxrss, ixrss, idrss, isrss, minflt, majflt, nswap, inblock, oublock,
+        msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
+} PtRusage;
 /* Is the shared registry mapped at all (ptrace usable this session)? */
 int  ptrace_available(void);
 /* Has anyone in the session started tracing? Gates the wait polling path. */
@@ -158,13 +173,16 @@ int  ptrace_any_trace(void);
  * or exit arrives through the registry, not the host wait. */
 int  ptrace_have_tracee(s32 wpid);
 /* Consume one ready ptrace-stop matching wpid (-1 = any). On success fills
- * *status (a WIFSTOPPED wait-status word) and *outpid, returns 1; else 0. */
-int  ptrace_collect(s32 wpid, int *status, s32 *outpid);
+ * *status (a WIFSTOPPED wait-status word) and *outpid, returns 1; else 0.
+ * `ru` (optional) receives the tracee's rusage as of the stop. */
+int  ptrace_collect(s32 wpid, int *status, s32 *outpid, PtRusage *ru);
 /* Backstop: a non-child tracee killed by an uncatchable SIGKILL vanishes without
  * a registry event. Detect its dead/zombie host process and report a synthetic
  * WIFSIGNALED(SIGKILL) so a sibling tracer's wait4 poll does not hang. Fills the
- * status and outpid out-params and returns 1 if found, else 0. */
-int  ptrace_reap_dead(s32 wpid, int *status, s32 *outpid);
+ * status and outpid out-params and returns 1 if found, else 0. `ru` (optional)
+ * receives the corpse's last published rusage -- nobody ran in it to stamp a
+ * fresh one, so it is the snapshot from its last stop. */
+int  ptrace_reap_dead(s32 wpid, int *status, s32 *outpid, PtRusage *ru);
 /* Sample the state-change generation. Take it *before* checking the registry
  * and the host WNOHANG wait, then sleep with ptrace_tracer_wait(gen, ms): a
  * stop/exit published in between bumps the generation and the sleep returns

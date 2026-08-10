@@ -1361,6 +1361,58 @@ static void rusage_out(GRusage *g, const struct rusage *h) {
     g->ru_nvcsw = h->ru_nvcsw;     g->ru_nivcsw = h->ru_nivcsw;
 }
 
+/* The rusage layout the *kernel* fills, which is not always the libc's: a
+ * 32-bit host built with 64-bit time_t (-D_TIME_BITS=64 here, and 32-bit musl
+ * unconditionally) has 64-bit timevals in its struct rusage, and its
+ * wait4/getrusage wrappers convert on the way out. A raw syscall gets no such
+ * conversion -- the kernel's rusage always carries __kernel_old_timeval, a pair
+ * of longs -- so the one raw wait in this file (waitid, whose fifth argument no
+ * libc exposes) decodes this instead. On LP64 it is the same 144 bytes the libc
+ * struct has, which is why reading the wrong one is an ILP32-only bug: it
+ * surfaced as a *sometimes* absurd guest rusage, since a small tv_usec landing
+ * in the high half of a 64-bit tv_sec still looks plausible. */
+typedef struct {
+    long utime_sec, utime_usec, stime_sec, stime_usec;
+    long maxrss, ixrss, idrss, isrss, minflt, majflt, nswap, inblock, oublock,
+         msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
+} KRusage;
+
+static void rusage_out_k(GRusage *g, const KRusage *k) {
+    memset(g, 0, sizeof *g);
+    g->ru_utime.tv_sec = k->utime_sec;   g->ru_utime.tv_usec = k->utime_usec;
+    g->ru_stime.tv_sec = k->stime_sec;   g->ru_stime.tv_usec = k->stime_usec;
+    g->ru_maxrss = k->maxrss;      g->ru_ixrss = k->ixrss;
+    g->ru_idrss = k->idrss;        g->ru_isrss = k->isrss;
+    g->ru_minflt = k->minflt;      g->ru_majflt = k->majflt;
+    g->ru_nswap = k->nswap;        g->ru_inblock = k->inblock;
+    g->ru_oublock = k->oublock;    g->ru_msgsnd = k->msgsnd;
+    g->ru_msgrcv = k->msgrcv;      g->ru_nsignals = k->nsignals;
+    g->ru_nvcsw = k->nvcsw;        g->ru_nivcsw = k->nivcsw;
+}
+
+/* The same, from the snapshot a ptrace stop publishes (no host `long` in the
+ * middle, so a 32-bit host does not truncate on the way through). */
+static void rusage_out_pt(GRusage *g, const PtRusage *p) {
+    memset(g, 0, sizeof *g);
+    g->ru_utime.tv_sec = p->utime_sec;   g->ru_utime.tv_usec = p->utime_usec;
+    g->ru_stime.tv_sec = p->stime_sec;   g->ru_stime.tv_usec = p->stime_usec;
+    g->ru_maxrss = p->maxrss;      g->ru_ixrss = p->ixrss;
+    g->ru_idrss = p->idrss;        g->ru_isrss = p->isrss;
+    g->ru_minflt = p->minflt;      g->ru_majflt = p->majflt;
+    g->ru_nswap = p->nswap;        g->ru_inblock = p->inblock;
+    g->ru_oublock = p->oublock;    g->ru_msgsnd = p->msgsnd;
+    g->ru_msgrcv = p->msgrcv;      g->ru_nsignals = p->nsignals;
+    g->ru_nvcsw = p->nvcsw;        g->ru_nivcsw = p->nivcsw;
+}
+
+/* Copy a stop/exit snapshot out to the guest's rusage buffer. */
+static int rusage_pt_to_guest(CPU *c, u64 addr, const PtRusage *p) {
+    GRusage g;
+    if (!addr) return 0;
+    rusage_out_pt(&g, p);
+    return copy_to_guest(c, addr, &g, sizeof g) < 0 ? -EFAULT : 0;
+}
+
 SYSDEF(wait4) {
     pid_t wpid = (pid_t)(s32)a0;
     int options = (int)a2;
@@ -1421,12 +1473,18 @@ SYSDEF(wait4) {
         u32 gen = ptrace_wait_gen();   /* before the checks: lost-wakeup guard */
         int st;
         s32 rp;
-        if (ptrace_collect((s32)wpid, &st, &rp)) {
+        PtRusage pru;
+        if (ptrace_collect((s32)wpid, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
             }
-            return (u64)(u32)rp;   /* ptrace-stops carry no rusage */
+            /* A ptrace stop fills rusage too -- the kernel's wait_task_stopped()
+             * ends in getrusage(p, RUSAGE_BOTH), and `strace -c` charges its
+             * per-syscall system time to exactly these deltas. The stopped
+             * tracee published the snapshot with the stop. */
+            if (a3 && rusage_pt_to_guest(c, a3, &pru) < 0) return (u64)(s64)-EFAULT;
+            return (u64)(u32)rp;
         }
         int status;
         struct rusage ru;
@@ -1454,11 +1512,13 @@ SYSDEF(wait4) {
         /* A non-child tracee killed by an uncatchable SIGKILL vanishes at the host
          * level with no registry event; detect its dead/zombie process and report
          * the synthetic WIFSIGNALED(SIGKILL) so we do not poll forever. */
-        if (pid < 0 && werr == ECHILD && ptrace_reap_dead((s32)wpid, &st, &rp)) {
+        if (pid < 0 && werr == ECHILD &&
+            ptrace_reap_dead((s32)wpid, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
             }
+            if (a3 && rusage_pt_to_guest(c, a3, &pru) < 0) return (u64)(s64)-EFAULT;
             return (u64)(u32)rp;
         }
         if (options & WNOHANG) return 0;     /* nothing ready yet */
@@ -1489,7 +1549,7 @@ SYSDEF(waitid) {
     id_t id = (id_t)a1;
     u64 infop = a2;
     int options = (int)a3;
-    (void)a4; (void)a5;
+    (void)a5;
 
     /* Same two modes as wait4: a real blocking host waitid unless the caller
      * is a tracer for the waited id, else the registry poll (a ptrace stop is
@@ -1500,8 +1560,16 @@ SYSDEF(waitid) {
         if (!ptrace_available() || !ptrace_any_trace() ||
             !ptrace_have_tracee(wpid)) {
             siginfo_t si;
+            KRusage ru;
             memset(&si, 0, sizeof si);
-            int r = waitid(idtype, id, &si, options);
+            memset(&ru, 0, sizeof ru);
+            /* Raw syscall, not the libc wrapper: waitid(2) takes a fifth
+             * rusage argument that no libc exposes (glibc/musl/Bionic all pass
+             * NULL), and a guest that supplies one expects it filled -- this is
+             * the wait4-less way to get a child's accounting. Kernel layout, so
+             * see KRusage. */
+            int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si, options,
+                                 a4 ? &ru : NULL);
             if (r < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -1516,6 +1584,13 @@ SYSDEF(waitid) {
             /* Defensive: see the matching wait4 comment. */
             if (si.si_pid != 0 && ptrace_any_trace())
                 ptrace_note_reaped((s32)si.si_pid);
+            /* Only a wait that found a child writes rusage (the kernel copies it
+             * out under `err > 0`), so a WNOHANG that found nothing must not. */
+            if (a4 && si.si_pid != 0) {
+                GRusage g;
+                rusage_out_k(&g, &ru);
+                if (copy_to_guest(c, a4, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+            }
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
@@ -1523,22 +1598,32 @@ SYSDEF(waitid) {
         u32 gen = ptrace_wait_gen();   /* before the checks: lost-wakeup guard */
         int st;
         s32 rp;
-        if ((options & WSTOPPED) && ptrace_collect(wpid, &st, &rp)) {
+        PtRusage pru;
+        if ((options & WSTOPPED) && ptrace_collect(wpid, &st, &rp, a4 ? &pru : NULL)) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             si.si_signo = SIGCHLD;
             si.si_code = CLD_TRAPPED;
             si.si_pid = rp;
             si.si_status = (st >> 8) & 0xff;   /* WSTOPSIG */
+            if (a4 && rusage_pt_to_guest(c, a4, &pru) < 0) return (u64)(s64)-EFAULT;
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
         siginfo_t si;
+        KRusage ru;
         memset(&si, 0, sizeof si);
-        int r = waitid(idtype, id, &si, options | WNOHANG);
+        memset(&ru, 0, sizeof ru);
+        int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
+                             options | WNOHANG, a4 ? &ru : NULL);
         int werr = errno;
         if (r == 0 && si.si_pid != 0) {
             ptrace_note_reaped((s32)si.si_pid);
+            if (a4) {
+                GRusage g;
+                rusage_out_k(&g, &ru);
+                if (copy_to_guest(c, a4, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+            }
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
@@ -1548,13 +1633,15 @@ SYSDEF(waitid) {
         /* Uncatchable SIGKILL of a non-child tracee: report the synthetic death as
          * a CLD_KILLED SIGCHLD siginfo so waitid does not poll forever (see wait4). */
         int dst, drp;
-        if (r < 0 && werr == ECHILD && ptrace_reap_dead(wpid, &dst, &drp)) {
+        if (r < 0 && werr == ECHILD &&
+            ptrace_reap_dead(wpid, &dst, &drp, a4 ? &pru : NULL)) {
             siginfo_t ki;
             memset(&ki, 0, sizeof ki);
             ki.si_signo = SIGCHLD;
             ki.si_code = CLD_KILLED;
             ki.si_pid = drp;
             ki.si_status = dst;        /* SIGKILL */
+            if (a4 && rusage_pt_to_guest(c, a4, &pru) < 0) return (u64)(s64)-EFAULT;
             int e = waitid_out(c, infop, &ki);
             return e ? (u64)(s64)e : 0;
         }

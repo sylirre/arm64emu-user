@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -125,6 +126,7 @@ typedef struct {
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
     u64 fault_addr;      /* siginfo si_addr for fault stops (SIGSEGV/TRAP/...);
                           * not named si_addr — that is a glibc signal.h macro */
+    PtRusage ru;         /* accounting as of the current stop (pt_ru_stamp) */
     /* futex mailbox: tracer bumps cmd_seq to submit, tracee bumps done_seq. */
     u32 cmd_seq, done_seq;
     u32 cmd;
@@ -235,12 +237,52 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
             e->fault_addr = 0;
             e->attach_pending = e->interrupt_pending = 0;
             e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
+            memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
             __atomic_store_n(&e->tracee, tracee, __ATOMIC_RELEASE);
             return e;
         }
     }
     return NULL;
+}
+
+/* Stamp the calling tracee's own accounting into its link, next to the other
+ * stop fields, so the tracer's wait4/waitid can fill a guest rusage for a stop
+ * the host wait never sees. RUSAGE_BOTH is kernel-internal; SELF + CHILDREN is
+ * the same thing (the kernel sums both, except maxrss where it takes the
+ * larger). Sampling at the stop rather than at wait time is also what the guest
+ * should see: from here until the tracer collects, this thread only runs the
+ * emulator's own service loop, and that host CPU time is not the guest's.
+ * A per-thread getrusage is not what the kernel reports either -- RUSAGE_SELF is
+ * thread-group-wide, which is what a stopped thread's tracer gets. */
+static void pt_ru_stamp(PtLink *e) {
+    struct rusage s, ch;
+    memset(&s, 0, sizeof s);
+    memset(&ch, 0, sizeof ch);
+    getrusage(RUSAGE_SELF, &s);
+    getrusage(RUSAGE_CHILDREN, &ch);
+    s64 ut = (s64)s.ru_utime.tv_sec * 1000000 + s.ru_utime.tv_usec +
+             (s64)ch.ru_utime.tv_sec * 1000000 + ch.ru_utime.tv_usec;
+    s64 st = (s64)s.ru_stime.tv_sec * 1000000 + s.ru_stime.tv_usec +
+             (s64)ch.ru_stime.tv_sec * 1000000 + ch.ru_stime.tv_usec;
+    PtRusage r;
+    r.utime_sec = ut / 1000000; r.utime_usec = ut % 1000000;
+    r.stime_sec = st / 1000000; r.stime_usec = st % 1000000;
+    r.maxrss = s.ru_maxrss > ch.ru_maxrss ? s.ru_maxrss : ch.ru_maxrss;
+    r.ixrss = s.ru_ixrss + ch.ru_ixrss;
+    r.idrss = s.ru_idrss + ch.ru_idrss;
+    r.isrss = s.ru_isrss + ch.ru_isrss;
+    r.minflt = s.ru_minflt + ch.ru_minflt;
+    r.majflt = s.ru_majflt + ch.ru_majflt;
+    r.nswap = s.ru_nswap + ch.ru_nswap;
+    r.inblock = s.ru_inblock + ch.ru_inblock;
+    r.oublock = s.ru_oublock + ch.ru_oublock;
+    r.msgsnd = s.ru_msgsnd + ch.ru_msgsnd;
+    r.msgrcv = s.ru_msgrcv + ch.ru_msgrcv;
+    r.nsignals = s.ru_nsignals + ch.ru_nsignals;
+    r.nvcsw = s.ru_nvcsw + ch.ru_nvcsw;
+    r.nivcsw = s.ru_nivcsw + ch.ru_nivcsw;
+    e->ru = r;   /* ordered by the state release-store that publishes the stop */
 }
 
 static void pt_free(PtLink *e) {
@@ -495,6 +537,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
     e->si_code = si_code ? si_code : (event ? ((event << 8) | 5 /*SIGTRAP*/) : 0);
     e->fault_addr = fault_addr;
     e->si_errno = 0;
+    pt_ru_stamp(e);
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
     /* Wake the tracer's wait4/waitid: the poll-mode futex, plus the SIGCHLD +
@@ -626,6 +669,7 @@ void ptrace_report_exit(CPU *c, int wstatus) {
     s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
     if (tr > 0 && ((s32)g_tls.tid != (s32)getpid() || tr != (s32)getppid())) {
         e->exit_status = wstatus;
+        pt_ru_stamp(e);            /* the tracer's wait4 rusage for this death */
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
@@ -666,6 +710,9 @@ void ptrace_report_exit_group(int wstatus) {
         if (tr <= 0) { pt_free(e); continue; }
         if (t == me && tr == ppid) continue;   /* host wait reaps this death */
         e->exit_status = wstatus;
+        /* Group-wide accounting, so the dying thread's own sample is equally
+         * true of the siblings it is publishing on behalf of. */
+        pt_ru_stamp(e);
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         pt_wake_tracer(tr);                 /* SIGCHLD loop + blocked-wait kick */
         published = 1;
@@ -1182,7 +1229,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
 }
 
 /* ---- tracer: wait4/waitid integration ---- */
-int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
+int ptrace_collect(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1196,6 +1243,7 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
         if (st_state == PT_ST_EXITED) {
             *status = e->exit_status;
             *outpid = t;
+            if (ru) *ru = e->ru;   /* before pt_free: the slot is reusable after */
             pt_free(e);
             return 1;
         }
@@ -1216,6 +1264,11 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid) {
                 sig |= 0x80;
             st = (sig << 8) | 0x7f;
         }
+        /* The snapshot the tracee stamped when it published this stop. A stop
+         * re-armed from the sender side (ptrace_signal_cont) carries the one
+         * from the tracee's last real stop, which is still the truth: it has
+         * been parked in its service loop ever since, running no guest code. */
+        if (ru) *ru = e->ru;
         __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
         *status = st;
         *outpid = t;
@@ -1304,7 +1357,7 @@ static int pt_task_zombie(s32 t) { return pt_state_is_dead(pt_task_state(t)); }
  * WIFSIGNALED(SIGKILL) so a sibling tracer polling in wait4 does not hang. Only
  * fires for a non-child tracee; a host-child's death is reaped via the host wait.
  * Returns 1 and fills status/outpid if such a tracee is found, else 0. */
-int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid) {
+int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1318,6 +1371,10 @@ int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid) {
         if (!pt_task_dead(t)) continue;
         *status = SIGKILL;            /* WIFSIGNALED(SIGKILL) */
         *outpid = t;
+        /* Killed outright: no guest code ran to stamp a fresh snapshot, so this
+         * is the one from its last stop (nothing better exists -- the accounting
+         * died with the task). */
+        if (ru) *ru = e->ru;
         pt_free(e);
         return 1;
     }

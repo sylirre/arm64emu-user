@@ -129,6 +129,26 @@ wrapper only what every libc's version of it accepts.
 *Visible on:* Bionic/Termux only. Symptom: `apt update` reports NO_PUBKEY for
 every archive key.
 
+### A raw syscall loses the libc's struct translation (32-bit hosts)
+
+The mirror image of the entry above: bypassing a wrapper also bypasses the
+*conversions* it performs. `waitid(2)` takes a fifth `rusage` argument that no
+libc exposes, so serving a guest's must go through `syscall()` — and on a 32-bit
+host with 64-bit `time_t` (this build passes `-D_TIME_BITS=64`; 32-bit musl is
+time64 unconditionally) the libc's `struct rusage` is **not** the kernel's. glibc
+i386: 88 bytes, `ru_stime` at offset 16, 8-byte `tv_sec`, and its `wait4`/
+`getrusage` wrappers convert. The kernel always writes `__kernel_old_timeval`, a
+pair of `long`s: 72 bytes, `ru_stime` at 8. Filling a libc `struct rusage` from
+the raw syscall therefore decodes 72 kernel bytes as an 88-byte struct. Declare
+the kernel's layout explicitly (`KRusage` in `sys_proc.c`) whenever a raw syscall
+returns a struct a wrapper would have translated.
+
+*Visible on:* i386 and armhf **glibc/musl** only — Bionic's 32-bit `time_t` makes
+the two layouts coincide, and on LP64 they are the same 144 bytes, so `make
+test32` is the only tier that can catch this. Symptom: an *intermittently*
+absurd guest `rusage` (4 of 6 runs), because a small `tv_usec` landing in the
+high half of a 64-bit `tv_sec` still looks like a plausible number.
+
 ### vfork mistaken for a thread
 
 `CLONE_VM` alone does not mean "thread"; only `CLONE_THREAD` does. Spawning a

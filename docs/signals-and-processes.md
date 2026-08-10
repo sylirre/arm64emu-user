@@ -533,6 +533,28 @@ deaths, which run no guest code to bump the generation). It synthesizes the
 status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall stops under
 `PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops.
 
+**`rusage` at a stop.** `wait4`/`waitid` fill their `rusage` argument at a ptrace
+stop, not only at a death — the kernel's `wait_task_stopped()` ends in
+`getrusage(p, RUSAGE_BOTH, wo->wo_rusage)` — and `strace -c` is built on exactly
+that: its per-syscall "seconds" column is the *delta* between the rusage of two
+consecutive stops of the same tracee. A cooperative stop is not a host wait
+event, so there is no host rusage for the tracer to marshal, and one process
+cannot read another's accounting anyway; the tracee therefore stamps its own
+(`RUSAGE_SELF + RUSAGE_CHILDREN`, which is what the kernel-internal
+`RUSAGE_BOTH` sums — additive but `max` for `maxrss`) into its registry link
+alongside the other stop fields, ordered by the same release-store on `state`.
+Sampling at the stop rather than at wait time is also the more honest number:
+from the stop until the tracer collects it, the tracee only runs the emulator's
+own service loop, and that host CPU time is not the guest's. Two corners follow
+from the kernel's behaviour rather than ours: a wait that reports *nothing*
+(`WNOHANG` with no event) must leave the buffer untouched, since the kernel
+copies rusage out only when it has a child to report; and a tracee killed
+outright by `SIGKILL`, reported through the dead-tracee backstop, carries the
+snapshot from its last stop, because no guest code ran in it to take a fresh one
+and the accounting died with the task. `waitid`'s fifth argument is a raw-syscall
+parameter that no libc wrapper exposes (glibc, musl and Bionic all pass `NULL`),
+so the host side of that path uses `syscall(SYS_waitid, ...)` directly.
+
 Everyone else — no registry, nobody tracing in the session (`any_trace`), or no
 live tracee of the caller matching the waited id (`ptrace_have_tracee`) — keeps
 the original genuinely **blocking** host `wait4`/`waitid`: the kernel provides
