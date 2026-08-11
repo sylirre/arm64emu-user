@@ -159,6 +159,9 @@ typedef struct Region {
 typedef struct RetiredMap {
     void  *addr;
     size_t len;
+    unsigned long gen;        /* address-space generation at retirement: this
+                               * backing is unreachable to any thread that has
+                               * emptied its D-TLB at or after it (mem.c) */
 } RetiredMap;
 
 typedef struct AddrSpace {
@@ -168,8 +171,8 @@ typedef struct AddrSpace {
     RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
     int nretired, cap_retired;
     int nthreads;             /* guest threads sharing this space (atomic).
-                               * 1 means the quarantine can be drained: no other
-                               * D-TLB exists to hold a stale host pointer. */
+                               * 1 means the whole quarantine can go at once: no
+                               * other D-TLB exists to hold a stale pointer. */
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
     u64 stack_top;            /* initial stack top (guest VA) */
@@ -195,6 +198,16 @@ int  guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot);
 int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                     u64 off, int shared, const char *path);
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
+/* Empty and publish this thread's D-TLB epoch, releasing its hold on the
+ * retired-backing quarantine. Called at the run-loop safepoint. */
+void as_tlb_quiesce_self(void);
+/* Bracket a stretch where this thread cannot run guest code (the syscall
+ * dispatch): while blocked it stops holding retired backing back. */
+void as_tlb_block_begin(void);
+void as_tlb_block_end(void);
+/* Drop every other thread's published epoch after a fork: they describe
+ * threads that do not exist in the child. */
+void as_tlb_fork_child(void);
 void as_thread_enter(AddrSpace *as);   /* a guest thread joins this space */
 void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
 /* A file changed size: drop the guest PTEs of any mapping of it that now

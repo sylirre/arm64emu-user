@@ -13,6 +13,7 @@
 #include <string.h>
 #include <ucontext.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -68,6 +69,96 @@ void tlb_flush_all(void) {
     g_dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
 }
 
+/* ---- published D-TLB epochs (what lets the quarantine drain) --------------
+ *
+ * Retired host backing may only be unmapped once no thread can still hold a
+ * translated pointer into it. Every thread empties its D-TLB promptly after a
+ * mutation already -- the interpreter on the generation check in translate(),
+ * a JIT thread on the `interrupt` flag as_gen_bump() raises -- but nobody could
+ * *observe* that, so the quarantine used to wait for the address space to fall
+ * to a single thread, i.e. until exit for anything multithreaded. A guest with
+ * two threads mapping and unmapping in a loop grew the emulator's address space
+ * without bound (15 GB in a few seconds), and a fork out of that eventually
+ * failed with ENOMEM once the doubled commit charge passed RAM+swap.
+ *
+ * So each thread publishes the generation its D-TLB reflects, at the two places
+ * it empties it, and a retired entry is released once every registered thread
+ * has published at or past the generation it was retired at. Nothing is added
+ * to the hot path: the store happens only when a D-TLB is actually emptied. */
+#define AS_PUB_MAX 256   /* published epochs, one per guest thread */
+
+static struct { s32 tid; int blocked; unsigned long gen; } g_pub[AS_PUB_MAX];
+static __thread int g_pub_slot = -1;
+
+/* A thread that is not executing guest code cannot consume a stale entry at all:
+ * the interpreter re-checks the generation on every access through translate(),
+ * and generated code services the interrupt flag as_gen_bump() raises at each
+ * block boundary, before it probes the D-TLB again. Only an access already in
+ * flight inside one JIT block is exposed -- which is what the quarantine is for.
+ * So a thread parked in a blocking host syscall publishes ~0UL and stops holding
+ * the quarantine open, and restores its real epoch before it can run guest code
+ * again (as_tlb_block_begin/end, called around the syscall dispatch). That is
+ * why no thread ever has to be interrupted to make this work: a first attempt
+ * kicked the stragglers with the de_thread call-out, whose entire purpose is to
+ * make blocking syscalls return EINTR, and it cut a guest's sleep(6) to 0.2 s.
+ *
+ * Publish the generation this thread's (now empty) D-TLB reflects. Claims a
+ * slot on first use: a thread with no slot has never emptied a D-TLB, so it has
+ * never cached a pointer either and constrains nothing. */
+static void dtlb_publish(unsigned long gen) {
+    if (UNLIKELY(g_pub_slot < 0)) {
+        s32 me = (s32)syscall(SYS_gettid);
+        for (int i = 0; i < AS_PUB_MAX; i++) {
+            s32 free_slot = 0;
+            if (__atomic_compare_exchange_n(&g_pub[i].tid, &free_slot, me, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                g_pub_slot = i;
+                break;
+            }
+        }
+        if (g_pub_slot < 0) return;   /* table full: fall back to the old rule */
+    }
+    __atomic_store_n(&g_pub[g_pub_slot].gen, gen, __ATOMIC_RELEASE);
+}
+
+/* The newest generation every registered thread has already emptied past.
+ * ~0UL when nobody is registered, which releases the whole quarantine. */
+static unsigned long dtlb_safe_gen(void) {
+    unsigned long safe = ~0UL;
+    for (int i = 0; i < AS_PUB_MAX; i++) {
+        if (!__atomic_load_n(&g_pub[i].tid, __ATOMIC_ACQUIRE)) continue;
+        /* Blocked in a host syscall: it cannot be mid-probe inside a JIT block,
+         * and it flushes before it can be again, so it constrains nothing. */
+        if (__atomic_load_n(&g_pub[i].blocked, __ATOMIC_ACQUIRE)) continue;
+        unsigned long g = __atomic_load_n(&g_pub[i].gen, __ATOMIC_ACQUIRE);
+        if (g < safe) safe = g;
+    }
+    return safe;
+}
+
+/* Drop this thread's epoch: it holds no D-TLB any more, so it must stop holding
+ * the quarantine back. Called as a guest thread leaves the address space. */
+static void dtlb_unpublish(void) {
+    if (g_pub_slot < 0) return;
+    __atomic_store_n(&g_pub[g_pub_slot].blocked, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub[g_pub_slot].gen, ~0UL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pub[g_pub_slot].tid, 0, __ATOMIC_RELEASE);
+    g_pub_slot = -1;
+}
+
+/* fork(2) duplicates the calling thread alone, so every other thread's epoch in
+ * the inherited table describes a thread that does not exist here. Keep only
+ * this one's -- otherwise the child's quarantine is pinned by ghosts. */
+void as_tlb_fork_child(void) {
+    int mine = g_pub_slot;
+    for (int i = 0; i < AS_PUB_MAX; i++) {
+        if (i == mine) continue;
+        g_pub[i].tid = 0;
+        g_pub[i].blocked = 0;
+        g_pub[i].gen = ~0UL;
+    }
+}
+
 /* ---- JIT D-TLB seam (see mmu.h) ---- */
 _Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
 _Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
@@ -80,6 +171,7 @@ void jit_dtlb_reset(void) {
     memset(g_dtlb, 0, sizeof g_dtlb);
     g_dtlb_gen = gen;
     g_fcache.host = NULL;
+    dtlb_publish(gen);
 }
 
 /* 128-bit CAS fallback lock for hosts without lock-free __int128 (32-bit ARM
@@ -234,6 +326,9 @@ void as_thread_enter(AddrSpace *as) {
     __atomic_fetch_add(&as->nthreads, 1, __ATOMIC_ACQ_REL);
 }
 void as_thread_exit(AddrSpace *as) {
+    /* Before the count drops: this thread has no D-TLB to hold anything back,
+     * and leaving its epoch behind would pin the quarantine on a ghost. */
+    dtlb_unpublish();
     __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
 }
 
@@ -342,19 +437,66 @@ static void as_retire(AddrSpace *as, void *addr, size_t len) {
     }
     as->retired[as->nretired].addr = addr;
     as->retired[as->nretired].len = len;
+    /* The generation as it stands *before* this range's PTEs are cleared:
+     * guest_unmap_impl punches the region list (which lands us here) and only
+     * then clears the PTEs and bumps, and the map-over paths do the same. The
+     * drain therefore compares strictly greater -- a thread that published a
+     * generation past this one emptied its D-TLB after the clearing bump, so it
+     * can neither still hold a pointer into this backing nor walk to a new one.
+     * Recording it here rather than relying on a caller to bump first keeps the
+     * rule true for every retirement path, at the cost of waiting one extra
+     * generation where a caller did bump first. */
+    as->retired[as->nretired].gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
     as->nretired++;
 }
 
-/* Release quarantined backing when no other thread could still be holding a
- * host pointer into it. With one guest thread in this address space the only
- * D-TLB that mattered is the caller's own, and the generation bump that every
- * mutation performs emptied that before this runs. Callers hold the AS lock. */
+/* Release quarantined backing no thread can still reach. With one guest thread
+ * in this address space that is all of it: the only D-TLB that mattered is the
+ * caller's own, and the generation bump every mutation performs emptied it
+ * before this runs. Otherwise release each entry whose retirement generation
+ * every thread has published past (dtlb_safe_gen). Callers hold the AS lock.
+ *
+ * What is left outstanding is therefore only what threads currently *running*
+ * guest code have yet to flush -- at most one block boundary's worth -- because a
+ * thread parked in a host syscall publishes ~0UL for the duration (see
+ * as_tlb_block_begin). */
 static void as_drain_retired(AddrSpace *as) {
     if (!as->nretired) return;
-    if (__atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) != 1) return;
-    for (int i = 0; i < as->nretired; i++)
-        munmap(as->retired[i].addr, as->retired[i].len);
-    as->nretired = 0;
+    unsigned long safe = (__atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) == 1)
+                             ? ~0UL : dtlb_safe_gen();   /* ~0UL releases all */
+    int keep = 0;
+    for (int i = 0; i < as->nretired; i++) {
+        if (as->retired[i].gen < safe) {   /* strict: see as_retire */
+            munmap(as->retired[i].addr, as->retired[i].len);
+        } else {
+            as->retired[keep++] = as->retired[i];
+        }
+    }
+    as->nretired = keep;
+}
+
+/* Entering / leaving a state where this thread cannot execute guest code (the
+ * syscall dispatch). While blocked its D-TLB holds the quarantine open for
+ * nothing; on the way out it re-publishes the generation its entries actually
+ * reflect, so nothing it could still reach is released before it flushes. */
+void as_tlb_block_begin(void) {
+    if (g_pub_slot < 0) dtlb_publish(g_dtlb_gen);   /* claim a slot to flag */
+    if (g_pub_slot >= 0) __atomic_store_n(&g_pub[g_pub_slot].blocked, 1, __ATOMIC_RELEASE);
+}
+void as_tlb_block_end(void) {
+    /* `gen` already says what this thread's D-TLB reflects -- a flush inside the
+     * handler kept it current -- so clearing the flag is all that is needed. It
+     * is safe even against a drain that raced us: generated code services the
+     * interrupt flag as_gen_bump() raised, and so empties the D-TLB, before it
+     * probes it again. */
+    if (g_pub_slot >= 0) __atomic_store_n(&g_pub[g_pub_slot].blocked, 0, __ATOMIC_RELEASE);
+}
+
+/* Empty this thread's D-TLB and publish the generation, so the quarantine stops
+ * waiting on it. Called at the run-loop safepoint (guest_stop_point): a thread
+ * that was parked in a host syscall reaches it via the kick above. */
+void as_tlb_quiesce_self(void) {
+    jit_dtlb_reset();   /* empties, adopts the current generation, publishes */
 }
 
 static HostMap *hmap_new(u8 *base, size_t len) {
@@ -1007,6 +1149,7 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
     if (UNLIKELY(gen != g_dtlb_gen)) {
         memset(g_dtlb, 0, sizeof g_dtlb);
         g_dtlb_gen = gen;
+        dtlb_publish(gen);   /* lets the quarantine release what we just dropped */
     }
     u64 page = va >> 12;
     DTlbEntry *e = &g_dtlb[page & (DTLB_SIZE - 1)];

@@ -568,7 +568,15 @@ void syscall_dispatch(CPU *c) {
     } else if (nr == (u64)-1) {
         ret = c->x[0];   /* tracer cancelled the syscall (nr := -1) */
     } else if (fn) {
+        /* A handler may block for a long time (read, wait4, futex), and while it
+         * does this thread cannot run generated code, so its D-TLB must stop
+         * holding retired host backing back — otherwise a sibling that maps and
+         * unmaps in a loop grows the emulator without bound (mem.c, published
+         * epochs). Handlers reach guest memory only through translate(), which
+         * re-checks the generation itself, so the window is safe to disown. */
+        as_tlb_block_begin();
         ret = fn(c, a0, a1, a2, a3, a4, a5);
+        as_tlb_block_end();
     } else {
         int quiet = 0;
         for (size_t i = 0; i < sizeof quiet_enosys / sizeof quiet_enosys[0]; i++)

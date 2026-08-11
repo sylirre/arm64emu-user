@@ -504,6 +504,10 @@ SYSDEF(clone) {
          * backing drain (mem.c) -- has to come back to one, or a child of a
          * threaded parent would never reclaim any address space. */
         m->as.nthreads = 1;
+        /* The inherited D-TLB epoch table describes the parent's threads, none
+         * of which exist here; keeping theirs would pin this child's quarantine
+         * on ghosts that can never publish again. */
+        as_tlb_fork_child();
         /* Any call-out outstanding in the parent belongs to the parent's thread
          * group, which this child is not part of: it inherited the state by
          * copy, together with the only thread it applies to. */
@@ -974,6 +978,13 @@ void guest_stop_point(CPU *c) {
     /* Sync first: everything below decides on state, never on the counter. */
     g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
 
+    /* Whatever called us out, empty this thread's D-TLB and publish the epoch:
+     * this is the one place every thread is guaranteed to pass through, so it is
+     * what lets mem.c release quarantined host backing while the guest is
+     * multithreaded (as_drain_retired). Cheap and unconditional -- a call-out is
+     * rare, and the thread was about to resync its stale entries anyway. */
+    as_tlb_quiesce_self();
+
     if (g_tls.image_gen != __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE)) {
         /* The program this thread belongs to is gone: it was either killed by
          * the de_thread that replaced it, or it *is* the thread that loaded the
@@ -995,6 +1006,7 @@ void guest_stop_point(CPU *c) {
 int guest_stop_pending(struct Machine *m) {
     return __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen;
 }
+
 
 /* Bring the thread group down to this thread plus the main thread, so the
  * address space can be replaced under nobody. Returns 0 with *carrier_is_me

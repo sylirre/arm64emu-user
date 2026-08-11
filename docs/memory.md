@@ -88,16 +88,53 @@ munmapped independently when host pages exceed the guest's 4 KB, and a trimmed
 fragment's host pointer need not be host-page aligned.
 
 Retired backing is **quarantined** rather than unmapped on the spot: another
-guest thread's D-TLB is invalidated only lazily (at its next access, via the
-generation counter), so it may still hold a host pointer it translated before
-the unmap, and releasing the backing under it would turn a stale-but-harmless
-access into a host `SIGSEGV`. The quarantine is drained as soon as the address
-space has **one** guest thread left (`as->nthreads`), when the only D-TLB that
-could hold such a pointer is the caller's own — already emptied by the
-generation bump every mutation performs. A multithreaded address space still
-waits for `as_destroy`. Without the drain a single-threaded map/unmap loop never
+guest thread may still hold a host pointer it translated before the unmap, and
+releasing the backing under it would turn a stale-but-harmless access into a
+host `SIGSEGV`. Without any drain a single-threaded map/unmap loop never
 returned anything: 1.25 GB churned through a 512 MB limit died two-thirds of the
 way in, where the same loop costs qemu 7 MB.
+
+#### Published D-TLB epochs are what let it drain
+
+With one guest thread left (`as->nthreads`) the whole quarantine goes at once:
+the only D-TLB that could hold such a pointer is the caller's own, already
+emptied by the generation bump every mutation performs. Otherwise each thread
+**publishes the generation its D-TLB reflects**, at the two places it empties
+one — `translate()`'s generation check and `jit_dtlb_reset()` — and an entry is
+released once every registered thread has published a generation *past* the one
+it was retired at. Strictly past, because the retirement is recorded before the
+range's PTEs are cleared (`guest_unmap_impl` punches the region list first and
+bumps afterwards), so it takes the following bump to prove a thread emptied after
+the clear. Nothing is added to the hot path: the store happens only when a
+D-TLB is actually emptied.
+
+The window that has to be covered is narrow, which is what makes this cheap. The
+interpreter re-checks the generation on *every* access, and generated code
+services the `interrupt` flag `as_gen_bump()` raises at each block boundary,
+before it probes the D-TLB again — so the only exposed access is one already in
+flight inside a single JIT block. A thread parked in a blocking host syscall has
+by definition left its block, so it is skipped outright
+(`as_tlb_block_begin`/`_end` around the syscall dispatch): otherwise a guest
+whose main thread sits in `sleep()` would pin the quarantine on a thread that
+cannot touch it. Note that the flag has to be separate from the published
+generation rather than a sentinel value in it — a handler that copies its
+arguments out of guest memory goes through `translate()`, whose flush would
+publish over the sentinel and re-pin the quarantine.
+
+Waiting for `as->nthreads` to fall to 1 was the earlier rule, and for anything
+multithreaded that meant *never*: a guest with two threads mapping and unmapping
+in a loop grew the emulator's address space by ~15 GB per second and a `fork`
+out of it eventually failed with `ENOMEM`, once the doubled private-anon commit
+charge passed RAM+swap. `tests/fixtures/forklock.c` is the regression test —
+it churns from a sibling thread while forking, and used to need 15 GB where it
+now peaks under 500 MB.
+
+An unrelated residue is worth knowing about when reading these numbers: guest VA
+is handed out by a bump allocator that does not reuse freed ranges, and the
+software page table keeps the L2 tables covering what it has handed out. A guest
+churning *fresh* mappings therefore still costs ~128 bytes of host memory per
+64 KB of guest VA consumed — some 500× less than the quarantine did, and nothing
+at all for a guest that reuses addresses (`MAP_FIXED` churn is measurably flat).
 
 ### `RLIMIT_AS` is the guest's, measured against the guest's address space
 
