@@ -165,6 +165,9 @@ test-pack: arm64chroot
 	A64_ORACLE=qemu A64_RECORD=1 bash tests/run_tests.sh ./arm64chroot
 	sh tests/run_consist.sh ./arm64chroot
 	git rev-parse HEAD > tests/.cache/recorded/COMMIT
+	md5sum $$(find tests/asm tests/c tests/fixtures tests/ptrace -name '*.bin') \
+	       $$(ls tests/fpconsist.bin 2>/dev/null) \
+	    < /dev/null > tests/.cache/recorded/BINSUMS
 	tar czf arm64chroot-testpack.tar.gz \
 	    $$(find tests/asm tests/c tests/fixtures tests/ptrace -name '*.bin') \
 	    $$(ls tests/fpconsist.bin 2>/dev/null) \

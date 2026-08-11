@@ -262,6 +262,16 @@ in, syscall and filesystem vintages), the proot-driven Alpine shell
 comparison, and anything whose binary or recording is missing from the
 pack — each named in the output.
 
+A binary the pack shipped counts as missing once it stops matching the
+checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That
+only happens on a device that also has a working toolchain — an aarch64
+phone, where a native run rebuilds the same paths with a different compiler —
+and the answers were recorded against the *packed* program, not the rebuilt
+one. Two asm tests "failed" that way before the checksum existed, purely
+because clang laid the binary out differently from gcc and the tests fold
+their own `ADR`/`ADRP` offsets into the hash they print. Unpack the pack
+again to restore them.
+
 `A64_ORACLE=recorded make test-jit` replays the same pack with the
 translator on, and on a 32-bit ARM device that is the *only* check that the
 silicon agrees with what the ARM32 code generator emits — the qemu-arm tier

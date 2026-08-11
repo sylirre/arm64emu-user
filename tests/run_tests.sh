@@ -82,7 +82,16 @@ for s in tests/asm/*.S; do
     # -DUSERMODE selects the Linux-exit variant of the dual-mode m19-m22
     # batteries shared with the ARM64_Emulator repo (their .arch directives
     # override -march per file); the other tests ignore the define.
-    "$AGCC" -march=armv8.1-a -DUSERMODE -static -nostdlib -o "$b" "$s" 2>/dev/null || { echo "FAIL build $s"; fail=$((fail+1)); continue; }
+    # A replay host has no assembler: "building" is the pack's inventory check
+    # (see tests/replay_cc.sh), and a binary the pack did not ship -- or one a
+    # local build has since replaced, which the checksum catches -- is a
+    # missing test, not a broken one. Everywhere else a build that fails is a
+    # real failure.
+    if ! "$AGCC" -march=armv8.1-a -DUSERMODE -static -nostdlib -o "$b" "$s" 2>/dev/null; then
+        if [ "$ORACLE_KIND" = recorded ]; then skip_build "asm/$(basename "$s" .S)"
+        else echo "FAIL build $s"; fail=$((fail+1)); fi
+        continue
+    fi
     run_diff "asm/$(basename "$s" .S)" "$b"
 done
 
