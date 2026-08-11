@@ -542,7 +542,13 @@ then make the consequences the caller depends on true:
   is try-host-first: the readable real file is strictly richer (per-CPU
   jiffies, intr, ctxt) and passes through; where the host denies it (Android
   again) a fallback is synthesized — CPU time estimated by integrating the
-  load average (monotonic, so `top`/`vmstat` deltas work), `btime` exact from
+  load average (busy *and* idle accumulated, never recomputed from
+  `uptime × ncpu`, because the online CPU count moves under a host that
+  hotplugs cores: every core Android took offline for power used to walk the
+  counters backwards, and `top`/`vmstat` subtract consecutive samples, so a
+  step backwards there is not a small error but an enormous bogus one —
+  `A64_PROCSTAT_HOTPLUG_SIM` walks the count down so a machine that never
+  hotplugs anything can test it), `btime` exact from
   `time() − CLOCK_BOOTTIME` (procps computes process start times from it),
   the rest honest zeros. `/proc/uptime`'s idle field comes from the host
   `stat` when readable, else the same estimate, so the two files agree.

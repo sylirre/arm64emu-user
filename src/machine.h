@@ -322,10 +322,13 @@ struct Machine {
     struct ShmAtt { s32 shmid; u64 va; u64 size; } shm_att[SHM_ATT_MAX];
     int shm_att_count;
 
-    /* /proc/stat busy-CPU estimate: integral of the sysinfo() load average
-     * over time (sys_procfs.c stat_estimate). Monotonic within a process,
-     * which is what delta-computing readers (top, vmstat) require. */
+    /* /proc/stat CPU-time estimate: integral of the sysinfo() load average
+     * over time (sys_procfs.c stat_estimate). Both halves are accumulated
+     * rather than derived from uptime * ncpu, since the online CPU count
+     * moves under a hotplugging host; that keeps them monotonic within a
+     * process, which is what delta-computing readers (top, vmstat) require. */
     u64 stat_busy;            /* accumulated busy jiffies (USER_HZ = 100) */
+    u64 stat_idle;            /* accumulated idle jiffies, same units */
     u64 stat_last_ns;         /* CLOCK_BOOTTIME at last sample; 0 = unseeded */
 
     /* Fake identity (-fake-id): proot-style fake uid/gid + credential set. */

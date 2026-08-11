@@ -1227,6 +1227,22 @@ overflowuid=65534 overflowgid=65534'
         fail=$((fail+1)); echo "FAIL fixture: procfs_fidelity"
         diff <(echo "$expect_pf") <(echo "$got") | head -10 | sed 's/^/     /'
     fi
+    # Hotplug tier: the same answers on a host whose online-CPU count moves
+    # under the emulator. Android takes cores offline for power (a Nougat
+    # armv7 device was measured going 3 -> 2 -> 3 -> 2 -> 1 in fifteen
+    # seconds), and deriving the /proc/stat totals from the current count made
+    # every such event walk the counters backwards, which the stat_rewind and
+    # uptime_rewind checks catch. A64_PROCSTAT_HOTPLUG_SIM alternates the
+    # count so a machine that never hotplugs anything can test it too.
+    got=$(A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1 \
+          A64_PROCSTAT_HOTPLUG_SIM=1 \
+          "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
+    if [ "$got" = "$expect_pf" ]; then
+        pass=$((pass+1)); echo "PASS fixture: procfs_fidelity (hotplug)"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: procfs_fidelity (hotplug)"
+        diff <(echo "$expect_pf") <(echo "$got") | head -10 | sed 's/^/     /'
+    fi
     # Passthrough tier: with the host files readable the guest must see their
     # real contents, not the synthesized default.
     if [ -r /proc/sys/kernel/overflowuid ]; then

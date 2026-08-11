@@ -192,6 +192,10 @@ JIT debugging environment variables:
 Behavior fallbacks:
 
 * `A64_PROCSTAT_FORCE_SYNTH`: forces the synthetic /proc/stat fallback.
+* `A64_PROCSTAT_HOTPLUG_SIM`: walks the online-CPU count down on every
+  /proc/stat sample, simulating a host that hotplugs cores (Android does, for
+  power) — the condition under which the synthesized counters must stay
+  monotonic, and one no ordinary CI machine ever produces.
 * `A64_OVERFLOWID_FORCE_SYNTH`: forces the synthetic /proc/sys/kernel/overflow{u,g}id fallback.
 * `A64_NETLINK_FORCE_BLOCK`: forces the netlink fallback path.
 * `A64_SHM_FORCE_FILE`: forces System V shm segments onto file backing (a file in the first writable dir) instead of an anonymous memfd, exercising the fallback tier.

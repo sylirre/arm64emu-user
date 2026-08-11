@@ -118,7 +118,13 @@ unfiltered:
   synthesized too when the host denies it: `top`/`vmstat` show a CPU% *estimate*
   (the load average integrated over time — the real jiffy split is not
   readable by an app), and `ps`/`top` start times are correct because `btime`
-  is computed exactly. These time-varying files regenerate when procps-style
+  is computed exactly. Both halves of that estimate are accumulated rather
+  than derived from the current uptime and CPU count, because on Android the
+  CPU count is not a constant: cores are hotplugged for power, and a Nougat
+  armv7 device was measured going 3 → 2 → 3 → 2 → 1 online within fifteen
+  seconds. Deriving the totals made every one of those events walk the
+  counters backwards, which is exactly what a delta-computing reader cannot
+  survive. These time-varying files regenerate when procps-style
   readers rewind and reread them through one long-lived fd, so a running
   `top` updates live instead of freezing. `/proc/sys/kernel/overflow{u,g}id`
   get the same try-host-first treatment (65534, the kernel's own default, when

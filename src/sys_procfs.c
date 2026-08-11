@@ -386,18 +386,46 @@ static void put_limits(int fd, struct Machine *m) {
     }
 }
 
+/* Online CPUs, as the synthesized /proc/stat reports them: one cpuN line each,
+ * kernel-style (Linux prints the online mask, not the possible one).
+ *
+ * A64_PROCSTAT_HOTPLUG_SIM walks the count down on every sample (N, N-1, ...,
+ * 1, N, ...). A host that takes cores offline is what breaks the counters'
+ * monotonicity, and no ordinary development or CI machine ever does -- only
+ * phones do -- so without this the regression is reachable on an Android
+ * device alone. Descending rather than alternating so that consecutive
+ * samples nearly always shrink: whether a *random* pattern catches the bug
+ * depends on which way the count happened to move between two reads. */
 static u64 stat_ncpu(void) {
+    static int sim = -1;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (u64)n : 1;
+    u64 v = n > 0 ? (u64)n : 1;
+    if (sim < 0) sim = getenv("A64_PROCSTAT_HOTPLUG_SIM") != NULL;
+    if (sim) {
+        static unsigned tick;
+        u64 top = v > 4 ? v : 4;
+        v = top - (u64)(tick++ % (unsigned)top);
+    }
+    return v;
 }
 
 /* CPU-time estimate for the synthesized /proc/stat, in USER_HZ = 100
  * jiffies (matching the G_AT_CLKTCK auxv): the real split is unknowable
  * without the host file, so busy time is the integral of the sysinfo()
  * load average over wall time (seeded from the 15-minute average, advanced
- * by the 1-minute average, capped at ncpu) and idle is the remainder.
- * Increments are >= 0, so the counters are monotonic — what delta-computing
- * readers (top, vmstat) require. */
+ * by the 1-minute average, capped at ncpu) and idle takes the rest of the
+ * elapsed CPU-seconds.
+ *
+ * Both figures are *accumulated*, never recomputed from the current uptime
+ * and CPU count, because ncpu is not a constant: Android hotplugs cores for
+ * power (a Nougat armv7 device was measured walking 3 -> 2 -> 3 -> 2 -> 1
+ * within fifteen seconds). Deriving the total as up_j * ncpu each time made
+ * every core that went offline walk the counters backwards, and a
+ * delta-computing reader -- top, vmstat, procps in general -- subtracts
+ * consecutive samples, so a backwards step there is not a small error but a
+ * huge bogus one. Accumulating instead keeps every increment >= 0 whatever
+ * the host does with its cores, which is the one property those readers
+ * actually require of the file. */
 static void stat_estimate(struct Machine *m, u64 ncpu, u64 *busy_j, u64 *idle_j) {
     struct timespec ts = { 0, 0 };
     clock_gettime(CLOCK_BOOTTIME, &ts);
@@ -410,17 +438,25 @@ static void stat_estimate(struct Machine *m, u64 ncpu, u64 *busy_j, u64 *idle_j)
     if (l1 > cap) l1 = cap;
     if (l15 > cap) l15 = cap;
     EMU_LOCK(&est_lock, EMU_LK_EST);
-    if (!m->stat_last_ns)
+    if (!m->stat_last_ns) {
+        /* Seed: split the whole of boot-so-far by the 15-minute average. */
         m->stat_busy = up_j * l15 >> 16;
-    else if (now > m->stat_last_ns)
-        m->stat_busy += (now - m->stat_last_ns) / 10000000 * l1 >> 16;
-    m->stat_last_ns = now;
-    u64 busy = m->stat_busy;
+        u64 total = up_j * ncpu;
+        m->stat_idle = total > m->stat_busy ? total - m->stat_busy : 0;
+        m->stat_last_ns = now;
+    } else if (now > m->stat_last_ns) {
+        u64 dt_j = (now - m->stat_last_ns) / 10000000;   /* whole jiffies */
+        u64 busy_inc = dt_j * l1 >> 16;                  /* <= dt_j * ncpu */
+        m->stat_busy += busy_inc;
+        m->stat_idle += dt_j * ncpu - busy_inc;
+        /* Advance by what was consumed, not to `now`: a reader polling faster
+         * than a jiffy would otherwise throw away the remainder every time and
+         * see counters frozen forever. */
+        m->stat_last_ns += dt_j * 10000000;
+    }
+    *busy_j = m->stat_busy;
+    *idle_j = m->stat_idle;
     EMU_UNLOCK(&est_lock, EMU_LK_EST);
-    u64 total = up_j * ncpu;
-    if (busy > total) busy = total;
-    *busy_j = busy;
-    *idle_j = total - busy;
 }
 
 /* Idle jiffies summed across CPUs (field 4 of the host /proc/stat aggregate
