@@ -4,7 +4,14 @@
  * these two options through the host libc's own macro and struct, so the
  * roundtrip and the timed recv below behave identically on every host tier
  * (LP64 hosts were already right by identity; the ILP32 build is what this
- * test exercises, via make test32). */
+ * test exercises, via make test32).
+ *
+ * NEEDS-ORACLE: so_rcvtimeo
+ * The same qemu build that cannot syncfs (see tests/c/mfdsync.c) also loses
+ * this roundtrip: set 1.252 s, read back zeroes and a zero length, where the
+ * host kernel hands the timeval straight back -- measured natively beside the
+ * emulator, which matches the kernel. The marker is the fallback explanation;
+ * a host CPU that can re-run the reference arbitrates first. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <netinet/in.h>

@@ -46,6 +46,35 @@ skip_build() {   # skip_build <what>
 # pack it is running from. hostenv.sh sets A64_KEEP_TESTBINS for both.
 fx_rm() { [ "${A64_KEEP_TESTBINS:-0}" = 1 ] || rm -f "$@"; }
 
+# What a test declares it needs of the ORACLE (its NEEDS-ORACLE marker, set by
+# the loop that is running it). Only consulted to explain a disagreement that
+# nothing could arbitrate; see diff_verdict.
+NEEDS_ORACLE=
+
+# One failed comparison, resolved. The host CPU arbitrates where it can -- qemu
+# is not authoritative about the kernel underneath it, and on a phone it has
+# been wrong twice (see hostenv.sh's a64_cpu_reference_ok) -- and a row it
+# settles in the emulator's favour PASSES rather than skipping, because the
+# test goes on checking everything else in it. What no second reference can
+# settle falls back to the test's own NEEDS-ORACLE marker, and is skipped by
+# name only if the oracle really cannot do what the test needs of it.
+diff_verdict() {   # diff_verdict <name> <out_q> <rc_q> <out_e> <rc_e> <argv0|""> <cmd...>
+    local name="$1" oq="$2" rq="$3" oe="$4" re="$5" a0="$6" miss
+    shift 6
+    cpu_verdict "$oe" "$re" "$a0" "$@"
+    case $? in
+    0)  pass=$((pass+1)); echo "PASS $name (the host CPU outvoted the oracle)"
+        return ;;
+    2)  miss=$(a64_oracle_missing $NEEDS_ORACLE)
+        if [ -n "$miss" ]; then
+            skip=$((skip+1)); echo "SKIP $name (oracle cannot: $miss)"
+            return
+        fi ;;
+    esac
+    fail=$((fail+1)); echo "FAIL $name (qemu rc=$rq, ours rc=$re)"
+    diff <(echo "$oq") <(echo "$oe") | head -6 | sed 's/^/     /'
+}
+
 run_diff() {   # run_diff <name> <binary> [args...]
     local name="$1"; shift
     local out_q out_e rc_q rc_e
@@ -63,8 +92,7 @@ run_diff() {   # run_diff <name> <binary> [args...]
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS $name"
     else
-        fail=$((fail+1)); echo "FAIL $name (qemu rc=$rc_q, ours rc=$rc_e)"
-        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+        diff_verdict "$name" "$out_q" "$rc_q" "$out_e" "$rc_e" "" "$@"
     fi
 }
 
@@ -113,6 +141,10 @@ for cfile in tests/c/*.c; do
     # host's permissions, not in the emulator. Such a test names what it needs.
     need_read=$(grep -m1 -o 'NEEDS-HOST-READ:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-READ: *//')
     need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
+    # What the test needs the ORACLE itself to be able to do. Unlike the two
+    # above it gates nothing up front: it is the fallback explanation for a
+    # disagreement the host CPU could not arbitrate (diff_verdict).
+    NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "$cfile" | sed 's/^NEEDS-ORACLE: *//')
     # Any of these markers means the test's answers depend on THIS host's
     # state — files it reads, a /tmp to build fixtures in, syscalls or ioctls
     # of a given vintage, filesystem behavior. A live oracle shares all of
@@ -171,11 +203,15 @@ for cfile in tests/c/*.c; do
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
-            fail=$((fail+1)); echo "FAIL c/${base}(dyn) (qemu rc=$rc_q, ours rc=$rc_e)"
-            diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+            # The CPU's re-run needs the same argv[0] both other worlds saw.
+            diff_verdict "c/${base}(dyn)" "$out_q" "$rc_q" "$out_e" "$rc_e" \
+                         "$A64_DYN_ARGV0" "$bd"
         fi
     fi
 done
+# Per-test state must not outlive the loop that set it: a later row's failure
+# would otherwise be explained away by the last C test's marker.
+NEEDS_ORACLE=
 rm -f /tmp/t.bin
 
 # ---- -link2symlink: emulated hardlinks ----
@@ -1085,15 +1121,17 @@ for base in memfd_seals mfdsync mmap_eof; do
     fi
     rec_have "$MBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(memfd-tier) (not in the test pack)"; continue; }
+    NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "tests/c/${base}.c" 2>/dev/null |
+                   sed 's/^NEEDS-ORACLE: *//')
     out_q=$(oracle_run "$MBIN" 2>/dev/null); rc_q=$?
     out_e=$(A64_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(memfd-tier)"
     else
-        fail=$((fail+1)); echo "FAIL c/${base}(memfd-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
-        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+        diff_verdict "c/${base}(memfd-tier)" "$out_q" "$rc_q" "$out_e" "$rc_e" "" "$MBIN"
     fi
 done
+NEEDS_ORACLE=
 
 # ---- grown file mappings: pipe-probe fallback tier ----
 # A page a file has since grown into is filled lazily, and whether the kernel

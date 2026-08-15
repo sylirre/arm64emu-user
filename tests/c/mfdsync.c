@@ -1,7 +1,15 @@
 /* memfd_create (nr 279), sync/syncfs (81/267), readahead (213). readahead
  * targets the memfd so both runs hit the same (tmpfs-backed) filesystem
  * regardless of where the rootfs lives. mlock2 lives in a self-checking
- * fixture instead: qemu-user returns ENOSYS for it. */
+ * fixture instead: qemu-user returns ENOSYS for it.
+ *
+ * NEEDS-ORACLE: syncfs
+ * qemu-aarch64 11.0.3 on an Android 13 phone answers ENOSYS for syncfs on any
+ * fd, where the host kernel answers 0 for a good one and EBADF for a bad one
+ * -- both measured natively beside the emulator, which matches the kernel.
+ * The marker only explains a disagreement nothing else could settle; where the
+ * host CPU can re-run this reference it arbitrates instead, and the rest of
+ * what this test checks keeps running. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <errno.h>

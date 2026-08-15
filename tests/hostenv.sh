@@ -265,6 +265,138 @@ oracle_proot() {   # oracle_proot <proot args...>
     fi
 }
 
+# ---- a second reference: the CPU itself --------------------------------------
+#
+# qemu is authoritative about instruction semantics and NOT about the kernel
+# underneath it. A build can lack a syscall the host has -- qemu-aarch64 11.0.3
+# on a Termux/Android 13 phone answers ENOSYS for `syncfs`, where the host
+# kernel answers 0 and EBADF -- or mistranslate one, the same build zeroing an
+# `SO_RCVTIMEO` round-trip the host returns intact. Both were measured with
+# native probes beside the emulator, and in both the emulator agreed with the
+# kernel while the oracle did not; three rows of the suite reported that as an
+# emulator difference.
+#
+# So where this host's CPU can execute the guest itself, a disagreement gets a
+# second opinion from it, and the emulator matching the CPU settles the row.
+# ONLY there: on an x86 dev box the qemu that answers is also the one every
+# recorded pack was made from, so a row it gets wrong has to fail loudly rather
+# than quietly consult something else.
+a64_cpu_reference_ok() {
+    [ "$ORACLE_KIND" = qemu ] || return 1     # already the CPU, or replaying
+    a64_host_arm64 && a64_native_exec_works
+}
+
+cpu_run() {   # cpu_run <binary> [args...]
+    timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@"
+}
+
+cpu_run0() {  # cpu_run0 <argv0> <binary> [args...]
+    _a0="$1"; shift
+    timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
+        bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@"
+}
+
+# Ask the CPU about a row the oracle and the emulator disagree on.
+#   0  the CPU agrees with the emulator: the oracle is the odd one out
+#   1  it does not: a real divergence, and the row fails
+#   2  no verdict -- there is no second reference here, or the CPU could not
+#      run this reference at all. The latter is not hypothetical: Android's app
+#      seccomp policy SIGSYS-kills a process that issues faccessat2, which says
+#      something about the reference's environment and nothing about the test.
+cpu_verdict() {   # cpu_verdict <emu_out> <emu_rc> <argv0-or-empty> <binary> [args...]
+    _eo="$1"; _erc="$2"; _a0="$3"; shift 3
+    a64_cpu_reference_ok || return 2
+    if [ -n "$_a0" ]; then _co=$(cpu_run0 "$_a0" "$@" 2>/dev/null)
+    else                   _co=$(cpu_run "$@" 2>/dev/null); fi
+    _crc=$?
+    if [ "$_co" = "$_eo" ] && [ "$_crc" = "$_erc" ]; then return 0; fi
+    if [ "$_crc" -ge 128 ] && [ "$_crc" != "$_erc" ]; then return 2; fi
+    return 1
+}
+
+# ---- what a test needs the ORACLE to be able to do ---------------------------
+# Declared in the test's own source as
+#
+#     NEEDS-ORACLE: <name> [<name> ...]
+#
+# and asked of the oracle itself, since that is the process whose answers the
+# test is compared against. This is the explanation of last resort: a row the
+# CPU can arbitrate is arbitrated (cpu_verdict), because a PASS keeps whatever
+# else the test checks, and only a row nothing can settle is skipped by name.
+# Same scope as the tiebreak -- on any other host an oracle that cannot do what
+# a test needs is a failure worth seeing.
+a64_oracle_can() {   # a64_oracle_can <name> -> 0 if the oracle can
+    a64_cpu_reference_ok || return 0
+    [ -n "$AGCC" ] || return 0
+    case "$1" in
+    syncfs)
+        if [ -z "${A64_ORACLE_SYNCFS:-}" ]; then
+            A64_ORACLE_SYNCFS=1
+            _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64syn.$$"
+            # The raw syscall, not the libc wrapper: Bionic declares syncfs
+            # only from API 28 and Termux's clang targets older, so a probe
+            # written the obvious way does not COMPILE on the one host this
+            # question has ever mattered on -- and a probe that cannot build
+            # answers "capable", which is how the row it guards kept failing.
+            if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+int main(void) {
+    /* Not "/": an Android app is denied the root directory outright, and a
+     * probe that cannot open its subject answers "capable" and gates nothing.
+     * procfs is readable wherever this runs, real or emulated. */
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return 0;            /* cannot tell: do not gate on it */
+    return syscall(SYS_syncfs, fd) == 0 ? 0 : 1;
+}
+EOF
+            then
+                chmod +x "$_p" 2>/dev/null
+                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_SYNCFS=0
+            fi
+            rm -f "$_p"
+        fi
+        [ "$A64_ORACLE_SYNCFS" = 1 ] ;;
+    so_rcvtimeo)
+        if [ -z "${A64_ORACLE_RCVTIMEO:-}" ]; then
+            A64_ORACLE_RCVTIMEO=1
+            _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64sot.$$"
+            if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+int main(void) {
+    struct timeval tv = { 1, 252000 }, got;
+    socklen_t gl = sizeof got;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;             /* cannot tell: do not gate on it */
+    memset(&got, 0, sizeof got);
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0) return 1;
+    if (getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &got, &gl) != 0) return 1;
+    /* The round trip has to come back intact, value and length both. */
+    return (got.tv_sec == tv.tv_sec && got.tv_usec == tv.tv_usec &&
+            gl == sizeof got) ? 0 : 1;
+}
+EOF
+            then
+                chmod +x "$_p" 2>/dev/null
+                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_RCVTIMEO=0
+            fi
+            rm -f "$_p"
+        fi
+        [ "$A64_ORACLE_RCVTIMEO" = 1 ] ;;
+    *)  return 0 ;;                  # unknown name: nothing to gate on
+    esac
+}
+
+# The subset of a NEEDS-ORACLE list this oracle cannot do (empty = all of it).
+a64_oracle_missing() {   # a64_oracle_missing <name>...
+    _miss=
+    for _n in "$@"; do a64_oracle_can "$_n" || _miss="$_miss $_n"; done
+    printf '%s' "${_miss# }"
+}
+
 # ---- where a (dyn) test's binary is staged -----------------------------------
 # Both sides of that comparison must see the SAME argv[0]: the emulator runs it
 # inside the glibc rootfs, the oracle runs it on the host, and several tests
