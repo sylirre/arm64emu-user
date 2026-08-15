@@ -19,6 +19,12 @@ echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
 [ "$A64_STATIC_OK" = 1 ] ||
     echo "WARN: $AGCC cannot link -static; most tests will skip (install the static libc)"
 
+# The HOST compiler, as distinct from $AGCC which builds guests. A handful of
+# checks need a program on this side of the emulator: the seccomp-mimic wrapper,
+# the memfd seal probe, the peak-RSS measurement. Empty on a replay host that
+# has no toolchain at all, and every user of it skips with a reason.
+HCC=$(command -v "${CC:-cc}" 2>/dev/null || command -v gcc 2>/dev/null || true)
+
 # Provision the Alpine + glibc test rootfs from scratch into a repo-local cache
 # (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
 # offline, Alpine needs a one-time network fetch and otherwise degrades to SKIP.
@@ -804,6 +810,42 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- address-space residue: what a guest costs the EMULATOR per mapping.
+# Nothing inside the guest can see this — its own view of its memory is right
+# the whole time — so the check is the emulator's peak RSS across two runs that
+# differ only in how many mappings they make. Comparing the two measures growth
+# per mapping and cancels every constant (the emulator, the JIT cache, the host
+# libc's reservations), which is what makes one threshold work on a phone and a
+# server alike. Before the L2 tables were freed on emptying, 900 extra 16 MB
+# mappings cost ~28 MB here; now it is flat. tests/maxrss.c does the wait4,
+# since /usr/bin/time is not portable enough to lean on. ----
+if [ -n "$AGCC" ] && [ -n "$HCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/vachurn.bin \
+            tests/fixtures/vachurn.c $A64_TESTLIBS 2>/dev/null &&
+       "$HCC" -O2 -o tests/maxrss.bin tests/maxrss.c 2>/dev/null; then
+        lo=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 100 2>/dev/null)
+        hi=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 1000 2>/dev/null)
+        if [ -n "$lo" ] && [ -n "$hi" ]; then
+            grew=$((hi - lo))
+            # 900 extra mappings; 8 MB allows ~9 kB of slack apiece against a
+            # regression that cost 32 kB apiece, and absorbs the allocator noise
+            # two runs of the same program differ by.
+            if [ "$grew" -lt 8192 ]; then
+                pass=$((pass+1)); echo "PASS fixture: vachurn (${grew} kB over 900 mappings)"
+            else
+                fail=$((fail+1))
+                echo "FAIL fixture: vachurn (peak RSS grew ${grew} kB over 900 mappings: ${lo} -> ${hi})"
+            fi
+        else
+            skip=$((skip+1)); echo "SKIP fixture: vachurn (no rusage from the host)"
+        fi
+        rm -f tests/maxrss.bin
+        fx_rm tests/fixtures/vachurn.bin
+    else
+        skip_build "fixtures/vachurn"
+    fi
+fi
+
 # ---- fork safety of the emulator's own mutexes: a guest that forks in a loop
 # while sibling threads keep nl_lock, as_lock and pf_lock hot. Catches a missing
 # pthread_atfork triple (the child inherits a locked, ownerless mutex) and an
@@ -1027,9 +1069,8 @@ fi
 # memfd, so on an older host the row compares kernels, not implementations.
 # Probed rather than guessed from `uname -r`, since kernels backport.
 MEMFD_SEAL_HOST=unknown
-_hcc=$(command -v "${CC:-cc}" 2>/dev/null || command -v gcc 2>/dev/null)
-if [ -n "$_hcc" ] &&
-   "$_hcc" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
+if [ -n "$HCC" ] &&
+   "$HCC" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
     ./tests/memfd_seal_probe.bin
     case $? in 0) MEMFD_SEAL_HOST=allow ;; 1) MEMFD_SEAL_HOST=refuse ;; esac
     rm -f tests/memfd_seal_probe.bin
@@ -1302,7 +1343,6 @@ fi
 # filter for the Android-8-blocked syscalls (tests/seccomp_wrap.c). The
 # SIGSYS net must convert a trapped forward into -ENOSYS: same differential
 # output for statx (fallback path), clean ENOSYS for the keyring family. ----
-HCC=$(command -v "${CC:-cc}" || command -v gcc)
 WRAP=tests/seccomp_wrap.bin
 wrap_ok=0
 # LP64 emulator builds only (matching the Android target): 32-bit glibc with

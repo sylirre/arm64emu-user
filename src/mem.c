@@ -30,6 +30,10 @@
 #define L2_IDX(va) ((size_t)(((va) >> 12) & (L2_SIZE - 1)))
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK)
 
+/* Where mmap(NULL, ...) starts looking. Well clear of where the ELF image and
+ * its heap land, and low enough that the region list stays compact. */
+#define MMAP_FLOOR 0x6000000000ULL
+
 /* Is [addr, addr+len) a valid guest range? Written so that addr + len cannot
  * wrap: every page-table index is derived from a VA in this range, and L1 only
  * has entries for VAs below GUEST_TASK_SIZE, so a range that escapes it walks
@@ -294,8 +298,9 @@ static void as_fields_init(AddrSpace *as) {
     as->nregions = as->cap_regions = 0;
     as->retired = NULL;
     as->nretired = as->cap_retired = 0;
+    as->l2spare = NULL;
     as->brk_start = as->brk = 0;
-    as->mmap_next = 0x6000000000ULL;
+    as->mmap_next = MMAP_FLOOR;
     as->stack_top = 0;
 }
 
@@ -332,22 +337,56 @@ void as_thread_exit(AddrSpace *as) {
     __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
 }
 
+/* `used` counts the non-zero PTEs in e[], maintained by every writer below so
+ * an emptied table can be freed instead of held for the life of the address
+ * space. Only ever read or written with as_lock held -- the D-TLB miss path is
+ * the one reader outside the mm syscalls and it takes the lock for the walk --
+ * which is also what makes freeing one safe. */
+struct L2Table {
+    u32 used;
+    uintptr_t e[L2_SIZE];
+};
+
+/* Write one PTE, keeping the count exact -- counting the transitions rather
+ * than the writes, so a clear of an already-absent page cannot underflow it and
+ * a rewrite of a live one cannot inflate it. The caller frees an emptied table
+ * where that is safe (pte_set_range does; the signal-safe pte_drop_existing
+ * must not). */
+static inline void pte_put(struct L2Table *l2, size_t idx, uintptr_t val) {
+    if ((l2->e[idx] != 0) != (val != 0)) {
+        if (val) l2->used++;
+        else     l2->used--;
+    }
+    l2->e[idx] = val;
+}
+
 static uintptr_t pte_get(AddrSpace *as, u64 va) {
-    uintptr_t *l2 = as->l1[L1_IDX(va)];
-    return l2 ? l2[L2_IDX(va)] : 0;
+    struct L2Table *l2 = as->l1[L1_IDX(va)];
+    return l2 ? l2->e[L2_IDX(va)] : 0;
 }
 
 /* Register host pages for [addr, addr+len). host may be NULL (PROT_NONE-like
- * placeholder is not supported; unmapped means PTE 0). */
+ * placeholder is not supported; unmapped means PTE 0), which is how an unmap
+ * clears its range -- and the point at which a table that has just lost its
+ * last live PTE goes back to the allocator. */
 static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) {
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
         u64 va = addr + off;
-        uintptr_t **slot = &as->l1[L1_IDX(va)];
+        struct L2Table **slot = &as->l1[L1_IDX(va)];
         if (!*slot) {
-            *slot = calloc(L2_SIZE, sizeof(uintptr_t));
-            if (!*slot) { perror("arm64chroot: calloc"); exit(127); }
+            if (!host) continue;          /* clearing an already-absent table */
+            /* An emptied table is all zeroes by definition -- that is what
+             * used == 0 means -- so the spare is handed straight back out. */
+            if (as->l2spare) { *slot = as->l2spare; as->l2spare = NULL; }
+            else if (!(*slot = calloc(1, sizeof **slot))) {
+                perror("arm64chroot: calloc"); exit(127);
+            }
         }
-        (*slot)[L2_IDX(va)] = host ? ((uintptr_t)(host + off) | prot) : 0;
+        pte_put(*slot, L2_IDX(va), host ? ((uintptr_t)(host + off) | prot) : 0);
+        if (!(*slot)->used) {
+            if (as->l2spare) free(*slot); else as->l2spare = *slot;
+            *slot = NULL;
+        }
     }
     jit_invalidate_range(addr, len);   /* map-over/unmap of translated code */
     as_gen_bump();
@@ -357,9 +396,9 @@ static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) 
 static void pte_prot_range(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
         u64 va = addr + off;
-        uintptr_t *l2 = as->l1[L1_IDX(va)];
-        if (l2 && l2[L2_IDX(va)])
-            l2[L2_IDX(va)] = (l2[L2_IDX(va)] & ~(uintptr_t)PTE_FLAGS) | prot;
+        struct L2Table *l2 = as->l1[L1_IDX(va)];
+        if (l2 && l2->e[L2_IDX(va)])
+            l2->e[L2_IDX(va)] = (l2->e[L2_IDX(va)] & ~(uintptr_t)PTE_FLAGS) | prot;
     }
     jit_invalidate_range(addr, len);   /* e.g. mprotect over translated code */
     as_gen_bump();
@@ -789,8 +828,29 @@ u64 as_mapped_bytes(AddrSpace *as) {
     return total;
 }
 
+/* A bump pointer that only goes forward, wrapping to the floor at the ceiling,
+ * rather than first fit over the region list.
+ *
+ * That looks like the cause of unbounded growth -- a guest mapping and
+ * unmapping in a loop walks through the address space instead of reusing it --
+ * and it is not: what the walk cost was one 128 KiB L2 table per 64 MiB of VA
+ * passed, and those are freed as they empty now (pte_set_range), which is the
+ * whole of it. Measured, 200k mmap/munmap pairs of 64 KiB: 45.4 MB peak RSS
+ * before, 20.9 MB after and flat to a million pairs. First fit was written and
+ * measured too: same memory, 6-8% slower on that loop, because every mapping
+ * then lands at a low address and inserts into the middle of the sorted region
+ * array instead of appending to it.
+ *
+ * The bump is also the safer of the two here. Handing a just-freed VA straight
+ * back means a thread holding a stale translation for it -- a D-TLB entry, or
+ * a JIT block mid-flight, both of which this design invalidates lazily -- can
+ * read the new mapping's address and the old mapping's data. Correct guests do
+ * not touch a range they freed, so neither allocator is wrong, but not reusing
+ * the address turns that class of guest bug into a fault instead of silent
+ * stale data. The cost is that a very long-lived guest eventually wraps and
+ * starts reusing anyway; the conflict scan below is what makes that safe. */
 u64 as_find_free_impl(AddrSpace *as, u64 len) {
-    len = (len + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK;
+    len = PG_UP(len);
     u64 base = as->mmap_next;
     for (int pass = 0; pass < 2; pass++) {
         while (base + len <= GUEST_TASK_SIZE - 0x10000000ULL) {
@@ -808,7 +868,7 @@ u64 as_find_free_impl(AddrSpace *as, u64 len) {
             }
             base = conflict;
         }
-        base = 0x6000000000ULL;   /* wrapped: rescan from the mmap floor */
+        base = MMAP_FLOOR;   /* wrapped: rescan from the mmap floor */
     }
     return 0;
 }
@@ -829,6 +889,8 @@ void as_destroy(AddrSpace *as) {
     free(as->retired);
     for (size_t i = 0; i < L1_SIZE; i++) free(as->l1[i]);
     free(as->l1);
+    free(as->l2spare);
+    as->l2spare = NULL;
     /* Null out what was freed -- but leave as->nthreads alone. Its only
      * caller is execve's reload (as_reinit_live follows), and the count word
      * is sampled lock-free by the last-thread-out checks in other threads:
@@ -1049,14 +1111,17 @@ static Region *region_by_host_locked(AddrSpace *as, const u8 *p) {
 }
 
 /* Clear the PTEs of an existing mapping. Unlike pte_set_range this never
- * allocates an L2 table and never calls jit_invalidate_range -- nothing is
- * being unmapped, the translations stay valid and only the data PTEs go --
- * which is what makes it usable from a signal handler. */
+ * allocates an L2 table, never frees an emptied one (free() in a signal
+ * handler could deadlock in the allocator; the table is reclaimed by the next
+ * unmap that empties it, or at as_destroy) and never calls
+ * jit_invalidate_range -- nothing is being unmapped, the translations stay
+ * valid and only the data PTEs go -- which is what makes it usable from a
+ * signal handler. */
 static void pte_drop_existing(AddrSpace *as, u64 addr, u64 len) {
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
         u64 va = addr + off;
-        uintptr_t *l2 = as->l1[L1_IDX(va)];
-        if (l2) l2[L2_IDX(va)] = 0;
+        struct L2Table *l2 = as->l1[L1_IDX(va)];
+        if (l2) pte_put(l2, L2_IDX(va), 0);
     }
     __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
 }

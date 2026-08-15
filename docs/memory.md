@@ -129,12 +129,47 @@ charge passed RAM+swap. `tests/fixtures/forklock.c` is the regression test —
 it churns from a sibling thread while forking, and used to need 15 GB where it
 now peaks under 500 MB.
 
-An unrelated residue is worth knowing about when reading these numbers: guest VA
-is handed out by a bump allocator that does not reuse freed ranges, and the
-software page table keeps the L2 tables covering what it has handed out. A guest
-churning *fresh* mappings therefore still costs ~128 bytes of host memory per
-64 KB of guest VA consumed — some 500× less than the quarantine did, and nothing
-at all for a guest that reuses addresses (`MAP_FIXED` churn is measurably flat).
+### The page table gives its second level back
+
+Guest VA is handed out by a bump allocator that walks forward and only wraps at
+the ceiling, so a guest that maps and unmaps in a loop travels through the
+address space rather than reusing it. That used to cost real memory, because the
+software page table kept every L2 table it had ever allocated: one 128 KB block
+per 64 MB of VA passed, about 124 bytes per `mmap`/`munmap` pair, for as long as
+the process lived. Each table now carries the count of live PTEs in it and is
+freed the moment its last page goes — with one emptied table kept as a spare,
+since a guest that unmaps and maps again inside the same 64 MB would otherwise
+free and re-zero a 128 KB block every time round. Measured over 200k pairs of
+64 KB: 45.4 MB peak RSS before, 20.9 MB after, and flat out to a million pairs;
+for 4 MB mappings, 420 MB before and the same 21 MB after.
+
+Reusing the address space instead — first fit over the region list, the way a
+kernel does it — was written and measured, and is *not* what shipped. It saves
+nothing beyond the above (the tables were the whole cost) and runs 6–8% slower
+on that loop, since every mapping then lands at a low address and inserts into
+the middle of the sorted region array instead of appending. It is also the less
+safe of the two here: handing a just-freed VA straight back means a thread
+holding a stale translation for it — a D-TLB entry, or a JIT block in flight,
+both invalidated lazily — reads the new mapping's address with the old
+mapping's data, where not reusing the address leaves that a fault. A guest that
+touches what it freed is buggy either way; one of the two makes the bug visible.
+
+Freeing a table is safe against a concurrent walk because there is no such
+thing: the D-TLB *miss* path takes `as_lock` for the walk (only the hit path,
+which holds host pointers rather than table pointers, is lock-free), and every
+PTE mutator already holds it. The exception is `pte_drop_existing`, which runs
+from the SIGBUS handler and therefore counts the PTEs it clears but never calls
+`free` — an emptied table there is reclaimed by the next unmap that touches it,
+or at `as_destroy`.
+
+`tests/fixtures/vachurn.c` is the regression test, and it has to be measured
+from outside: the guest's own view of its memory is correct throughout, so
+nothing the guest can print would show this. The harness runs it twice with
+different mapping counts and compares the emulator's peak RSS
+(`tests/maxrss.c`, one `wait4`), which measures growth *per mapping* and
+cancels every constant — the emulator's own footprint, the JIT cache, whatever
+the host libc reserves — so one threshold holds on a phone and a server alike.
+The regression it guards against showed as 28 MB across 900 extra mappings.
 
 ### `RLIMIT_AS` is the guest's, measured against the guest's address space
 

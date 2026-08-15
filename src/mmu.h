@@ -164,8 +164,19 @@ typedef struct RetiredMap {
                                * emptied its D-TLB at or after it (mem.c) */
 } RetiredMap;
 
+/* A second-level table: 1 << 14 PTEs covering 64 MiB of guest VA, plus the
+ * count of live ones. The count is what lets an unmap hand the 128 KiB block
+ * back as soon as its last page goes (mem.c); without it a guest that churns
+ * fresh mappings kept one alive for every 64 MiB of address space it ever
+ * touched. Defined in mem.c -- nothing outside it walks the table. */
+struct L2Table;
+
 typedef struct AddrSpace {
-    uintptr_t **l1;           /* [1 << (47-26)] L1 entries -> L2[1 << 14] */
+    struct L2Table **l1;      /* [1 << (47-26)] L1 entries -> L2[1 << 14] */
+    struct L2Table *l2spare;  /* one emptied table, kept for the next mapping:
+                               * a guest that unmaps and maps again inside the
+                               * same 64 MiB would otherwise free and re-zero a
+                               * 128 KiB block every time round (mem.c) */
     Region *regions;          /* sorted by start */
     int nregions, cap_regions;
     RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
