@@ -42,7 +42,10 @@ provision_glibc_cross() {
     return 0
 }
 
-provision_glibc_native() {
+# The runtime a *locally built* dynamic guest needs: its loader plus every
+# DT_NEEDED, resolved from a probe binary rather than guessed. Prints one
+# absolute host path per line.
+glibc_native_objects() {
     [ -n "$AGCC" ] || return 1
     command -v ldd >/dev/null 2>&1 || return 1
     tmpd=$(mktemp -d) || return 1
@@ -66,13 +69,58 @@ int main(void) {
     return (int)cos(a64_probe_x) + (int)log(a64_probe_x);
 }
 EOF
-    if ! "$AGCC" -O0 -o "$tmpd/probe" "$tmpd/probe.c" -lm -lpthread 2>/dev/null; then
+    # $A64_TESTLIBS, not a hardcoded -lm -lpthread: on Bionic both live in libc
+    # and the standalone archives may not exist, which would fail this link and
+    # leave the host with no native provisioning at all.
+    if ! "$AGCC" -O0 -o "$tmpd/probe" "$tmpd/probe.c" $A64_TESTLIBS 2>/dev/null; then
         rm -rf "$tmpd"; return 1
     fi
     # "lib => /abs/path (0x..)" for the DT_NEEDED set, a bare "/abs/path (0x..)"
     # for the loader itself; the vDSO has no path and drops out on its own.
-    libs=$(ldd "$tmpd/probe" 2>/dev/null | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }')
+    ldd "$tmpd/probe" 2>/dev/null | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }'
+    # Bionic's ldd prints the libraries and NOT the loader, so on Android that
+    # bare-path line never comes -- the mirror then had every library the guest
+    # needed and nothing to start it with, and each dynamic test died at 127.
+    # Read PT_INTERP out of the probe instead of trusting ldd to mention it.
+    elf_interp "$tmpd/probe"
     rm -rf "$tmpd"
+}
+
+# The program interpreter of a dynamic ELF. readelf where the host has one;
+# otherwise the .interp string itself, which lies in the first page -- an
+# Android phone has no binutils by default, and it is the host that needs this.
+elf_interp() {   # elf_interp <binary>
+    i=
+    if command -v readelf >/dev/null 2>&1; then
+        i=$(readelf -l "$1" 2>/dev/null |
+            sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p' | head -1)
+    fi
+    [ -n "$i" ] || i=$(head -c 8192 "$1" 2>/dev/null | tr -c '[:graph:]' '\n' |
+                       grep -m1 -E '^/.*(linker|ld-|ld\.so)')
+    [ -n "$i" ] && printf '%s\n' "$i"
+    return 0
+}
+
+# Does the tree still answer for what this host's compiler produces? A test
+# pack ships the *recording* host's runtime and unpacking one drops it on top
+# of whatever this host provisioned for itself. That is invisible where the
+# pack is meant to be replayed (no compiler, so nothing links against a local
+# runtime) and fatal on a host with both: an aarch64 phone builds its (dyn)
+# tests against Bionic, asks for /system/bin/linker64, and finds a glibc tree
+# recorded on x86 -- every dynamic row then dies at 127 with empty output and
+# a passing oracle beside it. The stamp alone cannot see that, so ask.
+glibc_runtime_stale() {
+    [ -e "$SYSROOT/lib/libc.so.6" ] && return 1   # cross runtime: matches by construction
+    libs=$(glibc_native_objects) || return 1      # cannot tell: leave it alone
+    [ -n "$libs" ] || return 1
+    for so in $libs; do
+        [ -e "$GLIBC$so" ] || return 0
+    done
+    return 1
+}
+
+provision_glibc_native() {
+    libs=$(glibc_native_objects) || return 1
     [ -n "$libs" ] || return 1
     mkdir -p "$GLIBC/tmp"
     for so in $libs; do
@@ -93,7 +141,7 @@ EOF
     return 0
 }
 
-if [ ! -e "$GLIBC/.provisioned" ]; then
+if [ ! -e "$GLIBC/.provisioned" ] || glibc_runtime_stale; then
     if provision_glibc_cross || provision_glibc_native; then
         : > "$GLIBC/.provisioned"
         echo "provisioned glibc env at $GLIBC"
