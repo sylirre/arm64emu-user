@@ -137,20 +137,31 @@ for cfile in tests/c/*.c; do
         skip_build "$cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
     GLIBC_ROOT="$A64_TEST_ROOT/glibc"
-    if [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null &&
-       { rec_have0 /tmp/t.bin "$bd" ||
+    # A test that writes its own /tmp paths needs one on the host too: the
+    # emulator side has the rootfs's, the live oracle side runs on the host and
+    # Android has no /tmp to give it. Nothing about the emulator is under test
+    # in that comparison, so name the skip rather than report a difference
+    # between two filesystems. (A recorded oracle never runs here, and the
+    # rootfs staging it does need works on any host.)
+    if [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ] &&
+       grep -q '"/tmp' "$cfile"; then
+        skip=$((skip+1)); echo "SKIP c/${base}(dyn) (host has no /tmp for the oracle side)"
+    elif [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null &&
+       { rec_have0 "$A64_DYN_ARGV0" "$bd" ||
          { skip=$((skip+1)); echo "SKIP c/${base}(dyn) (not in the test pack)"; false; }; }; then
-        # argv[0] must be /tmp/t.bin in BOTH worlds: tests that re-exec
+        # argv[0] must be the same path in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
-        # us, at host /tmp for the oracle. QEMU_LD_PREFIX (unlike -L) survives
+        # us, on the host for the oracle. QEMU_LD_PREFIX (unlike -L) survives
         # the host execve, so the binfmt-spawned qemu of a re-exec finds ld.so.
+        # /tmp/t.bin wherever /tmp exists, since the recorded answers are keyed
+        # by it; hostenv.sh picks a writable stand-in where it does not.
         # (A replaying host may have no /tmp — Android — and no live oracle to
         # need the copy; the rootfs staging is the one that matters there.)
-        mkdir -p "$GLIBC_ROOT/tmp"
-        cp "$bd" "$GLIBC_ROOT/tmp/t.bin"
-        cp "$bd" /tmp/t.bin 2>/dev/null || true
-        out_q=$(oracle_run0 /tmp/t.bin "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 60 "$EMU" -0 /tmp/t.bin "$GLIBC_ROOT" /tmp/t.bin 2>/dev/null); rc_e=$?
+        mkdir -p "$GLIBC_ROOT$(dirname "$A64_DYN_ARGV0")"
+        cp "$bd" "$GLIBC_ROOT$A64_DYN_ARGV0"
+        cp "$bd" "$A64_DYN_ARGV0" 2>/dev/null || true
+        out_q=$(oracle_run0 "$A64_DYN_ARGV0" "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 60 "$EMU" -0 "$A64_DYN_ARGV0" "$GLIBC_ROOT" "$A64_DYN_ARGV0" 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
@@ -1008,9 +1019,29 @@ fi
 # and the /proc spellings come from the fallback tier -- what a host kernel
 # without memfd_create (Android 7's 3.x) is served by -- and require
 # identical semantics.
+#
+# One row of memfd_seals is kernel-vintage-dependent: a read-only MAP_SHARED of
+# a write-sealed memfd opened read-write, which 6.x allows (VM_MAYWRITE
+# stripped) and older kernels refuse. The tier implements the former — the
+# vintage sys_uname advertises — while the oracle here IS the host's own
+# memfd, so on an older host the row compares kernels, not implementations.
+# Probed rather than guessed from `uname -r`, since kernels backport.
+MEMFD_SEAL_HOST=unknown
+_hcc=$(command -v "${CC:-cc}" 2>/dev/null || command -v gcc 2>/dev/null)
+if [ -n "$_hcc" ] &&
+   "$_hcc" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
+    ./tests/memfd_seal_probe.bin
+    case $? in 0) MEMFD_SEAL_HOST=allow ;; 1) MEMFD_SEAL_HOST=refuse ;; esac
+    rm -f tests/memfd_seal_probe.bin
+fi
 for base in memfd_seals mfdsync mmap_eof; do
     MBIN="tests/c/${base}_static.bin"
     [ -x "$MBIN" ] || continue
+    if [ "$base" = memfd_seals ] && [ "$MEMFD_SEAL_HOST" = refuse ]; then
+        skip=$((skip+1))
+        echo "SKIP c/memfd_seals(memfd-tier) (host kernel refuses a read-only shared map of a write-sealed memfd; the tier implements the 6.x semantics this emulator advertises)"
+        continue
+    fi
     rec_have "$MBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(memfd-tier) (not in the test pack)"; continue; }
     out_q=$(oracle_run "$MBIN" 2>/dev/null); rc_q=$?

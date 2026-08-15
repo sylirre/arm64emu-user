@@ -265,6 +265,29 @@ oracle_proot() {   # oracle_proot <proot args...>
     fi
 }
 
+# ---- where a (dyn) test's binary is staged -----------------------------------
+# Both sides of that comparison must see the SAME argv[0]: the emulator runs it
+# inside the glibc rootfs, the oracle runs it on the host, and several tests
+# read argv[0] back (faccessat2 of it, a proctitle re-exec, execve of it). /tmp
+# is that shared spelling wherever it exists, and the recorded answers are keyed
+# by it, so a replay must never move it.
+#
+# Android has no /tmp at all. There the oracle side was running a binary whose
+# argv[0] resolved to nothing -- faccessat2 answered ENOENT four times over, the
+# proctitle re-exec died -- while the emulator side, staged inside the rootfs,
+# worked; the row then reported a difference between two environments. So with a
+# live oracle on such a host, stage both copies in the first writable scratch
+# directory instead and let argv[0] be that. (A test that hardcodes /tmp paths of
+# its OWN still needs the oracle to have one; run_tests.sh names those skips.)
+A64_HOST_TMP=0
+{ [ -d /tmp ] && [ -w /tmp ]; } && A64_HOST_TMP=1
+A64_DYN_ARGV0=/tmp/t.bin
+if [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ]; then
+    for _d in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
+        [ -n "$_d" ] && [ -w "$_d" ] && { A64_DYN_ARGV0="$_d/t.bin"; break; }
+    done
+fi
+
 # ---- link libraries the guest compiler actually has --------------------------
 # -lm -lpthread are right for glibc and for a cross sysroot, and wrong for
 # Bionic, where both live in libc and the standalone archives may not exist at
