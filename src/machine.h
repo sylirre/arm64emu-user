@@ -590,18 +590,64 @@ void procfs_locks_reinit(void);
  * child re-initializes its locks regardless). as_lock is counted rather than
  * flagged because it legitimately nests -- translate() takes it on a D-TLB miss
  * under whatever mm syscall is already holding it. */
+/* Bit position IS rank in the hierarchy: outermost first, as_lock innermost.
+ * That is the order emu_atfork_prepare takes them in (main.c), and the order
+ * real code must take them in -- the two are the same statement, since a
+ * prepare handler that grabs them outermost-first can only be right if nobody
+ * ever goes the other way. Keep these in step with that triple. */
 enum {
-    EMU_LK_CASP16 = 1u << 0,   /* mem.c        */
-    EMU_LK_SFD    = 1u << 1,   /* sys_sig.c    */
-    EMU_LK_NL     = 1u << 2,   /* sys_netlink.c */
-    EMU_LK_PF     = 1u << 3,   /* sys_procfs.c */
-    EMU_LK_EST    = 1u << 4,   /* sys_procfs.c */
-    EMU_LK_JSTAT  = 1u << 5,   /* jit/jit.c    */
+    EMU_LK_JSTAT  = 1u << 0,   /* jit/jit.c      — outermost */
+    EMU_LK_PF     = 1u << 1,   /* sys_procfs.c   */
+    EMU_LK_EST    = 1u << 2,   /* sys_procfs.c   — under pf_lock (put_stat) */
+    EMU_LK_NL     = 1u << 3,   /* sys_netlink.c  */
+    EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
+    EMU_LK_CASP16 = 1u << 5,   /* mem.c          */
+    EMU_LK_AS     = 1u << 6,   /* mem.c as_lock  — innermost; counted, not
+                                * flagged, because it legitimately re-enters */
 };
 extern __thread unsigned g_emu_lk_held;   /* the six non-recursive locks */
 extern __thread int g_emu_as_depth;       /* as_lock, which nests: a count */
+
+/* ---- lock order, checked rather than merely written down -----------------
+ *
+ * The hierarchy above used to live in a comment and in the order of five
+ * adjacent calls, which is a poor place for a rule: code taking two of these
+ * the other way round deadlocks against a thread taking them this way, and
+ * breaks the atfork prepare handler for good measure -- and neither failure
+ * says which pair did it. Inverting the prepare order by hand hung 5 forks
+ * out of 6 (c2fe3ad), so the failure is not even reliably reproducible.
+ *
+ * Every acquisition now checks it: holding anything at or inside the rank of
+ * the lock being taken is an inversion. `at` catches re-taking a non-recursive
+ * lock, which self-deadlocks. as_lock needs no check of its own -- nothing is
+ * inside it, so an inversion involving it can only appear as some other lock
+ * being taken while it is held, which is exactly what this sees.
+ *
+ * A warning, not an abort. An inversion is a latent risk rather than a wedged
+ * process (the deadlock needs a second thread in the other order, at the same
+ * moment), and killing a guest over a risk trades a rare hang for a certain
+ * failure. The cost when nothing is held -- the overwhelmingly common case --
+ * is one test of two thread-locals. */
+#define EMU_LK_INNER(bit) (~((unsigned)(bit) - 1u))
+void emu_lock_order_warn(unsigned taking, unsigned held);
+
+/* The whole scheme is the bit positions being in hierarchy order; renumbering
+ * them into anything else silently turns the check into noise. */
+_Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
+               EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
+               EMU_LK_SFD < EMU_LK_CASP16 && EMU_LK_CASP16 < EMU_LK_AS,
+               "EMU_LK_* bits are ranks: keep them in the order "
+               "emu_atfork_prepare (main.c) takes the locks");
+
 #define EMU_LOCK(mtx, bit) \
-    do { pthread_mutex_lock(mtx); g_emu_lk_held |= (unsigned)(bit); } while (0)
+    do { \
+        unsigned emu_held_ = g_emu_lk_held | \
+                             (g_emu_as_depth ? (unsigned)EMU_LK_AS : 0u); \
+        if (emu_held_ & EMU_LK_INNER(bit)) \
+            emu_lock_order_warn((unsigned)(bit), emu_held_); \
+        pthread_mutex_lock(mtx); \
+        g_emu_lk_held |= (unsigned)(bit); \
+    } while (0)
 #define EMU_UNLOCK(mtx, bit) \
     do { g_emu_lk_held &= ~(unsigned)(bit); pthread_mutex_unlock(mtx); } while (0)
 /* Called before every fork(2) in the emulator. Names the held lock and aborts:

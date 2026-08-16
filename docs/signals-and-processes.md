@@ -338,6 +338,32 @@ the same bug about one run in fifteen — and with the walk inverted it deadlock
 rather than a slow test). One run in six passing is why the suite runs it in
 twelve slots: six tiers times two engines.
 
+##### The order is checked, not just written down
+
+A diagram and an ordered list of calls are a poor place to keep a rule that new
+code has to obey. So the bit each lock is flagged with **is** its rank in that
+hierarchy — outermost is bit 0, `as_lock` is bit 6 — and every `EMU_LOCK`
+checks that nothing at or inside the rank it is about to take is already held:
+
+```
+arm64chroot: lock-order inversion: taking casp16_lock while holding as_lock.
+```
+
+"At" catches re-taking a non-recursive lock, which self-deadlocks on the spot.
+`as_lock` needs no check of its own, since nothing is inside it: an inversion
+involving it can only show up as some *other* lock being taken while it is
+held, which is exactly what this sees. The cost where nothing is held — the
+overwhelmingly common case — is one test of two thread-locals.
+
+It warns rather than aborts. An inversion is a latent risk, not a wedged
+process: the deadlock needs a second thread taking the same pair the other way
+at the same moment, which is why inverting the walk by hand still let one fork
+in six through. Killing the guest over a risk would trade a rare hang for a
+certain failure. Each (taken, held) pair is reported once — an inversion on a
+warm path would otherwise bury the run in copies of itself — and the report is
+built without allocation or stdio, so it survives being reached from a signal
+handler if a future `EMU_LOCK` site ever is.
+
 ##### No code path may fork while holding one of these locks
 
 `prepare` takes all seven, so the forking thread must hold none of them. Six are

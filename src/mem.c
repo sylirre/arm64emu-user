@@ -190,16 +190,61 @@ void casp16_mutex_unlock(void) { EMU_UNLOCK(&g_casp16_lock, EMU_LK_CASP16); }
 __thread unsigned g_emu_lk_held;
 __thread int g_emu_as_depth;
 
+/* Indexed by rank, i.e. by bit position (machine.h). */
+static const char *const emu_lk_names[] = {
+    "the jit stats lock", "pf_lock", "est_lock", "nl_lock",
+    "sfd_lock", "casp16_lock", "as_lock",
+};
+#define EMU_LK_COUNT ((int)(sizeof emu_lk_names / sizeof *emu_lk_names))
+_Static_assert(1u << (EMU_LK_COUNT - 1) == EMU_LK_AS,
+               "one name per rank, innermost last");
+
 static const char *emu_lk_name(void) {
     if (g_emu_as_depth) return "as_lock";
-    static const struct { unsigned bit; const char *name; } n[] = {
-        { EMU_LK_CASP16, "casp16_lock" }, { EMU_LK_SFD, "sfd_lock" },
-        { EMU_LK_NL, "nl_lock" },         { EMU_LK_PF, "pf_lock" },
-        { EMU_LK_EST, "est_lock" },       { EMU_LK_JSTAT, "jit stats lock" },
-    };
-    for (size_t i = 0; i < sizeof n / sizeof *n; i++)
-        if (g_emu_lk_held & n[i].bit) return n[i].name;
+    for (int i = 0; i < EMU_LK_COUNT; i++)
+        if (g_emu_lk_held & (1u << i)) return emu_lk_names[i];
     return "?";
+}
+
+/* An acquisition that runs against the hierarchy. Reported once per (taken,
+ * held) pair: an inversion on a warm path would otherwise bury the run in
+ * copies of itself, and the first one already names both locks.
+ *
+ * Written to be usable from anywhere an EMU_LOCK is: no allocation, no stdio,
+ * one write(2) of a buffer built on the stack. Nothing takes these locks from
+ * a signal handler today, and a warning that cannot survive one being added is
+ * a warning that disappears exactly when it is needed. */
+void emu_lock_order_warn(unsigned taking, unsigned held) {
+    static unsigned reported[EMU_LK_COUNT];
+    int ti = 0;
+    for (unsigned b = taking; b > 1u; b >>= 1) ti++;
+    if (ti >= EMU_LK_COUNT) return;
+    unsigned offenders = held & EMU_LK_INNER(taking);
+    /* Only the pairs not seen before; the OR is the claim on them. */
+    if (!(offenders & ~__atomic_fetch_or(&reported[ti], offenders,
+                                         __ATOMIC_RELAXED))) return;
+    int hi = EMU_LK_COUNT - 1;              /* name the innermost one held */
+    while (hi > 0 && !(offenders & (1u << hi))) hi--;
+
+    char buf[384];   /* holds the longest pair of names plus the whole note */
+    size_t n = 0;
+    const char *parts[] = {
+        "arm64chroot: lock-order inversion: taking ",
+        emu_lk_names[ti],
+        " while holding ",
+        emu_lk_names[hi],
+        ".\n",
+        "  The hierarchy is stated in src/machine.h and taken in that order by\n",
+        "  the atfork prepare handler in main.c; a thread going the other way\n",
+        "  deadlocks against one going this way, and breaks fork() besides.\n",
+    };
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        size_t l = strlen(parts[i]);
+        if (n + l >= sizeof buf) break;
+        memcpy(buf + n, parts[i], l);
+        n += l;
+    }
+    (void)!write(2, buf, n);
 }
 
 void emu_fork_check(const char *site) {
