@@ -682,7 +682,10 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
  * everything after this point in the block was fetched before the rewrite. */
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn) {
     unsigned rt = insn & 31;
-    u64 va = (rt == 31) ? 0 : c->x[rt];
+    /* TBI0: cache maintenance by VA ignores the address's top byte, exactly as
+     * a data access does (mem.c's translate()), so a tagged code pointer still
+     * names the page it really lives on. */
+    u64 va = (rt == 31) ? 0 : (c->x[rt] & A64_TBI_MASK);
     jit_exec1(c, pc, insn);
     jit_invalidate_range(va & ~63ULL, 64);
     return 1;
@@ -749,6 +752,13 @@ retry:
 
 void jit_invalidate_range(u64 addr, u64 len) {
     if (!g_jit || !len) return;
+    /* IC IVAU hands this an arbitrary guest register value, so the range is
+     * not known to be a valid guest VA. Anything at or above GUEST_TASK_SIZE
+     * is unmappable by construction and can hold no translation, while the
+     * codemap is sized for that space alone -- indexing it with such an
+     * address reads past g_codemap[] and faults the host. Clamp. */
+    if (addr >= GUEST_TASK_SIZE) return;
+    if (len > GUEST_TASK_SIZE - addr) len = GUEST_TASK_SIZE - addr;
     JitEnv *env = &g_jit_env;
     u64 first = addr & ~(GUEST_PAGE_SIZE - 1);
     u64 npages = ((addr + len - 1 - first) >> 12) + 1;

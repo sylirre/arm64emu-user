@@ -258,7 +258,11 @@ actual delivery happens only from `emu_loop`, from consistent state, so
 **Self-modifying / remapped code.** The guest must execute `IC IVAU` before
 running written code (this CPU advertises `CTR_EL0.{DIC,IDC}=0`), so the JIT
 intercepts `IC IVAU` and invalidates the affected page's translations — the
-same architectural signal `__builtin___clear_cache` emits. Mapping changes
+same architectural signal `__builtin___clear_cache` emits. Its operand is a raw
+guest register, so it is treated like any other guest VA: the TBI0 top-byte tag
+is stripped (a tagged code pointer must still flush the page it really names),
+and an address outside the guest address space — which can hold no translation —
+is ignored instead of indexing the code-page bitmap past its end. Mapping changes
 (`munmap`/`mprotect`/`mremap`/map-over) call `jit_invalidate_range` from
 `mem.c`; a global sticky "this page ever held code" bitmap decides whether
 other threads must be interrupted. Each thread drops its own affected blocks at
