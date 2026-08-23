@@ -22,6 +22,12 @@
  * path in generated code -- where there is no C frame to unwind and recovery
  * has to resume at the access's own slow path instead.
  *
+ * The syscall side is here too. A kernel that hits such a page from inside a
+ * syscall -- copy_to_user landing on a read(2) buffer, copy_from_user on a
+ * write(2) one -- fails the call with EFAULT and sends no signal at all; the
+ * emulator, which does those copies itself, has to answer the same way
+ * instead of dying in its own memcpy.
+ *
  * qemu is the oracle, and a real kernel agrees with it.
  */
 #include <stdio.h>
@@ -31,6 +37,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 
@@ -130,12 +137,75 @@ static void one(int shared, int warm) {
     unlink(path);
 }
 
+/* The shrink seen from the syscall side. The page is warmed first on purpose:
+ * one with no cached translation is already refused by the up-front walk over
+ * the guest buffer, so only a stale translation gets as far as the copy. */
+static void bysyscall(int shared) {
+    char tag[24];
+    snprintf(tag, sizeof tag, "%s/syscall", shared ? "shared" : "private");
+    char path[] = "/tmp/mtsXXXXXX";
+    char name[80];
+    int fd = mkstemp(path);
+    if (fd < 0) { perror("mkstemp"); exit(1); }
+    if (ftruncate(fd, 2 * PGSZ) < 0) { perror("ftruncate"); exit(1); }
+
+    char *p = mmap(NULL, 2 * PGSZ, PROT_READ | PROT_WRITE,
+                   shared ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) { perror("mmap"); exit(1); }
+    volatile char w0 = p[0], w1 = p[PGSZ];   /* both pages translated */
+    (void)w0; (void)w1;
+
+    shrink_elsewhere(path, PGSZ);
+
+    /* read(2) into it: the kernel's copy_to_user fails, the call reports
+     * EFAULT. /dev/zero as the source, so nothing observable is consumed by
+     * the attempt on either side of the comparison. */
+    int z = open("/dev/zero", O_RDONLY);
+    errno = 0;
+    ssize_t n = read(z, p + PGSZ, 16);
+    snprintf(name, sizeof name, "%s: read into past-EOF is EFAULT", tag);
+    ck(name, n == -1 && errno == EFAULT);
+    close(z);
+
+    /* write(2) out of it: copy_from_user this time. A pipe, because a writer
+     * that never touches the buffer (/dev/null) cannot fail. */
+    int pf[2];
+    if (pipe(pf) < 0) { perror("pipe"); exit(1); }
+    errno = 0;
+    n = write(pf[1], p + PGSZ, 16);
+    snprintf(name, sizeof name, "%s: write from past-EOF is EFAULT", tag);
+    ck(name, n == -1 && errno == EFAULT);
+    close(pf[0]);
+    close(pf[1]);
+
+    /* A path argument parked in the same page has to fail the same way, and it
+     * does -- but not as a differential check. read/write are the two calls
+     * qemu hands to the host kernel buffer and all, so the kernel answers
+     * them; anything qemu copies ITSELF (a path string, a struct) dies of the
+     * very bus error this test is about, inside qemu. The emulator's own
+     * string copy carries the same bracket as the bulk ones above. */
+
+    /* Below the new end of file the very same buffer still works. */
+    errno = 0;
+    z = open("/dev/zero", O_RDONLY);
+    n = read(z, p, 16);
+    snprintf(name, sizeof name, "%s: read below EOF still works", tag);
+    ck(name, n == 16);
+    close(z);
+
+    munmap(p, 2 * PGSZ);
+    close(fd);
+    unlink(path);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* keep verdicts if a probe kills us */
     one(1, 0);
     one(0, 0);
     one(1, 1);
     one(0, 1);
+    bysyscall(1);
+    bysyscall(0);
     printf("mmap_truncate_bus: %d failed\n", fails);
     return fails != 0;
 }

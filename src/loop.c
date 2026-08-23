@@ -79,9 +79,10 @@ int emu_loop(CPU *c) {
          * which parks a mangled value in the live sp -- fatal under this
          * loop's async-signal traffic (mmu.h has the story). Deliberately
          * does NOT cover syscall dispatch further down: a handler may hold
-         * locks that an unwind would strand. */
+         * locks that an unwind out to here would strand -- the syscall layer
+         * brackets its own guest-memory touches instead (BUS_ARM_COPY). */
         if (bus_setjmp(&g_bus_jb) == 0) {
-        as_bus_arm(c);
+        as_bus_arm(c, BUS_ARM_ENGINE);
         if (UNLIKELY(g_debug_hooks)) {
             /* Full step: keeps every per-instruction debug facility
              * (trace/rtrace/prof/ring/cov/tpc) behaving exactly as before. */

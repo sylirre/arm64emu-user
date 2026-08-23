@@ -254,9 +254,26 @@ guest's own `SIGBUS` can be raised:
 
 The bracket is a `sigsetjmp` with `savemask` 0 (a register save, no syscall)
 taken once per run-loop round trip, and the fixups are recorded at translate
-time, so neither costs anything measurable. Syscall dispatch is deliberately
-*outside* the bracket: a handler may hold locks that an unwind would strand, so
-a fault while marshalling a syscall's buffers stays fatal.
+time, so neither costs anything measurable.
+
+Syscall dispatch stays deliberately *outside* that bracket, because an unwind
+reaching all the way back to the run loop would strand whatever a handler in
+between was holding. The syscall layer reaches guest memory too, though — every
+bulk copy (`copy_from_guest`, `copy_to_guest`, their partial and string forms,
+`copy_to_guest_code`) memcpys through a translated pointer that an outside
+truncation can invalidate — so it carries a *second* bracket of its own,
+`BUS_GUARD_BEGIN`/`BUS_GUARD_END` (`mmu.h`), armed as `BUS_ARM_COPY`. That one
+sits inside the copy helper, so the only frames it unwinds are `translate` —
+which drops `as_lock` before it returns — and the memcpy itself; the helper then
+returns to its caller normally. It records no guest abort either: a kernel whose
+own `copy_to_user` lands on a page past end-of-file fails the syscall with
+`EFAULT` and sends the process no signal, and the copy helper reports exactly
+that. `copy_to_guest_code` is the one that reaches the host backing directly,
+with `as_lock` held, and its fault path drops that one level before returning.
+The same bracket covers the one syscall-layer site that writes through a
+pointer of its own rather than through a copy helper: the `CLONE_CHILD_CLEARTID`
+zero store at thread exit, which has to be a single atomic store and so cannot
+go through the byte-wise helpers.
 
 Because a mapped page need not have a PTE, "is it mapped" is a question about
 the region list, not the page table: `mprotect`'s coverage check asks the

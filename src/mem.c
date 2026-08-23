@@ -1277,8 +1277,19 @@ static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool 
  * the entire guest state and c->cur_insn_pc names the faulting instruction.
  * A fault inside JIT-*generated* code is the one case that is not recoverable
  * -- guest registers cached in host registers would be lost -- so it is
- * declined and stays fatal. */
+ * declined and stays fatal.
+ *
+ * The syscall layer reaches guest memory through the bulk copy helpers at the
+ * bottom of this file, and those get their own bracket (BUS_GUARD_BEGIN in
+ * mmu.h, arming mode BUS_ARM_COPY). It cannot be the run loop's: an unwind out
+ * of a syscall handler would strand whatever that handler holds. It does not
+ * have to be, either -- the bracket sits in the helper itself, so the only
+ * frames it unwinds are translate() (which drops as_lock before it returns)
+ * and a memcpy, and the helper then returns to its caller normally, with
+ * EFAULT. That is also the answer a kernel gives: a copy_to_user landing on a
+ * page past end-of-file fails the syscall, it does not signal the process. */
 __thread BusJmpBuf g_bus_jb;
+__thread BusJmpBuf g_bus_copy_jb;
 __thread int g_bus_armed;
 static __thread CPU *g_bus_cpu;
 
@@ -1318,7 +1329,7 @@ __attribute__((naked)) void bus_longjmp(BusJmpBuf *jb, int val) {
 }
 #endif
 
-void as_bus_arm(CPU *c) { g_bus_cpu = c; g_bus_armed = 1; }
+void as_bus_arm(CPU *c, int mode) { g_bus_cpu = c; g_bus_armed = mode; }
 void as_bus_disarm(void) { g_bus_armed = 0; }
 
 /* bus_catcher's share of sig_tls_prewarm (signal.c): make sure no first
@@ -1326,6 +1337,7 @@ void as_bus_disarm(void) { g_bus_armed = 0; }
 void bus_tls_prewarm(void) {
     (void)*(volatile int *)&g_bus_armed;
     (void)*(volatile char *)&g_bus_jb;
+    (void)*(volatile char *)&g_bus_copy_jb;
     (void)*(volatile CPU *volatile *)&g_bus_cpu;
     /* The repair below takes as_lock, which counts itself in these two. */
     (void)*(volatile int *)&g_emu_as_depth;
@@ -1396,7 +1408,8 @@ static int as_bus_repair(const void *hostaddr, u64 *far) {
 
 static void bus_catcher(int sig, siginfo_t *si, void *uc) {
     u64 far = 0;
-    if (sig == SIGBUS && si && si->si_code == BUS_ADRERR && g_bus_armed &&
+    if (sig == SIGBUS && si && si->si_code == BUS_ADRERR &&
+        g_bus_armed == BUS_ARM_ENGINE &&
         g_bus_cpu && jit_pc_in_generated(BUS_FAULT_PC(uc))) {
         /* Inside JIT-generated code there is nothing to unwind to: guest
          * registers may live only in host registers, with no way to write
@@ -1415,19 +1428,23 @@ static void bus_catcher(int sig, siginfo_t *si, void *uc) {
         }
     } else if (sig == SIGBUS && si && si->si_code == BUS_ADRERR && g_bus_armed &&
         g_bus_cpu && as_bus_repair(si->si_addr, &far)) {
+        int mode = g_bus_armed;
         g_bus_armed = 0;
-        /* Exactly the abort the software path raises for a page past
-         * end-of-file, so the run loop delivers SIGBUS/BUS_ADRERR at
-         * cur_insn_pc with FAR = the guest address. */
-        cpu_raise_sync(g_bus_cpu,
-                       esr_make(EC_DABORT_LOWER, iss_dabort(false, FSC_EXTERNAL)),
-                       far);
+        /* Engine bracket: exactly the abort the software path raises for a
+         * page past end-of-file, so the run loop delivers SIGBUS/BUS_ADRERR at
+         * cur_insn_pc with FAR = the guest address. The syscall-copy bracket
+         * records nothing -- a kernel whose own copy_to_user lands past
+         * end-of-file fails the call with EFAULT and sends no signal. */
+        if (mode == BUS_ARM_ENGINE)
+            cpu_raise_sync(g_bus_cpu,
+                           esr_make(EC_DABORT_LOWER, iss_dabort(false, FSC_EXTERNAL)),
+                           far);
         sigset_t only;                   /* delivery blocked it; bus_longjmp
                                           * (savemask 0) will not put it back */
         sigemptyset(&only);
         sigaddset(&only, SIGBUS);
         sigprocmask(SIG_UNBLOCK, &only, NULL);
-        bus_longjmp(&g_bus_jb, 1);
+        bus_longjmp(mode == BUS_ARM_COPY ? &g_bus_copy_jb : &g_bus_jb, 1);
     }
     /* Not ours, or not recoverable from here: restore the default so the
      * retried access kills us exactly as it did before. */
@@ -1607,9 +1624,19 @@ void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
     return translate(c, va, need, &perm);
 }
 
-/* ---- bulk copies for the syscall layer (never raise guest exceptions) ---- */
+/* ---- bulk copies for the syscall layer (never raise guest exceptions) ----
+ *
+ * Every one of these is bracketed against a host bus error (BUS_GUARD_BEGIN,
+ * mmu.h): the PTE a translate() hit hands back may name a page an outside
+ * truncation has taken away since, and the memcpy through it would otherwise
+ * kill the emulator where a kernel merely fails the syscall. */
 
-long copy_from_guest(CPU *c, void *dst, u64 va, size_t len) {
+/* Each copy is written as a bracket around a separate walker. Keeping the
+ * walk out of the frame that holds the bus_setjmp is what makes the loop's
+ * cursors ordinary variables: a longjmp leaves the caller's own locals
+ * indeterminate, and here the bracket frame has none to lose. */
+static long __attribute__((noinline))
+copy_from_guest_walk(CPU *c, void *dst, u64 va, size_t len) {
     u8 *d = dst;
     while (len) {
         size_t chunk = GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK);
@@ -1623,7 +1650,15 @@ long copy_from_guest(CPU *c, void *dst, u64 va, size_t len) {
     return 0;
 }
 
-long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
+long copy_from_guest(CPU *c, void *dst, u64 va, size_t len) {
+    BUS_GUARD_BEGIN(c, -EFAULT);
+    long r = copy_from_guest_walk(c, dst, va, len);
+    BUS_GUARD_END();
+    return r;
+}
+
+static long __attribute__((noinline))
+copy_to_guest_walk(CPU *c, u64 va, const void *src, size_t len) {
     const u8 *s = src;
     while (len) {
         size_t chunk = GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK);
@@ -1637,11 +1672,23 @@ long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
     return 0;
 }
 
+long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
+    BUS_GUARD_BEGIN(c, -EFAULT);
+    long r = copy_to_guest_walk(c, va, src, len);
+    BUS_GUARD_END();
+    return r;
+}
+
 /* process_vm_readv/writev partial semantics: copy up to len bytes and return the
  * count transferred (0..len) before the first unmapped/forbidden page — never
  * negative. copy_from/to_guest are all-or-nothing; these stop at the first bad
  * page so the caller can report how many bytes actually crossed. */
-size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
+/* The count lives in the bracket's frame and is published a page at a time,
+ * so a bus error -- which unwinds this walk without a return value -- still
+ * leaves the caller with everything that crossed before the faulting page. */
+static void __attribute__((noinline))
+copy_from_guest_partial_walk(CPU *c, void *dst, u64 va, size_t len,
+                             volatile size_t *done_out) {
     u8 *d = dst;
     size_t done = 0;
     while (len) {
@@ -1652,11 +1699,21 @@ size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
         if (!p) break;
         memcpy(d, p, chunk);
         d += chunk; va += chunk; len -= chunk; done += chunk;
+        *done_out = done;
     }
+}
+
+size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
+    volatile size_t done = 0;
+    BUS_GUARD_BEGIN(c, done);
+    copy_from_guest_partial_walk(c, dst, va, len, &done);
+    BUS_GUARD_END();
     return done;
 }
 
-size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
+static void __attribute__((noinline))
+copy_to_guest_partial_walk(CPU *c, u64 va, const void *src, size_t len,
+                           volatile size_t *done_out) {
     const u8 *s = src;
     size_t done = 0;
     while (len) {
@@ -1667,7 +1724,15 @@ size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
         if (!p) break;
         memcpy(p, s, chunk);
         s += chunk; va += chunk; len -= chunk; done += chunk;
+        *done_out = done;
     }
+}
+
+size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
+    volatile size_t done = 0;
+    BUS_GUARD_BEGIN(c, done);
+    copy_to_guest_partial_walk(c, va, src, len, &done);
+    BUS_GUARD_END();
     return done;
 }
 
@@ -1682,9 +1747,9 @@ size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
  * re-fetch; the JIT keeps translated blocks by PC, so drop any over the range
  * (the same self-modifying-code coherence path guest IC IVAU uses). Returns 0,
  * or -EFAULT (unmapped) / -EIO (unwritable host backing). */
-long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len) {
+static long __attribute__((noinline))
+copy_to_guest_code_walk(CPU *c, u64 va, const void *src, size_t len, u64 *last_out) {
     const u8 *s = src;
-    u64 first = va & A64_TBI_MASK, last = first;
     while (len) {
         u64 a = va & A64_TBI_MASK;
         size_t chunk = GUEST_PAGE_SIZE - (a & GUEST_PAGE_MASK);
@@ -1696,15 +1761,31 @@ long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len) {
         memcpy(r->host + (a - r->start), s, chunk);   /* host backing is RW */
         as_unlock();
         s += chunk; va += chunk; len -= chunk;
-        last = a + chunk;
+        *last_out = a + chunk;
     }
+    return 0;
+}
+
+long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len) {
+    /* Bracketed like the copy helpers above, with one extra step on the fault
+     * path: the walk memcpys with as_lock held (it reaches the host backing
+     * directly, bypassing the PTE write bit), and an unwind does not release
+     * it. The memcpy is the only faulting point there, and it always runs
+     * under exactly the one level the walk took, so dropping that level here
+     * is the whole repair. */
+    u64 first = va & A64_TBI_MASK, last = first;
+    BUS_GUARD_BEGIN(c, (as_unlock(), -EFAULT));
+    long r = copy_to_guest_code_walk(c, va, src, len, &last);
+    BUS_GUARD_END();
+    if (r < 0) return r;
     /* Drop stale JIT blocks over the touched cache lines (interpreter needs
      * none). No-op when nothing here was ever translated. */
     jit_invalidate_range(first & ~63ULL, ((last + 63) & ~63ULL) - (first & ~63ULL));
     return 0;
 }
 
-long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
+static long __attribute__((noinline))
+copy_str_from_guest_walk(CPU *c, char *dst, u64 va, size_t max) {
     size_t n = 0;
     while (n < max) {
         size_t chunk = GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK);
@@ -1720,6 +1801,13 @@ long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
         va += chunk;
     }
     return -ENAMETOOLONG;
+}
+
+long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
+    BUS_GUARD_BEGIN(c, -EFAULT);
+    long r = copy_str_from_guest_walk(c, dst, va, max);
+    BUS_GUARD_END();
+    return r;
 }
 
 /* ---- thread-safe wrappers: serialize address-space mutations ---- */

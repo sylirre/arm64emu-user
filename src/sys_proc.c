@@ -284,14 +284,22 @@ typedef struct {
     pthread_t host;
 } GThread;
 
-/* futex(uaddr, FUTEX_WAKE, 1) helper for CLONE_CHILD_CLEARTID on thread exit. */
+/* futex(uaddr, FUTEX_WAKE, 1) helper for CLONE_CHILD_CLEARTID on thread exit.
+ *
+ * The zero store goes straight through the translated pointer -- it has to be
+ * one atomic store, which the byte-wise copy helpers are not -- so it carries
+ * the bus bracket itself (mmu.h): a clear-tid word parked in a file mapping
+ * that shrank from outside would otherwise kill the emulator at thread exit.
+ * The kernel ignores a fault here too (put_user, no error path). */
 static void futex_wake_addr(CPU *c, u64 va) {
+    BUS_GUARD_BEGIN(c, /* void: nothing to report */);
     void *hp = mem_host_ptr(c, va, 4, ACC_WRITE);
     if (hp) {
         u32 zero = 0;
         __atomic_store_n((u32 *)hp, zero, __ATOMIC_SEQ_CST);
         syscall(SYS_futex, hp, 1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
     }
+    BUS_GUARD_END();
 }
 
 static void *thread_entry(void *arg) {

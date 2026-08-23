@@ -76,8 +76,16 @@ void tlb_flush_all(void);
  * emulator rather than the guest. as_bus_init installs the handler, and the
  * run loop brackets the execution engines with bus_setjmp(&g_bus_jb) +
  * as_bus_arm/as_bus_disarm so a recoverable fault can unwind to a point where
- * the CPU struct is the whole guest state. Arm ONLY around the engines: a
- * syscall handler may hold locks that an unwind would strand.
+ * the CPU struct is the whole guest state. The engine bracket is armed ONLY
+ * around the engines: it unwinds all the way to the run loop, and a syscall
+ * handler on that path may hold locks the unwind would strand.
+ *
+ * The syscall layer reaches guest memory too -- every bulk copy helper below
+ * memcpys through a translated host pointer -- and it gets the second bracket,
+ * BUS_ARM_COPY (BUS_GUARD_BEGIN/END). That one unwinds no further than the
+ * helper it is written in, so nothing an outer frame holds is stranded, and
+ * the helper reports the fault as EFAULT: what a kernel's own copy_to_user
+ * does with a page past end-of-file.
  *
  * On 32-bit ARM Bionic the bracket must not use libc sigsetjmp: that
  * implementation cookie-mangles the LIVE sp register in place (eor sp, sp,
@@ -100,11 +108,43 @@ typedef sigjmp_buf BusJmpBuf;
 #define bus_setjmp(jb)       sigsetjmp(*(jb), 0)
 #define bus_longjmp(jb, val) siglongjmp(*(jb), val)
 #endif
-extern __thread BusJmpBuf g_bus_jb;
+extern __thread BusJmpBuf g_bus_jb;        /* engine bracket (loop.c) */
+extern __thread BusJmpBuf g_bus_copy_jb;   /* syscall-copy bracket (below) */
 extern __thread int g_bus_armed;
+#define BUS_ARM_ENGINE 1   /* record the guest abort, then unwind to loop.c */
+#define BUS_ARM_COPY   2   /* unwind only: the bracketed copy reports EFAULT */
 void as_bus_init(void);
-void as_bus_arm(struct CPU *c);
+void as_bus_arm(struct CPU *c, int mode);
 void as_bus_disarm(void);
+
+/* Bracket a guest-memory touch made outside the engines (the copy helpers in
+ * mem.c, and the few syscall-layer sites that write through a translated
+ * pointer of their own) so a host bus error returns `failval` instead of
+ * killing the emulator. Place BEGIN before the first touch and END on every
+ * path out; a `return` from the fault path runs END itself. A void function
+ * passes an empty failval -- a comment is one, being replaced by a space
+ * before the macro is expanded.
+ *
+ * The saved arming state, rather than a plain disarm at END, is what makes
+ * the bracket nest: inside the engine bracket it hands control back to it,
+ * and inside another copy bracket it restores the frame that one would unwind
+ * to. Nothing nests today -- no copy helper calls another -- but a bracket
+ * that breaks silently when one does is not worth having. */
+#define BUS_GUARD_BEGIN(cpu, failval)                                        \
+    BusJmpBuf bus_outer_jb_;                                                 \
+    volatile int bus_prev_ = g_bus_armed;                                    \
+    if (bus_prev_ == BUS_ARM_COPY)                                           \
+        __builtin_memcpy(&bus_outer_jb_, &g_bus_copy_jb,                     \
+                         sizeof bus_outer_jb_);                              \
+    if (bus_setjmp(&g_bus_copy_jb) != 0) { BUS_GUARD_END(); return failval; } \
+    as_bus_arm((cpu), BUS_ARM_COPY)
+#define BUS_GUARD_END()                                                      \
+    do {                                                                     \
+        if (bus_prev_ == BUS_ARM_COPY)                                       \
+            __builtin_memcpy(&g_bus_copy_jb, &bus_outer_jb_,                 \
+                             sizeof bus_outer_jb_);                          \
+        g_bus_armed = bus_prev_;                                             \
+    } while (0)
 
 /* ---- Guest address space (linux-user), defined in mem.c ---- */
 
