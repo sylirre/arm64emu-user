@@ -1232,7 +1232,7 @@ if [ ! -x tests/fixtures/execimg.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/execimg.c $A64_TESTLIBS 2>/dev/null || true
 fi
 if [ -x tests/fixtures/execimg.bin ]; then
-    expect=$'foreign=8\njunk=8\nnointerp=2\ndone'
+    expect=$'foreign=8\njunk=8\nnointerp=2\nbadsegs=-11\nwrapvaddr=-11\ndone'
     got=$(timeout -k 5 60 "$EMU" / tests/fixtures/execimg.bin 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: execimg"
     else

@@ -1323,8 +1323,23 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     free_strvec(argv);
     free_strvec(envp_copy);
     if (r < 0) {
+        /* Nothing can be returned any more: the caller's image is gone. A
+         * kernel is in the same position and answers it the same way --
+         * bprm_execve forces SIGSEGV on any failure once begin_new_exec has
+         * run -- so the process dies of SIGSEGV rather than of an invented
+         * exit status. That is what a shell reports as "Segmentation fault"
+         * for an ELF whose segments will not load: p_filesz past p_memsz, a
+         * p_vaddr + p_memsz that wraps, an address space that has no room for
+         * the span. (The one thing a kernel refuses earlier, while there is
+         * still a caller to refuse it to, is a header it cannot recognise or
+         * an interpreter that is not there -- elf_probe above.)
+         *
+         * guest_terminate_by_signal, not _exit: a tracer waiting on this
+         * process has to see the WIFSIGNALED status, and the guest-PID
+         * registry slot, SEM_UNDO adjustments and tmpfs backing have to be
+         * given back exactly as they are for any other fatal signal. */
         fprintf(stderr, "arm64chroot: execve reload of %s failed (%d)\n", pathbuf, r);
-        _exit(127);
+        guest_terminate_by_signal(c, SIGSEGV);
     }
     exec_close_cloexec(m);   /* CLOEXEC fds die here, as on a real execve */
     /* A new image generation, and the counter the run loop watches moves with

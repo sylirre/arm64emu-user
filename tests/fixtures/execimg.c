@@ -5,6 +5,13 @@
  * where a kernel answers ENOEXEC (wrong arch, malformed) or ENOENT (no such
  * interpreter) and a shell prints "cannot execute binary file".
  *
+ * The last two rows are the other half of that bargain: what a kernel commits
+ * to before it can tell the image is unloadable. Its own segment checks happen
+ * after begin_new_exec, so it has no caller left either, and bprm_execve
+ * forces SIGSEGV on the way out -- which is what these images must produce
+ * here too, rather than an invented exit status. (Checked against Linux by
+ * applying the same corruption to a native binary: both die of SIGSEGV.)
+ *
  * Self-checking rather than oracle-diffed: qemu hands the guest's execve to the
  * host, whose binfmt handler starts a *fresh qemu* on the image, so it is qemu
  * -- not the kernel -- that opens the interpreter and fails. The images live in
@@ -97,6 +104,27 @@ int main(void) {
     ph[1].p_align = 1;
     memcpy(img + 1024, ld, sizeof ld);
     printf("nointerp=%d\n", exec_image("nointerp", img, sizeof img));
+
+    /* A static image whose one segment claims more file bytes than it has
+     * memory to hold them in. Nothing can load that, and nothing can say so to
+     * a caller: the exec is already committed by the time it is known. */
+    eh->e_phnum = 1;
+    eh->e_entry = 0x400000;
+    ph[0].p_type = PT_LOAD;
+    ph[0].p_flags = PF_R | PF_X;
+    ph[0].p_offset = 0;
+    ph[0].p_vaddr = ph[0].p_paddr = 0x400000;
+    ph[0].p_filesz = sizeof img;
+    ph[0].p_memsz = sizeof img / 2;
+    ph[0].p_align = 0x1000;
+    memset(&ph[1], 0, sizeof ph[1]);
+    printf("badsegs=%d\n", exec_image("badsegs", img, sizeof img));
+
+    /* Same, for a segment whose memory extent runs off the top of the address
+     * space instead of ending. */
+    ph[0].p_filesz = ph[0].p_memsz = sizeof img;
+    ph[0].p_vaddr = ph[0].p_paddr = ~(Elf64_Addr)0 - sizeof img + 1;
+    printf("wrapvaddr=%d\n", exec_image("wrapvaddr", img, sizeof img));
 
     printf("done\n");
     return 0;

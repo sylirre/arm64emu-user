@@ -853,12 +853,26 @@ Everything else the loader can refuse is refused there too, by `elf_probe`
 (`elf.c`), which validates the ELF header and opens the interpreter it names
 *without touching the address space*. It has to run first because the reload is
 in-process: past the teardown there is no old image to return to, and a refusal
-could only `_exit` the process, where a kernel answers `ENOEXEC` (wrong arch or
+could only kill the process, where a kernel answers `ENOEXEC` (wrong arch or
 format — what a shell's "cannot execute binary file" and an `execvp` `PATH` walk
 read) or `ENOENT` (no such interpreter). The kernel makes the same two checks in
 the same order, ahead of its own `begin_new_exec`. `elf_header_check` is the
 single validator: the probe runs it, and `load_one` runs it again on the way to
 loading, so the two can never drift apart.
+
+What a kernel does *not* decide before committing is whether the segments
+themselves are loadable — `binfmt_elf` checks those after `begin_new_exec`, and
+`bprm_execve` turns a failure there into a forced `SIGSEGV`, since there is no
+caller left to answer. `load_one` makes the same checks at the same point (more
+file bytes than memory to hold them, a memory extent that wraps, a span the
+address space has no room for) and `do_execve` ends the process the same way:
+death by `SIGSEGV`, reported to any tracer and with the registry slot,
+`SEM_UNDO` adjustments and tmpfs backing given back, exactly as for any other
+fatal signal. One difference remains, and it is the loader's design rather than
+a check: segment content is `pread` into anonymous backing rather than mapped
+from the file, so an image naming content past the end of its file is refused
+here, where a kernel maps the hole, execs successfully and delivers `SIGBUS`
+when the guest touches it.
 
 ### `de_thread`: exec from a thread group with more than one thread
 

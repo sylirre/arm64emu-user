@@ -88,10 +88,20 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     u64 lo = ~0ULL, hi = 0;
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
+        /* The kernel's own segment sanity check, made where the kernel makes
+         * it: a segment holding more file bytes than it has memory for, or one
+         * whose memory extent wraps, cannot be loaded (binfmt_elf: "set_brk
+         * can never work. Avoid overflows."). Both are discovered past the
+         * point of no return there too, and the answer is the same one --
+         * do_execve turns this refusal into the SIGSEGV bprm_execve forces. */
+        if (ph[i].p_filesz > ph[i].p_memsz) return -EINVAL;
+        u64 end = ph[i].p_vaddr + ph[i].p_memsz;
+        if (end < ph[i].p_vaddr) return -EINVAL;
         if (PG_DOWN(ph[i].p_vaddr) < lo) lo = PG_DOWN(ph[i].p_vaddr);
-        if (ph[i].p_vaddr + ph[i].p_memsz > hi) hi = ph[i].p_vaddr + ph[i].p_memsz;
+        if (end > hi) hi = end;
     }
-    if (lo == ~0ULL) return -ENOEXEC;
+    if (lo == ~0ULL) return -ENOEXEC;      /* nothing to load */
+    if (hi > ~GUEST_PAGE_MASK) return -EINVAL;   /* the page-up below wraps */
     hi = PG_UP(hi);
 
     u64 base = 0;
