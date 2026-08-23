@@ -23,6 +23,7 @@
 #endif
 #include <errno.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -263,12 +264,53 @@ static const char *mmsg_cycle(int fd) {
                ? "data" : "broken";
 }
 
+/* A receive whose destination the guest cannot write is EFAULT, and the
+ * datagram is gone -- what netlink_recvmsg does with an skb it could not copy
+ * out (it is freed, not requeued). Reported as a short read or an empty
+ * success instead, the caller reads a truncated message, or walks a dump that
+ * never reaches its terminator. Both tiers must answer the same. */
+static const char *fault_recv(int fd) {
+    static char out[64];
+    struct { struct nlmsghdr n; struct rtgenmsg g; } req;
+    struct sockaddr_nl snl;
+    void *bad;
+
+    bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bad == MAP_FAILED) return "nomap";
+
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = sizeof req;
+    req.n.nlmsg_type = RTM_GETADDR;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = 1007;
+    req.g.rtgen_family = AF_INET;
+    if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&snl, sizeof snl) < 0)
+        return "sendfail";
+
+    struct iovec iov = { bad, 64 };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    ssize_t n = recvmsg(fd, &mh, 0);
+    if (n >= 0) {
+        snprintf(out, sizeof out, "delivered%d", (int)n);
+        return out;
+    }
+    if (errno == EFAULT) return "efault";
+    snprintf(out, sizeof out, "err%d", errno);
+    return out;
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
         printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
-               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\nframe=skip\n");
+               "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
+               "frame=skip\nmmsg=skip\nfault=skip\n");
         return 0;
     }
 
@@ -289,7 +331,8 @@ int main(void) {
     /* After the faked unshare, the same refusal must come back as an ack. */
     fd = nl_open();
     if (fd < 0) {
-        printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\nframe=skip\n");
+        printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
+               "frame=skip\nmmsg=skip\nfault=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -330,7 +373,10 @@ int main(void) {
      * AF_UNIX substitute has no such default destination and would answer
      * ENOTCONN, so these must be routed to the emulation like send/recv are. */
     fd = nl_open();
-    if (fd < 0) { printf("wrdump=skip\nready=skip\nframe=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n");
+        return 0;
+    }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
     memset(&d, 0, sizeof d);
     d.n.nlmsg_len = sizeof d;
@@ -351,14 +397,14 @@ int main(void) {
     /* Readiness: poll/select/epoll must track whether a reply is waiting, and
      * a caller must be able to wait for one before reading it. */
     fd = nl_open();
-    if (fd < 0) { printf("ready=skip\nframe=skip\n"); return 0; }
+    if (fd < 0) { printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"); return 0; }
     printf("ready=%s\n", readiness_cycle(fd));
     close(fd);
 
     /* Dump framing: the terminator must arrive in a datagram of its own, or a
      * caller that stops walking early never reaches it. */
     fd = nl_open();
-    if (fd < 0) { printf("frame=skip\n"); return 0; }
+    if (fd < 0) { printf("frame=skip\nmmsg=skip\nfault=skip\n"); return 0; }
     printf("frame=%s\n", dump_walk(fd));
     close(fd);
 
@@ -367,8 +413,14 @@ int main(void) {
      * request into the AF_UNIX stand-in as opaque bytes and read them back --
      * the guest saw its own request echoed instead of a reply. */
     fd = nl_open();
-    if (fd < 0) { printf("mmsg=skip\n"); return 0; }
+    if (fd < 0) { printf("mmsg=skip\nfault=skip\n"); return 0; }
     printf("mmsg=%s\n", mmsg_cycle(fd));
+    close(fd);
+
+    /* A destination the guest cannot write: EFAULT, not a silent short read. */
+    fd = nl_open();
+    if (fd < 0) { printf("fault=skip\n"); return 0; }
+    printf("fault=%s\n", fault_recv(fd));
     close(fd);
     return 0;
 }

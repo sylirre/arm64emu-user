@@ -1338,7 +1338,7 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # else in the output. ----
 if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
         tests/fixtures/netns_ack.c 2>/dev/null; then
-    nl_common=$'empty=eagain\nself=own\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data'
+    nl_common=$'empty=eagain\nself=own\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data\nfault=efault'
     for tier in real af_unix; do
         if [ "$tier" = af_unix ]; then
             # The substituted socket has no kernel behind it, so it acks every

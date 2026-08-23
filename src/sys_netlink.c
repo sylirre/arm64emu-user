@@ -1157,9 +1157,18 @@ static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid)
 }
 
 /* Scatter @reply into the guest recvmsg iovec array (@iov_va, @iov_count),
- * walking segments until the reply is exhausted. Returns the bytes scattered. */
-static size_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
-                         const uint8_t *reply, size_t reply_len)
+ * walking segments until the reply is exhausted. Returns the bytes scattered,
+ * or -EFAULT if the guest's array -- or one of the buffers it names -- could
+ * not be reached.
+ *
+ * That has to be an error and not a short count: a caller whose buffer faults
+ * is told EFAULT by the kernel, and one told "0 bytes, no error" instead reads
+ * a truncated message, or walks a dump that can never reach its terminator.
+ * The datagram is consumed either way (nl_take_reply), which is what
+ * netlink_recvmsg does with an skb whose copy to user space failed -- it is
+ * freed, not put back. */
+static ssize_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
+                          const uint8_t *reply, size_t reply_len)
 {
     size_t done = 0;
     if (iov_count > 1024)
@@ -1167,17 +1176,17 @@ static size_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
     for (u64 i = 0; i < iov_count && done < reply_len; i++) {
         GIovec gi;
         if (copy_from_guest(c, &gi, iov_va + i * sizeof(GIovec), sizeof gi) < 0)
-            break;
+            return -EFAULT;
         size_t chunk = reply_len - done;
         if (chunk > gi.iov_len)
             chunk = gi.iov_len;
-        if (gi.iov_base != 0 && chunk > 0) {
-            if (copy_to_guest(c, gi.iov_base, reply + done, chunk) < 0)
-                break;
-        }
+        if (chunk > 0 &&
+            (gi.iov_base == 0 ||
+             copy_to_guest(c, gi.iov_base, reply + done, chunk) < 0))
+            return -EFAULT;
         done += chunk;
     }
-    return done;
+    return (ssize_t)done;
 }
 
 /* ==================================================================== */
@@ -1273,7 +1282,7 @@ u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
  * asked. */
 static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
                          u64 iov_va, u64 iov_cnt, int flags,
-                         size_t *datagram, size_t *taken)
+                         size_t *datagram, ssize_t *taken)
 {
     const uint8_t *reply = NULL;
 
@@ -1288,10 +1297,14 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
     if (iov_va != 0) {
         if (iov_cnt > 0)
             *taken = nl_scatter(c, iov_va, iov_cnt, reply, *datagram);
-    } else if (buf != 0) {
+    } else {
         size_t copied = len < *datagram ? len : *datagram;
-        if (copied > 0 && copy_to_guest(c, buf, reply, copied) == 0)
-            *taken = copied;
+        /* As nl_scatter: a destination that cannot be written is EFAULT, not a
+         * silent zero -- and a NULL buffer with room asked for is one. */
+        if (copied > 0 && (buf == 0 || copy_to_guest(c, buf, reply, copied) < 0))
+            *taken = -EFAULT;
+        else
+            *taken = (ssize_t)copied;
     }
     /* MSG_PEEK leaves the datagram pending for the following real read -- and
      * the socket armed, since it is still readable. Consuming it re-syncs the
@@ -1307,13 +1320,15 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
 int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
                       u64 addr_va, u64 size_va, u64 *ret)
 {
-    size_t datagram, copied;
+    size_t datagram;
+    ssize_t copied;
 
     if (!nl_take_reply(c, fd, buf, len, 0, 0, flags, &datagram, &copied))
         return 0;                      /* let the real recvfrom(2) run */
+    if (copied < 0) { *ret = (u64)copied; return 1; }
 
     /* MSG_TRUNC asks for the untruncated length (libnetlink size probe). */
-    size_t result = (flags & MSG_TRUNC) ? datagram : copied;
+    size_t result = (flags & MSG_TRUNC) ? datagram : (size_t)copied;
     /* Name the kernel (nl_pid == 0), not this socket, as the sender: that is
      * how a netlink caller tells a reply apart from a message another socket
      * sent it, and glibc's __netlink_request() drops -- and then reads past --
@@ -1326,20 +1341,22 @@ int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
 
 int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
 {
-    size_t datagram, scattered;
+    size_t datagram;
+    ssize_t scattered;
 
     if (iov_va == 0)                   /* nothing to scatter into */
         return 0;
     if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &datagram, &scattered))
         return 0;                      /* let the real readv(2) run */
-    *ret = (u64)scattered;
+    *ret = (u64)scattered;             /* -EFAULT rides back as the errno */
     return 1;
 }
 
 int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
 {
     u64 msg_name = 0, iov_va = 0, iov_count = 0;
-    size_t datagram, scattered;
+    size_t datagram;
+    ssize_t scattered;
 
     if (msghdr_va == 0)                /* no header: let the real one EFAULT */
         return 0;
@@ -1350,8 +1367,11 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
     if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_count, flags,
                        &datagram, &scattered))
         return 0;                      /* let the real recvmsg(2) run */
+    /* Nothing of the header is written back on a fault: the kernel returns
+     * the error before ___sys_recvmsg touches msg_namelen or msg_flags. */
+    if (scattered < 0) { *ret = (u64)scattered; return 1; }
 
-    size_t result = (flags & MSG_TRUNC) ? datagram : scattered;
+    size_t result = (flags & MSG_TRUNC) ? datagram : (size_t)scattered;
 
     /* Hand back a kernel sockaddr_nl (nl_pid == 0) as the source, and set
      * msg_namelen accordingly; glibc's getifaddrs() inspects it. */
@@ -1368,7 +1388,7 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
         }
     }
     /* msg_flags @+48 (guest LP64): MSG_TRUNC iff the datagram didn't fit. */
-    u32 mf = (scattered < datagram) ? MSG_TRUNC : 0;
+    u32 mf = ((size_t)scattered < datagram) ? MSG_TRUNC : 0;
     (void) copy_to_guest(c, msghdr_va + 48, &mf, 4);
 
     *ret = (u64)result;
