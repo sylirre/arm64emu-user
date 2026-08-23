@@ -420,7 +420,9 @@ static void dp_register(CPU *c, u32 insn) {
                 if (!op && !o2) r = m;             /* CSEL */
                 else if (!op && o2) r = m + 1;     /* CSINC */
                 else if (op && !o2) r = ~m;        /* CSINV */
-                else r = (u64)(-(s64)m);           /* CSNEG */
+                else r = 0 - m;                    /* CSNEG (unsigned negation:
+                                                    * INT64_MIN is arithmetic,
+                                                    * not signed overflow) */
             }
             set_x_sz(c, Rd, sf, r);
             return;
@@ -1016,7 +1018,7 @@ static void ldst_pair(CPU *c, u32 insn) {
     bool V = BIT(26);
     unsigned mode = BITS(25, 23);   /* 000 STNP/LDNP,001 post,010 offset,011 pre */
     bool L = BIT(22);
-    s64 imm7 = (s64)sign_extend(BITS(21, 15), 7);
+    u64 imm7 = sign_extend(BITS(21, 15), 7);
     unsigned Rt2 = BITS(14, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
 
     unsigned scale, esz;
@@ -1034,7 +1036,7 @@ static void ldst_pair(CPU *c, u32 insn) {
         if (opc == 3) { undefined(c, insn); return; }    /* unallocated (was run as a 32-bit pair) */
         scale = (opc == 2) ? 3 : 2; esz = 1u << scale; signed_word = (opc == 1);
     }
-    s64 offset = imm7 << scale;
+    u64 offset = imm7 << scale;
 
     u64 base = reg_xsp(c, Rn), addr;
     bool wb = false; u64 wbval = 0;
@@ -1078,7 +1080,7 @@ static void ldst_literal(CPU *c, u32 insn) {
     unsigned opc = BITS(31, 30);
     bool V = BIT(26);
     unsigned Rt = BITS(4, 0);
-    s64 off = (s64)sign_extend(BITS(23, 5), 19) << 2;
+    u64 off = sign_extend(BITS(23, 5), 19) << 2;
     u64 va = c->cur_insn_pc + off;
     if (V) {                                     /* SIMD&FP: LDR St/Dt/Qt (literal) */
         if (opc == 3) { undefined(c, insn); return; }   /* UNALLOCATED */
@@ -1374,15 +1376,15 @@ static void loads_stores(CPU *c, u32 insn) {
 static void branch_system(CPU *c, u32 insn) {
     unsigned top6 = BITS(31, 26);
 
-    if (top6 == 0x05) { c->pc = c->cur_insn_pc + ((s64)sign_extend(BITS(25, 0), 26) << 2); return; } /* B */
+    if (top6 == 0x05) { c->pc = c->cur_insn_pc + (sign_extend(BITS(25, 0), 26) << 2); return; } /* B */
     if (top6 == 0x25) {                                                  /* BL */
         set_x(c, 30, c->cur_insn_pc + 4);
-        c->pc = c->cur_insn_pc + ((s64)sign_extend(BITS(25, 0), 26) << 2);
+        c->pc = c->cur_insn_pc + (sign_extend(BITS(25, 0), 26) << 2);
         return;
     }
     if (BITS(31, 24) == 0x54 && BIT(4) == 0) {                            /* B.cond */
         if (cond_holds(c, BITS(3, 0)))
-            c->pc = c->cur_insn_pc + ((s64)sign_extend(BITS(23, 5), 19) << 2);
+            c->pc = c->cur_insn_pc + (sign_extend(BITS(23, 5), 19) << 2);
         return;
     }
     if (BITS(30, 25) == 0x1a) {                                           /* CBZ/CBNZ */
@@ -1390,7 +1392,7 @@ static void branch_system(CPU *c, u32 insn) {
         unsigned Rt = BITS(4, 0);
         u64 v = reg_x_sz(c, Rt, sf);
         bool take = op ? (v != 0) : (v == 0);
-        if (take) c->pc = c->cur_insn_pc + ((s64)sign_extend(BITS(23, 5), 19) << 2);
+        if (take) c->pc = c->cur_insn_pc + (sign_extend(BITS(23, 5), 19) << 2);
         return;
     }
     if (BITS(30, 25) == 0x1b) {                                           /* TBZ/TBNZ */
@@ -1400,7 +1402,7 @@ static void branch_system(CPU *c, u32 insn) {
         u64 v = reg_x(c, Rt);
         bool set = (v >> bitpos) & 1;
         bool take = op ? set : !set;
-        if (take) c->pc = c->cur_insn_pc + ((s64)sign_extend(BITS(18, 5), 14) << 2);
+        if (take) c->pc = c->cur_insn_pc + (sign_extend(BITS(18, 5), 14) << 2);
         return;
     }
     if (BITS(31, 24) == 0xd4) {                                           /* exception generation */

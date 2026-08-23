@@ -745,7 +745,10 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
     if (b2927 == 3 && ((insn >> 24) & 3) == 0) {   /* literal */
         if (V) return 0;
         if (size == 2) {                           /* LDRSW (literal) */
-            s64 off = (s64)((s32)(insn << 8) >> 13) << 2;
+            /* Scale the sign-extended immediate as u64: shifting the
+             * negative value itself is undefined behaviour, for the same bits
+             * (the decoders next door do it the same way). */
+            s64 off = (s64)((u64)((s32)(insn << 8) >> 13) << 2);
             ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, pc + off, 0);
             put_ld(ir, VREG_TMP0, 0, rt, 2, 1, 1, pc);
             return 1;
@@ -762,7 +765,7 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
         if (V) {
             if (opc > 2) return 0;
             unsigned vszl = opc + 2;
-            s64 imm = (s64)((s32)(insn << 10) >> 25) << vszl;
+            s64 imm = (s64)((u64)((s32)(insn << 10) >> 25) << vszl);
             s64 a0 = (mode == 1) ? 0 : imm;
             if (L) {
                 put_ldv(ir, rsp(rn), a0, rt, vszl, pc);
@@ -776,7 +779,7 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
         }
         unsigned szl = (opc == 2) ? 3 : 2, esz = 1u << szl;
         int sign = (opc == 1);                     /* LDPSW */
-        s64 imm = (s64)((s32)(insn << 10) >> 25) << szl;
+        s64 imm = (s64)((u64)((s32)(insn << 10) >> 25) << szl);
         if (opc == 3 || (sign && (!L || mode == 0))) return 0;
         if (L) {                                   /* all-or-nothing commit */
             int wb = (mode == 1 || mode == 3);

@@ -145,30 +145,30 @@ static void fill_branch(PDEnt *e, u32 insn) {
 
     if (top6 == 0x05) {
         e->op = PD_B;
-        e->imm = (u64)((s64)sign_extend(BITS(25, 0), 26) << 2);
+        e->imm = sign_extend(BITS(25, 0), 26) << 2;
         return;
     }
     if (top6 == 0x25) {
         e->op = PD_BL;
-        e->imm = (u64)((s64)sign_extend(BITS(25, 0), 26) << 2);
+        e->imm = sign_extend(BITS(25, 0), 26) << 2;
         return;
     }
     if (BITS(31, 24) == 0x54 && BIT(4) == 0) {       /* B.cond */
         e->op = PD_BCOND;
         e->rd = (u8)BITS(3, 0);
-        e->imm = (u64)((s64)sign_extend(BITS(23, 5), 19) << 2);
+        e->imm = sign_extend(BITS(23, 5), 19) << 2;
         return;
     }
     if (BITS(30, 25) == 0x1a) {                      /* CBZ/CBNZ */
         bool sf = BIT(31), op = BIT(24);
         e->op = op ? (sf ? PD_CBNZ64 : PD_CBNZ32) : (sf ? PD_CBZ64 : PD_CBZ32);
-        e->imm = (u64)((s64)sign_extend(BITS(23, 5), 19) << 2);
+        e->imm = sign_extend(BITS(23, 5), 19) << 2;
         return;
     }
     if (BITS(30, 25) == 0x1b) {                      /* TBZ/TBNZ */
         e->op = BIT(24) ? PD_TBNZ : PD_TBZ;
         e->rm = (u8)((BIT(31) << 5) | BITS(23, 19));
-        e->imm = (u64)((s64)sign_extend(BITS(18, 5), 14) << 2);
+        e->imm = sign_extend(BITS(18, 5), 14) << 2;
         return;
     }
     if (BITS(31, 25) == 0x6b) {                      /* BR/BLR/RET */
@@ -213,13 +213,13 @@ static void fill_ldst(PDEnt *e, u32 insn) {
             if (opc == 3) return;                    /* UNALLOCATED -> GENERIC -> UNDEF */
             e->op  = PD_LDRLITV;
             e->rm  = (u8)(4u << opc);                /* byte count 4/8/16 */
-            e->imm = (u64)((s64)sign_extend(BITS(23, 5), 19) << 2);
+            e->imm = sign_extend(BITS(23, 5), 19) << 2;
             return;
         }
         if (opc == 0) e->op = PD_LDRLIT32;
         else if (opc == 1) e->op = PD_LDRLIT64;
         else if (opc == 3) e->op = PD_NOP;           /* PRFM literal */
-        e->imm = (u64)((s64)sign_extend(BITS(23, 5), 19) << 2);
+        e->imm = sign_extend(BITS(23, 5), 19) << 2;
         return;
     }
 
@@ -242,7 +242,7 @@ static void fill_ldst(PDEnt *e, u32 insn) {
         }
         e->op = (u8)(base_id + kind);                /* relies on OFF,PRE,POST id order */
         e->rm = (u8)BITS(14, 10);                    /* Rt2 */
-        e->imm = (u64)((s64)sign_extend(BITS(21, 15), 7) << scale);
+        e->imm = sign_extend(BITS(21, 15), 7) << scale;
         return;
     }
 
@@ -1114,7 +1114,11 @@ L_CSEL64:
             if (e->op == PD_CSEL64 || e->op == PD_CSEL32) r = m;
             else if (e->op == PD_CSINC64 || e->op == PD_CSINC32) r = m + 1;
             else if (e->op == PD_CSINV64 || e->op == PD_CSINV32) r = ~m;
-            else r = (u64)(-(s64)m);
+            else r = 0 - m;                          /* CSNEG: unsigned
+                                                      * negation, so the
+                                                      * INT64_MIN operand is
+                                                      * arithmetic and not
+                                                      * signed overflow */
         }
         set_x_sz(c, e->rd, is64, r);
         NEXT;
