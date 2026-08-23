@@ -362,6 +362,11 @@ SYSDEF(seccomp) {
         if (a1 != 0 || a2 != 0) return (u64)(s64)-EINVAL;
         if (!may_assign_mode(c->m, G_SECCOMP_MODE_STRICT)) return (u64)(s64)-EINVAL;
         c->m->seccomp_mode = G_SECCOMP_MODE_STRICT;
+        /* Enforcement is local to this process, but the Seccomp: line of its
+         * /proc/<pid>/status is read by OTHER processes, which can only see
+         * what the shared registry says -- and the prctl spelling of this same
+         * transition has always published it. */
+        seccomp_publish(c->m);
         return 0;
     case G_SECCOMP_SET_MODE_FILTER:
         return (u64)seccomp_install(c, a1, a2);

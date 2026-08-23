@@ -144,6 +144,41 @@ int main(void) {
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     printf("nnp1=%ld\n", num(self, "NoNewPrivs"));
 
+    /* Strict mode entered through seccomp(2), read from OUTSIDE. The process
+     * that set it cannot look at itself -- strict mode allows read, write,
+     * _exit and rt_sigreturn, and nothing else -- so the only place that
+     * answer can come from is the shared registry, and it only gets there if
+     * the seccomp(2) spelling publishes it the way the prctl one does. Forked
+     * before this process installs any filter of its own: a mode cannot be
+     * switched once set, so a child that inherited a filter could not enter
+     * strict mode at all. */
+    int up[2], down[2];
+    if (pipe(up) != 0 || pipe(down) != 0) return 1;
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        close(up[0]);
+        close(down[1]);
+        if (syscall(__NR_seccomp, (unsigned)SECCOMP_SET_MODE_STRICT, 0u, NULL) != 0)
+            _exit(9);
+        char one = 1;
+        if (write(up[1], &one, 1) != 1) _exit(9);
+        char sink;
+        read(down[0], &sink, 1);   /* park where strict mode permits */
+        _exit(0);
+    }
+    close(up[1]);
+    close(down[0]);
+    char ready = 0;
+    if (read(up[0], &ready, 1) != 1) return 1;
+    snprintf(kpath, sizeof kpath, "/proc/%d/status", (int)kid);
+    printf("strict_sec=%ld strict_f=%ld\n", num(kpath, "Seccomp"),
+           num(kpath, "Seccomp_filters"));
+    kill(kid, SIGKILL);
+    waitpid(kid, &st, 0);
+    close(up[0]);
+    close(down[1]);
+
     /* Seccomp: a guest filter never reaches the host, so the host file cannot
      * count it -- and where the emulator itself carries one, it counts that. */
     printf("sec0=%ld f0=%ld\n", num(self, "Seccomp"), num(self, "Seccomp_filters"));

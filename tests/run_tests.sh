@@ -808,7 +808,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/status_probe.bin \
             tests/fixtures/status_probe.c 2>/dev/null; then
         got=$(timeout -k 5 60 "$EMU" / tests/fixtures/status_probe.bin 2>/dev/null)
-        expect=$'ign_hup=1 cgt_hup=0 cgt_term=1 ign_term=0\nblk_usr1=1 blk_usr2=0 pnd_usr1=1 pnd_usr2=0 shd_usr1=0\nunblk_usr1=0\nuntraced=0\ntracer_is_me=1\nnnp0=0\nnnp1=1\nsec0=0 f0=0\ninstall1=0\nsec1=2 f1=1\ninstall2=0\nsec2=2 f2=2\nkid_sec=2 kid_f=2\nx86lines=0\ndone'
+        expect=$'ign_hup=1 cgt_hup=0 cgt_term=1 ign_term=0\nblk_usr1=1 blk_usr2=0 pnd_usr1=1 pnd_usr2=0 shd_usr1=0\nunblk_usr1=0\nuntraced=0\ntracer_is_me=1\nnnp0=0\nnnp1=1\nstrict_sec=1 strict_f=0\nsec0=0 f0=0\ninstall1=0\nsec1=2 f1=1\ninstall2=0\nsec2=2 f2=2\nkid_sec=2 kid_f=2\nx86lines=0\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: status_probe"
         else
             fail=$((fail+1)); echo "FAIL fixture: status_probe"
