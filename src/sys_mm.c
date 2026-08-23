@@ -247,6 +247,17 @@ SYSDEF(mprotect) {
 
 SYSDEF(madvise) {
     (void)a3; (void)a4; (void)a5;
+    /* The range checks a kernel makes for every advice value, in its order
+     * (do_madvise): an unaligned start is EINVAL, a length whose page round-up
+     * wrapped to zero is EINVAL ("rounded up from small -ve"), an end that
+     * wraps is EINVAL, and an empty range is success without a walk. */
+    if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+    u64 len = PG_UP(a1);
+    if (a1 && !len) return (u64)(s64)-EINVAL;
+    u64 end = a0 + len;
+    if (end < a0) return (u64)(s64)-EINVAL;
+    if (end == a0) return 0;
+
     /* MADV_DONTNEED / MADV_FREE return the pages to the kernel; on Linux the
      * next access to an anonymous page then faults in a fresh zero page. Go's
      * page allocator depends on this: after scavenging a range it treats those
@@ -257,18 +268,34 @@ SYSDEF(madvise) {
      * mark -> "sweep increased allocation count" / "marked free object". Discard
      * the range by zeroing its backing to match the kernel's zero-on-reuse
      * guarantee. Only whole guest pages inside the range are cleared. */
-    if (a2 == G_MADV_DONTNEED || a2 == G_MADV_FREE) {
-        if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-        u64 len = PG_UP(a1);
-        AddrSpace *as = &c->m->as;
-        as_lock();
-        for (u64 va = a0; va < a0 + len; va += GUEST_PAGE_SIZE) {
-            /* Only anonymous private mappings get the kernel's zero-on-reuse
-             * behavior. MADV_DONTNEED on a file mapping re-faults from the file
-             * (and the host backing of a MAP_SHARED region *is* the file), so
-             * never scribble zeros there. */
-            const Region *r = as_find_region(as, va);
-            if (!r) continue;
+    int discard = (a2 == G_MADV_DONTNEED || a2 == G_MADV_FREE);
+    long hps = sysconf(_SC_PAGESIZE);
+    AddrSpace *as = &c->m->as;
+    int hole = 0;
+    as_lock();
+    u64 va = a0;
+    while (va < end) {
+        const Region *r = as_find_region(as, va);
+        if (!r) {
+            /* An unmapped stretch. madvise_walk_vmas remembers it, carries on
+             * with the next mapping and ends the call in ENOMEM -- a guest
+             * that named a range it does not own is told so, whatever the
+             * advice was. Stepping to that mapping rather than to the next
+             * page is also what keeps a huge range cheap: the guest can name
+             * the whole address space, and walking it page by page would take
+             * hours. */
+            hole = 1;
+            const Region *nx = as_next_region(as, va);
+            if (!nx || nx->start >= end) break;
+            va = nx->start;
+            continue;
+        }
+        u64 stop = r->end < end ? r->end : end;
+        if (discard) {
+            /* Only anonymous mappings get the kernel's zero-on-reuse
+             * behavior. MADV_DONTNEED on a file mapping re-faults from the
+             * file (and the host backing of a MAP_SHARED region *is* the
+             * file), so never scribble zeros there. */
             if (r->file || r->shared) {
                 /* File-backed: the kernel drops the private copy (or the cached
                  * page) and re-faults from the file, so zeroing here would
@@ -277,19 +304,28 @@ SYSDEF(madvise) {
                  * sized, hand the discard to the host, which reproduces the
                  * re-fault exactly; a bigger host page would take neighbouring
                  * guest pages with it, so there we leave the range alone. */
-                long hps = sysconf(_SC_PAGESIZE);
-                if (!r->shared && hps == (long)GUEST_PAGE_SIZE) {
-                    void *h = mem_host_ptr(c, va, GUEST_PAGE_SIZE, ACC_READ);
-                    if (h) madvise(h, GUEST_PAGE_SIZE, MADV_DONTNEED);
-                }
-                continue;
+                if (!r->shared && hps == (long)GUEST_PAGE_SIZE)
+                    for (u64 p = va; p < stop; p += GUEST_PAGE_SIZE) {
+                        void *h = mem_host_ptr(c, p, GUEST_PAGE_SIZE, ACC_READ);
+                        if (h) madvise(h, GUEST_PAGE_SIZE, MADV_DONTNEED);
+                    }
+            } else {
+                /* Zero the region's own backing rather than reach through the
+                 * guest page table: a kernel discards an anonymous mapping
+                 * whatever protection the guest gave it -- a PROT_READ or
+                 * PROT_NONE one reads back as zeroes just the same -- and the
+                 * host backing of an anonymous region is always writable
+                 * (guest_map_anon), which is what the software-enforced guest
+                 * protection is layered on top of. */
+                memset(r->host + (va - r->start), 0, (size_t)(stop - va));
             }
-            void *h = mem_host_ptr(c, va, GUEST_PAGE_SIZE, ACC_WRITE);
-            if (h) memset(h, 0, GUEST_PAGE_SIZE);
         }
-        as_unlock();
+        va = stop;
     }
-    return 0;   /* other advice: accepted and ignored */
+    as_unlock();
+    /* Other advice: accepted and ignored, but not before the range it names
+     * has been judged. */
+    return hole ? (u64)(s64)-ENOMEM : 0;
 }
 
 #define G_MREMAP_MAYMOVE 1

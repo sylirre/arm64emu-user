@@ -261,6 +261,11 @@ void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path);
 /* Caller must hold as_lock: the region array is realloc'd/memmove'd by
  * concurrent mappers, and the returned pointer is only valid while held. */
 const Region *as_find_region(AddrSpace *as, u64 va);
+/* The lowest-addressed mapping that ends above `va` (it may contain `va`), or
+ * NULL if nothing does. Lets a walker cross an unmapped gap in one step
+ * instead of a page at a time -- a range the guest names can span the whole
+ * address space, and the kernel walks it vma by vma. Same locking as above. */
+const Region *as_next_region(AddrSpace *as, u64 va);
 
 /* Stable host pointer for [va, va+size) if within one guest page and permitted
  * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */

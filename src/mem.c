@@ -497,6 +497,16 @@ const Region *as_find_region(AddrSpace *as, u64 va) {
     return NULL;
 }
 
+const Region *as_next_region(AddrSpace *as, u64 va) {
+    const Region *best = NULL;
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        if (r->end <= va) continue;
+        if (!best || r->start < best->start) best = r;
+    }
+    return best;
+}
+
 /* Host page size handling: host backing is allocated with mmap and is at least
  * guest-page aligned. Each allocation is refcounted (HostMap) and retired whole
  * once no region references it — a punched slice is never released on its own,
