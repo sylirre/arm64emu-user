@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,6 +21,42 @@ typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
 /* Convert the current host errno to a guest return value. The generic errno
  * values are identical on x86, x86_64, arm and arm64, so this is a sign flip. */
 static inline u64 host_err(void) { return (u64)(s64)(-errno); }
+
+/* ---- one transfer's byte count ------------------------------------------
+ * A read/write count is a guest u64 and this emulator has to turn it into a
+ * host size_t and a bounce buffer, neither of which the kernel needs: it
+ * copies straight between the file and the caller's own pages.
+ *
+ * rw_count bounds it the way the kernel does. MAX_RW_COUNT is INT_MAX rounded
+ * down to a page, and rw_verify_area clamps a larger request rather than
+ * refusing it, so a guest that asks for more gets a short transfer -- which
+ * read(2) and write(2) are always allowed to return. Clamping before the cast
+ * is what makes it right on both host widths: on an ILP32 host the cast alone
+ * turns a 64-bit count into an unrelated small one and moves the wrong number
+ * of bytes.
+ *
+ * rw_room then bounds the bounce by the guest's own buffer: the run of pages
+ * from `va` that are actually mapped for `acc`, up to `len`. A kernel can only
+ * copy as far as the caller's memory goes -- it stops there and reports the
+ * short transfer -- so anything past this point could never be delivered, and
+ * allocating for it lets a guest name a length (read(fd, buf, 1 TB) with no
+ * such buf) that the emulator, not the guest, has to find room for. 0 means
+ * the buffer is not there at all, which is the kernel's EFAULT. */
+#define A64_MAX_RW_COUNT 0x7ffff000u
+static inline size_t rw_count(u64 n) {
+    return (size_t)(n > A64_MAX_RW_COUNT ? A64_MAX_RW_COUNT : n);
+}
+static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
+    size_t done = 0;
+    while (done < len) {
+        u64 p = va + done;
+        size_t chunk = GUEST_PAGE_SIZE - (size_t)(p & GUEST_PAGE_MASK);
+        if (chunk > len - done) chunk = len - done;
+        if (!mem_host_ptr(c, p, (unsigned)chunk, acc)) break;
+        done += chunk;
+    }
+    return done;
+}
 
 /* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
  * the host kernel predates it (< 3.17 — Android 7 devices). */

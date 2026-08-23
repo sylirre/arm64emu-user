@@ -279,7 +279,12 @@ SYSDEF(getpeername) {
 
 SYSDEF(sendto) {
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
-    size_t len = (size_t)a2;
+    /* Bounded, but never shortened: a datagram that does not fit is refused
+     * (EMSGSIZE, by the host), not sent truncated -- so the whole buffer has
+     * to be there, which is what the copy below would have found out after
+     * allocating for it. */
+    size_t len = rw_count(a2);
+    if (len && rw_room(c, a1, len, ACC_READ) < len) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
@@ -310,7 +315,11 @@ SYSDEF(recvfrom) {
     if (nl_is_fd(c->m, (int)a0) &&
         nl_maybe_recvfrom(c, (int)a0, a1, a2, (int)a3, a4, a5, &nlret))
         return nlret;
-    size_t len = (size_t)a2;
+    /* Clamped only: shortening the buffer would truncate the datagram the host
+     * hands over -- and it is gone once received -- while a guest that names
+     * more room than it has is still entitled to a datagram that fits in what
+     * it does have, so the room cannot be demanded up front either. */
+    size_t len = rw_count(a2);
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     struct sockaddr_storage ss;

@@ -105,6 +105,22 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   host the gate folds to a compile-time identity and the raw pass-through
   stays. One kernel detail worth pinning: an out-of-range `tv_usec` answers
   **`EDOM`**, not `EINVAL` (`tests/c/socktimeo.c`).
+- *A byte count is a guest `u64`, and it is the guest's to choose.* A kernel
+  never allocates for one — it copies between the file and the caller's own
+  pages — while this emulator has to bounce it, so both ends are bounded
+  (`rw_count`/`rw_room` in `sys.h`). `rw_count` clamps to the kernel's own
+  `MAX_RW_COUNT` (`INT_MAX` rounded down to a page), which `rw_verify_area`
+  clamps to as well rather than refusing — casting first instead turned a count
+  above 4 GB into an unrelated small one on an ILP32 host and transferred that
+  many bytes. `rw_room` then bounds the bounce by the run of the guest's buffer
+  that is actually mapped for the access: a kernel stops where the caller's
+  memory ends and reports the short transfer, so anything past that point could
+  never be delivered — and allocating for it let a guest name a length
+  (`read(fd, buf, 1 TB)`, no such `buf`) that the *emulator* had to find room
+  for. A datagram is the exception on both counts: `recvfrom` may not shorten
+  its buffer (the message would arrive truncated, and it is gone once received)
+  and `sendto` may not either (it would be sent truncated where the kernel
+  refuses it whole), so those clamp only (`tests/fixtures/bigcount.c`).
 
 ## Rootfs path containment (`src/path.c`)
 

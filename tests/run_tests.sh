@@ -1179,6 +1179,28 @@ else
     skip_build "fixtures/ownfdexec"
 fi
 
+# ---- a read/write count is a guest 64-bit value the emulator has to turn into
+# a host size_t and a bounce buffer. Self-checking: qemu-user validates the
+# whole [buf, buf+count) range before the call and answers EFAULT for every row
+# here, including the one a kernel completes; the block below is what a real
+# kernel prints for this program, natively. ----
+if [ ! -x tests/fixtures/bigcount.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/bigcount.bin \
+        tests/fixtures/bigcount.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/bigcount.bin ]; then
+    expect=$'huge-pread 204800 1\nshort-pread 4096 1\nefault-pread -1 14\nshort-write 4096\nefault-write -1 14'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/bigcount.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: bigcount"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: bigcount"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/bigcount.bin
+else
+    skip_build "fixtures/bigcount"
+fi
+
 # ---- execve refuses an unloadable image with an errno, not by dying. Loading
 # happens in the emulator's own address space, so the old one is gone before the
 # new image is read; anything refused after that has no caller left. Self-

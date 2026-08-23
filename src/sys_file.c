@@ -677,7 +677,8 @@ SYSDEF(read) {
         nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
         return nlret;
     procfs_pre_read(c, (int)a0, -1);
-    size_t len = (size_t)a2;
+    size_t len = rw_count(a2);
+    if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     /* A signalfd carries no readable bytes of its own: the queued signals it
@@ -702,7 +703,8 @@ SYSDEF(write) {
      * default destination to write to -- it would answer ENOTCONN. */
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
-    size_t len = (size_t)a2;
+    size_t len = rw_count(a2);
+    if (len && !(len = rw_room(c, a1, len, ACC_READ))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
@@ -798,7 +800,8 @@ SYSDEF(writev) {
 
 SYSDEF(pread64) {
     procfs_pre_read(c, (int)a0, (s64)a3);
-    size_t len = (size_t)a2;
+    size_t len = rw_count(a2);
+    if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     ssize_t n = pread((int)a0, buf, len, (off_t)a3);
@@ -810,7 +813,8 @@ SYSDEF(pread64) {
 
 SYSDEF(pwrite64) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
-    size_t len = (size_t)a2;
+    size_t len = rw_count(a2);
+    if (len && !(len = rw_room(c, a1, len, ACC_READ))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
