@@ -1484,6 +1484,24 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
 /* Sign-extend an `esize`-bit element value to s64. */
 static s64 sx(u64 v, unsigned esize) { return (s64)sign_extend(v, esize); }
 
+/* Wrapping signed arithmetic for the lane maths below. Every *allocated*
+ * encoding that reaches these has elements of at most 32 bits, where the
+ * result is exact in s64 and nothing ever wraps. What can overflow is the
+ * 64-bit element size of the unallocated encodings this decoder executes
+ * rather than rejecting (see the note on the fuzzer's chaos mode): there the
+ * plain signed operators are undefined behaviour, which a compiler may act on
+ * and which does not even agree between hosts -- a 32-bit one builds these out
+ * of pairs. Doing the arithmetic in u64 and reinterpreting makes those cases
+ * defined, identical everywhere, and unchanged for every real instruction. */
+static s64 wadd(s64 x, s64 y) { return (s64)((u64)x + (u64)y); }
+static s64 wsub(s64 x, s64 y) { return (s64)((u64)x - (u64)y); }
+static s64 wmul(s64 x, s64 y) { return (s64)((u64)x * (u64)y); }
+/* |x| as a bit pattern. The negation is unsigned, so INT64_MIN -- which a
+ * perfectly legal ABS/SABD on .2d lanes can be handed -- comes back as itself,
+ * which is what the architecture's non-saturating absolute value does, rather
+ * than being signed overflow. */
+static u64 wabs(s64 x) { return x < 0 ? 0u - (u64)x : (u64)x; }
+
 /* ---- integer saturation + register-shift helpers (saturating/shift ops) ---- */
 /* Every clamp in the saturating-integer family raises FPSR.QC (sticky). */
 static u64 sat_s(s64 v, unsigned e) {
@@ -1697,10 +1715,10 @@ static u64 vreg_shift(u64 val, int sh, unsigned e, int sgn, int round, int sat) 
             }
             if (sv > 0) {
                 if (sv > (max >> sh)) { g_fpexc |= FPSR_QC; return (u64)max; }
-                return (u64)(sv << sh) & emask;
+                return ((u64)sv << sh) & emask;
             }
             if (sv < (min >> sh)) { g_fpexc |= FPSR_QC; return (u64)min & emask; }
-            return (u64)(sv << sh) & emask;
+            return ((u64)sv << sh) & emask;
         } else {
             u64 uv = val & emask;
             u64 max = emask;
@@ -2137,12 +2155,12 @@ static void simd_three_same(CPU *c, u32 insn) {
             case (0 << 5) | 0x12: v = velem_get(&c->v[Rd], size, i) + a * b; break;    /* MLA */
             case (1 << 5) | 0x12: v = velem_get(&c->v[Rd], size, i) - a * b; break;    /* MLS */
             /* halving / rounding-halving add & sub (esize<=32) */
-            case (0 << 5) | 0x00: v = (u64)((sx(a,esize) + sx(b,esize)) >> 1); break;          /* SHADD */
+            case (0 << 5) | 0x00: v = (u64)(wadd(sx(a,esize), sx(b,esize)) >> 1); break;      /* SHADD */
             case (1 << 5) | 0x00: v = (a + b) >> 1; break;                                      /* UHADD */
-            case (0 << 5) | 0x02: v = (u64)((sx(a,esize) + sx(b,esize) + 1) >> 1); break;       /* SRHADD */
+            case (0 << 5) | 0x02: v = (u64)(wadd(wadd(sx(a,esize), sx(b,esize)), 1) >> 1); break; /* SRHADD */
             case (1 << 5) | 0x02: v = (a + b + 1) >> 1; break;                                  /* URHADD */
-            case (0 << 5) | 0x04: v = (u64)((sx(a,esize) - sx(b,esize)) >> 1); break;           /* SHSUB */
-            case (1 << 5) | 0x04: v = (u64)(((s64)(a & emask) - (s64)(b & emask)) >> 1); break; /* UHSUB */
+            case (0 << 5) | 0x04: v = (u64)(wsub(sx(a,esize), sx(b,esize)) >> 1); break;        /* SHSUB */
+            case (1 << 5) | 0x04: v = (u64)(wsub((s64)(a & emask), (s64)(b & emask)) >> 1); break; /* UHSUB */
             /* saturating add/sub */
             case (0 << 5) | 0x01: v = ssat_add(sx(a,esize), sx(b,esize), esize); break;  /* SQADD */
             case (1 << 5) | 0x01: v = usat_add(a & emask, b & emask, esize); break;      /* UQADD */
@@ -2158,15 +2176,15 @@ static void simd_three_same(CPU *c, u32 insn) {
             case (0 << 5) | 0x0b: v = vreg_shift(a, (s8)(b & 0xff), esize, 1, 1, 1); break;  /* SQRSHL */
             case (1 << 5) | 0x0b: v = vreg_shift(a, (s8)(b & 0xff), esize, 0, 1, 1); break;  /* UQRSHL */
             /* absolute difference (+ accumulate) */
-            case (0 << 5) | 0x0e: { s64 d = sx(a,esize) - sx(b,esize); v = (u64)(d < 0 ? -d : d); } break; /* SABD */
+            case (0 << 5) | 0x0e: { v = wabs(wsub(sx(a,esize), sx(b,esize))); } break;                    /* SABD */
             case (1 << 5) | 0x0e: { u64 ua=a&emask, ub=b&emask; v = ua > ub ? ua-ub : ub-ua; } break;      /* UABD */
-            case (0 << 5) | 0x0f: { s64 d = sx(a,esize) - sx(b,esize); v = velem_get(&c->v[Rd],size,i) + (u64)(d<0?-d:d); } break; /* SABA */
+            case (0 << 5) | 0x0f: { v = velem_get(&c->v[Rd],size,i) + wabs(wsub(sx(a,esize), sx(b,esize))); } break;              /* SABA */
             case (1 << 5) | 0x0f: { u64 ua=a&emask, ub=b&emask; v = velem_get(&c->v[Rd],size,i) + (ua>ub?ua-ub:ub-ua); } break;    /* UABA */
             /* saturating doubling multiply-high. Overflow-safe: form a*b (fits
              * s64 for esize<=32) and shift by esize-1, not 2*a*b (which overflows
              * s64 at the INT32_MIN*INT32_MIN corner and mis-saturates). */
-            case (0 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize); v = sat_s(p >> (esize-1), esize); } break;                          /* SQDMULH */
-            case (1 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break;   /* SQRDMULH */
+            case (0 << 5) | 0x16: { s64 p = wmul(sx(a,esize), sx(b,esize)); v = sat_s(p >> (esize-1), esize); } break;                  /* SQDMULH */
+            case (1 << 5) | 0x16: { s64 p = wadd(wmul(sx(a,esize), sx(b,esize)), (s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break; /* SQRDMULH */
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
@@ -2357,25 +2375,27 @@ static u64 sqshlu_sat(s64 sv, int sh, u64 emask) {
     return ((u64)sv << sh) & emask;
 }
 
-/* Saturate the doubled product 2*sa*sb to e bits (e = 16/32/64). sa/sb are
- * sign-extended source lanes of at most 32 bits, so p = sa*sb is exact in s64
- * (|p| <= 2^62); 2p is saturated by a pre-doubling range check, which keeps
- * the arithmetic in 64 bits (portable to 32-bit hosts). */
+/* Saturate the doubled product 2*sa*sb to e bits (e = 16/32/64 for every
+ * allocated form). sa/sb are sign-extended source lanes of at most 32 bits, so
+ * p = sa*sb is exact in s64 (|p| <= 2^62); 2p is saturated by a pre-doubling
+ * range check, which keeps the arithmetic in 64 bits (portable to 32-bit
+ * hosts). An unallocated 64-bit source makes e 128 -- a destination wider than
+ * s64, so nothing can saturate into it and the bound is not computed. */
 static u64 sqdmull_sat(s64 sa, s64 sb, unsigned e) {
     s64 max = (e >= 64) ? INT64_MAX : (((s64)1 << (e - 1)) - 1);
     s64 min = (e >= 64) ? INT64_MIN : (-((s64)1 << (e - 1)));
-    s64 p = sa * sb;
+    s64 p = wmul(sa, sb);
     /* 2p > max  <=>  p >= (max+1)/2 = 2^(e-2);  2p < min  <=>  p < -2^(e-2) */
-    s64 hi = (s64)1 << (e - 2);
+    s64 hi = (e > 64) ? INT64_MAX : ((s64)1 << (e - 2));
     if (p >= hi) { g_fpexc |= FPSR_QC; return (u64)max; }
     if (p < -hi) { g_fpexc |= FPSR_QC; return (u64)min; }
-    return (u64)(2 * p);
+    return (u64)p * 2;
 }
 static void simd_three_diff(CPU *c, u32 insn) {
     unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
     unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
     unsigned esize = 8u << size, ndest = 64u / esize, base = Q ? ndest : 0, dsize = size + 1;
-    u64 emask = (1ULL << esize) - 1;               /* esize is 8/16/32 here */
+    u64 emask = (esize >= 64) ? ~0ULL : ((1ULL << esize) - 1);   /* 8/16/32 allocated */
     u64 dmask = (2 * esize >= 64) ? ~0ULL : ((1ULL << (2 * esize)) - 1);
     V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
 
@@ -2402,12 +2422,12 @@ static void simd_three_diff(CPU *c, u32 insn) {
         u64 a = velem_get(&vn, size, base + i) & emask, b = velem_get(&vm, size, base + i) & emask;
         u64 d = velem_get(&vd, dsize, i), v;
         u64 adiff = U ? (a > b ? a - b : b - a)
-                      : (u64)((sx(a, esize) > sx(b, esize)) ? sx(a, esize) - sx(b, esize)
-                                                            : sx(b, esize) - sx(a, esize));
-        u64 prod  = U ? (a * b) : (u64)(sx(a, esize) * sx(b, esize));
+                      : (u64)((sx(a, esize) > sx(b, esize)) ? wsub(sx(a, esize), sx(b, esize))
+                                                            : wsub(sx(b, esize), sx(a, esize)));
+        u64 prod  = U ? (a * b) : (u64)wmul(sx(a, esize), sx(b, esize));
         switch (opc) {
-            case 0x0: v = U ? a + b : (u64)(sx(a,esize) + sx(b,esize)); break;  /* S/UADDL */
-            case 0x2: v = U ? a - b : (u64)(sx(a,esize) - sx(b,esize)); break;  /* S/USUBL */
+            case 0x0: v = U ? a + b : (u64)wadd(sx(a,esize), sx(b,esize)); break;  /* S/UADDL */
+            case 0x2: v = U ? a - b : (u64)wsub(sx(a,esize), sx(b,esize)); break;  /* S/USUBL */
             case 0x5: v = d + adiff; break;                                    /* S/UABAL */
             case 0x7: v = adiff; break;                                        /* S/UABDL */
             case 0x8: v = d + prod; break;                                     /* S/UMLAL */
@@ -2994,7 +3014,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
         V128 r; r.d[0] = r.d[1] = 0;
         for (unsigned i = 0; i < nd; i++) {
             u64 e0 = velem_get(&c->v[Rn], size, 2*i), e1 = velem_get(&c->v[Rn], size, 2*i + 1);
-            u64 sum = U ? (e0 + e1) : (u64)(sx(e0, esz) + sx(e1, esz));
+            u64 sum = U ? (e0 + e1) : (u64)wadd(sx(e0, esz), sx(e1, esz));
             if (opc == 0x06) sum += velem_get(&c->v[Rd], dsz, i);   /* ADALP accumulate */
             velem_set(&r, dsz, i, sum & dmask);
         }
@@ -3003,7 +3023,7 @@ static void simd_two_misc(CPU *c, u32 insn) {
     /* SQXTN/UQXTN (0x14) and SQXTUN (0x12,U=1): saturating extract narrow. */
     if (opc == 0x14 || (opc == 0x12 && U == 1)) {
         unsigned esz = 8u << size, nd = 64u / esz, base = Q ? nd : 0;
-        u64 emask = (1ULL << esz) - 1;
+        u64 emask = (esz >= 64) ? ~0ULL : ((1ULL << esz) - 1);   /* 8/16/32 allocated */
         V128 r; if (Q) r = c->v[Rd]; else { r.d[0] = r.d[1] = 0; }
         for (unsigned i = 0; i < nd; i++) {
             u64 src = velem_get(&c->v[Rn], size + 1, i), nv;
@@ -3017,10 +3037,14 @@ static void simd_two_misc(CPU *c, u32 insn) {
     /* SHLL/SHLL2 (0x13,U=1): shift left long by the element size. */
     if (opc == 0x13 && U == 1) {
         unsigned esz = 8u << size, nd = 64u / esz, base = Q ? nd : 0, dsz = size + 1;
-        u64 emask = (1ULL << esz) - 1, dmask = (2 * esz >= 64) ? ~0ULL : ((1ULL << (2 * esz)) - 1);
+        u64 emask = (esz >= 64) ? ~0ULL : ((1ULL << esz) - 1);
+        u64 dmask = (2 * esz >= 64) ? ~0ULL : ((1ULL << (2 * esz)) - 1);
         V128 r; r.d[0] = r.d[1] = 0;
         for (unsigned i = 0; i < nd; i++)
-            velem_set(&r, dsz, i, ((velem_get(&c->v[Rn], size, base + i) & emask) << esz) & dmask);
+            velem_set(&r, dsz, i,
+                      (esz >= 64 ? 0   /* unallocated .2d: everything shifts out */
+                                 : ((velem_get(&c->v[Rn], size, base + i) & emask) << esz))
+                      & dmask);
         c->v[Rd] = r; return;
     }
     unsigned esize = 8u << size, n = (Q ? 16 : 8) >> size;
@@ -3035,8 +3059,8 @@ static void simd_two_misc(CPU *c, u32 insn) {
             case (1 << 5) | 0x09: v = (sx(a,esize) <= 0) ? emask : 0; break;   /* CMLE #0 */
             case (0 << 5) | 0x0a: v = (sx(a,esize) <  0) ? emask : 0; break;   /* CMLT #0 */
             case (0 << 5) | 0x05: v = (u64)__builtin_popcount((unsigned)(a & 0xff)); break; /* CNT */
-            case (0 << 5) | 0x0b: { s64 s = sx(a,esize); v = (s < 0) ? (u64)(-s) : a; } break; /* ABS */
-            case (1 << 5) | 0x0b: v = (u64)(-(s64)a); break;                   /* NEG */
+            case (0 << 5) | 0x0b: v = wabs(sx(a,esize)); break;                /* ABS */
+            case (1 << 5) | 0x0b: v = 0u - a; break;                           /* NEG */
             case (1 << 5) | 0x04: { u64 val = a & emask; unsigned cnt = 0;     /* CLZ */
                 for (int bit = esize - 1; bit >= 0; bit--) { if (val & (1ULL << bit)) break; cnt++; } v = cnt; } break;
             case (0 << 5) | 0x04: { u64 val = a & emask; unsigned msb = (val >> (esize-1)) & 1, cnt = 0; /* CLS */
@@ -3180,8 +3204,8 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         case (0 << 5) | 0x09: v = (a == 0) ? emask : 0; break;             /* CMEQ #0 */
         case (1 << 5) | 0x09: v = (sx(a,esize) <= 0) ? emask : 0; break;   /* CMLE #0 */
         case (0 << 5) | 0x0a: v = (sx(a,esize) <  0) ? emask : 0; break;   /* CMLT #0 */
-        case (0 << 5) | 0x0b: { s64 s = sx(a,esize); v = (s < 0) ? (u64)(-s) : a; } break;        /* ABS */
-        case (1 << 5) | 0x0b: v = (u64)(-(s64)a); break;                   /* NEG */
+        case (0 << 5) | 0x0b: v = wabs(sx(a,esize)); break;                                       /* ABS */
+        case (1 << 5) | 0x0b: v = 0u - a; break;                           /* NEG */
         default: ok = 0; v = 0; break;
     }
     if (ok) { V128 r; r.d[0] = r.d[1] = 0; velem_set(&r, size, 0, v & emask); c->v[Rd] = r; return; }
@@ -3823,8 +3847,8 @@ static void simd_scalar_three_same(CPU *c, u32 insn) {
         case (1 << 5) | 0x10: v = a - b; break;                                        /* SUB */
         case (0 << 5) | 0x11: v = ((a & emask) & (b & emask)) ? emask : 0; break;       /* CMTST */
         case (1 << 5) | 0x11: v = ((a & emask) == (b & emask)) ? emask : 0; break;      /* CMEQ */
-        case (0 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize); v = sat_s(p >> (esize-1), esize); } break;                          /* SQDMULH (overflow-safe, see three-same) */
-        case (1 << 5) | 0x16: { s64 p = sx(a,esize)*sx(b,esize) + ((s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break;   /* SQRDMULH */
+        case (0 << 5) | 0x16: { s64 p = wmul(sx(a,esize), sx(b,esize)); v = sat_s(p >> (esize-1), esize); } break;                  /* SQDMULH (overflow-safe, see three-same) */
+        case (1 << 5) | 0x16: { s64 p = wadd(wmul(sx(a,esize), sx(b,esize)), (s64)1 << (esize-2)); v = sat_s(p >> (esize-1), esize); } break; /* SQRDMULH */
         default: fpsimd_undef(c, insn); return;
     }
     velem_set(&r, size, 0, v & emask); c->v[Rd] = r;
@@ -3846,7 +3870,8 @@ static void simd_scalar_pairwise(CPU *c, u32 insn) {
 
 static void simd_scalar_three_diff(CPU *c, u32 insn) {
     unsigned size = BITS(23, 22), opc = BITS(15, 12), Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
-    unsigned esize = 8u << size; u64 emask = (1ULL << esize) - 1;
+    unsigned esize = 8u << size;
+    u64 emask = (esize >= 64) ? ~0ULL : ((1ULL << esize) - 1);   /* 16/32 allocated */
     u64 a = velem_get(&c->v[Rn], size, 0) & emask, b = velem_get(&c->v[Rm], size, 0) & emask;
     s64 pr = (s64)sqdmull_sat(sx(a, esize), sx(b, esize), 2 * esize);
     u64 d = velem_get(&c->v[Rd], size + 1, 0), v;
