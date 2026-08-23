@@ -739,24 +739,42 @@ void sig_return(CPU *c) {
     if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) < 0) goto bad;
     g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     sig_sync_host_mask(c->m);
-    /* fpsimd */
+    /* fpsimd. Every read here is checked like the ones above: a frame whose
+     * FP context cannot be read is a bad frame, and parse_user_sigframe says
+     * so too -- any __get_user failure walking uc_mcontext.__reserved ends in
+     * arm64_notify_segfault. Ignoring the failures left the FP registers
+     * holding the handler's values while the general-purpose ones came from
+     * the frame, and read c->fpsr and c->fpcr out of an uninitialised local.
+     * A record that is simply not there stays permissive (a kernel insists on
+     * one, but a guest that builds its own frame without FP context is asking
+     * for its FP state to be left alone, and this is the more forgiving
+     * reading of that). */
     u32 magic = 0;
-    copy_from_guest(c, &magic, frame + MC_RESERVED, 4);
+    if (copy_from_guest(c, &magic, frame + MC_RESERVED, 4) < 0) goto bad;
     if (magic == FPSIMD_MAGIC) {
-        u32 f;
-        copy_from_guest(c, &f, frame + MC_RESERVED + 8, 4); c->fpsr = f;
-        copy_from_guest(c, &f, frame + MC_RESERVED + 12, 4); c->fpcr = f;
+        u32 fpsr, fpcr;
+        V128 v128[32];
+        if (copy_from_guest(c, &fpsr, frame + MC_RESERVED + 8, 4) < 0) goto bad;
+        if (copy_from_guest(c, &fpcr, frame + MC_RESERVED + 12, 4) < 0) goto bad;
         for (int i = 0; i < 32; i++)
-            copy_from_guest(c, &c->v[i], frame + MC_RESERVED + 16 + 16u * (unsigned)i, 16);
+            if (copy_from_guest(c, &v128[i],
+                                frame + MC_RESERVED + 16 + 16u * (unsigned)i, 16) < 0)
+                goto bad;
+        /* Committed only once all of it is in hand, so a frame that faults
+         * part way through leaves no half-restored FP state behind. */
+        c->fpsr = fpsr;
+        c->fpcr = fpcr;
+        memcpy(c->v, v128, sizeof v128);
     }
     c->excl_valid = false;
     return;
 bad:
+    /* The guest is on its way out with a signal it cannot handle (a kernel
+     * forces the disposition), so this goes through the one path that reports
+     * a WIFSIGNALED death to a tracer and hands back the PID registry slot,
+     * the SEM_UNDO adjustments and any tmpfs backing. */
     fprintf(stderr, "arm64chroot: bad sigreturn frame, killing\n");
-    proctab_unregister((s32)getpid());
-    signal(SIGSEGV, SIG_DFL);
-    raise(SIGSEGV);
-    _exit(128 + SIGSEGV);
+    guest_terminate_by_signal(c, SIGSEGV);
 }
 
 /* Does this thread's capture queue hold a signal that sig_deliver_pending
