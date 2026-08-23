@@ -41,9 +41,14 @@ static u32 pf_to_prot(u32 pf) {
 /* Load one ELF file into the address space. `fixed_base`: ET_DYN load bias to
  * request, or -1 to allocate from the mmap area (used for the interpreter).
  * `gpath` (guest path) names the image's regions for /proc/self/maps. */
-static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
-                    const char *gpath) {
+/* Is this an image this loader can run, and what interpreter does it name?
+ * `interp` (PATH_MAX, may be NULL) comes back empty for a static image. The
+ * one validator: load_one runs it on the way to loading, and elf_probe runs it
+ * on its own so execve can refuse a bad image while there is still a caller to
+ * refuse it to. */
+static int elf_header_check(int fd, char *interp) {
     Elf64_Ehdr eh;
+    if (interp) interp[0] = 0;
     if (pread(fd, &eh, sizeof eh, 0) != sizeof eh) return -ENOEXEC;
     if (memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_machine != EM_AARCH64 ||
@@ -51,6 +56,29 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
         return -ENOEXEC;
     if (eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum == 0 || eh.e_phnum > 128)
         return -ENOEXEC;
+    if (!interp) return 0;
+    Elf64_Phdr ph[128];
+    if (pread(fd, ph, sizeof(Elf64_Phdr) * eh.e_phnum, (off_t)eh.e_phoff) !=
+        (ssize_t)(sizeof(Elf64_Phdr) * eh.e_phnum))
+        return -ENOEXEC;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        if (ph[i].p_type != PT_INTERP) continue;
+        if (ph[i].p_filesz == 0 || ph[i].p_filesz >= PATH_MAX) return -ENOEXEC;
+        if (pread(fd, interp, ph[i].p_filesz, (off_t)ph[i].p_offset) !=
+            (ssize_t)ph[i].p_filesz)
+            return -ENOEXEC;
+        interp[ph[i].p_filesz] = 0;
+        break;
+    }
+    return 0;
+}
+
+static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
+                    const char *gpath) {
+    Elf64_Ehdr eh;
+    int hr = elf_header_check(fd, out->interp);
+    if (hr < 0) return hr;
+    if (pread(fd, &eh, sizeof eh, 0) != sizeof eh) return -ENOEXEC;
 
     Elf64_Phdr ph[128];
     if (pread(fd, ph, sizeof(Elf64_Phdr) * eh.e_phnum, (off_t)eh.e_phoff) !=
@@ -87,14 +115,7 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     if (!pageprot) return -ENOMEM;
 
     for (int i = 0; i < eh.e_phnum; i++) {
-        if (ph[i].p_type == PT_INTERP && out->interp[0] == 0) {
-            if (ph[i].p_filesz == 0 || ph[i].p_filesz >= PATH_MAX) { free(pageprot); return -ENOEXEC; }
-            if (pread(fd, out->interp, ph[i].p_filesz, (off_t)ph[i].p_offset) !=
-                (ssize_t)ph[i].p_filesz) { free(pageprot); return -ENOEXEC; }
-            out->interp[ph[i].p_filesz] = 0;
-            continue;
-        }
-        if (ph[i].p_type != PT_LOAD) continue;
+        if (ph[i].p_type != PT_LOAD) continue;   /* PT_INTERP: read above */
         u64 va = base + ph[i].p_vaddr;
         if (ph[i].p_filesz) {
             u8 buf[65536];
@@ -148,16 +169,17 @@ static u64 stack_push(struct Machine *m, u64 *sp, const void *data, size_t len) 
     return *sp;
 }
 
-int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp) {
-    char host_path[PATH_MAX], canon[PATH_MAX];
+/* Open a guest program for loading. `canon` may be NULL. Returns a descriptor
+ * or -errno. */
+static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
+    char host_path[PATH_MAX];
     int r = path_resolve(m, G_AT_FDCWD, guest_path, 0, host_path, canon);
     if (r < 0) return r;
-
     int fd = open(host_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
          * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --
-         * Android denies it for memfds. Everything below reads by pread, which
+         * Android denies it for memfds. Every reader here uses pread, which
          * never moves the shared offset, so a plain dup of the guest's fd is a
          * faithful stand-in for the re-open. */
         int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
@@ -165,6 +187,37 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         if (ownfd >= 0) fd = fcntl(ownfd, F_DUPFD_CLOEXEC, 0);
         if (fd < 0) return ownfd >= 0 ? -errno : -e;
     }
+    return fd;
+}
+
+/* Everything execve can refuse about an image, asked without loading it: is it
+ * an AArch64 ELF this loader can run, and is the interpreter it names there?
+ *
+ * do_execve has to know before it tears the old image down, because past that
+ * point there is no one left to return an error to -- a refusal can only
+ * _exit the process, where a kernel answers ENOEXEC (wrong arch or format) or
+ * ENOENT (no such interpreter) to the caller, which is what a shell's "cannot
+ * execute binary file" and an execvp PATH walk are reading. The kernel makes
+ * the same two checks in the same order, ahead of its own begin_new_exec. */
+int elf_probe(struct Machine *m, const char *guest_path) {
+    int fd = exec_open(m, guest_path, NULL);
+    if (fd < 0) return fd;
+    char interp[PATH_MAX];
+    int r = elf_header_check(fd, interp);
+    close(fd);
+    if (r < 0 || !interp[0]) return r;
+    fd = exec_open(m, interp, NULL);
+    if (fd < 0) return fd;
+    r = elf_header_check(fd, NULL);
+    close(fd);
+    return r;
+}
+
+int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp) {
+    char canon[PATH_MAX];
+    int fd = exec_open(m, guest_path, canon);
+    if (fd < 0) return fd;
+    int r;
 
     LoadInfo exe = {0}, interp = {0};
     /* ET_EXEC ignores the base; ET_DYN main executables load at the fixed
@@ -175,11 +228,8 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
 
     u64 entry = exe.entry, at_base = 0;
     if (exe.interp[0]) {
-        char ihost[PATH_MAX];
-        r = path_resolve(m, G_AT_FDCWD, exe.interp, 0, ihost, NULL);
-        if (r < 0) return r;
-        int ifd = open(ihost, O_RDONLY | O_CLOEXEC);
-        if (ifd < 0) return -errno;
+        int ifd = exec_open(m, exe.interp, NULL);
+        if (ifd < 0) return ifd;
         r = load_one(m, ifd, (u64)-1, &interp, exe.interp);
         close(ifd);
         if (r < 0) return r;

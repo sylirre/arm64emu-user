@@ -1251,6 +1251,13 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         return (u64)(s64)-ENOEXEC;
     }
 
+    /* Everything the loader can still refuse -- a foreign or malformed ELF, an
+     * interpreter that is not there -- refused now, while there is a caller to
+     * refuse it to. Past the point of no return below, load_elf's failure can
+     * only kill the process, where a kernel hands the shell its ENOEXEC. */
+    int pr = elf_probe(m, pathbuf);
+    if (pr < 0) { free_strvec(argv); return (u64)(s64)pr; }
+
     /* Copy envp too: load_elf reads it after as_destroy, and the caller's
      * copy must survive for its own free. */
     char **envp_copy = dup_strvec(envp);

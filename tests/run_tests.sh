@@ -1179,6 +1179,28 @@ else
     skip_build "fixtures/ownfdexec"
 fi
 
+# ---- execve refuses an unloadable image with an errno, not by dying. Loading
+# happens in the emulator's own address space, so the old one is gone before the
+# new image is read; anything refused after that has no caller left. Self-
+# checking: under qemu the host's binfmt handler starts a fresh qemu on the
+# image, so qemu, not the kernel, is what fails to open a missing interpreter. ----
+if [ ! -x tests/fixtures/execimg.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/execimg.bin \
+        tests/fixtures/execimg.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/execimg.bin ]; then
+    expect=$'foreign=8\njunk=8\nnointerp=2\ndone'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/execimg.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: execimg"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: execimg"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/execimg.bin
+else
+    skip_build "fixtures/execimg"
+fi
+
 # ---- nothing under ANOTHER guest process's /proc may hand back the emulator's
 # own state. Self-checking: qemu has no guest PID registry, so it cannot be the
 # oracle -- the fixture compares every file against what it sees for itself,

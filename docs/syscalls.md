@@ -799,9 +799,20 @@ so the interpreter a script names must be executable too. Whether the image can
 be *read* — which the emulator, unlike a kernel, does need — is answered by the
 header read just below it, still ahead of the point of no return, and reported
 as the errno the open was refused with. No host `execve` and no dependency on
-the emulator's own path. A wrong arch/format yields `ENOEXEC` so the guest shell's
-script fallback works. `do_execve` takes private copies of argv/envp — the caller
-retains ownership (a subtle earlier use-after-free lives in the git history).
+the emulator's own path. `do_execve` takes private copies of argv/envp — the
+caller retains ownership (a subtle earlier use-after-free lives in the git
+history).
+
+Everything else the loader can refuse is refused there too, by `elf_probe`
+(`elf.c`), which validates the ELF header and opens the interpreter it names
+*without touching the address space*. It has to run first because the reload is
+in-process: past the teardown there is no old image to return to, and a refusal
+could only `_exit` the process, where a kernel answers `ENOEXEC` (wrong arch or
+format — what a shell's "cannot execute binary file" and an `execvp` `PATH` walk
+read) or `ENOENT` (no such interpreter). The kernel makes the same two checks in
+the same order, ahead of its own `begin_new_exec`. `elf_header_check` is the
+single validator: the probe runs it, and `load_one` runs it again on the way to
+loading, so the two can never drift apart.
 
 ### `de_thread`: exec from a thread group with more than one thread
 

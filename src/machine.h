@@ -659,6 +659,10 @@ void emu_fork_check(const char *site);
  * prepare the initial stack. Returns 0 or -errno. */
 int load_elf(struct Machine *m, const char *guest_path,
              char **argv, char **envp);
+/* Can execve load this program? Validates the ELF and the interpreter it names
+ * without touching the address space, so a refusal still has a caller to reach
+ * (elf.c). Returns 0 or -errno. */
+int elf_probe(struct Machine *m, const char *guest_path);
 
 /* path.c: resolve a guest path against the rootfs.
  * dirfd: guest fd for *at syscalls, or AT_FDCWD.
