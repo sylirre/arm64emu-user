@@ -38,9 +38,20 @@ extern __thread FetchCache g_fcache;
 /* Slow path: walk the table, refresh the fetch cache, read. */
 bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out);
 
+/* The 4-byte alignment of the PC has to be tested here and not only in the
+ * slow path: a branch to a misaligned address inside the page this thread is
+ * already fetching from would otherwise never reach mem_ifetch_slow, so the
+ * PC-alignment exception never happened -- the misparsed word was decoded
+ * instead, and the guest saw SIGILL (or worse, a plausible instruction) where
+ * a kernel reports SIGBUS/BUS_ADRALN -- and a target in the last three bytes
+ * of the page read past the end of the cached page's host backing while doing
+ * it. Free to check: the cached page base has no bits below 12, so keeping
+ * va's low two bits in the compared key (mask ~0xffc rather than ~0xfff)
+ * makes any misaligned VA miss the compare and take the slow path, which
+ * raises the exception. */
+#define IFETCH_KEY(va) ((va) & ~0xffcULL)
 static inline bool mem_ifetch(CPU *c, u64 va, u32 *insn_out) {
-    u64 page = va & ~0xfffULL;
-    if (g_fcache.host && g_fcache.page == page) {
+    if (LIKELY(g_fcache.host && IFETCH_KEY(va) == g_fcache.page)) {
         u32 v;
         __builtin_memcpy(&v, g_fcache.host + (va & 0xfffULL), 4);
         *insn_out = v;
