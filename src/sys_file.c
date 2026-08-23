@@ -103,17 +103,26 @@ void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
 /* True when -fake-id is active and the guest's effective uid is root. */
 static int fake_root(struct Machine *m) { return m->fake_id && m->cred.euid == 0; }
 
-/* Bounded guest-iovec import. Returns iov count or -errno. */
+/* Bounded guest-iovec import. Returns iov count or -errno.
+ *
+ * The guest's own array is read exactly once, and `gout` keeps that one
+ * snapshot for the caller: the segment bases are needed again after the host
+ * syscall (to scatter a read back, or to gather a write's bytes), and a second
+ * copy_from_guest of the same array is a different array. Another guest thread
+ * sharing the address space can rewrite it -- or unmap it -- while the call is
+ * in flight, and then the bases the copy-back used would name memory the
+ * kernel never agreed to touch, paired with lengths from the first read. The
+ * kernel snapshots an iovec array once, in import_iovec, and never looks at
+ * the user's copy again; so does this. */
 static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
-                          u8 **bounce_out, int writeback) {
+                          GIovec *gout, u8 **bounce_out, int writeback) {
     (void)writeback;
     if (cnt > 1024) return -EINVAL;
-    GIovec g[1024];
-    if (copy_from_guest(c, g, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
+    if (copy_from_guest(c, gout, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
     size_t total = 0;
     for (unsigned i = 0; i < cnt; i++) {
-        if (g[i].iov_len > (1ULL << 30)) return -EINVAL;
-        total += g[i].iov_len;
+        if (gout[i].iov_len > (1ULL << 30)) return -EINVAL;
+        total += gout[i].iov_len;
         if (total > (1ULL << 30)) return -EINVAL;
     }
     u8 *bounce = malloc(total ? total : 1);
@@ -121,8 +130,8 @@ static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
     size_t off = 0;
     for (unsigned i = 0; i < cnt; i++) {
         out[i].iov_base = bounce + off;
-        out[i].iov_len = g[i].iov_len;
-        off += g[i].iov_len;
+        out[i].iov_len = gout[i].iov_len;
+        off += gout[i].iov_len;
     }
     *bounce_out = bounce;
     return (int)cnt;
@@ -721,8 +730,9 @@ SYSDEF(readv) {
         return nlret;
     procfs_pre_read(c, (int)a0, -1);
     struct iovec iov[1024];
+    GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n;
     if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: filled from the ring */
@@ -745,9 +755,7 @@ SYSDEF(readv) {
         n = readv((int)a0, iov, cnt);
     }
     if (n < 0) { free(bounce); return host_err(); }
-    /* scatter back */
-    GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
         size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
@@ -765,11 +773,10 @@ SYSDEF(writev) {
     if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, a2);   /* as in write */
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
-    u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
-    if (cnt < 0) return (u64)(s64)cnt;
     GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    if (cnt < 0) return (u64)(s64)cnt;
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
@@ -836,8 +843,9 @@ SYSDEF(pwrite64) {
 SYSDEF(preadv2) {
     procfs_pre_read(c, (int)a0, (s64)a3);   /* -1 = current pos, as here */
     struct iovec iov[1024];
+    GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n;
 #if defined(__BIONIC__) && defined(SYS_preadv2)
@@ -846,9 +854,7 @@ SYSDEF(preadv2) {
     n = preadv2((int)a0, iov, cnt, (off_t)a3, (int)a5);
 #endif
     if (n < 0) { free(bounce); return host_err(); }
-    /* scatter back */
-    GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
         size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
@@ -865,11 +871,10 @@ SYSDEF(preadv2) {
 SYSDEF(pwritev2) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
-    u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
-    if (cnt < 0) return (u64)(s64)cnt;
     GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    if (cnt < 0) return (u64)(s64)cnt;
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
@@ -894,14 +899,13 @@ SYSDEF(pwritev2) {
 SYSDEF(preadv) {
     procfs_pre_read(c, (int)a0, (s64)a3);
     struct iovec iov[1024];
+    GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 1);
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = preadv((int)a0, iov, cnt, (off_t)a3);
     if (n < 0) { free(bounce); return host_err(); }
-    /* scatter back */
-    GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
         size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
@@ -918,11 +922,10 @@ SYSDEF(preadv) {
 SYSDEF(pwritev) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
-    u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, &bounce, 0);
-    if (cnt < 0) return (u64)(s64)cnt;
     GIovec g[1024];
-    copy_from_guest(c, g, a1, sizeof(GIovec) * (unsigned)cnt);
+    u8 *bounce;
+    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    if (cnt < 0) return (u64)(s64)cnt;
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
