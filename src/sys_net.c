@@ -592,8 +592,16 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
     return goff;
 }
 
+/* Import a guest msghdr into a host one. `gbase_out` comes back holding the
+ * guest base of every segment, taken from the single reading of the guest's
+ * iovec array below: a receive has to write the data back to those bases after
+ * the host call, and re-reading the guest array to find them again would be
+ * reading a different array -- a sibling thread sharing the address space can
+ * rewrite it (or unmap it) while the call is parked. import_iovec in the
+ * kernel snapshots it once and never looks again. Every out-parameter is the
+ * caller's to free. */
 static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
-                      struct iovec **iov_out, u8 **bounce_out,
+                      struct iovec **iov_out, u64 **gbase_out, u8 **bounce_out,
                       struct sockaddr_storage *ss, u8 *ctrl, size_t ctrl_cap,
                       int for_send, int *dirfd_out) {
     if (copy_from_guest(c, g, va, sizeof *g) < 0) return -EFAULT;
@@ -629,14 +637,18 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     }
     u8 *bounce = malloc(total ? (size_t)total : 1);
     struct iovec *iov = malloc(sizeof(struct iovec) * (cnt ? cnt : 1));
-    if (!bounce || !iov) { free(bounce); free(iov); return -ENOMEM; }
+    u64 *gbase = malloc(sizeof(u64) * (cnt ? cnt : 1));
+    if (!bounce || !iov || !gbase) {
+        free(bounce); free(iov); free(gbase); return -ENOMEM;
+    }
     size_t off = 0;
     for (unsigned i = 0; i < cnt; i++) {
         iov[i].iov_base = bounce + off;
         iov[i].iov_len = gi[i].iov_len;
+        gbase[i] = gi[i].iov_base;
         if (for_send && gi[i].iov_len &&
             copy_from_guest(c, bounce + off, gi[i].iov_base, gi[i].iov_len) < 0) {
-            free(bounce); free(iov); return -EFAULT;
+            free(bounce); free(iov); free(gbase); return -EFAULT;
         }
         off += gi[i].iov_len;
     }
@@ -650,10 +662,10 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
              * layout -- the two differ on an ILP32 host. */
             u8 gctrl[MSG_CTRL_MAX];
             if (copy_from_guest(c, gctrl, g->msg_control, cl) < 0) {
-                free(bounce); free(iov); return -EFAULT;
+                free(bounce); free(iov); free(gbase); return -EFAULT;
             }
             ssize_t hl = cmsg_g2h(gctrl, cl, ctrl, ctrl_cap);
-            if (hl < 0) { free(bounce); free(iov); return -EINVAL; }
+            if (hl < 0) { free(bounce); free(iov); free(gbase); return -EINVAL; }
             h->msg_controllen = (size_t)hl;
         } else {
             /* Receiving: the host writes its own layout here and the writeback
@@ -667,6 +679,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     }
     h->msg_flags = g->msg_flags;
     *iov_out = iov;
+    *gbase_out = gbase;
     *bounce_out = bounce;
     /* Translate an AF_UNIX destination path last: unix_path_in may open a dirfd
      * (for a path that overflows sun_path) which the caller closes after the
@@ -675,7 +688,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     if (for_send && h->msg_name) {
         socklen_t sl = h->msg_namelen;
         int tr = unix_path_in(c, ss, &sl, 1, dirfd_out);
-        if (tr < 0) { free(iov); free(bounce); return tr; }
+        if (tr < 0) { free(iov); free(gbase); free(bounce); return tr; }
         h->msg_namelen = sl;
     }
     return (int)cnt;
@@ -686,18 +699,19 @@ SYSDEF(sendmsg) {
     GMsghdr g;
     struct msghdr h;
     struct iovec *iov;
+    u64 *gbase;
     u8 *bounce;
     struct sockaddr_storage ss;
     u8 ctrl[4096];
     int dfd = -1;
-    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
+    int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
     if (cnt < 0) return (u64)(s64)cnt;   /* dfd == -1 on error: nothing to close */
     /* As in sendto: note a reconfiguring rtnetlink request from a guest with a
      * faked network namespace. The message starts at the first iovec, which
      * msg_import laid at the head of the bounce buffer. */
     if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
-    free(iov); free(bounce);
+    free(iov); free(gbase); free(bounce);
     if (dfd >= 0) close(dfd);
     return n < 0 ? host_err() : (u64)n;
 }
@@ -711,18 +725,14 @@ SYSDEF(sendmsg) {
  * is gone and the call reports EFAULT. Reporting success instead would tell
  * the guest bytes were delivered to memory that never received them. */
 static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
-                             struct iovec *iov, u8 *bounce,
+                             struct iovec *iov, const u64 *gbase, u8 *bounce,
                              struct sockaddr_storage *ss, u8 *ctrl, ssize_t n) {
     int cnt = (int)h->msg_iovlen;
-    GIovec gi[1024];
-    if (cnt && copy_from_guest(c, gi, g->msg_iov,
-                               sizeof(GIovec) * (unsigned)cnt) < 0)
-        return -EFAULT;
     ssize_t left = n;
     size_t off = 0;
     for (int i = 0; i < cnt && left > 0; i++) {
         size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
-        if (chunk && copy_to_guest(c, gi[i].iov_base, bounce + off, chunk) < 0)
+        if (chunk && copy_to_guest(c, gbase[i], bounce + off, chunk) < 0)
             return -EFAULT;
         off += iov[i].iov_len;
         left -= (ssize_t)chunk;
@@ -761,13 +771,14 @@ SYSDEF(recvmsg) {
     GMsghdr g;
     struct msghdr h;
     struct iovec *iov;
+    u64 *gbase;
     u8 *bounce;
     struct sockaddr_storage ss;
     u8 ctrl[4096];
-    int cnt = msg_import(c, a1, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
+    int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
-    if (n < 0) { free(iov); free(bounce); return host_err(); }
+    if (n < 0) { free(iov); free(gbase); free(bounce); return host_err(); }
     /* Rewrite a faked-namespace refusal before the reply is scattered back to
      * the guest. The received bytes are contiguous at the head of the bounce
      * buffer (msg_import concatenates the iovecs in order), so the whole
@@ -778,8 +789,8 @@ SYSDEF(recvmsg) {
         nlr_fix_reply(c->m, (int)a0, bounce,
                       (size_t)n < total ? (size_t)n : total, (int)a2 & MSG_PEEK);
     }
-    int wb = recvmsg_writeback(c, a1, &g, &h, iov, bounce, &ss, ctrl, n);
-    free(iov); free(bounce);
+    int wb = recvmsg_writeback(c, a1, &g, &h, iov, gbase, bounce, &ss, ctrl, n);
+    free(iov); free(gbase); free(bounce);
     return wb < 0 ? (u64)(s64)wb : (u64)n;
 }
 
@@ -807,16 +818,16 @@ SYSDEF(sendmmsg) {
             sent++;
             continue;
         }
-        GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
+        GMsghdr g; struct msghdr h; struct iovec *iov; u64 *gbase; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
         int dfd = -1;
-        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
+        int cnt = msg_import(c, entry, &g, &h, &iov, &gbase, &bounce, &ss, ctrl, sizeof ctrl, 1, &dfd);
         if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;   /* dfd == -1 */
         /* As sendmsg: note a reconfiguring rtnetlink request from a guest whose
          * network namespace was faked, so its refusal can be rewritten. */
         if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
-        free(iov); free(bounce);
+        free(iov); free(gbase); free(bounce);
         if (dfd >= 0) close(dfd);
         if (n < 0) return sent ? (u64)sent : host_err();
         u32 mlen = (u32)n;
@@ -854,13 +865,13 @@ SYSDEF(recvmmsg) {
             got++;
             continue;
         }
-        GMsghdr g; struct msghdr h; struct iovec *iov; u8 *bounce;
+        GMsghdr g; struct msghdr h; struct iovec *iov; u64 *gbase; u8 *bounce;
         struct sockaddr_storage ss; u8 ctrl[4096];
-        int cnt = msg_import(c, entry, &g, &h, &iov, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
+        int cnt = msg_import(c, entry, &g, &h, &iov, &gbase, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
         if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
         ssize_t n = recvmsg((int)a0, &h, mf);
         if (n < 0) {
-            free(iov); free(bounce);
+            free(iov); free(gbase); free(bounce);
             if (got) break;   /* return the messages received so far */
             return host_err();
         }
@@ -871,11 +882,11 @@ SYSDEF(recvmmsg) {
             nlr_fix_reply(c->m, (int)a0, bounce,
                           (size_t)n < total ? (size_t)n : total, mf & MSG_PEEK);
         }
-        int wb = recvmsg_writeback(c, entry, &g, &h, iov, bounce, &ss, ctrl, n);
+        int wb = recvmsg_writeback(c, entry, &g, &h, iov, gbase, bounce, &ss, ctrl, n);
         u32 mlen = (u32)n;
         if (wb == 0 && copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
             wb = -EFAULT;
-        free(iov); free(bounce);
+        free(iov); free(gbase); free(bounce);
         /* A message that could not be handed over is still a message that was
          * received: report the ones before it, as the kernel does, and let the
          * next call answer with the error. */
