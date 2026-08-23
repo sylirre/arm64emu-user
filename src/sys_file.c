@@ -2614,9 +2614,15 @@ SYSDEF(pselect6) {
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     if (rr < 0) return host_err();
-    if (a1) copy_to_guest(c, a1, &r, setb);
-    if (a2) copy_to_guest(c, a2, &w, setb);
-    if (a3) copy_to_guest(c, a3, &e, setb);
+    /* A set that cannot be written back is EFAULT, whatever the call found:
+     * core_sys_select overwrites its own return with it (the input sets were
+     * readable at entry, but nothing says the memory is still writable when
+     * the sleep ends). Reporting the ready count instead tells the guest to
+     * read descriptor bits that were never stored. */
+    if ((a1 && copy_to_guest(c, a1, &r, setb) < 0) ||
+        (a2 && copy_to_guest(c, a2, &w, setb) < 0) ||
+        (a3 && copy_to_guest(c, a3, &e, setb) < 0))
+        return (u64)(s64)-EFAULT;
     return (u64)rr;
 }
 
