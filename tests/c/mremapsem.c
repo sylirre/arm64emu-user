@@ -160,7 +160,12 @@ int main(void) {
     }
 
     /* 8. The same two grows with another thread in the address space, where
-     *    backing may not be moved out from under a live guest VA. */
+     *    backing may not be moved out from under a live guest VA -- so the
+     *    shared one is duplicated (mremap with an old length of zero) instead
+     *    of moved. Under valgrind that call answers EINVAL (its mremap does
+     *    not implement the duplicate), and this row then reports the emulator
+     *    refusing the grow, which is the tier doing what it says rather than a
+     *    regression. */
     pthread_t th;
     if (pthread_create(&th, NULL, spin, NULL) != 0) return 1;
     while (!__atomic_load_n(&running, __ATOMIC_ACQUIRE)) ;
