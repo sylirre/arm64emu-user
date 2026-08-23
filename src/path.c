@@ -498,6 +498,12 @@ int a64_mfdfile(int cloexec) {
     int fd = mkstemp(p);
     if (fd < 0) return -1;
     unlink(p);
+    /* A kernel memfd is mode 0777, and this stands in for one: mkstemp's 0600
+     * would make it the one memfd a guest cannot execute (execve of
+     * /proc/self/fd/N is how apk-tools runs its triggers, and execve checks
+     * the mode). Nothing else can reach the file -- it is unlinked and lives
+     * only on this fd. */
+    fchmod(fd, 0777);
     if (cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
     return fd;
 }

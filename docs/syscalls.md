@@ -782,10 +782,23 @@ there is nothing to build a hugetlb mapping from on such a host.
 
 ## `execve`
 
-`do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, handles a
-`#!` shebang loop (depth 4, rebuilding argv), and for an ELF64/AArch64 file
-performs an **in-process reload**: tear down the address space, close CLOEXEC
-fds, reset signal handlers, and `load_elf`. No host `execve` and no dependency on
+`do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, checks that
+the guest may **execute** it, handles a `#!` shebang loop (depth 4, rebuilding
+argv), and for an ELF64/AArch64 file performs an **in-process reload**: tear down
+the address space, close CLOEXEC fds, reset signal handlers, and `load_elf`.
+
+The execute check has to be made here because nothing else asks it: the emulator
+only ever *reads* an image, so without it a file that is merely readable would
+run where a kernel answers `EACCES`, and so would a directory or a device node
+(only a regular file is executable). Without `--fake-id` the host's `access(2)`
+answers it for this process, supplementary groups and all; with one, the
+kernel's rule is applied to the guest's fake credentials against the file's
+*remapped* ownership — a fake root needs an execute bit somewhere, anyone else
+the bit for the class it falls into. It runs once per turn of the shebang loop,
+so the interpreter a script names must be executable too. Whether the image can
+be *read* — which the emulator, unlike a kernel, does need — is answered by the
+header read just below it, still ahead of the point of no return, and reported
+as the errno the open was refused with. No host `execve` and no dependency on
 the emulator's own path. A wrong arch/format yields `ENOEXEC` so the guest shell's
 script fallback works. `do_execve` takes private copies of argv/envp — the caller
 retains ownership (a subtle earlier use-after-free lives in the git history).
@@ -914,7 +927,10 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   cannot regain root.
 - **setuid/setgid bit on exec**: `do_execve` reads the file's mode; `S_ISUID`
   sets `euid/suid/fsuid` to the file owner's *remapped* id, `S_ISGID` the group.
-  `AT_SECURE` follows a real transition (`euid != ruid`).
+  `AT_SECURE` follows a real transition (`euid != ruid`). The raise is applied
+  past the point of no return, where a kernel's `commit_creds` runs: the one
+  refusal still ahead of it (`de_thread`) returns to the *old* image, which must
+  not go on running with privilege it never exec'd into.
 - **Ownership remap** (proot-style, no per-file database): a file the host
   reports as owned by the **real invoking user** is presented to the guest as
   owned by the **fake identity**; other owners pass through. Applied in

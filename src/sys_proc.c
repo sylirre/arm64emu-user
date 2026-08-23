@@ -1121,6 +1121,52 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
     return -ENOSYS;
 }
 
+/* Is the guest allowed to execute this file? Nothing else asks, because the
+ * emulator only ever READS an image: without this a file that is merely
+ * readable runs, where a kernel answers EACCES, and so do a directory and a
+ * device node (the kernel's do_open_execat refuses anything but a regular
+ * file).
+ *
+ * The identity doing the asking is the guest's. Without --fake-id that is this
+ * process, and the host's own access(2) answers it exactly -- supplementary
+ * groups and all. With one, the guest's credentials are the fake ones and the
+ * file's ownership is the remapped ownership it sees everywhere else, so the
+ * kernel's rule is applied against those: a fake root needs an execute bit
+ * somewhere, anyone else needs the bit for the class they fall into.
+ *
+ * Being allowed to execute is not the same as being readable, and the emulator
+ * needs the second too -- but that is not this function's business: the header
+ * read in do_execve's resolution loop reports it, still ahead of the point of
+ * no return. */
+static int exec_perm_check(struct Machine *m, const char *host) {
+    struct stat st;
+    if (stat(host, &st) != 0) {
+        /* One of our own fds on a host that refuses to re-open it (Android
+         * denies it for memfds): ask the descriptor itself. Anything else
+         * keeps the errno the host gave -- a path that names nothing (a
+         * dangling symlink, say) is ENOENT, not a permission answer. */
+        int e = errno;
+        int ofd = proc_own_fd_path(host);
+        if (ofd < 0) return -e;
+        if (fstat(ofd, &st) != 0) return -errno;
+    }
+    if (!S_ISREG(st.st_mode)) return -EACCES;
+    if (!m->fake_id) return access(host, X_OK) == 0 ? 0 : -EACCES;
+    if (m->cred.euid == 0)
+        return (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 0 : -EACCES;
+    mode_t bit = S_IXOTH;
+    u32 fowner = remap_uid(m, (u32)st.st_uid), fgroup = remap_gid(m, (u32)st.st_gid);
+    if (m->cred.euid == fowner) {
+        bit = S_IXUSR;
+    } else if (m->cred.egid == fgroup) {
+        bit = S_IXGRP;
+    } else {
+        for (int i = 0; i < m->cred.ngroups; i++)
+            if (m->cred.groups[i] == fgroup) { bit = S_IXGRP; break; }
+    }
+    return (st.st_mode & bit) ? 0 : -EACCES;
+}
+
 u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     struct Machine *m = c->m;
     char host[PATH_MAX], canon[PATH_MAX];
@@ -1135,6 +1181,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }
         int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, host, canon);
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        /* Both the script and the interpreter it names have to be executable,
+         * which is why this sits inside the loop. */
+        r = exec_perm_check(m, host);
+        if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
         unsigned char hdr[256];
         size_t n;
         FILE *f = fopen(host, "rb");
@@ -1145,10 +1195,17 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             /* The path names one of our own fds and the host refused the
              * re-open (Android denies it for memfds — apk's triggers): read
              * the header through the fd itself. pread leaves the guest's
-             * offset alone. */
+             * offset alone. Anything else that cannot be read is reported as
+             * what it was refused with -- an unreadable image is EACCES, not
+             * a missing one, and finding that out here keeps it ahead of the
+             * point of no return, where a load failure can only _exit. */
+            int e = errno;
             int ofd = proc_own_fd_path(host);
             ssize_t pn = ofd >= 0 ? pread(ofd, hdr, sizeof hdr, 0) : -1;
-            if (pn < 0) { free_strvec(argv); return (u64)(s64)-ENOENT; }
+            if (pn < 0) {
+                free_strvec(argv);
+                return (u64)(s64)(ofd >= 0 ? -errno : -e);
+            }
             n = (size_t)pn;
         }
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
