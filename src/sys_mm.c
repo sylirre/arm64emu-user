@@ -148,6 +148,13 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             if (ftruncate(fd, (off_t)back) != 0) { close(fd); return host_err(); }
             r = guest_map_file(as, addr, len, pte, fd, 0, 1, NULL);
             close(fd);
+            if (r == 0) {
+                /* Mark it as the emulator's own backing: its end-of-file is an
+                 * artifact of how this is built, not something the guest can
+                 * see or mremap can extend (mem.c). */
+                Region *reg = (Region *)as_find_region(as, addr);
+                if (reg) reg->anon_shm = 1;
+            }
         } else {
             r = guest_map_anon(as, addr, len, pte);
         }
@@ -288,6 +295,57 @@ SYSDEF(madvise) {
 #define G_MREMAP_MAYMOVE 1
 #define G_MREMAP_FIXED   2
 
+/* Copy `len` bytes of guest memory between two mapped ranges. Only used to
+ * rebuild anonymous shared memory below, where every page of both ranges is
+ * mapped by construction. */
+static int guest_copy_range(CPU *c, u64 dst, u64 src, u64 len) {
+    u8 buf[GUEST_PAGE_SIZE];
+    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
+        if (copy_from_guest(c, buf, src + off, GUEST_PAGE_SIZE) < 0) return -EFAULT;
+        if (copy_to_guest(c, dst + off, buf, GUEST_PAGE_SIZE) < 0) return -EFAULT;
+    }
+    return 0;
+}
+
+/* Grow a MAP_SHARED|MAP_ANONYMOUS mapping, the one kind mem.c cannot extend:
+ * its memfd was sized when the mapping was made and the descriptor is long
+ * closed (guest fd == host fd here, so nothing may keep one across guest
+ * execution). Build the larger mapping on a fresh memfd, copy the old contents
+ * into it, and move it onto `dst` -- so the guest, and every process it forks
+ * from here on, share the grown region as a kernel's would.
+ *
+ * What a kernel does keep and this cannot is a sharer from BEFORE the grow: it
+ * grows the one shmem object, while this leaves anyone else mapping the old
+ * memfd -- a child forked earlier, a second mapping of the same region -- on
+ * the old pages. Restoring that would need the descriptor this design forbids
+ * holding; every other route (extending past the memfd's end-of-file) turns
+ * the added pages into bus errors, which is further from the kernel still. */
+static int anon_shm_regrow(CPU *c, u64 old_addr, u64 old_len, u64 new_len,
+                           u64 dst, u32 prot) {
+    AddrSpace *as = &c->m->as;
+    int fd = anon_memfd();
+    if (fd < 0) return -ENOMEM;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps < (long)GUEST_PAGE_SIZE) ps = (long)GUEST_PAGE_SIZE;
+    u64 back = (new_len + (u64)ps - 1) & ~((u64)ps - 1);
+    if (ftruncate(fd, (off_t)back) != 0) { close(fd); return -ENOMEM; }
+    /* Staged at a free VA: `dst` may be the old mapping's own address, whose
+     * contents are still needed for the copy. */
+    u64 tmp = as_find_free(as, new_len);
+    if (!tmp) { close(fd); return -ENOMEM; }
+    int r = guest_map_file(as, tmp, new_len, prot, fd, 0, 1, NULL);
+    close(fd);
+    if (r < 0) return r;
+    Region *nr = (Region *)as_find_region(as, tmp);
+    if (nr) nr->anon_shm = 1;
+    if ((r = guest_copy_range(c, tmp, old_addr, old_len)) < 0 ||
+        (r = guest_remap_move(as, tmp, new_len, dst)) < 0) {
+        guest_unmap(as, tmp, new_len);
+        return r;
+    }
+    return 0;
+}
+
 static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     AddrSpace *as = &c->m->as;
     u64 old_addr = a0, old_len = PG_UP(a1), new_len = PG_UP(a2);
@@ -304,7 +362,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     /* The old range must be fully mapped; the kernel returns EFAULT when it
      * is not. musl's pthread_getattr_np probes for the main-thread stack
      * bottom with growing mremaps and relies on this non-ENOMEM failure to
-     * stop — succeeding here would hand it a bogus stack size and leak a
+     * stop -- succeeding here would hand it a bogus stack size and leak a
      * stray mapping below the stack. */
     for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
         if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
@@ -313,24 +371,39 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * where it started, so one check up here covers them all. */
     if (new_len > old_len && !as_fits(c->m, new_len - old_len))
         return (u64)(s64)-ENOMEM;
+
+    /* What the growth paths need to know about the mapping being grown: its
+     * protection, and whether it is anonymous shared memory (which mem.c
+     * cannot extend). Read before anything moves. */
+    const Region *tail = as_find_region(as, old_addr + old_len - 1);
+    u32 prot = tail ? tail->prot : (PTE_R | PTE_W);
+    int shm = tail && tail->anon_shm;
+
     if (!(flags & G_MREMAP_FIXED)) {
         /* Staying put: shrink in place, or grow in place when allowed. */
         if (new_len <= old_len) {
             if (new_len < old_len) guest_unmap(as, old_addr + new_len, old_len - new_len);
             return old_addr;
         }
-        if (!(flags & G_MREMAP_MAYMOVE)) {
-            for (u64 va = old_addr + old_len; va < old_addr + new_len; va += GUEST_PAGE_SIZE)
-                if (as_find_region(as, va)) return (u64)(s64)-ENOMEM;
-            int r = guest_map_anon(as, old_addr + old_len, new_len - old_len, PTE_R | PTE_W);
-            return r < 0 ? (u64)(s64)r : old_addr;
+        int busy = 0;
+        for (u64 va = old_addr + old_len; va < old_addr + new_len; va += GUEST_PAGE_SIZE)
+            if (as_find_region(as, va)) { busy = 1; break; }
+        if (!busy) {
+            int r = shm ? anon_shm_regrow(c, old_addr, old_len, new_len,
+                                          old_addr, prot)
+                        : guest_remap_grow(as, old_addr, old_len, new_len);
+            if (r == 0) return old_addr;
+            if (!(flags & G_MREMAP_MAYMOVE)) return (u64)(s64)r;
+        } else if (!(flags & G_MREMAP_MAYMOVE)) {
+            return (u64)(s64)-ENOMEM;
         }
     }
-    /* move: allocate new anon, copy, unmap old */
+
+    /* Move, growing at the destination if asked. */
     u64 new_addr;
     if (flags & G_MREMAP_FIXED) {
         /* The destination is the caller's to choose, and whatever already
-         * lives there is replaced (guest_map_anon punches it out). Handing
+         * lives there is replaced (guest_remap_move punches it out). Handing
          * back some other address instead, as this used to, silently breaks a
          * caller that goes on to use the address it asked for. */
         new_addr = a4;
@@ -339,22 +412,39 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
             return (u64)(s64)-EINVAL;
         if (new_addr < old_addr + old_len && old_addr < new_addr + new_len)
             return (u64)(s64)-EINVAL;   /* overlaps the source */
+        /* MREMAP_FIXED clears the whole destination first, not just the part
+         * the move covers: a grow that lands on top of an existing mapping
+         * replaces it, exactly as mmap(MAP_FIXED) would. */
+        guest_unmap(as, new_addr, new_len);
+        /* ...and a shrinking move drops the tail of the source, so the old
+         * range is gone in full whatever the new length is. */
+        if (new_len < old_len)
+            guest_unmap(as, old_addr + new_len, old_len - new_len);
     } else {
         new_addr = as_find_free(as, new_len);
         if (!new_addr) return (u64)(s64)-ENOMEM;
     }
-    const Region *reg = as_find_region(as, old_addr);
-    u32 prot = reg ? reg->prot : (PTE_R | PTE_W);
-    int r = guest_map_anon(as, new_addr, new_len, PTE_R | PTE_W);
-    if (r < 0) return (u64)(s64)r;
-    u8 buf[4096];
-    u64 copy_len = old_len < new_len ? old_len : new_len;   /* FIXED may shrink */
-    for (u64 o = 0; o < copy_len; o += GUEST_PAGE_SIZE) {
-        if (copy_from_guest(c, buf, old_addr + o, GUEST_PAGE_SIZE) == 0)
-            copy_to_guest(c, new_addr + o, buf, GUEST_PAGE_SIZE);
+    if (shm && new_len > old_len) {
+        /* Rebuilt rather than moved: the copy reads the old mapping, so it has
+         * to happen before the old VA is released. */
+        int r = anon_shm_regrow(c, old_addr, old_len, new_len, new_addr, prot);
+        if (r < 0) return (u64)(s64)r;
+        guest_unmap(as, old_addr, old_len);
+        return new_addr;
     }
-    guest_protect(as, new_addr, new_len, prot);
-    guest_unmap(as, old_addr, old_len);
+    u64 keep = old_len < new_len ? old_len : new_len;   /* FIXED may shrink */
+    int r = guest_remap_move(as, old_addr, keep, new_addr);
+    if (r < 0) return (u64)(s64)r;
+    if (new_len > old_len) {
+        r = guest_remap_grow(as, new_addr, old_len, new_len);
+        if (r < 0) {
+            /* Nothing to grow onto: put the mapping back where it was rather
+             * than leave the guest without it. The old range is free -- this
+             * move just vacated it. */
+            guest_remap_move(as, new_addr, keep, old_addr);
+            return (u64)(s64)r;
+        }
+    }
     return new_addr;
 }
 

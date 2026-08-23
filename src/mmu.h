@@ -147,6 +147,11 @@ typedef struct Region {
     u32  hostmap;             /* backed by a real host mapping OF THE FILE, so a
                                * page past end-of-file faults; the private
                                * pread-into-anonymous fallback sets this to 0 */
+    u32  anon_shm;            /* MAP_SHARED|MAP_ANONYMOUS: the backing is a memfd
+                               * this emulator made and sized, not a file the
+                               * guest named -- so mremap cannot grow it in
+                               * place (mem.c), and nothing else may treat its
+                               * end-of-file as the guest's business */
     u32  mfdcnt;              /* counted in the memfd tier's writable-shared
                                * mapping census (F_SEAL_WRITE's EBUSY check):
                                * region_insert/-delete keep the broker's count
@@ -209,6 +214,13 @@ int  guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot);
 int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                     u64 off, int shared, const char *path);
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
+/* mremap(2) primitives. guest_remap_move re-points the guest VA of an existing
+ * mapping without touching its backing (so MAP_SHARED, the file behind a file
+ * mapping and the protection all survive the move); guest_remap_grow extends
+ * the mapping ending at addr + old_len, or fails rather than substitute
+ * backing that maps something else. */
+int  guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst);
+int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len);
 /* Empty and publish this thread's D-TLB epoch, releasing its hold on the
  * retired-backing quarantine. Called at the run-loop safepoint. */
 void as_tlb_quiesce_self(void);

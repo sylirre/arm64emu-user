@@ -410,32 +410,44 @@ static uintptr_t pte_get(AddrSpace *as, u64 va) {
     return l2 ? l2->e[L2_IDX(va)] : 0;
 }
 
-/* Register host pages for [addr, addr+len). host may be NULL (PROT_NONE-like
- * placeholder is not supported; unmapped means PTE 0), which is how an unmap
- * clears its range -- and the point at which a table that has just lost its
- * last live PTE goes back to the allocator. */
-static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) {
-    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
-        u64 va = addr + off;
-        struct L2Table **slot = &as->l1[L1_IDX(va)];
-        if (!*slot) {
-            if (!host) continue;          /* clearing an already-absent table */
-            /* An emptied table is all zeroes by definition -- that is what
-             * used == 0 means -- so the spare is handed straight back out. */
-            if (as->l2spare) { *slot = as->l2spare; as->l2spare = NULL; }
-            else if (!(*slot = calloc(1, sizeof **slot))) {
-                perror("arm64chroot: calloc"); exit(127);
-            }
-        }
-        pte_put(*slot, L2_IDX(va), host ? ((uintptr_t)(host + off) | prot) : 0);
-        if (!(*slot)->used) {
-            if (as->l2spare) free(*slot); else as->l2spare = *slot;
-            *slot = NULL;
+/* One page's PTE. `host` may be NULL (PROT_NONE-like placeholder is not
+ * supported; unmapped means PTE 0), which is how an unmap clears its range --
+ * and the point at which a table that has just lost its last live PTE goes
+ * back to the allocator. Split out of pte_set_range so the mremap helpers,
+ * which rewrite a range page by page from differing sources, can invalidate
+ * once at the end instead of per page. */
+static void pte_put_one(AddrSpace *as, u64 va, u8 *host, u32 prot) {
+    struct L2Table **slot = &as->l1[L1_IDX(va)];
+    if (!*slot) {
+        if (!host) return;                /* clearing an already-absent table */
+        /* An emptied table is all zeroes by definition -- that is what
+         * used == 0 means -- so the spare is handed straight back out. */
+        if (as->l2spare) { *slot = as->l2spare; as->l2spare = NULL; }
+        else if (!(*slot = calloc(1, sizeof **slot))) {
+            perror("arm64chroot: calloc"); exit(127);
         }
     }
+    pte_put(*slot, L2_IDX(va), host ? ((uintptr_t)host | prot) : 0);
+    if (!(*slot)->used) {
+        if (as->l2spare) free(*slot); else as->l2spare = *slot;
+        *slot = NULL;
+    }
+}
+
+/* Publish a page-table mutation over [addr, addr+len): drop translations the
+ * JIT made of code there, and make every thread's cached translations stale. */
+static void pte_sync_range(AddrSpace *as, u64 addr, u64 len) {
+    (void)as;
     jit_invalidate_range(addr, len);   /* map-over/unmap of translated code */
     as_gen_bump();
     tlb_flush_all();
+}
+
+/* Register host pages for [addr, addr+len). */
+static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) {
+    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
+        pte_put_one(as, addr + off, host ? host + off : NULL, prot);
+    pte_sync_range(as, addr, len);
 }
 
 static void pte_prot_range(AddrSpace *as, u64 addr, u64 len, u32 prot) {
@@ -759,6 +771,187 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     } else {
         pte_set_range(as, addr, len, host, prot);
     }
+    return 0;
+}
+
+/* ---- mremap: moving and growing a mapping (sys_mm.c) ----
+ *
+ * A mapping here is a Region plus the host backing it names, so moving one is
+ * bookkeeping: copy the record to the new guest VA, re-point the page table,
+ * drop the old record. Copying the guest's bytes into fresh anonymous memory
+ * instead -- what this used to do -- is not a slower way of getting the same
+ * answer, it is a different mapping: a MAP_SHARED region stops reaching its
+ * file, a file mapping forgets the file (and the end-of-file holes whose
+ * accesses must raise SIGBUS), and the result carries whatever protection the
+ * copy was made with rather than the mapping's own.
+ */
+
+/* Point [start, start+len) at `newhost`, keeping each page's presence and
+ * permissions: a file mapping's holes past end-of-file must stay holes, and
+ * software protection lives in the PTE, not in the region record. */
+static void pte_repoint_range(AddrSpace *as, u64 start, u64 len, u8 *newhost) {
+    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
+        uintptr_t pte = pte_get(as, start + off);
+        if (!pte) continue;
+        pte_put_one(as, start + off, newhost + off, (u32)(pte & PTE_FLAGS));
+    }
+    pte_sync_range(as, start, len);
+}
+
+/* Give `r` `extra` more bytes of host backing directly after its slice,
+ * keeping whatever is behind it. Returns 0, or -ENOMEM when that cannot be
+ * done -- never a substitute that maps something else. */
+static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
+    HostMap *hm = r->hmap;
+    u64 rlen = r->end - r->start;
+
+    /* (1) The slice runs to the end of its own host allocation: extend the
+     *     allocation where it stands. Nothing moves, so a host pointer another
+     *     guest thread has already translated stays valid, and the pages that
+     *     appear continue the same object -- the file's next pages for a file
+     *     mapping, fresh zeroes for anonymous memory. */
+    if (r->host + rlen == hm->base + hm->len &&
+        mremap(hm->base, hm->len, hm->len + extra, 0) != MAP_FAILED) {
+        hm->len += extra;
+        return 0;
+    }
+
+    /* Everything below hands the region different backing, which moves the
+     * host pages under a guest VA that is not itself moving. That is only safe
+     * while no other guest thread can hold a translation into them: D-TLB
+     * entries and the JIT's generated fast paths are invalidated at a
+     * safepoint, not at the instant of the mutation. */
+    int alone = __atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) <= 1;
+    u8 *nb = NULL;
+    if (alone) {
+        /* (2) Move the slice itself and grow it in one step. mremap carries
+         *     the mapping's identity across, so a file stays that file at the
+         *     same offsets and a shared segment stays shared. */
+        void *p = mremap(r->host, rlen, rlen + extra, MREMAP_MAYMOVE);
+        if (p == (void *)r->host) { hm->len += extra; return 0; }   /* in place */
+        if (p != MAP_FAILED) {
+            /* The move left a hole in the middle of an allocation whose munmap
+             * is still described by hm->base/hm->len. Fill it, so the
+             * allocation stays whole and a stale translation into it lands on
+             * memory rather than faulting the emulator. */
+            mmap(r->host, rlen, PROT_READ | PROT_WRITE,
+                 MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            nb = p;
+        }
+    } else if (r->shared) {
+        /* (3) Another guest thread is in this address space. Duplicate the
+         *     mapping rather than move it -- mremap with an old length of zero
+         *     makes a second mapping of the same shared object -- so a stale
+         *     translation still reaches the very pages the new one does. */
+        void *p = mremap(r->host, 0, rlen + extra, MREMAP_MAYMOVE);
+        if (p != MAP_FAILED) nb = p;
+    } else if (!r->file) {
+        /* (4) Private anonymous memory: no one else can observe these pages,
+         *     so a fresh allocation holding the same bytes IS the same memory
+         *     as far as the guest is concerned. The old backing stays mapped
+         *     until the quarantine releases it, which keeps a racing thread's
+         *     stale pointer benign. */
+        u8 *p = host_alloc(rlen + extra, PROT_READ | PROT_WRITE);
+        if (p) { memcpy(p, r->host, rlen); nb = p; }
+    }
+    /* Left over: a private file mapping in a multi-threaded address space that
+     * could not be extended in place. Copying it into anonymous memory would
+     * drop the file behind it, so report the failure mremap(2) is allowed to
+     * report and let the guest fall back to mmap+copy itself. */
+    if (!nb) return -ENOMEM;
+
+    HostMap *nh = hmap_new(nb, rlen + extra);
+    pte_repoint_range(as, r->start, rlen, nb);
+    r->host = nb;
+    r->hmap = nh;
+    hmap_unref(as, hm);
+    return 0;
+}
+
+/* Move the guest mapping of [addr, addr+len) to `dst`, which must not overlap
+ * it and is replaced if occupied (MREMAP_FIXED). Nothing but the guest VA
+ * changes: same host backing, same file, same protection, same holes. */
+int guest_remap_move_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    if ((addr | len | dst) & GUEST_PAGE_MASK || !len) return -EINVAL;
+    if (!range_ok(addr, len) || !range_ok(dst, len)) return -EINVAL;
+    if (dst < addr + len && addr < dst + len) return -EINVAL;
+
+    region_punch(as, dst, dst + len);          /* whatever was there is gone */
+    pte_set_range(as, dst, len, NULL, 0);
+
+    /* Copy every source slice across. The region array is re-sorted (and may
+     * be realloc'd) by each insert, so the source is looked up again for every
+     * slice rather than iterated. A page belonging to no region is a hole the
+     * caller allowed (mremap itself refuses those up front) and is skipped. */
+    u64 pos = addr;
+    while (pos < addr + len) {
+        Region *src = NULL;
+        for (int i = 0; i < as->nregions; i++)
+            if (pos >= as->regions[i].start && pos < as->regions[i].end) {
+                src = &as->regions[i]; break;
+            }
+        if (!src) { pos += GUEST_PAGE_SIZE; continue; }
+        u64 hi = src->end < addr + len ? src->end : addr + len;
+        Region nr = *src;
+        nr.start = dst + (pos - addr);
+        nr.end = nr.start + (hi - pos);
+        nr.host = src->host + (pos - src->start);
+        nr.file_off = src->file_off + (pos - src->start);
+        nr.path = src->path ? strdup(src->path) : NULL;
+        nr.hmap->refs++;                  /* the copy shares the allocation */
+        region_insert(as, nr);
+        for (u64 off = 0; off < hi - pos; off += GUEST_PAGE_SIZE) {
+            uintptr_t pte = pte_get(as, pos + off);
+            if (pte)
+                pte_put_one(as, nr.start + off,
+                            (u8 *)(pte & ~(uintptr_t)PTE_FLAGS),
+                            (u32)(pte & PTE_FLAGS));
+        }
+        pos = hi;
+    }
+    pte_sync_range(as, dst, len);
+    region_punch(as, addr, addr + len);        /* release the old VA */
+    pte_set_range(as, addr, len, NULL, 0);
+    return 0;
+}
+
+/* Grow the mapping that ends at addr + old_len so that it covers new_len bytes
+ * from addr. The guest VA of what is already there does not change; the ground
+ * the growth needs must be free. Returns 0 or -errno. */
+int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
+    if ((addr | old_len | new_len) & GUEST_PAGE_MASK || new_len <= old_len)
+        return -EINVAL;
+    if (!range_ok(addr, new_len)) return -ENOMEM;
+    Region *r = (Region *)as_find_region(as, addr + old_len - 1);
+    /* Only the mapping's own tail can be extended: a kernel refuses to grow a
+     * vma that does not end where the old range does. */
+    if (!r || r->end != addr + old_len) return -ENOMEM;
+    for (u64 va = addr + old_len; va < addr + new_len; va += GUEST_PAGE_SIZE)
+        if (as_find_region(as, va)) return -ENOMEM;
+    /* A private file mapping served by the pread-into-anonymous fallback (a
+     * host page larger than the guest's, mapping a file offset it cannot
+     * align) has no host mapping of the file to extend: the pages a grow adds
+     * could only be fabricated zeroes where the file has content. */
+    if (r->file && !r->hostmap) return -ENOMEM;
+    /* Anonymous shared memory is backed by a memfd this emulator sized when
+     * the mapping was made, and nothing may hold that descriptor across guest
+     * execution (guest fd == host fd here), so its size can never be raised
+     * again. Extending the host mapping would put the new pages past
+     * end-of-file, where a touch is a bus error, while a kernel simply grows
+     * the shmem object -- so refuse, and let sys_mm.c rebuild the mapping on
+     * larger backing instead. */
+    if (r->anon_shm) return -ENOMEM;
+
+    u64 rlen = r->end - r->start, extra = new_len - old_len;
+    int rc = region_extend_backing(as, r, extra);
+    if (rc < 0) return rc;
+    r->end += extra;
+    /* A real host mapping of a file gets no page-table entries for the new
+     * pages: they may lie past end-of-file, and the fault path probes the
+     * backing and either fills the page in or raises the guest's bus error,
+     * exactly as it does for the tail of any file mapping. */
+    if (r->hostmap) pte_sync_range(as, r->start + rlen, extra);
+    else pte_set_range(as, r->start + rlen, extra, r->host + rlen, r->prot);
     return 0;
 }
 
@@ -1538,6 +1731,20 @@ int guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int fd, u64 off,
 int guest_unmap(AddrSpace *as, u64 addr, u64 len) {
     as_lock();
     int r = guest_unmap_impl(as, addr, len);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
+}
+int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    as_lock();
+    int r = guest_remap_move_impl(as, addr, len, dst);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
+}
+int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
+    as_lock();
+    int r = guest_remap_grow_impl(as, addr, old_len, new_len);
     as_drain_retired(as);
     as_unlock();
     return r;

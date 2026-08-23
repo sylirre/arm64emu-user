@@ -27,10 +27,13 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
   - On a 32-bit host an L2 entry is 4 bytes — this is *why* a 47-bit guest space
     works there: the leaf stores a host pointer, never a guest address.
 - **Region list**: a sorted array of `{guest range, prot, shared, host_base,
-  refcounted host allocation, path, file offset}`. It backs `munmap`/`mremap`
-  splitting, `mprotect` bookkeeping, `/proc/self/maps` synthesis, and
-  address-space teardown at `execve`/exit. The page table is the fast lookup;
-  the region list is the authoritative record.
+  refcounted host allocation, path, file offset}` (plus the flags that say what
+  the backing *is*: a real host mapping of a file whose end-of-file the guest can
+  run past, or a memfd this emulator made for `MAP_SHARED|MAP_ANONYMOUS`). It
+  backs `munmap`/`mremap` splitting, `mprotect` bookkeeping,
+  `/proc/self/maps` synthesis, and address-space teardown at `execve`/exit.
+  The page table is the fast lookup; the region list is the authoritative
+  record.
 
 ## The `mem_*` seam
 
@@ -59,9 +62,10 @@ next access. `tlb_flush_all` also forces a re-sync for the calling thread.
   change via `tlb_flush_all`.
 - `mem_host_ptr(c, va, size, acc)`: returns a **stable** host pointer when
   `[va, va+size)` lies within one page and the permission holds; `NULL`
-  otherwise. Host backing never moves (`mremap` re-registers), so the pointer is
-  safe to hold briefly. This is the substrate for `futex`, LSE/exclusive host
-  atomics, and the `DC ZVA` fast path.
+  otherwise. Host backing under a live guest VA never moves while another guest
+  thread exists — `mremap`'s grow tiers are written around that (below) — so
+  the pointer is safe to hold briefly. This is the substrate for `futex`,
+  LSE/exclusive host atomics, and the `DC ZVA` fast path.
 - `copy_from_guest` / `copy_to_guest` / `copy_str_from_guest`: page-wise loops,
   `-EFAULT` on a hole. The syscall layer's **only** route into guest memory.
 
@@ -265,21 +269,58 @@ is what keeps runtimes that reserve specific high addresses and munmap anything
 placed elsewhere — Go's heap-arena reservation is the motivating case — from
 thrashing at startup, and is why the guest VA space is 47 bits (`sys_mm.c`).
 
-`mremap` shrinks and grows in place where it can, and otherwise moves by
-allocating, copying and unmapping. `MREMAP_FIXED` is honored — the destination
-comes from the fifth argument, replaces whatever was mapped there, and is
-refused when it overlaps the source — because a caller that names an address
-goes on to *use* that address, so returning a different one silently corrupts
-it. Both lengths must be non-zero, as in Linux: a zero new length is not a
-request to unmap the region, and a zero old length only means anything for the
-shared-mapping duplication this does not implement. Every range-taking entry
-point bounds its request against `GUEST_TASK_SIZE` with a subtraction rather
-than an addition (`range_ok`), since the page-table walk indexes `l1[va >> 26]`
-for each page and a length chosen to wrap the sum would walk off the array.
+`mremap` **moves a mapping, it does not copy bytes.** A move is bookkeeping:
+the region record is copied to the new guest VA with its host backing, file
+identity, offset and protection intact, the page table is re-pointed page by
+page (so a file mapping's holes past end-of-file move as holes), and the old
+range is released. Copying into fresh anonymous memory — what this used to do —
+would produce a *different* mapping: a `MAP_SHARED` region that no longer
+reaches its file, a file mapping with no file behind it and no `SIGBUS` past
+end-of-file, and whatever protection the copy was made with.
 
-One thing the move path still does not preserve: a moved file or `MAP_SHARED`
-region is re-created as anonymous memory and byte-copied, so it loses its
-connection to the file.
+Growing is the same question asked of the host backing, and `guest_remap_grow`
+answers it in tiers, never by substituting backing that maps something else:
+
+1. the slice runs to the end of its own host allocation → extend the allocation
+   in place (`mremap`, no move). Nothing moves, so a host pointer another guest
+   thread already translated stays valid, and the pages that appear continue the
+   same object: the file's next pages, or fresh zeroes for anonymous memory;
+2. otherwise, if this is the only guest thread in the address space, move the
+   slice itself and grow it in one `MREMAP_MAYMOVE` — the mapping's identity
+   travels with it — and plug the hole the move leaves in the old allocation
+   with anonymous pages, so that allocation stays whole for its eventual
+   `munmap`;
+3. with other threads running, a `MAP_SHARED` region is *duplicated* instead
+   (`mremap` with an old length of zero makes a second mapping of the same
+   object), so a thread still holding a stale translation reaches the very pages
+   the new mapping does;
+4. private anonymous memory, which no one else can observe, gets a fresh
+   allocation with the old bytes copied in;
+5. anything left — a private file mapping in a multi-threaded address space
+   that could not be extended in place — is refused with `ENOMEM`, which
+   `mremap(2)` is allowed to return, rather than fabricated.
+
+`MAP_SHARED|MAP_ANONYMOUS` is the one case rebuilt rather than extended
+(`sys_mm.c`): its backing is a memfd sized when the mapping was made, and
+nothing may hold that descriptor across guest execution (guest fd == host fd),
+so it cannot be enlarged — extending the host mapping past the memfd's
+end-of-file would turn the added pages into bus errors, where a kernel grows the
+shmem object. The mapping is rebuilt on a fresh, larger memfd and the old
+contents copied in; what a kernel keeps and this cannot is a sharer from
+*before* the grow — a child forked earlier goes on seeing the old pages.
+
+`MREMAP_FIXED` is honored — the destination comes from the fifth argument,
+replaces whatever was mapped there (all of it, not just the part the move
+covers), and is refused when it overlaps the source — because a caller that
+names an address goes on to *use* that address, so returning a different one
+silently corrupts it. A shrinking move releases the whole source range, as the
+kernel's does. Both lengths must be non-zero, as in Linux: a zero new length is
+not a request to unmap the region, and a zero old length only means anything for
+the shared-mapping duplication this does not offer the guest. Every range-taking
+entry point bounds its request against `GUEST_TASK_SIZE` with a subtraction
+rather than an addition (`range_ok`), since the page-table walk indexes
+`l1[va >> 26]` for each page and a length chosen to wrap the sum would walk off
+the array.
 
 ## Host memory-ordering discipline
 
