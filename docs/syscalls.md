@@ -340,6 +340,21 @@ A socket bound through the fallback reports that `/proc/self/fd` path from
 `getsockname` rather than its guest path (cosmetic; real software reads back the
 bound pathname only rarely).
 
+**Writing back into the guest is part of the call.** A socket call's results
+land in guest memory through `copy_to_guest`, which can fail — and a failure
+there is the kernel's `EFAULT`, not something to drop on the floor.
+`recvmsg`/`recvmmsg` scatter data, source address, control and the updated
+header, and reporting success after any of those was refused would tell the
+guest bytes had been delivered to memory that never received them; the message
+is already off the socket by then, which is exactly what a kernel does with it
+too. `recvmmsg` reports the messages it did hand over and leaves the error for
+the next call. `socketpair` has the mirror-image problem: when the guest's
+result pointer is bad it never learns the two numbers, so nothing it does can
+ever close them — and every descriptor here is one of the guest's own (guest
+fd == host fd), so a caller looping on a bad pointer emptied the process's fd
+table two at a time. Both are closed on that path, as `pipe2` already did
+(`tests/fixtures/netfault.c`).
+
 **Interface-query ioctls.** The read-only `SIOCGIF*` family that `ifconfig` /
 net-tools issue on an `AF_INET` socket — `SIOCGIFCONF` (enumerate) plus the
 per-interface `SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,DSTADDR,MTU,METRIC,

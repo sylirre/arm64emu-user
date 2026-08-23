@@ -1179,6 +1179,27 @@ else
     skip_build "fixtures/ownfdexec"
 fi
 
+# ---- guest pointers a socket call cannot write to. Self-checking: qemu-user
+# leaks the descriptors of a refused socketpair exactly as this used to, so it
+# cannot be the oracle for that row; the block below is what a real kernel
+# prints for this program, natively. ----
+if [ ! -x tests/fixtures/netfault.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/netfault.bin \
+        tests/fixtures/netfault.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/netfault.bin ]; then
+    expect=$'socketpair err=14 leaked=0 still=1\nrecvmsg n=-1 err=14\nrecvmsg-hdr n=-1 err=14'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/netfault.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: netfault"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: netfault"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/netfault.bin
+else
+    skip_build "fixtures/netfault"
+fi
+
 # ---- a read/write count is a guest 64-bit value the emulator has to turn into
 # a host size_t and a bounce buffer. Self-checking: qemu-user validates the
 # whole [buf, buf+count) range before the call and answers EFAULT for every row

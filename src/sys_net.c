@@ -65,7 +65,17 @@ SYSDEF(socketpair) {
     int sv[2];
     if (socketpair((int)a0, (int)a1, (int)a2, sv) < 0) return host_err();
     s32 g[2] = { sv[0], sv[1] };
-    return copy_to_guest(c, a3, g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+    if (copy_to_guest(c, a3, g, sizeof g) < 0) {
+        /* The guest never learns the two numbers, so nothing it does can ever
+         * close them: a caller looping on a bad pointer would run this process
+         * out of descriptors two at a time, and every fd here is the guest's
+         * own (guest fd == host fd). The kernel closes them on this path too;
+         * pipe2 above already did. */
+        close(sv[0]);
+        close(sv[1]);
+        return (u64)(s64)-EFAULT;
+    }
+    return 0;
 }
 
 /* Import a guest sockaddr (raw bytes; layout is arch-independent). */
@@ -693,18 +703,27 @@ SYSDEF(sendmsg) {
 }
 
 /* Scatter a received message back into the guest: iov data, source address,
- * control, and the updated header at `hdr_va`. `n` is the recvmsg result. */
-static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
-                              struct iovec *iov, u8 *bounce,
-                              struct sockaddr_storage *ss, u8 *ctrl, ssize_t n) {
+ * control, and the updated header at `hdr_va`. `n` is the recvmsg result.
+ *
+ * Returns 0, or -EFAULT if any of that could not be written. The message is
+ * already off the socket by then and cannot be put back -- which is exactly
+ * what a kernel does with a datagram whose destination buffer faults: the data
+ * is gone and the call reports EFAULT. Reporting success instead would tell
+ * the guest bytes were delivered to memory that never received them. */
+static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
+                             struct iovec *iov, u8 *bounce,
+                             struct sockaddr_storage *ss, u8 *ctrl, ssize_t n) {
     int cnt = (int)h->msg_iovlen;
     GIovec gi[1024];
-    copy_from_guest(c, gi, g->msg_iov, sizeof(GIovec) * (unsigned)cnt);
+    if (cnt && copy_from_guest(c, gi, g->msg_iov,
+                               sizeof(GIovec) * (unsigned)cnt) < 0)
+        return -EFAULT;
     ssize_t left = n;
     size_t off = 0;
     for (int i = 0; i < cnt && left > 0; i++) {
         size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
-        if (chunk) copy_to_guest(c, gi[i].iov_base, bounce + off, chunk);
+        if (chunk && copy_to_guest(c, gi[i].iov_base, bounce + off, chunk) < 0)
+            return -EFAULT;
         off += iov[i].iov_len;
         left -= (ssize_t)chunk;
     }
@@ -716,7 +735,7 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
          * length below -- POSIX: "fromlen shall refer to the value before
          * truncation", which is what the kernel's move_addr_to_user does. */
         u32 out = (u32)sl < g->msg_namelen ? (u32)sl : g->msg_namelen;
-        if (out) copy_to_guest(c, g->msg_name, ss, out);
+        if (out && copy_to_guest(c, g->msg_name, ss, out) < 0) return -EFAULT;
     }
     if (g->msg_control && h->msg_controllen) {
         u8 gctrl[MSG_CTRL_MAX];
@@ -724,7 +743,7 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
                                                        : (size_t)g->msg_controllen;
         int ctrunc = 0;
         size_t gl = cmsg_h2g(ctrl, h->msg_controllen, gctrl, gcap, &ctrunc);
-        if (gl) copy_to_guest(c, g->msg_control, gctrl, gl);
+        if (gl && copy_to_guest(c, g->msg_control, gctrl, gl) < 0) return -EFAULT;
         if (ctrunc) h->msg_flags |= MSG_CTRUNC;
         g->msg_controllen = gl;
     } else {
@@ -732,7 +751,7 @@ static void recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
     }
     g->msg_namelen = h->msg_namelen;
     g->msg_flags = h->msg_flags;
-    copy_to_guest(c, hdr_va, g, sizeof *g);
+    return copy_to_guest(c, hdr_va, g, sizeof *g) < 0 ? -EFAULT : 0;
 }
 
 SYSDEF(recvmsg) {
@@ -759,9 +778,9 @@ SYSDEF(recvmsg) {
         nlr_fix_reply(c->m, (int)a0, bounce,
                       (size_t)n < total ? (size_t)n : total, (int)a2 & MSG_PEEK);
     }
-    recvmsg_writeback(c, a1, &g, &h, iov, bounce, &ss, ctrl, n);
+    int wb = recvmsg_writeback(c, a1, &g, &h, iov, bounce, &ss, ctrl, n);
     free(iov); free(bounce);
-    return (u64)n;
+    return wb < 0 ? (u64)(s64)wb : (u64)n;
 }
 
 /* struct mmsghdr = { struct msghdr msg_hdr; unsigned msg_len; } — on arm64 LP64
@@ -828,7 +847,10 @@ SYSDEF(recvmmsg) {
                 return nlret;
             }
             u32 nlen = (u32)nlret;
-            copy_to_guest(c, entry + GMMSG_LEN_OFF, &nlen, 4);
+            if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &nlen, 4) < 0) {
+                if (got) break;
+                return (u64)(s64)-EFAULT;
+            }
             got++;
             continue;
         }
@@ -849,10 +871,18 @@ SYSDEF(recvmmsg) {
             nlr_fix_reply(c->m, (int)a0, bounce,
                           (size_t)n < total ? (size_t)n : total, mf & MSG_PEEK);
         }
-        recvmsg_writeback(c, entry, &g, &h, iov, bounce, &ss, ctrl, n);
+        int wb = recvmsg_writeback(c, entry, &g, &h, iov, bounce, &ss, ctrl, n);
         u32 mlen = (u32)n;
-        copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4);
+        if (wb == 0 && copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
+            wb = -EFAULT;
         free(iov); free(bounce);
+        /* A message that could not be handed over is still a message that was
+         * received: report the ones before it, as the kernel does, and let the
+         * next call answer with the error. */
+        if (wb < 0) {
+            if (got) break;
+            return (u64)(s64)wb;
+        }
         got++;
     }
     return (u64)got;
