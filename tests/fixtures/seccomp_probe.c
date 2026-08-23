@@ -196,6 +196,32 @@ int main(void) {
     printf("killed=%d sig=%d\n", WIFSIGNALED(st),
            WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS);
 
+    /* The ALU op with a sign to get wrong: NEG of 0x80000000, whose negation
+     * has no positive counterpart. Classic BPF is unsigned 32-bit throughout,
+     * so the answer is the wraparound -- 0x80000000 again -- and a filter can
+     * see the difference. In a child of its own, so the filter stack the rows
+     * above built is not disturbed. */
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        struct sock_filter neg_ppid[] = {
+            PROLOGUE,
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getppid, 0, 4),
+            BPF_STMT(BPF_LD | BPF_IMM, 0x80000000),
+            BPF_STMT(BPF_ALU | BPF_NEG, 0),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x80000000, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EDOM),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        if (install(neg_ppid, sizeof neg_ppid / sizeof neg_ppid[0]) != 0) _exit(9);
+        errno = 0;
+        long v = syscall(__NR_getppid);
+        _exit(v < 0 && errno == EDOM ? 0 : 1);
+    }
+    st = 0;
+    waitpid(kid, &st, 0);
+    printf("alu_neg=%d\n", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
     /* A mode cannot be switched once one is set. */
     r = seccomp_(SECCOMP_SET_MODE_STRICT, 0, NULL);
     printf("noswitch=%d\n", r < 0 && errno == EINVAL);

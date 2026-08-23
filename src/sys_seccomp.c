@@ -173,7 +173,13 @@ static u32 bpf_run(const GSockFilter *f, u32 len, const GSeccompData *d) {
             case BPF_XOR: A ^= v; break;
             case BPF_LSH: if (v >= 32) return 0; A <<= v; break;
             case BPF_RSH: if (v >= 32) return 0; A >>= v; break;
-            case BPF_NEG: A = (u32)(-(s32)A); break;
+            /* Classic BPF is unsigned 32-bit throughout, and the kernel's
+             * NEG is the wraparound (its eBPF form is DST = (u32) -DST): the
+             * negation of 0x80000000 is 0x80000000. Negating it as a signed
+             * int is overflow -- undefined behaviour, which UBSan flags and a
+             * compiler is free to act on -- for an answer the arithmetic has
+             * to give anyway. */
+            case BPF_NEG: A = 0u - A; break;
             }
             break;
         }
