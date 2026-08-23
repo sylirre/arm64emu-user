@@ -460,11 +460,27 @@ SYSDEF(msync) {
     return 0;
 }
 
+/* mincore(2). The kernel's validation, in the kernel's order (mm/mincore.c):
+ * an unaligned start is EINVAL; a range that is not user space -- including
+ * one whose length wraps -- is ENOMEM; and a page with no mapping under it
+ * ends the walk with ENOMEM, after the pages before it have been reported,
+ * because do_mincore looks the vma up per chunk and gives up when there is
+ * none. Reporting a hole as "not resident" instead told a guest probing for
+ * unmapped ranges -- the usual reason to call this -- that the memory was
+ * there but paged out.
+ *
+ * A page that IS mapped always reports resident. The emulator owns the backing
+ * of every guest mapping, so there is no guest-side paging to report; what the
+ * host has done with its own memory underneath is not the guest's business. */
 static u64 mincore_locked(CPU *c, u64 a0, u64 a1, u64 a2) {
+    if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+    if (a0 > GUEST_TASK_SIZE || a1 > GUEST_TASK_SIZE - a0)
+        return (u64)(s64)-ENOMEM;
     u64 len = PG_UP(a1);
     u64 pages = len >> 12;
     for (u64 i = 0; i < pages; i++) {
-        u8 one = as_find_region(&c->m->as, a0 + (i << 12)) ? 1 : 0;
+        if (!as_find_region(&c->m->as, a0 + (i << 12))) return (u64)(s64)-ENOMEM;
+        u8 one = 1;
         if (copy_to_guest(c, a2 + i, &one, 1) < 0) return (u64)(s64)-EFAULT;
     }
     return 0;
