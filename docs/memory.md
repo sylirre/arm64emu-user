@@ -59,7 +59,10 @@ next access. `tlb_flush_all` also forces a re-sync for the calling thread.
   with `SCTLR.A` clear, no extra work).
 - `mem_ifetch` (inline): a per-thread single-page host-pointer cache (`g_fcache`,
   `__thread`) so sequential fetches skip the walk. Invalidated by any mapping
-  change via `tlb_flush_all`.
+  change via `tlb_flush_all`. A misaligned PC misses it by construction — the
+  compared key keeps the VA's low two bits, so only the slow path answers such
+  a fetch, and it raises the PC-alignment exception (`SIGBUS`/`BUS_ADRALN`)
+  instead of reading four bytes that straddle the address.
 - `mem_host_ptr(c, va, size, acc)`: returns a **stable** host pointer when
   `[va, va+size)` lies within one page and the permission holds; `NULL`
   otherwise. Host backing under a live guest VA never moves while another guest

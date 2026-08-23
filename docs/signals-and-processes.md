@@ -46,7 +46,13 @@ on the guest stack (or the guest `sigaltstack`):
 The CPU is redirected: `x0`=signo, `x1`=&siginfo, `x2`=&ucontext, `pc`=handler,
 and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page
 **sigreturn trampoline** (`mov x8,#139; svc #0`) mapped by `elf.c` at load time.
-`rt_sigreturn` restores the full CPU + fpsimd + sigmask from the frame.
+`rt_sigreturn` restores the full CPU + fpsimd + sigmask from the frame. Every
+read of it is checked and the FP part is staged before it is committed: the
+frame is the guest's own memory, so nothing promises it is still readable when
+sigreturn arrives, and a thread resumed with general-purpose registers from the
+frame and FP registers from somewhere else is the worst possible answer. A
+frame that cannot be read is a bad frame, and the guest dies of `SIGSEGV` --
+what `parse_user_sigframe` does with a failed `__get_user`.
 
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`).
