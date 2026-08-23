@@ -1203,14 +1203,23 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * "Disregard actual filesystem ownership": the file's guest-visible owner
      * is the remapped owner, so a rootfs binary owned by the host user confers
      * the fake identity. euid/fsuid (and saved id) take the file owner; the
-     * real uid is unchanged. AT_SECURE then follows from euid != ruid. */
+     * real uid is unchanged. AT_SECURE then follows from euid != ruid.
+     *
+     * Computed here, next to the resolution that decided which file this is,
+     * but only *applied* past the point of no return below: a kernel raises
+     * privilege as part of committing to the new image, and the one refusal
+     * still ahead of us (de_thread) must leave the caller exactly as it was --
+     * an execve that returns an error and a raised euid would be a real
+     * privilege leak, since the old image goes on running with it. */
+    int raise_uid = 0, raise_gid = 0;
+    u32 new_euid = 0, new_egid = 0;
     if (m->fake_id) {
         struct stat est;
         if (stat(host, &est) == 0) {
             if (est.st_mode & S_ISUID)
-                m->cred.euid = m->cred.suid = m->cred.fsuid = remap_uid(m, est.st_uid);
+                { raise_uid = 1; new_euid = remap_uid(m, est.st_uid); }
             if (est.st_mode & S_ISGID)
-                m->cred.egid = m->cred.sgid = m->cred.fsgid = remap_gid(m, est.st_gid);
+                { raise_gid = 1; new_egid = remap_gid(m, est.st_gid); }
         }
     }
 
@@ -1224,6 +1233,8 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     if (dt < 0) { free_strvec(argv); free_strvec(envp_copy); return (u64)(s64)dt; }
 
     /* Point of no return: tear down and reload. */
+    if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
+    if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
     shm_detach_all(m);       /* System V shm attaches do not survive execve */
     ipc_exec_clear(m);       /* forget parked-IPC sockets (the CLOEXEC walk
                               * below closes the fds); SEM_UNDO lists and
