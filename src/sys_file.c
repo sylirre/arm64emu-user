@@ -2329,6 +2329,13 @@ SYSDEF(sendfile) {
 
 SYSDEF(fallocate) {
     if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    /* The kernel's own argument check (vfs_fallocate), which runs before any
+     * question about the file: a negative offset or a non-positive length is
+     * EINVAL. Made here rather than left to the host so every backing tier
+     * answers the same -- the memfd fallback tier decides a sealed file's
+     * fallocate itself and would otherwise report the seal (EPERM) for an
+     * argument pair the kernel never gets far enough to consider. */
+    if ((s64)a2 < 0 || (s64)a3 <= 0) return (u64)(s64)-EINVAL;
     if (mfd_fallocate_denied(c, (int)a0, (int)a1, a2, a3)) return (u64)(s64)-EPERM;
     if (fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0)
         return host_err();

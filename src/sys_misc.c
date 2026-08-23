@@ -405,11 +405,25 @@ int mfd_fallocate_denied(CPU *c, int fd, int mode, u64 off, u64 len) {
     if (fd < MFDC_N && mfdc_cls[fd] == 0) return 0;
     s32 seals = mfd_resolve(c, fd, NULL, NULL, NULL);
     if (seals < 0) return 0;
-    if ((mode & 0x2 /* FALLOC_FL_PUNCH_HOLE */) &&
-        (seals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE))) return 1;
-    if ((seals & G_F_SEAL_GROW) && !(mode & 0x1 /* KEEP_SIZE */)) {
+    /* In the kernel's order (shmem_fallocate): a hole punch is decided by the
+     * write seals and returns before the grow seal is ever consulted. */
+    if (mode & 0x2 /* FALLOC_FL_PUNCH_HOLE */)
+        return (seals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE)) ? 1 : 0;
+    if (seals & G_F_SEAL_GROW) {
         struct stat st;
-        if (fstat(fd, &st) == 0 && off + len > (u64)st.st_size) return 1;
+        /* FALLOC_FL_KEEP_SIZE is not an exemption: the kernel compares
+         * offset + len against i_size whatever the mode says, because the file
+         * gains the blocks either way, and that is what the seal is about.
+         *
+         * "Past the end" as a subtraction: both operands are the guest's, and
+         * a sum that wraps reads as "does not grow the file", which is how a
+         * seal check gets arithmetic'd around. (fallocate's own argument
+         * validation refuses such a pair first -- a wrapping sum needs an
+         * operand with its sign bit set -- but that is the caller's reasoning,
+         * not this check's, and it is not what makes the seal hold.) */
+        if (fstat(fd, &st) == 0 &&
+            (off > (u64)st.st_size || len > (u64)st.st_size - off))
+            return 1;
     }
     return 0;
 }

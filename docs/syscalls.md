@@ -611,7 +611,11 @@ then make the consequences the caller depends on true:
   The exact signal state and credentials exist only in the process's own
   `Machine`, so for **another** guest process only what the shared tables can
   answer is rewritten (`TracerPid` from the ptrace link registry, `Seccomp` from
-  the PID registry) and the host's approximation of the rest stands — the same
+  the PID registry — which is why *every* transition into a seccomp mode
+  publishes it there, `seccomp(2)`'s strict mode included: a process in strict
+  mode may only read, write and exit, so it cannot look at itself, and the
+  registry is the only place its `Seccomp` line can come from) and the host's
+  approximation of the rest stands — the same
   split every other cross-process `/proc` file makes. What these lines say
   changes as a process runs, so `status` is refreshed on `lseek(0)`+reread like
   the time-varying files above. `/proc/self/fd/N` open/stat stays
@@ -805,7 +809,18 @@ which is what turns a later `mprotect(PROT_WRITE)` into `EACCES`, exactly
 the kernel's stripped-`VM_MAYWRITE` behaviour (`F_SEAL_FUTURE_WRITE`
 grandfathers mappings that existed before the seal). `/proc` keeps the
 kernel's spelling: fd links and `maps` show `/memfd:name (deleted)` instead
-of leaking the backing path. `A64_MEMFD_FORCE_FILE=1` forces the tier on
+of leaking the backing path. `fallocate` follows `shmem_fallocate`'s own order and reading of the seals: a
+hole punch is decided by the write seals and returns before `F_SEAL_GROW` is
+consulted at all, and `F_SEAL_GROW` then compares `offset + len` against the
+size **whatever the mode says** — `FALLOC_FL_KEEP_SIZE` is not an exemption,
+because the file gains the blocks either way, which is what the seal is about.
+That comparison is written as a subtraction: both operands are the guest's, and
+a sum that wraps would read as "does not grow the file". The argument
+validation that a kernel performs first (`offset < 0 || len <= 0` → `EINVAL`) is
+made in the emulator rather than left to the host, so the tier cannot answer a
+seal (`EPERM`) for a pair the kernel never gets far enough to consider.
+
+`A64_MEMFD_FORCE_FILE=1` forces the tier on
 any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
 (`(memfd-tier)` rows). `MFD_HUGETLB` is refused (`EINVAL`) on the tier —

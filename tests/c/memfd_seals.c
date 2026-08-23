@@ -76,6 +76,17 @@ int main(int argc, char **argv) {
     errno = 0; pe("grow", ftruncate(fd, 4096));
     errno = 0; pe("same", ftruncate(fd, 5));
 
+    /* the same seal at fallocate. FALLOC_FL_KEEP_SIZE is no exemption -- the
+     * file gains the blocks either way, which is what the seal is about -- and
+     * an offset/length pair that wraps is refused as arguments, before the
+     * file is looked at at all. Raw syscalls: what is under test is the guest
+     * kernel ABI, and glibc's wrapper reorders nothing but does hide the
+     * offsets on an ILP32 build of the emulator. */
+    errno = 0; pe("falloc_grow", (int)syscall(SYS_fallocate, fd, 0, (off_t)0, (off_t)8192));
+    errno = 0; pe("falloc_keep", (int)syscall(SYS_fallocate, fd, 1, (off_t)0, (off_t)8192));
+    errno = 0; pe("falloc_in", (int)syscall(SYS_fallocate, fd, 1, (off_t)0, (off_t)4));
+    errno = 0; pe("falloc_wrap", (int)syscall(SYS_fallocate, fd, 0, (off_t)-1024, (off_t)2048));
+
     errno = 0; pe("seal_wr", fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE));
     printf("seals2=%d\n", fcntl(fd, F_GET_SEALS));
     errno = 0; printf("write_sealed=%s\n",
