@@ -7,11 +7,22 @@
  * fd instead, so its output here is the same on every host while a native
  * oracle's is not.
  *
- * Three legs: a sealed script memfd (execve + the interpreter's re-open; the
+ * Four legs: a sealed script memfd (execve + the interpreter's re-open; the
  * shebang names /proc/self/exe, so this binary is its own interpreter and no
- * rootfs shell is needed), an unsealed ELF memfd (execve), and the same ELF
- * memfd through execveat(fd, "", AT_EMPTY_PATH) -- musl's fexecve. */
+ * rootfs shell is needed), an unsealed ELF memfd (execve), the same ELF memfd
+ * through execveat(fd, "", AT_EMPTY_PATH) -- musl's fexecve -- and a memfd
+ * with no execute bit, which has to be refused just the same.
+ *
+ * The last one is the check that decides whether the guest may execute the
+ * image, and it is the step most easily got wrong once the path form is
+ * refused: the emulator falls back to the descriptor for the stat, so it must
+ * judge the mode it got that way instead of asking the same path again -- and
+ * it must not answer "allowed" to everything for having lost the path. The
+ * harness runs the whole fixture again with A64_OWNFD_FORCE_DENY, which makes
+ * an ordinary host refuse those path forms the way Android's policy does, and
+ * requires the two runs to be identical. */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,6 +57,15 @@ static int run_child(const char *path, char *const argv[], int viaexecveat, int 
             execv(path, argv);
         _exit(126);
     }
+    int st;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 125;
+}
+
+/* Same, but reporting the errno the exec was refused with. */
+static int run_child_err(const char *path, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid == 0) { execv(path, argv); _exit(errno); }
     int st;
     waitpid(pid, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 125;
@@ -102,6 +122,14 @@ int main(int argc, char **argv) {
            run_child(epath, (char *[]){epath, "elfmode", NULL}, 0, -1));
     printf("execveat=%d\n",
            run_child(NULL, (char *[]){epath, "elfmode", NULL}, 1, efd));
+
+    /* Leg 4: a memfd with the execute bits taken off. The permission check
+     * runs before the image is ever read, so an empty one is enough. */
+    int nfd = mfd_create("noexec", 0);
+    if (nfd < 0 || fchmod(nfd, 0600) != 0) { printf("no noexec memfd\n"); return 1; }
+    char npath[32];
+    snprintf(npath, sizeof npath, "/proc/self/fd/%d", nfd);
+    printf("noexec=%d\n", run_child_err(npath, (char *[]){npath, NULL}));
     printf("done\n");
     return 0;
 }

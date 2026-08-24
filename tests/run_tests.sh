@@ -1216,14 +1216,35 @@ if [ ! -x tests/fixtures/ownfdexec.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o tests/fixtures/ownfdexec.bin \
         tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null || true
 fi
+#
+# Run four times, and every run must print the same thing. A64_OWNFD_FORCE_DENY
+# makes this host refuse the path spelling of one of our own fds the way that
+# policy does -- harsher, in fact, since it refuses stat and access as well as
+# open, so a host that denies only the open is covered a fortiori -- and that is
+# the only way to reach those fallbacks off a device. --fake-id because the
+# permission check takes a different branch for a faked identity, and the
+# fallback has to be right in both.
 if [ -x tests/fixtures/ownfdexec.bin ]; then
-    expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\ndone'
-    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/ownfdexec.bin 2>/dev/null)
-    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: ownfdexec"
-    else
-        fail=$((fail+1)); echo "FAIL fixture: ownfdexec"
-        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
-    fi
+    expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\nnoexec=13\ndone'
+    for ofx_id in "" "--fake-id"; do
+        for ofx_deny in 0 1; do
+            ofx_tag="ownfdexec${ofx_id:+ $ofx_id}"
+            if [ "$ofx_deny" = 1 ]; then
+                ofx_tag="$ofx_tag (path-denied tier)"
+                got=$(A64_OWNFD_FORCE_DENY=1 timeout -k 5 60 "$EMU" $ofx_id / \
+                          tests/fixtures/ownfdexec.bin 2>/dev/null)
+            else
+                got=$(timeout -k 5 60 "$EMU" $ofx_id / \
+                          tests/fixtures/ownfdexec.bin 2>/dev/null)
+            fi
+            if [ "$got" = "$expect" ]; then
+                pass=$((pass+1)); echo "PASS fixture: $ofx_tag"
+            else
+                fail=$((fail+1)); echo "FAIL fixture: $ofx_tag"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+    done
     fx_rm tests/fixtures/ownfdexec.bin
 else
     skip_build "fixtures/ownfdexec"
@@ -1374,6 +1395,7 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
 check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nhole_normal=-12\nunmapped=-12\ndiscarded=00\nwhole_space=-12\ndone'
+
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
 # Self-checking rather than qemu-diffed: the emulator answers *differently*

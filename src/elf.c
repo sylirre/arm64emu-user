@@ -185,7 +185,9 @@ static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
     char host_path[PATH_MAX];
     int r = path_resolve(m, G_AT_FDCWD, guest_path, 0, host_path, canon);
     if (r < 0) return r;
-    int fd = open(host_path, O_RDONLY | O_CLOEXEC);
+    int fd;
+    if (proc_own_fd_denied(host_path)) { fd = -1; errno = EACCES; }
+    else fd = open(host_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
          * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --

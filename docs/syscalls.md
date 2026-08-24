@@ -634,7 +634,12 @@ then make the consequences the caller depends on true:
   through `pread`/a `dup` (the offset the guest owns never moves), and an
   `O_RDONLY` `open` of a memfd-backed path returns a sealed-memfd snapshot of
   its contents (writes keep failing, as they would on the sealed original;
-  `proc_own_fd_path` in `src/path.c`, fallback in `sys_file.c` openat).
+  `proc_own_fd_path` in `src/path.c`, fallback in `sys_file.c` openat). The
+  execute-permission check (`exec_perm_check`, `sys_proc.c`) makes the same
+  turn: with the path refused it applies the kernel's rule to the mode the
+  descriptor reported rather than re-asking the path through `access(2)`, which
+  would only reproduce the refusal. `A64_OWNFD_FORCE_DENY` simulates the tier
+  on a host that allows the path form.
 
   Those files and `comm` cover **this** process; the cross-process view that
   `ps`/`top` build of *other* processes needs more, because every guest process

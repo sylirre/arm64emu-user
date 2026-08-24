@@ -1129,6 +1129,43 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
     return -ENOSYS;
 }
 
+/* The kernel's execute-permission rule, applied to one stat'ed mode against
+ * one identity: uid 0 needs an execute bit somewhere, anyone else needs the
+ * bit for the class it falls into. Both callers below need it -- the fake
+ * identity judges the remapped ownership the guest sees, the real one judges
+ * the host's -- and neither can reach for access(2). */
+static int mode_exec_ok(u32 euid, u32 egid, const u32 *groups, int ngroups,
+                        u32 fowner, u32 fgroup, mode_t mode) {
+    if (euid == 0)
+        return (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 0 : -EACCES;
+    mode_t bit = S_IXOTH;
+    if (euid == fowner) {
+        bit = S_IXUSR;
+    } else if (egid == fgroup) {
+        bit = S_IXGRP;
+    } else {
+        for (int i = 0; i < ngroups; i++)
+            if (groups[i] == fgroup) { bit = S_IXGRP; break; }
+    }
+    return (mode & bit) ? 0 : -EACCES;
+}
+
+/* This process's own supplementary groups, for the rule above. Cold (an exec),
+ * and asked for the real count first so a process in more groups than a fixed
+ * buffer holds is judged on all of them rather than on none. */
+static int self_groups(u32 *out, int max) {
+    int n = getgroups(0, NULL);
+    if (n <= 0) return 0;
+    gid_t *g = malloc(sizeof *g * (size_t)n);
+    if (!g) return 0;
+    n = getgroups(n, g);
+    if (n < 0) n = 0;
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = (u32)g[i];
+    free(g);
+    return n;
+}
+
 /* Is the guest allowed to execute this file? Nothing else asks, because the
  * emulator only ever READS an image: without this a file that is merely
  * readable runs, where a kernel answers EACCES, and so do a directory and a
@@ -1139,8 +1176,7 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
  * process, and the host's own access(2) answers it exactly -- supplementary
  * groups and all. With one, the guest's credentials are the fake ones and the
  * file's ownership is the remapped ownership it sees everywhere else, so the
- * kernel's rule is applied against those: a fake root needs an execute bit
- * somewhere, anyone else needs the bit for the class they fall into.
+ * kernel's rule is applied against those.
  *
  * Being allowed to execute is not the same as being readable, and the emulator
  * needs the second too -- but that is not this function's business: the header
@@ -1148,7 +1184,8 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
  * no return. */
 static int exec_perm_check(struct Machine *m, const char *host) {
     struct stat st;
-    if (stat(host, &st) != 0) {
+    int by_fd = 0;
+    if (proc_own_fd_denied(host) ? (errno = EACCES, 1) : stat(host, &st) != 0) {
         /* One of our own fds on a host that refuses to re-open it (Android
          * denies it for memfds): ask the descriptor itself. Anything else
          * keeps the errno the host gave -- a path that names nothing (a
@@ -1157,22 +1194,32 @@ static int exec_perm_check(struct Machine *m, const char *host) {
         int ofd = proc_own_fd_path(host);
         if (ofd < 0) return -e;
         if (fstat(ofd, &st) != 0) return -errno;
+        by_fd = 1;
     }
     if (!S_ISREG(st.st_mode)) return -EACCES;
-    if (!m->fake_id) return access(host, X_OK) == 0 ? 0 : -EACCES;
-    if (m->cred.euid == 0)
-        return (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 0 : -EACCES;
-    mode_t bit = S_IXOTH;
-    u32 fowner = remap_uid(m, (u32)st.st_uid), fgroup = remap_gid(m, (u32)st.st_gid);
-    if (m->cred.euid == fowner) {
-        bit = S_IXUSR;
-    } else if (m->cred.egid == fgroup) {
-        bit = S_IXGRP;
-    } else {
-        for (int i = 0; i < m->cred.ngroups; i++)
-            if (m->cred.groups[i] == fgroup) { bit = S_IXGRP; break; }
+    if (!m->fake_id) {
+        /* The path answered the stat, so it will answer this too, and access(2)
+         * is the exact answer -- supplementary groups, ACLs, capabilities.
+         * (The denial knob is asked here as well even though !by_fd means the
+         * path just worked: it keeps the simulated tier honest, so a change
+         * that put access(2) back on the fallback path would be caught.) */
+        if (!by_fd)
+            return (proc_own_fd_denied(host) ? (errno = EACCES, -1)
+                                             : access(host, X_OK)) == 0
+                       ? 0 : -EACCES;
+        /* It did not: the file was reached through the descriptor, and asking
+         * the same path again would reproduce the same refusal and hand it to
+         * the guest as its own EACCES -- so the fd fallback above would have
+         * bought nothing. Judge the mode the descriptor did give, against this
+         * process's real identity, which is the guest's identity here. */
+        u32 gs[64];
+        int ng = self_groups(gs, (int)(sizeof gs / sizeof gs[0]));
+        return mode_exec_ok((u32)geteuid(), (u32)getegid(), gs, ng,
+                            (u32)st.st_uid, (u32)st.st_gid, st.st_mode);
     }
-    return (st.st_mode & bit) ? 0 : -EACCES;
+    return mode_exec_ok(m->cred.euid, m->cred.egid, m->cred.groups,
+                        m->cred.ngroups, remap_uid(m, (u32)st.st_uid),
+                        remap_gid(m, (u32)st.st_gid), st.st_mode);
 }
 
 u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
@@ -1195,7 +1242,8 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
         unsigned char hdr[256];
         size_t n;
-        FILE *f = fopen(host, "rb");
+        FILE *f = proc_own_fd_denied(host) ? (errno = EACCES, NULL)
+                                           : fopen(host, "rb");
         if (f) {
             n = fread(hdr, 1, sizeof hdr, f);
             fclose(f);

@@ -147,6 +147,18 @@ unfiltered:
   [syscalls.md](syscalls.md)). Without this, `apk upgrade` of `apk-tools`
   itself fails its busybox trigger with `execve: No such file or directory`.
 
+  *Every* step of the exec has to make that turn, including the one that
+  decides whether the guest may execute the image at all. `exec_perm_check`
+  fell back to the descriptor for the `stat` and then asked `access(path,
+  X_OK)` — the same path, the same refusal — so on a host whose denial covers
+  the path walk and not only the open, the fallback bought nothing and the exec
+  failed with `EACCES`. It now judges the mode the descriptor gave it, against
+  this process's real identity (the guest's, without `--fake-id`), by the
+  kernel's own rule. `A64_OWNFD_FORCE_DENY` makes an ordinary host refuse those
+  path forms — stat and access included, so it is stricter than the device —
+  and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
+  without `--fake-id`, requiring identical output.
+
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
 

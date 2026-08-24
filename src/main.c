@@ -313,6 +313,10 @@ static void help(void) {
                         "instead of at the top of the RT range (exercises the "
                         "tier a host that cannot deliver its top RT signals is "
                         "served by)."},
+        {"A64_OWNFD_FORCE_DENY", "Refuse the path spelling of the emulator's "
+                        "own fds (/proc/self/fd/N), as Android's policy does "
+                        "for a memfd, so exec and open take the descriptor "
+                        "fallback."},
         {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "

@@ -654,7 +654,9 @@ SYSDEF(openat) {
         s64 pf;
         if (procfs_open(c, pcanon, gflags, &pf)) return (u64)pf;
     }
-    int fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
+    int fd;
+    if (proc_own_fd_denied(host)) { fd = -1; errno = EACCES; }
+    else fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
     if (fd < 0 && (errno == EACCES || errno == EPERM)) {
         int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
         int own = proc_own_fd_path(host);

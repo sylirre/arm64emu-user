@@ -191,6 +191,23 @@ int proc_own_fd_path(const char *host) {
     return *p ? -1 : (int)fd;
 }
 
+/* Test knob for the tier above. Every caller that can serve a request from the
+ * descriptor tries the path first, and on an ordinary Linux host the path form
+ * always works -- so those fallbacks have coverage on a device and nowhere
+ * else. A64_OWNFD_FORCE_DENY makes this host refuse the path spelling of one
+ * of our own fds, which is what Android's policy does to a memfd's, and is
+ * deliberately harsher than the device: it refuses stat and access as well as
+ * open, so a caller that is correct under it is correct under the real thing.
+ * Returns 1 when the caller must behave as though the host said EACCES. */
+int proc_own_fd_denied(const char *host) {
+    static int on = -1;
+    if (on < 0)
+        __atomic_store_n(&on, getenv("A64_OWNFD_FORCE_DENY") ? 1 : 0,
+                         __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&on, __ATOMIC_RELAXED)) return 0;
+    return proc_own_fd_path(host) >= 0;
+}
+
 /* Magic /proc symlinks — exe, cwd, root — whose host targets name emulator
  * state (our binary, the host cwd, the host root). Following or reading them raw
  * would leak host paths, and root/… would escape the rootfs entirely, so the
