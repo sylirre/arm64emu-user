@@ -97,6 +97,15 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 
     if (!len) return (u64)(s64)-EINVAL;
     len = PG_UP(len);
+    /* do_mmap's "careful about overflows": a length whose page round-up wrapped
+     * to zero is ENOMEM, not the EINVAL an outright zero gets. Letting the zero
+     * through mapped nothing and handed the guest an address for it. */
+    if (!len) return (u64)(s64)-ENOMEM;
+    /* No address could hold it, whichever one is asked for. get_unmapped_area
+     * makes this test before it looks at any address, and it is what lets the
+     * two range checks below subtract from the top instead of adding to the
+     * base -- an addr + len that wraps compares as though it fit. */
+    if (len > GUEST_TASK_SIZE) return (u64)(s64)-ENOMEM;
     u32 pte = prot_g2pte(prot);
 
     /* RLIMIT_AS. A MAP_FIXED over ground the guest already owns replaces it
@@ -109,7 +118,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 
     if (flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) {
         if (addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-        if (addr + len > GUEST_TASK_SIZE) return (u64)(s64)-ENOMEM;
+        if (addr > GUEST_TASK_SIZE - len) return (u64)(s64)-ENOMEM;
         if (flags & G_MAP_FIXED_NOREPLACE)
             for (u64 va = addr; va < addr + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) return (u64)(s64)-EEXIST;
@@ -121,7 +130,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
          * churn against a smaller-than-expected guest address space. */
         u64 hint = addr;
         addr = 0;
-        if (hint && !(hint & GUEST_PAGE_MASK) && hint + len <= GUEST_TASK_SIZE) {
+        if (hint && !(hint & GUEST_PAGE_MASK) && hint <= GUEST_TASK_SIZE - len) {
             int busy = 0;
             for (u64 va = hint; va < hint + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) { busy = 1; break; }
@@ -237,7 +246,14 @@ SYSDEF(munmap) {
 
 SYSDEF(mprotect) {
     if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-    int r = guest_protect(&c->m->as, a0, PG_UP(a1), prot_g2pte((int)a2));
+    /* do_mprotect_pkey's two length cases, which are not the same: an outright
+     * zero length is a no-op it accepts, while a length whose page round-up
+     * wrapped to zero describes a range ending at or below its start, and that
+     * is ENOMEM. Passing the wrapped zero down looked like the first. */
+    if (!a1) return 0;
+    u64 len = PG_UP(a1);
+    if (!len) return (u64)(s64)-ENOMEM;
+    int r = guest_protect(&c->m->as, a0, len, prot_g2pte((int)a2));
     return r < 0 ? (u64)(s64)r : 0;
 }
 
@@ -395,6 +411,13 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     if (!new_len || !old_len) return (u64)(s64)-EINVAL;
     if ((flags & G_MREMAP_FIXED) && !(flags & G_MREMAP_MAYMOVE))
         return (u64)(s64)-EINVAL;
+    /* The old range has to lie inside the address space, its end included. An
+     * old_addr + old_len that wraps past the top of it makes the walk below run
+     * zero times, so a range nobody owns passed for fully mapped: a shrink then
+     * unmapped whatever the wrapped end landed on and returned old_addr as a
+     * success. There is no VMA out there, and the kernel says so. */
+    if (old_addr > GUEST_TASK_SIZE || old_len > GUEST_TASK_SIZE - old_addr)
+        return (u64)(s64)-EFAULT;
     /* The old range must be fully mapped; the kernel returns EFAULT when it
      * is not. musl's pthread_getattr_np probes for the main-thread stack
      * bottom with growing mremaps and relies on this non-ENOMEM failure to

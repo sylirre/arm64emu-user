@@ -1395,6 +1395,11 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
 check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nhole_normal=-12\nunmapped=-12\ndiscarded=00\nwhole_space=-12\ndone'
+# Ranges that wrap past the top of the address space, and lengths whose page
+# round-up wraps to zero. Self-checking because qemu-user range-checks mremap
+# itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;
+# these are a real kernel's answers, taken natively.
+check_fixture mmwrap $'mmap_zerolen=22\nmmap_len_align0=12\nmmap_len_huge=12\nmmap_fixed_wrap=12\nmmap_hint_wrap=0\nmremap_old_wrap=14\nmremap_old_wrap_grow=14\nmremap_newlen_align0=22\nmremap_oldlen_align0=22\nmremap_zero_oldlen=22\nmunmap_zerolen=22\nmunmap_len_align0=22\nmunmap_wrap=22\nmprotect_zerolen=0\nmprotect_len_align0=12\nmprotect_wrap=12\nkeep=1\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

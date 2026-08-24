@@ -316,6 +316,23 @@ is what keeps runtimes that reserve specific high addresses and munmap anything
 placed elsewhere — Go's heap-arena reservation is the motivating case — from
 thrashing at startup, and is why the guest VA space is 47 bits (`sys_mm.c`).
 
+**Ranges that wrap** are asked about by subtraction from the top of the address
+space (`addr > GUEST_TASK_SIZE - len`), never by adding to the base — a sum that
+wraps compares as though it fit — and a length is checked against the whole
+space first so the subtraction itself cannot underflow. Two length cases are
+distinct and Linux keeps them apart: an outright zero (`EINVAL` for `mmap`,
+accepted as a no-op by `mprotect`) and one whose page round-up wrapped to zero,
+which is `ENOMEM` for both. `mem.c` refuses a wrapped range at the bottom
+(`range_ok`, itself a subtraction), so containment never rested on the checks
+above them, but the answer the guest got did — and for `mremap` so did more than
+the answer: its "is the old range mapped" walk ran from `old_addr` while
+`old_addr + old_len` had already wrapped below it, so it ran zero times, a range
+nobody owned passed for fully mapped, and a shrinking `mremap` of it unmapped
+whatever the wrapped end landed on and returned the bogus address as a success.
+`tests/fixtures/mmwrap.c` is the regression test, self-checking against a real
+kernel's answers — qemu-user makes its own `mremap` range checks and gets these
+wrong, so it is not the oracle for them.
+
 `mremap` **moves a mapping, it does not copy bytes.** A move is bookkeeping:
 the region record is copied to the new guest VA with its host backing, file
 identity, offset and protection intact, the page table is re-pointed page by
