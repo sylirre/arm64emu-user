@@ -203,6 +203,7 @@ Behavior fallbacks:
 * `A64_PAGEPROBE_FORCE_PIPE`: probes the pages of a grown file mapping with a pipe write instead of process_vm_readv — the tier a host kernel older than 3.2 (e.g. Android 7's 3.1) is served by, since the syscall does not exist there.
 * `A64_MEMFD_FORCE_FILE`: forces guest memfd_create(2) onto the unlinked-file fallback tier with broker-held seals (what a host kernel without memfd_create is served by); the suite's `(memfd-tier)` rows run over it.
 * `A64_SIGRT_MAX=N`: reserves the emulator's own three host signals (the control-channel kick and the guest-32/33 carriers) below N instead of at the top of the RT range — the tier a host that accepts but cannot deliver its top RT signals is served by, `qemu-user` being one; the suite's `(low-rt-tier)` rows run over it.
+* `A64_TLBPUB_MAX=N`: caps the D-TLB published-epoch table at N slots — the tier a guest with more live threads than the table holds is served by: a thread the quarantine cannot account for stops it draining at all, so retired host backing is never released out from under a stale translation.
 
 Tuning:
 

@@ -88,11 +88,46 @@ void tlb_flush_all(void) {
  * So each thread publishes the generation its D-TLB reflects, at the two places
  * it empties it, and a retired entry is released once every registered thread
  * has published at or past the generation it was retired at. Nothing is added
- * to the hot path: the store happens only when a D-TLB is actually emptied. */
-#define AS_PUB_MAX 256   /* published epochs, one per guest thread */
+ * to the hot path: the store happens only when a D-TLB is actually emptied.
+ *
+ * A thread with no slot is the dangerous case, and the table is finite, so it
+ * has to be handled rather than assumed away: an unregistered thread is exactly
+ * the one whose stale pointer the drain would not be waiting for. g_pub_over
+ * counts them, and while it is nonzero dtlb_safe_gen releases NOTHING -- the
+ * behaviour the quarantine had before epochs existed, which grows the address
+ * space but can never free backing out from under a thread. Slots are handed
+ * out for the life of a guest thread and returned when it leaves, so the count
+ * bounds live threads, not threads ever created; the table is sized past what
+ * any real guest reaches (and far past what an ILP32 host can even hold thread
+ * stacks for), so the fallback is a safety net, not a working mode. */
+#define AS_PUB_MAX 4096   /* published epochs, one per LIVE guest thread */
 
-static struct { s32 tid; int blocked; unsigned long gen; } g_pub[AS_PUB_MAX];
+static struct { s32 tid; s32 blocked; unsigned long gen; } g_pub[AS_PUB_MAX];
+/* One past the highest slot index ever handed out. Both the reuse scan and the
+ * drain stop there, so a process with four threads walks four entries and never
+ * touches (or commits) the rest of the table. */
+static int g_pub_hi;
+static int g_pub_over;                  /* live threads that got no slot */
 static __thread int g_pub_slot = -1;
+static __thread int g_pub_over_self;    /* this thread is one of them */
+static __thread s32 g_pub_tid;          /* cached: the claim path is not hot */
+
+/* How many slots this run may hand out. A64_TLBPUB_MAX shrinks it, which is
+ * the only way to reach the unregistered-thread fallback on a machine that
+ * cannot run four thousand guest threads -- i.e. every machine. Resolved once;
+ * a race between two threads recomputes the same answer from the same env. */
+static int g_pub_cap;
+static int pub_cap(void) {
+    int c = __atomic_load_n(&g_pub_cap, __ATOMIC_RELAXED);
+    if (UNLIKELY(!c)) {
+        const char *e = getenv("A64_TLBPUB_MAX");
+        c = e ? atoi(e) : AS_PUB_MAX;
+        if (c < 1) c = 1;
+        if (c > AS_PUB_MAX) c = AS_PUB_MAX;
+        __atomic_store_n(&g_pub_cap, c, __ATOMIC_RELAXED);
+    }
+    return c;
+}
 
 /* A thread that is not executing guest code cannot consume a stale entry at all:
  * the interpreter re-checks the generation on every access through translate(),
@@ -106,30 +141,71 @@ static __thread int g_pub_slot = -1;
  * kicked the stragglers with the de_thread call-out, whose entire purpose is to
  * make blocking syscalls return EINTR, and it cut a guest's sleep(6) to 0.2 s.
  *
- * Publish the generation this thread's (now empty) D-TLB reflects. Claims a
+ * Claim a slot for this thread. Reuses one a departed thread returned before
+ * extending the table, so the walked prefix tracks live threads rather than
+ * threads ever created. Returns 0 when the table is full, having counted this
+ * thread into g_pub_over exactly once. */
+static int __attribute__((cold)) dtlb_claim_slot(void) {
+    if (!g_pub_tid) g_pub_tid = (s32)syscall(SYS_gettid);
+    int cap = pub_cap();
+    for (;;) {
+        int hi = __atomic_load_n(&g_pub_hi, __ATOMIC_ACQUIRE);
+        if (hi > cap) hi = cap;
+        for (int i = 0; i < hi; i++) {
+            s32 free_slot = 0;
+            if (__atomic_compare_exchange_n(&g_pub[i].tid, &free_slot, g_pub_tid,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                g_pub_slot = i;
+                goto claimed;
+            }
+        }
+        if (hi >= cap) break;
+        /* Nothing free below the mark: take the next index. The reservation
+         * publishes the wider bound, so another thread may reach the slot
+         * first -- hence the same CAS, and a retry from the top if it loses. */
+        int i = __atomic_fetch_add(&g_pub_hi, 1, __ATOMIC_ACQ_REL);
+        if (i >= cap) {                        /* raced past the end: undo */
+            __atomic_fetch_sub(&g_pub_hi, 1, __ATOMIC_ACQ_REL);
+            break;
+        }
+        s32 free_slot = 0;                     /* virgin slot: gen 0 = "release
+                                                * nothing", the safe start */
+        if (__atomic_compare_exchange_n(&g_pub[i].tid, &free_slot, g_pub_tid,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            g_pub_slot = i;
+            goto claimed;
+        }
+    }
+    if (!g_pub_over_self) {
+        g_pub_over_self = 1;
+        __atomic_fetch_add(&g_pub_over, 1, __ATOMIC_ACQ_REL);
+    }
+    return 0;
+claimed:
+    if (g_pub_over_self) {
+        g_pub_over_self = 0;
+        __atomic_fetch_sub(&g_pub_over, 1, __ATOMIC_ACQ_REL);
+    }
+    return 1;
+}
+
+/* Publish the generation this thread's (now empty) D-TLB reflects. Claims a
  * slot on first use: a thread with no slot has never emptied a D-TLB, so it has
  * never cached a pointer either and constrains nothing. */
 static void dtlb_publish(unsigned long gen) {
-    if (UNLIKELY(g_pub_slot < 0)) {
-        s32 me = (s32)syscall(SYS_gettid);
-        for (int i = 0; i < AS_PUB_MAX; i++) {
-            s32 free_slot = 0;
-            if (__atomic_compare_exchange_n(&g_pub[i].tid, &free_slot, me, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-                g_pub_slot = i;
-                break;
-            }
-        }
-        if (g_pub_slot < 0) return;   /* table full: fall back to the old rule */
-    }
+    if (UNLIKELY(g_pub_slot < 0) && !dtlb_claim_slot()) return;
     __atomic_store_n(&g_pub[g_pub_slot].gen, gen, __ATOMIC_RELEASE);
 }
 
 /* The newest generation every registered thread has already emptied past.
- * ~0UL when nobody is registered, which releases the whole quarantine. */
+ * ~0UL when nobody is registered, which releases the whole quarantine; 0 while
+ * any live thread is unregistered, which releases none of it. */
 static unsigned long dtlb_safe_gen(void) {
+    if (UNLIKELY(__atomic_load_n(&g_pub_over, __ATOMIC_ACQUIRE))) return 0;
     unsigned long safe = ~0UL;
-    for (int i = 0; i < AS_PUB_MAX; i++) {
+    int hi = __atomic_load_n(&g_pub_hi, __ATOMIC_ACQUIRE);
+    if (hi > AS_PUB_MAX) hi = AS_PUB_MAX;
+    for (int i = 0; i < hi; i++) {
         if (!__atomic_load_n(&g_pub[i].tid, __ATOMIC_ACQUIRE)) continue;
         /* Blocked in a host syscall: it cannot be mid-probe inside a JIT block,
          * and it flushes before it can be again, so it constrains nothing. */
@@ -141,25 +217,42 @@ static unsigned long dtlb_safe_gen(void) {
 }
 
 /* Drop this thread's epoch: it holds no D-TLB any more, so it must stop holding
- * the quarantine back. Called as a guest thread leaves the address space. */
+ * the quarantine back. Called as a guest thread leaves the address space.
+ * The slot is left reading generation 0 -- release nothing -- because the next
+ * thread to claim it owns it for the few instructions before its first publish,
+ * and that window has to be the conservative answer, not ~0UL. */
 static void dtlb_unpublish(void) {
+    if (g_pub_over_self) {
+        g_pub_over_self = 0;
+        __atomic_fetch_sub(&g_pub_over, 1, __ATOMIC_ACQ_REL);
+    }
     if (g_pub_slot < 0) return;
     __atomic_store_n(&g_pub[g_pub_slot].blocked, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_pub[g_pub_slot].gen, ~0UL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pub[g_pub_slot].gen, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_pub[g_pub_slot].tid, 0, __ATOMIC_RELEASE);
     g_pub_slot = -1;
 }
 
 /* fork(2) duplicates the calling thread alone, so every other thread's epoch in
  * the inherited table describes a thread that does not exist here. Keep only
- * this one's -- otherwise the child's quarantine is pinned by ghosts. */
+ * this one's -- otherwise the child's quarantine is pinned by ghosts -- and put
+ * it at slot 0, so a child of a thread-heavy parent does not inherit its walk
+ * length for the rest of its life. Single-threaded here: no CAS needed. */
 void as_tlb_fork_child(void) {
     int mine = g_pub_slot;
-    for (int i = 0; i < AS_PUB_MAX; i++) {
-        if (i == mine) continue;
-        g_pub[i].tid = 0;
-        g_pub[i].blocked = 0;
-        g_pub[i].gen = ~0UL;
+    unsigned long gen = mine >= 0 ? g_pub[mine].gen : 0;
+    int blocked = mine >= 0 ? g_pub[mine].blocked : 0;
+    memset(g_pub, 0, sizeof g_pub[0] * (size_t)(g_pub_hi > AS_PUB_MAX
+                                                ? AS_PUB_MAX : g_pub_hi));
+    g_pub_hi = 0;
+    g_pub_over = g_pub_over_self ? 1 : 0;
+    g_pub_tid = (s32)syscall(SYS_gettid);   /* the fork gave this thread a new one */
+    if (mine >= 0) {
+        g_pub[0].tid = g_pub_tid;
+        g_pub[0].blocked = blocked;
+        g_pub[0].gen = gen;
+        g_pub_hi = 1;
+        g_pub_slot = 0;
     }
 }
 
@@ -379,6 +472,14 @@ void as_thread_exit(AddrSpace *as) {
     /* Before the count drops: this thread has no D-TLB to hold anything back,
      * and leaving its epoch behind would pin the quarantine on a ghost. */
     dtlb_unpublish();
+    __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
+}
+/* Take back an entry made for a thread that never started (pthread_create
+ * failed). It is the CREATOR running here, not the thread being undone, so
+ * this must not touch the epoch table: dropping the creator's own slot while
+ * it is still executing guest code -- with its D-TLB still full -- is exactly
+ * the unaccounted thread the drain is not allowed to have. */
+void as_thread_enter_undo(AddrSpace *as) {
     __atomic_fetch_sub(&as->nthreads, 1, __ATOMIC_ACQ_REL);
 }
 

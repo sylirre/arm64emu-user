@@ -424,7 +424,7 @@ SYSDEF(clone) {
         as_thread_enter(&m->as);
         int e = pthread_create(&t->host, &at, thread_entry, t);
         pthread_attr_destroy(&at);
-        if (e) { as_thread_exit(&m->as); free(t); return (u64)(s64)-EAGAIN; }
+        if (e) { as_thread_enter_undo(&m->as); free(t); return (u64)(s64)-EAGAIN; }
         s32 tid;
         while ((tid = __atomic_load_n(&start_tid, __ATOMIC_ACQUIRE)) == 0)
             syscall(SYS_futex, (s32 *)&start_tid, 0 /*FUTEX_WAIT*/, 0,

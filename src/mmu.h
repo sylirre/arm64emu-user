@@ -282,8 +282,11 @@ void as_tlb_block_end(void);
 /* Drop every other thread's published epoch after a fork: they describe
  * threads that do not exist in the child. */
 void as_tlb_fork_child(void);
-void as_thread_enter(AddrSpace *as);   /* a guest thread joins this space */
-void as_thread_exit(AddrSpace *as);    /* ...and leaves it */
+void as_thread_enter(AddrSpace *as);    /* a guest thread joins this space */
+void as_thread_exit(AddrSpace *as);    /* ...and leaves it, dropping its epoch */
+/* Undo an enter for a thread that never started. The creator calls it, so it
+ * touches only the count -- never the caller's own epoch (mem.c). */
+void as_thread_enter_undo(AddrSpace *as);
 /* A file changed size: drop the guest PTEs of any mapping of it that now
  * reaches past end-of-file, so an access faults instead of reaching a host page
  * the kernel would refuse (mem.c). */

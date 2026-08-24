@@ -313,6 +313,10 @@ static void help(void) {
                         "instead of at the top of the RT range (exercises the "
                         "tier a host that cannot deliver its top RT signals is "
                         "served by)."},
+        {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
+                        "(exercises the tier a guest with more live threads "
+                        "than it holds is served by: the retired-backing "
+                        "quarantine stops draining)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",

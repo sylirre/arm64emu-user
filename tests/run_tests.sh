@@ -875,6 +875,56 @@ if [ -n "$AGCC" ] && [ -n "$HCC" ]; then
         else
             skip=$((skip+1)); echo "SKIP fixture: vachurn (no rusage from the host)"
         fi
+        # The same measurement behind 300 parked guest threads. With more than
+        # one thread in the address space the backing is quarantined until every
+        # thread has published that it flushed its cached translations, so this
+        # asks whether that release still happens for a thread count past what
+        # the epoch table used to hold -- a thread it cannot account for must
+        # hold the quarantine shut, which is safe and reclaims nothing at all.
+        lo=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 100 300 2>/dev/null)
+        hi=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 1000 300 2>/dev/null)
+        if [ -n "$lo" ] && [ -n "$hi" ]; then
+            grew=$((hi - lo))
+            # 32 touched pages per mapping: a quarantine that never drains shows
+            # up as ~115 MB here, so the same 8 MB slack separates them widely.
+            if [ "$grew" -lt 8192 ]; then
+                pass=$((pass+1))
+                echo "PASS fixture: vachurn threaded (${grew} kB over 900 mappings)"
+            else
+                fail=$((fail+1))
+                echo "FAIL fixture: vachurn threaded (peak RSS grew ${grew} kB over 900 mappings: ${lo} -> ${hi})"
+            fi
+        else
+            skip=$((skip+1)); echo "SKIP fixture: vachurn threaded (no rusage from the host)"
+        fi
+        # And the fallback itself, forced with A64_TLBPUB_MAX. A thread the
+        # epoch table has no room for is exactly the thread the drain would not
+        # be waiting for, so the rule is that one such thread stops the drain
+        # dead -- the quarantine grows instead of freeing backing out from under
+        # a translation somebody still holds. This asserts that growth: it is
+        # the only outwardly visible difference between holding the line and
+        # silently releasing, which is what an ignored thread used to get.
+        # Eight threads, not three hundred: the cap is what forces the
+        # fallback, and three hundred host thread stacks plus a code cache
+        # apiece is more address space than a 32-bit host has to spare.
+        lo=$(A64_TLBPUB_MAX=2 ./tests/maxrss.bin "$EMU" / \
+                tests/fixtures/vachurn.bin 100 8 2>/dev/null); rcl=$?
+        hi=$(A64_TLBPUB_MAX=2 ./tests/maxrss.bin "$EMU" / \
+                tests/fixtures/vachurn.bin 1000 8 2>/dev/null); rch=$?
+        if [ -n "$lo" ] && [ -n "$hi" ] && [ "$rcl" = 0 ] && [ "$rch" = 0 ]; then
+            grew=$((hi - lo))
+            # 900 extra mappings x 32 touched pages = ~115 MB held; releasing
+            # them anyway measured ~0. 32 MB sits between the two with room.
+            if [ "$grew" -ge 32768 ]; then
+                pass=$((pass+1))
+                echo "PASS fixture: vachurn unaccounted (${grew} kB held over 900 mappings)"
+            else
+                fail=$((fail+1))
+                echo "FAIL fixture: vachurn unaccounted (backing released for a thread with no epoch slot: ${lo} -> ${hi})"
+            fi
+        else
+            skip=$((skip+1)); echo "SKIP fixture: vachurn unaccounted (no rusage from the host)"
+        fi
         rm -f tests/maxrss.bin
         fx_rm tests/fixtures/vachurn.bin
     else

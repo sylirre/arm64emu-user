@@ -128,6 +128,24 @@ generation rather than a sentinel value in it — a handler that copies its
 arguments out of guest memory goes through `translate()`, whose flush would
 publish over the sentinel and re-pin the quarantine.
 
+The table of published epochs is finite, and a thread that cannot get a slot in
+it is precisely the thread the drain would *not* be waiting for — so it cannot
+simply be ignored, which is what the first version of this did above 256
+threads: the drain computed safety from the registered slots alone and
+`munmap`ed backing a 257th thread could still be holding a pointer into. A
+thread with no slot now counts into `g_pub_over`, and while that is nonzero
+`dtlb_safe_gen` returns 0 and the quarantine releases **nothing** — the
+pre-epoch rule, which grows the address space but can never pull backing out
+from under a translation. Slots are held for the life of a guest thread and
+returned when it leaves, so the table bounds *live* threads (4096) rather than
+threads ever created; both the reuse scan and the drain stop at the high-water
+mark, so a four-thread process walks four entries. `A64_TLBPUB_MAX=N` shrinks
+the table, which is the only way to reach the fallback on a machine that cannot
+run four thousand guest threads — the suite's `vachurn unaccounted` row runs
+over it and asserts that the backing really is held, since releasing it anyway
+is invisible from inside the guest and shows up only as memory that did *not*
+grow.
+
 Waiting for `as->nthreads` to fall to 1 was the earlier rule, and for anything
 multithreaded that meant *never*: a guest with two threads mapping and unmapping
 in a loop grew the emulator's address space by ~15 GB per second and a `fork`
@@ -177,6 +195,15 @@ different mapping counts and compares the emulator's peak RSS
 cancels every constant — the emulator's own footprint, the JIT cache, whatever
 the host libc reserves — so one threshold holds on a phone and a server alike.
 The regression it guards against showed as 28 MB across 900 extra mappings.
+
+An optional second argument parks that many guest threads first and touches 32
+pages of each mapping instead of one, which points the same measurement at the
+quarantine: the harness runs it once at 300 threads (the drain must still
+happen, so the growth must stay flat) and once more at eight threads with
+`A64_TLBPUB_MAX=2`, so that most of them have no epoch slot (the drain must then
+stop, so the growth must appear). Eight for the second one because the cap, not
+the thread count, is what forces the fallback — three hundred host thread stacks
+and a code cache apiece is more address space than a 32-bit host has to spare.
 
 ### `RLIMIT_AS` is the guest's, measured against the guest's address space
 
