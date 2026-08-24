@@ -1323,7 +1323,9 @@ fi
 # bind mounts are the emulator's own feature, so qemu is not an oracle. The
 # point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr
 # needs a writable fd, so a plain read-only open used to be enough to reach the
-# host file behind the bind and change its metadata. ----
+# host file behind the bind and change its metadata -- and neither do the two
+# that reach a file by descriptor while looking like something else,
+# fchownat(fd, "", AT_EMPTY_PATH) and the FS_IOC_SETFLAGS ioctl. ----
 if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/robind.bin \
             tests/fixtures/robind.c 2>/dev/null &&
@@ -1332,7 +1334,7 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
         rm -rf "$ROSRC"; mkdir -p "$ROSRC"; echo content > "$ROSRC/f"
         chmod 644 "$ROSRC/f"
         got=$("$EMU" --bind "$ROSRC:/ro:ro" "$ALPINE" /tmp/robind.bin 2>/dev/null)
-        expect=$'path_chmod=EROFS\npath_truncate=EROFS\nopen_rdonly=1\nfchmod=EROFS\nfchown=EROFS\nftruncate=EROFS\nfallocate=EROFS\nfutimens=EROFS\nfsetxattr=EROFS\nmode=644 size_nonzero=1\nopen_wronly=EROFS\ndone'
+        expect=$'path_chmod=EROFS\npath_truncate=EROFS\nopen_rdonly=1\nfchmod=EROFS\nfchown=EROFS\nftruncate=EROFS\nfallocate=EROFS\nfutimens=EROFS\nfsetxattr=EROFS\nfchownat_empty=EROFS\nsetflags=EROFS\nmode=644 size_nonzero=1\nopen_wronly=EROFS\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS bind: :ro blocks fd-based mutation"
         else
             fail=$((fail+1)); echo "FAIL bind: :ro blocks fd-based mutation"

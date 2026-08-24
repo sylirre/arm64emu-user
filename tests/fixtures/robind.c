@@ -9,7 +9,15 @@
  * Opening for reading is allowed and needs no write permission -- and none of
  * fchmod, fchown, ftruncate, fallocate, futimens or fsetxattr needs the fd to
  * be writable either, so a read-only open was enough to reach the host file
- * behind the bind and change it. Every one of them must be refused. */
+ * behind the bind and change it. Every one of them must be refused.
+ *
+ * The last two are the same thing wearing a different hat: fchownat looks like
+ * a path call but names the fd itself when the path is empty and AT_EMPTY_PATH
+ * is set, and FS_IOC_SETFLAGS is `chattr`, which the kernel gates on a write
+ * reference to the MOUNT and not to the file. Both went straight to the host.
+ * Worse for the first: under --fake-id the emulator reports an ownership
+ * change the host refused as a success, so the guest was told a :ro bind had
+ * been written to. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -17,9 +25,17 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+
+/* Spelled out rather than taken from <linux/fs.h>: the guest compiler may be a
+ * Bionic one whose headers put it elsewhere, and the value is what the guest
+ * kernel ABI says it is -- _IOW('f', 2, long) with an LP64 long. */
+#ifndef FS_IOC_SETFLAGS
+#define FS_IOC_SETFLAGS _IOW('f', 2, long)
+#endif
 
 static void refused(const char *what, int rc) {
     printf("%s=%s\n", what, rc < 0 ? (errno == EROFS ? "EROFS" : strerror(errno))
@@ -41,6 +57,10 @@ int main(void) {
     errno = 0; refused("fallocate", fallocate(fd, 0, 0, 4096));
     errno = 0; refused("futimens",  futimens(fd, NULL));
     errno = 0; refused("fsetxattr", fsetxattr(fd, "user.probe", "v", 1, 0));
+    errno = 0; refused("fchownat_empty",
+                       fchownat(fd, "", (uid_t)-1, (gid_t)-1, AT_EMPTY_PATH));
+    { long flags = 0;
+      errno = 0; refused("setflags", ioctl(fd, FS_IOC_SETFLAGS, &flags)); }
 
     struct stat st;
     fstat(fd, &st);

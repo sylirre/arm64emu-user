@@ -164,9 +164,15 @@ re-root to the guest root and `..` climbs into the rootfs, never to the host
 parent of `src`. A `:ro` bind returns `EROFS` for mutating syscalls under it
 (enforced in the `sys_file.c` handlers via `host_ro`, and via `fd_ro` for the
 ones that name the file by descriptor — `fchmod`, `fchown`, `ftruncate`,
-`fallocate`, `futimens`, `fsetxattr`, `fremovexattr`. None of those needs a
-writable fd, so a plain read-only open was otherwise enough to change the host
-file's metadata through a read-only bind). Binds are listed in the
+`fallocate`, `futimens`, `fsetxattr`, `fremovexattr`, and the two that name it
+by descriptor while looking like something else: `fchownat(fd, "",
+AT_EMPTY_PATH)` and the `FS_IOC_SETFLAGS` ioctl, which is what `chattr` issues.
+None of those needs a writable fd — the kernel gates the last two on a write
+reference to the *mount*, not to the file — so a plain read-only open was
+otherwise enough to change the host file's metadata through a read-only bind.
+The `fchownat` hole was the quiet one: under `--fake-id`, `chattr_result` turns
+the host's own `EPERM` into a reported success, so the guest was told the change
+had taken effect). Binds are listed in the
 synthesized `/proc/mounts` and `/proc/mountinfo`. A bind destination is a pure
 resolution overlay with no physical dirent in the rootfs, so `getdents64`
 (`bind_inject_dents` in `sys_file.c`) splices the mount point into a listing of

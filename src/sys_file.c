@@ -67,8 +67,11 @@ static int host_ro(struct Machine *m, const char *host) {
  * descriptor rather than by path. A read-only bind was only ever enforced on
  * the path-taking calls, so a guest that opened a file -- read-only was enough,
  * none of these need write access -- could still fchmod, fchown, ftruncate,
- * fallocate or set xattrs on it, straight through to the host. Guest fds are
- * host fds, so the fd's own /proc/self/fd link is the host path to test.
+ * fallocate, set xattrs or set the inode's chattr flags on it, straight
+ * through to the host. That includes the calls that reach a file by descriptor
+ * while still looking like path calls: fchownat(fd, "", AT_EMPTY_PATH) and the
+ * FS_IOC_SETFLAGS ioctl. Guest fds are host fds, so the fd's own
+ * /proc/self/fd link is the host path to test.
  * Skipped entirely when no bind mounts exist, which is the usual case. */
 static int fd_ro(struct Machine *m, int fd) {
     if (fd < 0 || bind_count() == 0) return 0;
@@ -1543,6 +1546,11 @@ SYSDEF(ioctl) {
     if (cmd == 0x80086601 /*guest FS_IOC_GETFLAGS*/ ||
         cmd == 0x40086602 /*guest FS_IOC_SETFLAGS*/) {
         int is_set = (cmd == 0x40086602);
+        /* The same family as fchmod/fchown: the kernel takes a write reference
+         * on the MOUNT for this (mnt_want_write_file -> EROFS on a read-only
+         * one) and none on the file, so `chattr` does its work through a plain
+         * O_RDONLY descriptor -- and a :ro bind has to answer for it here. */
+        if (is_set && fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
         unsigned long hcmd = is_set ? _IOW('f', 2, long) : _IOR('f', 1, long);
         /* Give the call a buffer of the width the command declares, not of the
          * width the handler happens to touch. A bare int left the four bytes
@@ -2196,9 +2204,17 @@ SYSDEF(fchownat) {
         char gpath[PATH_MAX];
         long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
         if (n < 0) return (u64)(s64)n;
-        if (n == 0)
+        if (n == 0) {
+            /* Named by descriptor, so the bind has to be asked about the fd --
+             * there is no path here for host_ro to judge. Missing that check
+             * was a hole with nothing to warn about it: fchown(fd) on the very
+             * same descriptor was refused, and under --fake-id chattr_result
+             * turned the host's own EPERM into a reported success, so the
+             * guest was told an ownership change on a :ro bind had happened. */
+            if (fd_ro(c->m, (int)(s32)a0)) return (u64)(s64)-EROFS;
             return chattr_result(c->m,
                 fchownat((int)(s32)a0, "", (uid_t)a2, (gid_t)a3, AT_EMPTY_PATH));
+        }
     }
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
