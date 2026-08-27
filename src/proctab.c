@@ -26,6 +26,9 @@
  *      splits a late joiner onto a fresh empty table while any guest is still
  *      alive. Works for same-uid processes even under Android/Termux, where
  *      SysV IPC is denied and no ownerless tmpfs exists — hence memfd, not shm.
+ *      Both ends authenticate the other's uid (peer_is_ours): an abstract name
+ *      has no permission bits, so without that check any local process could
+ *      take the table — or squat the name and hand us one of its own.
  *   2. named file (proctab_open_shared) — fallback when memfd or abstract
  *      sockets are unavailable (very old kernel, or a seccomp filter blocking
  *      memfd_create): a shared file keyed by rootfs+uid on tmpfs (/dev/shm) or
@@ -273,6 +276,32 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
         : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v5.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+}
+
+/* Peer authentication for the rendezvous, applied by both ends of every broker
+ * connection. The socket lives in the abstract namespace, which has no
+ * filesystem node and therefore no permission bits: any local process, under
+ * any uid, may connect to a name it can guess -- and the name is guessable
+ * (uid plus a hash of the rootfs path). Unchecked, that hands a stranger the
+ * proctab memfd and every System V segment fd the daemon serves, read-write,
+ * plus the ability to speak the request protocol with a uid/gid of its
+ * choosing. The reverse is just as bad: a stranger that binds the name first
+ * would be handed the guest's requests, and could answer them with a memfd of
+ * its own for the emulator to trust as its registry.
+ *
+ * Same-uid processes are inside the boundary by definition (they can ptrace
+ * the emulator), so the test is exactly the uid. A peer that dropped its
+ * effective uid to our real one, or raised it back, is still us -- the address
+ * is keyed by the real uid. Anything else is refused; a squatter can then deny
+ * the rendezvous, which no unprivileged process can prevent in a namespace
+ * with no permissions, but it can neither read the table nor forge one. */
+static int peer_is_ours(int sock) {
+    struct ucred cr;
+    socklen_t cl = sizeof cr;
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cr, &cl) < 0 ||
+        cl != sizeof cr)
+        return 0;                       /* no credentials: not trusted */
+    return cr.uid == geteuid() || cr.uid == getuid();
 }
 
 /* Send a fixed-size payload plus an optional fd (fd < 0 => none) over a connected
@@ -1852,6 +1881,7 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
             }
             if (pf[0].revents & POLLIN) {
                 int c = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+                if (c >= 0 && !peer_is_ours(c)) { close(c); c = -1; }
                 if (c >= 0) {
                     struct timeval tv = { 2, 0 };   /* don't wedge on a stuck client */
                     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1964,6 +1994,10 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
         struct timeval tv = { 2, 0 };   /* never block forever on a wedged daemon */
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         if (connect(s, (struct sockaddr *)&a, al) == 0) {
+            /* Whoever answered must be us (see peer_is_ours): a foreign daemon
+             * squatting the name would otherwise hand us its own memfd to use
+             * as the registry. Nothing to retry -- degrade to the next tier. */
+            if (!peer_is_ours(s)) { close(s); return 0; }
             /* Ask for the proctab memfd by op tag — the daemon multiplexes
              * proctab and shm over this one rendezvous. */
             struct BReq q;
@@ -2574,7 +2608,11 @@ static int shm_connect(struct Machine *m) {
         struct timeval tv = { 2, 0 };   /* never block forever on a wedged daemon */
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(s, (struct sockaddr *)&a, al) == 0) return s;
+        if (connect(s, (struct sockaddr *)&a, al) == 0) {
+            if (peer_is_ours(s)) return s;      /* see peer_is_ours */
+            close(s);
+            return -1;                          /* squatted: no broker for us */
+        }
         close(s);
         if (errno != ECONNREFUSED && errno != ENOENT) return -1;
         /* Spawn a shm-only daemon on the first miss (a --shared-proc proctab

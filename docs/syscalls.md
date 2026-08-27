@@ -764,6 +764,22 @@ the authoritative registry: a detached per-rootfs (or, without `--shared-proc`,
 per-invocation) daemon owns every shm segment's backing (handed to attachers
 over `SCM_RIGHTS`) and all semaphore/message-queue state.
 
+**Peer authentication.** The rendezvous is an abstract-namespace socket, which
+has no filesystem node and therefore no permission bits: any local process,
+under any uid, may connect to a name it can guess — and the name is guessable
+(uid plus a hash of the rootfs path). So *both* ends check `SO_PEERCRED` and
+require the peer's uid to be ours (`peer_is_ours`): the daemon before it serves
+a request, and every client right after `connect`, since a stranger that binds
+the name first would otherwise be handed the guest's requests and could answer
+them with a memfd of its own for the emulator to trust as its registry. A
+squatter can still deny the rendezvous — nothing unprivileged can prevent that
+in a namespace with no permissions — and the emulator then degrades to the next
+backing tier. Same-uid processes are inside the boundary by definition (they can
+`ptrace` the emulator), which is what makes the uid the whole test: the `uid`/
+`gid` a request carries are *guest* credentials (`--fake-id`'s, when it is on),
+so they are the emulator's to state, and the daemon's permission checks over
+them are the guest's own IPC model, not a host one.
+
 ### Shared memory
 
 - **Backing.** Each segment is an anonymous `memfd` (the normal, Android-safe
