@@ -1349,6 +1349,31 @@ else
     skip_build "fixtures/bigcount"
 fi
 
+# ---- recvmmsg's timeout. A relative CLOCK_MONOTONIC span the kernel validates
+# before receiving anything, checks after every datagram, and writes the
+# remainder of back on a call that received one -- all of which the emulator
+# used to discard. Self-checking: qemu-user does not model it either, and hangs
+# on this program exactly as the previous emulator does. The one case the
+# kernel itself never terminates (its manual page lists it under BUGS: a
+# recvmmsg blocking for a datagram blocks past the timeout forever) is
+# deliberately not reproduced and not tested -- the oracle would hang. ----
+if [ ! -x tests/fixtures/recvmmsg_tmo.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/recvmmsg_tmo.bin \
+        tests/fixtures/recvmmsg_tmo.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/recvmmsg_tmo.bin ]; then
+    expect=$'bad-nsec -1 22\nneg-sec -1 22\nbad-ptr -1 14\nwaitforone 2 0 len0=1 len1=1\nremainder-shrank 1\nzero-tmo -1 11 quick=1\nno-tmo 1 0'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/recvmmsg_tmo.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: recvmmsg_tmo"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: recvmmsg_tmo"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/recvmmsg_tmo.bin
+else
+    skip_build "fixtures/recvmmsg_tmo"
+fi
+
 # ---- vector I/O into memory the guest does not have. A kernel copies straight
 # into the caller's pages and stops where they do; a regular file reports the
 # short transfer, a pipe or a socket rolls the copy back and answers EFAULT,

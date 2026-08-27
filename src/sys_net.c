@@ -11,12 +11,14 @@
  * sockets, which have no filesystem node, are instead isolated per rootfs by a
  * name tag (abs_tag_in/out) unless --share-abstract-sockets is given. */
 #include <fcntl.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>    /* struct timeval (SO_RCVTIMEO/SO_SNDTIMEO) */
+#include <time.h>       /* clock_gettime (recvmmsg's deadline)               */
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -846,16 +848,74 @@ SYSDEF(sendmmsg) {
     return (u64)sent;
 }
 
+/* CLOCK_MONOTONIC now, in nanoseconds -- the clock recvmmsg's timeout runs on
+ * (poll_select_set_timeout uses ktime_get_ts64). */
+static u64 mono_ns(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
+
+/* Wait for `fd` to become readable, but never past `deadline` (monotonic ns).
+ * 1 readable, 0 the deadline arrived first, -1 error/interrupted (errno set). */
+static int wait_readable(int fd, u64 deadline) {
+    u64 now = mono_ns();
+    if (now >= deadline) return 0;
+    u64 left = deadline - now;
+    int ms = (int)((left + 999999ULL) / 1000000ULL);   /* round up: never early */
+    if (ms < 0) ms = -1;                               /* absurdly far: block */
+    struct pollfd p = { fd, POLLIN, 0 };
+    int r = poll(&p, 1, ms);
+    return r > 0 ? 1 : r;
+}
+
+/* recvmmsg(fd, msgvec, vlen, flags, timeout).
+ *
+ * The timeout is a relative CLOCK_MONOTONIC span the kernel turns into a
+ * deadline, checks after every datagram it managed to receive, and -- on a
+ * call that received at least one -- writes the remainder of back, which is
+ * the only way the caller learns how much of it was left. An invalid one is
+ * EINVAL and an unreadable one EFAULT, both before anything is received. All
+ * of that was simply discarded here, so a guest's timeout meant nothing at
+ * all.
+ *
+ * One deliberate difference: the kernel checks the deadline only AFTER a
+ * datagram arrives, so a recvmmsg that blocks waiting for one blocks past the
+ * timeout forever -- its own manual page lists this under BUGS. Here the
+ * deadline bounds every wait, which is what a caller that passed one asked
+ * for; there is nothing to be gained from reproducing a hang. Everything else
+ * follows the kernel, including that MSG_DONTWAIT is taken up after the first
+ * datagram only when the caller asked for MSG_WAITFORONE -- without it (and
+ * without a timeout) the call really does wait for all vlen of them. */
 SYSDEF(recvmmsg) {
     unsigned vlen = (unsigned)a2;
     int flags = (int)a3;
-    (void)a4;   /* timeout: honored only as "block for the first message" */
     if (vlen > 1024) vlen = 1024;
+    int have_tmo = 0;
+    u64 deadline = 0;
+    if (a4) {
+        GTimespec gt;
+        if (copy_from_guest(c, &gt, a4, sizeof gt) < 0) return (u64)(s64)-EFAULT;
+        if (gt.tv_sec < 0 || (u64)gt.tv_nsec >= 1000000000ULL)
+            return (u64)(s64)-EINVAL;
+        struct timespec rel = { (time_t)gt.tv_sec, (long)gt.tv_nsec };
+        syscall_wait_begin(&rel);   /* a restart keeps the deadline (syscall.c) */
+        deadline = mono_ns() +
+                   (u64)rel.tv_sec * 1000000000ULL + (u64)rel.tv_nsec;
+        have_tmo = 1;
+    }
     int got = 0;
     for (unsigned i = 0; i < vlen; i++) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
         int mf = flags & ~MSG_WAITFORONE;
-        if (got > 0) mf |= MSG_DONTWAIT;   /* only the first message blocks */
+        /* MSG_WAITFORONE turns on MSG_DONTWAIT after one packet -- and only it. */
+        if (got > 0 && (flags & MSG_WAITFORONE)) mf |= MSG_DONTWAIT;
+        if (have_tmo && !(mf & MSG_DONTWAIT)) {
+            int w = wait_readable((int)a0, deadline);
+            if (w == 0) break;                       /* the timeout ran out */
+            if (w < 0) { if (got) break; return host_err(); }
+            mf |= MSG_DONTWAIT;   /* readable now; do not sleep past the deadline */
+        }
         /* A substituted netlink socket answers from the reply it recorded, one
          * datagram per element, exactly as recvmsg does. */
         u64 nlret;
@@ -903,6 +963,16 @@ SYSDEF(recvmmsg) {
             return (u64)(s64)wb;
         }
         got++;
+        if (have_tmo && mono_ns() >= deadline) break;
+    }
+    /* The remainder goes back only on a call that received something, as the
+     * kernel does (it returns early for 0 and for an error). */
+    if (have_tmo && got > 0) {
+        u64 now = mono_ns();
+        u64 left = now < deadline ? deadline - now : 0;
+        GTimespec out = { (s64)(left / 1000000000ULL),
+                          (s64)(left % 1000000000ULL) };
+        if (copy_to_guest(c, a4, &out, sizeof out) < 0) return (u64)(s64)-EFAULT;
     }
     return (u64)got;
 }

@@ -327,7 +327,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_sendmsg,   { AT_FD, AT_PTR, AT_HEX }, 0 },
     { G_NR_recvmsg,   { AT_FD, AT_PTR, AT_HEX }, 0 },
     { G_NR_sendmmsg,  { AT_FD, AT_PTR, AT_UINT, AT_HEX }, 0 },
-    { G_NR_recvmmsg,  { AT_FD, AT_PTR, AT_UINT, AT_HEX, AT_PTR }, 0 },
+    { G_NR_recvmmsg,  { AT_FD, AT_PTR, AT_UINT, AT_HEX, AT_TIMESPEC }, 0 },
 };
 
 static u8 g_argtab[G_NR_MAX][6];  /* per-syscall arg types (0 => AT_NONE) */

@@ -381,6 +381,20 @@ fd == host fd), so a caller looping on a bad pointer emptied the process's fd
 table two at a time. Both are closed on that path, as `pipe2` already did
 (`tests/fixtures/netfault.c`).
 
+**`recvmmsg`'s timeout is a deadline, and an out-parameter.** The fifth
+argument is a relative `CLOCK_MONOTONIC` span; a kernel validates it before
+receiving anything (`EINVAL` for a negative second or an out-of-range
+nanosecond, `EFAULT` for an unreadable one), checks it after each datagram, and
+— on a call that received at least one — writes the *remainder* back, which is
+the only way a caller learns how much of it was left. `MSG_DONTWAIT` is taken
+up after the first datagram only when the caller asked for `MSG_WAITFORONE`;
+without it, the call really does wait for all `vlen`. One case is deliberately
+not reproduced: the kernel checks the deadline only *after* a datagram arrives,
+so a `recvmmsg` blocking for one blocks past the timeout forever — its own
+manual page lists this under **BUGS** — whereas here the deadline bounds every
+wait. `tests/fixtures/recvmmsg_tmo.c` covers every case the kernel terminates
+in; `qemu-user` hangs on that program, so it is not the oracle either.
+
 **Interface-query ioctls.** The read-only `SIOCGIF*` family that `ifconfig` /
 net-tools issue on an `AF_INET` socket — `SIOCGIFCONF` (enumerate) plus the
 per-interface `SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,DSTADDR,MTU,METRIC,
