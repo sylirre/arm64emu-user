@@ -806,7 +806,29 @@ out:
  * Android 7): without that, every synthesized open here silently fell through
  * to the HOST file, and a guest read the emulator's own Uid lines, mount
  * table and environment. */
-static int synth_memfd(void) { return a64_anonfd("proc-synth"); }
+static int synth_memfd(void) {
+    /* A64_PROCSYNTH_FORCE_FAIL: pretend there is no anonymous backing at all
+     * -- the tier a host with neither memfd_create nor a writable directory is
+     * served by. What matters about that tier is that it must not degrade into
+     * handing the guest the emulator's own /proc files, so the suite runs the
+     * leak check over it. Probed once per process (a fork inherits it). */
+    static int forced = -1;
+    if (PROBE_ONCE(forced, getenv("A64_PROCSYNTH_FORCE_FAIL") != NULL)) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return a64_anonfd("proc-synth");
+}
+
+/* What to answer when there is no anonymous backing for a synthesized view.
+ * Never 0 ("fall through to the host file"): these files describe the EMULATOR
+ * -- its environment, command line, address space, mount table, limits -- and
+ * handing them to the guest is the leak the synthesis exists to prevent. A
+ * guest that ran the process out of descriptors gets the error its own open(2)
+ * would have hit; anything else reads as a file that is not there. */
+static s64 synth_denied(void) {
+    return (errno == EMFILE || errno == ENFILE) ? -errno : -ENOENT;
+}
 
 /* Which spelling of "status" canon names, if any: PS_SELF for this process
  * (self / own-pid / thread-self / one of our own threads' task dirs), PS_OTHER
@@ -829,7 +851,8 @@ static int is_key(const char *line, const char *key) {
     return !strncmp(line, key, n) && line[n] == ':';
 }
 
-#define STATUS_MAX 16384   /* a status file is ~2 KB; Groups: is the long line */
+#define STATUS_MAX 16384    /* a status file is ~2 KB; Groups: is the long line */
+#define STATUS_CAP (1u << 20)   /* refuse to rewrite anything past this */
 
 /* Guest view of /proc/<pid>/status: pass the host file through, rewriting the
  * lines that describe the EMULATOR rather than the guest and dropping the ones
@@ -885,21 +908,29 @@ static int is_key(const char *line, const char *key) {
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out) {
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
-    if (hfd < 0) return -1;
-    char *buf = malloc(STATUS_MAX);
-    if (!buf) { close(hfd); return -1; }
-    size_t n = 0;
+    if (hfd < 0) return -1;              /* no host file: the caller's open
+                                            fails the same way, nothing leaks */
+    size_t cap = STATUS_MAX, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) { close(hfd); return -2; }
     for (;;) {
-        ssize_t r = read(hfd, buf + n, STATUS_MAX - 1 - n);
+        ssize_t r = read(hfd, buf + n, cap - 1 - n);
         if (r <= 0) break;
         n += (size_t)r;
-        if (n >= STATUS_MAX - 1) break;
+        if (n < cap - 1) continue;
+        /* Only Groups: can grow without bound (towards NGROUPS_MAX), and a
+         * rewrite of half a file would be worse than none -- so grow rather
+         * than give up, and stop only at an absurdity. Handing back the raw
+         * host file is not an option: its Uid, Seccomp and Sig* lines describe
+         * the emulator, which is exactly what the rewrite exists to hide. */
+        if (cap >= STATUS_CAP) { free(buf); close(hfd); return -2; }
+        char *nb = realloc(buf, cap * 2);
+        if (!nb) { free(buf); close(hfd); return -2; }
+        buf = nb;
+        cap *= 2;
     }
     close(hfd);
-    /* Empty, or bigger than the buffer -- a rewrite of half a file would be
-     * worse than the host's own answer, so hand the caller back to it. (Only
-     * Groups: can grow without bound, and only towards NGROUPS_MAX.) */
-    if (!n || n >= STATUS_MAX - 1) { free(buf); return -1; }
+    if (!n) { free(buf); return -2; }    /* readable but empty: not rewritable */
     buf[n] = 0;
 
     /* Pass 1 for the two values a rewrite needs but does not carry: the tid
@@ -1090,7 +1121,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
-        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
+        if (fd < 0) { *ret = synth_denied(); return 1; }   /* never the host file */
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
@@ -1112,7 +1143,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
-        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
+        if (fd < 0) { *ret = synth_denied(); return 1; }   /* never the host file */
         int fmt = !strcmp(mtail, "mountinfo")  ? MNT_MOUNTINFO :
                   !strcmp(mtail, "mountstats") ? MNT_MOUNTSTATS : MNT_MOUNTS;
         put_mounts(fd, m, fmt);
@@ -1145,7 +1176,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             blen = etail[0] == 'a' ? snap.auxv_len : snap.env_len;
         }
         int fd = synth_memfd();
-        if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
+        if (fd < 0) { *ret = synth_denied(); return 1; }   /* never the host file */
         if (blen) { ssize_t w = write(fd, buf, blen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
@@ -1203,10 +1234,19 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
-        if (fd < 0) return 0;                       /* no memfd: passthrough */
+        if (fd < 0) { *ret = synth_denied(); return 1; }
         int self = stgt == PS_SELF;
         s32 tid = 0;
-        if (put_status(fd, m, canon, self, &tid) < 0) { close(fd); return 0; }
+        int st = put_status(fd, m, canon, self, &tid);
+        if (st < 0) {
+            close(fd);
+            /* -1 is "there is no host file to rewrite": the caller's own open
+             * reports that, and reports it exactly. -2 is "there is one but it
+             * cannot be rewritten", and the raw file describes the emulator. */
+            if (st == -1) return 0;
+            *ret = -ENOMEM;
+            return 1;
+        }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         if (tid > 0) pf_track(m, fd, PF_STATUS, tid, self);
@@ -1259,7 +1299,20 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if (gflags & G_O_DIRECTORY)                        { *ret = -ENOTDIR; return 1; }
 
     int fd = synth_memfd();
-    if (fd < 0) return 0;   /* no memfd: degrade to host passthrough */
+    if (fd < 0) {
+        /* Only the host-global views may fall through to the host file: they
+         * carry no guest state and the host's own answer is the truthful one
+         * (PF_STAT and PF_OVERFLOWID are only synthesized when it cannot be
+         * read at all, so falling through re-reports that same failure). The
+         * rest describe THIS process, and the host file describes the emulator
+         * running it -- its environment, command line, address space, mount
+         * table and limits. Deny those instead. */
+        if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_VERSION ||
+            kind == PF_STAT || kind == PF_OVERFLOWID)
+            return 0;
+        *ret = synth_denied();
+        return 1;
+    }
 
     ssize_t wr = 0;
     switch (kind) {

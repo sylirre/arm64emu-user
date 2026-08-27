@@ -677,6 +677,22 @@ then make the consequences the caller depends on true:
   | `CapPrm`/`CapEff` | under fake-root, `capget(2)` already answers with a full set, so zeros here contradict the emulator's own syscall |
   | `x86_*` | an arch hook of the host kernel; an aarch64 kernel prints no such line, so passing it through tells the guest what the host CPU is |
 
+  Every one of these views is served from an anonymous fd (a memfd, or an
+  unlinked temp file where the host predates `memfd_create`), and a host that
+  can provide **neither** must not be answered with the host's own file: that
+  file is the emulator's — its environment, command line, address space, mount
+  table, limits — which is exactly what the synthesis exists to hide. So the
+  per-process views are **denied** instead (`ENOENT`, or the guest's own
+  `EMFILE`/`ENFILE` where it ran the process out of descriptors), while only the
+  host-global ones (`loadavg`, `uptime`, `version`, and the try-host-first
+  `stat`/`overflow{u,g}id`) still fall through, carrying no guest state to leak.
+  `status` is the same: a host file it can read but not rewrite — bigger than
+  the 1 MiB cap, or no memory to hold it — is refused rather than passed
+  through, and only "there is no host file at all" falls through, since the
+  caller's own open then fails in exactly the same way.
+  `A64_PROCSYNTH_FORCE_FAIL` forces the no-backing tier so the suite can check
+  all of that (`tests/fixtures/procsynth_tier.c`).
+
   The exact signal state and credentials exist only in the process's own
   `Machine`, so for **another** guest process only what the shared tables can
   answer is rewritten (`TracerPid` from the ptrace link registry, `Seccomp` from

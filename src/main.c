@@ -295,6 +295,11 @@ static void help(void) {
                         "cores, as Android does)."},
         {"A64_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
                         "/proc/sys/kernel/overflow{u,g}id fallback."},
+        {"A64_PROCSYNTH_FORCE_FAIL", "Make the synthesized /proc views find no "
+                        "anonymous backing (the tier a host with neither "
+                        "memfd_create nor a writable directory is served by): "
+                        "the per-process files are denied, never served from "
+                        "the host's own /proc."},
         {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
         {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "

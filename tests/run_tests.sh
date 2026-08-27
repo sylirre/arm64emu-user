@@ -1604,6 +1604,48 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- the synthesized /proc must fail closed. Self-checking: qemu-user has no
+# synthesized /proc, so it cannot be the oracle. A64_PROCSYNTH_FORCE_FAIL is the
+# tier a host with neither memfd_create nor a writable directory is served by,
+# where every synthesized open used to fall through to the HOST file -- the
+# emulator's own environment, command line, mount table and address space. Both
+# tiers run: denied under the forced one, served under the normal one, and
+# SECRET in the emulator's environment makes a leak through either unmistakable.
+# The host-global views (version, uptime) pass through on purpose. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/procsynth_tier.bin \
+            tests/fixtures/procsynth_tier.c 2>/dev/null; then
+        pst_run() {   # pst_run <label> <expected-verdict> [env...]
+            local label="$1" want="$2"; shift 2
+            local expect got
+            expect="environ=$want
+cmdline=$want
+auxv=$want
+maps=$want
+mounts=$want
+mountinfo=$want
+limits=$want
+status=$want
+version=served
+uptime=served
+leak=0
+done"
+            got=$(env SECRET=emulator-only "$@" timeout -k 5 120 "$EMU" / \
+                  tests/fixtures/procsynth_tier.bin 2>/dev/null)
+            if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: procsynth_tier ($label)"
+            else
+                fail=$((fail+1)); echo "FAIL fixture: procsynth_tier ($label)"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        }
+        pst_run "normal" served
+        pst_run "no-anonfd tier" ENOENT A64_PROCSYNTH_FORCE_FAIL=1
+        fx_rm tests/fixtures/procsynth_tier.bin
+    else
+        skip_build "fixtures/procsynth_tier"
+    fi
+fi
+
 # ---- the id-taking syscalls (kill/tkill/tgkill/rt_sigqueueinfo, nice and the
 # scheduler family) must not reach a host process. Self-checking: qemu-user
 # passes every id straight through, so it answers "ok" for exactly the cases
