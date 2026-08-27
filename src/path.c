@@ -378,10 +378,13 @@ int dev_node_get(int i, const char **name, const char **host) {
 
 /* host = bind.host + rem, where rem is "" or "/...". bind.host is realpath'd and
  * never "/" (add_bind rejects a host-root bind), so this is a plain concat. */
+/* Bound host directory + the remainder of the guest path. `out` may be `host`
+ * itself (the caller stages the winning slot's snapshot there and appends in
+ * place); `rem` never aliases it. */
 static int join_host(const char *host, const char *rem, char *out) {
     size_t hl = strlen(host), rl = strlen(rem);
     if (hl + rl + 1 > PATH_MAX) return -ENAMETOOLONG;
-    memcpy(out, host, hl);
+    memmove(out, host, hl);
     memcpy(out + hl, rem, rl + 1);
     return 0;
 }
@@ -405,6 +408,9 @@ static struct BindTab {
 static struct Bind *g_binds = g_bindtab_fallback.e;
 static int *g_nbinds = &g_bindtab_fallback.n;
 static unsigned *g_bindseq = &g_bindtab_fallback.nextseq;
+
+static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
+                     size_t *glen_out, unsigned *seq_out);
 
 void bindtab_init(void) {
     void *p = mmap(NULL, sizeof(struct BindTab), PROT_READ | PROT_WRITE,
@@ -435,11 +441,11 @@ void bindtab_unshare(void) {
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     if (n > BIND_MAX) n = BIND_MAX;
     for (int i = 0; i < n; i++) {
-        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
-        strcpy(t->e[i].guest, g_binds[i].guest);
-        strcpy(t->e[i].host, g_binds[i].host);
-        t->e[i].ro = g_binds[i].ro;
-        t->e[i].seq = g_binds[i].seq;
+        unsigned sq;
+        if (!bind_snap(i, NULL, t->e[i].guest, t->e[i].host, NULL, &sq)) continue;
+        t->e[i].ro = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+        t->e[i].seq = sq;
+        t->e[i].lock = 0;     /* fresh region: nothing has ever written here */
         t->e[i].active = 1;   /* private region: no other reader yet */
     }
     t->n = n;
@@ -676,55 +682,113 @@ void tmpfs_sweep_stale(void) {
  * errno where none was, never the ENAMETOOLONG a kernel gives.
  * Takes precedence over special zones and the rootfs prefix (see path_resolve),
  * so a bound subtree is served from its real host location. */
+/* Consistent read of one slot. Gating on `active` alone is not enough: umount
+ * frees a slot and the next mount is handed the same one, rewriting both paths
+ * in place, so a reader could walk a string a strcpy is halfway through, or --
+ * worse, because it looks like an answer -- match a stale guest prefix and then
+ * join it onto the fresh host directory that replaced it, resolving a guest
+ * path into a host subtree it was never mounted at. The per-slot seqlock (odd
+ * while a writer holds the slot, bumped twice per claim and never reset) makes
+ * a free-and-refill visible to any reader that straddles it.
+ *
+ * `pfx`, when non-NULL, is a canonical guest path the slot's mount point has to
+ * be a path prefix of; a slot that fails that test is reported as a miss with
+ * nothing copied. That test needs no seqlock validation of its own -- reading
+ * torn bytes at all means a writer is re-claiming the slot, so skipping a mount
+ * that is being taken away is as legitimate an outcome as skipping one taken
+ * away a moment sooner -- and it is what keeps the resolver's cost at a length
+ * and a compare per slot, the same two operations it did before. A MATCH is
+ * what must be proved consistent, because it decides where the path lands.
+ *
+ * Either output may be NULL; both must be PATH_MAX. Only as far as each path
+ * actually goes is copied. glen_out receives the mount point's length, which
+ * is what the caller strips off the guest path. Returns 1 on a consistent live
+ * snapshot, 0 otherwise -- and a mount a concurrent umount removes under the
+ * reader is exactly as legitimate an outcome as one removed just before it. */
+static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
+                     size_t *glen_out, unsigned *seq_out) {
+    const struct Bind *e = &g_binds[i];
+    for (int tries = 0; tries < 64; tries++) {
+        if (__atomic_load_n(&e->active, __ATOMIC_SEQ_CST) != 1) return 0;
+        unsigned l1 = __atomic_load_n(&e->lock, __ATOMIC_RELAXED);
+        if (l1 & 1) continue;                       /* a writer holds the slot */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        /* Bounded: a half-written string need not carry a terminator at all. */
+        size_t gl = strnlen(e->guest, PATH_MAX);
+        if (gl >= PATH_MAX) continue;
+        if (pfx && (strncmp(pfx, e->guest, gl) ||
+                    (pfx[gl] != 0 && pfx[gl] != '/')))   /* '/' boundary */
+            return 0;
+        size_t hl = 0;
+        if (host_out) {
+            hl = strnlen(e->host, PATH_MAX);
+            if (hl >= PATH_MAX) continue;
+            memcpy(host_out, e->host, hl + 1);
+        }
+        if (guest_out) memcpy(guest_out, e->guest, gl + 1);
+        unsigned sq = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->lock, __ATOMIC_RELAXED) != l1) continue;
+        if (__atomic_load_n(&e->active, __ATOMIC_SEQ_CST) != 1) return 0;
+        if (glen_out) *glen_out = gl;
+        if (seq_out)  *seq_out = sq;
+        return 1;
+    }
+    return 0;
+}
+
 static int bind_match(struct Machine *m, const char *canon, char *host_out) {
     (void)m;
+    char host[PATH_MAX];
     int best = -1;
     size_t bestlen = 0;
     unsigned bestseq = 0;
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     for (int i = 0; i < n; i++) {
-        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
-        size_t gl = strlen(g_binds[i].guest);
-        if (strncmp(canon, g_binds[i].guest, gl)) continue;
-        if (canon[gl] != 0 && canon[gl] != '/') continue;   /* '/' boundary */
+        size_t gl;
+        unsigned sq;
+        if (!bind_snap(i, canon, NULL, host, &gl, &sq)) continue;
         /* Longest prefix wins; on a tie the *topmost* (latest) mount does, as
          * on a real mount stack -- pivot_root's second step deliberately mounts
          * the old root over the new one and then detaches it again. */
-        if (best < 0 || gl > bestlen ||
-            (gl == bestlen && g_binds[i].seq > bestseq)) {
-            best = i; bestlen = gl; bestseq = g_binds[i].seq;
+        if (best < 0 || gl > bestlen || (gl == bestlen && sq > bestseq)) {
+            best = i; bestlen = gl; bestseq = sq;
+            memcpy(host_out, host, strlen(host) + 1);   /* stage the winner */
         }
     }
     if (best < 0) return 0;
-    int r = join_host(g_binds[best].host, canon + bestlen, host_out);
+    int r = join_host(host_out, canon + bestlen, host_out);   /* appends in place */
     return r < 0 ? r : 1;
 }
 
 /* Reverse of bind_match: a host path back to its guest view. See machine.h. */
 int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out) {
     (void)m;
+    char guest[PATH_MAX], host[PATH_MAX];
+    char bguest[PATH_MAX];             /* the winning slot's guest mount point */
     int best = -1;
     size_t bestlen = 0;
     unsigned bestseq = 0;
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     for (int i = 0; i < n; i++) {
-        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
-        size_t hl = strlen(g_binds[i].host);
-        if (strncmp(hostpath, g_binds[i].host, hl)) continue;
+        unsigned sq;
+        if (!bind_snap(i, NULL, guest, host, NULL, &sq)) continue;
+        size_t hl = strlen(host);
+        if (strncmp(hostpath, host, hl)) continue;
         if (hostpath[hl] != 0 && hostpath[hl] != '/') continue;
         /* Topmost on a tie, as in bind_match: an fd held across a pivot_root
          * names the mount now covering that host directory. */
-        if (best < 0 || hl > bestlen ||
-            (hl == bestlen && g_binds[i].seq > bestseq)) {
-            best = i; bestlen = hl; bestseq = g_binds[i].seq;
+        if (best < 0 || hl > bestlen || (hl == bestlen && sq > bestseq)) {
+            best = i; bestlen = hl; bestseq = sq;
+            memcpy(bguest, guest, strlen(guest) + 1);
         }
     }
     if (best < 0) return -1;
     if (guest_out) {
-        const char *g = g_binds[best].guest, *rem = hostpath + bestlen;
-        size_t gl = strlen(g), rl = strlen(rem);
+        const char *rem = hostpath + bestlen;
+        size_t gl = strlen(bguest), rl = strlen(rem);
         if (gl + rl + 1 > PATH_MAX) return -1;
-        memcpy(guest_out, g, gl);
+        memcpy(guest_out, bguest, gl);
         memcpy(guest_out + gl, rem, rl + 1);
     }
     return best;
@@ -742,10 +806,22 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host, int r
         if (!__atomic_compare_exchange_n(&g_binds[i].active, &expect, -1,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
             continue;                       /* slot live or mid-claim */
+        /* The slot is ours (active == -1 keeps every other writer out), so the
+         * seqlock needs no atomicity between writers -- only the odd/even
+         * bracket readers straddle. fetch_add rather than a reset: it has to
+         * keep increasing, or a reader whose two samples land either side of a
+         * whole free-and-refill would see the same value twice and accept the
+         * torn read it was there to catch. A writer killed inside the bracket
+         * leaves the slot odd *and* mid-claim, so no reader can reach it and
+         * no later mount can take it -- one leaked slot, not a stuck reader. */
+        __atomic_fetch_add(&g_binds[i].lock, 1, __ATOMIC_RELAXED);   /* odd */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         strcpy(g_binds[i].guest, guest_canon);
         strcpy(g_binds[i].host, host);
         g_binds[i].ro = ro;
         g_binds[i].seq = __atomic_fetch_add(g_bindseq, 1, __ATOMIC_SEQ_CST) + 1;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __atomic_fetch_add(&g_binds[i].lock, 1, __ATOMIC_RELAXED);   /* even */
         __atomic_store_n(&g_binds[i].active, 1, __ATOMIC_SEQ_CST);   /* publish */
         /* Raise the high-water bound so readers scan this slot (retry against a
          * concurrent raise; a bound already past i+1 leaves the loop at once). */
@@ -763,11 +839,14 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host, int r
  * position -- not slot index, which a freed-and-reused slot would scramble). */
 static int bind_top_at(const char *guest_canon) {
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST), best = -1;
+    size_t want = strlen(guest_canon);
     unsigned bestseq = 0;
     for (int i = 0; i < n; i++) {
-        if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) continue;
-        if (strcmp(g_binds[i].guest, guest_canon)) continue;
-        if (best < 0 || g_binds[i].seq > bestseq) { best = i; bestseq = g_binds[i].seq; }
+        size_t gl;
+        unsigned sq;
+        /* Prefix test plus equal length is the exact match. */
+        if (!bind_snap(i, guest_canon, NULL, NULL, &gl, &sq) || gl != want) continue;
+        if (best < 0 || sq > bestseq) { best = i; bestseq = sq; }
     }
     return best;
 }
@@ -832,10 +911,8 @@ int bind_count(void) { return __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST); }
 
 int bind_get(int i, char *guest_out, char *host_out, int *ro_out) {
     if (i < 0 || i >= BIND_MAX) return 0;
-    if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) return 0;
-    if (guest_out) strcpy(guest_out, g_binds[i].guest);
-    if (host_out)  strcpy(host_out, g_binds[i].host);
-    if (ro_out)    *ro_out = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+    if (!bind_snap(i, NULL, guest_out, host_out, NULL, NULL)) return 0;
+    if (ro_out) *ro_out = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
     return 1;
 }
 

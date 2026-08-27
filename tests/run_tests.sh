@@ -720,6 +720,31 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     else fail=$((fail+1)); echo "FAIL mount: unprivileged EPERM (got '$got')"; fi
 fi
 
+# ---- bind-table readers against slot reuse. umount frees a slot and the next
+# mount is handed the same one, rewriting both of its paths in place, so a
+# reader gated only on "live" could match the guest mount point that WAS there
+# and join it onto the host directory that replaced it. The fixture makes that
+# visible -- /mnt is bound to a directory whose file says A, and B must never
+# come back out of it -- and pads the table so every reader keeps scanning
+# after the match, which is the window. Self-checking (qemu performs real
+# mounts) and a timing race, so the loop is sized to catch it: without the
+# per-slot seqlock it trips several times in every run. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/bindrace.bin \
+            tests/fixtures/bindrace.c $A64_TESTLIBS 2>/dev/null; then
+        expect="resolved=1 wrong=0 garbage=0"
+        got=$(timeout -k 5 120 "$EMU" --fake-id / tests/fixtures/bindrace.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: bindrace"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: bindrace (want '$expect' got '$got')"
+        fi
+        rm -rf /tmp/a64bindrace
+        fx_rm tests/fixtures/bindrace.bin
+    else
+        skip_build "fixtures/bindrace"
+    fi
+fi
+
 # ---- guest chroot(2) re-root (self-checking; qemu performs a real chroot and
 # cannot be the oracle). The fixture builds a target subtree in the writable
 # alpine rootfs, chroots in, and checks containment; the end-to-end case runs the

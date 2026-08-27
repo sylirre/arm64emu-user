@@ -56,6 +56,15 @@ struct Bind {
                              * next mount -- and two mounts at one point must
                              * resolve to the topmost, which is what makes
                              * pivot_root's stack-then-detach idiom work. */
+    unsigned lock;          /* per-slot seqlock, odd while the slot is being
+                             * (re)written. `active` alone cannot carry that:
+                             * an umount frees a slot and the next mount fills
+                             * the same one, so a reader gated only on "live"
+                             * could walk a string mid-strcpy, or pair a stale
+                             * guest prefix with the fresh host directory that
+                             * replaced it. Bumped twice per claim and never
+                             * reset, so a whole free-and-refill cycle is
+                             * always visible to a reader that straddles it. */
 };
 
 struct Machine {
