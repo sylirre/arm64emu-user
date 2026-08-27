@@ -15,11 +15,13 @@
  * `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel uses the vDSO
  * for this). rt_sigreturn restores everything from the frame at SP. */
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -52,7 +54,66 @@
  * it unblocked), host_catcher queues it there, and the same thread consumes
  * it from its run loop — single producer, single consumer, program-ordered.
  * A shared ring would be multi-producer under Go's SIGURG async preemption
- * and tears on weakly-ordered hosts (garbage signo -> bogus handler PC). */
+ * and tears on weakly-ordered hosts (garbage signo -> bogus handler PC).
+ *
+ * This queue *is* the guest's pending set (sig_pending_set): a signal the
+ * guest has blocked is caught host-side all the same and waits here until the
+ * guest unblocks it. So it has to hold what a kernel's pending queue holds,
+ * and by the same rules:
+ *
+ *   - A standard signal (below SIGRTMIN, i.e. 1..31) does not queue. One
+ *     instance can be pending; further ones are dropped with their siginfo,
+ *     which is what the kernel's legacy_queue() does. Queuing them instead
+ *     ran the guest's handler once per host delivery where a kernel runs it
+ *     once -- a guest that blocks SIGUSR1, is sent it forty times and then
+ *     unblocks got forty handler entries -- and, before that, filled the
+ *     queue with entries a kernel would never have kept.
+ *
+ *   - A real-time signal does queue, every instance of it, until the kernel's
+ *     limit (RLIMIT_SIGPENDING) refuses the *sender* with EAGAIN. A fixed
+ *     32-entry ring is nothing like that limit: an rt_sigqueueinfo the host
+ *     accepted -- so the guest sender was told it succeeded -- was then
+ *     dropped here, and with it a sigqueue payload, a POSIX timer expiry, or
+ *     a signal some other thread sits in sigwaitinfo() for. The queue grows
+ *     on demand up to sigq_limit() instead.
+ *
+ * Growth cannot happen in the capture handler (it would have to allocate), so
+ * the handler asks -- sigq_grow_req -- and the next consumer, all of which
+ * run in ordinary context and pass through sigq_sync(), does it with signals
+ * blocked.
+ *
+ * That leaves the burst: signals the kernel delivers back to back, with none
+ * of the emulator's own code running in between, so that no consumer gets the
+ * chance to honour the request. It is not a corner case -- a thread parked in
+ * a host syscall while a flood of signals queues up behind it wakes to exactly
+ * that, every pending one delivered before it returns to user code -- and no
+ * fixed amount of headroom is enough for it.
+ *
+ * So the queue does not wait to be full: while it still has room it pushes
+ * back. sigq_gate blocks every signal it may block in the host mask the
+ * handler *returns to*, which leaves the rest of the burst queued in the
+ * kernel -- keeping its order, its payloads and its RLIMIT_SIGPENDING
+ * accounting, so a guest sender really is refused with EAGAIN at the limit,
+ * exactly as it would be on a kernel. The next consumer with room opens the
+ * gate again (sigq_ungate) and the kernel hands the signals straight back,
+ * oldest first. The queue here is then a window onto the kernel's, and what a
+ * kernel would not lose, this does not lose either.
+ *
+ * (One caveat, for whoever debugs this: the gate needs the host to honour
+ * the mask in the frame it built. A kernel does, and so does qemu-user, which
+ * restores the target mask from the frame's uc_sigmask on sigreturn. Valgrind
+ * keeps a private copy and restores that instead, so under valgrind the gate
+ * does nothing and a burst is back to dropping what will not fit.)
+ *
+ * The gate has to shut *early*, with slots to spare: a signal that reaches
+ * this handler has already come off the kernel's queue, and there is no
+ * putting it back -- blocking it then would drop the very instance in hand.
+ * SIGQ_GATE slots of headroom is what "early" means, and it is enough for
+ * what a shut gate still lets through (sig_gateable): five synchronous fault
+ * numbers and SIGSYS, which are standard signals and so coalesce to one
+ * instance each. The seventh is the control-channel kick, and a guest is
+ * free to send that number itself -- the one arrival that can still find the
+ * queue full, and the one the notice in sigq_push is there for. */
 typedef struct {
     int signo;
     int code;
@@ -62,10 +123,264 @@ typedef struct {
     s64 value;   /* full guest sigval width, even on a 32-bit host */
 } PendSig;
 
-#define SIGQ_LEN 32
-static __thread PendSig sigq[SIGQ_LEN];
+#define SIGQ_MIN 32       /* the fixed ring this used to be; now the floor */
+#define SIGQ_MAX 16384    /* ...and the ceiling, whatever the rlimit says */
+
+/* The floor lives in thread-local storage so an ordinary guest -- which never
+ * has more than a signal or two pending -- allocates nothing at all. */
+static __thread PendSig sigq_base[SIGQ_MIN];
+static __thread PendSig *sigq;          /* == sigq_base until grown */
+static __thread int sigq_cap;
 static __thread volatile sig_atomic_t sigq_head, sigq_tail;
+static __thread volatile sig_atomic_t sigq_grow_req;
+/* Instances queued per signal number. The producer and the consumers are the
+ * same thread (one interrupts the other), so these need atomicity but no
+ * ordering: a plain read-modify-write in a consumer would lose the handler's
+ * update if the handler landed inside it. They answer "what is pending" in
+ * constant time, which a queue that may hold thousands of entries needs --
+ * sig_pending_deliverable is polled from every blocking wait there is. */
+static __thread u16 sigq_cnt[65];
+/* Host signals the gate blocked, and so the ones it may unblock again: the
+ * emulator's own mask is not the guest's, and what was blocked before the
+ * gate shut stays blocked after it opens. */
+static __thread u64 sigq_gated;
+#define SIGQ_GATE 8   /* free slots kept in hand for the gate to shut in */
 __thread volatile sig_atomic_t g_sig_npend;
+
+/* Read one of those counts. Atomic for the compiler's sake as much as the
+ * CPU's: a plain load can be hoisted out of a poll loop, and the store that
+ * would end the loop comes from a signal handler the optimizer cannot see. */
+static u16 sigq_pend(int sig) {
+    return __atomic_load_n(&sigq_cnt[sig], __ATOMIC_RELAXED);
+}
+
+/* How deep one thread's queue may go. The kernel bounds its pending queues
+ * with RLIMIT_SIGPENDING, counted per user across the whole system; per thread
+ * is the closest a per-thread queue gets, and it is never the stricter of the
+ * two. Clamped at both ends so a guest can neither shrink it below the ring
+ * that was always here nor make the emulator allocate without bound, and read
+ * once -- it bounds an emulator-side buffer, not a guest-visible resource. */
+static int sigq_limit(void) {
+    static int cached;
+    int v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (v) return v;
+    struct rlimit rl;
+    v = SIGQ_MAX;
+    if (getrlimit(RLIMIT_SIGPENDING, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (rlim_t)SIGQ_MAX)
+        v = (int)rl.rlim_cur;
+    /* A64_SIGQ_MAX caps it further, which is how the gate below gets tested:
+     * pin the queue at its floor and every flood has to go through the
+     * kernel's queue and back. */
+    const char *cap = getenv("A64_SIGQ_MAX");
+    if (cap && *cap) {
+        int n = atoi(cap);
+        if (n > 0 && n < v) v = n;
+    }
+    if (v < SIGQ_MIN) v = SIGQ_MIN;
+    __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+    return v;
+}
+
+static int sigq_next(int t) { return t + 1 == sigq_cap ? 0 : t + 1; }
+
+/* Ordinary context: double the queue, up to the limit. Signals are blocked
+ * across the swap only -- the allocation itself is done first, outside it --
+ * so the capture handler can never be appending into the buffer being
+ * replaced, and never has to allocate. */
+static void sigq_regrow(void) {
+    sigq_grow_req = 0;
+    int lim = sigq_limit();
+    if (sigq_cap >= lim) return;
+    int want = sigq_cap * 2;
+    if (want > lim) want = lim;
+    PendSig *nb = malloc((size_t)want * sizeof *nb);
+    if (!nb) return;   /* keep what we have: the gate covers the shortfall */
+    sigset_t all, prev;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &prev);
+    int n = 0;
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) nb[n++] = sigq[t];
+    PendSig *old = sigq == sigq_base ? NULL : sigq;
+    sigq = nb;
+    sigq_cap = want;
+    sigq_tail = 0;
+    sigq_head = n;
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    free(old);
+}
+
+/* What the gate must never hold back, whatever it costs. The control-channel
+ * kick is itself the wake that gets a thread to a consumer, so blocking it is
+ * a deadlock rather than a delay; a seccomp SIGSYS that arrives blocked
+ * force-kills the process; and the synchronous fault numbers -- which reach
+ * this handler only when a guest raises one deliberately -- are the numbers
+ * the emulator's own nets need deliverable at every instant. */
+static int sig_gateable(int hostsig) {
+    if (hostsig == g_sig_kicksig || hostsig == SIGSYS) return 0;
+    switch (hostsig) {
+    case SIGSEGV: case SIGBUS: case SIGILL: case SIGFPE: case SIGTRAP:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+/* Shut the gate: block every signal that may be blocked, in the mask this
+ * handler returns to, so the queue takes nothing more until a consumer has
+ * made room. Async-signal-safe -- it is a few stores into the frame the
+ * kernel built for us. */
+static void sigq_gate(void *uctx) {
+    if (!uctx) return;
+    ucontext_t *uc = uctx;
+    /* The kernel's own sigset -- 64 bits on every Linux architecture -- sits
+     * at the front of this field whatever width the libc declares for it, and
+     * rt_sigreturn restores the thread's mask from exactly there. (Bionic's
+     * 32-bit sigset_t aliases the 64-bit one in a union; a libc that offers
+     * only the narrow form can express only the low signals, so gate those.) */
+    u64 m = 0;
+    size_t w = sizeof uc->uc_sigmask;
+    if (w > sizeof m) w = sizeof m;
+    memcpy(&m, &uc->uc_sigmask, w);
+    u64 gate = 0;
+    for (int i = 1; i <= 64 && i <= (int)(w * 8); i++)
+        if (sig_gateable(i)) gate |= 1ULL << (i - 1);
+    gate &= ~m;                     /* what was already blocked is not ours */
+    if (!gate) return;
+    m |= gate;
+    memcpy(&uc->uc_sigmask, &m, w);
+    __atomic_fetch_or(&sigq_gated, gate, __ATOMIC_RELAXED);
+}
+
+/* Ordinary context: open the gate, whatever the queue looks like. The kernel
+ * delivers the unblocked signals inside this call, so a caller that runs it
+ * first sees a queue that is up to date -- and if the flood is still coming,
+ * the gate simply shuts again a few entries later. */
+static void sigq_ungate_now(void) {
+    u64 host = __atomic_exchange_n(&sigq_gated, 0, __ATOMIC_RELAXED);
+    if (!host) return;
+    /* SIGTTOU/SIGTTIN/SIGTSTP may since have been blocked because the guest
+     * asked for it (sig_sync_host_mask). That mirroring outranks the gate and
+     * undoes itself when the guest unblocks them, so hand those over rather
+     * than unblock them here. */
+    u64 keep = g_tls.sigmask & ((1ULL << (SIGTTOU - 1)) | (1ULL << (SIGTTIN - 1)) |
+                                (1ULL << (SIGTSTP - 1)));
+    host &= ~keep;
+    if (!host) return;
+    sigset_t s;
+    sigemptyset(&s);
+    for (int i = 1; i <= 64; i++)
+        if (host & (1ULL << (i - 1))) sigaddset(&s, i);
+    pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+}
+
+/* ...and the same, once there is room for what comes back through it. This is
+ * the one every consumer calls. */
+static void sigq_ungate(void) {
+    if (!__atomic_load_n(&sigq_gated, __ATOMIC_RELAXED)) return;
+    int used = sigq_head - sigq_tail;
+    if (used < 0) used += sigq_cap;
+    if (sigq_cap - 1 - used < 2 * SIGQ_GATE) return;   /* not enough room yet */
+    sigq_ungate_now();
+}
+
+/* Forget what the gate holds without unblocking any of it: the caller has
+ * taken the host mask over for its own reasons (leader_park's parked zombie,
+ * whose queue nobody drains) and those signals are better left with the
+ * kernel, where its own unblock will find them. */
+void sig_gate_forget(void) {
+    __atomic_store_n(&sigq_gated, 0, __ATOMIC_RELAXED);
+}
+
+/* Every consumer's first act: make sure this thread's queue exists (a thread
+ * that never ran sig_tls_prewarm cannot be one guest code runs on, but the
+ * check costs a load) and honour a growth request the handler left behind. */
+static void sigq_sync(void) {
+    if (!sigq) { sigq = sigq_base; sigq_cap = SIGQ_MIN; }
+    if (sigq_grow_req) sigq_regrow();
+    if (sigq_gated) sigq_ungate();
+}
+
+/* Give up any grown buffer and empty the queue. Ordinary context (exec, thread
+ * exit); signals are blocked across it because the handler may still fire on
+ * this thread afterwards -- it lands back in the static floor. */
+static void sigq_reset(void) {
+    /* Before the mask is captured below, so the restore cannot put the gate's
+     * blocks back: this thread is starting over (a new image, or an ending
+     * thread) and nothing here is holding anything for the kernel. */
+    sigq_ungate_now();
+    sigset_t all, prev;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &prev);
+    PendSig *old = sigq == sigq_base ? NULL : sigq;
+    sigq = sigq_base;
+    sigq_cap = SIGQ_MIN;
+    sigq_head = sigq_tail = 0;
+    sigq_grow_req = 0;
+    sigq_gated = 0;   /* anything caught during the ungate above goes with the
+                       * entries: the queue this reset leaves behind is empty */
+    memset((void *)sigq_cnt, 0, sizeof sigq_cnt);
+    g_sig_npend = 0;
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    free(old);
+}
+
+void sig_tls_release(void) { sigq_reset(); }
+
+/* Append one captured signal. Async-signal-safe: no allocation, no lock, and
+ * the only producer is this thread's own handlers, which never nest. Returns
+ * 0 when it is not queued -- because a standard signal is already pending, as
+ * on a kernel, or because the queue is full and it had to be dropped. */
+static int sigq_push(const PendSig *p, void *uctx) {
+    int sig = p->signo;
+    if (sig < 1 || sig > 64 || !sigq) return 0;
+    if (sig < 32 && sigq_pend(sig)) return 0;   /* standard: one pending instance */
+    int cap = sigq_cap, head = sigq_head, tail = sigq_tail;
+    int used = head - tail;
+    if (used < 0) used += cap;
+    if (used * 4 >= cap * 3) sigq_grow_req = 1;   /* ask, before it is too late */
+    int next = head + 1 == cap ? 0 : head + 1;
+    if (next == tail) {
+        /* Nothing left but to drop it -- and to say so. The gate below is
+         * what makes this unreachable in practice: it shuts with SIGQ_GATE
+         * slots still free, and only the signals it may not block
+         * (sig_gateable) can go on arriving after that. Composed by hand and
+         * written with write(2): this is a signal handler. */
+        static char warned;
+        if (!warned) {
+            warned = 1;
+            static const char msg[] = "arm64chroot: pending-signal queue full, "
+                                      "dropping signals\n";
+            ssize_t ignored = write(2, msg, sizeof msg - 1); (void)ignored;
+        }
+        return 0;
+    }
+    sigq[head] = *p;
+    __atomic_fetch_add(&sigq_cnt[sig], 1, __ATOMIC_RELAXED);
+    sigq_head = next;
+    g_sig_npend = 1;
+    /* Room for SIGQ_GATE more and no consumer in sight: shut the gate now,
+     * while this handler still has a frame to shut it in. Shutting it again
+     * on every later arrival costs nothing -- the mask bits are already set,
+     * and sigq_gate sees that and returns. */
+    if (cap - 2 - used < SIGQ_GATE) sigq_gate(uctx);
+    return 1;
+}
+
+/* Remove queue slot `t`, keeping the rest in arrival order: the entries older
+ * than it shift up by one and the tail follows them. (Shifting the *newer*
+ * ones down instead would have to move the head, which only the handler may
+ * write.) */
+static void sigq_take(int t) {
+    __atomic_fetch_sub(&sigq_cnt[sigq[t].signo], 1, __ATOMIC_RELAXED);
+    for (int u = t; u != sigq_tail; ) {
+        int prev = u ? u - 1 : sigq_cap - 1;
+        sigq[u] = sigq[prev];
+        u = prev;
+    }
+    sigq_tail = sigq_next(sigq_tail);
+    if (sigq_tail == sigq_head) g_sig_npend = 0;
+}
 
 /* Set by sig_kick_net for every one of the emulator's OWN uses of the reserved
  * signal -- a tracer's attach/INTERRUPT kick, a tracee's wake of its tracer,
@@ -205,7 +520,10 @@ void sig_probe_reserved(void) {
 void sig_tls_prewarm(void) {
     (void)*(volatile sig_atomic_t *)&sigq_head;
     (void)*(volatile sig_atomic_t *)&sigq_tail;
-    (void)*(volatile int *)&sigq[0].signo;
+    (void)*(volatile sig_atomic_t *)&sigq_grow_req;
+    (void)*(volatile int *)&sigq_base[0].signo;
+    (void)*(volatile u16 *)&sigq_cnt[0];
+    if (!sigq) { sigq = sigq_base; sigq_cap = SIGQ_MIN; }   /* the queue itself */
     (void)*(volatile sig_atomic_t *)&g_sig_npend;
     (void)*(volatile sig_atomic_t *)&g_ptrace_kick;   /* sig_kick_net */
     (void)*(volatile s32 *)&g_tls.tid;                /* handlers read g_tls */
@@ -214,13 +532,10 @@ void sig_tls_prewarm(void) {
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
-    (void)uctx;
-    int next = (sigq_head + 1) % SIGQ_LEN;
-    if (next == sigq_tail) return;   /* queue full: drop (kernel coalesces too) */
-    PendSig *p = &sigq[sigq_head];
+    PendSig ps, *p = &ps;
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
-    p->err = si->si_errno;   /* the ring is reused: never leave this stale */
+    p->err = si->si_errno;
     p->pid = (int)si->si_pid;
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
@@ -238,8 +553,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
             p->pid = si->si_value.sival_int;   /* si_timerid slot */
         }
     }
-    sigq_head = next;
-    g_sig_npend = 1;
+    if (!sigq_push(p, uctx)) return;
     jit_signal_interrupt();   /* make generated code exit at its next entry */
 }
 
@@ -264,11 +578,18 @@ int sig_arm_rt_remap(int guest_sig) {
  * pending set: everything the host catches is queued here, and one the guest has
  * blocked stays queued instead of being delivered (sig_deliver_pending). */
 u64 sig_pending_set(void) {
+    sigq_sync();
     u64 m = 0;
-    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
-        int sig = sigq[t].signo;
-        if (sig >= 1 && sig <= 64) m |= 1ULL << (sig - 1);
-    }
+    for (int sig = 1; sig <= 64; sig++)
+        if (sigq_pend(sig)) m |= 1ULL << (sig - 1);
+    /* Whatever the gate is holding is pending for the guest too, and the
+     * kernel is the one that knows which of the signals it blocked are. */
+    u64 held = __atomic_load_n(&sigq_gated, __ATOMIC_RELAXED);
+    sigset_t hp;
+    if (held && sigpending(&hp) == 0)
+        for (int i = 1; i <= 64; i++)
+            if ((held & (1ULL << (i - 1))) && sigismember(&hp, i))
+                m |= 1ULL << (sig_remap_to_guest(i) - 1);
     return m;
 }
 
@@ -292,14 +613,12 @@ int sig_send_host_nr(int guest_sig) {
  * signal-delivery stop instead of a real host job-control stop, which would
  * freeze the tracee so it could no longer serve its ptrace mailbox. */
 void sig_raise_local(int sig) {
-    int next = (sigq_head + 1) % SIGQ_LEN;
-    if (next == sigq_tail) return;   /* queue full: drop */
-    PendSig *p = &sigq[sigq_head];
-    memset(p, 0, sizeof *p);
-    p->signo = sig;
-    p->pid = (int)getpid();
-    sigq_head = next;
-    g_sig_npend = 1;
+    sigq_sync();   /* ordinary context: this one can grow the queue itself */
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = sig;
+    p.pid = (int)getpid();
+    if (!sigq_push(&p, NULL)) return;
     jit_signal_interrupt();
 }
 
@@ -578,8 +897,7 @@ void sig_reset_for_exec(struct Machine *m) {
             sig_host_update(m, s);
         }
     }
-    sigq_head = sigq_tail = 0;   /* this thread's queue; post-exec is single-threaded */
-    g_sig_npend = 0;
+    sigq_reset();   /* this thread's queue; post-exec is single-threaded */
     g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
 }
 
@@ -802,8 +1120,9 @@ bad:
  * (ignored, and default-ignore dispositions), matching the kernel, where
  * those never wake sigsuspend. */
 int sig_pending_deliverable(struct Machine *m) {
-    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
-        int sig = sigq[t].signo;
+    sigq_sync();
+    for (int sig = 1; sig <= 64; sig++) {
+        if (!sigq_pend(sig)) continue;
         if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
         u64 h = m->sigact[sig].handler;
         if (h == GSIG_IGN) continue;
@@ -823,8 +1142,9 @@ int sig_pending_deliverable(struct Machine *m) {
  * default-ignore discards). So the ring restricted to the fd's mask is the
  * set a read(2) may return, and no separate bookkeeping is needed. */
 int sig_fd_pending(u64 mask) {
-    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN)
-        if (mask & (1ULL << (sigq[t].signo - 1))) return 1;
+    sigq_sync();
+    for (int sig = 1; sig <= 64; sig++)
+        if (sigq_pend(sig) && (mask & (1ULL << (sig - 1)))) return 1;
     return 0;
 }
 
@@ -832,17 +1152,12 @@ int sig_fd_pending(u64 mask) {
  * Returns 0 when the ring holds no match. Only the fields the kernel fills for
  * the signal's si_code are set; the rest stay zero, as they do there. */
 int sig_fd_take(u64 mask, GSignalfdSiginfo *out) {
-    for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+    sigq_sync();
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
         int sig = sigq[t].signo;
         if (!(mask & (1ULL << (sig - 1)))) continue;
         PendSig p = sigq[t];
-        for (int u = t; u != sigq_tail; ) {   /* remove by shifting, as above */
-            int prev = (u + SIGQ_LEN - 1) % SIGQ_LEN;
-            sigq[u] = sigq[prev];
-            u = prev;
-        }
-        sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
-        if (sigq_tail == sigq_head) g_sig_npend = 0;
+        sigq_take(t);
         memset(out, 0, sizeof *out);
         out->ssi_signo = (u32)p.signo;
         out->ssi_code = p.code;
@@ -878,17 +1193,12 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
         if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
     }
     for (;;) {
-        for (int t = sigq_tail; t != sigq_head; t = (t + 1) % SIGQ_LEN) {
+        sigq_sync();
+        for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
             int sig = sigq[t].signo;
             if (!(set & (1ULL << (sig - 1)))) continue;
             PendSig p = sigq[t];
-            for (int u = t; u != sigq_tail; ) {   /* remove by shifting */
-                int prev = (u + SIGQ_LEN - 1) % SIGQ_LEN;
-                sigq[u] = sigq[prev];
-                u = prev;
-            }
-            sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
-            if (sigq_tail == sigq_head) g_sig_npend = 0;
+            sigq_take(t);
             if (info_va) {
                 u8 si[128];
                 memset(si, 0, sizeof si);
@@ -958,29 +1268,28 @@ void guest_terminate_by_signal(CPU *c, int sig) {
 
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
+    sigq_sync();
     while (sigq_tail != sigq_head) {
         PendSig p = sigq[sigq_tail];
         int sig = p.signo;
         if (g_tls.sigmask & (1ULL << (sig - 1))) {
-            /* Blocked: leave it queued. Scan the rest for an unblocked one. */
-            int t = sigq_tail;
+            /* Blocked: leave it queued. Scan the rest for an unblocked one --
+             * but only once the counts say there is one, so a queue full of
+             * blocked signals is not walked at every safe point. */
+            u64 pend = 0;
+            for (int t = 1; t <= 64; t++)
+                if (sigq_pend(t)) pend |= 1ULL << (t - 1);
+            if (!(pend & ~g_tls.sigmask)) return;
             int found = -1;
-            for (t = (t + 1) % SIGQ_LEN; t != sigq_head; t = (t + 1) % SIGQ_LEN)
+            for (int t = sigq_next(sigq_tail); t != sigq_head; t = sigq_next(t))
                 if (!(g_tls.sigmask & (1ULL << (sigq[t].signo - 1)))) { found = t; break; }
             if (found < 0) return;
             p = sigq[found];
             sig = p.signo;
-            /* remove `found` by shifting */
-            for (int u = found; u != sigq_tail; ) {
-                int prev = (u + SIGQ_LEN - 1) % SIGQ_LEN;
-                sigq[u] = sigq[prev];
-                u = prev;
-            }
-            sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
+            sigq_take(found);
         } else {
-            sigq_tail = (sigq_tail + 1) % SIGQ_LEN;
+            sigq_take(sigq_tail);
         }
-        if (sigq_tail == sigq_head) g_sig_npend = 0;
 
         /* ptrace signal-delivery stop: the tracer sees WSTOPSIG==sig and may
          * suppress it (return 0) or substitute another signal before it is

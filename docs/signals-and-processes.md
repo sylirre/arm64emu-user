@@ -22,6 +22,57 @@ come through the host catcher — they arrive from the interpreter as pending
 exceptions and are delivered directly by `sig_deliver_fault`, which has precise
 `si_addr`/`si_code` from `mem.c`.
 
+### The pending queue
+
+That per-thread queue is not a buffer between two ends of the same delivery —
+it **is** the guest's pending set. A guest that blocks a signal does not block
+it on the host (only the job-control trio is mirrored, below), so the host
+catches it anyway and it waits here until the guest unblocks it. `sigpending`,
+`signalfd`, `rt_sigtimedwait` and `sigsuspend` are all answered from it. So it
+has to hold what a kernel's pending queue holds, by the kernel's own two rules:
+
+- **A standard signal (1..31) does not queue.** One instance is pending and
+  further ones are dropped with their siginfo — the kernel's `legacy_queue()`.
+  Queuing them instead ran the guest's handler once per host delivery where a
+  kernel runs it once: block `SIGUSR1`, take forty of them, unblock, and forty
+  handler entries followed one.
+- **A real-time signal queues, every instance**, in arrival order and with its
+  payload, until `RLIMIT_SIGPENDING` refuses the *sender* with `EAGAIN`. The
+  queue is sized for that now: 32 entries in thread-local storage, which an
+  ordinary guest never outgrows, then doubling on demand up to the rlimit
+  (capped; `A64_SIGQ_MAX` caps it further, which is how the gate below is
+  tested). It used to be a fixed 32-entry ring, so an `rt_sigqueueinfo` the
+  host had already accepted — the guest sender was told it succeeded — was
+  dropped on arrival, and with it a `sigqueue` payload, a POSIX timer expiry,
+  or the signal another thread sat in `sigwaitinfo()` for.
+
+Growth belongs to the consumer: the capture handler cannot allocate, so it
+asks and the next consumer (every one of them starts with `sigq_sync`) does it
+with signals blocked. That leaves the case no queue can be sized for — the
+**burst**, where the kernel delivers a whole pile of signals back to back with
+none of the emulator's own code running in between. A thread parked in a
+blocking syscall while a flood queues up behind it wakes to exactly that.
+
+So the queue pushes back before it is full. With `SIGQ_GATE` slots still free,
+`sigq_gate` blocks every signal it may block **in the host mask the handler
+returns to**, and the rest of the flood stays in the kernel's queue — in
+order, payloads intact, counted against `RLIMIT_SIGPENDING`, so a guest sender
+really is refused with `EAGAIN` at the limit exactly as it would be on a
+kernel. The next consumer with room opens the gate again and the kernel hands
+the signals straight back, oldest first. Shutting it *early* is the whole
+trick: a signal that has reached the handler is already off the kernel's queue
+and cannot be put back, so blocking it at that point would drop the instance
+in hand.
+
+Three things are never held at the gate: the control-channel kick (it is the
+wake that gets a parked thread to a consumer at all, so blocking it deadlocks
+rather than delays), `SIGSYS` (a seccomp trap that arrives blocked force-kills
+the process), and the synchronous fault numbers (the emulator's own nets need
+them deliverable at every instant). `tests/c/sigqdepth.c` covers all of it,
+including a real cross-process flood onto a parked receiver, and the suite
+runs it a second time under `A64_SIGQ_MAX=32` so every flood in it has to go
+through the gate and back.
+
 `SIGBUS` is the one whose *host* disposition the emulator keeps for itself, like
 `SIGSYS`: `sig_host_update` leaves it alone so the bus-error recovery net
 (`mem.c`, see docs/memory.md) is never replaced by a guest `sigaction`. A file
@@ -459,8 +510,12 @@ other threads ran: it keeps it as a zombie — running nothing, but still listed
 last thread of the group goes. All three were measured against a real kernel and
 hold here; qemu-aarch64, by contrast, reports one thread too many. The parked
 thread blocks every host signal first, since the kernel never picks a zombie to
-receive a process-directed signal and the capture ring is per-thread, so a
-signal landing there would never be delivered to anyone.
+receive a process-directed signal and the capture queue is per-thread, so a
+signal landing there would never be delivered to anyone. It also drops the
+emulator's claim on whatever the pending-signal gate was holding
+(`sig_gate_forget`), so nothing reopens that gate behind its back: the kernel
+is the one place a signal aimed at a parked leader can wait to be seen, and a
+revived thread's own unblock finds it there.
 
 Parking rather than really exiting buys one more thing: the thread stays
 available to carry a new image, so a later multithreaded `execve` still lands on

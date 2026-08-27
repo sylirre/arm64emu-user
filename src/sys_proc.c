@@ -102,6 +102,10 @@ static void leader_park(CPU *c) {
     sigset_t all;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, NULL);
+    /* The mask is ours now, so nothing may reopen the pending-signal gate
+     * behind our back: what it holds stays with the kernel, which is the one
+     * place a signal aimed at a parked leader can wait to be seen. */
+    sig_gate_forget();
     jit_thread_exit();   /* hand back the code cache; jit_run builds a fresh
                           * one if this thread is ever revived */
     g_tls.sc_ret_eintr = 0;   /* exit(2) is not a syscall to be restarted, and
@@ -345,6 +349,7 @@ static void *thread_entry(void *arg) {
     /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes
      * joiners. */
     jit_thread_exit();
+    sig_tls_release();   /* and whatever this thread's signal queue grew into */
     /* Leave the address space's thread count *before* releasing a joiner. That
      * count is what tells the rest of the emulator how many guest threads are
      * live -- it gates the retired-backing drain, and de_thread waits on it --

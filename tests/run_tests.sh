@@ -1806,6 +1806,29 @@ elif [ -x "$TMBIN" ]; then
     fi
 fi
 
+# ---- the pending-signal queue's back-pressure gate ----
+# A signal caught for a guest that has blocked it waits in the emulator's own
+# per-thread queue, and a flood can outrun every chance that queue has to grow:
+# the kernel hands the whole pile over back to back, with none of the
+# emulator's own code running in between to make room. The queue answers by
+# blocking those signals in the mask its capture handler returns to, so the
+# rest of the flood stays in the kernel's own queue -- in order, payloads
+# intact -- until a consumer opens it again. A64_SIGQ_MAX pins the queue at its
+# floor, so every flood in this test has to go through that gate and back.
+SQBIN="tests/c/sigqdepth_static.bin"
+if [ -x "$SQBIN" ] && ! rec_have "$SQBIN"; then
+    skip=$((skip+1)); echo "SKIP c/sigqdepth(gate-tier) (not in the test pack)"
+elif [ -x "$SQBIN" ]; then
+    out_q=$(oracle_run "$SQBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_SIGQ_MAX=32 timeout -k 5 60 "$EMU" / "$SQBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/sigqdepth(gate-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/sigqdepth(gate-tier) (oracle rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
+fi
+
 # ---- the stale-tmpfs sweep must not follow a planted symlink ----
 # Backing directories for emulated tmpfs mounts live in a place anyone can
 # create a name in (/dev/shm, /tmp), and every startup sweeps the ones whose

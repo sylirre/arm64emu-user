@@ -539,6 +539,13 @@ void sig_sync_host_mask(struct Machine *m);
  * every new host thread before guest code. bus_tls_prewarm is mem.c's share
  * (bus_catcher's state), called from sig_tls_prewarm. */
 void sig_tls_prewarm(void);
+/* The other end of it: hand back whatever this thread's capture queue grew
+ * into, and empty it. Called where a guest thread ends. */
+void sig_tls_release(void);
+/* Give up the emulator's claim on the host signals its pending-signal gate is
+ * holding, without unblocking them (signal.c). For a caller that has taken the
+ * host mask over itself. */
+void sig_gate_forget(void);
 void bus_tls_prewarm(void);
 int  sig_on_altstack(u64 sp);   /* the kernel's on_sig_stack(): SP-range test */
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */

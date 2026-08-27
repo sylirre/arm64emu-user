@@ -322,6 +322,10 @@ static void help(void) {
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "
                         "quarantine stops draining)."},
+        {"A64_SIGQ_MAX=N", "Cap a thread's pending-signal queue at N entries "
+                        "(exercises the back-pressure gate: a queue with no "
+                        "room leaves the rest of a flood in the host kernel's "
+                        "own queue until it drains)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",
