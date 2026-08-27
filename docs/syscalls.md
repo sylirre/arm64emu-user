@@ -235,6 +235,14 @@ is what a mount point or a zone-mapped node like `/dev/null` looks like.
 Anything else that cannot be pinned is **refused**, never handed to the host as
 a path.
 
+The emulated-hardlink scheme (`--link2symlink`, Android) works the same way: a
+group's backing file and its marker live beside the name that points at them —
+the "hardlink" symlink targets a bare same-directory basename, which is what
+makes it resolve identically for the guest and for us — so every operation it
+performs is a bare name in a pinned directory, and "are these two names in the
+same directory?" is answered by the descriptors' inode identity rather than by
+comparing path strings.
+
 Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `truncate` and `statfs` pin the final component itself and reach it through
 `/proc/self/fd/<fd>` — `fstatfs` directly where the kernel allows it on an

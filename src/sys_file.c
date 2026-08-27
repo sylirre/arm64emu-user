@@ -233,6 +233,17 @@ static int iov_from_guest(CPU *c, int fd, u64 iov_va, unsigned cnt,
  *                                link count. Nothing points to it, so renaming
  *                                it on a count change breaks nothing. */
 
+/* Every operation here is confined to ONE directory: a group's backing file and
+ * its marker live beside the name that points at them, because a "hardlink"
+ * symlink must target a bare same-directory basename to resolve identically for
+ * the guest and for us (l2s_link refuses to share across directories and copies
+ * instead). So everything below works from a PINNED directory descriptor plus
+ * bare names -- never from a path string the host would resolve a second time,
+ * which a concurrent rename could redirect out of the rootfs the same way it
+ * could redirect the syscalls themselves (path.c, PathPin). A target that is
+ * not a pinned name is not one of ours: the scheme only ever creates these
+ * inside the rootfs. */
+
 /* Parse a data basename ".l2s.<ino>" (single numeric field): 1 or 0. */
 static int l2s_parse_data(const char *name, unsigned long long *ino) {
     if (strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN) != 0) return 0;
@@ -264,47 +275,46 @@ static int l2s_hidden(const char *name) {
     return l2s_parse_data(name, NULL) || l2s_parse_marker(name, NULL, NULL);
 }
 
-/* Directory portion of an absolute host path -> `dir` ("/" for a root child). */
-static void l2s_dirname(const char *path, char *dir) {
-    const char *slash = strrchr(path, '/');
-    if (!slash || slash == path) { strcpy(dir, "/"); return; }
-    size_t dl = (size_t)(slash - path);
-    if (dl >= PATH_MAX) dl = PATH_MAX - 1;
-    memcpy(dir, path, dl);
-    dir[dl] = '\0';
-}
-
 static const char *l2s_basename(const char *path) {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
 }
 
-/* Format "<dir>/.l2s.<ino>" (data) into `out` (>= PATH_MAX). 0 or -errno. */
-static int l2s_data_name(char *out, const char *dir, unsigned long long ino) {
-    const char *sep = (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/";
-    int r = snprintf(out, PATH_MAX, "%s%s" L2S_PREFIX "%llu", dir, sep, ino);
-    return (r < 0 || r >= PATH_MAX) ? -ENAMETOOLONG : 0;
+#define L2S_NAME_MAX 64   /* ".l2s." + a 20-digit inode + "." + a count */
+
+/* Format the data basename ".l2s.<ino>" into `out` (>= L2S_NAME_MAX). */
+static int l2s_data_name(char *out, unsigned long long ino) {
+    int r = snprintf(out, L2S_NAME_MAX, L2S_PREFIX "%llu", ino);
+    return (r < 0 || r >= L2S_NAME_MAX) ? -ENAMETOOLONG : 0;
 }
 
-/* Format "<dir>/.l2s.<ino>.<count>" (marker) into `out`. 0 or -errno. */
-static int l2s_marker_name(char *out, const char *dir,
-                           unsigned long long ino, unsigned long count) {
-    const char *sep = (dir[0] && dir[strlen(dir) - 1] == '/') ? "" : "/";
-    int r = snprintf(out, PATH_MAX, "%s%s" L2S_PREFIX "%llu.%04lu",
-                     dir, sep, ino, count);
-    return (r < 0 || r >= PATH_MAX) ? -ENAMETOOLONG : 0;
+/* Format the marker basename ".l2s.<ino>.<count>" into `out`. */
+static int l2s_marker_name(char *out, unsigned long long ino, unsigned long count) {
+    int r = snprintf(out, L2S_NAME_MAX, L2S_PREFIX "%llu.%04lu", ino, count);
+    return (r < 0 || r >= L2S_NAME_MAX) ? -ENAMETOOLONG : 0;
 }
 
-static void l2s_touch(const char *path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+static void l2s_touch(int dfd, const char *name) {
+    int fd = openat(dfd, name, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd >= 0) close(fd);
 }
 
-/* Live link count for inode `ino`: scan `dir` for its ".l2s.<ino>.<count>"
- * marker. 0 (found, fills *count) or -1 (no marker). */
-static int l2s_find_marker(const char *dir, unsigned long long ino, unsigned long *count) {
-    DIR *d = opendir(dir);
-    if (!d) return -1;
+/* Are these two descriptors the same directory? Two pins of one directory are
+ * different numbers, so the identity has to come from the inode. */
+static int l2s_same_dir(int a, int b) {
+    struct stat sa, sb;
+    if (a < 0 || b < 0) return 0;
+    if (fstat(a, &sa) < 0 || fstat(b, &sb) < 0) return 0;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* Live link count for inode `ino`: scan the pinned directory for its
+ * ".l2s.<ino>.<count>" marker. 0 (found, fills *count) or -1 (no marker). */
+static int l2s_find_marker(int dfd, unsigned long long ino, unsigned long *count) {
+    int d2 = openat(dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (d2 < 0) return -1;
+    DIR *d = fdopendir(d2);
+    if (!d) { close(d2); return -1; }
     struct dirent *de;
     int found = -1;
     while ((de = readdir(d)) != NULL) {
@@ -313,66 +323,67 @@ static int l2s_find_marker(const char *dir, unsigned long long ino, unsigned lon
             *count = dc; found = 0; break;
         }
     }
-    closedir(d);
+    closedir(d);                                  /* closes d2 */
     return found;
 }
 
-/* If `host` is one of our l2s symlinks, fill `data` (the backing file path) and
- * *count (from the marker, 0 if the group is broken). Returns 1 (ours), 0 (not
- * ours), or -errno. */
-static int l2s_resolve(const char *host, char *data, unsigned long *count) {
+/* If `p` names one of our l2s symlinks, fill `data` (the backing file's bare
+ * name, in p's own directory) and *count (from the marker, 0 if the group is
+ * broken). Returns 1 (ours), 0 (not ours), or -errno. */
+static int l2s_resolve(const PathPin *p, char *data, unsigned long *count) {
+    if (!p->pinned) return 0;                     /* not a name we could have made */
     struct stat lst;
-    if (lstat(host, &lst) < 0) return -errno;
+    if (fstatat(p->dfd, p->name, &lst, AT_SYMLINK_NOFOLLOW) < 0) return -errno;
     if (!S_ISLNK(lst.st_mode)) return 0;
 
     char tgt[PATH_MAX];
-    ssize_t n = readlink(host, tgt, sizeof tgt - 1);
+    ssize_t n = readlinkat(p->dfd, p->name, tgt, sizeof tgt - 1);
     if (n < 0) return -errno;
     tgt[n] = '\0';
 
+    /* Ours always point at a bare same-directory basename; anything else is a
+     * symlink the guest wrote that happens to look like one. */
     unsigned long long ino;
-    if (!l2s_parse_data(l2s_basename(tgt), &ino)) return 0;   /* a real symlink */
-
-    char dir[PATH_MAX];
-    if (tgt[0] == '/') l2s_dirname(tgt, dir);    /* data beside the target */
-    else               l2s_dirname(host, dir);   /* relative: beside the link */
-    (void)l2s_data_name(data, dir, ino);
-    if (l2s_find_marker(dir, ino, count) != 0) *count = 0;
+    if (strchr(tgt, '/') || !l2s_parse_data(tgt, &ino)) return 0;
+    if (l2s_data_name(data, ino) < 0) return 0;
+    if (l2s_find_marker(p->dfd, ino, count) != 0) *count = 0;
     return 1;
 }
 
-/* Map a resolved host path to its backing file + count. `host` may be one of our
- * symlinks (NOFOLLOW resolution) or already the data file itself (a FOLLOW
+/* Map a pinned target to its backing name + count. It may be one of our
+ * symlinks (a NOFOLLOW resolution) or already the data file itself (a FOLLOW
  * resolution followed the symlink). Returns 1 (fills `data`+*count), 0, -errno. */
-static int l2s_target(const char *host, char *data, unsigned long *count) {
-    int isl = l2s_resolve(host, data, count);
+static int l2s_target(const PathPin *p, char *data, unsigned long *count) {
+    int isl = l2s_resolve(p, data, count);
     if (isl != 0) return isl;                     /* 1 (ours) or -errno */
     unsigned long long ino;
-    if (l2s_parse_data(l2s_basename(host), &ino)) {   /* host itself is the data file */
-        char dir[PATH_MAX];
-        l2s_dirname(host, dir);
-        (void)l2s_data_name(data, dir, ino);
-        if (l2s_find_marker(dir, ino, count) != 0) *count = 0;
+    if (p->pinned && l2s_parse_data(p->name, &ino)) {   /* it IS the data file */
+        if (l2s_data_name(data, ino) < 0) return 0;
+        if (l2s_find_marker(p->dfd, ino, count) != 0) *count = 0;
         return 1;
     }
     return 0;
 }
 
-/* Materialize the contents of `src` into a new regular file `dst` by copying.
- * Used when `src` is not a named regular file that can be symlinked -- notably
- * "/proc/self/fd/N" naming an O_TMPFILE (as apk does to publish its downloaded
- * index): the anonymous inode has nothing to point a symlink at, so a copy is
- * the only faithful emulation. Returns 0 or -errno. */
-static int l2s_materialize(struct Machine *m, const char *src, const char *dst) {
+/* Materialize the contents of one pinned name into a new regular file at
+ * another by copying. Used when the source is not a named regular file that can
+ * be symlinked -- notably "/proc/self/fd/N" naming an O_TMPFILE (as apk does to
+ * publish its downloaded index): the anonymous inode has nothing to point a
+ * symlink at, so a copy is the only faithful emulation. Also the answer for a
+ * cross-directory link, where a same-directory target cannot reach. 0 or
+ * -errno. */
+static int l2s_materialize(struct Machine *m, int sdfd, const char *sname,
+                           int ddfd, const char *dname) {
 #define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
-    int in = open(src, O_RDONLY | O_CLOEXEC);            /* follows /proc/self/fd/N */
-    if (in < 0) { L2SLOG("materialize open('%s'): %s\n", src, strerror(errno)); return -errno; }
+    int in = openat(sdfd, sname, O_RDONLY | O_CLOEXEC);  /* follows /proc/self/fd/N */
+    if (in < 0) { L2SLOG("materialize open('%s'): %s\n", sname, strerror(errno)); return -errno; }
     struct stat sst;
     if (fstat(in, &sst) < 0) { int e = errno; close(in); return -e; }
     if (!S_ISREG(sst.st_mode)) { close(in); return -EPERM; }   /* only regular content */
 
-    int out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, sst.st_mode & 0777);
-    if (out < 0) { int e = errno; close(in); L2SLOG("materialize creat('%s'): %s\n", dst, strerror(e)); return -e; }
+    int out = openat(ddfd, dname, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                     sst.st_mode & 0777);
+    if (out < 0) { int e = errno; close(in); L2SLOG("materialize creat('%s'): %s\n", dname, strerror(e)); return -e; }
 
     char buf[65536];
     ssize_t n;
@@ -389,33 +400,33 @@ static int l2s_materialize(struct Machine *m, const char *src, const char *dst) 
     if (rc == 0) fchmod(out, sst.st_mode & 0777);    /* best-effort metadata */
     close(in);
     if (close(out) < 0 && rc == 0) rc = -errno;
-    if (rc != 0) { unlink(dst); L2SLOG("materialize copy '%s'->'%s': %s\n", src, dst, strerror(-rc)); }
+    if (rc != 0) { unlinkat(ddfd, dname, 0); L2SLOG("materialize copy '%s'->'%s': %s\n", sname, dname, strerror(-rc)); }
     return rc;
 #undef L2SLOG
 }
 
-/* Emulate link(src, dst) via the symlink scheme (both are host paths). With
- * -strace, log the exact failing host op so Android EPERM/EXDEV causes show up. */
-static int l2s_link(struct Machine *m, const char *src, const char *dst) {
+/* Emulate link(src, dst) via the symlink scheme (both pinned). With -strace,
+ * log the exact failing host op so Android EPERM/EXDEV causes show up. */
+static int l2s_link(struct Machine *m, const PathPin *src, const PathPin *dst) {
 #define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
-    L2SLOG("linkat fallback: '%s' -> '%s'\n", src, dst);
+    L2SLOG("linkat fallback: '%s' -> '%s'\n", src->host, dst->host);
     struct stat dsst;
-    if (lstat(dst, &dsst) == 0) return -EEXIST;   /* link(2): dst must not exist */
+    if (fstatat(dst->dfd, dst->name, &dsst, AT_SYMLINK_NOFOLLOW) == 0)
+        return -EEXIST;                          /* link(2): dst must not exist */
 
-    char data[PATH_MAX], dir[PATH_MAX];
+    char data[L2S_NAME_MAX];
     unsigned long count;
     unsigned long long ino;
     int isl = l2s_resolve(src, data, &count);
-    if (isl < 0) { L2SLOG("resolve('%s'): %s\n", src, strerror(-isl)); return isl; }
+    if (isl < 0) { L2SLOG("resolve('%s'): %s\n", src->host, strerror(-isl)); return isl; }
 
     /* AT_SYMLINK_FOLLOW may have resolved src directly onto the data file. */
-    if (isl == 0) {
+    if (isl == 0 && src->pinned) {
         struct stat sst;
-        if (lstat(src, &sst) == 0 && S_ISREG(sst.st_mode)
-            && l2s_parse_data(l2s_basename(src), &ino)) {
-            strcpy(data, src);
-            l2s_dirname(src, dir);
-            if (l2s_find_marker(dir, ino, &count) != 0) count = 0;
+        if (fstatat(src->dfd, src->name, &sst, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(sst.st_mode) && l2s_parse_data(src->name, &ino) &&
+            l2s_data_name(data, ino) == 0) {
+            if (l2s_find_marker(src->dfd, ino, &count) != 0) count = 0;
             isl = 1;
         }
     }
@@ -426,53 +437,54 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
      * the guest, and a guest path would be wrong for the emulator. So a guest
      * hardlink whose two names are in different directories can't share the
      * backing via a symlink; copy instead (independent inode, correct data). */
-    char ddir[PATH_MAX];
-    l2s_dirname(dst, ddir);
+    int same = l2s_same_dir(src->dfd, dst->dfd);
 
     if (isl == 1) {
         /* Existing group. */
-        l2s_parse_data(l2s_basename(data), &ino);
-        l2s_dirname(data, dir);
-        if (strcmp(dir, ddir) != 0) return l2s_materialize(m, data, dst);   /* cross-dir */
-        char newm[PATH_MAX], oldm[PATH_MAX];                                /* bump count */
+        if (!l2s_parse_data(data, &ino)) return -EINVAL;
+        if (!same)                               /* cross-dir */
+            return l2s_materialize(m, src->dfd, data, dst->dfd, dst->name);
+        char newm[L2S_NAME_MAX], oldm[L2S_NAME_MAX];              /* bump count */
         unsigned long nc = (count ? count : 1) + 1;
-        if (l2s_marker_name(newm, dir, ino, nc) < 0) return -ENAMETOOLONG;
-        if (count && l2s_marker_name(oldm, dir, ino, count) == 0)
-            rename(oldm, newm);
+        if (l2s_marker_name(newm, ino, nc) < 0) return -ENAMETOOLONG;
+        if (count && l2s_marker_name(oldm, ino, count) == 0)
+            renameat(src->dfd, oldm, src->dfd, newm);
         else
-            l2s_touch(newm);           /* marker was lost: recreate */
+            l2s_touch(src->dfd, newm);           /* marker was lost: recreate */
     } else {
         /* First hardlink for a real file: it must be a regular file. */
         struct stat sst;
-        if (lstat(src, &sst) < 0) { L2SLOG("lstat('%s'): %s\n", src, strerror(errno)); return -errno; }
+        if (fstatat(src->dfd, src->name, &sst, AT_SYMLINK_NOFOLLOW) < 0) {
+            L2SLOG("lstat('%s'): %s\n", src->host, strerror(errno));
+            return -errno;
+        }
         if (!S_ISREG(sst.st_mode)) {
             /* Not a named regular file (e.g. /proc/self/fd/N naming an O_TMPFILE):
              * the symlink scheme can't apply, so copy the contents into dst. */
-            L2SLOG("materialize non-regular src '%s' (mode 0%o)\n", src, sst.st_mode);
-            return l2s_materialize(m, src, dst);
+            L2SLOG("materialize non-regular src '%s' (mode 0%o)\n", src->host, sst.st_mode);
+            return l2s_materialize(m, src->dfd, src->name, dst->dfd, dst->name);
         }
-        l2s_dirname(src, dir);
-        if (strcmp(dir, ddir) != 0)              /* cross-dir: copy, leave src intact */
-            return l2s_materialize(m, src, dst);
+        if (!same || !src->pinned)               /* cross-dir: copy, leave src intact */
+            return l2s_materialize(m, src->dfd, src->name, dst->dfd, dst->name);
         ino = (unsigned long long)sst.st_ino;
-        if (l2s_data_name(data, dir, ino) < 0) return -ENAMETOOLONG;
-        if (rename(src, data) < 0) {                          /* move the contents */
-            L2SLOG("rename('%s' -> '%s'): %s\n", src, data, strerror(errno));
+        if (l2s_data_name(data, ino) < 0) return -ENAMETOOLONG;
+        if (renameat(src->dfd, src->name, src->dfd, data) < 0) {   /* move contents */
+            L2SLOG("rename('%s' -> '%s'): %s\n", src->host, data, strerror(errno));
             return -errno;
         }
-        if (symlink(l2s_basename(data), src) < 0) {           /* src -> data (same dir) */
+        if (symlinkat(data, src->dfd, src->name) < 0) {   /* src -> data (same dir) */
             int e = errno;
-            L2SLOG("symlink('%s' -> '%s'): %s\n", l2s_basename(data), src, strerror(e));
-            rename(data, src);                                /* best-effort rollback */
+            L2SLOG("symlink('%s' -> '%s'): %s\n", data, src->host, strerror(e));
+            renameat(src->dfd, data, src->dfd, src->name);   /* best-effort rollback */
             return -e;
         }
-        char newm[PATH_MAX];
-        if (l2s_marker_name(newm, dir, ino, 2) == 0) l2s_touch(newm);
+        char newm[L2S_NAME_MAX];
+        if (l2s_marker_name(newm, ino, 2) == 0) l2s_touch(src->dfd, newm);
     }
 
     /* Point dst at the data file with a same-directory (relative) target. */
-    if (symlink(l2s_basename(data), dst) < 0) {
-        L2SLOG("symlink('%s' -> '%s'): %s\n", l2s_basename(data), dst, strerror(errno));
+    if (symlinkat(data, dst->dfd, dst->name) < 0) {
+        L2SLOG("symlink('%s' -> '%s'): %s\n", data, dst->host, strerror(errno));
         return -errno;
     }
     return 0;
@@ -480,22 +492,21 @@ static int l2s_link(struct Machine *m, const char *src, const char *dst) {
 }
 
 /* One name in a group was removed: `data`/`count` come from l2s_resolve run
- * *before* the removal. Drop the marker count; delete the data + marker on the
- * last reference. */
-static void l2s_decref(const char *data, unsigned long count) {
+ * *before* the removal, and `dfd` is the pinned directory they name. Drop the
+ * marker count; delete the data + marker on the last reference. */
+static void l2s_decref(int dfd, const char *data, unsigned long count) {
     unsigned long long ino;
-    if (!l2s_parse_data(l2s_basename(data), &ino)) return;
-    char dir[PATH_MAX], m[PATH_MAX];
-    l2s_dirname(data, dir);
+    if (!l2s_parse_data(data, &ino)) return;
+    char mk[L2S_NAME_MAX];
     if (count <= 1) {                                 /* last reference */
-        unlink(data);
-        if (l2s_marker_name(m, dir, ino, count ? count : 1) == 0) unlink(m);
+        unlinkat(dfd, data, 0);
+        if (l2s_marker_name(mk, ino, count ? count : 1) == 0) unlinkat(dfd, mk, 0);
         return;
     }
-    char newm[PATH_MAX];
-    if (l2s_marker_name(m, dir, ino, count) == 0
-        && l2s_marker_name(newm, dir, ino, count - 1) == 0)
-        rename(m, newm);
+    char newm[L2S_NAME_MAX];
+    if (l2s_marker_name(mk, ino, count) == 0
+        && l2s_marker_name(newm, ino, count - 1) == 0)
+        renameat(dfd, mk, dfd, newm);
 }
 
 /* A group member is being renamed OUT of the directory holding its backing.
@@ -521,30 +532,30 @@ static void l2s_decref(const char *data, unsigned long count) {
  * Not atomic, unlike rename(2) -- neither is the cross-directory link it
  * mirrors. Returns 1 when it handled the rename (*err = 0 or -errno), 0 when
  * this is not that case and the caller should do the ordinary host rename. */
-static int l2s_rename_out(struct Machine *m, const char *src, const char *dst,
+static int l2s_rename_out(struct Machine *m, const PathPin *src, const PathPin *dst,
                           int may_replace, int *err) {
-    char data[PATH_MAX];
+    char data[L2S_NAME_MAX];
     unsigned long count;
     if (l2s_resolve(src, data, &count) != 1) return 0;   /* not a group member */
-
-    char sdir[PATH_MAX], ddir[PATH_MAX];
-    l2s_dirname(data, sdir);
-    l2s_dirname(dst, ddir);
-    if (strcmp(sdir, ddir) == 0) return 0;   /* same dir: the target still resolves */
+    if (l2s_same_dir(src->dfd, dst->dfd)) return 0;   /* the target still resolves */
 
     unsigned long long ino;
-    if (!l2s_parse_data(l2s_basename(data), &ino)) return 0;
+    if (!l2s_parse_data(data, &ino)) return 0;
 
     if (!may_replace) {                      /* RENAME_NOREPLACE */
         struct stat dst_st;
-        if (lstat(dst, &dst_st) == 0) { *err = -EEXIST; return 1; }
+        if (fstatat(dst->dfd, dst->name, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
+            *err = -EEXIST;
+            return 1;
+        }
     }
 
     if (count <= 1) {                        /* last name: move the real file */
-        if (rename(data, dst) < 0) { *err = -errno; return 1; }
-        char mk[PATH_MAX];
-        if (l2s_marker_name(mk, sdir, ino, count ? count : 1) == 0) unlink(mk);
-        unlink(src);                         /* the now-stale symlink */
+        if (renameat(src->dfd, data, dst->dfd, dst->name) < 0) { *err = -errno; return 1; }
+        char mk[L2S_NAME_MAX];
+        if (l2s_marker_name(mk, ino, count ? count : 1) == 0)
+            unlinkat(src->dfd, mk, 0);
+        unlinkat(src->dfd, src->name, 0);    /* the now-stale symlink */
         *err = 0;
         return 1;
     }
@@ -552,11 +563,11 @@ static int l2s_rename_out(struct Machine *m, const char *src, const char *dst,
     /* l2s_materialize creates with O_EXCL, so clear a destination the caller
      * is entitled to replace; its own l2s bookkeeping is the caller's job and
      * was captured before this point. */
-    if (may_replace) unlink(dst);
-    int r = l2s_materialize(m, data, dst);
+    if (may_replace) unlinkat(dst->dfd, dst->name, 0);
+    int r = l2s_materialize(m, src->dfd, data, dst->dfd, dst->name);
     if (r < 0) { *err = r; return 1; }
-    unlink(src);
-    l2s_decref(data, count);                 /* this name left the group */
+    unlinkat(src->dfd, src->name, 0);
+    l2s_decref(src->dfd, data, count);       /* this name left the group */
     *err = 0;
     return 1;
 }
@@ -572,23 +583,21 @@ static int l2s_rename_out(struct Machine *m, const char *src, const char *dst,
  *   others left -- copy the contents over the name and drop this reference;
  *                 the names that stay behind keep sharing.
  *
- * Returns 1 when it acted (*err = 0 or -errno), 0 when `path` is not a group
+ * Returns 1 when it acted (*err = 0 or -errno), 0 when `p` is not a group
  * member and nothing was needed. */
-static int l2s_detach(struct Machine *m, const char *path, int *err) {
+static int l2s_detach(struct Machine *m, const PathPin *p, int *err) {
 #define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
-    char data[PATH_MAX];
+    char data[L2S_NAME_MAX];
     unsigned long count;
-    if (l2s_resolve(path, data, &count) != 1) return 0;   /* not a group member */
+    if (l2s_resolve(p, data, &count) != 1) return 0;   /* not a group member */
 
     unsigned long long ino;
-    if (!l2s_parse_data(l2s_basename(data), &ino)) return 0;
-    char dir[PATH_MAX];
-    l2s_dirname(data, dir);
+    if (!l2s_parse_data(data, &ino)) return 0;
 
     if (count <= 1) {                        /* last name: the backing IS it */
-        if (rename(data, path) < 0) { *err = -errno; return 1; }
-        char mk[PATH_MAX];
-        if (l2s_marker_name(mk, dir, ino, count ? count : 1) == 0) unlink(mk);
+        if (renameat(p->dfd, data, p->dfd, p->name) < 0) { *err = -errno; return 1; }
+        char mk[L2S_NAME_MAX];
+        if (l2s_marker_name(mk, ino, count ? count : 1) == 0) unlinkat(p->dfd, mk, 0);
         *err = 0;
         return 1;
     }
@@ -597,36 +606,38 @@ static int l2s_detach(struct Machine *m, const char *path, int *err) {
      * temporary is needed to make that recoverable: every member's target is
      * the backing's bare basename, so a failed copy can put the link back
      * exactly as it was. */
-    char tgt[PATH_MAX];
-    if (strlen(l2s_basename(data)) + 1 > sizeof tgt) { *err = -ENAMETOOLONG; return 1; }
-    strcpy(tgt, l2s_basename(data));
-    if (unlink(path) < 0) { *err = -errno; return 1; }
-    int r = l2s_materialize(m, data, path);
+    if (unlinkat(p->dfd, p->name, 0) < 0) { *err = -errno; return 1; }
+    int r = l2s_materialize(m, p->dfd, data, p->dfd, p->name);
     if (r < 0) {
-        if (symlink(tgt, path) < 0)          /* best effort: the copy already failed */
-            L2SLOG("detach restore symlink('%s'): %s\n", path, strerror(errno));
+        if (symlinkat(data, p->dfd, p->name) < 0)  /* best effort: the copy failed */
+            L2SLOG("detach restore symlink('%s'): %s\n", p->host, strerror(errno));
         *err = r;
         return 1;
     }
-    l2s_decref(data, count);                 /* this name left the group */
+    l2s_decref(p->dfd, data, count);         /* this name left the group */
     *err = 0;
     return 1;
 #undef L2SLOG
 }
 
-/* If `host` resolves to one of our backing files, stat it (a regular file) into
+/* If `p` resolves to one of our backing files, stat it (a regular file) into
  * *out with st_nlink = live count. Returns 1 (filled), 0 (not ours), -errno. */
-static int l2s_stat(const char *host, struct stat *out) {
-    char data[PATH_MAX];
+static int l2s_stat(const PathPin *p, struct stat *out) {
+    char data[L2S_NAME_MAX];
     unsigned long count;
-    int r = l2s_target(host, data, &count);
+    int r = l2s_target(p, data, &count);
     if (r != 1) return r;
-    if (stat(data, out) < 0) return -errno;
+    if (fstatat(p->dfd, data, out, 0) < 0) return -errno;
     out->st_nlink = count ? count : 1;
     return 1;
 }
 
-/* fstat-by-fd: if the fd names a data backing file, correct st_nlink in place. */
+/* fstat-by-fd: if the fd names a data backing file, correct st_nlink in place.
+ * The one place here with no pin to work from -- an fd carries no path -- so
+ * the group's directory is opened by the name /proc/self/fd/N reports. Nothing
+ * is written through it and nothing is read out of it but the marker's link
+ * count for a file the guest already holds open, so a name raced underneath
+ * this can report a wrong count and nothing else. */
 static void l2s_fix_fd(int fd, struct stat *st) {
     char link[64], path[PATH_MAX];
     snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
@@ -634,12 +645,20 @@ static void l2s_fix_fd(int fd, struct stat *st) {
     if (n < 0) return;
     path[n] = '\0';
     unsigned long long ino;
-    if (l2s_parse_data(l2s_basename(path), &ino)) {
-        char dir[PATH_MAX]; unsigned long count;
-        l2s_dirname(path, dir);
-        if (l2s_find_marker(dir, ino, &count) == 0)
-            st->st_nlink = count ? count : 1;
-    }
+    if (!l2s_parse_data(l2s_basename(path), &ino)) return;
+    const char *slash = strrchr(path, '/');
+    if (!slash) return;
+    char dir[PATH_MAX];
+    size_t dl = (size_t)(slash - path);
+    if (!dl) dl = 1;                          /* a root child: the root itself */
+    memcpy(dir, path, dl);
+    dir[dl] = 0;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return;
+    unsigned long count;
+    if (l2s_find_marker(dfd, ino, &count) == 0)
+        st->st_nlink = count ? count : 1;
+    close(dfd);
 }
 #endif /* L2S_ENABLED */
 
@@ -1110,7 +1129,7 @@ SYSDEF(newfstatat) {
         if (rr < 0) return (u64)(s64)rr;
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {
-            int h = l2s_stat(pin.host, &st);   /* present an l2s symlink as backing */
+            int h = l2s_stat(&pin, &st);   /* present an l2s symlink as backing */
             if (h == 1) { path_unpin(&pin); goto out; }
             if (h < 0) { path_unpin(&pin); return (u64)(s64)h; }
         }
@@ -1208,8 +1227,8 @@ SYSDEF(readlinkat) {
     } else {
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {
-            char backing[PATH_MAX]; unsigned long count;
-            if (l2s_resolve(host, backing, &count) == 1) {
+            char backing[L2S_NAME_MAX]; unsigned long count;
+            if (l2s_resolve(&pin, backing, &count) == 1) {
                 path_unpin(&pin);
                 return (u64)(s64)-EINVAL;   /* a regular file to the guest, not a link */
             }
@@ -2292,20 +2311,21 @@ SYSDEF(unlinkat) {
     if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
     int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
 #ifdef L2S_ENABLED
-    char backing[PATH_MAX]; unsigned long count; int isl = 0;
+    char backing[L2S_NAME_MAX]; unsigned long count; int isl = 0;
     if (c->m->link2symlink && !flags) {
-        isl = l2s_resolve(pin.host, backing, &count);
+        isl = l2s_resolve(&pin, backing, &count);
         if (isl < 0) isl = 0;   /* probe error: fall through to a plain unlink */
     }
 #endif
     int ur = unlinkat(pin.dfd, pin.name, flags);   /* never follows a symlink */
     u64 e = ur < 0 ? host_err() : 0;
-    path_unpin(&pin);
-    if (ur < 0) return e;
 #ifdef L2S_ENABLED
-    if (isl == 1) l2s_decref(backing, count);
+    /* The group bookkeeping lives in the same pinned directory, so it has to
+     * happen before the pin is dropped. */
+    if (ur == 0 && isl == 1) l2s_decref(pin.dfd, backing, count);
 #endif
-    return 0;
+    path_unpin(&pin);
+    return ur < 0 ? e : 0;
 }
 
 SYSDEF(renameat) {
@@ -2320,29 +2340,27 @@ SYSDEF(renameat) {
         return (u64)(s64)-EROFS;
     }
 #ifdef L2S_ENABLED
-    char backing[PATH_MAX]; unsigned long count; int isl = 0;
+    char backing[L2S_NAME_MAX]; unsigned long count; int isl = 0;
     if (c->m->link2symlink && strcmp(h1, h2) != 0) {
-        isl = l2s_resolve(h2, backing, &count);   /* dest replaced by the rename */
+        isl = l2s_resolve(&p2, backing, &count);   /* dest replaced by the rename */
         if (isl < 0) isl = 0;
         /* Moving a group member to another directory cannot be a plain host
          * rename: the symlink's same-directory target would stop resolving. */
         int lerr = 0;
-        if (l2s_rename_out(c->m, h1, h2, 1, &lerr)) {
+        if (l2s_rename_out(c->m, &p1, &p2, 1, &lerr)) {
+            if (lerr == 0 && isl == 1) l2s_decref(p2.dfd, backing, count);
             path_unpin(&p1); path_unpin(&p2);
-            if (lerr < 0) return (u64)(s64)lerr;
-            if (isl == 1) l2s_decref(backing, count);
-            return 0;
+            return lerr < 0 ? (u64)(s64)lerr : 0;
         }
     }
 #endif
     int rr = renameat(p1.dfd, p1.name, p2.dfd, p2.name);   /* follows neither end */
     u64 e = rr < 0 ? host_err() : 0;
-    path_unpin(&p1); path_unpin(&p2);
-    if (rr < 0) return e;
 #ifdef L2S_ENABLED
-    if (isl == 1) l2s_decref(backing, count);
+    if (rr == 0 && isl == 1) l2s_decref(p2.dfd, backing, count);
 #endif
-    return 0;
+    path_unpin(&p1); path_unpin(&p2);
+    return rr < 0 ? e : 0;
 }
 
 SYSDEF(renameat2) {
@@ -2363,14 +2381,13 @@ SYSDEF(renameat2) {
      * helper enforces the extra condition itself. */
     if (c->m->link2symlink && (unsigned)a4 == 1 /*RENAME_NOREPLACE*/ &&
         strcmp(h1, h2) != 0) {
-        char backing[PATH_MAX]; unsigned long count;
-        int isl = l2s_resolve(h2, backing, &count);
+        char backing[L2S_NAME_MAX]; unsigned long count;
+        int isl = l2s_resolve(&p2, backing, &count);
         int lerr = 0;
-        if (l2s_rename_out(c->m, h1, h2, 0, &lerr)) {
+        if (l2s_rename_out(c->m, &p1, &p2, 0, &lerr)) {
+            if (lerr == 0 && isl == 1) l2s_decref(p2.dfd, backing, count);
             path_unpin(&p1); path_unpin(&p2);
-            if (lerr < 0) return (u64)(s64)lerr;
-            if (isl == 1) l2s_decref(backing, count);
-            return 0;
+            return lerr < 0 ? (u64)(s64)lerr : 0;
         }
     }
     /* RENAME_EXCHANGE swaps two names, so BOTH end up where the other was, and
@@ -2391,14 +2408,13 @@ SYSDEF(renameat2) {
      * detach the call was going to fail anyway. */
     if (c->m->link2symlink && (unsigned)a4 == 2 /*RENAME_EXCHANGE*/ &&
         strcmp(h1, h2) != 0) {
-        char d1[PATH_MAX], d2[PATH_MAX];
         struct stat s1, s2;
-        l2s_dirname(h1, d1);
-        l2s_dirname(h2, d2);
-        if (strcmp(d1, d2) != 0 && lstat(h1, &s1) == 0 && lstat(h2, &s2) == 0) {
+        if (!l2s_same_dir(p1.dfd, p2.dfd) &&
+            fstatat(p1.dfd, p1.name, &s1, AT_SYMLINK_NOFOLLOW) == 0 &&
+            fstatat(p2.dfd, p2.name, &s2, AT_SYMLINK_NOFOLLOW) == 0) {
             int lerr = 0;
-            if ((l2s_detach(c->m, h1, &lerr) && lerr < 0) ||
-                (l2s_detach(c->m, h2, &lerr) && lerr < 0)) {
+            if ((l2s_detach(c->m, &p1, &lerr) && lerr < 0) ||
+                (l2s_detach(c->m, &p2, &lerr) && lerr < 0)) {
                 path_unpin(&p1); path_unpin(&p2);
                 return (u64)(s64)lerr;
             }
@@ -2446,16 +2462,13 @@ SYSDEF(linkat) {
 #if defined(L2S_ENABLED) && defined(A64_L2S_FORCE)
     /* Test hook: exercise the l2s path even where the host allows hardlinks. */
     if (c->m->link2symlink) {
-        u64 lret = (u64)(s64)l2s_link(c->m, p1.host, h2);
+        u64 lret = (u64)(s64)l2s_link(c->m, &p1, &p2);
         path_unpin(&p1); path_unpin(&p2);
         return lret;
     }
 #endif
     int lr = linkat(p1.dfd, p1.name, p2.dfd, p2.name, hflags);
-    int lerrno = errno;
-    path_unpin(&p1); path_unpin(&p2);
-    errno = lerrno;
-    if (lr == 0) return 0;
+    if (lr == 0) { path_unpin(&p1); path_unpin(&p2); return 0; }
 #ifdef L2S_ENABLED
     /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path
      * (an O_TMPFILE publish via linkat(AT_SYMLINK_FOLLOW) yields EACCES), and a
@@ -2463,10 +2476,13 @@ SYSDEF(linkat) {
      * genuine permission error still surfaces, since the copy/symlink then
      * fails the same way. */
     if (c->m->link2symlink && (errno == EXDEV || errno == EPERM
-                               || errno == EACCES || errno == EOPNOTSUPP))
-        return (u64)(s64)l2s_link(c->m, p1.host, h2);   /* pins already closed */
+                               || errno == EACCES || errno == EOPNOTSUPP)) {
+        u64 lret = (u64)(s64)l2s_link(c->m, &p1, &p2);
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
 #endif
-    return host_err();
+    { u64 e = host_err(); path_unpin(&p1); path_unpin(&p2); return e; }
 }
 
 /* A file the guest has mapped just changed size. Shrinking pulls the ground
@@ -2840,13 +2856,14 @@ SYSDEF(statx) {
         if ((rr = path_pin(c->m, canon, host, &pin)) < 0) return (u64)(s64)rr;
         int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
 #ifdef L2S_ENABLED
-        char l2sb[PATH_MAX]; unsigned long l2sc;
-        if (c->m->link2symlink && l2s_target(host, l2sb, &l2sc) == 1) {   /* l2s: by path */
-            /* Present the backing file (regular) with the group's link count. */
-            r = host_statx(AT_FDCWD, l2sb, 0, (unsigned)a3, buf);
+        char l2sb[L2S_NAME_MAX]; unsigned long l2sc;
+        if (c->m->link2symlink && l2s_target(&pin, l2sb, &l2sc) == 1) {
+            /* Present the backing file (regular) with the group's link count.
+             * It lives in the pinned directory, beside the name asked about. */
+            r = host_statx(pin.dfd, l2sb, 0, (unsigned)a3, buf);
             if (r < 0 && errno == ENOSYS) {
                 struct stat st;
-                r = stat(l2sb, &st);
+                r = fstatat(pin.dfd, l2sb, &st, 0);
                 if (r == 0) statx_from_stat(buf, &st);
             }
             if (r == 0) { u32 nl = l2sc ? (u32)l2sc : 1; memcpy(buf + 16, &nl, 4); }
