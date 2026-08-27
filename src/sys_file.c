@@ -794,7 +794,10 @@ SYSDEF(write) {
 
 SYSDEF(readv) {
     u64 nlret;   /* fake netlink socket: as in read */
-    if (nl_is_fd(c->m, (int)a0) && nl_maybe_readv(c, (int)a0, a1, a2, &nlret))
+    /* (unsigned)a2 for the same reason iov_from_guest takes it narrow below:
+     * the kernel's import_iovec truncates the count there too. */
+    if (nl_is_fd(c->m, (int)a0) &&
+        nl_maybe_readv(c, (int)a0, a1, (unsigned)a2, &nlret))
         return nlret;
     procfs_pre_read(c, (int)a0, -1);
     struct iovec iov[1024];
@@ -844,7 +847,8 @@ SYSDEF(readv) {
 }
 
 SYSDEF(writev) {
-    if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, a2);   /* as in write */
+    /* as in write; (unsigned)a2 as in readv above */
+    if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, (unsigned)a2);
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
     GIovec g[1024];

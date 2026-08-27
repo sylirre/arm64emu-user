@@ -31,6 +31,7 @@
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
@@ -304,13 +305,126 @@ static const char *fault_recv(int fd) {
     return out;
 }
 
+/* Guest pointers a *send* cannot read. A kernel reads the msghdr, then the
+ * iovec array, then the message itself out of the caller's memory before it
+ * queues anything (copy_msghdr_from_user / import_iovec / netlink_sendmsg), so
+ * every one of these is EFAULT with nothing sent. Read as "no segments"
+ * instead, a bad pointer became a successful send of nothing -- and on the
+ * substituted socket it left a synthesised reply behind for a receive that
+ * should never have had one, which the final drain here is what catches. Both
+ * tiers must answer the same. */
+static const char *fault_send(int fd) {
+    struct sockaddr_nl snl;
+    struct iovec badbase;
+    struct msghdr mh;
+    char buf[256];
+    void *bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (bad == MAP_FAILED) return "nomap";
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    badbase.iov_base = bad;                  /* a readable array naming an
+                                                unreadable buffer */
+    badbase.iov_len = 64;
+
+    if (write(fd, bad, 64) != -1 || errno != EFAULT) return "write";
+    if (sendto(fd, bad, 64, 0, (struct sockaddr *)&snl, sizeof snl) != -1 ||
+        errno != EFAULT) return "sendto";
+    if (writev(fd, (struct iovec *)bad, 1) != -1 || errno != EFAULT)
+        return "writev-array";
+    if (writev(fd, &badbase, 1) != -1 || errno != EFAULT) return "writev-base";
+    if (sendmsg(fd, (struct msghdr *)bad, 0) != -1 || errno != EFAULT)
+        return "sendmsg-hdr";
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = (struct iovec *)bad;
+    mh.msg_iovlen = 1;
+    if (sendmsg(fd, &mh, 0) != -1 || errno != EFAULT) return "sendmsg-array";
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &badbase;
+    mh.msg_iovlen = 1;
+    if (sendmsg(fd, &mh, 0) != -1 || errno != EFAULT) return "sendmsg-base";
+
+    /* Nothing went out, so nothing may be waiting to come back. */
+    if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) >= 0) return "queued";
+    if (errno != EAGAIN && errno != EWOULDBLOCK) return "queued-err";
+    return "ok";
+}
+
+/* Ask for a dump and drain whatever it produced, so the next check starts from
+ * an empty queue on either tier (a real kernel may split a dump across
+ * datagrams). Returns 0 on failure. */
+static int ask_dump(int fd, unsigned seq) {
+    struct { struct nlmsghdr n; struct rtgenmsg g; } req;
+    struct sockaddr_nl snl;
+
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = sizeof req;
+    req.n.nlmsg_type = RTM_GETADDR;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = seq;
+    req.g.rtgen_family = AF_INET;
+    return sendto(fd, &req, sizeof req, 0,
+                  (struct sockaddr *)&snl, sizeof snl) == (ssize_t)sizeof req;
+}
+
+static void drain(int fd) {
+    char buf[8192];
+    while (recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0)
+        ;
+}
+
+/* The source address a receive writes back. The datagram is delivered first and
+ * the copyout fault is then the call's own result (__sys_recvfrom overwrites
+ * its byte count with move_addr_to_user's error, ____sys_recvmsg the same for
+ * the header) -- and the datagram is gone regardless. Reported as a success,
+ * the caller reads a message it was told came from an address that was never
+ * written. Both tiers must answer the same. */
+static const char *fault_addr(int fd) {
+    struct msghdr mh;
+    struct iovec iov;
+    socklen_t sl;
+    char buf[8192];
+    void *bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (bad == MAP_FAILED) return "nomap";
+
+    if (!ask_dump(fd, 1008)) return "sendfail";
+    sl = sizeof(struct sockaddr_nl);
+    if (recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)bad, &sl) != -1 ||
+        errno != EFAULT) return "recvfrom";
+    drain(fd);
+
+    /* A msghdr the guest cannot even read: EFAULT before anything is taken off
+     * the socket, so the reply is still there afterwards. */
+    if (!ask_dump(fd, 1009)) return "sendfail2";
+    if (recvmsg(fd, (struct msghdr *)bad, 0) != -1 || errno != EFAULT)
+        return "recvmsg-hdr";
+    if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) <= 0) return "consumed";
+    drain(fd);
+
+    if (!ask_dump(fd, 1010)) return "sendfail3";
+    memset(&mh, 0, sizeof mh);
+    iov.iov_base = buf;
+    iov.iov_len = sizeof buf;
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_name = bad;
+    mh.msg_namelen = sizeof(struct sockaddr_nl);
+    if (recvmsg(fd, &mh, 0) != -1 || errno != EFAULT) return "recvmsg-name";
+    drain(fd);
+    return "ok";
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
         printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
-               "frame=skip\nmmsg=skip\nfault=skip\n");
+               "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
+               "addrfault=skip\n");
         return 0;
     }
 
@@ -332,7 +446,8 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
-               "frame=skip\nmmsg=skip\nfault=skip\n");
+               "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
+               "addrfault=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -374,7 +489,8 @@ int main(void) {
      * ENOTCONN, so these must be routed to the emulation like send/recv are. */
     fd = nl_open();
     if (fd < 0) {
-        printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n");
+        printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"
+               "sendfault=skip\naddrfault=skip\n");
         return 0;
     }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
@@ -397,14 +513,22 @@ int main(void) {
     /* Readiness: poll/select/epoll must track whether a reply is waiting, and
      * a caller must be able to wait for one before reading it. */
     fd = nl_open();
-    if (fd < 0) { printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
+               "addrfault=skip\n");
+        return 0;
+    }
     printf("ready=%s\n", readiness_cycle(fd));
     close(fd);
 
     /* Dump framing: the terminator must arrive in a datagram of its own, or a
      * caller that stops walking early never reaches it. */
     fd = nl_open();
-    if (fd < 0) { printf("frame=skip\nmmsg=skip\nfault=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
+               "addrfault=skip\n");
+        return 0;
+    }
     printf("frame=%s\n", dump_walk(fd));
     close(fd);
 
@@ -413,14 +537,30 @@ int main(void) {
      * request into the AF_UNIX stand-in as opaque bytes and read them back --
      * the guest saw its own request echoed instead of a reply. */
     fd = nl_open();
-    if (fd < 0) { printf("mmsg=skip\nfault=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("mmsg=skip\nfault=skip\nsendfault=skip\naddrfault=skip\n");
+        return 0;
+    }
     printf("mmsg=%s\n", mmsg_cycle(fd));
     close(fd);
 
     /* A destination the guest cannot write: EFAULT, not a silent short read. */
     fd = nl_open();
-    if (fd < 0) { printf("fault=skip\n"); return 0; }
+    if (fd < 0) { printf("fault=skip\nsendfault=skip\naddrfault=skip\n"); return 0; }
     printf("fault=%s\n", fault_recv(fd));
+    close(fd);
+
+    /* ...and the pointers a send reads, and the address a receive writes back:
+     * a bad one must fail the call rather than become a successful empty
+     * operation. */
+    fd = nl_open();
+    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\n"); return 0; }
+    printf("sendfault=%s\n", fault_send(fd));
+    close(fd);
+
+    fd = nl_open();
+    if (fd < 0) { printf("addrfault=skip\n"); return 0; }
+    printf("addrfault=%s\n", fault_addr(fd));
     close(fd);
     return 0;
 }

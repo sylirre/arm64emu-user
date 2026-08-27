@@ -474,6 +474,21 @@ go wrong:
   `__netlink_request()` discards, then reads past, anything else); a socket
   naming *itself*, via `getsockname`, still reports its own port id.
 
+  A guest pointer the call cannot reach fails it here exactly as it would on
+  any other socket, rather than becoming a successful empty operation. The
+  `msghdr`, the iovec array and the message itself are all read before anything
+  is queued, in that order, as a kernel reads them (`copy_msghdr_from_user` →
+  `import_iovec` → `netlink_sendmsg`), so an unreadable one is `EFAULT` with
+  nothing sent — and so with nothing left for the read that follows, which is
+  the same "never asked" state described above. A message larger than the
+  socket's send buffer is refused with `EMSGSIZE` ahead of all of it, which the
+  stand-in answers out of its own `SO_SNDBUF` — the same `net.core.wmem_default`
+  a real netlink socket takes it from, and the same value a guest
+  `setsockopt` on the fd would change. Coming back, the source address and the
+  header fields a receive writes are checked too: a writeback that faults is
+  what the call returns, byte count or not, and the datagram is gone either
+  way — which is what `netlink_recvmsg` does with an skb it could not copy out.
+
   The reply is handed back one datagram at a time, with the `NLMSG_DONE` that
   ends a dump in a datagram of its own — which is how the kernel frames one,
   and what callers depend on. fastfetch's default-route lookup stops walking a

@@ -42,6 +42,7 @@
 #include <netpacket/packet.h>
 
 #include "guest_abi.h"
+#include "sys.h"
 #include "sys_netlink.h"
 
 /* ABI-stable rtnetlink constants for the synthesised replies. Defined locally
@@ -1135,8 +1136,11 @@ static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid)
     struct sockaddr_nl snl;
     u32 in_size, out_size;
 
-    if (size_va == 0)
-        return -EINVAL;
+    /* Neither pointer supplied means nothing to write back, which is how
+     * addr_out (sys_net.c) answers the same pair on every socket that does not
+     * go through this emulation -- the two tiers must be indistinguishable. */
+    if (addr_va == 0 || size_va == 0)
+        return 0;
     if (copy_from_guest(c, &in_size, size_va, 4) < 0)
         return -EFAULT;
 
@@ -1144,7 +1148,7 @@ static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid)
     snl.nl_family = AF_NETLINK;
     snl.nl_pid    = nl_pid;
 
-    if (addr_va != 0 && in_size > 0) {
+    if (in_size > 0) {
         u32 copy = in_size < sizeof(snl) ? in_size : (u32) sizeof(snl);
         if (copy_to_guest(c, addr_va, &snl, copy) < 0)
             return -EFAULT;
@@ -1194,12 +1198,47 @@ static ssize_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
 /* socket calls) and sys_file.c (read/write and their vector forms).       */
 /* ==================================================================== */
 
+/* Can the guest back the request at [base, blen)? A kernel copies the whole
+ * message out of the caller's memory before it queues anything
+ * (netlink_sendmsg -> memcpy_from_msg), so a request it cannot read is EFAULT
+ * with nothing sent -- and therefore nothing to read back either, which is the
+ * same "no reply pending" state a socket that was never written to is in.
+ *
+ * Only the head of the message is ever parsed here (build_reply_into reads 256
+ * bytes at most), so the remainder is probed rather than copied. A message
+ * larger than the socket's send buffer never reaches that point on a kernel:
+ * netlink_sendmsg refuses it with EMSGSIZE before reading a byte of it, and the
+ * substitute socket carries the same limit -- it comes from the same sysctl
+ * (net.core.wmem_default) and a guest setsockopt(SO_SNDBUF) on this fd reaches
+ * it. Without that bound a guest could name a length no buffer could hold and
+ * be told all of it was sent. */
+static int nl_request_check(CPU *c, int fd, u64 base, u64 blen)
+{
+    int sndbuf = 0;
+    socklen_t sl = sizeof sndbuf;
+    size_t len;
+
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &sl) == 0 &&
+        sndbuf > 32 && blen > (u64)(sndbuf - 32))
+        return -EMSGSIZE;
+    if (blen == 0)
+        return 0;                      /* an empty message is a valid one */
+    len = rw_count(blen);
+    if ((u64) len != blen || base == 0 ||
+        rw_room(c, base, len, ACC_READ) < len)
+        return -EFAULT;
+    return 0;
+}
+
 /* Record the reply the request at [base, blen) draws, and report the whole
- * request as sent. Called unconditionally, even for a message we couldn't read:
- * build_reply_into always leaves something behind, so no send on this socket
- * can strand a later read. */
+ * request as sent. Called for every message we accepted, even one we couldn't
+ * parse: build_reply_into always leaves something behind, so no *successful*
+ * send on this socket can strand a later read. */
 static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
 {
+    int e = nl_request_check(c, fd, base, blen);
+    if (e < 0) return (u64)(s64) e;
+
     EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(c->m, fd);
     if (i < 0) { EMU_UNLOCK(&nl_lock, EMU_LK_NL); return (u64)(s64)-EBADF; }
@@ -1223,18 +1262,29 @@ static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
 
 /* First segment of a guest iovec array, which is where the netlink callers we
  * care about put their (single) message: multi-iovec netlink requests don't
- * occur for bwrap / glibc / iproute2. Zeroed when there is no such segment. */
-static void nl_first_iovec(CPU *c, u64 iov_va, u64 iov_cnt, u64 *base, u64 *len)
+ * occur for bwrap / glibc / iproute2.
+ *
+ * An empty vector is an empty message (zeroed, and sent as one). An array the
+ * guest cannot back is -EFAULT, which is what import_iovec makes of it -- a
+ * pointer that cannot be read is not a message of no bytes. One longer than
+ * UIO_MAXIOV is refused with @toobig, which differs by caller: iovec_from_user
+ * answers EINVAL for writev, while copy_msghdr_from_user answers EMSGSIZE for
+ * sendmsg (mirrors iov_from_guest / msg_import, sys_file.c and sys_net.c). */
+static int nl_first_iovec(CPU *c, u64 iov_va, u64 iov_cnt, int toobig,
+                          u64 *base, u64 *len)
 {
     GIovec gi;
 
     *base = *len = 0;
-    if (iov_va == 0 || iov_cnt == 0)
-        return;
-    if (copy_from_guest(c, &gi, iov_va, sizeof gi) < 0)
-        return;
+    if (iov_cnt > 1024)
+        return toobig;
+    if (iov_cnt == 0)
+        return 0;
+    if (iov_va == 0 || copy_from_guest(c, &gi, iov_va, sizeof gi) < 0)
+        return -EFAULT;
     *base = gi.iov_base;
     *len  = gi.iov_len;
+    return 0;
 }
 
 u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len)
@@ -1244,23 +1294,31 @@ u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len)
 
 u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va)
 {
-    /* struct msghdr (guest LP64): msg_iov @+16, msg_iovlen @+24. */
+    /* struct msghdr (guest LP64): msg_iov @+16, msg_iovlen @+24. The header is
+     * read in full before anything is sent and a field that cannot be read
+     * fails the call (copy_msghdr_from_user), so a bad pointer here is EFAULT
+     * -- reading it as "no segments" instead reported it as a successful send
+     * of nothing, and left a reply behind for a receive that should never have
+     * had one. */
     u64 iov_va = 0, iov_count = 0, base, blen;
+    int e;
 
-    if (msghdr_va != 0) {
-        if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0 ||
-            copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0)
-            iov_va = iov_count = 0;
-    }
-    nl_first_iovec(c, iov_va, iov_count, &base, &blen);
+    if (msghdr_va == 0)
+        return (u64)(s64)-EFAULT;
+    if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0 ||
+        copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0)
+        return (u64)(s64)-EFAULT;
+    e = nl_first_iovec(c, iov_va, iov_count, -EMSGSIZE, &base, &blen);
+    if (e < 0) return (u64)(s64) e;
     return nl_take_request(c, fd, base, blen);
 }
 
 u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
 {
     u64 base, blen;
+    int e = nl_first_iovec(c, iov_va, iov_cnt, -EINVAL, &base, &blen);
 
-    nl_first_iovec(c, iov_va, iov_cnt, &base, &blen);
+    if (e < 0) return (u64)(s64) e;
     return nl_take_request(c, fd, base, blen);
 }
 
@@ -1333,8 +1391,11 @@ int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
      * how a netlink caller tells a reply apart from a message another socket
      * sent it, and glibc's __netlink_request() drops -- and then reads past --
      * every buffer whose source claims a port id of its own. */
-    if (addr_va != 0 && size_va != 0)
-        (void) nl_write_sockname(c, addr_va, size_va, 0);
+    /* A writeback that faults is the answer the call returns, byte count or
+     * not: __sys_recvfrom overwrites its result with move_addr_to_user's error,
+     * and the datagram is gone either way. */
+    int e = nl_write_sockname(c, addr_va, size_va, 0);
+    if (e < 0) { *ret = (u64)(s64) e; return 1; }
     *ret = (u64)result;
     return 1;
 }
@@ -1344,6 +1405,9 @@ int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
     size_t datagram;
     ssize_t scattered;
 
+    /* As iovec_from_user, and ahead of the receive: too many segments is
+     * EINVAL whether or not a reply is waiting. */
+    if (iov_cnt > 1024) { *ret = (u64)(s64)-EINVAL; return 1; }
     if (iov_va == 0)                   /* nothing to scatter into */
         return 0;
     if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &datagram, &scattered))
@@ -1355,14 +1419,24 @@ int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
 int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
 {
     u64 msg_name = 0, iov_va = 0, iov_count = 0;
+    u32 in_namelen = 0;
     size_t datagram;
     ssize_t scattered;
 
     if (msghdr_va == 0)                /* no header: let the real one EFAULT */
         return 0;
-    if (copy_from_guest(c, &msg_name, msghdr_va, 8) < 0)       msg_name = 0;
-    if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0)    iov_va = 0;
-    if (copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0) iov_count = 0;
+    /* The whole header is read before anything is received, and a field that
+     * cannot be read fails the call there (copy_msghdr_from_user runs ahead of
+     * the receive, so nothing is consumed). Treating an unreadable field as
+     * absent reported a bad pointer as a successful receive. */
+    if (copy_from_guest(c, &msg_name, msghdr_va, 8) < 0 ||
+        copy_from_guest(c, &in_namelen, msghdr_va + 8, 4) < 0 ||
+        copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0 ||
+        copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0) {
+        *ret = (u64)(s64)-EFAULT;
+        return 1;
+    }
+    if (iov_count > 1024) { *ret = (u64)(s64)-EMSGSIZE; return 1; }
 
     if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_count, flags,
                        &datagram, &scattered))
@@ -1374,22 +1448,41 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
     size_t result = (flags & MSG_TRUNC) ? datagram : (size_t)scattered;
 
     /* Hand back a kernel sockaddr_nl (nl_pid == 0) as the source, and set
-     * msg_namelen accordingly; glibc's getifaddrs() inspects it. */
+     * msg_namelen accordingly; glibc's getifaddrs() inspects it. This is
+     * recvmsg_writeback (sys_net.c) again, reached only when the caller named a
+     * msg_name: truncate to the room offered, always report the real length --
+     * even when no room was offered at all -- and let a writeback that faults be
+     * what the call returns. The datagram is gone by then, which is what a
+     * kernel does with an skb it could not copy out. */
     if (msg_name != 0) {
-        u32 in_namelen;
-        if (copy_from_guest(c, &in_namelen, msghdr_va + 8, 4) == 0 && in_namelen > 0) {
-            struct sockaddr_nl snl;
-            u32 copy = in_namelen < sizeof(snl) ? in_namelen : (u32) sizeof(snl);
-            memset(&snl, 0, sizeof(snl));
-            snl.nl_family = AF_NETLINK;
-            (void) copy_to_guest(c, msg_name, &snl, copy);
-            u32 real = sizeof(snl);
-            (void) copy_to_guest(c, msghdr_va + 8, &real, 4);
+        struct sockaddr_nl snl;
+        u32 real = (u32) sizeof(snl);
+        u32 copy = in_namelen < sizeof(snl) ? in_namelen : (u32) sizeof(snl);
+        memset(&snl, 0, sizeof(snl));
+        snl.nl_family = AF_NETLINK;
+        if (copy > 0 && copy_to_guest(c, msg_name, &snl, copy) < 0) {
+            *ret = (u64)(s64)-EFAULT;
+            return 1;
+        }
+        if (copy_to_guest(c, msghdr_va + 8, &real, 4) < 0) {
+            *ret = (u64)(s64)-EFAULT;
+            return 1;
         }
     }
     /* msg_flags @+48 (guest LP64): MSG_TRUNC iff the datagram didn't fit. */
     u32 mf = ((size_t)scattered < datagram) ? MSG_TRUNC : 0;
-    (void) copy_to_guest(c, msghdr_va + 48, &mf, 4);
+    if (copy_to_guest(c, msghdr_va + 48, &mf, 4) < 0) {
+        *ret = (u64)(s64)-EFAULT;
+        return 1;
+    }
+    /* msg_controllen @+40: the bytes of control data delivered, which is none
+     * -- no NETLINK_PKTINFO here. The kernel writes it unconditionally, so a
+     * caller cannot be left reading its own request value back as an answer. */
+    u64 cl = 0;
+    if (copy_to_guest(c, msghdr_va + 40, &cl, 8) < 0) {
+        *ret = (u64)(s64)-EFAULT;
+        return 1;
+    }
 
     *ret = (u64)result;
     return 1;
