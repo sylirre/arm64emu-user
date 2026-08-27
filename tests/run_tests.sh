@@ -1381,6 +1381,35 @@ else
     skip_build "fixtures/sigactorder"
 fi
 
+# ---- execve/execveat with a null or empty argv/envp. Linux counts a null
+# vector as an empty one and then gives the new image a single empty string as
+# argv[0], so a program that starts at argv[1] cannot walk into envp. A fixture
+# and not a C differential test: the cases clear the environment, and qemu-user's
+# own re-exec of a dynamic binary needs QEMU_LD_PREFIX to survive there, so its
+# children die in the loader printing nothing. The block below is what a real
+# kernel prints for this program natively (statically linked, qemu agrees with
+# it too). Pre-fix the three null-vector cases answered execve-failed e=14 and
+# the empty-argv one handed the new image argc=0. ----
+if [ ! -x tests/fixtures/execnullv.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/execnullv.bin \
+        tests/fixtures/execnullv.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/execnullv.bin ]; then
+    expect=$'keptargv argc=2 arg0=kept envc=0\nnullboth argc=1 arg0=empty envc=0\nnullargv argc=1 arg0=empty envc=1\nemptyargv argc=1 arg0=empty envc=1'
+    for eng in "" "--jit"; do
+        lbl="fixture: execnullv${eng:+ (jit)}"
+        got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/execnullv.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS $lbl"
+        else
+            fail=$((fail+1)); echo "FAIL $lbl"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+    done
+    fx_rm tests/fixtures/execnullv.bin
+else
+    skip_build "fixtures/execnullv"
+fi
+
 # ---- a read/write count is a guest 64-bit value the emulator has to turn into
 # a host size_t and a bounce buffer. Self-checking: qemu-user validates the
 # whole [buf, buf+count) range before the call and answers EFAULT for every row

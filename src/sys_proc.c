@@ -606,11 +606,16 @@ SYSDEF(clone) {
     return (u64)pid;
 }
 
-/* Import a guest pointer-array (argv/envp) into a host string vector. */
+/* Import a guest pointer-array (argv/envp) into a host string vector. A null
+ * vector is an empty one, not a fault: execve(2)'s count() walks the array only
+ * `if (argv.ptr.native != NULL)` and returns 0 otherwise, so execve(path, NULL,
+ * NULL) is a legal call. Dereferencing it unconditionally answered EFAULT for
+ * one the kernel accepts. */
 static char **import_strvec(CPU *c, u64 va, int *err) {
     int cap = 16, n = 0;
     char **vec = malloc(sizeof(char *) * (size_t)cap);
     if (!vec) { *err = -ENOMEM; return NULL; }
+    if (va == 0) { vec[0] = NULL; return vec; }
     for (;;) {
         u64 p;
         if (copy_from_guest(c, &p, va + (u64)n * 8, 8) < 0) { *err = -EFAULT; goto fail; }
@@ -1237,6 +1242,19 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
 
     char **argv = dup_strvec(argv_in);   /* private working copy */
     if (!argv) return (u64)(s64)-ENOMEM;
+    /* An empty argv becomes a single empty string, as do_execveat_common has
+     * done since v5.18: the new image is entitled to an argv[0], and a program
+     * that starts reading at argv[1] would otherwise walk straight into envp.
+     * The shebang rewrite below drops argv[0] and relies on there being one. */
+    if (!argv[0]) {
+        char **nv = malloc(sizeof(char *) * 2);
+        if (!nv) { free_strvec(argv); return (u64)(s64)-ENOMEM; }
+        nv[0] = strdup("");
+        if (!nv[0]) { free(nv); free_strvec(argv); return (u64)(s64)-ENOMEM; }
+        nv[1] = NULL;
+        free_strvec(argv);
+        argv = nv;
+    }
 
     for (int depth = 0; ; depth++) {
         if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }

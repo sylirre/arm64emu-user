@@ -923,6 +923,15 @@ the emulator's own path. `do_execve` takes private copies of argv/envp — the
 caller retains ownership (a subtle earlier use-after-free lives in the git
 history).
 
+A **null** argv or envp is an empty vector, not a fault: `count()` in `fs/exec.c`
+walks the array only when the pointer is non-null, so `execve(path, NULL, NULL)`
+is a call a kernel accepts and `import_strvec` dereferencing it unconditionally
+answered `EFAULT` for it. An **empty** argv then gets a single empty string as
+`argv[0]`, as `do_execveat_common` has done since v5.18: the new image is
+entitled to an `argv[0]`, and a program that starts reading at `argv[1]` would
+otherwise walk straight into `envp`. The shebang rewrite below relies on there
+being one too, since it replaces `argv[0]` with the script path.
+
 Everything else the loader can refuse is refused there too, by `elf_probe`
 (`elf.c`), which validates the ELF header and opens the interpreter it names
 *without touching the address space*. It has to run first because the reload is
