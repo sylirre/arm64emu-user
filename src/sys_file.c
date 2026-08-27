@@ -2433,7 +2433,14 @@ SYSDEF(sendfile) {
         off = (off_t)g;
         offp = &off;
     }
-    ssize_t n = sendfile((int)a0, (int)a1, offp, (size_t)a3);
+    /* The count is a guest 64-bit size_t, and the host's is 32 bits wide on an
+     * ILP32 build: clamp before the cast (rw_count), exactly as do_sendfile
+     * clamps it to MAX_RW_COUNT. Cast first and a count at or above 4 GB wraps
+     * into an unrelated small one -- zero for an exact multiple -- and moves
+     * the wrong number of bytes while reporting success. The clamp costs
+     * nothing observable: a short transfer is what sendfile(2) returns for a
+     * count the kernel clamped, and callers loop on it. */
+    ssize_t n = sendfile((int)a0, (int)a1, offp, rw_count(a3));
     if (n < 0) return host_err();
     if (offp) {
         s64 g = off;
@@ -2750,11 +2757,16 @@ SYSDEF(splice) {
     if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    /* len is a guest 64-bit size_t: clamp it before it becomes a host one, or
+     * an ILP32 build turns a >= 4 GB request into an unrelated small one (see
+     * sendfile). splice(2) is always free to move less than asked -- a pipe
+     * bounds it anyway -- so the clamp is invisible to a looping caller. */
+    size_t len = rw_count(a4);
     ssize_t n;
 #ifdef __BIONIC__
-    n = syscall(SYS_splice, (int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+    n = syscall(SYS_splice, (int)a0, inp, (int)a2, outp, len, (unsigned)a5);
 #else
-    n = splice((int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+    n = splice((int)a0, inp, (int)a2, outp, len, (unsigned)a5);
 #endif
     if (n < 0) return host_err();
     if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }
@@ -2770,11 +2782,15 @@ SYSDEF(copy_file_range) {
     if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    /* Clamped before the cast like splice's, and here the kernel does exactly
+     * the same thing itself: generic_copy_file_checks caps the count at
+     * MAX_RW_COUNT and reports the short copy. */
+    size_t len = rw_count(a4);
     ssize_t n;
 #ifdef __BIONIC__
-    n = syscall(SYS_copy_file_range, (int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+    n = syscall(SYS_copy_file_range, (int)a0, inp, (int)a2, outp, len, (unsigned)a5);
 #else
-    n = copy_file_range((int)a0, inp, (int)a2, outp, (size_t)a4, (unsigned)a5);
+    n = copy_file_range((int)a0, inp, (int)a2, outp, len, (unsigned)a5);
 #endif
     if (n < 0) return host_err();
     if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }

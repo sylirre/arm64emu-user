@@ -121,6 +121,20 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   its buffer (the message would arrive truncated, and it is gone once received)
   and `sendto` may not either (it would be sent truncated where the kernel
   refuses it whole), so those clamp only (`tests/fixtures/bigcount.c`).
+- *The same count, on the calls that never build a bounce buffer.* `sendfile`,
+  `splice` and `copy_file_range` hand the guest's count straight to the host,
+  and `getrandom`/`add_key` bound it themselves — all five cast it to a host
+  `size_t` first, which on an ILP32 host is where a 4 GB request became a small
+  one or, for an exact multiple, nothing at all: a transfer that moved no
+  bytes and reported success, `getrandom` handing back no entropy, and a
+  payload length over the kernel's 1 MB cap reading as *no payload*, so
+  `add_key` created the key a kernel answers **`EINVAL`** for. All five clamp
+  the guest value before the cast now, which is what the kernel does with them
+  too (`do_sendfile` and `generic_copy_file_checks` cap at `MAX_RW_COUNT`,
+  `import_ubuf` caps `getrandom`'s iterator); `getrandom` also bounds the fill
+  by `rw_room`, since it fills a bounce buffer of its own and a kernel stops
+  where the caller's memory ends. `tests/fixtures/hugecount.c` covers the five,
+  and is self-checking for the same reason `bigcount.c` is.
 - *The vector calls need the same bound, per segment* (`iov_from_guest`,
   `sys_file.c`). `readv`/`writev` and the `p*v*` family stage the whole gather
   in one bounce buffer before the transfer, so an unbounded import let a guest

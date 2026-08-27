@@ -57,10 +57,22 @@ int host_random_bytes(void *buf, size_t len) {
 }
 
 SYSDEF(getrandom) {
-    size_t len = (size_t)a1;
+    /* The length is a guest 64-bit size_t. Bound it while it still is one: on
+     * an ILP32 build the cast alone turns a >= 4 GB request into an unrelated
+     * small one -- zero for an exact multiple, i.e. "no bytes for you" where
+     * the kernel hands out a bufferful. Serving less than asked is the
+     * syscall's own contract above 256 bytes (its callers loop), and the
+     * kernel bounds it too: import_ubuf caps the iterator at MAX_RW_COUNT. */
     unsigned flags = (unsigned)a2;
-    if (len > 65536) len = 65536;
     u8 buf[65536];
+    size_t len = a1 > sizeof buf ? sizeof buf : (size_t)a1;
+    /* Then by the guest's own buffer, the way the kernel's iterator is bounded
+     * by the caller's: it fills as far as that memory goes and reports the
+     * short count, and answers EFAULT only when it could not place a single
+     * byte. Without this the bounce below is copied out whole, so a caller
+     * that names more than it mapped -- which a clamped huge count makes easy
+     * -- got EFAULT where a kernel hands it a bufferful. */
+    if (len && !(len = rw_room(c, a0, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     if (!getenv("A64_GETRANDOM_FORCE_DEV")) {
         ssize_t n = syscall(SYS_getrandom, buf, len, flags);
         if (n >= 0) {
@@ -702,8 +714,12 @@ SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
     char type[64], desc[256];
     if (copy_str_from_guest(c, type, a0, sizeof type) < 0) return (u64)(s64)-EFAULT;
     if (copy_str_from_guest(c, desc, a1, sizeof desc) < 0) return (u64)(s64)-EFAULT;
+    /* The kernel's payload cap, tested on the guest's own 64-bit value: cast
+     * to a 32-bit host size_t first and a payload length at or above 4 GB
+     * wraps under the limit -- zero for an exact multiple, which then reads as
+     * "no payload" and creates an empty key where the kernel answers EINVAL. */
+    if (a3 > (1u << 20)) return (u64)(s64)-EINVAL;
     size_t plen = (size_t)a3;
-    if (plen > (1u << 20)) return (u64)(s64)-EINVAL;
     u8 *pl = NULL;
     if (a2 && plen) {
         pl = malloc(plen);

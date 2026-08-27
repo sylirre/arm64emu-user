@@ -1349,6 +1349,29 @@ else
     skip_build "fixtures/bigcount"
 fi
 
+# ---- the same guest 64-bit count on the paths that never build a bounce
+# buffer: sendfile/splice/copy_file_range hand it straight to the host, and
+# getrandom/add_key bound it themselves. Self-checking for the same reason as
+# bigcount above; two rows are yes/no because the number is the host's to pick
+# (a pipe's capacity) or the feature may be missing (copy_file_range before
+# 4.5, keyrings on Android). ----
+if [ ! -x tests/fixtures/hugecount.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/hugecount.bin \
+        tests/fixtures/hugecount.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/hugecount.bin ]; then
+    expect=$'huge-sendfile 204800 1\nhuge-splice 1\nhuge-cfr 1\nshort-getrandom 4096 1\nhuge-addkey 1'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/hugecount.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: hugecount"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: hugecount"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/hugecount.bin
+else
+    skip_build "fixtures/hugecount"
+fi
+
 # ---- recvmmsg's timeout. A relative CLOCK_MONOTONIC span the kernel validates
 # before receiving anything, checks after every datagram, and writes the
 # remainder of back on a call that received one -- all of which the emulator
