@@ -1671,6 +1671,56 @@ done"
     fi
 fi
 
+# ---- rootfs containment against a path race. The emulator resolves a guest
+# path itself and then asks the host to resolve the result again; a guest thread
+# renaming a symlink into that path between the two used to redirect the syscall
+# wherever it pointed -- and a symlink is resolved by the HOST against the
+# host's root, so "/" was the whole filesystem. Self-checking twice over: the
+# fixture counts every sighting of a host file that an honest lookup cannot
+# reach, and the harness checks from out here that none of the creations the
+# fixture aimed through the raced path landed on the host, and that the two host
+# objects it tried to destroy are still there. Needs a real rootfs (a run at "/"
+# has nothing to escape from) and a writable host /tmp to keep the victims in.
+# Verified to catch the original bug: with any one of these syscalls back on its
+# pre-fix "resolve to a string, hand the string to the host" form, the fixture
+# reports thousands of escapes in three seconds, and /tmp/a64_race_mkdir appears
+# on the host. ----
+if [ -n "$AGCC" ] && [ -d "$ALPINE" ] && [ -w /tmp ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/pathrace.bin \
+            tests/fixtures/pathrace.c $A64_TESTLIBS 2>/dev/null; then
+        rm -rf /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
+               /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
+               /tmp/a64_race_rmdir /tmp/a64_toctou_victim /tmp/a64_toctou_unlinkme
+        head -c 4242 /dev/urandom > /tmp/a64_toctou_victim
+        echo keep-me > /tmp/a64_toctou_unlinkme
+        mkdir -p /tmp/a64_race_rmdir
+        rm -rf "$ALPINE/a64race"
+        cp tests/fixtures/pathrace.bin "$ALPINE/tmp/ci_pathrace"
+        got=$(timeout -k 5 120 "$EMU" "$ALPINE" /tmp/ci_pathrace 3 2>/dev/null)
+        planted=$(ls -d /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
+                        /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
+                        2>/dev/null | wc -l)
+        kept=no
+        [ -f /tmp/a64_toctou_unlinkme ] && [ -d /tmp/a64_race_rmdir ] && \
+            [ "$(stat -c %s /tmp/a64_toctou_victim 2>/dev/null)" = 4242 ] && kept=yes
+        expect=$'escaped=0\ntries=enough\ndone'
+        if [ "$got" = "$expect" ] && [ "$planted" = 0 ] && [ "$kept" = yes ]; then
+            pass=$((pass+1)); echo "PASS fixture: pathrace"
+        else
+            fail=$((fail+1))
+            echo "FAIL fixture: pathrace (planted=$planted host-objects-kept=$kept)"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -rf /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
+               /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
+               /tmp/a64_race_rmdir /tmp/a64_toctou_victim /tmp/a64_toctou_unlinkme
+        rm -rf "$ALPINE/a64race" "$ALPINE/tmp/ci_pathrace"
+        fx_rm tests/fixtures/pathrace.bin
+    else
+        skip_build "fixtures/pathrace"
+    fi
+fi
+
 # ---- the id-taking syscalls (kill/tkill/tgkill/rt_sigqueueinfo, nice and the
 # scheduler family) must not reach a host process. Self-checking: qemu-user
 # passes every id straight through, so it answers "ok" for exactly the cases

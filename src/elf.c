@@ -181,12 +181,18 @@ static u64 stack_push(struct Machine *m, u64 *sp, const void *data, size_t len) 
 /* Open a guest program for loading. `canon` may be NULL. Returns a descriptor
  * or -errno. */
 static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
-    char host_path[PATH_MAX];
-    int r = path_resolve(m, G_AT_FDCWD, guest_path, 0, host_path, canon);
+    PathPin pin;
+    char own[PATH_MAX];
+    int r = path_resolve(m, G_AT_FDCWD, guest_path, 0, pin.host, own);
     if (r < 0) return r;
+    if (canon) strcpy(canon, own);
+    if ((r = path_pin(m, own, pin.host, &pin)) < 0) return r;
+    const char *host_path = pin.host;
     int fd;
     if (proc_own_fd_denied(host_path)) { fd = -1; errno = EACCES; }
-    else fd = open(host_path, O_RDONLY | O_CLOEXEC);
+    else fd = openat(pin.dfd, pin.name,
+                     O_RDONLY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
+    { int e = errno; path_unpin(&pin); errno = e; }
     if (fd < 0) {
         /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
          * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --

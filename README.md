@@ -349,9 +349,11 @@ src/
                 host register-pair halves, only destinations allocated
     jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c        rootfs containment resolver, bind table (runtime mount/umount/
-                pivot_root; process-shared, private per faked mount namespace),
-                tmpfs backing dirs, /proc & /dev special cases
+  path.c        rootfs containment resolver handing every syscall a pinned
+                parent-directory fd rather than a re-resolvable path string,
+                bind table (runtime mount/umount/pivot_root; process-shared,
+                private per faked mount namespace), tmpfs backing dirs,
+                /proc & /dev special cases
   syscall.c sys_*.c   dispatcher + per-area handlers (~225 syscalls)
   strace.c      --strace-full argument decoder (flags, strings, structs, errno)
   sys_procfs.c  synthesized guest /proc (maps, cmdline, mounts, stat, the

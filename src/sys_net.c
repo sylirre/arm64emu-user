@@ -6,8 +6,9 @@
  * pathname sockets carry a filesystem path in sun_path, so bind/connect/sendto/
  * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
  * the kernel reports back is stripped to its guest view (unix_path_out). A
- * translated path that overflows the 108-byte sun_path is reached relative to a
- * parent-directory fd via /proc/self/fd (unix_path_in fallback). Abstract
+ * translated path is reached relative to its PINNED parent-directory fd via
+ * /proc/self/fd (unix_path_in), which both contains it against a concurrent
+ * rename and leaves only the basename to fit the 108 bytes. Abstract
  * sockets, which have no filesystem node, are instead isolated per rootfs by a
  * name tag (abs_tag_in/out) unless --share-abstract-sockets is given. */
 #include <fcntl.h>
@@ -159,31 +160,32 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
         gpath[i] = un->sun_path[i];
     }
     gpath[i] = 0;
-    char host[PATH_MAX];
+    PathPin pin;
+    char canon[PATH_MAX];
     int r = path_resolve(c->m, G_AT_FDCWD, gpath,
-                         follow ? 0 : PATH_NOFOLLOW_LAST, host, NULL);
+                         follow ? 0 : PATH_NOFOLLOW_LAST, pin.host, canon);
     if (r < 0) return r;
-    size_t hl = strlen(host);
-    if (hl + 1 <= sizeof un->sun_path) {       /* fits directly */
-        memcpy(un->sun_path, host, hl + 1);
+    if ((r = path_pin(c->m, canon, pin.host, &pin)) < 0) return r;
+    if (!pin.pinned) {                         /* nothing to pin (the /proc zone) */
+        size_t hl = strlen(pin.host);
+        if (hl + 1 > sizeof un->sun_path) { path_unpin(&pin); return -ENAMETOOLONG; }
+        memcpy(un->sun_path, pin.host, hl + 1);
         *sl = (socklen_t)(poff + hl + 1);
         return 0;
     }
-    /* Overlong: bind/connect relative to the parent dir so only the basename
-     * lands in sun_path. Needs a caller that will close the returned fd. */
-    if (!dirfd_out) return -ENAMETOOLONG;
-    char *slash = strrchr(host, '/');
-    if (!slash || slash == host) return -ENAMETOOLONG;   /* need a real parent */
-    *slash = 0;                                /* host := parent dir */
-    const char *base = slash + 1;
-    int dfd = open(host, O_PATH | O_DIRECTORY | O_CLOEXEC);
-    if (dfd < 0) return -errno;
+    /* Pinned: name the socket through its parent's descriptor, so no rename can
+     * redirect the bind or connect (the kernel follows that magic symlink to
+     * the directory the walk found). This is also what makes a path too long
+     * for the 108-byte sun_path work at all -- only the basename has to fit --
+     * which is why it was already the shape of the overlong fallback. The
+     * caller closes *dirfd_out once the syscall has run. */
+    if (!dirfd_out) { path_unpin(&pin); return -ENAMETOOLONG; }
     char proc[sizeof un->sun_path];
-    int n = snprintf(proc, sizeof proc, "/proc/self/fd/%d/%s", dfd, base);
-    if (n < 0 || (size_t)n >= sizeof proc) { close(dfd); return -ENAMETOOLONG; }
+    int n = snprintf(proc, sizeof proc, "/proc/self/fd/%d/%s", pin.dfd, pin.base);
+    if (n < 0 || (size_t)n >= sizeof proc) { path_unpin(&pin); return -ENAMETOOLONG; }
     memcpy(un->sun_path, proc, (size_t)n + 1);
     *sl = (socklen_t)(poff + (size_t)n + 1);
-    *dirfd_out = dfd;
+    *dirfd_out = pin.dfd;                      /* handed to the caller to close */
     return 0;
 }
 

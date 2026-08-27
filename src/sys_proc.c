@@ -1193,10 +1193,13 @@ static int self_groups(u32 *out, int max) {
  * needs the second too -- but that is not this function's business: the header
  * read in do_execve's resolution loop reports it, still ahead of the point of
  * no return. */
-static int exec_perm_check(struct Machine *m, const char *host) {
+static int exec_perm_check(struct Machine *m, const PathPin *p) {
+    const char *host = p->host;
     struct stat st;
     int by_fd = 0;
-    if (proc_own_fd_denied(host) ? (errno = EACCES, 1) : stat(host, &st) != 0) {
+    int hf = p->pinned ? AT_SYMLINK_NOFOLLOW : 0;   /* the walk already followed */
+    if (proc_own_fd_denied(host) ? (errno = EACCES, 1)
+                                 : fstatat(p->dfd, p->name, &st, hf) != 0) {
         /* One of our own fds on a host that refuses to re-open it (Android
          * denies it for memfds): ask the descriptor itself. Anything else
          * keeps the errno the host gave -- a path that names nothing (a
@@ -1216,7 +1219,7 @@ static int exec_perm_check(struct Machine *m, const char *host) {
          * that put access(2) back on the fallback path would be caught.) */
         if (!by_fd)
             return (proc_own_fd_denied(host) ? (errno = EACCES, -1)
-                                             : access(host, X_OK)) == 0
+                                             : access_pinned(p, X_OK)) == 0
                        ? 0 : -EACCES;
         /* It did not: the file was reached through the descriptor, and asking
          * the same path again would reproduce the same refusal and hand it to
@@ -1235,7 +1238,8 @@ static int exec_perm_check(struct Machine *m, const char *host) {
 
 u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     struct Machine *m = c->m;
-    char host[PATH_MAX], canon[PATH_MAX];
+    PathPin pin;
+    char canon[PATH_MAX];
     char pathbuf[PATH_MAX];
 
     snprintf(pathbuf, sizeof pathbuf, "%s", gpath);
@@ -1258,19 +1262,33 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
 
     for (int depth = 0; ; depth++) {
         if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }
-        int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, host, canon);
+        int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, pin.host, canon);
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        /* Pinned for everything this loop asks about the image -- permission,
+         * header, and (past the loop) the setuid bits -- so a rename cannot
+         * slip a different file in between the questions. */
+        r = path_pin(m, canon, pin.host, &pin);
+        if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        const char *host = pin.host;
         /* Both the script and the interpreter it names have to be executable,
          * which is why this sits inside the loop. */
-        r = exec_perm_check(m, host);
-        if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        r = exec_perm_check(m, &pin);
+        if (r < 0) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)r; }
         unsigned char hdr[256];
         size_t n;
-        FILE *f = proc_own_fd_denied(host) ? (errno = EACCES, NULL)
-                                           : fopen(host, "rb");
-        if (f) {
-            n = fread(hdr, 1, sizeof hdr, f);
-            fclose(f);
+        int hfd = proc_own_fd_denied(host)
+                      ? (errno = EACCES, -1)
+                      : openat(pin.dfd, pin.name,
+                               O_RDONLY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
+        if (hfd >= 0) {
+            ssize_t hn = pread(hfd, hdr, sizeof hdr, 0);
+            close(hfd);
+            if (hn < 0) {
+                path_unpin(&pin);
+                free_strvec(argv);
+                return host_err();
+            }
+            n = (size_t)hn;
         } else {
             /* The path names one of our own fds and the host refused the
              * re-open (Android denies it for memfds — apk's triggers): read
@@ -1283,6 +1301,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             int ofd = proc_own_fd_path(host);
             ssize_t pn = ofd >= 0 ? pread(ofd, hdr, sizeof hdr, 0) : -1;
             if (pn < 0) {
+                path_unpin(&pin);
                 free_strvec(argv);
                 return (u64)(s64)(ofd >= 0 ? -errno : -e);
             }
@@ -1324,9 +1343,11 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             free_strvec(argv);          /* free the previous working copy */
             argv = nv;
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
+            path_unpin(&pin);
             continue;
         }
-        if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;
+        if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;   /* pin held past here */
+        path_unpin(&pin);
         free_strvec(argv);
         return (u64)(s64)-ENOEXEC;
     }
@@ -1336,12 +1357,12 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * refuse it to. Past the point of no return below, load_elf's failure can
      * only kill the process, where a kernel hands the shell its ENOEXEC. */
     int pr = elf_probe(m, pathbuf);
-    if (pr < 0) { free_strvec(argv); return (u64)(s64)pr; }
+    if (pr < 0) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)pr; }
 
     /* Copy envp too: load_elf reads it after as_destroy, and the caller's
      * copy must survive for its own free. */
     char **envp_copy = dup_strvec(envp);
-    if (!envp_copy) { free_strvec(argv); return (u64)(s64)-ENOMEM; }
+    if (!envp_copy) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOMEM; }
 
     /* setuid/setgid bit on the final ELF (`host` holds its resolved path).
      * "Disregard actual filesystem ownership": the file's guest-visible owner
@@ -1359,7 +1380,8 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     u32 new_euid = 0, new_egid = 0;
     if (m->fake_id) {
         struct stat est;
-        if (stat(host, &est) == 0) {
+        if (fstatat(pin.dfd, pin.name, &est,
+                    pin.pinned ? AT_SYMLINK_NOFOLLOW : 0) == 0) {
             if (est.st_mode & S_ISUID)
                 { raise_uid = 1; new_euid = remap_uid(m, est.st_uid); }
             if (est.st_mode & S_ISGID)
@@ -1372,6 +1394,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * comes after resolution and the shebang loop deliberately -- ENOENT and
      * ENOEXEC must leave the group untouched, exactly as they do on a kernel,
      * where de_thread runs only once the binary is known to be loadable. */
+    path_unpin(&pin);        /* nothing below names the image by path again */
     int carrier_is_me = 1;
     int dt = dethread_begin(c, pathbuf, &carrier_is_me);
     if (dt < 0) { free_strvec(argv); free_strvec(envp_copy); return (u64)(s64)dt; }
@@ -1497,15 +1520,19 @@ SYSDEF(execveat) {
         if (fcntl((int)(s32)a0, F_GETFD) < 0) return (u64)(s64)-EBADF;
         snprintf(exec_path, sizeof exec_path, "/proc/self/fd/%d", (int)(s32)a0);
     } else {
-        char host[PATH_MAX], canon[PATH_MAX];
+        PathPin pin;
+        char canon[PATH_MAX];
         int r = path_resolve(c->m, (int)(s32)a0, gpath,
                              (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0,
-                             host, canon);
+                             pin.host, canon);
         if (r < 0) return (u64)(s64)r;
         if (gf & G_AT_SYMLINK_NOFOLLOW) {
+            if ((r = path_pin(c->m, canon, pin.host, &pin)) < 0) return (u64)(s64)r;
             struct stat st;
-            if (lstat(host, &st) == 0 && S_ISLNK(st.st_mode))
-                return (u64)(s64)-ELOOP;   /* kernel: refuse a final symlink */
+            int isl = fstatat(pin.dfd, pin.name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                      S_ISLNK(st.st_mode);
+            path_unpin(&pin);
+            if (isl) return (u64)(s64)-ELOOP;   /* kernel: refuse a final symlink */
         }
         snprintf(exec_path, sizeof exec_path, "%s", canon);
     }

@@ -407,7 +407,7 @@ static int *g_nbinds = &g_bindtab_fallback.n;
 static unsigned *g_bindseq = &g_bindtab_fallback.nextseq;
 
 static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
-                     size_t *glen_out, unsigned *seq_out);
+                     size_t *glen_out, unsigned *seq_out, unsigned *hroot_out);
 
 void bindtab_init(void) {
     void *p = mmap(NULL, sizeof(struct BindTab), PROT_READ | PROT_WRITE,
@@ -439,7 +439,8 @@ void bindtab_unshare(void) {
     if (n > BIND_MAX) n = BIND_MAX;
     for (int i = 0; i < n; i++) {
         unsigned sq;
-        if (!bind_snap(i, NULL, t->e[i].guest, t->e[i].host, NULL, &sq)) continue;
+        if (!bind_snap(i, NULL, t->e[i].guest, t->e[i].host, NULL, &sq,
+                       &t->e[i].hroot)) continue;
         t->e[i].ro = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
         t->e[i].seq = sq;
         t->e[i].lock = 0;     /* fresh region: nothing has ever written here */
@@ -707,7 +708,7 @@ void tmpfs_sweep_stale(void) {
  * snapshot, 0 otherwise -- and a mount a concurrent umount removes under the
  * reader is exactly as legitimate an outcome as one removed just before it. */
 static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
-                     size_t *glen_out, unsigned *seq_out) {
+                     size_t *glen_out, unsigned *seq_out, unsigned *hroot_out) {
     const struct Bind *e = &g_binds[i];
     for (int tries = 0; tries < 64; tries++) {
         if (__atomic_load_n(&e->active, __ATOMIC_SEQ_CST) != 1) return 0;
@@ -733,31 +734,38 @@ static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
         if (__atomic_load_n(&e->active, __ATOMIC_SEQ_CST) != 1) return 0;
         if (glen_out) *glen_out = gl;
         if (seq_out)  *seq_out = sq;
+        if (hroot_out) {
+            unsigned hr = __atomic_load_n(&e->hroot, __ATOMIC_RELAXED);
+            *hroot_out = hr <= hl ? hr : (unsigned)hl;
+        }
         return 1;
     }
     return 0;
 }
 
-static int bind_match(struct Machine *m, const char *canon, char *host_out) {
+static int bind_match(struct Machine *m, const char *canon, char *host_out,
+                     size_t *hroot) {
     (void)m;
     char host[PATH_MAX];
     int best = -1;
     size_t bestlen = 0;
     unsigned bestseq = 0;
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
+    unsigned besthr = 0;
     for (int i = 0; i < n; i++) {
         size_t gl;
-        unsigned sq;
-        if (!bind_snap(i, canon, NULL, host, &gl, &sq)) continue;
+        unsigned sq, hr;
+        if (!bind_snap(i, canon, NULL, host, &gl, &sq, &hr)) continue;
         /* Longest prefix wins; on a tie the *topmost* (latest) mount does, as
          * on a real mount stack -- pivot_root's second step deliberately mounts
          * the old root over the new one and then detaches it again. */
         if (best < 0 || gl > bestlen || (gl == bestlen && sq > bestseq)) {
-            best = i; bestlen = gl; bestseq = sq;
+            best = i; bestlen = gl; bestseq = sq; besthr = hr;
             memcpy(host_out, host, strlen(host) + 1);   /* stage the winner */
         }
     }
     if (best < 0) return 0;
+    if (hroot) *hroot = besthr;   /* how much of the mount's root is host-owned */
     int r = join_host(host_out, canon + bestlen, host_out);   /* appends in place */
     return r < 0 ? r : 1;
 }
@@ -773,7 +781,7 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
     int n = __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST);
     for (int i = 0; i < n; i++) {
         unsigned sq;
-        if (!bind_snap(i, NULL, guest, host, NULL, &sq)) continue;
+        if (!bind_snap(i, NULL, guest, host, NULL, &sq, NULL)) continue;
         size_t hl = strlen(host);
         if (strncmp(hostpath, host, hl)) continue;
         if (hostpath[hl] != 0 && hostpath[hl] != '/') continue;
@@ -798,7 +806,8 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
 /* Runtime bind-table mutation (machine.h). Lock-free: a slot is claimed by
  * CAS'ing active 0 -> -1, filled, then published with a store to 1; readers
  * (bind_match/bind_of_host above) skip anything not observed as 1. */
-int bind_add(struct Machine *m, const char *guest_canon, const char *host, int ro) {
+int bind_add(struct Machine *m, const char *guest_canon, const char *host,
+             unsigned hroot, int ro) {
     (void)m;
     if (strlen(guest_canon) + 1 > PATH_MAX || strlen(host) + 1 > PATH_MAX)
         return -ENAMETOOLONG;
@@ -819,6 +828,7 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host, int r
         __atomic_thread_fence(__ATOMIC_RELEASE);
         strcpy(g_binds[i].guest, guest_canon);
         strcpy(g_binds[i].host, host);
+        g_binds[i].hroot = hroot;
         g_binds[i].ro = ro;
         g_binds[i].seq = __atomic_fetch_add(g_bindseq, 1, __ATOMIC_SEQ_CST) + 1;
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -846,7 +856,7 @@ static int bind_top_at(const char *guest_canon) {
         size_t gl;
         unsigned sq;
         /* Prefix test plus equal length is the exact match. */
-        if (!bind_snap(i, guest_canon, NULL, NULL, &gl, &sq) || gl != want) continue;
+        if (!bind_snap(i, guest_canon, NULL, NULL, &gl, &sq, NULL) || gl != want) continue;
         if (best < 0 || sq > bestseq) { best = i; bestseq = sq; }
     }
     return best;
@@ -878,8 +888,32 @@ int bind_remove(struct Machine *m, const char *guest_canon) {
  * looks at /oldroot/proc/self/fd/N), and /proc has to stay /proc wherever the
  * tree it belongs to is mounted -- the rootfs's own /proc is an empty
  * mountpoint directory, so nothing is shadowed by this. */
-static int canon_to_host(struct Machine *m, const char *canon, char *host_out) {
-    int b = bind_match(m, canon, host_out);
+/* How much of a mapped host path is host-owned and therefore trusted: the
+ * rootfs directory itself, a --bind's source, or a special zone's root. The
+ * guest can rewrite nothing at or above it (those directories live outside the
+ * containment area), so that prefix may be opened by NAME; everything below it
+ * is guest-writable and must be walked one component at a time (path_pin).
+ * 0 means "do not pin at all" -- the host /proc zone, where the magic links
+ * are the point and no guest-writable symlink exists. */
+static size_t host_trusted_root(struct Machine *m, const char *host, size_t bindroot) {
+    if (proc_zone_path(host)) return 0;              /* magic links: never pin */
+    size_t rl = strlen(m->rootfs);
+    /* Anything under the rootfs is guest-writable from the rootfs down, mount
+     * or no mount: a guest `mount --bind` names its source with a guest path,
+     * every component of which it can rename. */
+    if (rl && !strncmp(host, m->rootfs, rl) && (host[rl] == '/' || host[rl] == 0))
+        return rl;
+    if (bindroot) return bindroot;                   /* the mount's host-owned root */
+    if (!strncmp(host, "/dev/", 5)) return 4;        /* the host's own /dev */
+    return rl ? rl : 1;                              /* rootfs "/": the host root */
+}
+
+/* `rootlen` (optional) receives that trusted prefix length for the path this
+ * produced -- see host_trusted_root. */
+static int canon_to_host(struct Machine *m, const char *canon, char *host_out,
+                         size_t *rootlen) {
+    size_t bindroot = 0;
+    int b = bind_match(m, canon, host_out, &bindroot);
     if (b < 0) return b;               /* bound, but the host path will not fit */
     if (b) {
         size_t rl = strlen(m->rootfs);
@@ -889,13 +923,22 @@ static int canon_to_host(struct Machine *m, const char *canon, char *host_out) {
             const char *tail = host_out[rl] ? host_out + rl : "/";
             if (strlen(tail) < PATH_MAX) {
                 strcpy(rel, tail);
-                if (special_host_path(m, rel, zone)) strcpy(host_out, zone);
+                if (special_host_path(m, rel, zone)) {
+                    strcpy(host_out, zone);
+                    bindroot = 0;      /* the zone's root now governs, not the bind */
+                }
             }
         }
+        if (rootlen) *rootlen = host_trusted_root(m, host_out, bindroot);
         return 0;
     }
-    if (special_host_path(m, canon, host_out)) return 0;
-    return to_host(m, canon, host_out);
+    if (special_host_path(m, canon, host_out)) {
+        if (rootlen) *rootlen = host_trusted_root(m, host_out, 0);
+        return 0;
+    }
+    int r = to_host(m, canon, host_out);
+    if (rootlen) *rootlen = host_trusted_root(m, host_out, 0);
+    return r;
 }
 
 
@@ -912,7 +955,7 @@ int bind_count(void) { return __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST); }
 
 int bind_get(int i, char *guest_out, char *host_out, int *ro_out) {
     if (i < 0 || i >= BIND_MAX) return 0;
-    if (!bind_snap(i, NULL, guest_out, host_out, NULL, NULL)) return 0;
+    if (!bind_snap(i, NULL, guest_out, host_out, NULL, NULL, NULL)) return 0;
     if (ro_out) *ro_out = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
     return 1;
 }
@@ -927,6 +970,175 @@ static int path_wants_dir(const char *s) {
     const char *base = strrchr(s, '/');
     base = base ? base + 1 : s;
     return !strcmp(base, ".") || !strcmp(base, "..");
+}
+
+/* The host-owned prefix of the host path a canonical guest path maps to, for
+ * bind_add's hroot (machine.h): how much of a new mount's source may be opened
+ * by name when something under it is pinned. */
+unsigned path_host_root(struct Machine *m, const char *canon) {
+    char host[PATH_MAX];
+    size_t rl = 0;
+    if (canon_to_host(m, canon, host, &rl) < 0) return 0;
+    return (unsigned)rl;
+}
+
+/* ---- symlink-safe pinning ------------------------------------------------
+ *
+ * path_resolve hands back a host path *string*, and the syscall that follows
+ * asks the host to resolve that string all over again. Between the two, another
+ * guest thread can replace any directory in it with a symlink -- and a symlink
+ * inside the rootfs is resolved by the HOST against the host's root, not the
+ * guest's, so `ln -s / dir` after the check and before the syscall reaches the
+ * whole filesystem with the emulator's own uid. It does not even take a symlink
+ * of the guest's making: an ordinary rootfs is full of absolute ones (Alpine's
+ * /var/run -> /run), and renaming one into place does just as well.
+ *
+ * The fix is to stop naming the target by a string the host re-resolves. A pin
+ * walks the path's parent directory ONE COMPONENT AT A TIME with
+ * O_PATH|O_NOFOLLOW, starting from a directory the guest cannot rewrite, and
+ * hands the caller that directory's descriptor plus the final component. The
+ * syscall then runs as an *at form against the descriptor -- an inode, not a
+ * name, so no rename or symlink can redirect it afterwards -- and forbids the
+ * host to follow the final component, which is always right here because
+ * path_resolve has already resolved it (or the caller asked for it not to be).
+ * A component that IS a symlink at pin time means the path changed under us:
+ * O_NOFOLLOW answers ELOOP and the syscall fails, which is a safe answer to a
+ * race the guest created.
+ *
+ * Where the path maps into the host /proc zone there is nothing to pin: its
+ * magic links are the point (/proc/self/fd/N reopens an fd), and no
+ * guest-writable symlink lives there. Such a pin is left "unpinned" -- dfd
+ * AT_FDCWD and the absolute host path as the name -- so a caller's single
+ * *at spelling still works, and `pinned` tells it whether to add the
+ * no-follow flag.
+ *
+ * The pin is a second pass over the finished canonical path rather than a
+ * rewrite of the walk above, so the resolution rules are untouched: this only
+ * decides how the RESULT is named to the kernel. */
+
+/* Open the directory `host` names, whose first `rootlen` bytes are trusted (see
+ * host_trusted_root): the trusted part by name, every component below it with
+ * O_NOFOLLOW so nothing the guest could have rewritten is followed. Returns the
+ * fd or -errno -- the errno the syscall would have reported for that path
+ * anyway (ENOENT, ENOTDIR, EACCES), plus ELOOP for a component that turned into
+ * a symlink after the walk. */
+static int pin_walk(const char *host, size_t rootlen) {
+    char root[PATH_MAX];
+    size_t hl = strlen(host);
+    if (!rootlen || rootlen > hl || rootlen >= sizeof root) return -EINVAL;
+    memcpy(root, host, rootlen);
+    root[rootlen] = 0;
+    int dfd = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -errno;
+    for (const char *p = host + rootlen; *p; ) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        char comp[PATH_MAX];
+        size_t cl = (size_t)(e - p);
+        if (cl >= sizeof comp) { close(dfd); return -ENAMETOOLONG; }
+        memcpy(comp, p, cl);
+        comp[cl] = 0;
+        int nfd = openat(dfd, comp, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(dfd);
+        if (nfd < 0) return -errno;
+        dfd = nfd;
+        p = e;
+    }
+    return dfd;
+}
+
+/* Pin the target `canon` (whose mapped host path is `host`) for the syscall
+ * that is about to run. Always fills `p` with something usable: a pinned parent
+ * plus a bare final component where that is possible, the plain host path
+ * otherwise. Returns 0, or -errno when the parent walk failed -- the same error
+ * the syscall itself would have produced. */
+int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p) {
+    p->dfd = AT_FDCWD;
+    p->pinned = 0;
+    p->base[0] = 0;
+    if (host != p->host) {
+        if (strlen(host) + 1 > sizeof p->host) return -ENAMETOOLONG;
+        strcpy(p->host, host);
+    }
+    p->name = p->host;
+
+    /* Only three things may be left unpinned, and each is a name the guest
+     * cannot rewrite: the guest root itself, the host /proc zone (rootlen 0),
+     * and a name whose own mapping is not its parent's plus a component -- a
+     * mount point, or a zone-mapped node like /dev/null, whose guest parent
+     * maps into the rootfs while it does not. Anything else that cannot be
+     * pinned is refused rather than named by a path the host would re-resolve. */
+    const char *slash = strrchr(canon, '/');
+    if (!slash || !slash[1]) return 0;          /* the root itself: nothing to pin */
+    if (strlen(slash + 1) + 1 > sizeof p->base) return -ENAMETOOLONG;
+
+    char parent[PATH_MAX], parhost[PATH_MAX], joined[PATH_MAX];
+    size_t pl = (size_t)(slash - canon);
+    if (pl + 1 > sizeof parent) return -ENAMETOOLONG;
+    memcpy(parent, canon, pl);
+    parent[pl] = 0;
+    if (!pl) strcpy(parent, "/");
+    size_t rootlen = 0;
+    int cr = canon_to_host(m, parent, parhost, &rootlen);
+    if (cr < 0) return cr;                      /* the parent's mapping will not fit */
+    if (!rootlen) return 0;                     /* the /proc zone */
+
+    /* The pin names the same target only when the mapping of the parent, plus
+     * the final component, IS the mapping of the whole path (see above). */
+    size_t phl = strlen(parhost);
+    if (phl + 1 + strlen(slash + 1) + 1 > sizeof joined) return -ENAMETOOLONG;
+    strcpy(joined, parhost);
+    if (phl && joined[phl - 1] == '/') joined[phl - 1] = 0;   /* host root "/" */
+    strcat(joined, "/");
+    strcat(joined, slash + 1);
+    if (strcmp(joined, p->host)) return 0;
+
+    int dfd = pin_walk(parhost, rootlen);
+    if (dfd < 0) return dfd;
+    p->dfd = dfd;
+    strcpy(p->base, slash + 1);
+    p->name = p->base;
+    p->pinned = 1;
+    return 0;
+}
+
+void path_unpin(PathPin *p) {
+    if (p->dfd >= 0) close(p->dfd);
+    p->dfd = AT_FDCWD;
+    p->pinned = 0;
+    p->name = p->host;
+}
+
+/* A path spelling of a pinned target, for the syscalls with no *at form at all
+ * (the xattr family, inotify_add_watch). The pinned parent is named by its own
+ * descriptor, so only the final component is resolved by name -- and the caller
+ * must still tell the host not to follow it (lgetxattr, IN_DONT_FOLLOW). */
+int path_pin_spell(const PathPin *p, char *out) {
+    if (!p->pinned) {
+        if (strlen(p->host) + 1 > PATH_MAX) return -ENAMETOOLONG;
+        strcpy(out, p->host);
+        return 0;
+    }
+    int n = snprintf(out, PATH_MAX, "/proc/self/fd/%d/%s", p->dfd, p->base);
+    return (n > 0 && n < PATH_MAX) ? 0 : -ENAMETOOLONG;
+}
+
+/* Pin the final component itself, for the few syscalls that both follow it and
+ * have no way to be told not to (chmod, truncate, statfs). The returned O_PATH
+ * fd names the inode the walk resolved, so /proc/self/fd/<fd> reaches exactly
+ * that file however the tree changes afterwards; path_fd_spell writes it.
+ * Returns the fd or -errno. */
+int path_pin_final(const PathPin *p) {
+    int fd = p->pinned
+        ? openat(p->dfd, p->base, O_PATH | O_NOFOLLOW | O_CLOEXEC)
+        : open(p->host, O_PATH | O_CLOEXEC);
+    return fd < 0 ? -errno : fd;
+}
+
+void path_fd_spell(int fd, char *out) {
+    snprintf(out, PATH_MAX, "/proc/self/fd/%d", fd);
 }
 
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
@@ -989,7 +1201,7 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (last && (flags & PATH_NOFOLLOW_LAST) && !want_dir) continue;
         char tgt[PATH_MAX];
         ssize_t tn;
-        r = canon_to_host(m, canon, hostbuf);
+        r = canon_to_host(m, canon, hostbuf, NULL);
         if (r < 0) return r;
         /* /proc self-link: splice in the guest target. The zone can be reached
          * under another name -- a sandbox that bound or pivot_root'd the rootfs
@@ -1039,7 +1251,7 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
     }
 
-    int r = canon_to_host(m, canon, host_out);   /* -bind > /dev,/proc > rootfs */
+    int r = canon_to_host(m, canon, host_out, NULL);   /* -bind > /dev,/proc > rootfs */
     if (r < 0) return r;
     if (want_dir) {
         struct stat st;

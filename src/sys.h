@@ -5,9 +5,12 @@
 #define A64_SYS_H
 
 #include <errno.h>
+#include <fcntl.h>     /* AT_FDCWD: a pin with nothing to pin (machine.h) */
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include "machine.h"
@@ -109,6 +112,50 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
     long n = copy_str_from_guest(c, gpath, path_va, sizeof gpath);
     if (n < 0) return (int)n;
     return path_resolve(c->m, dirfd, gpath, rflags, host_out, canon_out);
+}
+
+/* The same, then pinned for the syscall about to run: `pin` carries a parent
+ * directory descriptor and the final component instead of a path the kernel
+ * would resolve a second time (machine.h, PathPin). The caller must
+ * path_unpin() before it returns. `canon_out` is optional. */
+static inline int resolve_pin(CPU *c, int dirfd, u64 path_va, unsigned rflags,
+                              PathPin *pin, char *canon_out) {
+    char canon[PATH_MAX];
+    int r = resolve_at(c, dirfd, path_va, rflags, pin->host, canon);
+    if (r < 0) { pin->dfd = AT_FDCWD; pin->pinned = 0; pin->name = pin->host; return r; }
+    if (canon_out) strcpy(canon_out, canon);
+    return path_pin(c->m, canon, pin->host, pin);
+}
+
+/* Resolve, pin, and spell the target as a path for the syscalls that have no
+ * *at form at all (the xattr family, inotify_add_watch): the pinned parent is
+ * named by its own descriptor, so only the final component is resolved by name
+ * -- and the caller must still tell the host not to follow it, which for these
+ * means the l* variant or IN_DONT_FOLLOW. `spell` is >= PATH_MAX. The caller
+ * must path_unpin() before it returns. */
+static inline int resolve_at_spell(CPU *c, int dirfd, u64 path_va, unsigned rflags,
+                                   PathPin *pin, char *spell) {
+    int r = resolve_pin(c, dirfd, path_va, rflags, pin, NULL);
+    if (r < 0) return r;
+    r = path_pin_spell(pin, spell);
+    if (r < 0) path_unpin(pin);
+    return r;
+}
+
+/* faccessat(2) the syscall takes no flags -- only faccessat2 (Linux 5.8) does,
+ * and AT_SYMLINK_NOFOLLOW is the one a pin needs, since the final component
+ * must not be followed. Try the newer call and fall back to the old one, which
+ * on a kernel without it leaves that component followed: a query, and the only
+ * pinned operation that cannot be closed on such a host. */
+static inline int access_pinned(const PathPin *p, int mode) {
+#ifdef SYS_faccessat2
+    if (p->pinned) {
+        long r = syscall(SYS_faccessat2, p->dfd, p->name, mode, AT_SYMLINK_NOFOLLOW);
+        if (r == 0) return 0;
+        if (errno != ENOSYS) return -1;
+    }
+#endif
+    return faccessat(p->dfd, p->name, mode, 0);
 }
 
 /* Guest<->host open-flag translation. Most O_* values are shared between

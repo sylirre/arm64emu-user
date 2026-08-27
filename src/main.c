@@ -474,7 +474,9 @@ static void add_bind(struct Machine *m, const char *spec) {
         exit(2);
     }
     /* Register into the shared bind table (same path the runtime mount(2) uses). */
-    int r = bind_add(m, guest, host, ro);
+    /* A --bind source is a host path the invoker chose: nothing the guest can
+     * rename lies above it, so all of it may be opened by name (path.c). */
+    int r = bind_add(m, guest, host, (unsigned)strlen(host), ro);
     if (r == -ENOMEM) {
         fprintf(stderr, "arm64chroot: too many --bind mounts (max %d)\n", BIND_MAX);
         exit(2);

@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* File and fd syscalls. Guest fd == host fd (the kernel does the numbering);
- * every path argument goes through resolve_at() for rootfs containment.
+ * every path argument goes through resolve_pin() for rootfs containment: the
+ * syscall names its target by a pinned parent fd, never by a path the host
+ * would resolve a second time (path.c).
  * Structs are marshalled through explicit guest layouts (guest_abi.h) so the
  * same code is correct on ILP32 hosts. */
 #include <dirent.h>
@@ -688,8 +690,22 @@ static int own_memfd_reopen(int own, int gflags) {
     return nfd;   /* offset 0, like the re-open the host denied */
 }
 
+/* open(2) promises the LOWEST free descriptor, and here the guest's numbers are
+ * the host's -- a shell that closes fd 3 and opens a file expects 3 back. A pin
+ * holds a descriptor of its own while the open runs, so it can take the number
+ * the guest was owed; once the pin is closed, hand the new fd back down to the
+ * lowest free slot. Only needed when the pin sat below it. */
+static int fd_relower(int fd, int cloexec) {
+    int nf = fcntl(fd, cloexec ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+    if (nf < 0) return fd;
+    if (nf >= fd) { close(nf); return fd; }
+    close(fd);
+    return nf;
+}
+
 SYSDEF(openat) {
-    char host[PATH_MAX], canon[PATH_MAX];
+    PathPin pin;
+    char canon[PATH_MAX];
     int gflags = (int)a2;
     unsigned rf = (gflags & G_O_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     if (gflags & O_CREAT) rf |= PATH_CREATING;   /* "/nope/" -> EISDIR, not ENOENT */
@@ -699,14 +715,17 @@ SYSDEF(openat) {
      * exactly the race O_EXCL exists to prevent -- and a dangling link made the
      * open succeed where the kernel refuses it. */
     if ((gflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) rf |= PATH_NOFOLLOW_LAST;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, canon);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
     if (r < 0) return (u64)(s64)r;
+    const char *host = pin.host;
     /* Write intent (non-RDONLY, or create/truncate) into a :ro bind -> EROFS.
      * O_CREAT/O_TRUNC/O_ACCMODE are in the pass-through set, so the host bits
      * apply to the guest flags unchanged. */
     if (((gflags & O_ACCMODE) != O_RDONLY || (gflags & (O_CREAT | O_TRUNC))) &&
-        host_ro(c->m, host))
+        host_ro(c->m, host)) {
+        path_unpin(&pin);
         return (u64)(s64)-EROFS;
+    }
     /* maps/cmdline/mounts: the guest view. A sandbox reaches /proc under
      * another name (/newroot/proc/...), and the host path such a lookup
      * resolves to is the canonical spelling, so that covers both. */
@@ -714,11 +733,22 @@ SYSDEF(openat) {
                        : (proc_zone_path(host) ? host : NULL);
     if (pcanon) {
         s64 pf;
-        if (procfs_open(c, pcanon, gflags, &pf)) return (u64)pf;
+        if (procfs_open(c, pcanon, gflags, &pf)) { path_unpin(&pin); return (u64)pf; }
     }
     int fd;
     if (proc_own_fd_denied(host)) { fd = -1; errno = EACCES; }
-    else fd = openat(AT_FDCWD, host, oflags_g2h(gflags) | O_CLOEXEC * 0, (mode_t)a3);
+    else fd = openat(pin.dfd, pin.name,
+                     /* Pinned means path_resolve already followed the final
+                      * component; a symlink standing there now is the race,
+                      * and O_NOFOLLOW is what refuses to walk into it. */
+                     oflags_g2h(gflags) | (pin.pinned ? O_NOFOLLOW : 0),
+                     (mode_t)a3);
+    {   /* Close the pin before anything else allocates a descriptor. */
+        int e = errno, dfd = pin.dfd;
+        path_unpin(&pin);
+        if (fd >= 0 && dfd >= 0 && fd > dfd) fd = fd_relower(fd, gflags & O_CLOEXEC);
+        errno = e;
+    }
     if (fd < 0 && (errno == EACCES || errno == EPERM)) {
         int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
         int own = proc_own_fd_path(host);
@@ -1074,19 +1104,26 @@ SYSDEF(newfstatat) {
         if (n < 0) return (u64)(s64)n;
     }
     {
-        char host[PATH_MAX];
+        PathPin pin;
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-        int rr = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
+        int rr = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
         if (rr < 0) return (u64)(s64)rr;
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {
-            int h = l2s_stat(host, &st);   /* present an l2s symlink as backing */
-            if (h == 1) goto out;
-            if (h < 0) return (u64)(s64)h;
+            int h = l2s_stat(pin.host, &st);   /* present an l2s symlink as backing */
+            if (h == 1) { path_unpin(&pin); goto out; }
+            if (h < 0) { path_unpin(&pin); return (u64)(s64)h; }
         }
 #endif
-        r = (gf & G_AT_SYMLINK_NOFOLLOW) ? lstat(host, &st) : stat(host, &st);
-        if (r < 0) return host_err();
+        /* Pinned: the walk already followed the final component, so nothing
+         * the host resolves now may follow one (machine.h, PathPin). Unpinned
+         * (the /proc zone) the guest's own flag still decides -- lstat of a
+         * magic link must report the link. */
+        int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+        r = fstatat(pin.dfd, pin.name, &st, hf);
+        u64 e = r < 0 ? host_err() : 0;
+        path_unpin(&pin);
+        if (r < 0) return e;
     }
 out:;
     GStat g;
@@ -1097,21 +1134,23 @@ out:;
 /* Root's DAC bypass: existence and R/W are always granted; X requires at least
  * one execute bit. Applied only when fake-root, and only as a fallback after the
  * host check (so a genuinely-accessible file still succeeds normally). */
-static u64 access_fake_root(struct Machine *m, const char *host, int mode) {
+static u64 access_fake_root(struct Machine *m, const PathPin *p, int mode) {
     if (!fake_root(m)) return host_err();
     struct stat st;
-    if (stat(host, &st) < 0) return host_err();     /* keep ENOENT etc. */
+    if (fstatat(p->dfd, p->name, &st, p->pinned ? AT_SYMLINK_NOFOLLOW : 0) < 0)
+        return host_err();                          /* keep ENOENT etc. */
     if ((mode & X_OK) && !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
         return (u64)(s64)-EACCES;
     return 0;
 }
 
 SYSDEF(faccessat) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, 0, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (faccessat(AT_FDCWD, host, (int)a2, 0) == 0) return 0;
-    return access_fake_root(c->m, host, (int)a2);
+    u64 ret = access_pinned(&pin, (int)a2) == 0 ? 0 : access_fake_root(c->m, &pin, (int)a2);
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(faccessat2) {
@@ -1128,12 +1167,13 @@ SYSDEF(faccessat2) {
     unsigned gf = (unsigned)a3;
     if (gf & ~(unsigned)(G_AT_SYMLINK_NOFOLLOW | G_AT_EACCESS))
         return (u64)(s64)-EINVAL;
-    char host[PATH_MAX];
+    PathPin pin;
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (faccessat(AT_FDCWD, host, (int)a2, 0) == 0) return 0;
-    return access_fake_root(c->m, host, (int)a2);
+    u64 ret = access_pinned(&pin, (int)a2) == 0 ? 0 : access_fake_root(c->m, &pin, (int)a2);
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(readlinkat) {
@@ -1148,9 +1188,12 @@ SYSDEF(readlinkat) {
         if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
         return out;
     }
-    char host[PATH_MAX], canon[PATH_MAX];
-    int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, host, canon);
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, pin.host, canon);
     if (r < 0) return (u64)(s64)r;
+    if ((r = path_pin(c->m, canon, pin.host, &pin)) < 0) return (u64)(s64)r;
+    const char *host = pin.host;
     char buf[PATH_MAX];
     ssize_t rn;
     /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
@@ -1158,19 +1201,26 @@ SYSDEF(readlinkat) {
     int magic = path_proc_magic(c->m, canon, buf);
     if (magic == 0 && proc_zone_path(host))
         magic = path_proc_magic(c->m, host, buf);
-    if (magic < 0) return (u64)(s64)magic;   /* guest process, no guest target */
+    if (magic < 0) { path_unpin(&pin); return (u64)(s64)magic; }   /* guest process */
     if (magic > 0) {
         rn = (ssize_t)strlen(buf);
+        path_unpin(&pin);
     } else {
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {
             char backing[PATH_MAX]; unsigned long count;
-            if (l2s_resolve(host, backing, &count) == 1)
-                return (u64)(s64)-EINVAL;   /* guest sees a regular file, not a link */
+            if (l2s_resolve(host, backing, &count) == 1) {
+                path_unpin(&pin);
+                return (u64)(s64)-EINVAL;   /* a regular file to the guest, not a link */
+            }
         }
 #endif
-        rn = readlink(host, buf, sizeof buf - 1);
-        if (rn < 0) return host_err();
+        /* readlinkat never follows the final component, so the pin alone is
+         * the whole guarantee here. */
+        rn = readlinkat(pin.dfd, pin.name, buf, sizeof buf - 1);
+        u64 e = rn < 0 ? host_err() : 0;
+        path_unpin(&pin);
+        if (rn < 0) return e;
         /* Passthrough /proc (and /dev/fd -> /proc/self/fd) links to a
          * rootfs-contained file carry the rootfs prefix; strip it. */
         if (!strncmp(host, "/proc/", 6)) {
@@ -1479,20 +1529,25 @@ static long xattr_name(CPU *c, char *dst, u64 va) {
 }
 
 SYSDEF(getxattr) {   /* (path, name, value, size) — follow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    return xattr_read(c, host, -1, 1, name, a2, a3);
+    u64 ret = nn < 0 ? (u64)(s64)nn
+                     : xattr_read(c, spell, -1, !pin.pinned, name, a2, a3);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(lgetxattr) {  /* (path, name, value, size) — nofollow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    return xattr_read(c, host, -1, 0, name, a2, a3);
+    u64 ret = nn < 0 ? (u64)(s64)nn : xattr_read(c, spell, -1, 0, name, a2, a3);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(fgetxattr) {  /* (fd, name, value, size) */
     char name[XATTR_NAME_BUF];
@@ -1501,37 +1556,49 @@ SYSDEF(fgetxattr) {  /* (fd, name, value, size) */
     return xattr_read(c, NULL, (int)a0, 1, name, a2, a3);
 }
 SYSDEF(listxattr) {  /* (path, list, size) — follow */
-    char host[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    char spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
-    return xattr_read(c, host, -1, 1, NULL, a1, a2);
+    u64 ret = xattr_read(c, spell, -1, !pin.pinned, NULL, a1, a2);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(llistxattr) { /* (path, list, size) — nofollow */
-    char host[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    char spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
     if (r < 0) return (u64)(s64)r;
-    return xattr_read(c, host, -1, 0, NULL, a1, a2);
+    u64 ret = xattr_read(c, spell, -1, 0, NULL, a1, a2);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(flistxattr) { /* (fd, list, size) */
     return xattr_read(c, NULL, (int)a0, 1, NULL, a1, a2);
 }
 SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return xattr_write(c, host, -1, 1, name, a2, a3, (int)a4);
+    u64 ret = nn < 0            ? (u64)(s64)nn
+            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : xattr_write(c, spell, -1, !pin.pinned, name, a2, a3, (int)a4);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return xattr_write(c, host, -1, 0, name, a2, a3, (int)a4);
+    u64 ret = nn < 0            ? (u64)(s64)nn
+            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : xattr_write(c, spell, -1, 0, name, a2, a3, (int)a4);
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
     char name[XATTR_NAME_BUF];
@@ -1541,24 +1608,29 @@ SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
     return xattr_write(c, NULL, (int)a0, 1, name, a2, a3, (int)a4);
 }
 SYSDEF(removexattr) {  /* (path, name) — follow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    if (removexattr(host, name) < 0) return host_err();
-    return 0;
+    u64 ret = nn < 0                  ? (u64)(s64)nn
+            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : (pin.pinned ? lremovexattr(spell, name)
+                          : removexattr(spell, name)) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(lremovexattr) { /* (path, name) — nofollow */
-    char host[PATH_MAX], name[XATTR_NAME_BUF];
-    int r = resolve_at(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, host, NULL);
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
-    if (nn < 0) return (u64)(s64)nn;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    if (lremovexattr(host, name) < 0) return host_err();
-    return 0;
+    u64 ret = nn < 0                  ? (u64)(s64)nn
+            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : lremovexattr(spell, name) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 SYSDEF(fremovexattr) { /* (fd, name) */
     char name[XATTR_NAME_BUF];
@@ -1938,11 +2010,18 @@ SYSDEF(getcwd) {
 }
 
 SYSDEF(chdir) {
-    char host[PATH_MAX], canon[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, canon);
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
     if (r < 0) return (u64)(s64)r;
+    /* The cwd is tracked as a guest string, so nothing is opened for it -- but
+     * the "is it a directory" check must still be about the pinned target and
+     * not about whatever the name means by now. */
     struct stat st;
-    if (stat(host, &st) < 0) return host_err();
+    int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
+    u64 e = sr < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    if (sr < 0) return e;
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
     strcpy(c->m->cwd, canon);
     proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
@@ -1979,14 +2058,30 @@ SYSDEF(fchdir) {
 SYSDEF(chroot) {
     struct Machine *m = c->m;
     if (!fake_root(m)) return (u64)(s64)-EPERM;
-    char host[PATH_MAX], canon[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, canon);
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
     if (r < 0) return (u64)(s64)r;
     struct stat st;
-    if (stat(host, &st) < 0) return host_err();
+    int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
+    u64 e = sr < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    if (sr < 0) return e;
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
     strcpy(m->chroot_base, canon);
     return 0;
+}
+
+/* Does the pinned target exist (and, when `want_dir`, is it a directory)? The
+ * mount family only ever asks that much of the host -- everything else it does
+ * is bookkeeping in the bind table -- but it must ask it about the file the
+ * walk resolved, not about whatever the name means by the time the host looks.
+ * 0, or -errno. */
+static int pin_isdir(PathPin *p, int want_dir) {
+    struct stat st;
+    int r = fstatat(p->dfd, p->name, &st, p->pinned ? AT_SYMLINK_NOFOLLOW : 0);
+    if (r < 0) return -errno;
+    return (want_dir && !S_ISDIR(st.st_mode)) ? -ENOTDIR : 0;
 }
 
 /* mount(source=a0, target=a1, fstype=a2, flags=a3, data=a4): bind-mount
@@ -2022,15 +2117,24 @@ SYSDEF(mount) {
     }
 
     if (flags & G_MS_BIND) {                           /* new bind mount */
-        char shost[PATH_MAX], thost[PATH_MAX], tcanon[PATH_MAX];
-        struct stat st;
-        int r = resolve_at(c, G_AT_FDCWD, a0, 0, shost, NULL);   /* source */
+        char shost[PATH_MAX], thost[PATH_MAX], tcanon[PATH_MAX], scanon[PATH_MAX];
+        PathPin sp, tp;
+        int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &sp, scanon);   /* source */
         if (r < 0) return (u64)(s64)r;
-        if (stat(shost, &st) < 0) return host_err();             /* must exist */
-        r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);     /* mountpoint */
+        r = pin_isdir(&sp, 0);                                   /* must exist */
+        strcpy(shost, sp.host);
+        path_unpin(&sp);
         if (r < 0) return (u64)(s64)r;
-        if (stat(thost, &st) < 0) return host_err();             /* must exist */
-        r = bind_add(m, tcanon, shost, (flags & G_MS_RDONLY) ? 1 : 0);
+        r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);      /* mountpoint */
+        if (r < 0) return (u64)(s64)r;
+        r = pin_isdir(&tp, 0);                                   /* must exist */
+        strcpy(thost, tp.host);
+        path_unpin(&tp);
+        if (r < 0) return (u64)(s64)r;
+        /* The source is a GUEST path, so only its host-owned prefix may ever be
+         * opened by name -- the guest can rename every component below it. */
+        r = bind_add(m, tcanon, shost, path_host_root(m, scanon),
+                     (flags & G_MS_RDONLY) ? 1 : 0);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2044,12 +2148,13 @@ SYSDEF(mount) {
     if (a2 && copy_str_from_guest(c, fstype, a2, sizeof fstype) < 0)
         return (u64)(s64)-EFAULT;
     if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs")) {
-        char thost[PATH_MAX], tcanon[PATH_MAX], backing[PATH_MAX];
-        struct stat st;
-        int r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);
+        char tcanon[PATH_MAX], backing[PATH_MAX];
+        PathPin tp;
+        int r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
         if (r < 0) return (u64)(s64)r;
-        if (stat(thost, &st) < 0) return host_err();
-        if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+        r = pin_isdir(&tp, 1);
+        path_unpin(&tp);
+        if (r < 0) return (u64)(s64)r;
         r = tmpfs_dir_new(m, backing);
         if (r < 0) return (u64)(s64)r;
         /* mode= from the option string, like the kernel's tmpfs parser; the
@@ -2064,7 +2169,9 @@ SYSDEF(mount) {
                 if (p != mp + 5) chmod(backing, (mode_t)(mode & 07777));
             }
         }
-        r = bind_add(m, tcanon, backing, (flags & G_MS_RDONLY) ? 1 : 0);
+        /* The backing directory is ours, in a host-owned dir: trusted whole. */
+        r = bind_add(m, tcanon, backing, (unsigned)strlen(backing),
+                     (flags & G_MS_RDONLY) ? 1 : 0);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2081,13 +2188,14 @@ SYSDEF(mount) {
     const char *zone = !strcmp(fstype, "proc")   && !m->no_proc ? "/proc"    :
                        !strcmp(fstype, "devpts") && !m->no_dev  ? "/dev/pts" : NULL;
     if (zone) {
-        char thost[PATH_MAX], tcanon[PATH_MAX];
-        struct stat st;
-        int r = resolve_at(c, G_AT_FDCWD, a1, 0, thost, tcanon);
+        char tcanon[PATH_MAX];
+        PathPin tp;
+        int r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
         if (r < 0) return (u64)(s64)r;
-        if (stat(thost, &st) < 0) return host_err();
-        if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
-        r = bind_add(m, tcanon, zone, 0);
+        r = pin_isdir(&tp, 1);
+        path_unpin(&tp);
+        if (r < 0) return (u64)(s64)r;
+        r = bind_add(m, tcanon, zone, path_host_root(m, zone), 0);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2108,16 +2216,18 @@ SYSDEF(pivot_root) {
     struct Machine *m = c->m;
     (void)a2; (void)a3; (void)a4; (void)a5;
     if (!fake_root(m)) return (u64)(s64)-EPERM;
-    char nhost[PATH_MAX], ncanon[PATH_MAX], ohost[PATH_MAX], ocanon[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, nhost, ncanon);
+    char ncanon[PATH_MAX], ocanon[PATH_MAX];
+    PathPin np, op;
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &np, ncanon);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_at(c, G_AT_FDCWD, a1, 0, ohost, ocanon);
+    r = pin_isdir(&np, 1);
+    path_unpin(&np);
     if (r < 0) return (u64)(s64)r;
-    struct stat st;
-    if (stat(nhost, &st) < 0) return host_err();
-    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
-    if (stat(ohost, &st) < 0) return host_err();
-    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    r = resolve_pin(c, G_AT_FDCWD, a1, 0, &op, ocanon);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&op, 1);
+    path_unpin(&op);
+    if (r < 0) return (u64)(s64)r;
     /* put_old must be at or underneath new_root, as the kernel requires. */
     size_t nl = strlen(ncanon);
     if (strncmp(ocanon, ncanon, nl) ||
@@ -2128,7 +2238,7 @@ SYSDEF(pivot_root) {
     char roothost[PATH_MAX];
     r = path_resolve(m, G_AT_FDCWD, "/", 0, roothost, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = bind_add(m, ocanon, roothost, 0);
+    r = bind_add(m, ocanon, roothost, path_host_root(m, "/"), 0);
     if (r < 0) return (u64)(s64)r;
     strcpy(m->chroot_base, ncanon);
     return 0;
@@ -2148,41 +2258,50 @@ SYSDEF(umount2) {
 }
 
 SYSDEF(mknodat) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
+    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
     /* Pass the guest-supplied dev straight to the raw host syscall: it is
      * already in the kernel's major:minor encoding, and glibc's mknod()
      * wrapper would re-encode it. Unprivileged callers (this emulator) can
      * make S_IFIFO/S_IFSOCK/S_IFREG nodes -- so mkfifo(3) works; device
      * nodes fail with EPERM, exactly as on a real unprivileged host. */
-    return syscall(SYS_mknodat, AT_FDCWD, host, (unsigned)a2, (unsigned)a3) < 0
-               ? host_err() : 0;
+    /* mknod never follows a final symlink, so the pinned parent is the whole
+     * guarantee. */
+    u64 ret = syscall(SYS_mknodat, pin.dfd, pin.name, (unsigned)a2, (unsigned)a3) < 0
+                  ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(mkdirat) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return mkdir(host, (mode_t)a2) < 0 ? host_err() : 0;
+    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : mkdirat(pin.dfd, pin.name, (mode_t)a2) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(unlinkat) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
+    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
     int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
 #ifdef L2S_ENABLED
     char backing[PATH_MAX]; unsigned long count; int isl = 0;
     if (c->m->link2symlink && !flags) {
-        isl = l2s_resolve(host, backing, &count);
+        isl = l2s_resolve(pin.host, backing, &count);
         if (isl < 0) isl = 0;   /* probe error: fall through to a plain unlink */
     }
 #endif
-    if (unlinkat(AT_FDCWD, host, flags) < 0) return host_err();
+    int ur = unlinkat(pin.dfd, pin.name, flags);   /* never follows a symlink */
+    u64 e = ur < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    if (ur < 0) return e;
 #ifdef L2S_ENABLED
     if (isl == 1) l2s_decref(backing, count);
 #endif
@@ -2190,12 +2309,16 @@ SYSDEF(unlinkat) {
 }
 
 SYSDEF(renameat) {
-    char h1[PATH_MAX], h2[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, h1, NULL);
+    PathPin p1, p2;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
-    if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, h1) || host_ro(c->m, h2)) return (u64)(s64)-EROFS;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h1 = p1.host, *h2 = p2.host;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EROFS;
+    }
 #ifdef L2S_ENABLED
     char backing[PATH_MAX]; unsigned long count; int isl = 0;
     if (c->m->link2symlink && strcmp(h1, h2) != 0) {
@@ -2205,13 +2328,17 @@ SYSDEF(renameat) {
          * rename: the symlink's same-directory target would stop resolving. */
         int lerr = 0;
         if (l2s_rename_out(c->m, h1, h2, 1, &lerr)) {
+            path_unpin(&p1); path_unpin(&p2);
             if (lerr < 0) return (u64)(s64)lerr;
             if (isl == 1) l2s_decref(backing, count);
             return 0;
         }
     }
 #endif
-    if (rename(h1, h2) < 0) return host_err();
+    int rr = renameat(p1.dfd, p1.name, p2.dfd, p2.name);   /* follows neither end */
+    u64 e = rr < 0 ? host_err() : 0;
+    path_unpin(&p1); path_unpin(&p2);
+    if (rr < 0) return e;
 #ifdef L2S_ENABLED
     if (isl == 1) l2s_decref(backing, count);
 #endif
@@ -2220,12 +2347,16 @@ SYSDEF(renameat) {
 
 SYSDEF(renameat2) {
     if (a4 == 0) return sys_renameat(c, a0, a1, a2, a3, 0, 0);
-    char h1[PATH_MAX], h2[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, h1, NULL);
+    PathPin p1, p2;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
-    if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, h1) || host_ro(c->m, h2)) return (u64)(s64)-EROFS;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h1 = p1.host, *h2 = p2.host;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EROFS;
+    }
 #ifdef L2S_ENABLED
     /* RENAME_NOREPLACE is plain rename plus "the destination must not exist",
      * so a group member leaving its directory needs the same handling; the
@@ -2236,6 +2367,7 @@ SYSDEF(renameat2) {
         int isl = l2s_resolve(h2, backing, &count);
         int lerr = 0;
         if (l2s_rename_out(c->m, h1, h2, 0, &lerr)) {
+            path_unpin(&p1); path_unpin(&p2);
             if (lerr < 0) return (u64)(s64)lerr;
             if (isl == 1) l2s_decref(backing, count);
             return 0;
@@ -2265,44 +2397,65 @@ SYSDEF(renameat2) {
         l2s_dirname(h2, d2);
         if (strcmp(d1, d2) != 0 && lstat(h1, &s1) == 0 && lstat(h2, &s2) == 0) {
             int lerr = 0;
-            if (l2s_detach(c->m, h1, &lerr) && lerr < 0) return (u64)(s64)lerr;
-            if (l2s_detach(c->m, h2, &lerr) && lerr < 0) return (u64)(s64)lerr;
+            if ((l2s_detach(c->m, h1, &lerr) && lerr < 0) ||
+                (l2s_detach(c->m, h2, &lerr) && lerr < 0)) {
+                path_unpin(&p1); path_unpin(&p2);
+                return (u64)(s64)lerr;
+            }
         }
     }
 #endif
-    long rr = syscall(SYS_renameat2, AT_FDCWD, h1, AT_FDCWD, h2, (unsigned)a4);
-    return rr < 0 ? host_err() : 0;
+    long rr = syscall(SYS_renameat2, p1.dfd, p1.name, p2.dfd, p2.name, (unsigned)a4);
+    u64 ret = rr < 0 ? host_err() : 0;
+    path_unpin(&p1); path_unpin(&p2);
+    return ret;
 }
 
 SYSDEF(symlinkat) {
-    char target[PATH_MAX], host[PATH_MAX];
+    char target[PATH_MAX];
+    PathPin pin;
     long n = copy_str_from_guest(c, target, a0, sizeof target);
     if (n < 0) return (u64)(s64)n;
-    int r = resolve_at(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, host, NULL);
+    int r = resolve_pin(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
     /* The link *content* is stored as the guest wrote it. */
-    return symlink(target, host) < 0 ? host_err() : 0;
+    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : symlinkat(target, pin.dfd, pin.name) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(linkat) {
-    char h1[PATH_MAX], h2[PATH_MAX];
+    PathPin p1, p2;
     unsigned gf = (unsigned)a4;
     unsigned rf = (gf & G_AT_SYMLINK_FOLLOW) ? 0 : PATH_NOFOLLOW_LAST;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, h1, NULL);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_at(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, h2, NULL);
-    if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, h2)) return (u64)(s64)-EROFS;   /* new name on a :ro bind */
-    /* Use host linkat with AT_SYMLINK_FOLLOW so the guest's flag is honored --
-     * notably it lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) be
-     * materialized, which plain link() cannot do. */
-    int hflags = (gf & G_AT_SYMLINK_FOLLOW) ? AT_SYMLINK_FOLLOW : 0;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h2 = p2.host;
+    if (host_ro(c->m, h2)) {                          /* new name on a :ro bind */
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EROFS;
+    }
+    /* Pinned, the old name has already been followed as far as the guest asked,
+     * so AT_SYMLINK_FOLLOW must not be passed on -- a symlink standing there now
+     * is the race. Unpinned it still carries the guest's flag, which is what
+     * lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) materialize. */
+    int hflags = (!p1.pinned && (gf & G_AT_SYMLINK_FOLLOW)) ? AT_SYMLINK_FOLLOW : 0;
 #if defined(L2S_ENABLED) && defined(A64_L2S_FORCE)
     /* Test hook: exercise the l2s path even where the host allows hardlinks. */
-    if (c->m->link2symlink) return (u64)(s64)l2s_link(c->m, h1, h2);
+    if (c->m->link2symlink) {
+        u64 lret = (u64)(s64)l2s_link(c->m, p1.host, h2);
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
 #endif
-    if (linkat(AT_FDCWD, h1, AT_FDCWD, h2, hflags) == 0) return 0;
+    int lr = linkat(p1.dfd, p1.name, p2.dfd, p2.name, hflags);
+    int lerrno = errno;
+    path_unpin(&p1); path_unpin(&p2);
+    errno = lerrno;
+    if (lr == 0) return 0;
 #ifdef L2S_ENABLED
     /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path
      * (an O_TMPFILE publish via linkat(AT_SYMLINK_FOLLOW) yields EACCES), and a
@@ -2311,7 +2464,7 @@ SYSDEF(linkat) {
      * fails the same way. */
     if (c->m->link2symlink && (errno == EXDEV || errno == EPERM
                                || errno == EACCES || errno == EOPNOTSUPP))
-        return (u64)(s64)l2s_link(c->m, h1, h2);
+        return (u64)(s64)l2s_link(c->m, p1.host, h2);   /* pins already closed */
 #endif
     return host_err();
 }
@@ -2335,15 +2488,28 @@ SYSDEF(ftruncate) {
 }
 
 SYSDEF(truncate) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    if (truncate(host, (off_t)(s64)a1) < 0) return host_err();
-    struct stat st;
-    if (stat(host, &st) == 0)
-        as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)(s64)a1);
-    return 0;
+    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    /* truncate(2) follows the final component and has no way to be told not
+     * to, so the component itself is pinned and named by its descriptor: that
+     * magic link resolves to the inode the walk found, whatever the tree looks
+     * like by now (machine.h, path_pin_final). */
+    int ffd = path_pin_final(&pin);
+    path_unpin(&pin);
+    if (ffd < 0) return (u64)(s64)ffd;
+    char spell[PATH_MAX];
+    path_fd_spell(ffd, spell);
+    int tr = truncate(spell, (off_t)(s64)a1);
+    u64 e = tr < 0 ? host_err() : 0;
+    if (tr == 0) {
+        struct stat st;
+        if (fstat(ffd, &st) == 0)
+            as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)(s64)a1);
+    }
+    close(ffd);
+    return e;
 }
 
 /* Fake-root (fake_id && euid==0) turns an EPERM/EINVAL failure on an ownership/
@@ -2361,15 +2527,23 @@ SYSDEF(fchmod) {
 }
 
 SYSDEF(fchmodat) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, (int)(s32)a0, a1, 0, host, NULL);
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return chattr_result(c->m, chmod(host, (mode_t)a2));
+    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    /* As truncate: fchmodat's AT_SYMLINK_NOFOLLOW is ENOTSUP on Linux, so the
+     * final component is pinned and reached through its own descriptor. */
+    int ffd = path_pin_final(&pin);
+    path_unpin(&pin);
+    if (ffd < 0) return (u64)(s64)ffd;
+    char spell[PATH_MAX];
+    path_fd_spell(ffd, spell);
+    u64 ret = chattr_result(c->m, chmod(spell, (mode_t)a2));
+    close(ffd);
+    return ret;
 }
 
 SYSDEF(fchownat) {
-    char host[PATH_MAX];
     unsigned gf = (unsigned)a4;
     if (gf & G_AT_EMPTY_PATH) {   /* fchownat(fd, "", ..., AT_EMPTY_PATH): operate on the fd */
         char gpath[PATH_MAX];
@@ -2387,13 +2561,17 @@ SYSDEF(fchownat) {
                 fchownat((int)(s32)a0, "", (uid_t)a2, (gid_t)a3, AT_EMPTY_PATH));
         }
     }
+    PathPin pin;
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    int rr = (gf & G_AT_SYMLINK_NOFOLLOW) ? lchown(host, (uid_t)a2, (gid_t)a3)
-                                          : chown(host, (uid_t)a2, (gid_t)a3);
-    return chattr_result(c->m, rr);
+    int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+    u64 ret = host_ro(c->m, pin.host)
+                  ? (u64)(s64)-EROFS
+                  : chattr_result(c->m, fchownat(pin.dfd, pin.name, (uid_t)a2,
+                                                 (gid_t)a3, hf));
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(fchown) {
@@ -2414,15 +2592,16 @@ SYSDEF(utimensat) {
         if (fd_ro(c->m, (int)(s32)a0)) return (u64)(s64)-EROFS;
         return futimens((int)(s32)a0, tsp) < 0 ? host_err() : 0;
     }
-    char host[PATH_MAX];
+    PathPin pin;
     unsigned gf = (unsigned)a3;
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at(c, (int)(s32)a0, a1, rf, host, NULL);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, host)) return (u64)(s64)-EROFS;
-    return utimensat(AT_FDCWD, host, tsp,
-                     (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0) < 0
-               ? host_err() : 0;
+    int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : utimensat(pin.dfd, pin.name, tsp, hf) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(fsync) { return fsync((int)a0) < 0 ? host_err() : 0; }
@@ -2565,12 +2744,26 @@ static u64 statfs_out(CPU *c, u64 va, const struct statfs *h) {
 }
 
 SYSDEF(statfs) {
-    char host[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, 0, host, NULL);
+    /* statfs follows the final component with no way to be told not to, so ask
+     * the filesystem through a descriptor on the pinned inode instead of by
+     * name. fstatfs on an O_PATH fd wants Linux >= 3.12; where it is refused,
+     * the descriptor's own /proc spelling still names that exact inode. */
+    PathPin pin;
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
+    int ffd = path_pin_final(&pin);
+    path_unpin(&pin);
+    if (ffd < 0) return (u64)(s64)ffd;
     struct statfs h;
-    if (statfs(host, &h) < 0) return host_err();
-    return statfs_out(c, a1, &h);
+    int sr = fstatfs(ffd, &h);
+    if (sr < 0 && (errno == EBADF || errno == EINVAL)) {
+        char spell[PATH_MAX];
+        path_fd_spell(ffd, spell);
+        sr = statfs(spell, &h);
+    }
+    u64 e = sr < 0 ? host_err() : 0;
+    close(ffd);
+    return sr < 0 ? e : statfs_out(c, a1, &h);
 }
 
 SYSDEF(fstatfs) {
@@ -2640,11 +2833,15 @@ SYSDEF(statx) {
         }
     } else {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-        int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, NULL);
+        char canon[PATH_MAX];
+        int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, canon);
         if (rr < 0) return (u64)(s64)rr;
+        PathPin pin;
+        if ((rr = path_pin(c->m, canon, host, &pin)) < 0) return (u64)(s64)rr;
+        int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
 #ifdef L2S_ENABLED
         char l2sb[PATH_MAX]; unsigned long l2sc;
-        if (c->m->link2symlink && l2s_target(host, l2sb, &l2sc) == 1) {
+        if (c->m->link2symlink && l2s_target(host, l2sb, &l2sc) == 1) {   /* l2s: by path */
             /* Present the backing file (regular) with the group's link count. */
             r = host_statx(AT_FDCWD, l2sb, 0, (unsigned)a3, buf);
             if (r < 0 && errno == ENOSYS) {
@@ -2656,16 +2853,14 @@ SYSDEF(statx) {
         } else
 #endif
         {
-            r = host_statx(AT_FDCWD, host,
-                           (gf & G_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0,
-                           (unsigned)a3, buf);
+            r = host_statx(pin.dfd, pin.name, hf, (unsigned)a3, buf);
             if (r < 0 && errno == ENOSYS) {
                 struct stat st;
-                r = (gf & G_AT_SYMLINK_NOFOLLOW) ? lstat(host, &st)
-                                                 : stat(host, &st);
+                r = fstatat(pin.dfd, pin.name, &st, hf);
                 if (r == 0) statx_from_stat(buf, &st);
             }
         }
+        path_unpin(&pin);
     }
     if (r < 0) return host_err();
     if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) */
@@ -2906,12 +3101,19 @@ SYSDEF(inotify_init1) {
 }
 
 SYSDEF(inotify_add_watch) {
-    char host[PATH_MAX], canon[PATH_MAX];
+    PathPin pin;
+    char spell[PATH_MAX];
     unsigned rf = ((u32)a2 & 0x02000000u /*IN_DONT_FOLLOW*/) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at(c, G_AT_FDCWD, a1, rf, host, canon);
+    int r = resolve_at_spell(c, G_AT_FDCWD, a1, rf, &pin, spell);
     if (r < 0) return (u64)(s64)r;
-    r = inotify_add_watch((int)a0, host, (u32)a2);
-    return r < 0 ? host_err() : (u64)r;
+    /* No *at form at all, so the pinned parent is named by its descriptor and
+     * IN_DONT_FOLLOW keeps the host off the final component -- which the walk
+     * has already resolved as far as the guest asked. */
+    u32 mask = (u32)a2 | (pin.pinned ? 0x02000000u /*IN_DONT_FOLLOW*/ : 0);
+    r = inotify_add_watch((int)a0, spell, mask);
+    u64 ret = r < 0 ? host_err() : (u64)r;
+    path_unpin(&pin);
+    return ret;
 }
 
 SYSDEF(inotify_rm_watch) {

@@ -70,10 +70,10 @@ src/
     backend_x86_32.c backend_arm32.c ILP32 emitters: guest 64-bit values as host register-pair halves
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
-  path.c                             Rootfs containment resolver, bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
+  path.c                             Rootfs containment resolver: the walk, plus the pin that hands each syscall a parent-directory fd + final component instead of a path string the host would re-resolve (no concurrent rename can redirect it); bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
   strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
-  sys_file.c                         File & fd syscalls (every path arg via resolve_at containment)
+  sys_file.c                         File & fd syscalls (every path arg via resolve_pin containment)
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread); a main thread that exit(2)s while siblings run parks as the kernel's zombie leader instead of ending the process

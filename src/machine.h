@@ -49,6 +49,13 @@ typedef struct {
 struct Bind {
     char guest[PATH_MAX];   /* canonical guest mount point, no trailing slash */
     char host[PATH_MAX];    /* realpath'd host source directory */
+    unsigned hroot;         /* how much of `host` is host-owned and therefore
+                             * safe to open by name when a path under this mount
+                             * is pinned (path.c, host_trusted_root). The whole
+                             * of it for a --bind source, a tmpfs backing dir or
+                             * a zone; only the rootfs prefix for a source the
+                             * GUEST named (mount --bind inside the guest, whose
+                             * every component it can rename). */
     int ro;                 /* read-only mount (atomic) */
     int active;             /* 0 free, -1 mid-claim, 1 live (atomic) */
     unsigned seq;           /* mount order: the stack position. Slot indices
@@ -724,6 +731,46 @@ int elf_probe(struct Machine *m, const char *guest_path);
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out);
 
+/* path.c: the resolved target, named to the kernel in a way no concurrent
+ * rename or symlink can redirect. A host path string is re-resolved by the
+ * kernel when the syscall runs, and between the walk and the syscall another
+ * guest thread can turn any directory in it into a symlink -- one that, being
+ * resolved by the HOST against the host's root, reaches the whole filesystem.
+ * So the parent directory is walked component by component with
+ * O_PATH|O_NOFOLLOW and handed over as a descriptor, with the final component
+ * as a bare name (see the long comment in path.c).
+ *
+ * A caller runs the syscall in its *at form against `dfd`/`name` and, when
+ * `pinned`, must forbid the host to follow the final component (O_NOFOLLOW,
+ * AT_SYMLINK_NOFOLLOW, the l* variant): path_resolve has already resolved it,
+ * so a symlink there means the path changed underneath and following it is
+ * exactly the escape. Where nothing can be pinned -- the host /proc zone, whose
+ * magic links are the point -- `dfd` is AT_FDCWD and `name` the absolute host
+ * path, so the one spelling still works.
+ *
+ * The descriptor must be closed with path_unpin once the syscall has run.
+ * Nothing may return between the pin and the unpin without it. */
+typedef struct {
+    int  dfd;              /* parent directory, or AT_FDCWD when not pinned */
+    const char *name;      /* bare final component, or the absolute host path */
+    int  pinned;           /* 1: `name` is a component under `dfd` */
+    char host[PATH_MAX];   /* the host path, as path_resolve produced it */
+    char base[256];        /* storage behind `name` when pinned */
+} PathPin;
+
+int  path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p);
+void path_unpin(PathPin *p);
+/* Path spelling of a pinned target for the syscalls with no *at form (the
+ * xattr family, inotify_add_watch): only the final component is named, so the
+ * caller still has to say "do not follow it". Writes `out` (>= PATH_MAX). */
+int  path_pin_spell(const PathPin *p, char *out);
+/* An O_PATH descriptor for the final component itself, for the few syscalls
+ * that follow it with no way to be told not to (chmod, truncate, statfs):
+ * /proc/self/fd/<fd> then names that exact inode. Returns the fd or -errno;
+ * path_fd_spell writes the spelling (out >= PATH_MAX). */
+int  path_pin_final(const PathPin *p);
+void path_fd_spell(int fd, char *out);
+
 /* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
  * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
@@ -819,7 +866,10 @@ int  host_random_bytes(void *buf, size_t len);
  * return 0 on success or -EINVAL when no bind is mounted at that point. (The `m`
  * parameter is vestigial — the table is shared, not per-Machine — but kept so
  * call sites read naturally.) */
-int bind_add(struct Machine *m, const char *guest_canon, const char *host, int ro);
+int bind_add(struct Machine *m, const char *guest_canon, const char *host,
+             unsigned hroot, int ro);
+/* What to pass as bind_add's `hroot` for a source named by a guest path. */
+unsigned path_host_root(struct Machine *m, const char *canon);
 int bind_remount(struct Machine *m, const char *guest_canon, int ro);
 int bind_remove(struct Machine *m, const char *guest_canon);
 

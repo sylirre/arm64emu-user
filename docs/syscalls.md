@@ -192,6 +192,60 @@ containment.) `path_resolve` walks the guest path
   about to create the file gets `EISDIR`. A trailing slash also forces a final
   symlink to be followed even for callers that asked not to.
 
+### The resolved path is a descriptor, not a string
+
+A walk that ends in a host path *string* is only half of containment: the
+syscall that follows asks the host to resolve that string a second time, and
+between the two another guest thread can rename a symlink into any directory of
+it. A symlink inside the rootfs is resolved by the **host** against the host's
+root, so `ln -s / dir` in that window reaches the whole filesystem with the
+emulator's own uid — and it does not even take a symlink of the guest's making,
+since an ordinary rootfs is full of absolute ones (Alpine's `/var/run -> /run`)
+and renaming one into place does just as well.
+`tests/fixtures/pathrace.c` wins that race thousands of times per second against
+the string form.
+
+So `path_pin` (`src/path.c`) re-walks the finished canonical path's **parent**
+one component at a time with `O_PATH|O_NOFOLLOW`, starting from a directory the
+guest cannot rewrite, and hands the caller that descriptor plus the final
+component (`PathPin` in `machine.h`). Every handler then runs the syscall in its
+`*at` form against the descriptor — an inode, not a name — and forbids the host
+to follow the final component (`O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`, the `l*`
+variant, `IN_DONT_FOLLOW`), which is always right because `path_resolve` has
+already resolved it, or the caller asked for it not to be. A component that *is*
+a symlink at pin time means the path changed underneath: `O_NOFOLLOW` answers
+`ELOOP` and the syscall fails, which is a safe answer to a race the guest
+created. The cost is one `openat` per component of the parent — about 5% on
+`go build` and `node`, ~30% on a pure `find` — and one descriptor held across
+the syscall, which is also why `openat` hands its result back down to the lowest
+free number afterwards (`fd_relower`): the guest's fd numbers *are* the host's,
+and `open(2)` promises the lowest free one.
+
+What is trusted to be opened by name is the part above the containment area:
+the rootfs directory itself, a `--bind`'s source, a tmpfs backing directory, the
+host's `/dev`. A source the **guest** named — `mount --bind` inside the guest —
+is trusted only as far as the rootfs prefix, since it can rename every component
+below that; each mount records how much of its root is host-owned (`Bind.hroot`).
+
+Three things are left unpinned, and each is a name the guest cannot rewrite: the
+guest root itself, the host `/proc` zone (whose magic links are the point —
+`/proc/self/fd/N` exists to be followed, and no guest-writable symlink lives
+there), and a name whose own mapping is not its parent's plus a component, which
+is what a mount point or a zone-mapped node like `/dev/null` looks like.
+Anything else that cannot be pinned is **refused**, never handed to the host as
+a path.
+
+Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
+`truncate` and `statfs` pin the final component itself and reach it through
+`/proc/self/fd/<fd>` — `fstatfs` directly where the kernel allows it on an
+`O_PATH` descriptor. The `xattr` family and `inotify_add_watch` name the pinned
+parent the same way (`/proc/self/fd/<dfd>/<base>`) and use the `l*` /
+`IN_DONT_FOLLOW` spelling for the final component. `faccessat` is the one that
+cannot be closed on every host: only `faccessat2` (Linux 5.8) takes
+`AT_SYMLINK_NOFOLLOW`, so on an older kernel a raced final component is still
+followed — by a query, which reports whether a file is accessible and changes
+nothing.
+
 `O_CREAT|O_EXCL` resolves with the final symlink **not** followed (the kernel's
 `LOOKUP_EXCL`): finding one there is `EEXIST` whether or not it points anywhere.
 Following it let a guest be redirected into creating the link's target — the
