@@ -602,8 +602,10 @@ void sig_reset_for_exec(struct Machine *m) {
 #endif
 #define FRAME_SIZE    ((MC_RESERVED + 544 + 15) & ~15)
 
-static void wr64(CPU *c, u64 base, u64 off, u64 v) { copy_to_guest(c, base + off, &v, 8); }
-static void wr32(CPU *c, u64 base, u64 off, u32 v) { copy_to_guest(c, base + off, &v, 4); }
+/* Frame fields are laid into a host-side image of the frame, not written to
+ * the guest one at a time -- see deliver_to_handler. */
+static void wr64(u8 *fr, u64 off, u64 v) { memcpy(fr + off, &v, 8); }
+static void wr32(u8 *fr, u64 off, u32 v) { memcpy(fr + off, &v, 4); }
 
 /* Deliver `sig` to the guest handler in m->sigact[sig] (caller checked it is
  * a real handler). Builds the frame and redirects the CPU. */
@@ -635,72 +637,88 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     }
     u64 frame = (sp - FRAME_SIZE) & ~15ULL;
 
-    /* Zero the whole frame, then fill. */
-    static const u8 zeros[512];
-    for (u64 off = 0; off < FRAME_SIZE; off += sizeof zeros) {
-        u64 chunk = FRAME_SIZE - off < sizeof zeros ? FRAME_SIZE - off : sizeof zeros;
-        if (copy_to_guest(c, frame + off, zeros, chunk) < 0) {
-            /* Unwritable stack: force default SIGSEGV (matches the kernel). */
-            fprintf(stderr, "arm64chroot: cannot write sigframe, killing\n");
-            proctab_unregister((s32)getpid());
-            signal(SIGSEGV, SIG_DFL);
-            raise(SIGSEGV);
-            _exit(128 + SIGSEGV);
-        }
-    }
+    /* Build the frame in an image of our own and write it out once.
+     *
+     * It used to be built in place: one zeroing pass over the guest stack that
+     * *was* checked, and then some sixty field writes that discarded whatever
+     * copy_to_guest told them. Anything that unmapped or write-protected that
+     * stack between the two passes -- a CLONE_VM sibling's munmap/mprotect,
+     * the shrinking of a file mapping the stack came from -- therefore left a
+     * half-built frame that was delivered anyway, with a handler entered on
+     * whatever the guest happened to have there. A kernel has no such window:
+     * every __put_user in setup_rt_frame is checked, and one failure is
+     * force_sigsegv for the whole delivery.
+     *
+     * One copy also means the zero pass costs nothing extra (it is a memset of
+     * this image) and the whole frame crosses in one guest walk. */
+    u8 fr[FRAME_SIZE];
+    memset(fr, 0, sizeof fr);
 
     /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16) */
-    wr32(c, frame, SI_OFF + 0, (u32)sig);
-    wr32(c, frame, SI_OFF + 4, (u32)info->err);
-    wr32(c, frame, SI_OFF + 8, (u32)info->code);
+    wr32(fr, SI_OFF + 0, (u32)sig);
+    wr32(fr, SI_OFF + 4, (u32)info->err);
+    wr32(fr, SI_OFF + 8, (u32)info->code);
     if (sig == SIGCHLD) {
-        wr32(c, frame, SI_OFF + 16, (u32)info->pid);
-        wr32(c, frame, SI_OFF + 20, (u32)info->uid);
-        wr32(c, frame, SI_OFF + 24, (u32)info->status);
+        wr32(fr, SI_OFF + 16, (u32)info->pid);
+        wr32(fr, SI_OFF + 20, (u32)info->uid);
+        wr32(fr, SI_OFF + 24, (u32)info->status);
     } else if (is_sync_sig(sig)) {
-        wr64(c, frame, SI_OFF + 16, info->addr);
+        wr64(fr, SI_OFF + 16, info->addr);
     } else if (sig == SIGSYS && info->code == SIG_SECCOMP_CODE) {
         /* _sigsys: the call address, the syscall number and the architecture
          * -- what a seccomp trap handler reads to decide what was blocked. */
-        wr64(c, frame, SI_OFF + 16, info->addr);
-        wr32(c, frame, SI_OFF + 24, (u32)info->status);
-        wr32(c, frame, SI_OFF + 28, G_AUDIT_ARCH_AARCH64);
+        wr64(fr, SI_OFF + 16, info->addr);
+        wr32(fr, SI_OFF + 24, (u32)info->status);
+        wr32(fr, SI_OFF + 28, G_AUDIT_ARCH_AARCH64);
     } else {
-        wr32(c, frame, SI_OFF + 16, (u32)info->pid);
-        wr32(c, frame, SI_OFF + 20, (u32)info->uid);
+        wr32(fr, SI_OFF + 16, (u32)info->pid);
+        wr32(fr, SI_OFF + 20, (u32)info->uid);
         /* si_value: carries the rt_sigqueueinfo/sigqueue payload; the kernel
          * zeroes this union region for plain kill (SI_USER), so the captured
          * zero is faithful there too. */
-        wr64(c, frame, SI_OFF + 24, (u64)(s64)info->value);
+        wr64(fr, SI_OFF + 24, (u64)(s64)info->value);
     }
 
     /* ucontext */
     u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
                                                 : g_tls.sigmask;
-    g_tls.have_saved_sigmask = 0;
-    wr64(c, frame, UC_STACK + 0, g_tls.sig_altstack_sp);
-    wr32(c, frame, UC_STACK + 8,
+    wr64(fr, UC_STACK + 0, g_tls.sig_altstack_sp);
+    wr32(fr, UC_STACK + 8,
          !g_tls.sig_altstack_size ? 2 /*SS_DISABLE*/
                                   : (used_altstack ? 0 : 1 /*SS_ONSTACK*/));
-    wr64(c, frame, UC_STACK + 16, g_tls.sig_altstack_size);
-    wr64(c, frame, UC_SIGMASK, mask_to_save);
+    wr64(fr, UC_STACK + 16, g_tls.sig_altstack_size);
+    wr64(fr, UC_SIGMASK, mask_to_save);
 
     /* sigcontext */
-    wr64(c, frame, MC_FAULTADDR, is_sync_sig(sig) ? info->addr : 0);
-    for (int i = 0; i < 31; i++) wr64(c, frame, MC_REGS + 8u * (unsigned)i,
+    wr64(fr, MC_FAULTADDR, is_sync_sig(sig) ? info->addr : 0);
+    for (int i = 0; i < 31; i++) wr64(fr, MC_REGS + 8u * (unsigned)i,
                                       (i == 0) ? saved_x0 : c->x[i]);
-    wr64(c, frame, MC_SP, *cpu_cur_sp(c));
-    wr64(c, frame, MC_PC, saved_pc);
-    wr64(c, frame, MC_PSTATE, cpu_pack_spsr(c));
+    wr64(fr, MC_SP, *cpu_cur_sp(c));
+    wr64(fr, MC_PC, saved_pc);
+    wr64(fr, MC_PSTATE, cpu_pack_spsr(c));
 
     /* fpsimd_context + terminator */
-    wr32(c, frame, MC_RESERVED + 0, FPSIMD_MAGIC);
-    wr32(c, frame, MC_RESERVED + 4, 528);
-    wr32(c, frame, MC_RESERVED + 8, c->fpsr);
-    wr32(c, frame, MC_RESERVED + 12, c->fpcr);
+    wr32(fr, MC_RESERVED + 0, FPSIMD_MAGIC);
+    wr32(fr, MC_RESERVED + 4, 528);
+    wr32(fr, MC_RESERVED + 8, c->fpsr);
+    wr32(fr, MC_RESERVED + 12, c->fpcr);
     for (int i = 0; i < 32; i++)
-        copy_to_guest(c, frame + MC_RESERVED + 16 + 16u * (unsigned)i, &c->v[i], 16);
+        memcpy(fr + MC_RESERVED + 16 + 16u * (unsigned)i, &c->v[i], 16);
     /* terminator record is already zero */
+
+    if (copy_to_guest(c, frame, fr, sizeof fr) < 0) {
+        /* Unwritable stack: force default SIGSEGV (matches the kernel). */
+        fprintf(stderr, "arm64chroot: cannot write sigframe, killing\n");
+        proctab_unregister((s32)getpid());
+        signal(SIGSEGV, SIG_DFL);
+        raise(SIGSEGV);
+        _exit(128 + SIGSEGV);
+    }
+
+    /* Only now is the delivery committed: nothing above this point has changed
+     * any state the guest can see, so the fatal path is the clean force_sigsegv
+     * a kernel takes rather than a half-delivered signal. */
+    g_tls.have_saved_sigmask = 0;
 
     /* Redirect the CPU into the handler. */
     c->x[0] = (u64)sig;
