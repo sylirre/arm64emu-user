@@ -767,7 +767,7 @@ SYSDEF(read) {
     } else {
         n = read((int)a0, buf, len);
     }
-    if (n < 0) { free(buf); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(buf); return e; }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     return (u64)n;
@@ -787,8 +787,9 @@ SYSDEF(write) {
     s64 pr;
     if (procfs_pre_write(c, (int)a0, buf, len, -1, &pr)) { free(buf); return (u64)pr; }
     ssize_t n = write((int)a0, buf, len);
+    u64 e = n < 0 ? host_err() : (u64)n;   /* before the free() -- see sys.h */
     free(buf);
-    return n < 0 ? host_err() : (u64)n;
+    return e;
 }
 
 SYSDEF(readv) {
@@ -823,7 +824,7 @@ SYSDEF(readv) {
     } else {
         n = readv((int)a0, iov, cnt);
     }
-    if (n < 0) { free(bounce); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(bounce); return e; }
     /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
@@ -876,8 +877,9 @@ SYSDEF(writev) {
     if (cnt != 1) free(flat);
     if (consumed) { free(bounce); return (u64)pr; }
     ssize_t n = writev((int)a0, iov, cnt);
+    u64 e = n < 0 ? host_err() : 0;
     free(bounce);
-    if (n < 0) return host_err();
+    if (n < 0) return e;
     return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
@@ -888,7 +890,7 @@ SYSDEF(pread64) {
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     ssize_t n = pread((int)a0, buf, len, (off_t)a3);
-    if (n < 0) { free(buf); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(buf); return e; }
     if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
     return (u64)n;
@@ -904,8 +906,9 @@ SYSDEF(pwrite64) {
     s64 pr;
     if (procfs_pre_write(c, (int)a0, buf, len, (s64)a3, &pr)) { free(buf); return (u64)pr; }
     ssize_t n = pwrite((int)a0, buf, len, (off_t)a3);
+    u64 e = n < 0 ? host_err() : (u64)n;
     free(buf);
-    return n < 0 ? host_err() : (u64)n;
+    return e;
 }
 
 /* preadv2/pwritev2 (fd, iov, iovcnt, pos_l, pos_h, flags): scatter/gather at
@@ -931,7 +934,7 @@ SYSDEF(preadv2) {
 #else
     n = preadv2((int)a0, iov, cnt, (off_t)a3, (int)a5);
 #endif
-    if (n < 0) { free(bounce); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(bounce); return e; }
     /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
@@ -971,8 +974,9 @@ SYSDEF(pwritev2) {
 #else
     n = pwritev2((int)a0, iov, cnt, (off_t)a3, (int)a5);
 #endif
+    u64 e = n < 0 ? host_err() : 0;
     free(bounce);
-    if (n < 0) return host_err();
+    if (n < 0) return e;
     return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
@@ -991,7 +995,7 @@ SYSDEF(preadv) {
     if (cnt < 0) return (u64)(s64)cnt;
     if (efault == 1) { free(bounce); return (u64)(s64)-EFAULT; }
     ssize_t n = preadv((int)a0, iov, cnt, (off_t)a3);
-    if (n < 0) { free(bounce); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(bounce); return e; }
     /* scatter back, into the bases the import snapshotted */
     ssize_t left = n;
     for (int i = 0; i < cnt && left > 0; i++) {
@@ -1026,8 +1030,9 @@ SYSDEF(pwritev) {
             return (u64)(s64)-EFAULT;
         }
     ssize_t n = pwritev((int)a0, iov, cnt, (off_t)a3);
+    u64 e = n < 0 ? host_err() : 0;
     free(bounce);
-    if (n < 0) return host_err();
+    if (n < 0) return e;
     return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
@@ -1399,7 +1404,7 @@ SYSDEF(getdents64) {
     } else {
         n = syscall(SYS_getdents64, (int)a0, buf, len);
     }
-    if (n < 0) { free(buf); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(buf); return e; }
     if (want_inject && pos0 == 0 && n > 0) {
         if (inject_dev)
             n = (long)dev_inject_dents((int)a0, buf, (size_t)n, len);
@@ -2859,7 +2864,7 @@ SYSDEF(epoll_pwait) {
     syscall_wait_begin_ms(&tmo);
     int r = epoll_pwait((int)a0, evs, maxevents, tmo, ssp);
     if (ssp) pwait_mask_leave(c);
-    if (r < 0) { free(evs); return host_err(); }
+    if (r < 0) { u64 e = host_err(); free(evs); return e; }
     for (int i = 0; i < r; i++) {
         GEpollEvent g = { .events = evs[i].events, .__pad = 0, .data = evs[i].data.u64 };
         if (copy_to_guest(c, a1 + (u64)i * sizeof g, &g, sizeof g) < 0) {

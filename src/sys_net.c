@@ -314,9 +314,10 @@ SYSDEF(sendto) {
      * namespace: note it, so the kernel's refusal becomes an ack on receive. */
     if (len) nlr_note_request(c->m, (int)a0, buf, len);
     ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
+    u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
     free(buf);
     if (dfd >= 0) close(dfd);
-    return n < 0 ? host_err() : (u64)n;
+    return e;
 }
 
 SYSDEF(recvfrom) {
@@ -337,7 +338,7 @@ SYSDEF(recvfrom) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     ssize_t n = recvfrom((int)a0, buf, len, (int)a3, (struct sockaddr *)&ss, &sl);
-    if (n < 0) { free(buf); return host_err(); }
+    if (n < 0) { u64 e = host_err(); free(buf); return e; }
     /* Turn the refusal of a request against a faked network namespace into the
      * kernel's own ack, before the guest sees the reply. MSG_TRUNC reports the
      * untruncated length, so clamp to what the buffer actually holds. */
@@ -721,9 +722,10 @@ SYSDEF(sendmsg) {
      * msg_import laid at the head of the bounce buffer. */
     if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
+    u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
     free(iov); free(gbase); free(bounce);
     if (dfd >= 0) close(dfd);
-    return n < 0 ? host_err() : (u64)n;
+    return e;
 }
 
 /* Scatter a received message back into the guest: iov data, source address,
@@ -788,7 +790,11 @@ SYSDEF(recvmsg) {
     int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, ctrl, sizeof ctrl, 0, NULL);
     if (cnt < 0) return (u64)(s64)cnt;
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
-    if (n < 0) { free(iov); free(gbase); free(bounce); return host_err(); }
+    if (n < 0) {
+        u64 e = host_err();
+        free(iov); free(gbase); free(bounce);
+        return e;
+    }
     /* Rewrite a faked-namespace refusal before the reply is scattered back to
      * the guest. The received bytes are contiguous at the head of the bounce
      * buffer (msg_import concatenates the iovecs in order), so the whole
@@ -837,9 +843,10 @@ SYSDEF(sendmmsg) {
          * network namespace was faked, so its refusal can be rewritten. */
         if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
+        u64 e = n < 0 ? host_err() : 0;    /* before the close(2) below */
         free(iov); free(gbase); free(bounce);
         if (dfd >= 0) close(dfd);
-        if (n < 0) return sent ? (u64)sent : host_err();
+        if (n < 0) return sent ? (u64)sent : e;
         u32 mlen = (u32)n;
         if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
             return sent ? (u64)sent : (u64)(s64)-EFAULT;
@@ -939,9 +946,10 @@ SYSDEF(recvmmsg) {
         if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
         ssize_t n = recvmsg((int)a0, &h, mf);
         if (n < 0) {
+            u64 e = host_err();
             free(iov); free(gbase); free(bounce);
             if (got) break;   /* return the messages received so far */
-            return host_err();
+            return e;
         }
         /* Rewrite a faked-namespace refusal, as recvmsg does. */
         if (n > 0) {

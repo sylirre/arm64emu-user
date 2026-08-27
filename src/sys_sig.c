@@ -441,7 +441,7 @@ SYSDEF(signalfd4) {
     int nfd = eventfd(0, eflags);
     if (nfd < 0) return host_err();
     struct stat st;
-    if (fstat(nfd, &st) != 0) { close(nfd); return host_err(); }
+    if (fstat(nfd, &st) != 0) { u64 e = host_err(); close(nfd); return e; }
     EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     if (m->sfd_fds_count >= SFD_MAX_FDS) {
         EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);

@@ -670,7 +670,7 @@ SYSDEF(keyctl) {
             u8 *buf = malloc(buflen ? (size_t)buflen : 1);
             if (!buf) return (u64)(s64)-ENOMEM;
             long r = syscall(SYS_keyctl, op, (long)a1, buf, (size_t)buflen);
-            if (r < 0) { free(buf); return host_err(); }
+            if (r < 0) { u64 e = host_err(); free(buf); return e; }
             size_t out = (size_t)r < buflen ? (size_t)r : (size_t)buflen;
             if (bufva && out && copy_to_guest(c, bufva, buf, out) < 0) { free(buf); return (u64)(s64)-EFAULT; }
             free(buf);
@@ -712,8 +712,9 @@ SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
     }
     (void)a5;
     long r = syscall(SYS_add_key, type, desc, pl, plen, (int)a4);
+    u64 e = r < 0 ? host_err() : (u64)r;
     free(pl);
-    return r < 0 ? host_err() : (u64)r;
+    return e;
 #endif
 }
 

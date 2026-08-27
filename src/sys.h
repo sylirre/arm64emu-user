@@ -19,7 +19,20 @@ typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
     u64 sys_##name(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
 
 /* Convert the current host errno to a guest return value. The generic errno
- * values are identical on x86, x86_64, arm and arm64, so this is a sign flip. */
+ * values are identical on x86, x86_64, arm and arm64, so this is a sign flip.
+ *
+ * It reads errno as it stands NOW, so a handler that has anything to clean up
+ * has to take the value first and free/close afterwards -- the idiom is
+ *
+ *     u64 e = r < 0 ? host_err() : (u64)r;
+ *     free(buf); if (fd >= 0) close(fd);
+ *     return e;
+ *
+ * close(2) sets errno outright, and free(3) is only required not to touch it
+ * by POSIX-2008 -- which the allocators this builds against honour to varying
+ * degrees, Bionic's releasing pages of its own as it goes. Getting this wrong
+ * hands the guest an errno from the cleanup instead of from its syscall, which
+ * is both wrong and untraceable. */
 static inline u64 host_err(void) { return (u64)(s64)(-errno); }
 
 /* ---- one transfer's byte count ------------------------------------------

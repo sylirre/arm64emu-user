@@ -840,7 +840,11 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
             host = host_alloc(len, PROT_READ | PROT_WRITE);
             if (!host) return -ENOMEM;
             ssize_t rd = pread(host_fd, host, len, (off_t)off);
-            if (rd < 0) { munmap(host, len); return -errno; }
+            if (rd < 0) {
+                int e = errno;            /* munmap(2) would overwrite it */
+                munmap(host, len);
+                return -e;
+            }
             filemap = 0;   /* anonymous copy: no end-of-file to run past */
         } else host = p;
     }

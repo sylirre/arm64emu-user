@@ -154,7 +154,11 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             long ps = sysconf(_SC_PAGESIZE);
             if (ps < 4096) ps = 4096;
             u64 back = (len + (u64)ps - 1) & ~((u64)ps - 1);
-            if (ftruncate(fd, (off_t)back) != 0) { close(fd); return host_err(); }
+            if (ftruncate(fd, (off_t)back) != 0) {
+                u64 e = host_err();   /* before close(2) overwrites errno */
+                close(fd);
+                return e;
+            }
             r = guest_map_file(as, addr, len, pte, fd, 0, 1, NULL);
             close(fd);
             if (r == 0) {
