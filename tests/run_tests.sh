@@ -491,6 +491,37 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     rm -rf "$BSRC" "$BSRC2"
 fi
 
+# ---- a guest path whose BOUND host spelling will not fit. The bind applies
+# (the guest path is under its mount point), so the answer has to be
+# ENAMETOOLONG; reading the failed join as "no bind here" resolved the same
+# guest path under the rootfs and answered out of a different tree. Self-
+# checking: qemu has no bind-mount concept. ----
+if [ ! -x tests/fixtures/bindlong.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/bindlong.bin \
+        tests/fixtures/bindlong.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/bindlong.bin ]; then
+    BLSRC=$(mktemp -d)
+    # ~1.2 kB of host prefix, so a 3 kB guest remainder overruns PATH_MAX while
+    # the guest path itself stays well inside it (and every component inside
+    # NAME_MAX, so the host cannot answer ENAMETOOLONG on its own).
+    bldeep="$BLSRC"
+    for i in 1 2 3 4 5; do bldeep="$bldeep/$(printf 'd%.0s' $(seq 1 250))"; done
+    mkdir -p "$bldeep" && echo hi > "$bldeep/hello"
+    expect=$'short=0\nlen=3018\nlong=36'   # 36 = ENAMETOOLONG
+    got=$(timeout -k 5 60 "$EMU" --bind "$bldeep:/mnt/x" / \
+              tests/fixtures/bindlong.bin /mnt/x 12 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: bindlong"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: bindlong"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    rm -rf "$BLSRC"
+    fx_rm tests/fixtures/bindlong.bin
+else
+    skip_build "fixtures/bindlong"
+fi
+
 # ---- /dev node listing + --no-dev / --no-proc (self-checking; qemu has no
 # passthrough or synthesis concept). The passthrough /dev nodes now show up in
 # `ls /dev` (getdents dev_inject_dents); --no-dev / --no-proc disable each

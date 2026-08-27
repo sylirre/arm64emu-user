@@ -667,7 +667,13 @@ void tmpfs_sweep_stale(void) {
 }
 
 /* -bind forward map: longest guest-prefix match on the canonical guest path.
- * Fills host_out with the bound host path and returns 1; 0 if no bind applies.
+ * Fills host_out with the bound host path and returns 1; 0 if no bind applies;
+ * a negative errno if one does but its host path cannot be formed. That third
+ * answer has to stay distinct from "no bind": folding it into 0 sent the
+ * caller on to resolve the very same guest path under the rootfs instead, so a
+ * path only just too long for its bind was answered out of a different tree
+ * altogether -- the wrong file where one happened to be there, and the wrong
+ * errno where none was, never the ENAMETOOLONG a kernel gives.
  * Takes precedence over special zones and the rootfs prefix (see path_resolve),
  * so a bound subtree is served from its real host location. */
 static int bind_match(struct Machine *m, const char *canon, char *host_out) {
@@ -690,7 +696,8 @@ static int bind_match(struct Machine *m, const char *canon, char *host_out) {
         }
     }
     if (best < 0) return 0;
-    return join_host(g_binds[best].host, canon + bestlen, host_out) == 0;
+    int r = join_host(g_binds[best].host, canon + bestlen, host_out);
+    return r < 0 ? r : 1;
 }
 
 /* Reverse of bind_match: a host path back to its guest view. See machine.h. */
@@ -792,7 +799,9 @@ int bind_remove(struct Machine *m, const char *guest_canon) {
  * tree it belongs to is mounted -- the rootfs's own /proc is an empty
  * mountpoint directory, so nothing is shadowed by this. */
 static int canon_to_host(struct Machine *m, const char *canon, char *host_out) {
-    if (bind_match(m, canon, host_out)) {
+    int b = bind_match(m, canon, host_out);
+    if (b < 0) return b;               /* bound, but the host path will not fit */
+    if (b) {
         size_t rl = strlen(m->rootfs);
         if (rl && !strncmp(host_out, m->rootfs, rl) &&
             (host_out[rl] == '/' || host_out[rl] == 0)) {
