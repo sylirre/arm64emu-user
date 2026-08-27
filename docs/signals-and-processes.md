@@ -395,6 +395,39 @@ and stopped on the resulting SIGTTOU.
 Guest pid **is** host pid, so `kill`/`wait4`/`setpgid`/`tcsetpgrp` pass through
 unchanged and job control works (the guest's children are real host processes).
 
+### Target containment
+
+That identity cuts both ways: an id the guest supplies addresses **any** host
+task of the invoking user, guest or not. Every syscall that names another task
+by id therefore checks it against the PID registry first (`proctab_has_task`,
+`src/proctab.c`) — `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+`getpriority`/`setpriority` and the `sched_*setparam`/`*scheduler`/
+`rr_get_interval` family. A host task outside the guest answers **`ESRCH`**, the
+same non-existence the `/proc` view reports for it, rather than `EPERM`, which
+would confirm it is there.
+
+What counts as a guest task: our own thread group always (a process must be able
+to signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`
+answers it without a `/proc` read, which is what keeps a Go runtime's per-
+preemption `tgkill` cheap), a registered guest PID, or a thread of one minus the
+non-guest tasks that process published (`proctab_foreign_tasks` — an
+interposer's own threads, which the guest is never shown either).
+
+`kill` with a non-positive pid cannot be handed to the host at all:
+`kill(-1, SIGKILL)` there kills every process of the user — their shell, their
+session, the emulator's own IPC broker daemon — and the caller's host process
+group is whatever job the launching shell put the emulator in, not the guest's.
+Both are answered by walking the registry (`proctab_slots`/`proctab_pid_at`) and
+signalling the matching guest processes one at a time, keeping the kernel's own
+rules: `-1` skips the caller's thread group, a group send includes it, and the
+result is 0 if any target took the signal, else the last error. `nice`'s
+`PRIO_PGRP`/`PRIO_USER` are answered the same way (every guest process runs under
+the one host uid, so `PRIO_USER` of the guest's own uid *is* the whole guest).
+
+`tests/fixtures/sigcontain.c` checks both halves. `qemu-user` is the
+counter-example rather than the oracle here: it passes every id through, so it
+answers `ok` for exactly the cases that must be `ESRCH`.
+
 ### fork
 
 A fork-shaped `clone` maps to a host `fork()`; the entire interpreter state (page

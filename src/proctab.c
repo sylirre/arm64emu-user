@@ -2238,6 +2238,63 @@ int proctab_has(s32 pid) {
     return 0;
 }
 
+/* Registry walk for the callers that need every guest PID rather than one:
+ * the signal fan-outs (a process group, or "every process"), which the kernel
+ * would answer by walking its own task list. Slot by slot, so nobody needs a
+ * PROCTAB_MAX-entry buffer on the stack. A slot claimed for a not-yet-forked
+ * child (PT_RESERVED) is negative, so the > 0 test skips it. */
+int proctab_slots(void) { return g_tab ? g_tab_n : 0; }
+
+s32 proctab_pid_at(int slot) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return 0;
+    s32 pid = __atomic_load_n(&g_tab[slot].pid, __ATOMIC_ACQUIRE);
+    return pid > 0 ? pid : 0;
+}
+
+/* Thread group of host task `tid` (/proc/<tid>/status Tgid -- guest tids are
+ * host tids). -1 if the task does not exist or /proc cannot say. */
+s32 proctab_task_tgid(s32 tid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)tid);
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    char line[128];
+    s32 tg = -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "Tgid:", 5)) { tg = (s32)strtol(line + 5, NULL, 10); break; }
+    fclose(f);
+    return tg;
+}
+
+/* Is `tid` one of this process's own threads? tgkill with signal 0 is the
+ * kernel's own existence-and-pairing test and costs one syscall, where a
+ * /proc/<tid>/status read costs an open, a read and a parse -- and this is the
+ * hot answer: pthread_kill and a Go runtime's preemption both aim at a sibling
+ * thread of the caller. */
+static int own_thread(s32 tid) {
+    return syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)tid, 0) == 0;
+}
+
+/* Is host task `tid` a task of a guest process? See machine.h.
+ *
+ * Our own thread group answers yes whatever the registry holds: a process must
+ * be able to signal itself even if it never got a slot (a full table), and
+ * that is also the only case an unavailable table must not break. */
+int proctab_has_task(s32 tid) {
+    if (tid <= 0) return 0;
+    s32 self = (s32)getpid();
+    if (tid == self || own_thread(tid)) return 1;
+    s32 tgid = proctab_has(tid) ? tid : proctab_task_tgid(tid);
+    if (tgid <= 0 || !proctab_has(tgid)) return 0;
+    /* A guest process's host tasks are not all guest threads: an interposer
+     * (qemu-user) keeps one of its own, and the guest is never shown it. */
+    s32 foreign[PROCTAB_FOREIGN];
+    int n = proctab_foreign_tasks(tgid, foreign, PROCTAB_FOREIGN);
+    for (int i = 0; i < n; i++)
+        if (foreign[i] == tid) return 0;
+    return 1;
+}
+
 /* Snapshot the whole mutable payload (cmdline, environ, auxv, exe, cwd) for
  * `pid` via a seqlock read, then confirm the entry's starttime still matches
  * the live process. Returns 1 on a fresh hit, 0 on miss/stale.

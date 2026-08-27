@@ -1604,6 +1604,29 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- the id-taking syscalls (kill/tkill/tgkill/rt_sigqueueinfo, nice and the
+# scheduler family) must not reach a host process. Self-checking: qemu-user
+# passes every id straight through, so it answers "ok" for exactly the cases
+# that have to be ESRCH -- it is the counter-example, not the oracle. The
+# fixture's witness is its own parent: a live same-uid process outside the
+# guest. The second half proves the guest's own signalling still works,
+# including a real process-group delivery the child confirms. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/sigcontain.bin \
+            tests/fixtures/sigcontain.c 2>/dev/null; then
+        expect=$'kill-host=ESRCH\nkill-init=ESRCH\ntgkill-host=ESRCH\ntkill-host=ESRCH\nsigqueue-host=ESRCH\ngetprio-host=ESRCH\nsetprio-host=ESRCH\nsched-host=ESRCH\nkill-self=ok\ntkill-self=ok\ngetprio-self=ok\nkill-child=ok\nkill-all=ok\nkill-group=ok\ngroup-delivered=1\ndone'
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/sigcontain.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: sigcontain"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: sigcontain"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        fx_rm tests/fixtures/sigcontain.bin
+    else
+        skip_build "fixtures/sigcontain"
+    fi
+fi
+
 # ---- a :ro bind mount stays read-only for fd-based mutation too. Self-checking:
 # bind mounts are the emulator's own feature, so qemu is not an oracle. The
 # point is that none of fchmod/fchown/ftruncate/fallocate/futimens/fsetxattr

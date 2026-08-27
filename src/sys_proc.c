@@ -2108,20 +2108,109 @@ SYSDEF(getresgid) {
     return 0;
 }
 
+/* The nice(2) family names its target by id, and guest ids ARE host ids, so a
+ * raw which/who pair handed to the host reaches processes outside the guest:
+ * PRIO_USER with the invoking uid renices every process that user owns, and a
+ * PRIO_PGRP group is whatever job the shell put the emulator in. Each `which`
+ * is answered over the guest's own process set instead -- which for PRIO_USER
+ * is all of it, since every guest process runs under the one host uid.
+ *
+ * Returns 0 and stores the target pid in *one when the request names exactly
+ * one task (the fast, overwhelmingly common case), 1 when the caller must walk
+ * the registry itself with prio_in_group, or -errno. */
+enum { G_PRIO_PROCESS = 0, G_PRIO_PGRP = 1, G_PRIO_USER = 2 };
+
+static int prio_target(CPU *c, int which, u32 who, s32 *one) {
+    switch (which) {
+    case G_PRIO_PROCESS:
+        *one = who ? (s32)who : (s32)getpid();
+        if (!proctab_has_task(*one)) return -ESRCH;
+        return 0;
+    case G_PRIO_PGRP:
+        return 1;
+    case G_PRIO_USER: {
+        /* Only this guest's own user has processes here; any other id names a
+         * user with none, which is the kernel's ESRCH. */
+        u32 self = c->m->fake_id ? c->m->cred.euid : (u32)geteuid();
+        if (who && who != self) return -ESRCH;
+        return 1;
+    }
+    default:
+        return -EINVAL;
+    }
+}
+
+/* Is guest process `pid` in the set `which`/`who` names? (PRIO_USER: every
+ * guest process, see above.) */
+static int prio_in_group(int which, u32 who, s32 pid) {
+    if (which == G_PRIO_USER) return 1;
+    pid_t want = who ? (pid_t)who : getpgid(0);
+    return want > 0 && getpgid((pid_t)pid) == want;
+}
+
 SYSDEF(getpriority) {
     /* PRIO_PROCESS addresses a single thread by tid on Linux; guest tids ARE
-     * host tids (SYSDEF(clone)), so the value passes through. */
-    errno = 0;
-    int r = getpriority((int)a0, (id_t)a1);
-    if (errno) return host_err();
-    return (u64)(20 - r);   /* kernel encoding */
+     * host tids (SYSDEF(clone)), so the value passes through once the task is
+     * known to be the guest's. A group answers with the highest priority (the
+     * lowest nice) any of its members has, which is what the kernel's own walk
+     * over the group computes. */
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    int which = (int)a0;
+    s32 one;
+    int g = prio_target(c, which, (u32)a1, &one);
+    if (g < 0) return (u64)(s64)g;
+    if (!g) {
+        errno = 0;
+        int r = getpriority(PRIO_PROCESS, (id_t)one);
+        if (errno) return host_err();
+        return (u64)(20 - r);   /* kernel encoding */
+    }
+    int best = 0, found = 0;
+    s32 self = (s32)getpid();
+    for (int i = -1, n = proctab_slots(); i < n; i++) {
+        s32 t = i < 0 ? self : proctab_pid_at(i);   /* ourselves, registry or not */
+        if (t <= 0 || (i >= 0 && t == self)) continue;
+        if (!prio_in_group(which, (u32)a1, t)) continue;
+        errno = 0;
+        int r = getpriority(PRIO_PROCESS, (id_t)t);
+        if (errno) continue;                        /* raced away */
+        if (!found || r < best) { best = r; found = 1; }
+    }
+    return found ? (u64)(20 - best) : (u64)(s64)-ESRCH;
 }
 
 SYSDEF(setpriority) {
-    return setpriority((int)a0, (id_t)a1, (int)a2) < 0 ? host_err() : 0;
+    (void)a3; (void)a4; (void)a5;
+    int which = (int)a0, prio = (int)a2;
+    s32 one;
+    int g = prio_target(c, which, (u32)a1, &one);
+    if (g < 0) return (u64)(s64)g;
+    if (!g)
+        return setpriority(PRIO_PROCESS, (id_t)one, prio) < 0 ? host_err() : 0;
+    int done = 0;
+    s64 err = -ESRCH;
+    s32 self = (s32)getpid();
+    for (int i = -1, n = proctab_slots(); i < n; i++) {
+        s32 t = i < 0 ? self : proctab_pid_at(i);
+        if (t <= 0 || (i >= 0 && t == self)) continue;
+        if (!prio_in_group(which, (u32)a1, t)) continue;
+        if (setpriority(PRIO_PROCESS, (id_t)t, prio) == 0) done = 1;
+        else if (errno != ESRCH) err = -errno;
+    }
+    return done ? 0 : (u64)err;
 }
 
 SYSDEF(sched_yield) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sched_yield(); return 0; }
+
+/* The scheduler family names its target task by tid, and 0 means "me". Guest
+ * tids are host tids, so the same containment the signal syscalls apply is
+ * needed here: a host task outside the guest is not one it may read or steer. */
+static int sched_target(s32 tid) {
+    /* 0 is "me". A negative one addresses nothing at all and every one of
+     * these syscalls answers the kernel's EINVAL for it, which containment
+     * must not turn into ESRCH -- so only a real id is checked here. */
+    return tid <= 0 || proctab_has_task(tid);
+}
 
 SYSDEF(sched_getparam) {
     /* Only the real-time policies carry a non-zero priority; for the normal
@@ -2130,6 +2219,7 @@ SYSDEF(sched_getparam) {
      * right host task. struct sched_param is { int sched_priority; }. */
     (void)a2; (void)a3; (void)a4; (void)a5;
     if (!a1) return (u64)(s64)-EINVAL;
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     struct sched_param sp;
     if (sched_getparam((pid_t)(s32)a0, &sp) < 0) return host_err();
     s32 prio = sp.sched_priority;
@@ -2142,6 +2232,7 @@ SYSDEF(sched_setparam) {
      * enforces that only priority 0 is accepted. NULL param is EINVAL, not
      * EFAULT, matching the kernel. */
     if (!a1) return (u64)(s64)-EINVAL;
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     s32 prio;
     if (copy_from_guest(c, &prio, a1, sizeof prio) < 0) return (u64)(s64)-EFAULT;
     struct sched_param sp = { .sched_priority = prio };
@@ -2152,6 +2243,7 @@ SYSDEF(sched_setscheduler) {
     /* Tid passthrough: an unprivileged switch to a real-time policy fails
      * with EPERM on the host exactly as it would for the guest. */
     if (!a2) return (u64)(s64)-EINVAL;
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     s32 prio;
     if (copy_from_guest(c, &prio, a2, sizeof prio) < 0) return (u64)(s64)-EFAULT;
     struct sched_param sp = { .sched_priority = prio };
@@ -2160,6 +2252,7 @@ SYSDEF(sched_setscheduler) {
 }
 
 SYSDEF(sched_getscheduler) {
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     int r = sched_getscheduler((pid_t)(s32)a0);
     return r < 0 ? host_err() : (u64)r;
 }
@@ -2197,6 +2290,7 @@ SYSDEF(sched_rr_get_interval) {
     /* Host call, GTimespec out. For non-SCHED_RR tasks the kernel reports
      * the fair-class timeslice, which is scheduler state, not a constant --
      * tests must not print the raw value. */
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     struct timespec ts;
     if (sched_rr_get_interval((pid_t)(s32)a0, &ts) < 0)
         return host_err();

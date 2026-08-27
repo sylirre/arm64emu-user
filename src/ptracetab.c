@@ -947,21 +947,6 @@ static void pt_send_kick(s32 tgid, s32 tid) {
     syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si);
 }
 
-/* Thread group of host task `tid` (/proc/<tid>/status Tgid -- guest tids are
- * host tids). -1 if the task does not exist. Used to attach by thread tid. */
-static s32 pt_tgid_of(s32 tid) {
-    char path[64];
-    snprintf(path, sizeof path, "/proc/%d/status", (int)tid);
-    FILE *f = fopen(path, "re");
-    if (!f) return -1;
-    char line[128];
-    s32 tg = -1;
-    while (fgets(line, sizeof line, f))
-        if (!strncmp(line, "Tgid:", 5)) { tg = (s32)strtol(line + 5, NULL, 10); break; }
-    fclose(f);
-    return tg;
-}
-
 /* A stop signal aimed at a task whose thread group has ptrace tracees: route it
  * into cooperative group-stops instead of a real host stop. An uncatchable
  * SIGSTOP delivered to the host would freeze the tracees inside their ptrace
@@ -1080,7 +1065,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         if (!proctab_has(pid)) {
             /* Not a guest pid: maybe a secondary thread's tid (== host tid).
              * Its thread group must be a live guest process. */
-            tgid = pt_tgid_of(pid);
+            tgid = proctab_task_tgid(pid);   /* a thread's tid: its group (proctab.c) */
             if (tgid <= 0 || !proctab_has(tgid)) return -ESRCH;
         }
         if (tgid == (s32)getpid()) return -EPERM;   /* own thread group (kernel rule) */

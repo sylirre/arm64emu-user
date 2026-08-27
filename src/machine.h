@@ -879,6 +879,29 @@ int  proctab_has(s32 pid);                                 /* is a guest PID? */
 int  proctab_cmdline(s32 pid, char *out, u32 *len);        /* guest cmdline */
 int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap */
 
+/* Containment for the syscalls that name another task by id -- kill, tkill,
+ * tgkill, rt_sigqueueinfo, the nice/scheduler family. Guest PIDs and TIDs ARE
+ * host ones, so a raw id handed to the host addresses any process of the same
+ * uid, inside the rootfs or not; these answer "is this host task one the guest
+ * is allowed to see at all", the same question the /proc view answers when it
+ * hides non-guest PIDs.
+ *
+ *   proctab_task_tgid  thread group of a host task (/proc/<tid>/status Tgid),
+ *                      -1 if it is gone. Also how ptracetab.c attaches by tid.
+ *   proctab_has_task   is `tid` a guest task: our own thread group always, a
+ *                      registered guest PID, or a thread of one -- minus the
+ *                      non-guest tasks that process published (an interposer's
+ *                      own threads, which the guest is never shown).
+ *   proctab_slots      registry size, 0 when the table is unavailable, and
+ *   proctab_pid_at     the live guest PID in one slot (0 = none), so a caller
+ *                      can walk the whole registry -- the process-group and
+ *                      "every process" signal fan-outs do -- without a
+ *                      4096-entry buffer of its own. */
+s32  proctab_task_tgid(s32 tid);
+int  proctab_has_task(s32 tid);
+int  proctab_slots(void);
+s32  proctab_pid_at(int slot);
+
 /* Id maps of a faked user namespace, kept in the registry rather than in the
  * owner's Machine because the standard setup has the PARENT write the child's
  * maps -- and one emulator process cannot reach another's Machine. sys_procfs.c

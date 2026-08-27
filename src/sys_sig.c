@@ -208,34 +208,90 @@ SYSDEF(sigaltstack) {
     return 0;
 }
 
+/* One guest process, one signal: the ptrace routing every path below needs,
+ * then the host send. Returns 0 or -errno.
+ *
+ * A traced process stopping itself (kill(getpid(), SIGSTOP), as strace's child
+ * does to synchronize) must ptrace-stop cooperatively, not real-stop at the
+ * host. The group fan-out (ptrace_signal_stop) stops every traced thread, as
+ * the kernel's group-stop does; ptrace_selfstop backstops the calling thread
+ * when the registry has no link for it. A stop signal to *another* process
+ * that is a tracee likewise becomes a cooperative group-stop (a tracer
+ * stopping its tracee with SIGSTOP before detaching, as strace does on ^C); a
+ * real host SIGSTOP would freeze it. SIGCONT to a tracee a tracer has put into
+ * a listening group-stop ends the group-stop cooperatively (reports
+ * EVENT_STOP) instead of a real host signal. */
+static s64 kill_one(s32 pid, int sig) {
+    if (pid == (s32)getpid()) {
+        if (ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig)) return 0;
+    } else if (ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig)) {
+        return 0;
+    }
+    return kill((pid_t)pid, sig_send_host_nr(sig)) < 0 ? -errno : 0;
+}
+
+/* kill(2) with a non-positive pid: a process group (0 = the caller's, -pgid =
+ * that one) or, for -1, every process the caller may signal.
+ *
+ * The host cannot be asked these questions on the guest's behalf. Guest PIDs
+ * are host PIDs and the emulator holds no privilege that would narrow the
+ * blast radius: kill(-1, SIGKILL) handed to the host kills every process of
+ * the invoking user -- their shell, their session, the emulator's own IPC
+ * broker daemon -- and the caller's host process group is whatever job the
+ * shell that launched the emulator put it in, which is not the guest's. So the
+ * group is enumerated from the PID registry instead, which is exactly the set
+ * of processes the guest can see in /proc, and signalled one at a time.
+ *
+ * The kernel's rules are kept: pid -1 skips the caller's own thread group (and
+ * init, which is never a guest process), a group send includes the caller, and
+ * the result is 0 if any one target took the signal, else the last error --
+ * ESRCH when nothing matched. Our own PID is always a candidate, table or not,
+ * so a process whose registration failed can still signal its own group. */
+static u64 kill_group(s32 pid, int sig) {
+    s32 self = (s32)getpid();
+    pid_t want = 0;
+    if (pid != -1) {
+        want = pid ? (pid_t)-pid : getpgid(0);
+        if (want <= 0) return (u64)(s64)-ESRCH;
+    }
+    int sent = 0;
+    s64 err = -ESRCH;
+    if (pid != -1 && getpgid(self) == want) {   /* ourselves, registry or not */
+        s64 r = kill_one(self, sig);
+        if (r == 0) sent = 1; else err = r;
+    }
+    for (int i = 0, n = proctab_slots(); i < n; i++) {
+        s32 t = proctab_pid_at(i);
+        if (t <= 0 || t == self) continue;
+        if (pid != -1 && getpgid((pid_t)t) != want) continue;   /* gone, or elsewhere */
+        s64 r = kill_one(t, sig);
+        if (r == 0) sent = 1;
+        else if (r != -ESRCH) err = r;   /* a target that raced away is not the answer */
+    }
+    return sent ? 0 : (u64)err;
+}
+
 SYSDEF(kill) {
-    /* A traced process stopping itself (kill(getpid(), SIGSTOP), as strace's
-     * child does to synchronize) must ptrace-stop cooperatively, not real-stop
-     * at the host. The group fan-out (ptrace_signal_stop) stops every traced
-     * thread, as the kernel's group-stop does; ptrace_selfstop backstops the
-     * calling thread when the registry has no link for it. */
-    if ((a0 == (u64)getpid() || a0 == 0) &&
-        (ptrace_signal_stop((s32)getpid(), (int)a1) || ptrace_selfstop((int)a1)))
-        return 0;
-    /* A stop signal to *another* process that is a tracee likewise becomes a
-     * cooperative group-stop (a tracer stopping its tracee with SIGSTOP before
-     * detaching, as strace does on ^C); a real host SIGSTOP would freeze it. */
-    if ((s32)a0 > 0 && a0 != (u64)getpid() && ptrace_signal_stop((s32)a0, (int)a1))
-        return 0;
-    /* SIGCONT to a tracee a tracer has put into a listening group-stop ends the
-     * group-stop cooperatively (reports EVENT_STOP) instead of a real host signal. */
-    if ((s32)a0 > 0 && a0 != (u64)getpid() && ptrace_signal_cont((s32)a0, (int)a1))
-        return 0;
-    return kill((pid_t)(s32)a0, sig_send_host_nr((int)a1)) < 0 ? host_err() : 0;
+    (void)c; (void)a2; (void)a3; (void)a4; (void)a5;
+    s32 pid = (s32)a0;
+    int sig = (int)a1;
+    if (pid <= 0) return kill_group(pid, sig);
+    /* A host PID outside the guest does not exist as far as the guest is
+     * concerned -- it is hidden from /proc too -- so ESRCH, not EPERM. */
+    if (!proctab_has_task(pid)) return (u64)(s64)-ESRCH;
+    s64 r = kill_one(pid, sig);
+    return (u64)r;
 }
 
 SYSDEF(tkill) {
     /* Thread-directed signal. Guest tids ARE host tids (sys_proc.c clone), so
-     * the raw value addresses the right host task and a stale tid gets the
-     * kernel's ESRCH. */
+     * the raw value addresses the right host task -- which is why it has to be
+     * checked against the guest's task set first (machine.h, proctab_has_task);
+     * a stale tid gets ESRCH from there or from the kernel. */
     (void)c; (void)a2; (void)a3; (void)a4; (void)a5;
     s32 tid = (s32)a0;
     if (tid <= 0) return (u64)(s64)-EINVAL;
+    if (!proctab_has_task(tid)) return (u64)(s64)-ESRCH;
     if (tid == (s32)g_tls.tid) {
         /* Self (the common raise() case): route a traced self-stop via ptrace. */
         if (ptrace_selfstop((int)a1)) return 0;
@@ -250,11 +306,18 @@ SYSDEF(tkill) {
 }
 
 SYSDEF(tgkill) {
-    /* As tkill: guest tids are host tids, so both ids pass through and the
-     * host enforces the tgid/tid pairing. */
+    /* As tkill: guest tids are host tids, so both ids pass through the guest
+     * task check and then the host enforces the tgid/tid pairing. Inside our
+     * own thread group that check is free -- the kernel's pairing rule already
+     * says the tid is one of ours -- which matters because a Go runtime aims a
+     * tgkill at a sibling thread on every preemption. */
     (void)c; (void)a3; (void)a4; (void)a5;
     s32 tgid = (s32)a0, tid = (s32)a1;
     if (tgid <= 0 || tid <= 0) return (u64)(s64)-EINVAL;
+    if (tgid != (s32)getpid()) {
+        if (!proctab_has(tgid) || !proctab_has_task(tid))
+            return (u64)(s64)-ESRCH;
+    }
     if (tid == (s32)g_tls.tid && tgid == getpid()) {
         /* Self thread: route a traced self-stop through ptrace. */
         if (ptrace_selfstop((int)a2)) return 0;
@@ -493,6 +556,14 @@ SYSDEF(rt_sigqueueinfo) {
     memcpy(&pid, gsi + 16, 4);
     memcpy(&uid, gsi + 20, 4);
     memcpy(&value, gsi + 24, 8);
+    /* The forge rule comes before the pid lookup, as in the kernel: an si_code
+     * the caller may not claim is EPERM even for a pid that does not exist
+     * (tests/c/sigqueue.c checks that order). Only then is the target
+     * contained -- a host PID outside the guest does not exist for it, the
+     * same answer kill(2) gives. */
+    if ((code >= 0 || code == SI_TKILL) && (s32)a0 != (s32)getpid())
+        return (u64)(s64)-EPERM;
+    if ((s32)a0 <= 0 || !proctab_has_task((s32)a0)) return (u64)(s64)-ESRCH;
     int hs = sig_send_host_nr((int)(s32)a1);   /* 32/33 ride the carrier */
     siginfo_t si;
     memset(&si, 0, sizeof si);
