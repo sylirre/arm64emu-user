@@ -542,6 +542,9 @@ void sig_tls_prewarm(void);
 /* The other end of it: hand back whatever this thread's capture queue grew
  * into, and empty it. Called where a guest thread ends. */
 void sig_tls_release(void);
+/* And the same for a fork child, which inherits its parent's queue by copy
+ * and must start with an empty pending set. */
+void sig_fork_child(void);
 /* Give up the emulator's claim on the host signals its pending-signal gate is
  * holding, without unblocking them (signal.c). For a caller that has taken the
  * host mask over itself. */

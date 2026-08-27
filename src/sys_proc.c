@@ -536,6 +536,7 @@ SYSDEF(clone) {
         m->group_exit_code = 0;
         jit_fork_child();                 /* fork discipline for the JIT state */
         ptimers_fork_clear();             /* POSIX timers are not inherited */
+        sig_fork_child();                 /* nor is the pending-signal set */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */

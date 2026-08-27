@@ -64,6 +64,13 @@ trick: a signal that has reached the handler is already off the kernel's queue
 and cannot be put back, so blocking it at that point would drop the instance
 in hand.
 
+A fork child starts with none of it: `fork(2)` gives the child an empty
+pending set, and this queue is the one piece of the emulator's signal state
+that is per-thread and therefore comes across in the copy, so the child would
+otherwise deliver signals aimed at its parent (`sig_fork_child`, next to the
+other "not inherited" resets in the fork child). `exec` and thread exit reset
+it too, handing back whatever it grew into.
+
 Three things are never held at the gate: the control-channel kick (it is the
 wake that gets a parked thread to a consumer at all, so blocking it deadlocks
 rather than delays), `SIGSYS` (a seccomp trap that arrives blocked force-kills

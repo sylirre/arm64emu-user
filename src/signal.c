@@ -327,6 +327,16 @@ static void sigq_reset(void) {
 
 void sig_tls_release(void) { sigq_reset(); }
 
+/* fork(2) gives the child an empty pending set -- "the child does not inherit
+ * its parent's pending signals". Every other emulator queue is per-process
+ * state the child re-derives; this one is per-thread and came across in the
+ * copy, so the child would deliver signals aimed at its parent. A shell that
+ * blocks SIGINT or SIGCHLD around fork -- which is what a shell does -- is all
+ * it takes: whatever was pending at that moment ran in the child too, at its
+ * next unblock. Also lifts anything the gate had blocked host-side, since the
+ * child holds nothing back for the kernel. */
+void sig_fork_child(void) { sigq_reset(); }
+
 /* Append one captured signal. Async-signal-safe: no allocation, no lock, and
  * the only producer is this thread's own handlers, which never nest. Returns
  * 0 when it is not queued -- because a standard signal is already pending, as
