@@ -1671,6 +1671,34 @@ done"
     fi
 fi
 
+# ---- the pinned parent directory must be closed on every path out of a
+# syscall. Containment names a target by a descriptor on its parent rather than
+# by a path (path.c), and a `return` between the pin and the unpin leaks that
+# descriptor for the life of the process -- a guest fd number gone for good,
+# since guest fd == host fd, so a guest could exhaust its own table by asking
+# for the same failure repeatedly. Every call in the fixture is an error path,
+# where such a return hides; four of them (execve's shebang refusals) really did
+# leak, and this test reports 200 leaked descriptors with any one unpin removed.
+# Needs a rootfs and the :ro bind the fixture's read-only cases use. ----
+if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/pinleak.bin \
+            tests/fixtures/pinleak.c 2>/dev/null; then
+        cp tests/fixtures/pinleak.bin "$ALPINE/tmp/ci_pinleak"
+        expect=$'leaked=0\ndone'
+        got=$(timeout -k 5 120 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
+                  /tmp/ci_pinleak 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: pinleak"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: pinleak"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        rm -f "$ALPINE/tmp/ci_pinleak"
+        fx_rm tests/fixtures/pinleak.bin
+    else
+        skip_build "fixtures/pinleak"
+    fi
+fi
+
 # ---- rootfs containment against a path race. The emulator resolves a guest
 # path itself and then asks the host to resolve the result again; a guest thread
 # renaming a symlink into that path between the two used to redirect the syscall

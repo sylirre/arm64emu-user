@@ -1312,7 +1312,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
             hdr[n < sizeof hdr ? n : sizeof hdr - 1] = 0;
             char *line = (char *)hdr + 2;
             char *nl = strchr(line, '\n');
-            if (!nl) { free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!nl) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
             *nl = 0;
             while (*line == ' ' || *line == '\t') line++;
             char *interp = line, *arg = NULL;
@@ -1322,11 +1322,11 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                 while (*sp == ' ' || *sp == '\t') sp++;
                 if (*sp) arg = sp;
             }
-            if (!*interp) { free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!*interp) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
             int oldc = 0;
             while (argv[oldc]) oldc++;
             char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));
-            if (!nv) { free_strvec(argv); return (u64)(s64)-ENOMEM; }
+            if (!nv) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOMEM; }
             int k = 0;
             nv[k++] = strdup(interp);
             if (arg) nv[k++] = strdup(arg);
@@ -1337,6 +1337,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                 if (!nv[i]) {   /* a NULL hole would silently truncate argv */
                     for (int j = 0; j < k; j++) free(nv[j]);
                     free(nv);
+                    path_unpin(&pin);
                     free_strvec(argv);
                     return (u64)(s64)-ENOMEM;
                 }
