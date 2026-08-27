@@ -388,8 +388,10 @@ if [ -x "$ALPINE/bin/busybox" ] && head -c1 /proc/net/unix >/dev/null 2>&1 && \
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS absns: $label"
         else fail=$((fail+1)); echo "FAIL absns: $label (want '$expect' got '$got')"; fi
     }
-    check_abs "isolated per rootfs by default" "abstract=tag" "$ALPINE" /tmp/ci_absprobe
-    check_abs "shared via opt-out flag"        "abstract=raw" --share-abstract-sockets "$ALPINE" /tmp/ci_absprobe
+    check_abs "isolated per rootfs by default" "abstract=tag
+long=ENAMETOOLONG" "$ALPINE" /tmp/ci_absprobe
+    check_abs "shared via opt-out flag"        "abstract=raw
+long=bound" --share-abstract-sockets "$ALPINE" /tmp/ci_absprobe
     rm -f "$ALPINE/tmp/ci_absprobe"; fx_rm tests/fixtures/absprobe.bin
 fi
 

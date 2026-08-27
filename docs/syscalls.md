@@ -370,8 +370,15 @@ after the leading NUL on `bind`/`connect`/`sendto`/`sendmsg` and stripping it
 back on the readback calls: same-rootfs guests still rendezvous, while the host
 and other rootfs instances (untagged or differently tagged) are isolated.
 `--share-abstract-sockets` opts out (shares the host's global abstract
-namespace); names too long to fit the tag under 108 bytes, and unnamed/autobind
-addresses, pass through untagged. When the rootfs prefix pushes the translated
+namespace). A name too long for the tag to fit beside it is **refused**
+(`ENAMETOOLONG`), not bound untagged: untagged *is* the host's global namespace,
+so passing it through was a deliberate way out of the isolation — pick a name
+longer than `sun_path` minus the 12-byte tag and reach anything in it. The
+isolated namespace's names are that much shorter than the kernel's 107 bytes as
+a result, the same shape of limit the rootfs prefix imposes on pathname sockets
+below. Unnamed/autobind addresses (no name at all) and addresses longer than
+`sun_path` itself (invalid whatever we do, so the kernel's `EINVAL` is the
+better answer) still pass through. When the rootfs prefix pushes the translated
 path past the 108-byte `sun_path`
 limit, `bind`/`connect`/`sendto`/`sendmsg` fall back to opening the parent
 directory and operating relative to it via `/proc/self/fd/<fd>/<basename>`, so

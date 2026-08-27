@@ -3,7 +3,14 @@
  * /proc/net/unix (a passthrough) and look at our own socket's on-host name: the
  * emulator splices a per-rootfs tag right before the name by default, or leaves
  * it verbatim under --share-abstract-sockets. Prints "abstract=tag" or
- * "abstract=raw" (a single process, so no bind/inspect race). */
+ * "abstract=raw" (a single process, so no bind/inspect race).
+ *
+ * Then the escape hatch that used to exist: a name too long for the tag to fit
+ * beside was bound UNTAGGED, i.e. in the host's own global namespace, so any
+ * guest could reach it by simply choosing a long enough name. It is refused
+ * now ("long=ENAMETOOLONG"); with the isolation opted out there is no tag and
+ * the kernel's full 107 bytes are usable again ("long=bound"). */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -42,5 +49,24 @@ int main(void) {
     char *p = strstr(buf, nm);
     if (!p) { printf("abstract=missing\n"); return 0; }
     printf("abstract=%s\n", (p > buf && p[-1] == '@') ? "raw" : "tag");
+
+    /* A 100-byte name: it fits sun_path's 107, but not beside the tag. */
+    char lnm[101];
+    memset(lnm, 'L', sizeof lnm - 1);
+    lnm[sizeof lnm - 1] = 0;
+    int pid = (int)getpid();                    /* a name of our own, no NUL */
+    memcpy(lnm, "ABSLONG_", 8);
+    lnm[8] = (char)('0' + (pid / 100) % 10);
+    lnm[9] = (char)('0' + (pid / 10) % 10);
+    lnm[10] = (char)('0' + pid % 10);
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    memcpy(un.sun_path + 1, lnm, sizeof lnm - 1);
+    al = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + sizeof lnm - 1);
+    int s2 = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s2 < 0) { printf("long=nosocket\n"); return 0; }
+    if (bind(s2, (struct sockaddr *)&un, al) == 0) printf("long=bound\n");
+    else printf("long=%s\n", errno == ENAMETOOLONG ? "ENAMETOOLONG" : "err");
+    close(s2);
     return 0;
 }

@@ -94,14 +94,26 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
  * leading NUL. The name after the NUL is opaque bytes of length (*sl-poff-1);
  * shift it right by the tag and copy the tag in. Same rootfs -> same tag, so
  * guest processes still rendezvous, while the host and other rootfs (untagged
- * or differently tagged) don't. No-op with --share-abstract-sockets, or when
- * the tag would push the name past the 108-byte sun_path (left untagged). */
-static void abs_tag_in(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t poff) {
+ * or differently tagged) don't. No-op with --share-abstract-sockets.
+ *
+ * A name the tag cannot fit alongside is REFUSED (-ENAMETOOLONG), not passed
+ * through untagged: untagged is the host's own global namespace, so leaving it
+ * there gave any guest a deliberate way out of the isolation — pick a name
+ * longer than sun_path minus the tag and bind or connect anywhere in it. The
+ * cost is that the isolated namespace's names are that much shorter than the
+ * kernel's 107 bytes, which is the same shape of limit the rootfs prefix
+ * imposes on pathname sockets below (and which reports the same errno). An
+ * address longer than sun_path itself is left alone: it is invalid whatever we
+ * do with it, and the kernel's own EINVAL is the better answer. */
+static int abs_tag_in(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t poff) {
     size_t T = c->m->abs_tag_len, total = (size_t)*sl - poff;
-    if (c->m->share_abstract || T == 0 || total + T > sizeof un->sun_path) return;
+    if (c->m->share_abstract || T == 0) return 0;
+    if (total > sizeof un->sun_path) return 0;          /* the kernel's EINVAL */
+    if (total + T > sizeof un->sun_path) return -ENAMETOOLONG;
     memmove(un->sun_path + 1 + T, un->sun_path + 1, total - 1);
     memcpy(un->sun_path + 1, c->m->abs_tag, T);
     *sl = (socklen_t)(*sl + T);
+    return 0;
 }
 
 /* Reverse of abs_tag_in: strip our rootfs tag from an abstract address the
@@ -136,10 +148,8 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
     if ((size_t)*sl <= poff) return 0;         /* unnamed / autobind */
-    if (un->sun_path[0] == '\0') {             /* abstract namespace */
-        abs_tag_in(c, un, sl, poff);
-        return 0;
-    }
+    if (un->sun_path[0] == '\0')               /* abstract namespace */
+        return abs_tag_in(c, un, sl, poff);
     size_t maxp = (size_t)*sl - poff;
     if (maxp > sizeof un->sun_path) maxp = sizeof un->sun_path;
     char gpath[PATH_MAX];
