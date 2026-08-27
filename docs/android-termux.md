@@ -47,7 +47,10 @@ unfiltered:
   seeding *skips* its own device fallback on anything ≥ 4.8 precisely because
   `getrandom` must exist there — forwarding the host's `ENOSYS` left TLS
   software with no entropy source at all (`apk update` crashed on a NULL SSL
-  object). `A64_GETRANDOM_FORCE_DEV` forces this tier for testing.
+  object). `A64_GETRANDOM_FORCE_DEV` forces this tier for testing. The same
+  two tiers seed the guest's `AT_RANDOM` (the sixteen bytes libc turns into
+  a stack canary and pointer guard), which used to fall back to a fixed
+  pattern instead — the same canary in every guest on such a host.
 * **Never-forwarded set**: the keyring family returns `-ENOSYS` on Bionic;
   `set_robust_list`/`get_robust_list` are answered from per-thread emulator
   state; guest probes of post-Oreo syscalls (`rseq`, `clone3`, `openat2`, …)

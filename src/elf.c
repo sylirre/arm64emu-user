@@ -12,7 +12,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/prctl.h>
-#include <sys/syscall.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -299,9 +298,18 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     u64 execfn_va = str;
     copy_to_guest(&m->cpu, str, canon, strlen(canon) + 1);
 
+    /* AT_RANDOM is where a guest libc gets its stack canary and pointer guard
+     * from, so these sixteen bytes have to be unpredictable: a fixed pattern
+     * for a host whose getrandom(2) is missing or filtered would hand every
+     * guest on it the same canary and make the guard no guard at all. The
+     * helper falls back to the host's random devices exactly as the guest's
+     * own getrandom(2) does; a host that has neither cannot start a guest
+     * safely, and saying so is better than seeding one with a constant. */
     u8 rnd[16];
-    if (syscall(SYS_getrandom, rnd, sizeof rnd, 0) != (long)sizeof rnd)
-        for (int i = 0; i < 16; i++) rnd[i] = (u8)(i * 41 + 7);
+    if (host_random_bytes(rnd, sizeof rnd) < 0) {
+        free(argvp); free(envpp);
+        return -EIO;
+    }
     u64 rnd_va = stack_push(m, &sp, rnd, sizeof rnd);
     u64 plat_va = stack_push(m, &sp, "aarch64", 8);
 

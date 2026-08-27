@@ -21,6 +21,41 @@
 #define G_GRND_RANDOM   0x2
 #define G_GRND_INSECURE 0x4
 
+/* Random bytes for the EMULATOR's own use -- today the guest's AT_RANDOM seed
+ * (elf.c), which is what a guest libc builds its stack canary and pointer
+ * guard from, so a predictable answer here is a predictable canary in every
+ * guest on the host. Same two tiers sys_getrandom serves the guest from:
+ * getrandom(2), then the random devices where the host kernel has none
+ * (< 3.17 -- Android 7 devices run 3.x) or a seccomp filter answers ENOSYS
+ * through the SIGSYS net. A64_GETRANDOM_FORCE_DEV selects the device tier
+ * here too, so the suite's dev-tier row exercises this path as well.
+ * Returns 0, or -1 when the host offers no entropy at all -- which the caller
+ * must treat as a refusal to start, never as a reason to invent bytes. */
+int host_random_bytes(void *buf, size_t len) {
+    u8 *p = buf;
+    size_t got = 0;
+    if (!getenv("A64_GETRANDOM_FORCE_DEV")) {
+        while (got < len) {
+            long n = syscall(SYS_getrandom, p + got, len - got, 0);
+            if (n > 0) { got += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        if (got == len) return 0;
+    }
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) fd = open("/dev/random", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (got < len) {
+        ssize_t n = read(fd, p + got, len - got);
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fd);
+    return got == len ? 0 : -1;
+}
+
 SYSDEF(getrandom) {
     size_t len = (size_t)a1;
     unsigned flags = (unsigned)a2;

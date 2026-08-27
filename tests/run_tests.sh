@@ -1625,6 +1625,44 @@ elif [ -x "$TMBIN" ]; then
     fi
 fi
 
+# ---- AT_RANDOM: the guest libc's stack-canary seed ----
+# Self-checking: the value is random by construction, so there is nothing to
+# diff against an oracle -- what has to hold is that it VARIES. It used to fall
+# back to a fixed pattern (i*41+7) whenever the host's getrandom(2) was missing
+# or filtered, which gave every guest on such a host the same canary. Both
+# entropy tiers are checked, the second forced onto the random devices.
+if [ ! -x tests/fixtures/atrandom.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/atrandom.bin \
+        tests/fixtures/atrandom.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/atrandom.bin ]; then
+    LEGACY=07305982abd4fd264f78a1caf31c456e   # the old fixed pattern
+    for tier in "" "A64_GETRANDOM_FORCE_DEV=1"; do
+        label="fixture: atrandom${tier:+(dev-tier)}"
+        seen= bad= n=0
+        for i in 1 2 3; do
+            out=$(env $tier timeout -k 5 30 "$EMU" / tests/fixtures/atrandom.bin 2>/dev/null)
+            [ "$(echo "$out" | sed -n 2p)" = "onstack=1" ] || bad="not on the initial stack"
+            v=$(echo "$out" | sed -n 1p)
+            case "$v" in
+            "$LEGACY") bad="the fixed fallback pattern" ;;
+            [0-9a-f]*) ;;
+            *) bad="no AT_RANDOM" ;;
+            esac
+            case " $seen " in *" $v "*) bad="repeated across runs" ;; esac
+            seen="$seen $v"; n=$((n+1))
+        done
+        if [ -z "$bad" ] && [ "$n" = 3 ]; then
+            pass=$((pass+1)); echo "PASS $label"
+        else
+            fail=$((fail+1)); echo "FAIL $label ($bad)"
+        fi
+    done
+    fx_rm tests/fixtures/atrandom.bin
+else
+    skip_build "fixtures/atrandom"
+fi
+
 # ---- differential instruction fuzzer (tests/fixtures/insnfuzz.c) ----
 # Two comparisons, because they have different oracles.
 #

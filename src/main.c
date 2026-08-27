@@ -299,9 +299,10 @@ static void help(void) {
         {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "
                         "tier)."},
-        {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2) onto the /dev/urandom"
-                        " / /dev/random fallback (the tier a host kernel "
-                        "without getrandom is served by)."},
+        {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2), and the guest's "
+                        "AT_RANDOM seed, onto the /dev/urandom / /dev/random "
+                        "fallback (the tier a host kernel without getrandom "
+                        "is served by)."},
         {"A64_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
                         "with a pipe instead of process_vm_readv (the tier a "
                         "host kernel older than 3.2 is served by)."},

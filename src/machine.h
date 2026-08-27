@@ -757,6 +757,13 @@ int  tmpfs_dir_new(struct Machine *m, char *host_out);
 void tmpfs_session_cleanup(struct Machine *m);
 void tmpfs_sweep_stale(void);
 
+/* Entropy for the emulator's own use (sys_misc.c), as opposed to the guest's
+ * getrandom(2): getrandom(2) first, the host's random devices where there is
+ * no such syscall. 0 on success, -1 when the host offers neither -- which is
+ * a refusal to proceed, not a licence to make bytes up (elf.c's AT_RANDOM is
+ * the guest libc's stack canary). */
+int  host_random_bytes(void *buf, size_t len);
+
 /* Runtime bind-table mutation, backing the guest mount(2)/umount2(2) handlers.
  * Arguments are already canonical (guest_canon) / resolved (host). Lock-free,
  * mirroring m->gtid's slot idiom. bind_add returns the slot index, or -ENOMEM
