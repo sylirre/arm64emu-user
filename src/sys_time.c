@@ -47,7 +47,15 @@ SYSDEF(clock_nanosleep) {
     syscall_wait_begin((a1 & 1 /*TIMER_ABSTIME*/) ? NULL : &req);
     int e = clock_nanosleep((clockid_t)a0, (int)a1, &req, &rem);
     if (e) {
-        if (e == EINTR && a3 && !(a1 & 1 /*TIMER_ABSTIME*/)) ts_out(c, a3, &rem);
+        /* The remainder goes out before the interruption is reported, and a
+         * copyout that faults is what the call answers: nanosleep_copyout
+         * returns EFAULT in place of the restart, so a caller with a bad `rem`
+         * hears about the pointer rather than about the signal. An absolute
+         * deadline has no remainder to write, so its pointer is never touched. */
+        if (e == EINTR && a3 && !(a1 & 1 /*TIMER_ABSTIME*/)) {
+            int w = ts_out(c, a3, &rem);
+            if (w < 0) return (u64)(s64)w;
+        }
         return (u64)(s64)-e;
     }
     return 0;
@@ -59,8 +67,15 @@ SYSDEF(nanosleep) {
     if (r < 0) return (u64)(s64)r;
     syscall_wait_begin(&req);   /* a restart must not sleep the whole span again */
     if (nanosleep(&req, &rem) < 0) {
-        if (errno == EINTR && a1) ts_out(c, a1, &rem);
-        return host_err();
+        /* errno first: ts_out reaches guest memory and may set its own (see
+         * sys.h). Then, as in clock_nanosleep, the copyout fault outranks the
+         * interruption it was reporting. */
+        int en = errno;
+        if (en == EINTR && a1) {
+            int w = ts_out(c, a1, &rem);
+            if (w < 0) return (u64)(s64)w;
+        }
+        return (u64)(s64)-en;
     }
     return 0;
 }

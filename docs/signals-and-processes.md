@@ -156,6 +156,15 @@ short naps and poll for themselves (`rt_sigsuspend`, `rt_sigtimedwait`,
 asserts both halves: the sleep returns `0`, and it still ends when the guest
 asked rather than one interruption-point later.
 
+When a sleep *is* reported as interrupted, the remaining time goes out first and
+a copyout that faults is what the call answers: `nanosleep_copyout` returns
+`EFAULT` in place of the restart, so a caller with an unwritable `rem` hears
+about the pointer rather than about the signal. Discarding that error and
+reporting a bare `EINTR` left a caller that loops on `EINTR` re-sleeping from a
+`rem` it never received, which is the one thing the field exists for.
+`TIMER_ABSTIME` has no remainder to write and never touches the pointer
+(`tests/c/remfault.c` covers both, qemu agreeing with the host kernel).
+
 ### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
 
 `sig_timedwait` consumes one pending signal from the calling thread's capture
