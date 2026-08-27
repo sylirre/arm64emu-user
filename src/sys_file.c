@@ -120,6 +120,16 @@ static int fake_root(struct Machine *m) { return m->fake_id && m->cred.euid == 0
 static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
                           GIovec *gout, u8 **bounce_out, int writeback) {
     (void)writeback;
+    /* `cnt` is deliberately narrow. The guest passes iovcnt in a 64-bit
+     * register and the kernel takes it as `unsigned long`, but it reaches
+     * import_iovec's `unsigned nr_segs` and is truncated there -- so on a real
+     * kernel readv(fd, iov, 1ULL<<32) reads nothing and returns 0, and
+     * readv(fd, iov, (1ULL<<32)+1) is an ordinary one-segment read. Verified
+     * against one; qemu-user is not the oracle for this (it validates the full
+     * 64-bit value and answers EINVAL for both). The callers' (unsigned) cast
+     * reproduces the kernel's, and the UIO_MAXIOV check below then sees the
+     * same number the kernel does. A socket's msg_iovlen is the opposite case:
+     * the kernel checks the whole u64 there (see msg_import in sys_net.c). */
     if (cnt > 1024) return -EINVAL;
     if (copy_from_guest(c, gout, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
     size_t total = 0;

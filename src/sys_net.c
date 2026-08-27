@@ -621,8 +621,16 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
             h->msg_namelen = sizeof *ss;
         }
     }
+    /* msg_iovlen is a guest u64 and the kernel checks it as one --
+     * copy_msghdr_from_user compares the whole value against UIO_MAXIOV and
+     * answers EMSGSIZE, not EINVAL, above it. Casting first threw the high
+     * half away, so 2^32 became an empty gather the call went on to perform
+     * and 2^32+1 became a one-segment send, where a kernel refuses both.
+     * (readv/writev are the opposite case and deliberately do narrow: their
+     * vlen reaches the kernel's own `unsigned nr_segs`, so 2^32 really is
+     * zero segments there. See iov_from_guest in sys_file.c.) */
+    if (g->msg_iovlen > 1024) return -EMSGSIZE;
     unsigned cnt = (unsigned)g->msg_iovlen;
-    if (cnt > 1024) return -EINVAL;
     GIovec gi[1024];
     if (cnt && copy_from_guest(c, gi, g->msg_iov, sizeof(GIovec) * cnt) < 0) return -EFAULT;
     /* Bound every segment on its own, not just the sum: iov_len is a guest u64,

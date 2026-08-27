@@ -1349,6 +1349,43 @@ else
     skip_build "fixtures/bigcount"
 fi
 
+# ---- how many iovec segments a vector call was given. readv/writev truncate
+# it to the kernel's own `unsigned nr_segs`, so 2^32 is zero segments and
+# 2^32+1 is one; sendmsg/recvmsg check the whole 64-bit msg_iovlen and answer
+# EMSGSIZE above UIO_MAXIOV. Self-checking: the block below is what a real
+# kernel prints for this program, natively, and qemu-user cannot be the oracle
+# -- it validates the full 64-bit count for readv too. ----
+if [ ! -x tests/fixtures/iovcnt.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/iovcnt.bin \
+        tests/fixtures/iovcnt.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/iovcnt.bin ]; then
+    expect=$'readv 0x1 -> 11 errno=0
+readv 0x401 -> -1 errno=22
+readv 0x100000000 -> 0 errno=0
+readv 0x100000001 -> 11 errno=0
+readv 0xffffffffffffffff -> -1 errno=22
+sendmsg 0x1 -> 1 errno=0
+sendmsg 0x401 -> -1 errno=90
+sendmsg 0x100000000 -> -1 errno=90
+sendmsg 0x100000001 -> -1 errno=90
+sendmsg 0xffffffffffffffff -> -1 errno=90
+recvmsg 0x401 -> -1 errno=90
+recvmsg 0x100000000 -> -1 errno=90
+recvmsg 0x100000001 -> -1 errno=90
+recvmsg 0xffffffffffffffff -> -1 errno=90
+still-queued 1 \'x\''
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/iovcnt.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: iovcnt"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: iovcnt"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/iovcnt.bin
+else
+    skip_build "fixtures/iovcnt"
+fi
+
 # ---- execve refuses an unloadable image with an errno, not by dying. Loading
 # happens in the emulator's own address space, so the old one is gone before the
 # new image is read; anything refused after that has no caller left. Self-
