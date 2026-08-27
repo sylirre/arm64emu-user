@@ -1625,6 +1625,47 @@ elif [ -x "$TMBIN" ]; then
     fi
 fi
 
+# ---- the stale-tmpfs sweep must not follow a planted symlink ----
+# Backing directories for emulated tmpfs mounts live in a place anyone can
+# create a name in (/dev/shm, /tmp), and every startup sweeps the ones whose
+# owning invocation is gone. That sweep used to opendir() the name it read out
+# of that directory, so a symlink parked under a dead pid's session name turned
+# it into a recursive delete of whatever it pointed at. Self-checking: there is
+# nothing here for an oracle to model.
+sweep_base=
+for cand in /dev/shm "${XDG_RUNTIME_DIR:-}" "${TMPDIR:-}" /data/local/tmp /tmp; do
+    [ -n "$cand" ] && [ -w "$cand" ] && { sweep_base=$cand; break; }
+done
+if [ -z "$sweep_base" ]; then
+    skip=$((skip+1)); echo "SKIP tmpfs sweep: no writable base directory"
+else
+    canary=$(mktemp -d) || canary=
+    dead=$(sh -c 'echo $$')
+    plant="$sweep_base/arm64chroot-tmpfs.$(id -u).$dead"
+    if [ -z "$canary" ] || [ -e "$plant" ] || kill -0 "$dead" 2>/dev/null; then
+        skip=$((skip+1)); echo "SKIP tmpfs sweep: could not stage the plant"
+    else
+        : > "$canary/keep"
+        ln -s "$canary" "$plant"
+        # The sweep runs in main(), before the initial exec, so it happens
+        # even for an image that cannot be loaded -- no guest binary needed.
+        timeout -k 5 30 "$EMU" / /nonexistent-sweep-probe >/dev/null 2>&1
+        why=
+        [ -e "$canary/keep" ] || why="followed the symlink and deleted the target"
+        [ -d "$canary" ] || why="followed the symlink and deleted the target"
+        if [ -z "$why" ] && [ -L "$plant" ] && ! kill -0 "$dead" 2>/dev/null; then
+            why="left the planted link behind"
+        fi
+        if [ -z "$why" ]; then
+            pass=$((pass+1)); echo "PASS tmpfs sweep: plant not followed"
+        else
+            fail=$((fail+1)); echo "FAIL tmpfs sweep: $why"
+        fi
+        rm -f "$plant"
+        rm -rf "$canary"
+    fi
+fi
+
 # ---- AT_RANDOM: the guest libc's stack-canary seed ----
 # Self-checking: the value is random by construction, so there is nothing to
 # diff against an oracle -- what has to hold is that it VARIES. It used to fall

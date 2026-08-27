@@ -525,38 +525,68 @@ int a64_mfdfile(int cloexec) {
     return fd;
 }
 
-/* "<base>/arm64chroot-tmpfs.<uid>.<root pid>": the root pid (high half of the
- * session nonce, seeded in main and fork-inherited) both scopes the directory
- * to this invocation and lets a later run test whether it is still alive. */
+/* "arm64chroot-tmpfs.<uid>.<root pid>": the root pid (high half of the session
+ * nonce, seeded in main and fork-inherited) both scopes the directory to this
+ * invocation and lets a later run test whether it is still alive. The bare
+ * name is kept separate from the base directory because both cleanup paths
+ * work relative to an open fd on that base, never by path. */
+static int tmpfs_session_name(const struct Machine *m, char *out, size_t cap) {
+    int n = snprintf(out, cap, "arm64chroot-tmpfs.%u.%u",
+                     (unsigned)getuid(), (unsigned)(m->shm_session >> 32));
+    return (n > 0 && (size_t)n < cap) ? 0 : -ENAMETOOLONG;
+}
+
+/* "<base>/<session name>", for the callers that still need the full path. */
 static int tmpfs_session_path(const struct Machine *m, char *out) {
     const char *base = tmpfs_base();
     if (!base) return -EACCES;
-    int n = snprintf(out, PATH_MAX, "%s/arm64chroot-tmpfs.%u.%u",
-                     base, (unsigned)getuid(),
-                     (unsigned)(m->shm_session >> 32));
+    char name[64];
+    int r = tmpfs_session_name(m, name, sizeof name);
+    if (r < 0) return r;
+    int n = snprintf(out, PATH_MAX, "%s/%s", base, name);
     return (n > 0 && n < PATH_MAX) ? 0 : -ENAMETOOLONG;
 }
 
-/* Recursively delete `path`. Only ever called on a directory this emulator
- * created under tmpfs_base(); the caller checks the prefix, and symlinks are
- * removed as links (no descent), so nothing outside the tree can be reached. */
-static void rm_rf(const char *path, int depth) {
+/* Recursively delete the entry `name` inside the already-open directory
+ * `dirfd`. Everything is fd-relative and every open is O_NOFOLLOW, so no
+ * component is ever followed as a symlink and none can be swapped for one
+ * between the test and the use.
+ *
+ * That matters because these trees live in a directory anybody can create a
+ * name in (/dev/shm, /tmp), and the stale sweep below deletes by a name it
+ * read out of that directory: an opendir(path) that followed a planted
+ * "arm64chroot-tmpfs.<uid>.<dead pid>" symlink would have turned the sweep
+ * into a recursive delete of whatever it pointed at. A non-directory -- that
+ * symlink included -- is unlinked as a link and never entered, and a directory
+ * this uid does not own is not one this emulator created, so it is left
+ * alone. */
+static void rm_rf_at(int dirfd, const char *name, int depth) {
     if (depth > 32) return;
-    DIR *d = opendir(path);
-    if (d) {
-        struct dirent *de;
-        while ((de = readdir(d))) {
-            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            char sub[PATH_MAX];
-            if (snprintf(sub, sizeof sub, "%s/%s", path, de->d_name) >= (int)sizeof sub)
-                continue;
-            struct stat st;
-            if (lstat(sub, &st) == 0 && S_ISDIR(st.st_mode)) rm_rf(sub, depth + 1);
-            else unlink(sub);
-        }
-        closedir(d);
+    int fd = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        /* Not a directory (or a symlink to one): drop the name itself. A real
+         * directory cannot be lost this way -- unlinkat without AT_REMOVEDIR
+         * answers EISDIR -- so nothing here can delete a tree it did not
+         * manage to open and vet. */
+        unlinkat(dirfd, name, 0);
+        return;
     }
-    rmdir(path);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_uid != getuid()) { close(fd); return; }
+    DIR *d = fdopendir(fd);
+    if (!d) { close(fd); return; }
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        struct stat sst;
+        if (fstatat(fd, de->d_name, &sst, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISDIR(sst.st_mode))
+            rm_rf_at(fd, de->d_name, depth + 1);
+        else
+            unlinkat(fd, de->d_name, 0);
+    }
+    closedir(d);                       /* closes fd */
+    unlinkat(dirfd, name, AT_REMOVEDIR);
 }
 
 /* Fresh empty directory to back one tmpfs mount. */
@@ -565,15 +595,32 @@ int tmpfs_dir_new(struct Machine *m, char *host_out) {
     int r = tmpfs_session_path(m, sess);
     if (r < 0) return r;
     if (mkdir(sess, 0700) != 0 && errno != EEXIST) return -errno;
-    /* The counter only has to be unique within this process; mkdir resolves a
-     * collision with a sibling process by failing, and we retry. */
+    /* EEXIST is the ordinary case -- a sibling process of this session got
+     * here first -- but the base is world-writable, so "it exists" is not
+     * "we made it": open it without following and insist it is a private
+     * directory of ours before creating anything inside. Every leaf is then
+     * made relative to that fd, so the session name cannot be swapped for a
+     * symlink between the check and the mkdir. */
+    int sfd = open(sess, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd < 0) return -errno;
+    struct stat st;
+    if (fstat(sfd, &st) != 0) { r = -errno; close(sfd); return r; }
+    if (st.st_uid != getuid() || (st.st_mode & (S_IRWXG | S_IRWXO))) {
+        close(sfd);
+        return -EACCES;
+    }
+    /* The counter only has to be unique within this process; mkdirat resolves
+     * a collision with a sibling process by failing, and we retry. */
     static int seq;
     for (int tries = 0; tries < 4096; tries++) {
-        int n = snprintf(host_out, PATH_MAX, "%s/%d.%d", sess, (int)getpid(), seq++);
-        if (n <= 0 || n >= PATH_MAX) return -ENAMETOOLONG;
-        if (mkdir(host_out, 0755) == 0) return 0;
-        if (errno != EEXIST) return -errno;
+        char leaf[64];
+        snprintf(leaf, sizeof leaf, "%d.%d", (int)getpid(), seq++);
+        int n = snprintf(host_out, PATH_MAX, "%s/%s", sess, leaf);
+        if (n <= 0 || n >= PATH_MAX) { close(sfd); return -ENAMETOOLONG; }
+        if (mkdirat(sfd, leaf, 0755) == 0) { close(sfd); return 0; }
+        if (errno != EEXIST) { r = -errno; close(sfd); return r; }
     }
+    close(sfd);
     return -ENOSPC;
 }
 
@@ -582,9 +629,14 @@ int tmpfs_dir_new(struct Machine *m, char *host_out) {
  * sandbox that outlives a child keeps its mounts. */
 void tmpfs_session_cleanup(struct Machine *m) {
     if ((u32)getpid() != (u32)(m->shm_session >> 32)) return;
-    char sess[PATH_MAX];
-    if (tmpfs_session_path(m, sess) < 0) return;
-    rm_rf(sess, 0);
+    const char *base = tmpfs_base();
+    if (!base) return;
+    char name[64];
+    if (tmpfs_session_name(m, name, sizeof name) < 0) return;
+    int bfd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (bfd < 0) return;
+    rm_rf_at(bfd, name, 0);
+    close(bfd);
 }
 
 /* Sweep session directories left behind by invocations that died without
@@ -609,9 +661,7 @@ void tmpfs_sweep_stale(void) {
         }
         if (pid <= 0 || pid == (long)getpid()) continue;
         if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;   /* still alive */
-        char sub[PATH_MAX];
-        if (snprintf(sub, sizeof sub, "%s/%s", base, de->d_name) < (int)sizeof sub)
-            rm_rf(sub, 0);
+        rm_rf_at(dirfd(d), de->d_name, 0);
     }
     closedir(d);
 }
