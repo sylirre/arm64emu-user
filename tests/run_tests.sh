@@ -1349,6 +1349,46 @@ else
     skip_build "fixtures/bigcount"
 fi
 
+# ---- vector I/O into memory the guest does not have. A kernel copies straight
+# into the caller's pages and stops where they do; a regular file reports the
+# short transfer, a pipe or a socket rolls the copy back and answers EFAULT,
+# and nothing addressable at all is EFAULT with the file untouched. The
+# emulator stages every vector call through a bounce buffer, so it has to work
+# that out from the guest's page table first -- it used to allocate for
+# everything the guest named, run the transfer and only then find the
+# destination missing, losing the bytes it had consumed. Self-checking: the
+# block below is what a real kernel prints for this program, natively, and
+# qemu-user disagrees with it on seven of the eleven rows. ----
+if [ ! -x tests/fixtures/iovroom.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/iovroom.bin \
+        tests/fixtures/iovroom.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/iovroom.bin ]; then
+    expect="none-addressable   -1 14 left=11
+none-1gb           -1 14 left=11
+file-read          4 0 left=7 got='hell'
+file-read-1gb      8 0 left=3 got='hello wo'
+file-write         4 0 left=4
+pipe-read          -1 14 left=11
+pipe-write         -1 14 left=0
+stream-read        -1 14 left=11
+stream-write       -1 14 left=0
+dgram-read         -1 14 left=-11
+dgram-write        -1 14 left=-11"
+    # A run that hangs is the regression: with the destination unchecked the
+    # bytes are consumed before the EFAULT, and the leftover probe then waits
+    # on a pipe nothing will ever fill.
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/iovroom.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: iovroom"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: iovroom"
+        diff <(echo "$expect") <(echo "$got") | head -10 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/iovroom.bin
+else
+    skip_build "fixtures/iovroom"
+fi
+
 # ---- how many iovec segments a vector call was given. readv/writev truncate
 # it to the kernel's own `unsigned nr_segs`, so 2^32 is zero segments and
 # 2^32+1 is one; sendmsg/recvmsg check the whole 64-bit msg_iovlen and answer

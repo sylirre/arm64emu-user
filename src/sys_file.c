@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -117,9 +118,15 @@ static int fake_root(struct Machine *m) { return m->fake_id && m->cred.euid == 0
  * kernel never agreed to touch, paired with lengths from the first read. The
  * kernel snapshots an iovec array once, in import_iovec, and never looks at
  * the user's copy again; so does this. */
-static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
-                          GIovec *gout, u8 **bounce_out, int writeback) {
-    (void)writeback;
+/* *efault_out is how a vector the guest could not fully back is reported:
+ *   0  the transfer's own result is the answer (the usual case, and the
+ *      short-transfer case);
+ *   1  the call answers EFAULT and must not touch the fd at all;
+ *   2  the call answers EFAULT, but the transfer happens first. */
+static int iov_from_guest(CPU *c, int fd, u64 iov_va, unsigned cnt,
+                          struct iovec *out, GIovec *gout, u8 **bounce_out,
+                          int writeback, int *efault_out) {
+    *efault_out = 0;
     /* `cnt` is deliberately narrow. The guest passes iovcnt in a 64-bit
      * register and the kernel takes it as `unsigned long`, but it reaches
      * import_iovec's `unsigned nr_segs` and is truncated there -- so on a real
@@ -132,22 +139,67 @@ static int iov_from_guest(CPU *c, u64 iov_va, unsigned cnt, struct iovec *out,
      * the kernel checks the whole u64 there (see msg_import in sys_net.c). */
     if (cnt > 1024) return -EINVAL;
     if (copy_from_guest(c, gout, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
-    size_t total = 0;
+    size_t asked = 0;
     for (unsigned i = 0; i < cnt; i++) {
         if (gout[i].iov_len > (1ULL << 30)) return -EINVAL;
-        total += gout[i].iov_len;
-        if (total > (1ULL << 30)) return -EINVAL;
+        asked += gout[i].iov_len;
+        if (asked > (1ULL << 30)) return -EINVAL;
+    }
+    /* Bound every segment by the guest's own memory, as rw_room does for the
+     * scalar calls (sys.h). A kernel copies straight between the file and the
+     * caller's pages and stops at the first address the caller does not have;
+     * this emulator has to stage the bytes in a bounce buffer first, so
+     * without this it allocated for -- and then really consumed from the fd --
+     * everything the guest named, only to discover afterwards that the
+     * destination was not there. A guest could name a gigabyte it does not
+     * own and the emulator, not the guest, had to find room for it, and the
+     * bytes read on its behalf were lost with the EFAULT.
+     *
+     * Cut the vector where the kernel's copy stops. What that means for the
+     * call then depends on the file, because on a kernel it does -- all of the
+     * following measured against one:
+     *   regular file, device, tty  the short transfer IS the answer;
+     *   pipe, stream socket        EFAULT, and nothing is consumed or sent --
+     *                              the copy is rolled back;
+     *   datagram socket, reading   EFAULT, and the datagram is gone anyway,
+     *                              which a clamped read of it also does;
+     *   datagram socket, writing   EFAULT, and nothing is sent.
+     * So *efault_out tells the caller which of the three shapes to produce.
+     * Nothing addressable at all is EFAULT everywhere, answered before the fd
+     * is touched -- as a kernel does, having copied nothing. */
+    AccType acc = writeback ? ACC_WRITE : ACC_READ;
+    size_t total = 0;
+    unsigned nseg = 0;
+    int cut = 0;
+    for (; nseg < cnt; nseg++) {
+        size_t want = (size_t)gout[nseg].iov_len;
+        size_t room = want ? rw_room(c, gout[nseg].iov_base, want, acc) : 0;
+        out[nseg].iov_len = room;
+        total += room;
+        if (room < want) { nseg++; cut = 1; break; }
+    }
+    if (cut) {
+        if (!total) return -EFAULT;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+            *efault_out = 1;                       /* leave the fd untouched */
+            int type = 0;
+            socklen_t tl = sizeof type;
+            if (writeback && S_ISSOCK(st.st_mode) &&
+                getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 &&
+                type != SOCK_STREAM)
+                *efault_out = 2;                   /* the datagram goes either way */
+        }
     }
     u8 *bounce = malloc(total ? total : 1);
     if (!bounce) return -ENOMEM;
     size_t off = 0;
-    for (unsigned i = 0; i < cnt; i++) {
+    for (unsigned i = 0; i < nseg; i++) {
         out[i].iov_base = bounce + off;
-        out[i].iov_len = gout[i].iov_len;
-        off += gout[i].iov_len;
+        off += out[i].iov_len;
     }
     *bounce_out = bounce;
-    return (int)cnt;
+    return (int)nseg;
 }
 
 /* ---------------------------------------------------------------------------
@@ -747,8 +799,10 @@ SYSDEF(readv) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 1, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault == 1) { free(bounce); return (u64)(s64)-EFAULT; }
     ssize_t n;
     if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: filled from the ring */
         size_t tot = 0;
@@ -781,6 +835,10 @@ SYSDEF(readv) {
         left -= (ssize_t)chunk;
     }
     free(bounce);
+    /* The guest could not back the whole vector and this file answers such a
+     * call as a whole (iov_from_guest): the bytes above are the ones a kernel
+     * would have managed to hand over before it said so. */
+    if (efault) return (u64)(s64)-EFAULT;
     return (u64)n;
 }
 
@@ -790,8 +848,10 @@ SYSDEF(writev) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 0, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault) { free(bounce); return (u64)(s64)-EFAULT; }
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
@@ -817,7 +877,8 @@ SYSDEF(writev) {
     if (consumed) { free(bounce); return (u64)pr; }
     ssize_t n = writev((int)a0, iov, cnt);
     free(bounce);
-    return n < 0 ? host_err() : (u64)n;
+    if (n < 0) return host_err();
+    return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
 SYSDEF(pread64) {
@@ -860,8 +921,10 @@ SYSDEF(preadv2) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 1, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault == 1) { free(bounce); return (u64)(s64)-EFAULT; }
     ssize_t n;
 #if defined(__BIONIC__) && defined(SYS_preadv2)
     n = syscall(SYS_preadv2, (int)a0, iov, cnt, (long)(off_t)a3, 0L, (int)a5);
@@ -880,6 +943,10 @@ SYSDEF(preadv2) {
         left -= (ssize_t)chunk;
     }
     free(bounce);
+    /* The guest could not back the whole vector and this file answers such a
+     * call as a whole (iov_from_guest): the bytes above are the ones a kernel
+     * would have managed to hand over before it said so. */
+    if (efault) return (u64)(s64)-EFAULT;
     return (u64)n;
 }
 
@@ -888,8 +955,10 @@ SYSDEF(pwritev2) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 0, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault) { free(bounce); return (u64)(s64)-EFAULT; }
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
@@ -903,7 +972,8 @@ SYSDEF(pwritev2) {
     n = pwritev2((int)a0, iov, cnt, (off_t)a3, (int)a5);
 #endif
     free(bounce);
-    return n < 0 ? host_err() : (u64)n;
+    if (n < 0) return host_err();
+    return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
 /* preadv/pwritev (fd, iov, iovcnt, pos_l, pos_h): the v2 calls above minus
@@ -916,8 +986,10 @@ SYSDEF(preadv) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 1);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 1, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault == 1) { free(bounce); return (u64)(s64)-EFAULT; }
     ssize_t n = preadv((int)a0, iov, cnt, (off_t)a3);
     if (n < 0) { free(bounce); return host_err(); }
     /* scatter back, into the bases the import snapshotted */
@@ -931,6 +1003,10 @@ SYSDEF(preadv) {
         left -= (ssize_t)chunk;
     }
     free(bounce);
+    /* The guest could not back the whole vector and this file answers such a
+     * call as a whole (iov_from_guest): the bytes above are the ones a kernel
+     * would have managed to hand over before it said so. */
+    if (efault) return (u64)(s64)-EFAULT;
     return (u64)n;
 }
 
@@ -939,8 +1015,10 @@ SYSDEF(pwritev) {
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
-    int cnt = iov_from_guest(c, a1, (unsigned)a2, iov, g, &bounce, 0);
+    int efault;
+    int cnt = iov_from_guest(c, (int)a0, a1, (unsigned)a2, iov, g, &bounce, 0, &efault);
     if (cnt < 0) return (u64)(s64)cnt;
+    if (efault) { free(bounce); return (u64)(s64)-EFAULT; }
     for (int i = 0; i < cnt; i++)
         if (iov[i].iov_len &&
             copy_from_guest(c, iov[i].iov_base, g[i].iov_base, iov[i].iov_len) < 0) {
@@ -949,7 +1027,8 @@ SYSDEF(pwritev) {
         }
     ssize_t n = pwritev((int)a0, iov, cnt, (off_t)a3);
     free(bounce);
-    return n < 0 ? host_err() : (u64)n;
+    if (n < 0) return host_err();
+    return efault ? (u64)(s64)-EFAULT : (u64)n;
 }
 
 SYSDEF(lseek) {

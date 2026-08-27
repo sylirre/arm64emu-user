@@ -121,6 +121,26 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   its buffer (the message would arrive truncated, and it is gone once received)
   and `sendto` may not either (it would be sent truncated where the kernel
   refuses it whole), so those clamp only (`tests/fixtures/bigcount.c`).
+- *The vector calls need the same bound, per segment* (`iov_from_guest`,
+  `sys_file.c`). `readv`/`writev` and the `p*v*` family stage the whole gather
+  in one bounce buffer before the transfer, so an unbounded import let a guest
+  name a gigabyte it did not own, and — on the read side — the bytes really
+  read on its behalf were then lost with the `EFAULT`. Each segment is bounded
+  by `rw_room` and the vector cut where a kernel's copy would stop; what the
+  call reports then depends on the file, and it does on a kernel too: a regular
+  file (device, tty) reports the **short transfer**, while a pipe or socket
+  rolls the copy back and answers **`EFAULT`** with nothing consumed or sent —
+  except that a datagram read still costs the datagram. Nothing addressable at
+  all is `EFAULT` everywhere, answered before the fd is touched.
+  `tests/fixtures/iovroom.c` pins all eleven cases against a real kernel;
+  `qemu-user` disagrees with the kernel on seven of them (it validates each
+  segment's whole range up front), so it is not the oracle here.
+- *How many segments is a guest `u64` too, and the two families disagree about
+  it.* `readv`/`writev` pass `iovcnt` down to the kernel's own `unsigned
+  nr_segs` and it is truncated there, so `readv(fd, iov, 1ULL<<32)` really is a
+  read of zero segments; a socket's `msg_iovlen` is checked as a full 64-bit
+  value and answers **`EMSGSIZE`** above `UIO_MAXIOV`. The emulator reproduces
+  both (`tests/fixtures/iovcnt.c`), and again `qemu-user` does not.
 
 ## Rootfs path containment (`src/path.c`)
 
