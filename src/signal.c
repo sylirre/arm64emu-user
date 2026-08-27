@@ -801,6 +801,26 @@ void sig_install_kick_net(void) {
 void sig_sync_host_mask(struct Machine *m) {
     static const int sigs[] = { SIGTTOU, SIGTTIN, SIGTSTP };
     sigset_t block, unblock;
+
+    /* Publish this thread's blocked set into the process-wide union first, so
+     * the re-mirroring below sees it. A host disposition covers the whole
+     * process, so "is this signal blocked" has to be asked of the whole process:
+     * answering it from the calling thread alone let a SIG_DFL signal keep the
+     * host default while a sibling had it blocked, and the host default then
+     * killed everyone the moment it arrived.
+     *
+     * There is no thread registry to poll here, so the union accumulates while
+     * the process is multi-threaded -- catching a signal the guest will
+     * dispatch itself costs a queue entry and a run-loop check, while letting
+     * the host act on a blocked one is fatal, so erring high is the safe
+     * direction. A process down to one guest thread *is* that thread, so it
+     * puts the union back to its own mask and the over-approximation does not
+     * outlive the threads that caused it. */
+    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= 1)
+        __atomic_store_n(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_RELEASE);
+    else
+        __atomic_or_fetch(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_ACQ_REL);
+
     sigemptyset(&block);
     sigemptyset(&unblock);
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
@@ -824,7 +844,32 @@ void sig_sync_host_mask(struct Machine *m) {
         }
 }
 
-void sig_host_update(struct Machine *m, int sig) {
+/* ---- the disposition lock ------------------------------------------------
+ *
+ * m->sigact[] is shared by every thread of the process, and a disposition is
+ * four words that have to move as one: rt_sigaction used to write handler,
+ * flags, restorer and mask straight into the shared array while a sibling was
+ * reading the same entry to deliver a signal, so the sibling could run a new
+ * handler under the old mask -- or, on a 32-bit host, jump to a handler address
+ * assembled out of both halves of neither. This is the kernel's
+ * sighand->siglock: do_sigaction takes it to swap the entry, and get_signal
+ * takes it to read one.
+ *
+ * Rank EMU_LK_SIGACT sits under sfd_lock (sfd_remask re-mirrors dispositions
+ * while holding it) and above as_lock, which every guest-memory touch takes --
+ * so the critical sections here stay short and no reader holds it across a
+ * copy_to_guest. */
+static pthread_mutex_t sigact_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Raw pthread calls on purpose: main()'s atfork handlers call these from inside
+ * fork(), where the per-thread held-lock mask must not move (mem.c has the
+ * story). */
+void sigact_locks_take(void)   { pthread_mutex_lock(&sigact_lock); }
+void sigact_locks_drop(void)   { pthread_mutex_unlock(&sigact_lock); }
+void sigact_locks_reinit(void) { pthread_mutex_init(&sigact_lock, NULL); }
+
+/* sig_host_update's body, for callers that already hold sigact_lock. */
+static void sig_host_update_locked(struct Machine *m, int sig) {
     if (sig < 1 || sig > 64 || sig == SIGKILL || sig == SIGSTOP) return;
     if (sig == 32 || sig == 33) return;          /* host-libc internal rt sigs */
     if (sig == SIGSYS) return;                   /* owned by the SIGSYS net; guest
@@ -866,7 +911,9 @@ void sig_host_update(struct Machine *m, int sig) {
          * immediately -- killing us for most signals, and silently discarding
          * the SIGCHLD a signalfd was waiting for, so the fd never became
          * readable. */
-        if (((g_tls.sigmask | m->sfd_mask) & (1ULL << (sig - 1))) &&
+        u64 blocked = g_tls.sigmask |
+                      __atomic_load_n(&m->sig_blocked_any, __ATOMIC_ACQUIRE);
+        if (((blocked | m->sfd_mask) & (1ULL << (sig - 1))) &&
             !is_sync_sig(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
@@ -890,6 +937,39 @@ void sig_host_update(struct Machine *m, int sig) {
     sigaction(sig, &sa, NULL);
 }
 
+void sig_host_update(struct Machine *m, int sig) {
+    EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+    sig_host_update_locked(m, sig);
+    EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+}
+
+u64 sig_action_handler(struct Machine *m, int sig) {
+    EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+    u64 h = m->sigact[sig].handler;
+    EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+    return h;
+}
+
+/* Snapshot of the whole disposition, for a delivery that has to act on all four
+ * words. Taken once and used from the copy: re-reading the shared entry field
+ * by field is what let a sibling's rt_sigaction slip between them. */
+static void sig_action_snapshot(struct Machine *m, int sig, GSigAction *out) {
+    EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+    *out = m->sigact[sig];
+    EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+}
+
+void sig_action_swap(struct Machine *m, int sig, const GSigAction *act,
+                     GSigAction *old) {
+    EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+    if (old) *old = m->sigact[sig];
+    if (act) {
+        m->sigact[sig] = *act;
+        sig_host_update_locked(m, sig);
+    }
+    EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+}
+
 /* Re-mirror every disposition. Called when a thread of this process becomes a
  * ptrace tracee (so default-terminate signals gain a host catcher) or the last
  * traced one is detached (so they revert to SIG_DFL); sig_host_update reads
@@ -900,13 +980,19 @@ void sig_trace_update_all(struct Machine *m) {
 }
 
 void sig_reset_for_exec(struct Machine *m) {
+    EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+    /* Post-exec the process is single-threaded again (de_thread), so this
+     * thread's mask is the whole process's -- drop the union back to it rather
+     * than carrying a dead sibling's bits into the new image. */
+    __atomic_store_n(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_RELEASE);
     for (int s = 1; s <= 64; s++) {
         if (m->sigact[s].handler > GSIG_IGN) {   /* handlers do not survive exec */
             m->sigact[s].handler = GSIG_DFL;
             m->sigact[s].flags = 0;
-            sig_host_update(m, s);
+            sig_host_update_locked(m, s);
         }
     }
+    EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
     sigq_reset();   /* this thread's queue; post-exec is single-threaded */
     g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
 }
@@ -939,7 +1025,13 @@ static void wr32(u8 *fr, u64 off, u32 v) { memcpy(fr + off, &v, 4); }
  * a real handler). Builds the frame and redirects the CPU. */
 static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     struct Machine *m = c->m;
-    GSigAction *act = &m->sigact[sig];
+    /* One snapshot, used for the whole delivery: handler, flags, mask and
+     * restorer are installed together (sig_action_swap) and must be acted on
+     * together, or a sibling's rt_sigaction lands between the flags test at the
+     * top and the handler read at the bottom. */
+    GSigAction snap;
+    sig_action_snapshot(m, sig, &snap);
+    const GSigAction *act = &snap;
 
     int restart = 0;
     u64 saved_pc = c->pc, saved_x0 = c->x[0];
@@ -1062,9 +1154,16 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
     if (act->flags & G_SA_RESETHAND) {
-        act->handler = GSIG_DFL;
-        act->flags = 0;
-        sig_host_update(m, sig);
+        /* Only if this is still the disposition we delivered: a sibling that
+         * installed a new handler in the meantime must not have it cleared. */
+        EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+        if (m->sigact[sig].handler == snap.handler &&
+            m->sigact[sig].flags == snap.flags) {
+            m->sigact[sig].handler = GSIG_DFL;
+            m->sigact[sig].flags = 0;
+            sig_host_update_locked(m, sig);
+        }
+        EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
     }
     g_tls.sc_ret_eintr = 0;
 }
@@ -1134,7 +1233,7 @@ int sig_pending_deliverable(struct Machine *m) {
     for (int sig = 1; sig <= 64; sig++) {
         if (!sigq_pend(sig)) continue;
         if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
-        u64 h = m->sigact[sig].handler;
+        u64 h = sig_action_handler(m, sig);
         if (h == GSIG_IGN) continue;
         if (h == GSIG_DFL && (sig == SIGCHLD || sig == SIGWINCH ||
                               sig == SIGURG || sig == SIGCONT))
@@ -1310,7 +1409,7 @@ void sig_deliver_pending(CPU *c) {
             if (ns != sig) { sig = ns; p.signo = ns; }
         }
 
-        u64 h = m->sigact[sig].handler;
+        u64 h = sig_action_handler(m, sig);
         if (h == GSIG_IGN) continue;
         if (h == GSIG_DFL) {
             /* A default-terminate signal: kill the process and report the
@@ -1347,7 +1446,7 @@ void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr) {
         if (ns == 0) return;
         sig = ns;
     }
-    u64 h = m->sigact[sig].handler;
+    u64 h = sig_action_handler(m, sig);
     if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
         PendSig p;
         memset(&p, 0, sizeof p);
@@ -1379,7 +1478,7 @@ void sig_deliver_fault(CPU *c, int sig, int code, u64 addr) {
         if (ns == 0) return;              /* tracer suppressed: resume the guest */
         sig = ns;                         /* tracer may have substituted it */
     }
-    u64 h = m->sigact[sig].handler;
+    u64 h = sig_action_handler(m, sig);
     if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
         PendSig p;
         memset(&p, 0, sizeof p);

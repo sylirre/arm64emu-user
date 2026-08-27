@@ -510,10 +510,12 @@ static void emu_atfork_prepare(void) {
     procfs_locks_take();     /* pf_lock, then est_lock */
     netlink_locks_take();    /* nl_lock    — taken above as_lock by real code */
     sig_locks_take();        /* sfd_lock */
+    sigact_locks_take();     /* sigact_lock — sfd_remask re-mirrors under sfd_lock */
     mem_locks_take();        /* casp16, then as_lock — innermost */
 }
 static void emu_atfork_parent(void) {
     mem_locks_drop();        /* innermost first, mirroring prepare */
+    sigact_locks_drop();
     sig_locks_drop();
     netlink_locks_drop();
     procfs_locks_drop();
@@ -521,6 +523,7 @@ static void emu_atfork_parent(void) {
 }
 static void emu_atfork_child(void) {
     mem_locks_reinit();
+    sigact_locks_reinit();
     sig_locks_reinit();
     netlink_locks_reinit();
     procfs_locks_reinit();

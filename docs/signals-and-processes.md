@@ -313,6 +313,37 @@ changed, so the common case stays cheap. The signal then waits in the ring and
 the run loop applies the disposition at unblock time, terminating there if that
 is the default action — which is what the kernel does.
 
+A host disposition is **process-wide**, so "is this signal blocked" has to be a
+process-wide question. Asked of the calling thread alone it had the wrong answer
+under `CLONE_VM`: a thread that unblocked `SIGTERM` put the host disposition back
+to `SIG_DFL` while a sibling still had it blocked, and the next `SIGTERM` killed
+everyone instead of waiting for that sibling to unblock it. There is no registry
+of guest threads to poll, so `m->sig_blocked_any` accumulates what any thread has
+blocked, and `sig_host_update` asks it rather than `g_tls.sigmask` alone. It errs
+high on purpose — catching a signal the guest will dispatch itself costs a ring
+entry and a run-loop check, where letting the host default act on a blocked one
+is fatal — and a process down to a single guest thread *is* that thread, so it
+puts the union back to its own mask (as does `execve`, which lands single-threaded
+by construction) and the over-approximation does not outlive the threads that
+caused it.
+
+### One disposition, four words
+
+`m->sigact[]` is shared by every thread of the process, and each entry is a
+handler, flags, a restorer and a mask that are installed together and have to be
+acted on together. `rt_sigaction` wrote the four straight into the shared array
+while a sibling could be reading the same entry to deliver a signal — so the
+sibling could enter a *new* handler under the *old* mask, or (32-bit host, where
+a `u64` is two stores) jump to a handler address that was never installed at all.
+`signal.c` keeps a lock for the table — the emulator's stand-in for the kernel's
+`sighand->siglock`, which `do_sigaction` and `get_signal` take for exactly this —
+and every read and write goes through it: `sig_action_swap` for the syscall,
+`sig_action_handler` for the one-word tests, and a single snapshot at the top of
+`deliver_to_handler` that the whole delivery then works from. `SA_RESETHAND`
+clears the disposition back under the lock, and only if it is still the one that
+was delivered, so a handler a sibling installed in the meantime is not thrown
+away.
+
 ## Job control: mirroring the block mask to the host
 
 This is the non-obvious part, and the source of a real bug.
@@ -378,8 +409,8 @@ lock hierarchy, and `emu_atfork_prepare` in `main.c` is the one place it is
 written down:
 
 ```
-jit stats  →  pf_lock → est_lock  →  nl_lock  →  sfd_lock  →  casp16 → as_lock
-outermost                                                            innermost
+jit stats → pf_lock → est_lock → nl_lock → sfd_lock → sigact_lock → casp16 → as_lock
+outermost                                                                  innermost
 ```
 
 `as_lock` is innermost because **any** critical section that touches guest memory
@@ -388,7 +419,9 @@ on a D-TLB miss, and `sys_netlink.c`'s `nl_take_request` does that on every gues
 request while holding `nl_lock` — a sibling mapping or unmapping anything bumps
 the address-space generation, which invalidates that thread's D-TLB and
 *guarantees* the miss. `casp16` sits just above it (a CASP retry can miss the
-D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`).
+D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`),
+and `sigact_lock` under `sfd_lock` because `sfd_remask` re-mirrors dispositions
+with the signalfd table locked.
 
 This began as five separate triples, one per module. That worked, but it encoded
 the hierarchy in the *reverse* order of five adjacent `*_atfork_init()` calls —
@@ -408,7 +441,7 @@ twelve slots: six tiers times two engines.
 
 A diagram and an ordered list of calls are a poor place to keep a rule that new
 code has to obey. So the bit each lock is flagged with **is** its rank in that
-hierarchy — outermost is bit 0, `as_lock` is bit 6 — and every `EMU_LOCK`
+hierarchy — outermost is bit 0, `as_lock` is the last one — and every `EMU_LOCK`
 checks that nothing at or inside the rank it is about to take is already held:
 
 ```
@@ -432,9 +465,9 @@ handler if a future `EMU_LOCK` site ever is.
 
 ##### No code path may fork while holding one of these locks
 
-`prepare` takes all seven, so the forking thread must hold none of them. Six are
-non-recursive and `prepare` would block on them forever; the seventh, `as_lock`,
-is recursive and fails *quietly* instead — `prepare` succeeds, and the child's
+`prepare` takes all eight, so the forking thread must hold none of them. Seven
+are non-recursive and `prepare` would block on them forever; the eighth,
+`as_lock`, is recursive and fails *quietly* instead — `prepare` succeeds, and the child's
 handler re-initializes the mutex under the surviving thread, which goes on
 believing it holds it.
 

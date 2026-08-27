@@ -936,7 +936,8 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
          * this thread and the process-wide (shared) pending set is empty. */
         pnd = sig_pending_set();
         for (int s = 1; s <= 64; s++) {
-            u64 h = m->sigact[s].handler;
+            u64 h = sig_action_handler(m, s);            /* under the siglock
+                                                            stand-in (signal.c) */
             if (h == 1) ign |= 1ull << (s - 1);          /* SIG_IGN */
             else if (h) cgt |= 1ull << (s - 1);          /* a guest handler */
         }

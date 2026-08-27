@@ -185,8 +185,21 @@ struct Machine {
     GRlimit rlim[G_RLIM_NLIMITS];
 
     /* Guest signal state (process-wide per POSIX; signal.c). The blocked
-     * set is per-thread and lives in g_tls (thread.h). */
+     * set is per-thread and lives in g_tls (thread.h).
+     *
+     * sigact[] is shared by every thread of the process and is read and written
+     * under the lock signal.c keeps for it -- the emulator's stand-in for the
+     * kernel's sighand->siglock. The four words are one disposition and have to
+     * move as one: a delivery that saw a new handler with the old mask would run
+     * under a mask the installer never asked for, and on a 32-bit host a torn
+     * 64-bit handler is not an address at all. */
     GSigAction sigact[65];    /* index 1..64 */
+    /* Union of the blocked sets of this process's guest threads, as far as they
+     * can be known here (see sig_sync_host_mask). A host disposition is
+     * process-wide, so sig_host_update has to ask a process-wide question:
+     * leaving a signal at the host default because the *calling* thread does
+     * not block it kills the whole process for a sibling that does. */
+    u64 sig_blocked_any;
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
 
     /* Thread bookkeeping (CLONE_VM) needs no tid table: the guest tid of a
@@ -488,6 +501,13 @@ extern __thread volatile sig_atomic_t g_sig_npend;
 extern __thread volatile sig_atomic_t g_sig_selfintr;
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
+/* do_sigaction: swap the disposition of `sig` under the siglock stand-in, so a
+ * concurrent thread never sees half of one. `act` (may be NULL) is installed
+ * and mirrored onto the host; `old` (may be NULL) receives what was there. */
+void sig_action_swap(struct Machine *m, int sig, const GSigAction *act,
+                     GSigAction *old);
+/* The handler word of `sig`'s disposition, read under the same lock. */
+u64 sig_action_handler(struct Machine *m, int sig);
 /* Re-mirror every disposition (call when a process becomes / stops being a ptrace
  * tracee): a tracee gets host catchers for default-terminate signals so its tracer
  * sees the signal-delivery-stop and the WIFSIGNALED death. */
@@ -584,6 +604,9 @@ void mem_locks_reinit(void);
 void sig_locks_take(void);       /* sfd_lock */
 void sig_locks_drop(void);
 void sig_locks_reinit(void);
+void sigact_locks_take(void);    /* sigact_lock — signal.c */
+void sigact_locks_drop(void);
+void sigact_locks_reinit(void);
 void netlink_locks_take(void);   /* nl_lock */
 void netlink_locks_drop(void);
 void netlink_locks_reinit(void);
@@ -620,8 +643,10 @@ enum {
     EMU_LK_EST    = 1u << 2,   /* sys_procfs.c   — under pf_lock (put_stat) */
     EMU_LK_NL     = 1u << 3,   /* sys_netlink.c  */
     EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
-    EMU_LK_CASP16 = 1u << 5,   /* mem.c          */
-    EMU_LK_AS     = 1u << 6,   /* mem.c as_lock  — innermost; counted, not
+    EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (sfd_remask
+                                * re-mirrors dispositions) */
+    EMU_LK_CASP16 = 1u << 6,   /* mem.c          */
+    EMU_LK_AS     = 1u << 7,   /* mem.c as_lock  — innermost; counted, not
                                 * flagged, because it legitimately re-enters */
 };
 extern __thread unsigned g_emu_lk_held;   /* the six non-recursive locks */
@@ -654,7 +679,8 @@ void emu_lock_order_warn(unsigned taking, unsigned held);
  * them into anything else silently turns the check into noise. */
 _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
                EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
-               EMU_LK_SFD < EMU_LK_CASP16 && EMU_LK_CASP16 < EMU_LK_AS,
+               EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_CASP16 &&
+               EMU_LK_CASP16 < EMU_LK_AS,
                "EMU_LK_* bits are ranks: keep them in the order "
                "emu_atfork_prepare (main.c) takes the locks");
 

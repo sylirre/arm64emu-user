@@ -1327,6 +1327,34 @@ else
     skip_build "fixtures/netfault"
 fi
 
+# ---- signal dispositions under CLONE_VM threads: a host disposition is
+# process-wide (so a sibling's blocked SIGTERM must survive this thread
+# unblocking it) and a disposition is four words that move together (so a
+# handler never runs on the stack the *other* disposition asked for). Both are
+# things a bare kernel gets right for free, so the block below is what this
+# program prints natively -- qemu is not consulted. Pre-fix the first row killed
+# the process (rc 143, no output at all) 3 runs of 3 and the second reported
+# torn1/torn2 5 runs of 5. ----
+if [ ! -x tests/fixtures/sigdisp.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/sigdisp.bin \
+        tests/fixtures/sigdisp.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/sigdisp.bin ]; then
+    expect=$'held=pending\ntuple=ok'
+    for eng in "" "--jit"; do
+        lbl="fixture: sigdisp${eng:+ (jit)}"
+        got=$(timeout -k 5 120 "$EMU" $eng / tests/fixtures/sigdisp.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS $lbl"
+        else
+            fail=$((fail+1)); echo "FAIL $lbl"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+    done
+    fx_rm tests/fixtures/sigdisp.bin
+else
+    skip_build "fixtures/sigdisp"
+fi
+
 # ---- a read/write count is a guest 64-bit value the emulator has to turn into
 # a host size_t and a bounce buffer. Self-checking: qemu-user validates the
 # whole [buf, buf+count) range before the call and answers EFAULT for every row

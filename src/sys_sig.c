@@ -23,24 +23,25 @@ SYSDEF(rt_sigaction) {
     int sig = (int)a0;
     if (sig < 1 || sig > 64 || a3 != 8) return (u64)(s64)-EINVAL;
     struct Machine *m = c->m;
+    /* The disposition is read and written through sig_action_swap, which holds
+     * the lock standing in for the kernel's sighand->siglock: the four words are
+     * one action, and a sibling thread delivering this same signal must never
+     * catch half of an update (signal.c). GSigactionK and GSigAction are the same
+     * arm64 layout, hence the plain copy. */
     if (a2) {   /* old action out */
-        GSigactionK old = {
-            .handler = m->sigact[sig].handler,
-            .flags = m->sigact[sig].flags,
-            .restorer = m->sigact[sig].restorer,
-            .mask = m->sigact[sig].mask,
-        };
+        GSigAction cur;
+        sig_action_swap(m, sig, NULL, &cur);
+        GSigactionK old = { .handler = cur.handler, .flags = cur.flags,
+                            .restorer = cur.restorer, .mask = cur.mask };
         if (copy_to_guest(c, a2, &old, sizeof old) < 0) return (u64)(s64)-EFAULT;
     }
     if (a1) {
         GSigactionK ga;
         if (copy_from_guest(c, &ga, a1, sizeof ga) < 0) return (u64)(s64)-EFAULT;
         if (sig == SIGKILL || sig == SIGSTOP) return (u64)(s64)-EINVAL;
-        m->sigact[sig].handler = ga.handler;
-        m->sigact[sig].flags = ga.flags;
-        m->sigact[sig].restorer = ga.restorer;
-        m->sigact[sig].mask = ga.mask;
-        sig_host_update(m, sig);   /* install/remove the host catcher */
+        GSigAction act = { .handler = ga.handler, .flags = ga.flags,
+                           .restorer = ga.restorer, .mask = ga.mask };
+        sig_action_swap(m, sig, &act, NULL);   /* installs, then mirrors */
     }
     return 0;
 }

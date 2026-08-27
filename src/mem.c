@@ -286,7 +286,7 @@ __thread int g_emu_as_depth;
 /* Indexed by rank, i.e. by bit position (machine.h). */
 static const char *const emu_lk_names[] = {
     "the jit stats lock", "pf_lock", "est_lock", "nl_lock",
-    "sfd_lock", "casp16_lock", "as_lock",
+    "sfd_lock", "sigact_lock", "casp16_lock", "as_lock",
 };
 #define EMU_LK_COUNT ((int)(sizeof emu_lk_names / sizeof *emu_lk_names))
 _Static_assert(1u << (EMU_LK_COUNT - 1) == EMU_LK_AS,
