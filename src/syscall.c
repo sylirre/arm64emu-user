@@ -582,9 +582,14 @@ void syscall_dispatch(CPU *c) {
         for (size_t i = 0; i < sizeof quiet_enosys / sizeof quiet_enosys[0]; i++)
             if (quiet_enosys[i] == nr) { quiet = 1; break; }
         if (!quiet) {
+            /* One line per syscall number per process. The test and the mark
+             * are one atomic step: guest threads share this table, and a plain
+             * read-modify-write of it is a data race -- two threads printing
+             * the same line is the harmless outcome, one losing the other's
+             * mark is the one that makes the trace repeat forever. */
             static char warned[G_NR_MAX];
-            if (nr < G_NR_MAX && !warned[nr]) {
-                warned[nr] = 1;
+            if (nr < G_NR_MAX &&
+                !__atomic_test_and_set(&warned[nr], __ATOMIC_RELAXED)) {
                 fprintf(stderr, "arm64chroot: unimplemented syscall %llu at pc=0x%llx\n",
                         (unsigned long long)nr, (unsigned long long)c->pc);
             }

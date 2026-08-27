@@ -401,39 +401,41 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
 bool nl_host_blocks(void)
 {
     enum { PROBE_UNKNOWN, PROBE_ALLOWED, PROBE_BLOCKED };
+    /* Answered once per process and then remembered. Guest threads call this
+     * concurrently (every socket(2) does), so the cache moves through relaxed
+     * atomics: two threads racing here both run the probe and reach the same
+     * verdict -- which costs a socket pair, not correctness -- but a plain int
+     * written by one and read by another is a C11 data race all the same. */
     static int cached = PROBE_UNKNOWN;
     struct {
         struct nlmsghdr  nlh;
         struct ifaddrmsg ifa;
     } request;
     struct sockaddr_nl snl;
+    int verdict;
     int fd;
 
-    if (cached != PROBE_UNKNOWN)
-        return cached == PROBE_BLOCKED;
+    verdict = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (verdict != PROBE_UNKNOWN)
+        return verdict == PROBE_BLOCKED;
 
     /* Testability: force the fallback on hosts where netlink actually works
      * (mirrors the A64_*_FORCE_* android-sim switches). */
-    if (getenv("A64_NETLINK_FORCE_BLOCK")) {
-        cached = PROBE_BLOCKED;
-        return true;
-    }
+    if (getenv("A64_NETLINK_FORCE_BLOCK"))
+        goto blocked;
 
     /* Mirror bubblewrap's loopback_setup(): socket() then bind() with
      * nl_groups == 0. Some hosts permit socket creation but reject bind()
      * under a separate SELinux/seccomp check, so probing socket() alone would
      * wrongly classify them as "AF_NETLINK works". */
     fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-    if (fd < 0) {
-        cached = PROBE_BLOCKED;
-        return true;
-    }
+    if (fd < 0)
+        goto blocked;
     memset(&snl, 0, sizeof(snl));
     snl.nl_family = AF_NETLINK;
     if (bind(fd, (struct sockaddr *) &snl, sizeof(snl)) < 0) {
         close(fd);
-        cached = PROBE_BLOCKED;
-        return true;
+        goto blocked;
     }
 
     /* socket() and bind() succeeding doesn't mean the guest can use the
@@ -464,13 +466,16 @@ bool nl_host_blocks(void)
                (struct sockaddr *) &snl, sizeof(snl)) < 0
         && (errno == EACCES || errno == EPERM)) {
         close(fd);
-        cached = PROBE_BLOCKED;
-        return true;
+        goto blocked;
     }
 
     close(fd);
-    cached = PROBE_ALLOWED;
+    __atomic_store_n(&cached, PROBE_ALLOWED, __ATOMIC_RELAXED);
     return false;
+
+blocked:
+    __atomic_store_n(&cached, PROBE_BLOCKED, __ATOMIC_RELAXED);
+    return true;
 }
 
 /* ==================================================================== */

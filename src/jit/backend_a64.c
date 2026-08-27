@@ -660,8 +660,7 @@ fast:;
 
 static int fuse_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("A64_JIT_NOFUSE") == NULL;
-    return v;
+    return PROBE_ONCE(v, getenv("A64_JIT_NOFUSE") == NULL);
 }
 
 #define FUSE_VA_SLOT ((unsigned)(offsetof(JitEnv, tmp_spill) + 24))
@@ -802,12 +801,10 @@ fast:;
  * A64_JIT_NOFP16 forces it off, exercising the helper fallback. */
 static int cpu_has_fp16(void) {
     static int v = -1;
-    if (v < 0) {
-        unsigned long hw = getauxval(AT_HWCAP);
-        v = ((hw & (HWCAP_FPHP | HWCAP_ASIMDHP)) == (HWCAP_FPHP | HWCAP_ASIMDHP))
-            && getenv("A64_JIT_NOFP16") == NULL;
-    }
-    return v;
+    return PROBE_ONCE(v,
+        ((getauxval(AT_HWCAP) & (HWCAP_FPHP | HWCAP_ASIMDHP)) ==
+             (HWCAP_FPHP | HWCAP_ASIMDHP)) &&
+        getenv("A64_JIT_NOFP16") == NULL);
 }
 
 int be_vop_ok(unsigned vclass, u32 insn) {
@@ -878,8 +875,7 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
 
 static int vra_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("A64_JIT_NOVRA") == NULL;
-    return v;
+    return PROBE_ONCE(v, getenv("A64_JIT_NOVRA") == NULL);
 }
 static u32 enc_vmov16(unsigned vd, unsigned vn) {   /* mov vd.16b, vn.16b */
     return 0x4EA01C00u | (vn << 16) | (vn << 5) | vd;

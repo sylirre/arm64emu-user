@@ -823,8 +823,7 @@ fast:;
 
 static int fuse_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("A64_JIT_NOFUSE") == NULL;
-    return v;
+    return PROBE_ONCE(v, getenv("A64_JIT_NOFUSE") == NULL);
 }
 
 #define FUSE_VA_SLOT ((s32)(offsetof(JitEnv, tmp_spill) + 24))
@@ -1112,34 +1111,31 @@ static void st_lane_rax(Emit *e, unsigned size, s32 disp) {
  * recipe's decline/fallback path on a modern host. */
 static int sse_forced_baseline(void) {
     static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("A64_JIT_SSE");
-        v = (s && atoi(s) == 2);
-    }
-    return v;
+    const char *s;
+    return PROBE_ONCE(v, (s = getenv("A64_JIT_SSE")) != NULL && atoi(s) == 2);
 }
 static int cpu_has_sse41(void) {
     static int v = -1;
-    if (v < 0) v = __builtin_cpu_supports("sse4.1");
-    return v && !sse_forced_baseline();
+    return PROBE_ONCE(v, !!__builtin_cpu_supports("sse4.1")) &&
+           !sse_forced_baseline();
 }
 static int cpu_has_ssse3(void) {
     static int v = -1;
-    if (v < 0) v = __builtin_cpu_supports("ssse3");
-    return v && !sse_forced_baseline();
+    return PROBE_ONCE(v, !!__builtin_cpu_supports("ssse3")) &&
+           !sse_forced_baseline();
 }
 static int cpu_has_sse42(void) {
     static int v = -1;
-    if (v < 0) v = __builtin_cpu_supports("sse4.2");
-    return v && !sse_forced_baseline();
+    return PROBE_ONCE(v, !!__builtin_cpu_supports("sse4.2")) &&
+           !sse_forced_baseline();
 }
 /* F16C: half<->single vector convert (vcvtph2ps / vcvtps2ph). The gate for the
  * whole FP16 surface — without it every half encoding stays an interpreter
  * helper. A64_JIT_SSE=2 forces it off, exercising that fallback. */
 static int cpu_has_f16c(void) {
     static int v = -1;
-    if (v < 0) v = __builtin_cpu_supports("f16c");
-    return v && !sse_forced_baseline();
+    return PROBE_ONCE(v, !!__builtin_cpu_supports("f16c")) &&
+           !sse_forced_baseline();
 }
 /* FMA3: the gate for inlining the fused-multiply families (scalar FMADD,
  * vector FMLA/FMLS, the by-element forms). The interpreter computes them
@@ -1148,8 +1144,8 @@ static int cpu_has_f16c(void) {
  * Without it those encodings stay interpreter helpers. */
 static int cpu_has_fma(void) {
     static int v = -1;
-    if (v < 0) v = __builtin_cpu_supports("fma");
-    return v && !sse_forced_baseline();
+    return PROBE_ONCE(v, !!__builtin_cpu_supports("fma")) &&
+           !sse_forced_baseline();
 }
 
 /* SSE4.1 three-byte-opcode 0F 3A form (roundss/sd/ps/pd): 66 0F 3A opc /r ib */
@@ -1211,8 +1207,7 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
 
 static int vra_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("A64_JIT_NOVRA") == NULL;
-    return v;
+    return PROBE_ONCE(v, getenv("A64_JIT_NOVRA") == NULL);
 }
 static void vld_q(BE *be, int hx, unsigned vn) { /* movdqu hx, c->v[vn] */
     sse_mem(be->e, 0xF3, 0x6F, hx, OFF_V(vn));

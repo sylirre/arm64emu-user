@@ -16,6 +16,24 @@
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
+/* ---- work-it-out-once flags ----------------------------------------------
+ * A host capability, an A64_* fallback switch, a policy the host applies once
+ * and for all: decided on first use and remembered. Every one of them is
+ * idempotent, so two threads racing to decide reach the same answer and the
+ * only cost is deciding twice -- but a plain int written by one guest thread
+ * and read by another is a C11 data race regardless, and the threads
+ * translating blocks and serving syscalls do exactly that. Relaxed atomics
+ * leave nothing undefined and cost nothing: a relaxed load of an int is the
+ * load it already was.
+ *
+ * `v` is the caller's own `static int v = -1;`. The expression must yield a
+ * non-negative answer and must not care how many times it is evaluated. */
+#define PROBE_ONCE(v, expr) __extension__ ({                             \
+    int a64_probe_ = __atomic_load_n(&(v), __ATOMIC_RELAXED);            \
+    if (a64_probe_ < 0)                                                  \
+        __atomic_store_n(&(v), a64_probe_ = (expr), __ATOMIC_RELAXED);   \
+    a64_probe_; })
+
 typedef enum { ACC_READ, ACC_WRITE, ACC_EXEC } AccType;
 
 /* Typed accesses. Return false if a fault was raised (caller must abort the

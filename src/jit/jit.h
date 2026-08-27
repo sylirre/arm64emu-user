@@ -16,8 +16,23 @@
 
 /* -jit CLI flag (parsed in main.c, defined in jit.c). Cleared at startup when
  * no backend exists for this host or a per-instruction debug facility is on,
- * and at runtime if the code cache cannot be allocated (W^X denial). */
+ * and at runtime if the code cache cannot be allocated (W^X denial).
+ *
+ * main.c sets it before there is a second thread and may touch it directly.
+ * Everything after that goes through the two accessors below: the runtime
+ * clears it from whichever guest thread hit the problem, while every other
+ * thread reads it once per run-loop iteration, and a plain int shared that way
+ * is a C11 data race. Relaxed ordering is all it needs -- the flag only ever
+ * goes one way, and a thread that reads a stale 1 merely translates one more
+ * block before it notices. A relaxed load is the same instruction a plain one
+ * compiled to, so the run loop pays nothing for it. */
 extern int g_jit;
+static inline int jit_on(void) {
+    return __atomic_load_n(&g_jit, __ATOMIC_RELAXED);
+}
+static inline void jit_disable(void) {
+    __atomic_store_n(&g_jit, 0, __ATOMIC_RELAXED);
+}
 
 /* True if this build carries a code generator for the host architecture
  * (AArch64 or x86-64; other hosts run the interpreter). */

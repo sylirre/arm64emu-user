@@ -1296,10 +1296,7 @@ static int __attribute__((cold)) host_page_readable(const u8 *hp) {
      * FORCE_PIPE selects the fallback on a host that has the syscall, which
      * is how the pipe path is tested anywhere but on a pre-3.2 kernel. */
     static int no_pvr = -1;
-    if (no_pvr < 0)
-        __atomic_store_n(&no_pvr, getenv("A64_PAGEPROBE_FORCE_PIPE") ? 1 : 0,
-                         __ATOMIC_RELAXED);
-    if (!__atomic_load_n(&no_pvr, __ATOMIC_RELAXED)) {
+    if (!PROBE_ONCE(no_pvr, getenv("A64_PAGEPROBE_FORCE_PIPE") != NULL)) {
         u8 probe;
         struct iovec loc = { &probe, 1 };
         struct iovec rem = { (void *)(uintptr_t)hp, 1 };

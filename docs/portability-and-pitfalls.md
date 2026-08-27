@@ -48,6 +48,18 @@ all four targets.
   in `main()` before any handler installs and by every new host thread
   (`thread_entry`) — and any new handler-visible `__thread` state must be
   added to it.
+- **A "work it out once" flag is still shared state.** Host capabilities
+  (`__builtin_cpu_supports`, `AT_HWCAP`), the `A64_*` fallback switches and the
+  try-the-host-first probes are all decided on first use and remembered in a
+  process-wide `static int`. Every one of them is idempotent, so a race changes
+  no answer and the worst outcome is deciding twice — but a plain `int` written
+  by one guest thread and read by another is a C11 data race whatever the
+  values, and under `CLONE_VM` that is exactly what happens: guest threads
+  translate blocks and serve syscalls concurrently. `PROBE_ONCE(v, expr)`
+  (`mmu.h`) is the idiom, and relaxed atomics cost nothing here — a relaxed
+  load of an `int` is the load it already was. The same goes for the counters
+  and one-shot marks beside them (the unimplemented-syscall warning table, the
+  tmpfs leaf-name sequence): make the read-modify-write one atomic step.
 
 ## Catalog of pitfalls (each is a bug we hit)
 

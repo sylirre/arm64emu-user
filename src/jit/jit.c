@@ -143,7 +143,7 @@ static void registry_del(JitEnv *env) {
 }
 
 void jit_notify_mapping_change(void) {
-    if (!g_jit) return;
+    if (!jit_on()) return;
     as_lock();
     for (int i = 0; i < JIT_ENVS_MAX; i++) {
         JitEnv *e = g_jit_envs[i];
@@ -171,7 +171,12 @@ void jit_tls_prewarm(void) {
  * icount ratio only covers merged threads — fine for a profiler. */
 #define JSTAT_SLOTS 4096
 typedef struct { u32 word; u32 pad_; u64 count; } JStat;
-static int g_jit_stats = -1;                 /* -1 until first jit_env_init */
+/* -1 until the first jit_env_init decides; then 0 or 1. Shared by every guest
+ * thread and settled (or cleared, on an allocation failure) by whichever gets
+ * there first, so it moves through relaxed atomics for the same reason g_jit
+ * does -- the answer is the same whoever computes it, but a plain int written
+ * by one thread and read by another is still a data race. */
+static int g_jit_stats = -1;
 static int g_jstat_fd = -1;                  /* parked dup of stderr */
 static const char *g_jstat_path;             /* A64_JIT_STATS=/file: append */
 static __thread JStat *t_jstat;
@@ -204,7 +209,7 @@ static void jstat_add(JStat *tab, u32 insn, u64 n, u64 *lost) {
 static void jstat_bump(u32 insn) {
     if (!t_jstat) {
         t_jstat = calloc(JSTAT_SLOTS, sizeof *t_jstat);
-        if (!t_jstat) { g_jit_stats = 0; return; }
+        if (!t_jstat) { __atomic_store_n(&g_jit_stats, 0, __ATOMIC_RELAXED); return; }
     }
     jstat_add(t_jstat, insn, 1, &t_jstat_lost);
 }
@@ -460,10 +465,10 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->dtlb = jit_dtlb_base();
     env->slowmem = getenv("A64_JIT_SLOWMEM") != NULL;
     EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
-    if (g_jit_stats < 0) {
+    if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) < 0) {
         const char *s = getenv("A64_JIT_STATS");
-        g_jit_stats = s != NULL;
-        if (g_jit_stats) {
+        __atomic_store_n(&g_jit_stats, s != NULL, __ATOMIC_RELAXED);
+        if (s) {
             if (s[0] == '/') g_jstat_path = s;
             else {
                 g_jstat_fd = fcntl(2, F_DUPFD_CLOEXEC, 900);
@@ -603,7 +608,7 @@ static void jit_drop_range(JitEnv *env, u64 first, u64 npages) {
 /* exit/exit_group terminate via _exit (no atexit); the syscall handlers call
  * this so an enabled stats report still gets written. */
 void jit_stats_flush(void) {
-    if (g_jit_stats > 0) jstat_dump();
+    if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) > 0) jstat_dump();
 }
 
 /* ---- helpers called from generated code ---- */
@@ -616,7 +621,7 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->pc = pc + 4;
     exec_a64(c, insn);
     c->icount++;
-    if (UNLIKELY(g_jit_stats > 0)) jstat_bump(insn);
+    if (UNLIKELY(__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) > 0)) jstat_bump(insn);
     if (UNLIKELY(g_tls.pend_exc.valid || c->stop || c->halted || g_sig_npend))
         return 1;
     return c->pc != pc + 4;
@@ -698,7 +703,7 @@ static __thread IRBlock *t_ir;      /* ~17 KB: heap-allocated lazily */
 static JBlock *jit_translate(JitEnv *env, CPU *c, u64 pc) {
     if (!t_ir) {
         t_ir = malloc(sizeof *t_ir);
-        if (!t_ir) { g_jit = 0; return NULL; }
+        if (!t_ir) { jit_disable(); return NULL; }
     }
     u32 max_insns = JIT_MAX_BLOCK_INSNS;
 retry:
@@ -730,7 +735,7 @@ retry:
             goto retry;
         }
         fprintf(stderr, "arm64chroot: JIT emitter overflow, disabling jit\n");
-        g_jit = 0;
+        jit_disable();
         return NULL;
     }
 
@@ -751,7 +756,7 @@ retry:
 /* ---- coherence entry points ---- */
 
 void jit_invalidate_range(u64 addr, u64 len) {
-    if (!g_jit || !len) return;
+    if (!jit_on() || !len) return;
     /* IC IVAU hands this an arbitrary guest register value, so the range is
      * not known to be a valid guest VA. Anything at or above GUEST_TASK_SIZE
      * is unmappable by construction and can hold no translation, while the
@@ -795,7 +800,7 @@ void jit_invalidate_range(u64 addr, u64 len) {
 }
 
 void jit_execve_flush(void) {
-    if (!g_jit) return;
+    if (!jit_on()) return;
     JitEnv *env = &g_jit_env;
     if (env->active) jit_flush_all(env);
     __atomic_add_fetch(&g_jit_inval_gen, 1, __ATOMIC_RELEASE);
@@ -856,7 +861,7 @@ void jit_run(CPU *c) {
             fprintf(stderr,
                     "arm64chroot: cannot set up the JIT for this thread, "
                     "using interpreter\n");
-            g_jit = 0;
+            jit_disable();
             return;
         }
     }

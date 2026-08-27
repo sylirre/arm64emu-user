@@ -201,10 +201,7 @@ int proc_own_fd_path(const char *host) {
  * Returns 1 when the caller must behave as though the host said EACCES. */
 int proc_own_fd_denied(const char *host) {
     static int on = -1;
-    if (on < 0)
-        __atomic_store_n(&on, getenv("A64_OWNFD_FORCE_DENY") ? 1 : 0,
-                         __ATOMIC_RELAXED);
-    if (!__atomic_load_n(&on, __ATOMIC_RELAXED)) return 0;
+    if (!PROBE_ONCE(on, getenv("A64_OWNFD_FORCE_DENY") != NULL)) return 0;
     return proc_own_fd_path(host) >= 0;
 }
 
@@ -616,11 +613,15 @@ int tmpfs_dir_new(struct Machine *m, char *host_out) {
         return -EACCES;
     }
     /* The counter only has to be unique within this process; mkdirat resolves
-     * a collision with a sibling process by failing, and we retry. */
+     * a collision with a sibling process by failing, and we retry. Bumped
+     * atomically all the same: guest threads mount concurrently, and two
+     * landing on the same value would spend a retry each on the same name --
+     * and `seq++` on a shared int is a data race whatever it costs. */
     static int seq;
     for (int tries = 0; tries < 4096; tries++) {
         char leaf[64];
-        snprintf(leaf, sizeof leaf, "%d.%d", (int)getpid(), seq++);
+        snprintf(leaf, sizeof leaf, "%d.%d", (int)getpid(),
+                 __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED));
         int n = snprintf(host_out, PATH_MAX, "%s/%s", sess, leaf);
         if (n <= 0 || n >= PATH_MAX) { close(sfd); return -ENAMETOOLONG; }
         if (mkdirat(sfd, leaf, 0755) == 0) { close(sfd); return 0; }

@@ -92,7 +92,7 @@ int emu_loop(CPU *c) {
              * (never a JIT/predecode chunk), then a SIGTRAP stop below. */
             cpu_step(c);
             stepped = 1;
-        } else if (UNLIKELY(g_jit)) {
+        } else if (UNLIKELY(jit_on())) {
             /* -jit: run translated blocks; same return contract as pd_run. */
             jit_run(c);
         } else if (LIKELY(g_predecode)) {

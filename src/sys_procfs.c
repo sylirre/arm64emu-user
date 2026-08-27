@@ -299,18 +299,16 @@ static void put_loadavg(int fd) {
 /* Try-host-first gate for /proc/stat: 1 when the host denies the file
  * (Android SELinux) or A64_PROCSTAT_FORCE_SYNTH forces the fallback in
  * tests; probed once per process, netlink-style. */
+static int stat_probe_blocked(void) {
+    if (getenv("A64_PROCSTAT_FORCE_SYNTH")) return 1;
+    int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 1;
+    close(fd);
+    return 0;
+}
 static int stat_blocked(void) {
     static int blocked = -1;
-    if (blocked < 0) {
-        if (getenv("A64_PROCSTAT_FORCE_SYNTH")) {
-            blocked = 1;
-        } else {
-            int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
-            blocked = fd < 0;
-            if (fd >= 0) close(fd);
-        }
-    }
-    return blocked;
+    return PROBE_ONCE(blocked, stat_probe_blocked());
 }
 
 /* Same try-host-first gate for /proc/sys/kernel/overflow{u,g}id, which Android
@@ -318,20 +316,18 @@ static int stat_blocked(void) {
  * read them is not a hypothetical: it is the first thing bubblewrap does, and
  * it dies outright ("Can't read /proc/sys/kernel/overflowuid"). Probed once per
  * file per process; A64_OVERFLOWID_FORCE_SYNTH forces the fallback in tests. */
+static int overflowid_probe_blocked(int is_gid) {
+    if (getenv("A64_OVERFLOWID_FORCE_SYNTH")) return 1;
+    int fd = open(is_gid ? "/proc/sys/kernel/overflowgid"
+                         : "/proc/sys/kernel/overflowuid",
+                  O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 1;
+    close(fd);
+    return 0;
+}
 static int overflowid_blocked(int is_gid) {
     static int blocked[2] = { -1, -1 };
-    if (blocked[is_gid] < 0) {
-        if (getenv("A64_OVERFLOWID_FORCE_SYNTH")) {
-            blocked[is_gid] = 1;
-        } else {
-            int fd = open(is_gid ? "/proc/sys/kernel/overflowgid"
-                                 : "/proc/sys/kernel/overflowuid",
-                          O_RDONLY | O_CLOEXEC);
-            blocked[is_gid] = fd < 0;
-            if (fd >= 0) close(fd);
-        }
-    }
-    return blocked[is_gid];
+    return PROBE_ONCE(blocked[is_gid], overflowid_probe_blocked(is_gid));
 }
 
 /* The id a file's owner is reported as when it does not fit the caller's view
@@ -400,11 +396,11 @@ static u64 stat_ncpu(void) {
     static int sim = -1;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     u64 v = n > 0 ? (u64)n : 1;
-    if (sim < 0) sim = getenv("A64_PROCSTAT_HOTPLUG_SIM") != NULL;
-    if (sim) {
+    if (PROBE_ONCE(sim, getenv("A64_PROCSTAT_HOTPLUG_SIM") != NULL)) {
         static unsigned tick;
         u64 top = v > 4 ? v : 4;
-        v = top - (u64)(tick++ % (unsigned)top);
+        unsigned t = __atomic_fetch_add(&tick, 1u, __ATOMIC_RELAXED);
+        v = top - (u64)(t % (unsigned)top);
     }
     return v;
 }
