@@ -1606,6 +1606,29 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- fcntl(2) command dispatch. Self-checking: qemu-user answers EINVAL for
+# commands this host kernel does implement, and the owner containment and guest
+# signal remap below are the emulator's own. An unknown command must be refused
+# rather than forwarded with the guest's raw third argument (a pointer-taking
+# command the kernel grows would then read or write through a guest VA as a host
+# address), the known pointer-taking ones must be translated (never EFAULT), and
+# F_SETOWN must not be able to name a host process. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/fcntlcmd.bin \
+            tests/fixtures/fcntlcmd.c 2>/dev/null; then
+        expect=$'unknown=EINVAL\nunknown-hi=EINVAL\nrw_hint=translated\nsetown-host=ESRCH\nsetown-self=ok\ngetown=1\nsetown_ex-host=ESRCH\nsetown_ex-self=ok\nsetsig=ok\ngetsig=32\nsetsig0=ok\ngetsig0=0\nsetsig-bad=EINVAL\npipesz=1\ngetlease=ok\ndone'
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/fcntlcmd.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: fcntlcmd"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: fcntlcmd"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        fx_rm tests/fixtures/fcntlcmd.bin
+    else
+        skip_build "fixtures/fcntlcmd"
+    fi
+fi
+
 # ---- the synthesized /proc must fail closed. Self-checking: qemu-user has no
 # synthesized /proc, so it cannot be the oracle. A64_PROCSYNTH_FORCE_FAIL is the
 # tier a host with neither memfd_create nor a writable directory is served by,

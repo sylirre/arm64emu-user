@@ -428,6 +428,11 @@ static int sig_remap_to_guest(int sig) {
     return sig;
 }
 
+/* Host signal number -> the guest number it stands for: the inverse of
+ * sig_send_host_nr, for reading back a number the guest gave us to install on
+ * the host (fcntl F_GETSIG). */
+int sig_guest_nr(int sig) { return sig_remap_to_guest(sig); }
+
 /* ---- picking the three reserved host signals ----
  *
  * The emulator needs three host signal numbers of its own: the control-channel

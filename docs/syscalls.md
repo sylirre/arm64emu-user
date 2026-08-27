@@ -86,6 +86,21 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   `-D_FILE_OFFSET_BITS=64`, the host `F_SETLK` *macro* becomes `F_SETLK64` (13) on
   ILP32 hosts, but the guest sends arm64's `F_SETLK` (6). Match the **guest's
   literal** command values, then translate to the host macro when calling libc.
+- *An unknown command's argument type is unknown too.* `fcntl`'s third argument
+  is a `long` for some commands and a pointer for others, so a handler that
+  forwards commands it does not recognize is forwarding a guest VA as a host
+  address for every pointer-taking command it has not heard of — and the kernel
+  keeps growing them (`F_GET_RW_HINT` and its three siblings, `__u64 *`, were
+  once exactly that). `sys_fcntl` therefore knows every command it forwards:
+  scalar ones by an explicit list, pointer ones through `copy_from_guest`/
+  `copy_to_guest`, and anything else is `EINVAL` — which is both what a kernel
+  that does not know a command answers and what this build not knowing it means.
+  Two of the scalar ones are not plain pass-throughs either: `F_SETOWN` and
+  `F_SETOWN_EX` name the task that will be sent `SIGIO`, so their id is
+  contained exactly as `kill`'s is (see *Target containment* in
+  `docs/signals-and-processes.md`), and `F_SETSIG`'s argument is a **guest**
+  signal number, which for 32/33 has to ride a host carrier like every other one
+  the guest sends (`F_GETSIG` maps it back).
 - *An optval is not always opaque bytes.* `setsockopt` passes most option
   buffers through unchanged, but `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`
   take a `struct sock_fprog` whose second field is a **pointer** to the

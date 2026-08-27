@@ -1715,6 +1715,26 @@ SYSDEF(ioctl) {
     return (u64)r;
 }
 
+/* fcntl's owner (F_SETOWN, F_SETOWN_EX): the task or process group the kernel
+ * will send SIGIO/SIGURG to for this fd. That is an id the guest supplies, so
+ * it takes the same containment kill(2) does -- otherwise naming a host process
+ * here is a way to signal it (machine.h, proctab_has_task). 0 clears the owner.
+ * `pgrp` selects the process-group reading of a positive id, which F_SETOWN
+ * spells as a negative one. */
+static int owner_allowed(s32 id, int pgrp) {
+    if (!id) return 1;                       /* clear */
+    if (id < 0) {
+        if (id == INT32_MIN) return 0;
+        return owner_allowed(-id, 1);        /* F_SETOWN: -pgid */
+    }
+    if (!pgrp) return proctab_has_task(id);
+    for (int i = 0, n = proctab_slots(); i < n; i++) {
+        s32 t = proctab_pid_at(i);
+        if (t > 0 && getpgid((pid_t)t) == (pid_t)id) return 1;
+    }
+    return getpgid(0) == (pid_t)id;          /* our own group, registry or not */
+}
+
 SYSDEF(fcntl) {
     int fd = (int)a0, cmd = (int)a1;
     switch (cmd) {
@@ -1802,6 +1822,8 @@ SYSDEF(fcntl) {
             if (cmd == 15) {
                 if (copy_from_guest(c, gex, a2, sizeof gex) < 0) return (u64)(s64)-EFAULT;
                 memcpy(&type, gex + 0, 4); memcpy(&pid, gex + 4, 4);
+                /* F_OWNER_PGRP is 2; TID and PID name a task. */
+                if (!owner_allowed(pid, type == 2)) return (u64)(s64)-ESRCH;
                 ex.type = type; ex.pid = pid;
             }
             int r = fcntl(fd, cmd == 15 ? F_SETOWN_EX : F_GETOWN_EX, &ex);
@@ -1814,10 +1836,59 @@ SYSDEF(fcntl) {
             return (u64)r;
         }
 #endif
-        default: {
-            int r = fcntl(fd, cmd, (unsigned long)a2);
+        /* Async-I/O ownership: an id the guest supplies, contained as above. */
+        case 8: {   /* F_SETOWN */
+            if (!owner_allowed((s32)a2, 0)) return (u64)(s64)-ESRCH;
+            int r = fcntl(fd, F_SETOWN, (int)a2);
             return r < 0 ? host_err() : (u64)r;
         }
+        case 10: {  /* F_SETSIG: a GUEST signal number, so it crosses to the
+                     * host the way every other one does. Raised raw, guest 32
+                     * and 33 would be the host libc's own SIGCANCEL/SIGSETXID
+                     * and would kill the emulator instead of reaching the
+                     * guest (signal.c, sig_send_host_nr). 0 restores SIGIO. */
+            int gs = (int)(s32)a2;
+            if (gs < 0 || gs > 64) return (u64)(s64)-EINVAL;
+            int r = fcntl(fd, F_SETSIG, gs ? sig_send_host_nr(gs) : 0);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case 11: {  /* F_GETSIG: back to the guest's number */
+            int r = fcntl(fd, F_GETSIG);
+            return r < 0 ? host_err() : (u64)(r ? sig_guest_nr(r) : 0);
+        }
+        /* Write life-time hints: a __u64 through a POINTER, which is exactly
+         * what must never be forwarded as a guest VA. */
+        case 1035: case 1037: {   /* F_GET_RW_HINT / F_GET_FILE_RW_HINT */
+            u64 hint = 0;
+            int r = fcntl(fd, cmd, &hint);
+            if (r < 0) return host_err();
+            if (copy_to_guest(c, a2, &hint, sizeof hint) < 0) return (u64)(s64)-EFAULT;
+            return (u64)r;
+        }
+        case 1036: case 1038: {   /* F_SET_RW_HINT / F_SET_FILE_RW_HINT */
+            u64 hint;
+            if (copy_from_guest(c, &hint, a2, sizeof hint) < 0) return (u64)(s64)-EFAULT;
+            int r = fcntl(fd, cmd, &hint);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        /* The rest of the scalar-argument commands, forwarded as they are:
+         * F_GETOWN, F_SETLEASE/F_GETLEASE, F_NOTIFY, F_DUPFD_QUERY and
+         * F_CREATED_QUERY (whose argument is an fd, and guest fd == host fd),
+         * F_SETPIPE_SZ/F_GETPIPE_SZ. */
+        case 9: case 1024: case 1025: case 1026: case 1027: case 1028:
+        case 1031: case 1032: {
+            int r = fcntl(fd, cmd, (int)a2);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        default:
+            /* An unknown command's ARGUMENT TYPE is unknown too, so it cannot
+             * be forwarded: a2 would go to the host as a bare word, and the
+             * next pointer-taking command the kernel grows (the four above were
+             * once such a case) would read or write through it -- a guest VA
+             * interpreted as a host address, which on an ILP32 host is
+             * plausibly a valid one. EINVAL is what a kernel that does not know
+             * the command answers, and what this build not knowing it means. */
+            return (u64)(s64)-EINVAL;
     }
 }
 
