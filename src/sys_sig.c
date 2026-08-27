@@ -21,27 +21,43 @@
 
 SYSDEF(rt_sigaction) {
     int sig = (int)a0;
-    if (sig < 1 || sig > 64 || a3 != 8) return (u64)(s64)-EINVAL;
     struct Machine *m = c->m;
-    /* The disposition is read and written through sig_action_swap, which holds
-     * the lock standing in for the kernel's sighand->siglock: the four words are
-     * one action, and a sibling thread delivering this same signal must never
-     * catch half of an update (signal.c). GSigactionK and GSigAction are the same
-     * arm64 layout, hence the plain copy. */
-    if (a2) {   /* old action out */
-        GSigAction cur;
-        sig_action_swap(m, sig, NULL, &cur);
+    GSigactionK ga;
+    GSigAction act, cur;
+
+    /* sys_rt_sigaction -> do_sigaction, in that order, which is what a call
+     * mixing a good pointer with a bad one can tell apart: the set size, then
+     * the new action *in* from the guest, then the signal number, then the
+     * exchange, and only then the old action back *out*.
+     *
+     * Copying the old action out first got two cases backwards. A bad `act`
+     * with a good `oldact` wrote the old action anyway, where a kernel writes
+     * nothing -- it never reaches do_sigaction. And a good `act` with a bad
+     * `oldact` left the disposition uninstalled, where a kernel has already
+     * installed it under the siglock and reports the copyout fault over the
+     * top of a change that stands. */
+    if (a3 != 8) return (u64)(s64)-EINVAL;
+    if (a1 && copy_from_guest(c, &ga, a1, sizeof ga) < 0) return (u64)(s64)-EFAULT;
+    if (sig < 1 || sig > 64) return (u64)(s64)-EINVAL;
+    /* SIGKILL and SIGSTOP have no settable disposition, but reading theirs is
+     * allowed: sig_kernel_pending() is only consulted when there is an act. */
+    if (a1 && (sig == SIGKILL || sig == SIGSTOP)) return (u64)(s64)-EINVAL;
+
+    if (a1) {
+        act.handler = ga.handler;
+        act.flags = ga.flags;
+        act.restorer = ga.restorer;
+        act.mask = ga.mask;
+    }
+    /* One exchange under the lock standing in for sighand->siglock: the four
+     * words are a single action, and a sibling thread delivering this same
+     * signal must never catch half of an update (signal.c). */
+    sig_action_swap(m, sig, a1 ? &act : NULL, a2 ? &cur : NULL);
+
+    if (a2) {   /* old action out -- after the new one is in, as the kernel */
         GSigactionK old = { .handler = cur.handler, .flags = cur.flags,
                             .restorer = cur.restorer, .mask = cur.mask };
         if (copy_to_guest(c, a2, &old, sizeof old) < 0) return (u64)(s64)-EFAULT;
-    }
-    if (a1) {
-        GSigactionK ga;
-        if (copy_from_guest(c, &ga, a1, sizeof ga) < 0) return (u64)(s64)-EFAULT;
-        if (sig == SIGKILL || sig == SIGSTOP) return (u64)(s64)-EINVAL;
-        GSigAction act = { .handler = ga.handler, .flags = ga.flags,
-                           .restorer = ga.restorer, .mask = ga.mask };
-        sig_action_swap(m, sig, &act, NULL);   /* installs, then mirrors */
     }
     return 0;
 }

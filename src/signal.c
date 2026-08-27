@@ -965,6 +965,11 @@ void sig_action_swap(struct Machine *m, int sig, const GSigAction *act,
     if (old) *old = m->sigact[sig];
     if (act) {
         m->sigact[sig] = *act;
+        /* sigdelsetmask(SIGKILL|SIGSTOP), which do_sigaction does at install
+         * rather than at use: neither can be blocked, and stripping them here
+         * is what makes the oldact a later call reads back the kernel's own
+         * answer instead of the bits the caller happened to pass in. */
+        m->sigact[sig].mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
         sig_host_update_locked(m, sig);
     }
     EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);

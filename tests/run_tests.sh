@@ -1355,6 +1355,32 @@ else
     skip_build "fixtures/sigdisp"
 fi
 
+# ---- rt_sigaction(2) with one good pointer and one bad one, and what becomes
+# of SIGKILL/SIGSTOP in a new action's mask. Self-checking: qemu-user locks both
+# user structs before calling do_sigaction, so it refuses the call outright where
+# a kernel installs the action and reports the copyout fault over the top of it,
+# and it keeps the two unblockable signals in the mask a kernel strips them from
+# -- it prints disposition=unchanged and mask kill=1 stop=1. The block below is
+# what a real kernel prints for this program, natively. Pre-fix this emulator
+# printed oldact=written twice, disposition=unchanged, range-badact e=22 and
+# mask kill=1 stop=1. ----
+if [ ! -x tests/fixtures/sigactorder.bin ] && [ -n "$AGCC" ]; then
+    "$AGCC" -static -O2 -o tests/fixtures/sigactorder.bin \
+        tests/fixtures/sigactorder.c $A64_TESTLIBS 2>/dev/null || true
+fi
+if [ -x tests/fixtures/sigactorder.bin ]; then
+    expect=$'badact r=-1 e=14 oldact=untouched\nbadold r=-1 e=14 disposition=installed\nkill-badact r=-1 e=14 oldact=untouched\nkill-set r=-1 e=22\nkill-get r=0 e=0 handler=0\nrange-badact r=-1 e=14\nrange-set r=-1 e=22\nmask kill=0 stop=0 usr2=1'
+    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/sigactorder.bin 2>/dev/null)
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: sigactorder"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: sigactorder"
+        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+    fi
+    fx_rm tests/fixtures/sigactorder.bin
+else
+    skip_build "fixtures/sigactorder"
+fi
+
 # ---- a read/write count is a guest 64-bit value the emulator has to turn into
 # a host size_t and a bounce buffer. Self-checking: qemu-user validates the
 # whole [buf, buf+count) range before the call and answers EFAULT for every row

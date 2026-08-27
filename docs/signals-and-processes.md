@@ -344,6 +344,22 @@ clears the disposition back under the lock, and only if it is still the one that
 was delivered, so a handler a sibling installed in the meantime is not thrown
 away.
 
+The syscall's *order* is the kernel's too, which only a call mixing a good
+pointer with a bad one can see: the set size, then the new action in from the
+guest, then the signal number, then the exchange, and the old action out last.
+Copying the old action out first got two cases backwards — a bad `act` wrote
+`oldact` anyway (a kernel never reaches `do_sigaction`), and a bad `oldact` left
+the disposition uninstalled (a kernel has already installed it and reports the
+copyout fault over the top of a change that stands). An out-of-range signal, and
+`SIGKILL`/`SIGSTOP` with an action to set, are likewise judged *after* the action
+has been read, so an unreadable pointer is `EFAULT` rather than `EINVAL`; reading
+their disposition, with no `act`, is allowed. The new action's mask also loses
+`SIGKILL` and `SIGSTOP` at install (`sigdelsetmask`) rather than at use, which is
+what makes the `oldact` a later call reads back the kernel's answer instead of
+the bits the caller passed in. `tests/fixtures/sigactorder.c` covers all of it
+against the raw syscall; qemu-user is not the oracle there (it locks both user
+structs up front, and keeps the two unblockable signals in the mask).
+
 ## Job control: mirroring the block mask to the host
 
 This is the non-obvious part, and the source of a real bug.
