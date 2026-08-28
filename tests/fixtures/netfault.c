@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 /* How many descriptors this process holds. Both sides count their own, so
@@ -82,5 +83,82 @@ int main(void) {
     n = recvmsg(dg[0], bad, 0);
     printf("recvmsg-hdr n=%zd err=%d\n", n, n < 0 ? errno : 0);
     close(dg[0]); close(dg[1]); close(sv[0]); close(sv[1]);
+
+    /* Half a pointer pair. move_addr_to_user has no NULL test of its own: it
+     * reads the caller's length first (so an unreadable addrlen is EFAULT
+     * whatever the address is), clamps it to the real address length, refuses
+     * a negative one with EINVAL, and touches the address only when that
+     * leaves something to copy -- which is why asking for zero bytes succeeds
+     * with no address at all. accept/accept4/recvfrom are the exception in one
+     * direction only: they test the ADDRESS pointer before touching the pair,
+     * so a NULL address is an ordinary success and the length is never read.
+     * Reporting success for any missing pointer, as this used to, told a guest
+     * its address had been written when nothing was. */
+    int sk[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sk) != 0) { printf("pair failed\n"); return 1; }
+    struct sockaddr_storage sa;
+    socklen_t sl = sizeof sa;
+    errno = 0;
+    int e_addr = getsockname(sk[0], NULL, &sl) == 0 ? 0 : errno;
+    errno = 0;
+    int e_len = getsockname(sk[0], (struct sockaddr *)&sa, NULL) == 0 ? 0 : errno;
+    sl = 0;
+    int r_zero = getsockname(sk[0], NULL, &sl);
+    sl = (socklen_t)-1;
+    errno = 0;
+    int e_neg = getsockname(sk[0], (struct sockaddr *)&sa, &sl) == 0 ? 0 : errno;
+    errno = 0;
+    int e_peer = getpeername(sk[0], (struct sockaddr *)&sa, NULL) == 0 ? 0 : errno;
+    printf("getname addr=%d len=%d zero=%d neg=%d peer=%d\n",
+           e_addr, e_len, r_zero, e_neg, e_peer);
+    close(sk[0]); close(sk[1]);
+
+    /* recvfrom: no address asked for is a plain receive; an address asked for
+     * with nowhere to report its length is EFAULT -- and the datagram is gone
+     * either way, as it is for an skb the kernel could not copy out. */
+    int dg2[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dg2) != 0) { printf("dgram2 failed\n"); return 1; }
+    char rb[8];
+    if (write(dg2[1], "hi", 2) != 2) { printf("write failed\n"); return 1; }
+    ssize_t r1 = recvfrom(dg2[0], rb, sizeof rb, 0, NULL, NULL);
+    if (write(dg2[1], "hi", 2) != 2) { printf("write failed\n"); return 1; }
+    errno = 0;
+    ssize_t r2 = recvfrom(dg2[0], rb, sizeof rb, 0, (struct sockaddr *)&sa, NULL);
+    int e_rf = r2 < 0 ? errno : 0;
+    errno = 0;
+    ssize_t r3 = recv(dg2[0], rb, sizeof rb, MSG_DONTWAIT);
+    printf("recvfrom none=%zd half=%zd err=%d left=%d\n",
+           r1, r2, e_rf, r3 < 0 ? errno : (int)r3);
+    close(dg2[0]); close(dg2[1]);
+
+    /* accept: the same, and a connection whose writeback failed is dropped
+     * rather than left waiting -- the kernel closes the descriptor it had
+     * already made. */
+    int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    memcpy(un.sun_path + 1, "a64netfault", 11);   /* abstract: no filesystem node */
+    socklen_t ul = (socklen_t)(sizeof(sa_family_t) + 1 + 11);
+    if (ls < 0 || bind(ls, (struct sockaddr *)&un, ul) != 0 || listen(ls, 8) != 0) {
+        printf("listen failed\n");
+        return 1;
+    }
+    int cs = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (connect(cs, (struct sockaddr *)&un, ul) != 0) { printf("connect failed\n"); return 1; }
+    int a1 = accept(ls, NULL, NULL);
+    close(cs);
+    cs = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (connect(cs, (struct sockaddr *)&un, ul) != 0) { printf("connect failed\n"); return 1; }
+    errno = 0;
+    int a2 = accept(ls, (struct sockaddr *)&sa, NULL);
+    int e_ac = a2 < 0 ? errno : 0;
+    errno = 0;
+    int a3 = accept(ls, NULL, NULL);
+    printf("accept none=%d half=%d err=%d next=%d\n",
+           a1 >= 0, a2, e_ac, a3 < 0 ? errno : a3);
+    if (a1 >= 0) close(a1);
+    if (a3 >= 0) close(a3);
+    close(cs); close(ls);
     return 0;
 }

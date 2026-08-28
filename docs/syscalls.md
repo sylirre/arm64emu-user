@@ -530,6 +530,21 @@ fd == host fd), so a caller looping on a bad pointer emptied the process's fd
 table two at a time. Both are closed on that path, as `pipe2` already did
 (`tests/fixtures/netfault.c`).
 
+The `(addr, addrlen)` pair those calls write back has one shared
+implementation (`sock_addr_out`, used by the netlink emulation too so the two
+tiers cannot drift apart), and it follows `move_addr_to_user` step for step:
+the caller's length is read first — an unreadable `addrlen` is `EFAULT`
+whatever the address is — clamped to the real address length, refused with
+`EINVAL` when negative, and the address is written only when that leaves
+something to write, so asking for zero bytes succeeds with no address buffer at
+all. `accept`/`accept4`/`recvfrom` are the one exception, in one direction:
+they test the *address* pointer before touching the pair, so a `NULL` address
+is an ordinary success and `addrlen` is never read. Nothing here special-cases
+`NULL` as such — the copy helpers reach guest address 0 exactly as
+`get_user`/`copy_to_user` reach host address 0, and fail for the same reason.
+Answering a half-supplied pair with a bare success told a guest its address had
+been written when nothing was.
+
 **`recvmmsg`'s timeout is a deadline, and an out-parameter.** The fifth
 argument is a relative `CLOCK_MONOTONIC` span; a kernel validates it before
 receiving anything (`EINVAL` for a negative second or an out-of-range

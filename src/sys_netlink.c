@@ -1136,33 +1136,21 @@ reply:
  * (@addr_va, @size_va) buffer pair. The kernel would otherwise hand back the
  * AF_UNIX sockaddr of our substitute socket (length 2), which iproute2 rejects
  * with "Wrong address length 2". Returns 0 or -errno. */
-static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid)
+static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid,
+                             uint32_t nl_groups, int addr_optional)
 {
     struct sockaddr_nl snl;
-    u32 in_size, out_size;
-
-    /* Neither pointer supplied means nothing to write back, which is how
-     * addr_out (sys_net.c) answers the same pair on every socket that does not
-     * go through this emulation -- the two tiers must be indistinguishable. */
-    if (addr_va == 0 || size_va == 0)
-        return 0;
-    if (copy_from_guest(c, &in_size, size_va, 4) < 0)
-        return -EFAULT;
 
     memset(&snl, 0, sizeof(snl));
     snl.nl_family = AF_NETLINK;
     snl.nl_pid    = nl_pid;
+    snl.nl_groups = nl_groups;
 
-    if (in_size > 0) {
-        u32 copy = in_size < sizeof(snl) ? in_size : (u32) sizeof(snl);
-        if (copy_to_guest(c, addr_va, &snl, copy) < 0)
-            return -EFAULT;
-    }
-    /* Linux semantics: *size always reflects the real address length. */
-    out_size = sizeof(snl);
-    if (copy_to_guest(c, size_va, &out_size, 4) < 0)
-        return -EFAULT;
-    return 0;
+    /* The pointer pair is answered by the same helper every other socket goes
+     * through (sock_addr_out, sys_net.c) -- the two tiers must be
+     * indistinguishable, and a guest must not be able to tell a substituted
+     * netlink socket from a real one by handing it half a pair. */
+    return sock_addr_out(c, addr_va, size_va, &snl, sizeof snl, addr_optional);
 }
 
 /* Scatter @reply into the guest recvmsg iovec array (@iov_va, @iov_count),
@@ -1399,7 +1387,7 @@ int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
     /* A writeback that faults is the answer the call returns, byte count or
      * not: __sys_recvfrom overwrites its result with move_addr_to_user's error,
      * and the datagram is gone either way. */
-    int e = nl_write_sockname(c, addr_va, size_va, 0);
+    int e = nl_write_sockname(c, addr_va, size_va, 0, 0, 1);
     if (e < 0) { *ret = (u64)(s64) e; return 1; }
     *ret = (u64)result;
     return 1;
@@ -1495,7 +1483,8 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
 
 u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va)
 {
-    return (u64)(s64) nl_write_sockname(c, addr_va, size_va, (uint32_t) getpid());
+    return (u64)(s64) nl_write_sockname(c, addr_va, size_va,
+                                        (uint32_t) getpid(), 0, 0);
 }
 
 /* Guest ABI struct ifreq size (LP64): ifr_name[16] + a 24-byte union = 40. We

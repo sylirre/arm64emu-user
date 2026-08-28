@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>   /* socklen_t (sock_addr_out) */
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -235,6 +236,18 @@ void rlim_init(struct Machine *m);
  * shm_detach_all drops them all and clears the list (execve/exit). */
 void shm_fork_reattach(struct Machine *m);
 void shm_detach_all(struct Machine *m);
+
+/* sys_net.c: write a sockaddr back through a guest (addr, addrlen) pointer
+ * pair with move_addr_to_user's semantics -- addrlen read first (EFAULT if it
+ * cannot be), clamped to the real length, EINVAL if negative, the address
+ * copied only when that leaves something to copy, and the UNtruncated length
+ * reported. `addr_optional` is for the calls that test the address pointer
+ * before touching the pair at all (accept/accept4/recvfrom), where a NULL
+ * address is an ordinary success. Shared so the netlink emulation
+ * (sys_netlink.c), which answers the same pair for its own sockets, cannot
+ * drift from the tier beside it. Returns 0 or -errno. */
+int sock_addr_out(CPU *c, u64 addr_va, u64 len_va, const void *sa,
+                  socklen_t salen, int addr_optional);
 
 /* Fill in x0 (return value) after a handler runs. */
 void syscall_return(CPU *c, u64 ret);

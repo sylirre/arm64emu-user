@@ -251,18 +251,50 @@ SYSDEF(listen) {
     return listen((int)a0, (int)a1) < 0 ? host_err() : 0;
 }
 
-/* Write back a sockaddr result (accept/getsockname/getpeername/recvfrom). */
-static u64 addr_out(CPU *c, u64 addr_va, u64 len_va, struct sockaddr_storage *ss,
-                    socklen_t sl) {
-    if (!addr_va || !len_va) return 0;
-    unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
-    u32 glen;
-    if (copy_from_guest(c, &glen, len_va, 4) < 0) return (u64)(s64)-EFAULT;
-    u32 out = (u32)sl < glen ? (u32)sl : glen;
-    if (out && copy_to_guest(c, addr_va, ss, out) < 0) return (u64)(s64)-EFAULT;
-    u32 real = sl;
-    if (copy_to_guest(c, len_va, &real, 4) < 0) return (u64)(s64)-EFAULT;
+/* Write a sockaddr back through a guest (addr, addrlen) pointer pair, with
+ * move_addr_to_user's semantics -- shared with the netlink emulation
+ * (sys_netlink.c), which answers the same pair for its own sockets and must be
+ * indistinguishable from this one. Returns 0 or -errno.
+ *
+ * The kernel's order, and every consequence of it: read the caller's length
+ * first, so an unreadable addrlen is EFAULT whatever else is wrong; clamp it to
+ * the real address length; a negative length is EINVAL (and the caller's value
+ * is left alone); copy only when the clamped length is nonzero, so an
+ * unwritable -- NULL, usually -- address is EFAULT only when there was
+ * something to put there; and finally report the UNtruncated length, which is
+ * what POSIX asks for.
+ *
+ * `addr_optional` marks the calls whose address argument may be left out
+ * outright: accept/accept4 test upeer_sockaddr and recvfrom tests uaddr before
+ * touching the pair at all, so a NULL there is an ordinary success and the
+ * addrlen pointer is never read. getsockname/getpeername have no such test --
+ * a NULL address is refused unless the caller also asked for zero bytes.
+ *
+ * None of this special-cases a NULL pointer as such: the copy helpers reach
+ * guest address 0 exactly as get_user/copy_to_user reach host address 0, and
+ * fail for the same reason (nothing is mapped there). Answering a half-supplied
+ * pair with a bare success -- what this used to do whenever either pointer was
+ * missing -- told a guest its address had been written when it had not. */
+int sock_addr_out(CPU *c, u64 addr_va, u64 len_va, const void *sa,
+                  socklen_t salen, int addr_optional) {
+    if (addr_optional && !addr_va) return 0;
+    s32 glen;
+    if (copy_from_guest(c, &glen, len_va, 4) < 0) return -EFAULT;
+    if (glen > (s32)salen) glen = (s32)salen;
+    if (glen < 0) return -EINVAL;
+    if (glen && copy_to_guest(c, addr_va, sa, (size_t)glen) < 0) return -EFAULT;
+    u32 real = salen;
+    if (copy_to_guest(c, len_va, &real, 4) < 0) return -EFAULT;
     return 0;
+}
+
+/* Write back a sockaddr result (accept/getsockname/getpeername/recvfrom),
+ * translating an AF_UNIX path to the guest's view on the way out. */
+static u64 addr_out(CPU *c, u64 addr_va, u64 len_va, struct sockaddr_storage *ss,
+                    socklen_t sl, int addr_optional) {
+    if (addr_optional && !addr_va) return 0;
+    unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
+    return (u64)(s64)sock_addr_out(c, addr_va, len_va, ss, sl, addr_optional);
 }
 
 SYSDEF(accept) {
@@ -270,7 +302,7 @@ SYSDEF(accept) {
     socklen_t sl = sizeof ss;
     int fd = accept((int)a0, (struct sockaddr *)&ss, &sl);
     if (fd < 0) return host_err();
-    u64 e = addr_out(c, a1, a2, &ss, sl);
+    u64 e = addr_out(c, a1, a2, &ss, sl, 1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
 }
@@ -280,7 +312,7 @@ SYSDEF(accept4) {
     socklen_t sl = sizeof ss;
     int fd = accept4((int)a0, (struct sockaddr *)&ss, &sl, (int)a3);
     if (fd < 0) return host_err();
-    u64 e = addr_out(c, a1, a2, &ss, sl);
+    u64 e = addr_out(c, a1, a2, &ss, sl, 1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
 }
@@ -290,7 +322,7 @@ SYSDEF(getsockname) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getsockname((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
-    return addr_out(c, a1, a2, &ss, sl);
+    return addr_out(c, a1, a2, &ss, sl, 0);
 }
 
 SYSDEF(getpeername) {
@@ -298,7 +330,7 @@ SYSDEF(getpeername) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getpeername((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
-    return addr_out(c, a1, a2, &ss, sl);
+    return addr_out(c, a1, a2, &ss, sl, 0);
 }
 
 SYSDEF(sendto) {
@@ -363,7 +395,7 @@ SYSDEF(recvfrom) {
     size_t got = (size_t)n < len ? (size_t)n : len;
     if (n > 0 && copy_to_guest(c, a1, buf, got) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     free(buf);
-    u64 e = addr_out(c, a4, a5, &ss, sl);
+    u64 e = addr_out(c, a4, a5, &ss, sl, 1);
     if ((s64)e < 0) return e;
     return (u64)n;
 }
