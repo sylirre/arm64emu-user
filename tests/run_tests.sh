@@ -1317,7 +1317,7 @@ if [ ! -x tests/fixtures/netfault.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/netfault.c $A64_TESTLIBS 2>/dev/null || true
 fi
 if [ -x tests/fixtures/netfault.bin ]; then
-    expect=$'socketpair err=14 leaked=0 still=1\nrecvmsg n=-1 err=14\nrecvmsg-hdr n=-1 err=14\ngetname addr=14 len=14 zero=0 neg=22 peer=14\nrecvfrom none=2 half=-1 err=14 left=11\naccept none=1 half=-1 err=14 next=11'
+    expect=$'socketpair err=14 leaked=0 still=1\nrecvmsg n=-1 err=14\nrecvmsg-hdr n=-1 err=14\ngetname addr=14 len=14 zero=0 neg=22 peer=14\nrecvfrom none=2 half=-1 err=14 left=11\naccept none=1 half=-1 err=14 next=11\ngetsockopt val=14 len=14 zero=0 neg=22\ngso-timeo val=14 len=14 zero=0 neg=22'
     got=$(timeout -k 5 60 "$EMU" / tests/fixtures/netfault.bin 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: netfault"
     else

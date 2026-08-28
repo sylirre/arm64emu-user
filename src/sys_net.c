@@ -480,8 +480,19 @@ SYSDEF(setsockopt) {
 }
 
 SYSDEF(getsockopt) {
-    u32 glen = 0;
-    if (a4 && copy_from_guest(c, &glen, a4, 4) < 0) return (u64)(s64)-EFAULT;
+    /* The output pointers are the kernel's first business, ahead of the option
+     * name: sk_getsockopt reads the caller's length before the switch, so an
+     * unreadable optlen is EFAULT and a negative one is EINVAL whatever was
+     * asked for. The value is then written only when that length -- clamped to
+     * what the option is worth -- leaves something to write, which is why an
+     * ask for zero bytes succeeds with no optval buffer at all. Taking a
+     * missing optlen for "length 0" and bouncing a missing optval through a
+     * local buffer, as this used to, made both of those a silent success: the
+     * guest was told its option had been read out to memory that never
+     * received it. */
+    s32 glen;
+    if (copy_from_guest(c, &glen, a4, 4) < 0) return (u64)(s64)-EFAULT;
+    if (glen < 0) return (u64)(s64)-EINVAL;
     /* The reverse of setsockopt's SO_RCVTIMEO/SO_SNDTIMEO conversion: on a
      * host whose timeval is not the guest's 16-byte one the kernel would
      * write 8 bytes where the guest expects 16, read back as a garbage
@@ -496,14 +507,13 @@ SYSDEF(getsockopt) {
         u8 g[16];
         s64 v = (s64)tv.tv_sec;  memcpy(g, &v, 8);
         v = (s64)tv.tv_usec;     memcpy(g + 8, &v, 8);
-        u32 outl = glen < 16 ? glen : 16;   /* kernel: len = min(len, lv) */
-        if (a3 && outl && copy_to_guest(c, a3, g, outl) < 0) return (u64)(s64)-EFAULT;
-        if (a4 && copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
+        u32 outl = (u32)glen < 16 ? (u32)glen : 16;   /* kernel: len = min(len, lv) */
+        if (outl && copy_to_guest(c, a3, g, outl) < 0) return (u64)(s64)-EFAULT;
+        if (copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
         return 0;
     }
-    if (glen > 4096) glen = 4096;
     u8 buf[4096];
-    socklen_t sl = glen;
+    socklen_t sl = (u32)glen > 4096 ? 4096 : (u32)glen;
     if (getsockopt((int)a0, (int)a1, (int)a2, buf, &sl) < 0) return host_err();
     /* -fake-id: SO_PEERCRED reports the peer's *real* invoking uid/gid; present
      * the fake identity instead (same remap as stat ownership), so peer-uid
@@ -519,9 +529,9 @@ SYSDEF(getsockopt) {
         memcpy(buf + 4, &uid, 4);
         memcpy(buf + 8, &gid, 4);
     }
-    if (a3 && sl && copy_to_guest(c, a3, buf, sl) < 0) return (u64)(s64)-EFAULT;
+    if (sl && copy_to_guest(c, a3, buf, sl) < 0) return (u64)(s64)-EFAULT;
     u32 real = sl;
-    if (a4 && copy_to_guest(c, a4, &real, 4) < 0) return (u64)(s64)-EFAULT;
+    if (copy_to_guest(c, a4, &real, 4) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 

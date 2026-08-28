@@ -545,6 +545,15 @@ is an ordinary success and `addrlen` is never read. Nothing here special-cases
 Answering a half-supplied pair with a bare success told a guest its address had
 been written when nothing was.
 
+`getsockopt`'s `(optval, optlen)` pair is validated the same way and for the
+same reason — `sk_getsockopt` reads the caller's length before it looks at the
+option name, so an unreadable `optlen` is `EFAULT` and a negative one `EINVAL`
+whatever was asked for, and `optval` is written only once the clamped length
+leaves something to write. Taking a missing `optlen` for "length 0" and
+bouncing a missing `optval` through a local buffer made both a silent success.
+The `SO_RCVTIMEO`/`SO_SNDTIMEO` conversion path an ILP32 host takes is held to
+the same rule (`tests/fixtures/netfault.c` covers both).
+
 **`recvmmsg`'s timeout is a deadline, and an out-parameter.** The fifth
 argument is a relative `CLOCK_MONOTONIC` span; a kernel validates it before
 receiving anything (`EINVAL` for a negative second or an out-of-range

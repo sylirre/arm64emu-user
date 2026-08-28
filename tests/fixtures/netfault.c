@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -160,5 +161,38 @@ int main(void) {
     if (a1 >= 0) close(a1);
     if (a3 >= 0) close(a3);
     close(cs); close(ls);
+
+    /* getsockopt's own pair, validated before the option name is looked at:
+     * an unreadable optlen is EFAULT, a negative one EINVAL, and an optval
+     * with nowhere to write is EFAULT only once the clamped length leaves
+     * something to write -- so a zero-length ask is a plain success. */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sk) != 0) { printf("pair2 failed\n"); return 1; }
+    int v = 0;
+    socklen_t ol = sizeof v;
+    errno = 0;
+    int g_val = getsockopt(sk[0], SOL_SOCKET, SO_TYPE, NULL, &ol) == 0 ? 0 : errno;
+    errno = 0;
+    int g_len = getsockopt(sk[0], SOL_SOCKET, SO_TYPE, &v, NULL) == 0 ? 0 : errno;
+    ol = 0;
+    int g_zero = getsockopt(sk[0], SOL_SOCKET, SO_TYPE, NULL, &ol);
+    ol = (socklen_t)-1;
+    errno = 0;
+    int g_neg = getsockopt(sk[0], SOL_SOCKET, SO_TYPE, &v, &ol) == 0 ? 0 : errno;
+    printf("getsockopt val=%d len=%d zero=%d neg=%d\n", g_val, g_len, g_zero, g_neg);
+    /* The same for the timeout options, whose conversion is a separate path on
+     * a host whose struct timeval is not the guest's 16-byte one. */
+    struct timeval tv;
+    ol = sizeof tv;
+    errno = 0;
+    int t_val = getsockopt(sk[0], SOL_SOCKET, SO_RCVTIMEO, NULL, &ol) == 0 ? 0 : errno;
+    errno = 0;
+    int t_len = getsockopt(sk[0], SOL_SOCKET, SO_RCVTIMEO, &tv, NULL) == 0 ? 0 : errno;
+    ol = 0;
+    int t_zero = getsockopt(sk[0], SOL_SOCKET, SO_RCVTIMEO, NULL, &ol);
+    ol = (socklen_t)-1;
+    errno = 0;
+    int t_neg = getsockopt(sk[0], SOL_SOCKET, SO_RCVTIMEO, &tv, &ol) == 0 ? 0 : errno;
+    printf("gso-timeo val=%d len=%d zero=%d neg=%d\n", t_val, t_len, t_zero, t_neg);
+    close(sk[0]); close(sk[1]);
     return 0;
 }
