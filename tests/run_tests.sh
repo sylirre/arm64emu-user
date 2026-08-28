@@ -1848,8 +1848,8 @@ fi
 
 # ---- self-checking fixtures for syscalls qemu-user cannot model (it
 # returns ENOSYS for set/get_robust_list and mlock2) ----
-check_fixture() {   # check_fixture <name> <expected>
-    local name="$1" expect="$2"
+check_fixture() {   # check_fixture <name> <expected> [VAR=VAL] [tier-label]
+    local name="$1" expect="$2" tenv="${3-}" tlabel="${4-}"
     "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
         skip_build "fixtures/$name"; return; }
     local got
@@ -1858,6 +1858,17 @@ check_fixture() {   # check_fixture <name> <expected>
     else
         fail=$((fail+1)); echo "FAIL fixture: $name"
         diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
+    fi
+    # A fallback tier the same expectations have to survive: what the guest
+    # reads must not depend on which tier the host let the emulator use.
+    if [ -n "$tenv" ]; then
+        got=$(env "$tenv" "$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then
+            pass=$((pass+1)); echo "PASS fixture: $name ($tlabel)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: $name ($tlabel)"
+            diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
+        fi
     fi
     fx_rm "tests/fixtures/$name.bin"
 }
@@ -1870,7 +1881,14 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # its own process there, which is why it cannot be the oracle. Every row is a
 # relation a kernel keeps true for any process; compiled and run natively on
 # x86-64 the same program prints the same block.
-check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\nrss_bounded=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\nother_stat=1\nother_statm=1\nother_status=1\nother_bounded=1\nrsslim=1\ndone'
+#
+# Run again with the resident-set sample forced to fail (A64_MINCORE_FORCE_FAIL
+# -- the tier a host that will not answer mincore(2) is served by, which is
+# also the tier every reader of ANOTHER process is on). The expectations do not
+# change: the sizes are the guest's either way, and the resident figures the
+# emulator falls back to are bounded so that the same relations still hold.
+check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\nrss_bounded=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\nother_stat=1\nother_statm=1\nother_status=1\nother_bounded=1\nrsslim=1\ndone' \
+              A64_MINCORE_FORCE_FAIL=1 "no-mincore tier"
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.

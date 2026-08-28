@@ -323,6 +323,12 @@ static void help(void) {
         {"A64_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
                         "with a pipe instead of process_vm_readv (the tier a "
                         "host kernel older than 3.2 is served by)."},
+        {"A64_MINCORE_FORCE_FAIL", "Make the resident-set sample fail (the "
+                        "tier a host that will not answer mincore(2) is served "
+                        "by): the sizes the guest reads about its own memory "
+                        "stay its own, and the Rss figures fall back to the "
+                        "host's, bounded by what the guest mapped -- which is "
+                        "what every reader of ANOTHER process already gets."},
         {"A64_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "

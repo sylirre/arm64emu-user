@@ -307,7 +307,9 @@ high-water mark over the samples actually taken: a guest watching its own
 footprint reads repeatedly and misses nothing between its own reads. A host
 that cannot answer `mincore` — a sandbox or a seccomp policy between the
 emulator and the kernel — falls back to the host file's own figures, bounded
-as below. One approximation is named rather than hidden:
+as below; `A64_MINCORE_FORCE_FAIL=1` selects that tier anywhere, and the suite
+runs `tests/fixtures/vmreport.c` over both. One approximation is named rather
+than hidden:
 a System V shm attachment is backed by a memfd mapped like any other file, so
 its pages land in `RssFile` where a kernel would say `RssShmem` — `VmRSS` and
 `statm`'s `shared` column add the two together either way.

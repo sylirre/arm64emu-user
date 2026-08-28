@@ -282,9 +282,11 @@ typedef struct AddrSpace {
 
 /* The guest's memory footprint as its own /proc reports it. Bytes throughout;
  * a kernel prints kB in status and pages in statm/stat, and the callers there
- * divide. `rss_ok` is 0 on a host whose mincore(2) would not answer, where
- * the resident set is unknowable and the caller leaves the host's figures
- * alone rather than print a zero. */
+ * divide. `rss_ok` is 0 on a host whose mincore(2) would not answer (and under
+ * A64_MINCORE_FORCE_FAIL, which is how that tier is tested elsewhere): the
+ * resident set is unknowable there, the rss_* fields are left zero, and the
+ * caller falls back to the host's own figures -- bounded, since the host
+ * process is the emulator and its resident set is not the guest's. */
 typedef struct {
     u64 size, peak;              /* total_vm, hiwater_vm */
     u64 data, stack, exec;       /* data_vm, stack_vm, exec_vm */

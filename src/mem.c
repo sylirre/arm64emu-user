@@ -1282,6 +1282,16 @@ void as_publish(AddrSpace *as) {
  * pointer need not be host-page aligned (head trims, shared-file offset pads),
  * so the probe is aligned outward from it. */
 static u64 region_resident(const Region *r, int *ok) {
+    /* A host that will not answer. mincore(2) is old enough (2.4) that no
+     * kernel we run on lacks it, but a sandbox or a seccomp policy between
+     * the emulator and the kernel can deny it, and then the resident set is
+     * simply not knowable from in here. A64_MINCORE_FORCE_FAIL selects that
+     * tier anywhere, which is how it is exercised off such a host. */
+    static int no_mincore = -1;
+    if (PROBE_ONCE(no_mincore, getenv("A64_MINCORE_FORCE_FAIL") != NULL)) {
+        *ok = 0;
+        return 0;
+    }
     if (!r->host) return 0;
     u64 len = r->end - r->start;
     uintptr_t hps = (uintptr_t)g_host_pagesz;
