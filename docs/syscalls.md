@@ -554,6 +554,20 @@ bouncing a missing `optval` through a local buffer made both a silent success.
 The `SO_RCVTIMEO`/`SO_SNDTIMEO` conversion path an ILP32 host takes is held to
 the same rule (`tests/fixtures/netfault.c` covers both).
 
+**A length the kernel cannot use is refused, not trimmed.** `addrlen` is an
+`int`: `move_addr_to_kernel` takes a negative one and one past
+`sizeof(sockaddr_storage)` alike as `EINVAL`, whatever the address itself says,
+so `bind`/`connect`/`sendto` answer that. Clamping it instead turned a bad
+length into a plausible address — 128 bytes of whatever the guest's pointer
+happened to reach, handed to the protocol as an address. An `AF_UNIX` address
+cannot show the difference (anything past `sun_path` is refused by the protocol
+either way); an `AF_INET` one can. Inside a `msghdr` the rule differs by one
+detail, and `__copy_msghdr` is where it is settled: a `NULL` `msg_name` zeroes
+`msg_namelen` before anything looks at it, so a rubbish value is harmless
+there; a negative one is `EINVAL`, ahead of the `EMSGSIZE` of too many iovec
+segments and ahead of anything being sent or received; and an over-long one
+*is* clamped rather than refused.
+
 **`recvmmsg`'s timeout is a deadline, and an out-parameter.** The fifth
 argument is a relative `CLOCK_MONOTONIC` span; a kernel validates it before
 receiving anything (`EINVAL` for a negative second or an out-of-range

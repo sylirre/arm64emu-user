@@ -83,7 +83,15 @@ SYSDEF(socketpair) {
 
 /* Import a guest sockaddr (raw bytes; layout is arch-independent). */
 static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen_t *out) {
-    if (len > sizeof *ss) len = sizeof *ss;
+    /* move_addr_to_kernel refuses a length it cannot use rather than trimming
+     * it: an addrlen is an int, and both a negative one and one past
+     * sizeof(sockaddr_storage) are EINVAL, whatever the address itself says.
+     * Clamping instead -- what this did -- turned a bad length into a
+     * plausible address: bind/connect/sendto then went ahead with 128 bytes of
+     * whatever the guest's pointer happened to reach. An AF_UNIX address
+     * cannot show it (the protocol refuses anything past sun_path either way),
+     * an AF_INET one can: a kernel answers EINVAL where this answered 0. */
+    if ((s32)len < 0 || len > sizeof *ss) return -EINVAL;
     if (len && copy_from_guest(c, ss, va, len) < 0) return -EFAULT;
     *out = len;
     return 0;
@@ -663,6 +671,16 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
                       int for_send, int *dirfd_out) {
     if (copy_from_guest(c, g, va, sizeof *g) < 0) return -EFAULT;
     memset(h, 0, sizeof *h);
+    /* msg_namelen is an int, and __copy_msghdr settles it before the iovec:
+     * a NULL msg_name zeroes the length first, so a rubbish value is harmless
+     * there; a negative one is then EINVAL, ahead of the EMSGSIZE below and
+     * ahead of anything being sent or received; and only after that is an
+     * over-long one clamped to sizeof(sockaddr_storage) -- clamped, not
+     * refused, which is where this differs from an addrlen passed as its own
+     * argument (addr_in). The clamp was already here; the refusal was not, so
+     * a guest naming a negative length had 128 bytes read out of msg_name and
+     * sent, or a source address written back into a buffer it never offered. */
+    if (g->msg_name && (s32)g->msg_namelen < 0) return -EINVAL;
     if (g->msg_name && g->msg_namelen) {
         if (for_send) {
             u32 nl = g->msg_namelen > sizeof *ss ? sizeof *ss : g->msg_namelen;

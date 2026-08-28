@@ -1,4 +1,4 @@
-/* Guest pointers a socket call cannot write to. Both of these were silent:
+/* Guest pointers a socket call cannot reach, and lengths it cannot use. Both of these were silent:
  * socketpair leaked the two host descriptors it had just made when the guest's
  * result pointer was bad (and every fd here is one of the guest's own, so a
  * loop ran the process out of them), and recvmsg dropped the writeback error
@@ -8,10 +8,12 @@
  * cannot be the oracle for the first row. The expected block in run_tests.sh
  * is what a real kernel prints for this program, natively. */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -194,5 +196,65 @@ int main(void) {
     int t_neg = getsockopt(sk[0], SOL_SOCKET, SO_RCVTIMEO, &tv, &ol) == 0 ? 0 : errno;
     printf("gso-timeo val=%d len=%d zero=%d neg=%d\n", t_val, t_len, t_zero, t_neg);
     close(sk[0]); close(sk[1]);
+
+    /* An address LENGTH the kernel cannot use is refused, not trimmed:
+     * move_addr_to_kernel takes a negative one and one past
+     * sizeof(sockaddr_storage) alike as EINVAL, whatever the address says. It
+     * takes an AF_INET socket to show that -- an AF_UNIX address longer than
+     * sun_path is refused by the protocol either way, so it cannot tell a
+     * clamp from a refusal. connect(2) on a datagram socket only records the
+     * destination, so nothing is put on the wire to observe this. */
+    int un4 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = htons(9);                  /* discard; nothing need listen */
+    memcpy(&sa, &sin, sizeof sin);
+    errno = 0;
+    int c_ok = connect(un4, (struct sockaddr *)&sa, sizeof sin) == 0 ? 0 : errno;
+    errno = 0;
+    int c_big = connect(un4, (struct sockaddr *)&sa, 4096) == 0 ? 0 : errno;
+    errno = 0;
+    int c_neg = connect(un4, (struct sockaddr *)&sa, (socklen_t)-1) == 0 ? 0 : errno;
+    printf("addrlen ok=%d big=%d neg=%d\n", c_ok, c_big, c_neg);
+    close(un4);
+
+    /* Inside a msghdr the rule differs by one detail: an over-long
+     * msg_namelen IS clamped, while a negative one is EINVAL before anything
+     * is sent or received -- unless msg_name is NULL, which zeroes the length
+     * before the test and makes the same value harmless. */
+    int dg3[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dg3) != 0) { printf("dgram3 failed\n"); return 1; }
+    struct iovec siov = { (void *)"hi", 2 };
+    struct msghdr sm;
+    memset(&sm, 0, sizeof sm);
+    sm.msg_iov = &siov;
+    sm.msg_iovlen = 1;
+    sm.msg_name = &sa;
+    sm.msg_namelen = (unsigned)-1;
+    errno = 0;
+    int s_neg = sendmsg(dg3[1], &sm, 0) < 0 ? errno : 0;
+    sm.msg_name = NULL;
+    ssize_t s_null = sendmsg(dg3[1], &sm, 0);
+    char mb[8];
+    struct iovec riov = { mb, sizeof mb };
+    struct msghdr rm;
+    memset(&rm, 0, sizeof rm);
+    rm.msg_iov = &riov;
+    rm.msg_iovlen = 1;
+    rm.msg_name = &sa;
+    rm.msg_namelen = (unsigned)-1;
+    errno = 0;
+    int r_neg = recvmsg(dg3[0], &rm, 0) < 0 ? errno : 0;
+    /* The datagram the refused receive left behind is still there, so this
+     * takes it: over-long is clamped, not refused. MSG_DONTWAIT so that an
+     * emulator which wrongly consumed it above reports a wrong value here
+     * instead of blocking until the harness kills it. */
+    rm.msg_namelen = 4096;
+    ssize_t r_big = recvmsg(dg3[0], &rm, MSG_DONTWAIT);
+    printf("msgname send_neg=%d send_null=%zd recv_neg=%d recv_big=%zd\n",
+           s_neg, s_null, r_neg, r_big);
+    close(dg3[0]); close(dg3[1]);
     return 0;
 }
