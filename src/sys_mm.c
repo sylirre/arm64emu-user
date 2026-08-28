@@ -52,6 +52,27 @@ static int as_fits(struct Machine *m, u64 add) {
     return as_mapped_bytes(&m->as) <= cap - add;
 }
 
+/* Bytes of [addr, addr+len) that no region covers -- what a mapping placed
+ * there would ADD to the guest's mapped total, which is what a limit is
+ * measured against. For everything but MAP_FIXED that is the whole length
+ * (the range was picked because it was free); a fixed mapping over ground the
+ * guest already owns replaces it and adds nothing. Caller holds as_lock. */
+static u64 range_unmapped_bytes(AddrSpace *as, u64 addr, u64 len) {
+    u64 end = addr + len, free = 0, va = addr;
+    while (va < end) {
+        const Region *r = as_find_region(as, va);
+        if (r) { va = r->end; continue; }
+        /* No region holds va, so the next one starts above it (or there is
+         * none): everything up to it is free. Stepping mapping to mapping
+         * rather than page to page is what keeps a guest-sized range cheap. */
+        const Region *nx = as_next_region(as, va);
+        u64 stop = (nx && nx->start < end) ? nx->start : end;
+        free += stop - va;
+        va = stop;
+    }
+    return free;
+}
+
 static u64 brk_locked(CPU *c, u64 a0) {
     AddrSpace *as = &c->m->as;
     u64 newbrk = a0;
@@ -108,14 +129,6 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     if (len > GUEST_TASK_SIZE) return (u64)(s64)-ENOMEM;
     u32 pte = prot_g2pte(prot);
 
-    /* RLIMIT_AS. A MAP_FIXED over ground the guest already owns replaces it
-     * rather than adding to the total, so this is deliberately checked against
-     * the whole length only for the growing case; the fixed case is let through
-     * and settles at whatever the region list says afterwards. Erring that way
-     * keeps a guest from being refused a mapping it is merely relocating. */
-    if (!(flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) && !as_fits(c->m, len))
-        return (u64)(s64)-ENOMEM;
-
     if (flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) {
         if (addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
         if (addr > GUEST_TASK_SIZE - len) return (u64)(s64)-ENOMEM;
@@ -139,6 +152,22 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         if (!addr) addr = as_find_free(as, len);
         if (!addr) return (u64)(s64)-ENOMEM;
     }
+
+    /* RLIMIT_AS, charged the way mmap_region charges it: against what the
+     * mapping adds to the guest's mapped total, not against its length. The
+     * kernel tests the full length first and, when that is over the cap,
+     * retries with count_vma_pages_range() subtracted -- the pages this
+     * mapping would replace -- so what has to fit is the part of the range
+     * that is free, and only a fixed mapping can have less of that than its
+     * length. This used to skip the check for MAP_FIXED outright, on the
+     * grounds that a relocating guest should not be refused; the hole was
+     * that "fixed" says nothing about the ground being occupied, so a guest
+     * could map its entire address space in MAP_FIXED steps and never be
+     * charged a byte. Placed after the address is settled because that is
+     * where the kernel has it (get_unmapped_area runs first) and because the
+     * free part cannot be known before it. */
+    if (!as_fits(c->m, range_unmapped_bytes(as, addr, len)))
+        return (u64)(s64)-ENOMEM;
 
     int r;
     if (flags & G_MAP_ANONYMOUS) {

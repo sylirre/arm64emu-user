@@ -234,6 +234,17 @@ places than insert and delete — `region_punch` trims `start`/`end` in place an
 is silent, and wrong in both directions. The walk runs on those three syscalls
 only, never on a fault or an access.
 
+What a mapping is charged is what it **adds**, not its length — the same
+distinction `mmap_region` makes when it retries `may_expand_vm` with
+`count_vma_pages_range()` subtracted. Only `MAP_FIXED` can differ from its
+length: it replaces whatever it lands on, so ground the guest already owns
+costs nothing, while ground that is free costs its full size.
+`range_unmapped_bytes` (`sys_mm.c`) walks the range mapping to mapping and
+returns exactly that. Skipping the check for every fixed mapping — the older
+rule, meant to keep a relocating guest from being refused — was a hole, because
+"fixed" says nothing about the ground being occupied: a guest could map its
+whole address space in `MAP_FIXED` steps and never be charged a byte of it.
+
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max
 address space" nothing was enforcing while hiding the one that was.

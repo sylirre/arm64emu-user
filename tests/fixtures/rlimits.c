@@ -46,6 +46,10 @@ extern char **environ;
  * mmapchurn unrunnable on a Termux host. */
 #define WINDOW (512ULL << 20)
 
+/* The free range the MAP_FIXED accounting checks aim at. Small enough that
+ * reserving it costs the ILP32 host build nothing it cannot spare. */
+#define ARENA (64ULL << 20)
+
 static unsigned long long mapped_now(void) {
     FILE *f = fopen("/proc/self/maps", "r");
     unsigned long long total = 0, lo, hi;
@@ -128,6 +132,51 @@ int main(int argc, char **argv) {
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("reusable=%d\n", again != MAP_FAILED);
     if (again != MAP_FAILED) munmap(again, 64ULL << 20);
+
+    /* A fixed mapping is charged for the part of its range that is FREE, the
+     * way mmap_region charges it: ground the guest already owns is replaced
+     * rather than added to the total, but ground that is free costs its full
+     * length whether or not MAP_FIXED was asked for. Skipping the check for
+     * every fixed mapping -- which is what this used to do, so that a guest
+     * relocating a mapping could never be refused -- let a guest walk past its
+     * cap in MAP_FIXED steps without being charged a byte. */
+    void *arena = mmap(NULL, ARENA, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1, 0);
+    if (arena == MAP_FAILED) { printf("arena=fail\n"); return 1; }
+    munmap(arena, ARENA);            /* a known-free range to aim at */
+
+    /* Tighten the cap around what is mapped now, and put it back afterwards:
+     * mapping half a gigabyte to shut the window instead would cost the
+     * 32-bit host build address space it may not have. */
+    getrlimit(RLIMIT_AS, &rl);
+    rl.rlim_cur = mapped_now() + ARENA / 4;
+    setrlimit(RLIMIT_AS, &rl);
+    errno = 0;
+    void *f = mmap(arena, ARENA, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("fixed_over=%d\n", f == MAP_FAILED && errno == ENOMEM);
+    if (f != MAP_FAILED) munmap(f, ARENA);
+    errno = 0;
+    f = mmap(arena, ARENA, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    printf("noreplace_over=%d\n", f == MAP_FAILED && errno == ENOMEM);
+    if (f != MAP_FAILED) munmap(f, ARENA);
+    /* An eighth of the arena fits the window... */
+    void *own = mmap(arena, ARENA / 8, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("fixed_fits=%d\n", own == arena);
+    /* ...and replacing that same eighth still fits once the window is far
+     * smaller than it, because replacing it adds nothing. */
+    getrlimit(RLIMIT_AS, &rl);
+    rl.rlim_cur = mapped_now() + (1ULL << 20);
+    setrlimit(RLIMIT_AS, &rl);
+    f = mmap(arena, ARENA / 8, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf("fixed_replace=%d\n", f == arena);
+    munmap(arena, ARENA);
+    getrlimit(RLIMIT_AS, &rl);
+    rl.rlim_cur = g_cap;
+    setrlimit(RLIMIT_AS, &rl);
 
     /* A hard limit can only come down without privilege, and must stay down. */
     getrlimit(RLIMIT_AS, &rl);

@@ -892,7 +892,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/rlimits.bin \
             tests/fixtures/rlimits.c 2>/dev/null; then
         got=$(timeout -k 5 60 "$EMU" / tests/fixtures/rlimits.bin 2>/dev/null)
-        expect=$'set=1\nreadback=1\nprlimit=1\nprocfs=1\nunder=1\nover=1\nreusable=1\nraise_hard=1\nfork_kept=1\nexec_kept=1\nexec_limits=1\nexec_enforced=1\ndone'
+        expect=$'set=1\nreadback=1\nprlimit=1\nprocfs=1\nunder=1\nover=1\nreusable=1\nfixed_over=1\nnoreplace_over=1\nfixed_fits=1\nfixed_replace=1\nraise_hard=1\nfork_kept=1\nexec_kept=1\nexec_limits=1\nexec_enforced=1\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: rlimits"
         else
             fail=$((fail+1)); echo "FAIL fixture: rlimits"
