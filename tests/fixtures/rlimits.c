@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,27 @@ static unsigned long long mapped_now(void) {
     if (!f) return 0;
     while (fgets(line, sizeof line, f))
         if (sscanf(line, "%llx-%llx", &lo, &hi) == 2) total += hi - lo;
+    fclose(f);
+    return total;
+}
+
+/* The bytes of the guest's address space that RLIMIT_DATA bounds: what the
+ * kernel calls a data mapping -- private, writable, and not the stack. Read
+ * from the same synthesized /proc/self/maps as mapped_now(), because the
+ * VmData line of /proc/self/status describes the emulator's address space and
+ * not the guest's. */
+static unsigned long long data_now(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512], perms[8], name[64];
+    unsigned long long total = 0, lo, hi;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        int n = sscanf(line, "%llx-%llx %7s %*s %*s %*s %63s",
+                       &lo, &hi, perms, name);
+        if (n < 3 || perms[1] != 'w' || perms[3] != 'p') continue;
+        if (n >= 4 && strcmp(name, "[stack]") == 0) continue;
+        total += hi - lo;
+    }
     fclose(f);
     return total;
 }
@@ -177,6 +199,42 @@ int main(int argc, char **argv) {
     getrlimit(RLIMIT_AS, &rl);
     rl.rlim_cur = g_cap;
     setrlimit(RLIMIT_AS, &rl);
+
+    /* RLIMIT_DATA bounds the same thing may_expand_vm bounds -- mappings that
+     * are private, writable and not the stack -- and has done for every kernel
+     * since 4.5, so it bites on mmap as it does on brk. Enforcing it on brk
+     * alone left a guest that lowered it to bound its own allocator with no
+     * bound at all the moment malloc reached for mmap. A read-only mapping and
+     * a shared one are not data mappings, however large, and must still go
+     * through. */
+    struct rlimit saved_data;
+    getrlimit(RLIMIT_DATA, &saved_data);
+    rl = saved_data;
+    rl.rlim_cur = data_now() + ARENA / 4;
+    printf("data_set=%d\n", setrlimit(RLIMIT_DATA, &rl) == 0);
+    errno = 0;
+    void *d = mmap(NULL, ARENA, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("data_over=%d\n", d == MAP_FAILED && errno == ENOMEM);
+    if (d != MAP_FAILED) munmap(d, ARENA);
+    d = mmap(NULL, ARENA, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("data_ro=%d\n", d != MAP_FAILED);
+    if (d != MAP_FAILED) munmap(d, ARENA);
+    d = mmap(NULL, ARENA, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    printf("data_shared=%d\n", d != MAP_FAILED);
+    if (d != MAP_FAILED) munmap(d, ARENA);
+    /* ...and the heap is charged to it too, as it always was. */
+    errno = 0;
+    printf("data_brk=%d\n", sbrk((intptr_t)ARENA) == (void *)-1 && errno == ENOMEM);
+    /* A growing mremap of a data mapping is charged the same way. */
+    void *g = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = 0;
+    void *gg = g == MAP_FAILED ? MAP_FAILED : mremap(g, 4096, ARENA, MREMAP_MAYMOVE);
+    printf("data_mremap=%d\n", gg == MAP_FAILED && errno == ENOMEM);
+    if (gg != MAP_FAILED && gg != NULL) munmap(gg, ARENA);
+    else if (g != MAP_FAILED) munmap(g, 4096);
+    setrlimit(RLIMIT_DATA, &saved_data);
 
     /* A hard limit can only come down without privilege, and must stay down. */
     getrlimit(RLIMIT_AS, &rl);

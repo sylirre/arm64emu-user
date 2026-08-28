@@ -257,6 +257,23 @@ rule, meant to keep a relocating guest from being refused — was a hole, becaus
 "fixed" says nothing about the ground being occupied: a guest could map its
 whole address space in `MAP_FIXED` steps and never be charged a byte of it.
 
+`RLIMIT_DATA` bounds a subset of the same total: what `is_data_mapping()`
+calls a data mapping — private, writable, and not the main stack — summed by
+`as_data_bytes()`. Every kernel since 4.5 charges `mmap`, `mremap` and `brk`
+against it in `may_expand_vm`, alongside the `RLIMIT_AS` test and out of the
+same page count, and the `uname` presented here is 6.1; enforcing it on `brk`
+alone left a guest that lowered the limit to bound its own allocator with no
+bound at all as soon as `malloc` reached for `mmap`. A read-only or `PROT_NONE`
+mapping is not a data mapping, and neither is a shared one however writable.
+`brk` is charged twice, as the kernel charges it: once by `check_data_rlimit`
+against the heap's own span, and once by `may_expand_vm` against every data
+mapping the guest holds. `rlim_cur == 0` falls back to the hard limit, which is
+the kernel's own workaround for valgrind — a program a guest here plausibly
+runs. Region protections are the truth after an `mprotect` (which splits at the
+range's edges and rewrites `Region.prot`), so the sum tracks the kernel's own
+accounting, which likewise moves pages in and out of `data_vm` on `mprotect`
+without ever refusing one for it.
+
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max
 address space" nothing was enforcing while hiding the one that was.

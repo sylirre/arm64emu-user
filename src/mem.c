@@ -1181,6 +1181,34 @@ u64 as_mapped_bytes(AddrSpace *as) {
     return total;
 }
 
+/* Bytes of it that are a "data mapping" -- what RLIMIT_DATA is measured
+ * against, and what /proc/<pid>/status would call VmData.
+ *
+ * is_data_mapping() in the kernel is `(flags & (VM_WRITE|VM_SHARED|VM_STACK))
+ * == VM_WRITE`: writable, private, and not the process's own stack. So the
+ * heap counts, so do the executable's writable segments, a thread stack placed
+ * by mmap and any private writable file mapping; a read-only or PROT_NONE
+ * mapping does not, and neither does a shared one however writable. The main
+ * stack is the single exclusion, and is found the way put_maps names it -- the
+ * region holding the initial stack top.
+ *
+ * Region.prot is the truth after an mprotect, not just at creation:
+ * guest_protect splits at the range's edges first, so every region it touches
+ * is fully covered and its prot is rewritten. That is what makes this track
+ * the kernel's own accounting, which moves pages between data_vm and the rest
+ * on mprotect without ever failing for it. Summed rather than counted for the
+ * reasons above. */
+u64 as_data_bytes(AddrSpace *as) {
+    u64 total = 0;
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        if (!(r->prot & PTE_W) || r->shared) continue;
+        if (r->start < as->stack_top && as->stack_top <= r->end) continue;
+        total += r->end - r->start;
+    }
+    return total;
+}
+
 /* A bump pointer that only goes forward, wrapping to the floor at the ceiling,
  * rather than first fit over the region list.
  *

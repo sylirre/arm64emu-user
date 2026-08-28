@@ -54,6 +54,24 @@ static int as_fits(struct Machine *m, u64 add) {
     return as_mapped_bytes(&m->as) <= cap - add;
 }
 
+/* Would growing the guest's DATA mappings by `add` bytes cross its
+ * RLIMIT_DATA? The kernel applies this limit to what is_data_mapping() calls
+ * one -- private, writable, not the stack -- in may_expand_vm, alongside the
+ * RLIMIT_AS test and with the same page count, so it bites on mmap, mremap and
+ * brk alike from 4.5 onward. (The uname this emulator presents is 6.1.)
+ *
+ * The rlim_cur == 0 case is the kernel's own workaround, kept because the
+ * program it exists for is exactly the sort of thing a guest here runs:
+ * valgrind sets the limit to zero and expects the hard limit to govern. */
+static int data_fits(struct Machine *m, u64 add) {
+    u64 cap = m->rlim[G_RLIMIT_DATA].rlim_cur;
+    if (cap == G_RLIM_INFINITY) return 1;
+    if (!cap) cap = m->rlim[G_RLIMIT_DATA].rlim_max;
+    if (cap == G_RLIM_INFINITY) return 1;
+    if (add > cap) return 0;
+    return as_data_bytes(&m->as) <= cap - add;
+}
+
 /* Bytes of [addr, addr+len) that no region covers -- what a mapping placed
  * there would ADD to the guest's mapped total, which is what a limit is
  * measured against. For everything but MAP_FIXED that is the whole length
@@ -96,6 +114,13 @@ static u64 brk_locked(CPU *c, u64 a0) {
         if (dcap != G_RLIM_INFINITY && new_end - as->brk_start > dcap)
             return as->brk;
         if (!as_fits(c->m, new_end - old_end)) return as->brk;
+        /* ...and the same limit again, this time as may_expand_vm applies it:
+         * the heap is a data mapping like any other, so what has to fit is the
+         * growth against every data mapping the guest holds, not against the
+         * heap alone. The kernel makes both tests too -- check_data_rlimit
+         * above (which is the one brk(2) has always had) and this one inside
+         * do_brk_flags -- and they are not the same test. */
+        if (!data_fits(c->m, new_end - old_end)) return as->brk;
         if (guest_map_anon(as, old_end, new_end - old_end, PTE_R | PTE_W) < 0)
             return as->brk;
     } else if (new_end < old_end) {
@@ -187,7 +212,18 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
      * charged a byte. Placed after the address is settled because that is
      * where the kernel has it (get_unmapped_area runs first) and because the
      * free part cannot be known before it. */
-    if (!as_fits(c->m, range_unmapped_bytes(as, addr, len)))
+    u64 add = range_unmapped_bytes(as, addr, len);
+    if (!as_fits(c->m, add)) return (u64)(s64)-ENOMEM;
+    /* RLIMIT_DATA, charged out of the same page count and only for a mapping
+     * that is one: private and writable. A shared mapping is not, however
+     * writable, and neither is a read-only or PROT_NONE one -- all three
+     * confirmed against a native kernel, which refuses a private writable
+     * anonymous mmap over the limit exactly as it refuses a brk. Enforcing it
+     * on brk alone, which is what this did, is the pre-4.5 rule; the kernel
+     * this emulator's uname claims to be has applied it to mmap for ten years,
+     * and a guest that lowers RLIMIT_DATA to bound its own allocator got no
+     * bound at all as soon as malloc reached for mmap. */
+    if ((pte & PTE_W) && !(flags & G_MAP_SHARED) && !data_fits(c->m, add))
         return (u64)(s64)-ENOMEM;
 
     int r;
@@ -479,18 +515,25 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * stray mapping below the stack. */
     for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
         if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
-    /* Every path below that grows the mapping -- in place, or by allocating
-     * elsewhere and releasing the old -- settles new_len - old_len bytes above
-     * where it started, so one check up here covers them all. */
-    if (new_len > old_len && !as_fits(c->m, new_len - old_len))
-        return (u64)(s64)-ENOMEM;
-
     /* What the growth paths need to know about the mapping being grown: its
-     * protection, and whether it is anonymous shared memory (which mem.c
-     * cannot extend). Read before anything moves. */
+     * protection, whether it is shared, and whether it is anonymous shared
+     * memory (which mem.c cannot extend). Read before anything moves. */
     const Region *tail = as_find_region(as, old_addr + old_len - 1);
     u32 prot = tail ? tail->prot : (PTE_R | PTE_W);
+    int shared = tail && tail->shared;
     int shm = tail && tail->anon_shm;
+
+    /* Every path below that grows the mapping -- in place, or by allocating
+     * elsewhere and releasing the old -- settles new_len - old_len bytes above
+     * where it started, so one check up here covers them all. vma_to_resize
+     * charges that growth to both limits, with the flags of the mapping being
+     * grown: RLIMIT_DATA too when it is a data mapping. */
+    if (new_len > old_len) {
+        u64 add = new_len - old_len;
+        if (!as_fits(c->m, add)) return (u64)(s64)-ENOMEM;
+        if ((prot & PTE_W) && !shared && !data_fits(c->m, add))
+            return (u64)(s64)-ENOMEM;
+    }
 
     if (!(flags & G_MREMAP_FIXED)) {
         /* Staying put: shrink in place, or grow in place when allowed. */
