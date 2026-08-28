@@ -21,6 +21,8 @@ static int anon_memfd(void) { return a64_anonfd("a64shared"); }
 /* Guest mmap flag values (asm-generic == x86 for these). */
 #define G_MAP_SHARED    0x01
 #define G_MAP_PRIVATE   0x02
+#define G_MAP_SHARED_VALIDATE 0x03
+#define G_MAP_TYPE      0x0f
 #define G_MAP_FIXED     0x10
 #define G_MAP_ANONYMOUS 0x20
 #define G_MAP_FIXED_NOREPLACE 0x100000
@@ -152,6 +154,25 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
         if (!addr) addr = as_find_free(as, len);
         if (!addr) return (u64)(s64)-ENOMEM;
     }
+
+    /* MAP_TYPE -- the low four bits -- names the kind of mapping, and do_mmap
+     * switches on it and refuses anything it does not name. An anonymous
+     * mapping may be MAP_SHARED or MAP_PRIVATE; a file mapping may also be
+     * MAP_SHARED_VALIDATE, which is MAP_SHARED plus a promise to fail rather
+     * than ignore a flag the file does not support. Everything else is EINVAL,
+     * a flags word carrying no type at all included -- which is exactly what a
+     * caller that forgot MAP_PRIVATE passes, and what this used to map private
+     * anyway by reading nothing but `flags & MAP_SHARED`. Checked here because
+     * that is where the kernel has it: after the address is chosen and after
+     * MAP_FIXED_NOREPLACE's EEXIST, both of which a native probe confirms win
+     * over it. (6.11 added MAP_DROPPABLE, 0x08, as a third anonymous type --
+     * private pages the kernel may discard. It is refused here as it is on
+     * every kernel before it, and as the 6.1 this emulator's uname claims
+     * does.) */
+    u64 mtype = flags & G_MAP_TYPE;
+    if (mtype != G_MAP_SHARED && mtype != G_MAP_PRIVATE &&
+        !(mtype == G_MAP_SHARED_VALIDATE && !(flags & G_MAP_ANONYMOUS)))
+        return (u64)(s64)-EINVAL;
 
     /* RLIMIT_AS, charged the way mmap_region charges it: against what the
      * mapping adds to the guest's mapped total, not against its length. The

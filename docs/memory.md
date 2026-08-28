@@ -74,6 +74,18 @@ next access. `tlb_flush_all` also forces a re-sync for the calling thread.
 
 ## Mapping operations
 
+`mmap`'s arguments are validated in `do_mmap`'s order, which a native probe
+pins down: a zero length is `EINVAL` and one whose page round-up wrapped is
+`ENOMEM`, the address is chosen next, `MAP_FIXED_NOREPLACE` over occupied
+ground is `EEXIST`, and only then is `MAP_TYPE` — the low four bits — looked
+at. An anonymous mapping may be `MAP_SHARED` or `MAP_PRIVATE`; a file mapping
+may also be `MAP_SHARED_VALIDATE`. Anything else is `EINVAL`, a flags word
+carrying no type at all included: that is what a caller which forgot
+`MAP_PRIVATE` passes, and reading nothing but `flags & MAP_SHARED` mapped it
+private instead of refusing it. (Linux 6.11 added `MAP_DROPPABLE`, `0x08`, as a
+third anonymous type; it is refused here as it is on every kernel before it,
+and as the 6.1 `uname` claims does.)
+
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**
 regardless of the guest's requested protection: the interpreter itself must

@@ -27,6 +27,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+
+#ifndef MAP_SHARED_VALIDATE      /* pre-4.15 libc headers */
+#define MAP_SHARED_VALIDATE 0x03
+#endif
 
 #define PGSZ 4096UL
 /* The last page of a 64-bit address space: any length added to it wraps. */
@@ -66,6 +71,26 @@ int main(void) {
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     errno = 0; rp("mmap_hint_wrap", h);
     if (h != MAP_FAILED) munmap(h, 2 * PGSZ);
+
+    /* MAP_TYPE, the low four bits: do_mmap switches on it and refuses anything
+     * it does not name -- a flags word carrying no type at all included, which
+     * is exactly what a caller that forgot MAP_PRIVATE passes and what used to
+     * be mapped as private anyway. MAP_SHARED_VALIDATE (3) is a file-mapping
+     * type: on an anonymous mapping it is one of the refused ones. */
+    errno = 0; rp("mmap_notype", mmap(NULL, PGSZ, PROT_READ,
+                                      MAP_ANONYMOUS, -1, 0));
+    errno = 0; rp("mmap_anon_validate", mmap(NULL, PGSZ, PROT_READ,
+                                             MAP_ANONYMOUS | MAP_SHARED_VALIDATE,
+                                             -1, 0));
+    errno = 0; rp("mmap_type15", mmap(NULL, PGSZ, PROT_READ,
+                                      MAP_ANONYMOUS | 0x0f, -1, 0));
+    int mfd = (int)syscall(SYS_memfd_create, "mmwrap", 0u);
+    if (mfd < 0 || ftruncate(mfd, PGSZ) != 0) { printf("memfd failed\n"); return 1; }
+    errno = 0; rp("mmap_file_notype", mmap(NULL, PGSZ, PROT_READ, 0, mfd, 0));
+    void *fv = mmap(NULL, PGSZ, PROT_READ, MAP_SHARED_VALIDATE, mfd, 0);
+    errno = 0; rp("mmap_file_validate", fv);
+    if (fv != MAP_FAILED) munmap(fv, PGSZ);
+    close(mfd);
 
     /* mremap: a wrapped source range is a range with nothing mapped in it. */
     errno = 0; rp("mremap_old_wrap", mremap((void *)TOP, 2 * PGSZ, PGSZ, 0));
