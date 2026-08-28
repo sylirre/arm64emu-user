@@ -1722,23 +1722,28 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ] && [ -w /tmp ]; then
         head -c 4242 /dev/urandom > /tmp/a64_toctou_victim
         echo keep-me > /tmp/a64_toctou_unlinkme
         mkdir -p /tmp/a64_race_rmdir
-        rm -rf "$ALPINE/a64race"
         cp tests/fixtures/pathrace.bin "$ALPINE/tmp/ci_pathrace"
-        got=$(timeout -k 5 120 "$EMU" "$ALPINE" /tmp/ci_pathrace 3 2>/dev/null)
-        planted=$(ls -d /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
-                        /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
-                        2>/dev/null | wc -l)
-        kept=no
-        [ -f /tmp/a64_toctou_unlinkme ] && [ -d /tmp/a64_race_rmdir ] && \
-            [ "$(stat -c %s /tmp/a64_toctou_victim 2>/dev/null)" = 4242 ] && kept=yes
-        expect=$'escaped=0\ntries=enough\ndone'
-        if [ "$got" = "$expect" ] && [ "$planted" = 0 ] && [ "$kept" = yes ]; then
-            pass=$((pass+1)); echo "PASS fixture: pathrace"
-        else
-            fail=$((fail+1))
-            echo "FAIL fixture: pathrace (planted=$planted host-objects-kept=$kept)"
-            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
-        fi
+        # Both tiers of the pin walk: one openat2, and the per-component loop a
+        # host kernel older than 5.6 is served by.
+        for tier in "" "A64_PINWALK_FORCE_LOOP=1"; do
+            lbl="fixture: pathrace${tier:+ (loop-tier)}"
+            rm -rf "$ALPINE/a64race"
+            got=$(env $tier timeout -k 5 120 "$EMU" "$ALPINE" /tmp/ci_pathrace 2 2>/dev/null)
+            planted=$(ls -d /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
+                            /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
+                            2>/dev/null | wc -l)
+            kept=no
+            [ -f /tmp/a64_toctou_unlinkme ] && [ -d /tmp/a64_race_rmdir ] && \
+                [ "$(stat -c %s /tmp/a64_toctou_victim 2>/dev/null)" = 4242 ] && kept=yes
+            expect=$'escaped=0\ntries=enough\ndone'
+            if [ "$got" = "$expect" ] && [ "$planted" = 0 ] && [ "$kept" = yes ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1))
+                echo "FAIL $lbl (planted=$planted host-objects-kept=$kept)"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
         rm -rf /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
                /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
                /tmp/a64_race_rmdir /tmp/a64_toctou_victim /tmp/a64_toctou_unlinkme

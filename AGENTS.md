@@ -191,12 +191,14 @@ JIT debugging environment variables:
 
 Behavior fallbacks:
 
+* `A64_PINWALK_FORCE_LOOP`: pins a resolved path's parent one component at a time (openat/O_NOFOLLOW) instead of in a single `openat2(RESOLVE_NO_SYMLINKS)` — the tier a host kernel older than 5.6 is served by. Same containment, one syscall per component instead of one per path.
 * `A64_PROCSTAT_FORCE_SYNTH`: forces the synthetic /proc/stat fallback.
 * `A64_PROCSTAT_HOTPLUG_SIM`: walks the online-CPU count down on every
   /proc/stat sample, simulating a host that hotplugs cores (Android does, for
   power) — the condition under which the synthesized counters must stay
   monotonic, and one no ordinary CI machine ever produces.
 * `A64_OVERFLOWID_FORCE_SYNTH`: forces the synthetic /proc/sys/kernel/overflow{u,g}id fallback.
+* `A64_PROCSYNTH_FORCE_FAIL`: makes the synthesized /proc views find no anonymous backing (no memfd, no writable dir) — the per-process files are then denied, never served from the host's own /proc.
 * `A64_NETLINK_FORCE_BLOCK`: forces the netlink fallback path.
 * `A64_SHM_FORCE_FILE`: forces System V shm segments onto file backing (a file in the first writable dir) instead of an anonymous memfd, exercising the fallback tier.
 * `A64_GETRANDOM_FORCE_DEV`: forces guest getrandom(2), and the guest's AT_RANDOM seed, onto the /dev/urandom / /dev/random fallback — the tier a host kernel without getrandom(2) (< 3.17, e.g. Android 7's 3.x) is served by.

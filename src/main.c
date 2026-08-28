@@ -295,6 +295,10 @@ static void help(void) {
                         "cores, as Android does)."},
         {"A64_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
                         "/proc/sys/kernel/overflow{u,g}id fallback."},
+        {"A64_PINWALK_FORCE_LOOP", "Pin a resolved path's parent directory one "
+                        "component at a time instead of in a single openat2 "
+                        "(the tier a host kernel older than 5.6 is served by). "
+                        "Same containment, one syscall per component."},
         {"A64_PROCSYNTH_FORCE_FAIL", "Make the synthesized /proc views find no "
                         "anonymous backing (the tier a host with neither "
                         "memfd_create nor a writable directory is served by): "

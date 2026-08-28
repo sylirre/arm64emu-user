@@ -215,11 +215,28 @@ variant, `IN_DONT_FOLLOW`), which is always right because `path_resolve` has
 already resolved it, or the caller asked for it not to be. A component that *is*
 a symlink at pin time means the path changed underneath: `O_NOFOLLOW` answers
 `ELOOP` and the syscall fails, which is a safe answer to a race the guest
-created. The cost is one `openat` per component of the parent — about 5% on
-`go build` and `node`, ~30% on a pure `find` — and one descriptor held across
-the syscall, which is also why `openat` hands its result back down to the lowest
-free number afterwards (`fd_relower`): the guest's fd numbers *are* the host's,
-and `open(2)` promises the lowest free one.
+created.
+
+That walk is **one `openat2`** where the host has it (Linux 5.6):
+`RESOLVE_NO_SYMLINKS` refuses to traverse any symlink at all, which is exactly
+what the component-by-component `O_NOFOLLOW` loop guarantees, so the kernel does
+the whole walk in a single call — and against the absolute host path, so not
+even the trusted root is opened by name. That is legitimate for the same reason
+the loop is: a success means no component anywhere was a symlink, and the
+rootfs and every `--bind` source are `realpath`'d at startup, so the trusted
+prefix holds none to trip over. `ELOOP` is the one ambiguous answer (a symlink
+in that prefix, or the race), and it falls back to opening the trusted root by
+name and resolving only the remainder — which answers it authoritatively. A host
+without `openat2` (Android 7 runs 3.x kernels) takes the per-component loop,
+probed once; `A64_PINWALK_FORCE_LOOP` forces that tier so the suite runs the
+race test over both.
+
+The cost is therefore one syscall per resolved path — measured at no detectable
+change on `go build` and `node`, and about 5% on a `find` that does nothing but
+path syscalls (the per-component loop costs 30% there). The other cost is one
+descriptor held across the syscall, which is why `openat` hands its result back
+down to the lowest free number afterwards (`fd_relower`): the guest's fd numbers
+*are* the host's, and `open(2)` promises the lowest free one.
 
 What is trusted to be opened by name is the part above the containment area:
 the rootfs directory itself, a `--bind`'s source, a tmpfs backing directory, the

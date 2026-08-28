@@ -1016,20 +1016,91 @@ unsigned path_host_root(struct Machine *m, const char *canon) {
  * rewrite of the walk above, so the resolution rules are untouched: this only
  * decides how the RESULT is named to the kernel. */
 
+/* The whole walk below in ONE syscall. RESOLVE_NO_SYMLINKS refuses to traverse
+ * any symlink at all -- which is precisely what the component-by-component
+ * O_NOFOLLOW loop guarantees -- so the kernel does the walk, at one call
+ * instead of one per component. RESOLVE_BENEATH is belt and braces: `rest` is
+ * relative and canonical (path_resolve resolved every symlink and folded every
+ * ".."), so nothing in it can climb out of `rootfd` even lexically.
+ *
+ * openat2 is Linux 5.6; a host without it (Android 7 runs 3.x) answers ENOSYS,
+ * which is probed once and then never asked again. A64_PINWALK_FORCE_LOOP
+ * forces that tier so the suite exercises both. Returns the fd, or -1 with
+ * errno set -- ENOSYS meaning "ask the loop", anything else being the answer. */
+static int pin_walk_at2(int rootfd, const char *rest) {
+#ifdef SYS_openat2
+    static int off = -1;
+    if (!PROBE_ONCE(off, getenv("A64_PINWALK_FORCE_LOOP") != NULL)) {
+        struct { u64 flags, mode, resolve; } how = {
+            (u64)(O_PATH | O_DIRECTORY | O_CLOEXEC), 0,
+            /* BENEATH is meaningless (and refused) for the absolute spelling
+             * below, which starts at AT_FDCWD; NO_SYMLINKS is the guarantee in
+             * both cases. */
+            0x04 /* RESOLVE_NO_SYMLINKS */ |
+            (rootfd == AT_FDCWD ? 0 : 0x08 /* RESOLVE_BENEATH */),
+        };
+        long r = syscall(SYS_openat2, rootfd, rest, &how, sizeof how);
+        if (r >= 0) return (int)r;
+        /* Only "this kernel does not have it" falls through to the loop: every
+         * other error is this path's real answer, and ELOOP in particular is
+         * the race being caught. E2BIG/EINVAL mean the struct is not the one
+         * this kernel knows, which is the same "not available" for us. */
+        if (errno != ENOSYS && errno != E2BIG && errno != EINVAL) return -1;
+        __atomic_store_n(&off, 1, __ATOMIC_RELAXED);   /* do not ask again */
+    }
+#else
+    (void)rootfd; (void)rest;
+#endif
+    errno = ENOSYS;
+    return -1;
+}
+
 /* Open the directory `host` names, whose first `rootlen` bytes are trusted (see
- * host_trusted_root): the trusted part by name, every component below it with
- * O_NOFOLLOW so nothing the guest could have rewritten is followed. Returns the
- * fd or -errno -- the errno the syscall would have reported for that path
- * anyway (ENOENT, ENOTDIR, EACCES), plus ELOOP for a component that turned into
- * a symlink after the walk. */
+ * host_trusted_root): the trusted part by name, everything below it without
+ * following a single symlink, so nothing the guest could have rewritten is
+ * traversed. Returns the fd or -errno -- the errno the syscall would have
+ * reported for that path anyway (ENOENT, ENOTDIR, EACCES), plus ELOOP for a
+ * component that turned into a symlink after the walk. */
 static int pin_walk(const char *host, size_t rootlen) {
     char root[PATH_MAX];
     size_t hl = strlen(host);
     if (!rootlen || rootlen > hl || rootlen >= sizeof root) return -EINVAL;
+    if (rootlen == hl) {                           /* the trusted root itself */
+        memcpy(root, host, rootlen);
+        root[rootlen] = 0;
+        int rfd = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        return rfd < 0 ? -errno : rfd;
+    }
+
+    /* Whole path in one call, opening nothing by name at all. Legitimate for
+     * the same reason the two-call form below is: a success means no component
+     * anywhere was a symlink, so following the trusted prefix by name would
+     * have reached the same directory. It is what the trusted prefix normally
+     * looks like -- the rootfs and every --bind source are realpath'd at
+     * startup, so they hold no symlinks to trip over. Only ELOOP is ambiguous
+     * (a symlink in the trusted prefix, or the race this exists to catch), and
+     * the two-call form below answers it authoritatively. */
+    if (host[0] == '/') {
+        int nfd = pin_walk_at2(AT_FDCWD, host);
+        if (nfd >= 0) return nfd;
+        if (errno != ENOSYS && errno != ELOOP) return -errno;
+    }
+
     memcpy(root, host, rootlen);
     root[rootlen] = 0;
     int dfd = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return -errno;
+    {   /* The one-call form, where the host has it. */
+        const char *rest = host + rootlen;
+        while (*rest == '/') rest++;
+        if (!*rest) return dfd;                    /* the root itself */
+        int nfd = pin_walk_at2(dfd, rest);
+        if (nfd >= 0 || errno != ENOSYS) {
+            int e = errno;
+            close(dfd);
+            return nfd >= 0 ? nfd : -e;
+        }
+    }
     for (const char *p = host + rootlen; *p; ) {
         while (*p == '/') p++;
         if (!*p) break;
