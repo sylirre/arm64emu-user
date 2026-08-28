@@ -274,6 +274,47 @@ range's edges and rewrites `Region.prot`), so the sum tracks the kernel's own
 accounting, which likewise moves pages in and out of `data_vm` on `mprotect`
 without ever refusing one for it.
 
+### The guest's footprint is the guest's, in all three files that report it
+
+`/proc/<pid>/status`'s `Vm`/`Rss` block, all of `/proc/<pid>/statm`, and the
+address fields of `/proc/<pid>/stat` describe the **guest's** address space,
+synthesized from the region list (`as_meminfo`). Passed through from the host
+they describe the emulator: measured inside a guest that had mapped 74 MB, the
+host file said `VmSize` 145 MB, `VmStk` 148 kB for an 8 MB stack, and a `VmExe`
+naming the emulator's own text. It is the same reason `/proc/<pid>/limits` is
+synthesized, and the same reason `RLIMIT_AS`/`RLIMIT_DATA` are enforced here —
+a guest reading its own usage against its own limit needs both to describe one
+address space. `statm` and `stat` matter as much as `status`: `ps` and `top`
+read those two and never `status`.
+
+The classifications are the kernel's, from the same predicates —
+`is_data_mapping` for `VmData`, `is_exec_mapping` for `exec_vm` (split into
+`VmExe` and `VmLib` by the executable's own code span), the region holding the
+initial stack top for `VmStk`. `VmLck`/`VmPin`/`VmSwap` are structurally zero
+(`mlock` is a no-op, there is no guest swap). `VmPTE` is the emulator's
+second-level tables, which cost eight bytes per mapped guest page — exactly
+what a kernel's leaf page tables cost, so the figure means what a guest expects
+even though the table's shape is not a kernel's. The ELF loader records the
+code, data, stack and argv/envp spans `stat` reports, deriving each one the way
+`binfmt_elf` does (`start_data` really is the *last* segment's address, and
+`start_stack` the initial SP rather than the string block, which a native run
+is what settles).
+
+The resident set is sampled with `mincore(2)` over the host backing, since that
+backing **is** the guest's memory and what the guest has touched is the host
+kernel's business — nothing here is told about a fault. `VmHWM` is therefore a
+high-water mark over the samples actually taken: a guest watching its own
+footprint reads repeatedly and misses nothing between its own reads. A host
+that cannot answer `mincore` leaves the resident lines as the host file had
+them rather than printing zeros. One approximation is named rather than hidden:
+a System V shm attachment is backed by a memfd mapped like any other file, so
+its pages land in `RssFile` where a kernel would say `RssShmem` — `VmRSS` and
+`statm`'s `shared` column add the two together either way.
+
+Only for **this** process. Another guest's sizes live in its own emulator's
+region list, which is not shared, so its files are left alone — as `limits` and
+the signal lines already are.
+
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max
 address space" nothing was enforcing while hiding the one that was.

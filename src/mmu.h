@@ -261,7 +261,37 @@ typedef struct AddrSpace {
     u64 brk_start, brk;       /* program break */
     u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
     u64 stack_top;            /* initial stack top (guest VA) */
+    /* What the ELF loader knows about the image it laid out, and the guest can
+     * read back about itself (/proc/<pid>/{status,statm,stat}). Named after the
+     * mm_struct fields they answer, and derived the way binfmt_elf derives
+     * them: the code span is the PF_X PT_LOADs, the data span every PT_LOAD's
+     * (last vaddr, highest file end), and start_stack with the arg and env
+     * bounds describe the argv+envp string block at the top of the stack. */
+    u64 start_code, end_code;
+    u64 start_data, end_data;
+    u64 start_stack;
+    u64 arg_start, arg_end, env_start, env_end;
+    u64 peak;                 /* high-water mapped bytes (VmPeak): raised by
+                               * every mapping that grows the space, since only
+                               * an unmap can lower the total */
+    u64 peak_rss;             /* highest resident set yet SAMPLED (VmHWM) --
+                               * see as_meminfo, which is where sampling
+                               * happens */
+    u32 npgtables;            /* live second-level tables (VmPTE) */
 } AddrSpace;
+
+/* The guest's memory footprint as its own /proc reports it. Bytes throughout;
+ * a kernel prints kB in status and pages in statm/stat, and the callers there
+ * divide. `rss_ok` is 0 on a host whose mincore(2) would not answer, where
+ * the resident set is unknowable and the caller leaves the host's figures
+ * alone rather than print a zero. */
+typedef struct {
+    u64 size, peak;              /* total_vm, hiwater_vm */
+    u64 data, stack, exec;       /* data_vm, stack_vm, exec_vm */
+    u64 rss_anon, rss_file, rss_shmem, rss_peak;
+    u64 pgtables;
+    int rss_ok;
+} AsMem;
 
 void as_init(AddrSpace *as);
 /* as_init for execve's in-place reload: resets everything EXCEPT nthreads,
@@ -315,6 +345,10 @@ int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
  * stack -- which is what RLIMIT_DATA bounds. */
 u64  as_mapped_bytes(AddrSpace *as);
 u64  as_data_bytes(AddrSpace *as);
+/* Everything the guest can read about its own footprint, in one walk. Samples
+ * the resident set (mincore over the host backing), so it also moves the
+ * VmHWM high-water mark. Takes as_lock itself. */
+void as_meminfo(AddrSpace *as, AsMem *out);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
 /* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.

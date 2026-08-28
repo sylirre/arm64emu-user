@@ -59,7 +59,7 @@ enum {
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
-    PF_OVERFLOWID, PF_STATUS, PF_LIMITS,
+    PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT,
 };
 
 /* put_mounts format selector. */
@@ -73,6 +73,9 @@ static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
  * path (procfs_pre_read) comes first in this file. */
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out);
+static int put_pidstat(int fd, struct Machine *m, const char *canon,
+                       s32 *tid_out);
+static void put_statm(int fd, struct Machine *m);
 /* Leaf lock for the /proc/stat busy estimate — the writers run both with
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -795,6 +798,16 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
             m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* process is gone */
         break;
     }
+    case PF_STATM: put_statm(fd, m); break;
+    /* As PF_STATUS: the rewrite is of the host file, so a re-read has to go
+     * back to it, and the tid the open resolved names it directly. */
+    case PF_PIDSTAT: {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)m->pf_fds[i].pid);
+        if (put_pidstat(fd, m, path, NULL) < 0)
+            m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
+        break;
+    }
     }
     lseek(fd, 0, SEEK_SET);
 out:
@@ -849,6 +862,107 @@ static int status_target(const char *canon) {
 static int is_key(const char *line, const char *key) {
     size_t n = strlen(key);
     return !strncmp(line, key, n) && line[n] == ':';
+}
+
+/* ---- the guest's own memory footprint ----
+ *
+ * Every size a guest can read about itself -- the Vm and Rss block of
+ * /proc/<pid>/status, all of /proc/<pid>/statm, and the address fields of
+ * /proc/<pid>/stat -- describes the GUEST's address space, which the emulator
+ * knows exactly (mem.c keeps the region list) and the host file does not: the
+ * host process is the emulator, holding the guest's memory plus its own code,
+ * software page tables, JIT cache and malloc, at its own foreign-ISA
+ * addresses. Left alone, a guest that had mapped 74 MB read VmSize 145 MB, a
+ * VmStk of 148 kB for an 8 MB stack, and a VmExe naming the emulator's text.
+ * It is the same reason /proc/<pid>/limits is synthesized, and the same reason
+ * RLIMIT_AS and RLIMIT_DATA are enforced here rather than handed to the host:
+ * the two must describe one address space, or a guest reading its own usage
+ * against its own limit gets nonsense.
+ *
+ * Only for THIS process. Another guest process's sizes live in its own
+ * emulator's region list, which is not shared -- as with limits and the signal
+ * lines, its host file is left as it is. */
+#define PG_UP_G(x) (((x) + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK)
+
+/* The kernel's VmExe/VmLib split: the executable's own code span is "text",
+ * everything else executable and unwritable -- the interpreter, the shared
+ * libraries -- is "lib". */
+static void exe_text_lib(struct Machine *m, const AsMem *mi, u64 *text, u64 *lib) {
+    const AddrSpace *as = &m->as;
+    u64 t = 0;
+    if (as->end_code > as->start_code)
+        t = PG_UP_G(as->end_code) - (as->start_code & ~(u64)GUEST_PAGE_MASK);
+    if (t > mi->exec) t = mi->exec;   /* task_mem: text = min(text, exec_vm) */
+    *text = t;
+    *lib = mi->exec - t;
+}
+
+/* The status lines this answers, in the kernel's own order. VM_RSSFIRST..
+ * VM_RSSLAST are the ones that need a resident-set sample, which a host
+ * without mincore(2) cannot give -- there the host's own figures stand. */
+enum {
+    VM_PEAK, VM_SIZE, VM_LCK, VM_PIN,
+    VM_HWM, VM_RSS, VM_RSSANON, VM_RSSFILE, VM_RSSSHMEM,
+    VM_DATA, VM_STK, VM_EXE, VM_LIB, VM_PTE, VM_SWAP, VM_NKEYS
+};
+#define VM_RSSFIRST VM_HWM
+#define VM_RSSLAST  VM_RSSSHMEM
+static const char *const vm_keys[VM_NKEYS] = {
+    "VmPeak", "VmSize", "VmLck", "VmPin",
+    "VmHWM", "VmRSS", "RssAnon", "RssFile", "RssShmem",
+    "VmData", "VmStk", "VmExe", "VmLib", "VmPTE", "VmSwap"
+};
+
+/* The value for one of them, in kB. mlock is a no-op here and there is no
+ * guest swap, so VmLck/VmPin/VmSwap are structurally zero rather than
+ * unknown. VmPTE is the emulator's own second-level tables: eight bytes per
+ * mapped guest page, which is exactly what a kernel's leaf page tables cost,
+ * so the figure means what the guest expects it to mean even though the shape
+ * of the table is not a kernel's. */
+static u64 vm_value_kb(struct Machine *m, const AsMem *mi, int k) {
+    u64 text, lib;
+    switch (k) {
+    case VM_PEAK:     return mi->peak >> 10;
+    case VM_SIZE:     return mi->size >> 10;
+    case VM_HWM:      return mi->rss_peak >> 10;
+    case VM_RSS:      return (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 10;
+    case VM_RSSANON:  return mi->rss_anon >> 10;
+    case VM_RSSFILE:  return mi->rss_file >> 10;
+    case VM_RSSSHMEM: return mi->rss_shmem >> 10;
+    case VM_DATA:     return mi->data >> 10;
+    case VM_STK:      return mi->stack >> 10;
+    case VM_EXE:      exe_text_lib(m, mi, &text, &lib); return text >> 10;
+    case VM_LIB:      exe_text_lib(m, mi, &text, &lib); return lib >> 10;
+    case VM_PTE:      return mi->pgtables >> 10;
+    default:          return 0;   /* VmLck, VmPin, VmSwap */
+    }
+}
+
+/* /proc/<pid>/statm: size resident shared text lib data dt, in guest pages.
+ * `lib` has been 0 since 2.6 and `dt` since 2.6 as well -- the kernel prints
+ * both as literals, so this does too. */
+static void put_statm(int fd, struct Machine *m) {
+    AsMem mi;
+    u64 text, lib;
+    as_meminfo(&m->as, &mi);
+    exe_text_lib(m, &mi, &text, &lib);
+    u64 shared = mi.rss_file + mi.rss_shmem;
+    u64 resident = shared + mi.rss_anon;
+    dprintf(fd, "%llu %llu %llu %llu 0 %llu 0\n",
+            (unsigned long long)(mi.size >> 12),
+            (unsigned long long)(resident >> 12),
+            (unsigned long long)(shared >> 12),
+            (unsigned long long)(text >> 12),
+            (unsigned long long)((mi.data + mi.stack) >> 12));
+}
+
+/* Can the resident set be sampled at all? statm is synthesized whole, so on a
+ * host that cannot answer there is nothing to fall back to except the host
+ * file itself. */
+static int rss_available(struct Machine *m) {
+    AsMem mi;
+    as_meminfo(&m->as, &mi);
+    return mi.rss_ok;
 }
 
 #define STATUS_MAX 16384    /* a status file is ~2 KB; Groups: is the long line */
@@ -969,6 +1083,11 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             else if (h) cgt |= 1ull << (s - 1);          /* a guest handler */
         }
     }
+    /* The guest's own address-space sizes; see the block comment above. */
+    AsMem mi;
+    if (self) as_meminfo(&m->as, &mi);
+    u32 vseen = 0;
+
     u8 scmode = 0;
     u32 scfilters = 0;
     int scknown;
@@ -1020,6 +1139,18 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             goto next_line;
         }
         if (self) {
+            /* The Vm/Rss block, from the guest's region list rather than the
+             * emulator's. Rewritten where the host file has the line and
+             * appended below where it does not -- RssAnon/RssFile/RssShmem
+             * are 4.5 and later. */
+            for (int k = 0; k < VM_NKEYS; k++) {
+                if (!is_key(p, vm_keys[k])) continue;
+                if (!mi.rss_ok && k >= VM_RSSFIRST && k <= VM_RSSLAST) break;
+                dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k],
+                        (unsigned long long)vm_value_kb(m, &mi, k));
+                vseen |= 1u << k;
+                goto next_line;
+            }
             if (is_key(p, "SigPnd")) { dprintf(fd, "SigPnd:\t%016llx\n", (unsigned long long)pnd); goto next_line; }
             if (is_key(p, "ShdPnd")) { dprintf(fd, "ShdPnd:\t%016llx\n", 0ULL); goto next_line; }
             if (is_key(p, "SigBlk")) { dprintf(fd, "SigBlk:\t%016llx\n", (unsigned long long)blk); goto next_line; }
@@ -1064,11 +1195,92 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
         if (!next) break;
         p = next;
     }
+    /* A host file missing one of the Vm/Rss keys is a host kernel older than
+     * it (RssAnon/RssFile/RssShmem are 4.5). The guest ABI promises the whole
+     * block, and a reader that greps for a line reads its absence as zero, so
+     * what the loop never saw is appended -- as NoNewPrivs and Seccomp are,
+     * and for the same reason. */
+    if (self)
+        for (int k = 0; k < VM_NKEYS; k++) {
+            if (vseen & (1u << k)) continue;
+            if (!mi.rss_ok && k >= VM_RSSFIRST && k <= VM_RSSLAST) continue;
+            dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k],
+                    (unsigned long long)vm_value_kb(m, &mi, k));
+        }
     if (self && !saw_nnp)
         dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0);
     if (scknown && !saw_sec) dprintf(fd, "Seccomp:\t%u\n", scmode);
     if (scknown && !saw_scflt) dprintf(fd, "Seccomp_filters:\t%u\n", scfilters);
     free(buf);
+    return 0;
+}
+
+/* One field of /proc/<pid>/stat that describes the guest's address space
+ * rather than the emulator's, by its 1-based position in the line. Everything
+ * else there -- the pid, the state, the times, the scheduling numbers -- is a
+ * real property of the task and stands. `rss` is in pages, the rest in bytes,
+ * as the kernel prints them. Returns 0 for a field this does not answer. */
+static int pidstat_field(struct Machine *m, const AsMem *mi, int f, u64 *out) {
+    const AddrSpace *as = &m->as;
+    switch (f) {
+    case 23: *out = mi->size; return 1;                       /* vsize */
+    case 24:                                                  /* rss, pages */
+        if (!mi->rss_ok) return 0;
+        *out = (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 12;
+        return 1;
+    case 25:                                                  /* rsslim */
+        *out = m->rlim[G_RLIMIT_RSS].rlim_cur;
+        if (*out == G_RLIM_INFINITY) *out = ~0ULL;
+        return 1;
+    case 26: *out = as->start_code;  return 1;
+    case 27: *out = as->end_code;    return 1;
+    case 28: *out = as->start_stack; return 1;
+    case 45: *out = as->start_data;  return 1;
+    case 46: *out = as->end_data;    return 1;
+    case 47: *out = as->brk_start;   return 1;
+    case 48: *out = as->arg_start;   return 1;
+    case 49: *out = as->arg_end;     return 1;
+    case 50: *out = as->env_start;   return 1;
+    case 51: *out = as->env_end;     return 1;
+    default: return 0;
+    }
+}
+
+/* Guest view of /proc/<pid>/stat: the host line with those fields replaced.
+ * Returns 0, or -1 when there is no host file (the caller's open reports that
+ * itself) / -2 when there is one that cannot be parsed.
+ *
+ * The comm field is parenthesized and may itself contain spaces and
+ * parentheses, so the split starts at the LAST ')' -- the same rule every
+ * reader of this file has to follow. */
+static int put_pidstat(int fd, struct Machine *m, const char *canon,
+                       s32 *tid_out) {
+    int hfd = open(canon, O_RDONLY | O_CLOEXEC);
+    if (hfd < 0) return -1;
+    char buf[4096];
+    ssize_t n = read(hfd, buf, sizeof buf - 1);
+    close(hfd);
+    if (n <= 0) return -2;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    if (!rp || !rp[1]) return -2;
+    /* Field 1 names the task this file describes -- which spelling of the path
+     * got here does not matter, and a refresh can reach it as /proc/<tid>. */
+    if (tid_out) *tid_out = (s32)strtol(buf, NULL, 10);
+
+    AsMem mi;
+    as_meminfo(&m->as, &mi);
+    *rp = 0;
+    dprintf(fd, "%s)", buf);       /* pid and comm stand as the host has them */
+    int f = 2;
+    for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
+        u64 v;
+        if (pidstat_field(m, &mi, ++f, &v))
+            dprintf(fd, " %llu", (unsigned long long)v);
+        else
+            dprintf(fd, " %s", tok);
+    }
+    dprintf(fd, "\n");
     return 0;
 }
 
@@ -1250,6 +1462,42 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         if (tid > 0) pf_track(m, fd, PF_STATUS, tid, self);
+        *ret = fd;
+        return 1;
+    }
+
+    /* /proc/<pid>/statm and /proc/<pid>/stat of THIS process: their sizes are
+     * the emulator's address space, which is not the guest's (see the memory
+     * block above). These are the two files ps and top actually read -- status
+     * is not -- so leaving them alone would have left `ps` inside the guest
+     * reporting the emulator's VSZ and RSS. Tracked for refresh: every number
+     * in them moves as the process runs. */
+    const char *sztail = self_tail(canon);
+    if (sztail && (!strcmp(sztail, "statm") || !strcmp(sztail, "stat"))) {
+        int is_statm = sztail[4] == 'm';
+        s32 sttid = 0;
+        if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+        if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+        /* statm is synthesized whole, so on a host that cannot sample the
+         * resident set there would be nothing behind its `resident` and
+         * `shared` columns. The host file is wrong in places, not useless. */
+        if (is_statm && !rss_available(m)) return 0;
+        int fd = synth_memfd();
+        if (fd < 0) { *ret = synth_denied(); return 1; }
+        if (is_statm) {
+            put_statm(fd, m);
+        } else {
+            int st = put_pidstat(fd, m, canon, &sttid);
+            if (st < 0) {
+                close(fd);
+                if (st == -1) return 0;   /* no host file: report that exactly */
+                *ret = -ENOMEM;
+                return 1;
+            }
+        }
+        lseek(fd, 0, SEEK_SET);
+        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        pf_track(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, 1);
         *ret = fd;
         return 1;
     }

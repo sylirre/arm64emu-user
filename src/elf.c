@@ -29,6 +29,13 @@ typedef struct {
     u64 phdr_va;     /* biased VA of the program headers */
     u16 phnum;
     u64 lo, hi;      /* biased load span */
+    /* The code and data spans binfmt_elf records in mm_struct, by its own
+     * rules: start/end_code cover the executable PT_LOADs only, while
+     * start_data is the LAST loaded segment's address and end_data the highest
+     * file end of any of them (elf_map's running comparisons -- start_data is
+     * deliberately not the first writable segment). /proc reports them, and
+     * status splits VmExe from VmLib with the code span. */
+    u64 start_code, end_code, start_data, end_data;
     char interp[PATH_MAX];
 } LoadInfo;
 
@@ -84,7 +91,7 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
         (ssize_t)(sizeof(Elf64_Phdr) * eh.e_phnum))
         return -ENOEXEC;
 
-    u64 lo = ~0ULL, hi = 0;
+    u64 lo = ~0ULL, hi = 0, sc = ~0ULL, ec = 0, sd = 0, ed = 0;
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
         /* The kernel's own segment sanity check, made where the kernel makes
@@ -98,6 +105,11 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
         if (end < ph[i].p_vaddr) return -EINVAL;
         if (PG_DOWN(ph[i].p_vaddr) < lo) lo = PG_DOWN(ph[i].p_vaddr);
         if (end > hi) hi = end;
+        u64 fend = ph[i].p_vaddr + ph[i].p_filesz;
+        if ((ph[i].p_flags & PF_X) && ph[i].p_vaddr < sc) sc = ph[i].p_vaddr;
+        if ((ph[i].p_flags & PF_X) && fend > ec) ec = fend;
+        if (ph[i].p_vaddr > sd) sd = ph[i].p_vaddr;
+        if (fend > ed) ed = fend;
     }
     if (lo == ~0ULL) return -ENOEXEC;      /* nothing to load */
     if (hi > ~GUEST_PAGE_MASK) return -EINVAL;   /* the page-up below wraps */
@@ -153,6 +165,10 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     as_set_region_path(&m->as, base + lo, base + hi, gpath);
 
     out->base = base;
+    out->start_code = sc == ~0ULL ? 0 : base + sc;
+    out->end_code = ec ? base + ec : 0;
+    out->start_data = base + sd;
+    out->end_data = base + ed;
     out->entry = base + eh.e_entry;
     out->phnum = eh.e_phnum;
     out->lo = base + lo;
@@ -254,8 +270,14 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
         at_base = interp.base;
     }
 
-    /* Program break after the executable image. */
+    /* Program break after the executable image, and the spans /proc reports
+     * about it. The executable's, never the interpreter's: mm_struct records
+     * one image, and it is the one that was execve'd. */
     m->as.brk_start = m->as.brk = PG_UP(exe.hi);
+    m->as.start_code = exe.start_code;
+    m->as.end_code = exe.end_code;
+    m->as.start_data = exe.start_data;
+    m->as.end_data = exe.end_data;
 
     /* Stack. */
     r = guest_map_anon(&m->as, STACK_TOP - STACK_SIZE, STACK_SIZE, PTE_R | PTE_W);
@@ -289,18 +311,23 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     if (strtab > scap / 4) { free(argvp); free(envpp); return -E2BIG; }
     u64 sp = STACK_TOP - strtab;
     u64 str = sp;
+    /* The argv+envp string block starts here: setup_arg_pages records exactly
+     * this address as arg_start. */
+    m->as.arg_start = sp;
     for (int i = 0; i < argc; i++) {
         size_t l = strlen(argv[i]) + 1;
         copy_to_guest(&m->cpu, str, argv[i], l);
         argvp[i] = str; str += l;
     }
     argvp[argc] = 0;
+    m->as.arg_end = m->as.env_start = str;   /* envp strings follow argv's */
     for (int i = 0; i < envc; i++) {
         size_t l = strlen(envp[i]) + 1;
         copy_to_guest(&m->cpu, str, envp[i], l);
         envpp[i] = str; str += l;
     }
     envpp[envc] = 0;
+    m->as.env_end = str;
     u64 execfn_va = str;
     copy_to_guest(&m->cpu, str, canon, strlen(canon) + 1);
 
@@ -364,6 +391,11 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     sp &= ~15ULL;
     if ((vec_bytes & 15) != 0) sp -= 16 - (vec_bytes & 15);
     sp -= vec_bytes;
+    /* ...and start_stack is the address of argc -- the SP the image starts on.
+     * load_elf_binary assigns it from bprm->p AFTER create_elf_tables has
+     * lowered it to the vector area, so it sits BELOW the string block rather
+     * than at it, which is what a native run shows. */
+    m->as.start_stack = sp;
 
     u64 va = sp;
     u64 argc64 = (u64)argc;

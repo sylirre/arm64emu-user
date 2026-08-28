@@ -1863,6 +1863,13 @@ check_fixture() {   # check_fixture <name> <expected>
 }
 check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+# The guest's own memory footprint, as its own /proc reports it. Self-checking:
+# status/statm/stat are host-passthrough unless synthesized, and the host
+# process is the emulator -- qemu-user passes them through too and so reports
+# its own process there, which is why it cannot be the oracle. Every row is a
+# relation a kernel keeps true for any process; compiled and run natively on
+# x86-64 the same program prints the same block.
+check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\ndone'
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.

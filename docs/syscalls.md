@@ -842,13 +842,14 @@ then make the consequences the caller depends on true:
   freeze `top`. The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
   for every guest process. `status` is rebuilt line by line instead
-  (`put_status`): most of it — `State`, `PPid`, `FDSize`, the `Vm*` sizes,
-  `Threads`, the context-switch counters — is a true property of the process
-  being asked about, but several lines describe the *emulator*, and one
-  describes the host CPU:
+  (`put_status`): most of it — `State`, `PPid`, `FDSize`, `Threads`, the
+  context-switch counters — is a true property of the process being asked
+  about, but several lines describe the *emulator*, and one describes the host
+  CPU:
 
   | line | why the host file is wrong |
   |---|---|
+  | the `Vm`/`Rss` block | it measures the *emulator's* address space — its code, software page tables, JIT cache and malloc, at its own foreign-ISA addresses. Synthesized from the guest's region list (see `docs/memory.md`), together with all of `statm` and the address fields of `stat`, which are the two files `ps` and `top` actually read |
   | `TracerPid` | the emulated `ptrace` never host-attaches, so the host task reports no tracer even while a guest `gdb` has it stopped |
   | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-seccomp`), an unfiltered guest reads 2 |
   | `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` | the capture layer's dispositions and mask, not the guest's |
@@ -883,7 +884,8 @@ then make the consequences the caller depends on true:
   approximation of the rest stands — the same
   split every other cross-process `/proc` file makes. What these lines say
   changes as a process runs, so `status` is refreshed on `lseek(0)`+reread like
-  the time-varying files above. `/proc/self/fd/N` open/stat stays
+  the time-varying files above — as are `statm` and `stat`, every number in
+  which moves. `/proc/self/fd/N` open/stat stays
   host-passthrough deliberately: host fd == guest fd, and reopen semantics
   (including O_TMPFILE publishing) must keep working. When the host *refuses*
   the re-open of one of the process's own fds — Android denies it for memfds,

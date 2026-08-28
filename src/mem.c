@@ -440,6 +440,12 @@ static void as_fields_init(AddrSpace *as) {
     as->brk_start = as->brk = 0;
     as->mmap_next = MMAP_FLOOR;
     as->stack_top = 0;
+    as->start_code = as->end_code = 0;
+    as->start_data = as->end_data = 0;
+    as->start_stack = 0;
+    as->arg_start = as->arg_end = as->env_start = as->env_end = 0;
+    as->peak = as->peak_rss = 0;
+    as->npgtables = 0;
 }
 
 void as_init(AddrSpace *as) {
@@ -527,11 +533,13 @@ static void pte_put_one(AddrSpace *as, u64 va, u8 *host, u32 prot) {
         else if (!(*slot = calloc(1, sizeof **slot))) {
             perror("arm64chroot: calloc"); exit(127);
         }
+        as->npgtables++;   /* VmPTE. The two transitions are both here. */
     }
     pte_put(*slot, L2_IDX(va), host ? ((uintptr_t)host | prot) : 0);
     if (!(*slot)->used) {
         if (as->l2spare) free(*slot); else as->l2spare = *slot;
         *slot = NULL;
+        as->npgtables--;
     }
 }
 
@@ -1198,15 +1206,113 @@ u64 as_mapped_bytes(AddrSpace *as) {
  * the kernel's own accounting, which moves pages between data_vm and the rest
  * on mprotect without ever failing for it. Summed rather than counted for the
  * reasons above. */
+/* Is this the region the initial stack lives in? The kernel's VM_STACK, which
+ * every accounting rule below either counts or excludes -- and the way
+ * /proc/<pid>/maps names it. A thread stack placed by mmap is not one, there
+ * as here. */
+static inline int region_is_stack(const AddrSpace *as, const Region *r) {
+    return r->start < as->stack_top && as->stack_top <= r->end;
+}
+
 u64 as_data_bytes(AddrSpace *as) {
     u64 total = 0;
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
         if (!(r->prot & PTE_W) || r->shared) continue;
-        if (r->start < as->stack_top && as->stack_top <= r->end) continue;
+        if (region_is_stack(as, r)) continue;
         total += r->end - r->start;
     }
     return total;
+}
+
+/* Note a mapping that may have grown the address space: VmPeak is the highest
+ * total the guest ever held, and only an unmap can lower the total, so every
+ * path that adds a region passes through here. One region-list walk per
+ * mapping call -- the same walk the limit checks above already make, on the
+ * same syscalls, and never on a fault or an access. */
+static void as_peak_note(AddrSpace *as) {
+    u64 t = as_mapped_bytes(as);
+    if (t > as->peak) as->peak = t;
+}
+
+/* Resident bytes of one region, measured on the host backing that IS the
+ * guest's memory for it.
+ *
+ * mincore(2) is the only thing that knows: the emulator allocates a mapping's
+ * backing when the guest asks for the mapping, and what the guest has since
+ * touched is the host kernel's business, not something recorded here. It
+ * answers per HOST page, so on a host whose pages are bigger than the guest's
+ * 4 KB one resident host page counts up to four guest pages at the edges --
+ * the same rounding madvise already documents, and the result is clamped to
+ * the region so it can never exceed what the guest mapped. A region's backing
+ * pointer need not be host-page aligned (head trims, shared-file offset pads),
+ * so the probe is aligned outward from it. */
+static u64 region_resident(const Region *r, int *ok) {
+    if (!r->host) return 0;
+    u64 len = r->end - r->start;
+    uintptr_t hps = (uintptr_t)g_host_pagesz;
+    uintptr_t base = (uintptr_t)r->host & ~(hps - 1);
+    uintptr_t last = ((uintptr_t)r->host + len + hps - 1) & ~(hps - 1);
+    unsigned char vec[4096];
+    u64 res = 0;
+    for (uintptr_t a = base; a < last; ) {
+        size_t span = (size_t)(last - a);
+        if (span > sizeof vec * (size_t)hps) span = sizeof vec * (size_t)hps;
+        if (mincore((void *)a, span, vec) != 0) { *ok = 0; return 0; }
+        size_t np = (span + (size_t)hps - 1) / (size_t)hps;
+        for (size_t i = 0; i < np; i++) if (vec[i] & 1) res += (u64)hps;
+        a += span;
+    }
+    return res > len ? len : res;
+}
+
+/* One walk for everything the guest can read about its own footprint.
+ *
+ * The classification is the kernel's, from the same three predicates: a data
+ * mapping is private, writable and not the stack (is_data_mapping); an exec
+ * mapping is executable, NOT writable and not the stack (is_exec_mapping); the
+ * stack is the one region holding the initial stack top. The resident set is
+ * split the way the kernel's MM_ANONPAGES / MM_FILEPAGES / MM_SHMEMPAGES
+ * counters split it, with one approximation named here rather than hidden: a
+ * System V shm attachment is backed by a memfd this emulator maps like any
+ * other file, so its pages land in RssFile where a kernel would call them
+ * RssShmem. Nothing a guest can act on -- statm adds the two together, and
+ * VmRSS is their sum.
+ *
+ * VmHWM is a high-water mark over the samples actually taken, because taking
+ * one costs syscalls and there is no page-fault path here to hook: the guest's
+ * pages are faulted by the host, under the emulator, without the emulator
+ * being told. A guest watching its own footprint reads repeatedly and so
+ * misses nothing between its own reads; one that reads once has no earlier
+ * sample to have missed. */
+void as_meminfo(AddrSpace *as, AsMem *out) {
+    memset(out, 0, sizeof *out);
+    out->rss_ok = 1;
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    as_lock();
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        u64 len = r->end - r->start;
+        int stk = region_is_stack(as, r);
+        out->size += len;
+        if (stk) out->stack += len;
+        else if ((r->prot & PTE_W) && !r->shared) out->data += len;
+        if (!stk && (r->prot & PTE_X) && !(r->prot & PTE_W)) out->exec += len;
+        if (out->rss_ok) {
+            u64 res = region_resident(r, &out->rss_ok);
+            if (r->anon_shm)   out->rss_shmem += res;
+            else if (r->file)  out->rss_file  += res;
+            else               out->rss_anon  += res;
+        }
+    }
+    if (!out->rss_ok) out->rss_anon = out->rss_file = out->rss_shmem = 0;
+    if (out->size > as->peak) as->peak = out->size;
+    out->peak = as->peak;
+    u64 rss = out->rss_anon + out->rss_file + out->rss_shmem;
+    if (out->rss_ok && rss > as->peak_rss) as->peak_rss = rss;
+    out->rss_peak = as->peak_rss;
+    out->pgtables = (u64)as->npgtables * sizeof(struct L2Table);
+    as_unlock();
 }
 
 /* A bump pointer that only goes forward, wrapping to the floor at the ceiling,
@@ -1940,10 +2046,16 @@ long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
     return r;
 }
 
-/* ---- thread-safe wrappers: serialize address-space mutations ---- */
+/* ---- thread-safe wrappers: serialize address-space mutations ----
+ *
+ * The three that can enlarge the space note the high-water mark (VmPeak) on
+ * the way out. Here rather than in the syscall layer because these are the
+ * only doors into it: the ELF loader, brk, mmap, mremap and shmat all arrive
+ * through one of them. */
 int guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     as_lock();
     int r = guest_map_anon_impl(as, addr, len, prot);
+    if (r == 0) as_peak_note(as);
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -1952,6 +2064,7 @@ int guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int fd, u64 off,
                    int shared, const char *path) {
     as_lock();
     int r = guest_map_file_impl(as, addr, len, prot, fd, off, shared, path);
+    if (r == 0) as_peak_note(as);
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -1973,6 +2086,7 @@ int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
 int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
     as_lock();
     int r = guest_remap_grow_impl(as, addr, old_len, new_len);
+    if (r == 0) as_peak_note(as);
     as_drain_retired(as);
     as_unlock();
     return r;
