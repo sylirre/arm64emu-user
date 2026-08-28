@@ -305,8 +305,9 @@ backing **is** the guest's memory and what the guest has touched is the host
 kernel's business — nothing here is told about a fault. `VmHWM` is therefore a
 high-water mark over the samples actually taken: a guest watching its own
 footprint reads repeatedly and misses nothing between its own reads. A host
-that cannot answer `mincore` leaves the resident lines as the host file had
-them rather than printing zeros. One approximation is named rather than hidden:
+that cannot answer `mincore` — a sandbox or a seccomp policy between the
+emulator and the kernel — falls back to the host file's own figures, bounded
+as below. One approximation is named rather than hidden:
 a System V shm attachment is backed by a memfd mapped like any other file, so
 its pages land in `RssFile` where a kernel would say `RssShmem` — `VmRSS` and
 `statm`'s `shared` column add the two together either way.
@@ -332,6 +333,25 @@ the host's approximation — its emulator's resident set, which holds that
 guest's pages plus its own overhead. Everything else about it — `VmSize`, the
 `statm` size and data columns, `stat`'s `vsize` and every address span — is
 exact. That is what `ps` and `top` read for the processes they list.
+
+That approximation has to be **bounded**, and this is the same tier a host
+without `mincore` puts *every* process on, including the reader itself. The
+host's figure is not nothing — the emulator's backing is the guest's memory, so
+the host's resident set contains the guest's and over-states it — but a
+resident set larger than the address space holding it is something no kernel
+can report, and unbounded that is exactly what came out: `ps` inside the guest
+printed `RSS 21m` against `VSZ 9964`, and a reader computing `VmSize - VmRSS`
+in unsigned arithmetic got an enormous number instead of a small one. So every
+unsampled figure is capped by the guest's own size (`rss_bound`,
+`sys_procfs.c`), and `RssAnon`/`RssFile`/`RssShmem` are capped in turn by
+what is left of the capped total, in the order the file prints them — which
+keeps their sum exactly `VmRSS`, as a kernel keeps it.
+
+All three files take the registry route, because all three describe one address
+space and a reader may compare them. Leaving `status` out of it was worse than
+leaving it alone: the same process reported `VmSize: 81804 kB` there while its
+`stat` and `statm` reported 9948, so a reader that consulted two of the three
+got a contradiction rather than an approximation.
 
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max

@@ -29,13 +29,15 @@
  * exe/cwd/root symlinks resolve to the guest view too, spliced in path.c from
  * this Machine (self) or the shared PID registry (another guest process).
  * /proc/<pid>/status is synthesized line by line: most of it is a true
- * property of the process being asked about, but TracerPid, Seccomp, the
- * signal masks, NoNewPrivs and (under --fake-id) Uid/Gid/Groups and the
- * capability sets all describe the emulator instead, and the host kernel's
- * x86_* arch-hook lines describe the host CPU (see put_status). Another guest
- * process's address-space files (maps, smaps, pagemap, mem, ...) have no guest
- * answer to synthesize and the host's describes the emulator, so those are
- * refused with EACCES rather than passed through. Everything else under /proc
+ * property of the process being asked about, but the Vm and Rss block,
+ * TracerPid, Seccomp, the signal masks, NoNewPrivs and (under --fake-id)
+ * Uid/Gid/Groups and the capability sets all describe the emulator instead,
+ * and the host kernel's x86_* arch-hook lines describe the host CPU (see
+ * put_status); statm and stat carry that same address-space block and are
+ * synthesized with it. Another guest process's address-space files (maps,
+ * smaps, pagemap, mem, ...) have no guest answer to synthesize and the host's
+ * describes the emulator, so those are refused with EACCES rather than passed
+ * through. Everything else under /proc
  * stays host-passthrough — including stat() of these paths (readers open+read). */
 #include <fcntl.h>
 #include <pthread.h>
@@ -74,7 +76,8 @@ static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out);
 static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
-                       const AsMem *mi, const char *canon, s32 *tid_out);
+                       const AsMem *mi, int self, const char *canon,
+                       s32 *tid_out);
 static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
                      const AsMem *mi, const char *canon);
 /* Leaf lock for the /proc/stat busy estimate — the writers run both with
@@ -818,7 +821,7 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
         }
         int st = m->pf_fds[i].kind == PF_STATM
                      ? put_statm(fd, m, &pm, mi, path)
-                     : put_pidstat(fd, m, &pm, mi, path, NULL);
+                     : put_pidstat(fd, m, &pm, mi, self, path, NULL);
         if (st < 0) m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
         break;
     }
@@ -893,27 +896,37 @@ static int is_key(const char *line, const char *key) {
  * the two must describe one address space, or a guest reading its own usage
  * against its own limit gets nonsense.
  *
- * Only for THIS process. Another guest process's sizes live in its own
- * emulator's region list, which is not shared -- as with limits and the signal
- * lines, its host file is left as it is. */
+ * Another guest process's sizes are not in reach of its own region list --
+ * that lives in its own emulator and is not shared -- so they come from what
+ * it published in the shared PID registry (proctab.c) on every change to its
+ * address space. All three files take that route, because all three describe
+ * one address space and a reader may compare them: status reporting 81804 kB
+ * where that process's own stat and statm reported 9948 is worse than either
+ * figure alone.
+ *
+ * The resident half is the exception, and the one thing here that is not the
+ * guest's own: sampling it means walking the address space being described
+ * (mincore, in as_meminfo), which a reader can do only for itself and only on
+ * a host that answers. Everywhere else the host's figure stands -- bounded, so
+ * that a resident set larger than the whole address space that holds it can
+ * never be reported (rss_bound). */
 #define PG_UP_G(x) (((x) + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK)
 
-/* The kernel's VmExe/VmLib split: the executable's own code span is "text",
- * everything else executable and unwritable -- the interpreter, the shared
- * libraries -- is "lib". */
-static void exe_text_lib(struct Machine *m, const AsMem *mi, u64 *text, u64 *lib) {
-    const AddrSpace *as = &m->as;
+/* The executable's code span out of a ProcMem, split as task_mem splits it:
+ * the executable's own code span is "text", everything else executable and
+ * unwritable -- the interpreter, the shared libraries -- is "lib". */
+static void pm_text_lib(const ProcMem *pm, u64 *text, u64 *lib) {
     u64 t = 0;
-    if (as->end_code > as->start_code)
-        t = PG_UP_G(as->end_code) - (as->start_code & ~(u64)GUEST_PAGE_MASK);
-    if (t > mi->exec) t = mi->exec;   /* task_mem: text = min(text, exec_vm) */
+    if (pm->end_code > pm->start_code)
+        t = PG_UP_G(pm->end_code) - (pm->start_code & ~(u64)GUEST_PAGE_MASK);
+    if (t > pm->exec) t = pm->exec;   /* task_mem: text = min(text, exec_vm) */
     *text = t;
-    *lib = mi->exec - t;
+    *lib = pm->exec - t;
 }
 
 /* The status lines this answers, in the kernel's own order. VM_RSSFIRST..
- * VM_RSSLAST are the ones that need a resident-set sample, which a host
- * without mincore(2) cannot give -- there the host's own figures stand. */
+ * VM_RSSLAST are the ones that need a resident-set sample; the rest are sizes,
+ * which come out of the ProcMem every guest process publishes. */
 enum {
     VM_PEAK, VM_SIZE, VM_LCK, VM_PIN,
     VM_HWM, VM_RSS, VM_RSSANON, VM_RSSFILE, VM_RSSSHMEM,
@@ -927,50 +940,85 @@ static const char *const vm_keys[VM_NKEYS] = {
     "VmData", "VmStk", "VmExe", "VmLib", "VmPTE", "VmSwap"
 };
 
-/* The value for one of them, in kB. mlock is a no-op here and there is no
- * guest swap, so VmLck/VmPin/VmSwap are structurally zero rather than
+/* The value for one of the size lines, in kB. mlock is a no-op here and there
+ * is no guest swap, so VmLck/VmPin/VmSwap are structurally zero rather than
  * unknown. VmPTE is the emulator's own second-level tables: eight bytes per
  * mapped guest page, which is exactly what a kernel's leaf page tables cost,
  * so the figure means what the guest expects it to mean even though the shape
- * of the table is not a kernel's. */
-static u64 vm_value_kb(struct Machine *m, const AsMem *mi, int k) {
+ * of the table is not a kernel's. The resident lines are not here: they need a
+ * sample, and rss_line_kb answers them. */
+static u64 vm_value_kb(const ProcMem *pm, const AsMem *mi, int k) {
     u64 text, lib;
     switch (k) {
-    case VM_PEAK:     return mi->peak >> 10;
-    case VM_SIZE:     return mi->size >> 10;
+    case VM_PEAK:     return pm->peak >> 10;
+    case VM_SIZE:     return pm->size >> 10;
     case VM_HWM:      return mi->rss_peak >> 10;
     case VM_RSS:      return (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 10;
     case VM_RSSANON:  return mi->rss_anon >> 10;
     case VM_RSSFILE:  return mi->rss_file >> 10;
     case VM_RSSSHMEM: return mi->rss_shmem >> 10;
-    case VM_DATA:     return mi->data >> 10;
-    case VM_STK:      return mi->stack >> 10;
-    case VM_EXE:      exe_text_lib(m, mi, &text, &lib); return text >> 10;
-    case VM_LIB:      exe_text_lib(m, mi, &text, &lib); return lib >> 10;
-    case VM_PTE:      return mi->pgtables >> 10;
+    case VM_DATA:     return pm->data >> 10;
+    case VM_STK:      return pm->stack >> 10;
+    case VM_EXE:      pm_text_lib(pm, &text, &lib); return text >> 10;
+    case VM_LIB:      pm_text_lib(pm, &text, &lib); return lib >> 10;
+    case VM_PTE:      return pm->pgtables >> 10;
     default:          return 0;   /* VmLck, VmPin, VmSwap */
     }
 }
 
-/* The executable's code span out of a ProcMem, split as task_mem splits it. */
-static void pm_text_lib(const ProcMem *pm, u64 *text, u64 *lib) {
-    u64 t = 0;
-    if (pm->end_code > pm->start_code)
-        t = PG_UP_G(pm->end_code) - (pm->start_code & ~(u64)GUEST_PAGE_MASK);
-    if (t > pm->exec) t = pm->exec;
-    *text = t;
-    *lib = pm->exec - t;
+/* A resident figure the emulator could not sample inside the guest's own
+ * address space: another process's -- a reader cannot walk an address space
+ * that is not its own -- or our own on a host that will not answer mincore(2).
+ * The host's figure stands there, and it is not nothing: the emulator's
+ * backing IS the guest's memory, so the host's resident set contains the
+ * guest's and over-estimates it.
+ *
+ * What it must not do is exceed what the guest mapped, which a kernel's never
+ * can. Unbounded it did: `ps` inside the guest printed RSS 21m against VSZ
+ * 9964 kB, and a reader computing VmSize - VmRSS in unsigned arithmetic gets
+ * an enormous number rather than a small one. So every such figure is bounded
+ * by the guest's own size, and the RssAnon/RssFile/RssShmem components are
+ * bounded in turn by what is left of the bounded total, in the order the file
+ * prints them -- which keeps their sum exactly VmRSS, as a kernel keeps it. */
+static u64 rss_bound(u64 host, u64 *budget) {
+    if (host > *budget) host = *budget;
+    *budget -= host;
+    return host;
+}
+
+/* One resident line of status, in kB: sampled where we could sample, and the
+ * host's own figure bounded where we could not. `p` is the host's line, whose
+ * number is what gets bounded; *budget carries the bounded VmRSS down to the
+ * three components. */
+static u64 rss_line_kb(const ProcMem *pm, const AsMem *mi, int k,
+                       const char *p, u64 *budget) {
+    if (mi) return vm_value_kb(pm, mi, k);
+    u64 host = strtoull(p + strlen(vm_keys[k]) + 1, NULL, 10);
+    switch (k) {
+    case VM_HWM: { u64 b = pm->peak >> 10; return rss_bound(host, &b); }
+    case VM_RSS: {
+        /* The bounded total, which the three components then partition -- so
+         * it sets the budget rather than drawing on it. */
+        u64 b = pm->size >> 10;
+        return *budget = rss_bound(host, &b);
+    }
+    case VM_RSSANON: case VM_RSSFILE: case VM_RSSSHMEM:
+        return rss_bound(host, budget);
+    default: return host;    /* unreachable: only the resident lines get here,
+                                and only those have a size to be bounded by */
+    }
 }
 
 /* /proc/<pid>/statm: size resident shared text lib data dt, in guest pages.
  * `lib` and `dt` have read 0 since 2.6 -- the kernel prints both as literals,
  * so this does too.
  *
- * For our own process every column is ours. For another guest's, the sizes
- * come from what it published and the two resident columns are kept from the
- * host file: its resident set would take a mincore walk inside ITS address
- * space, which a reader cannot do. Returns 0, or -1 when another process's
- * host file could not be read. */
+ * The sizes are always the guest's: ours from our own region list, another
+ * process's from what it published. The two resident columns need a sample
+ * inside the address space being described, so they are ours only when we
+ * could take one -- for another process, or on a host that will not answer
+ * mincore(2), the host file's figures stand, bounded (see rss_bound). Returns
+ * 0, or -1 when the host file could not be read. */
 static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
                      const AsMem *mi, const char *canon) {
     u64 text, lib;
@@ -990,6 +1038,10 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
         unsigned long long ign;
         if (sscanf(buf, "%llu %llu %llu", &ign, &resident, &shared) != 3)
             return -1;
+        u64 budget = pm->size >> 12;
+        resident = rss_bound(resident, &budget);
+        budget = resident;                  /* shared is part of resident */
+        shared = rss_bound(shared, &budget);
     }
     (void)m;
     dprintf(fd, "%llu %llu %llu %llu 0 %llu 0\n",
@@ -1005,8 +1057,8 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
 /* Guest view of /proc/<pid>/status: pass the host file through, rewriting the
  * lines that describe the EMULATOR rather than the guest and dropping the ones
  * that describe the host's architecture. Everything else -- State, PPid,
- * FDSize, the Vm* sizes, Threads, the context-switch counters -- is a real
- * property of the process being asked about and stands as it is.
+ * FDSize, Threads, the context-switch counters -- is a real property of the
+ * process being asked about and stands as it is.
  *
  * What has to be rewritten, and why the host file cannot answer it:
  *   TracerPid  the emulated ptrace never host-attaches (ptracetab.c), so the
@@ -1036,11 +1088,11 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
  * `self` says the file describes this Machine, the only place the guest's exact
  * signal state and credentials exist. For another guest process we rewrite what
  * the shared tables can answer -- TracerPid from the ptrace link registry,
- * Seccomp from the PID registry -- and leave the host's approximation of the
- * rest standing, the same split every other cross-process /proc file here
- * makes: its blocked set would have to be republished on every sigprocmask and
- * every delivery to be worth reading, and being per-thread it does not belong
- * in a per-process record anyway.
+ * Seccomp and the Vm sizes from the PID registry -- and leave the host's
+ * approximation of the rest standing, the same split every other cross-process
+ * /proc file here makes: its blocked set would have to be republished on every
+ * sigprocmask and every delivery to be worth reading, and being per-thread it
+ * does not belong in a per-process record anyway.
  *
  * That per-thread part also decides which mask the self case reports: the
  * *calling* thread's, since that is the one this emulator process can see. It
@@ -1117,9 +1169,26 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             else if (h) cgt |= 1ull << (s - 1);          /* a guest handler */
         }
     }
-    /* The guest's own address-space sizes; see the block comment above. */
-    AsMem mi;
-    if (self) as_meminfo(&m->as, &mi);
+    /* The guest's own address-space sizes in place of the emulator's; see the
+     * block comment above. Ours come from our own region list, another guest
+     * process's from what it published in the shared registry (proctab.c) --
+     * the same split its stat and statm make, and this file has to agree with
+     * those two. Tgid, not Pid: a thread's task/<tid>/status describes the
+     * address space of the process it belongs to. The resident half needs a
+     * sample taken inside that address space, which is ours to take only for
+     * ourselves; `budget` carries the bounded VmRSS to its components. */
+    ProcMem pm;
+    AsMem lm, *mi = NULL;
+    int pm_ok;
+    if (self) {
+        as_procmem(&m->as, &pm);
+        as_meminfo(&m->as, &lm);
+        if (lm.rss_ok) mi = &lm;
+        pm_ok = 1;
+    } else {
+        pm_ok = tgid > 0 && proctab_mem_get(tgid, &pm);
+    }
+    u64 budget = pm_ok ? pm.size >> 10 : 0;
     u32 vseen = 0;
 
     u8 scmode = 0;
@@ -1172,19 +1241,23 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             dprintf(fd, "Seccomp_filters:\t%u\n", scfilters);
             goto next_line;
         }
-        if (self) {
-            /* The Vm/Rss block, from the guest's region list rather than the
-             * emulator's. Rewritten where the host file has the line and
-             * appended below where it does not -- RssAnon/RssFile/RssShmem
-             * are 4.5 and later. */
+        if (pm_ok) {
+            /* The Vm and Rss block, describing the guest's address space
+             * rather than the emulator's. Rewritten where the host file has
+             * the line and appended below where it does not -- RssAnon,
+             * RssFile and RssShmem are 4.5 and later. */
             for (int k = 0; k < VM_NKEYS; k++) {
                 if (!is_key(p, vm_keys[k])) continue;
-                if (!mi.rss_ok && k >= VM_RSSFIRST && k <= VM_RSSLAST) break;
+                u64 v = (k >= VM_RSSFIRST && k <= VM_RSSLAST)
+                            ? rss_line_kb(&pm, mi, k, p, &budget)
+                            : vm_value_kb(&pm, mi, k);
                 dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k],
-                        (unsigned long long)vm_value_kb(m, &mi, k));
+                        (unsigned long long)v);
                 vseen |= 1u << k;
                 goto next_line;
             }
+        }
+        if (self) {
             if (is_key(p, "SigPnd")) { dprintf(fd, "SigPnd:\t%016llx\n", (unsigned long long)pnd); goto next_line; }
             if (is_key(p, "ShdPnd")) { dprintf(fd, "ShdPnd:\t%016llx\n", 0ULL); goto next_line; }
             if (is_key(p, "SigBlk")) { dprintf(fd, "SigBlk:\t%016llx\n", (unsigned long long)blk); goto next_line; }
@@ -1234,12 +1307,15 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
      * block, and a reader that greps for a line reads its absence as zero, so
      * what the loop never saw is appended -- as NoNewPrivs and Seccomp are,
      * and for the same reason. */
-    if (self)
+    if (pm_ok)
         for (int k = 0; k < VM_NKEYS; k++) {
             if (vseen & (1u << k)) continue;
-            if (!mi.rss_ok && k >= VM_RSSFIRST && k <= VM_RSSLAST) continue;
+            /* A resident line the host file does not have is one there is no
+             * figure to bound, and no sample of our own to print instead: a
+             * kernel too old for it prints nothing, and so does this. */
+            if (!mi && k >= VM_RSSFIRST && k <= VM_RSSLAST) continue;
             dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k],
-                    (unsigned long long)vm_value_kb(m, &mi, k));
+                    (unsigned long long)vm_value_kb(&pm, mi, k));
         }
     if (self && !saw_nnp)
         dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0);
@@ -1255,18 +1331,27 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
  * real property of the task and stands. `rss` is in pages, the rest in bytes,
  * as the kernel prints them. Returns 0 for a field this does not answer. */
 static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
-                         int f, u64 *out) {
+                         int self, const char *tok, int f, u64 *out) {
     switch (f) {
     case 23: *out = pm->size; return 1;                       /* vsize */
-    case 24:                                                  /* rss, pages */
-        /* Only for our own process: another guest's resident set would take a
-         * mincore walk inside its address space. Its host file's figure -- its
-         * emulator's -- stands. */
-        if (!mi || !mi->rss_ok) return 0;
-        *out = (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 12;
+    case 24: {                                                /* rss, pages */
+        /* A sample taken inside the address space this file describes, where
+         * one could be taken; otherwise the host's own figure -- its
+         * emulator's -- bounded by what the guest mapped (see rss_bound). */
+        if (mi) {
+            *out = (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 12;
+            return 1;
+        }
+        u64 budget = pm->size >> 12;
+        *out = rss_bound(strtoull(tok, NULL, 10), &budget);
         return 1;
+    }
     case 25:                                                  /* rsslim */
-        if (!mi) return 0;      /* another guest's limit table is its own */
+        /* This process's own RLIMIT_RSS, which is a property of the process
+         * and not of any sample: it stands whether or not the resident set
+         * could be measured. Another guest's limit table lives in its own
+         * Machine and is not shared, so its host file's figure stands. */
+        if (!self) return 0;
         *out = m->rlim[G_RLIMIT_RSS].rlim_cur;
         if (*out == G_RLIM_INFINITY) *out = ~0ULL;
         return 1;
@@ -1292,7 +1377,8 @@ static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
  * parentheses, so the split starts at the LAST ')' -- the same rule every
  * reader of this file has to follow. */
 static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
-                       const AsMem *mi, const char *canon, s32 *tid_out) {
+                       const AsMem *mi, int self, const char *canon,
+                       s32 *tid_out) {
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
     if (hfd < 0) return -1;
     char buf[4096];
@@ -1311,7 +1397,7 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
     int f = 2;
     for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
         u64 v;
-        if (pidstat_field(m, pm, mi, ++f, &v))
+        if (pidstat_field(m, pm, mi, self, tok, ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else
             dprintf(fd, " %s", tok);
@@ -1502,12 +1588,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 1;
     }
 
-    /* /proc/<pid>/statm and /proc/<pid>/stat of THIS process: their sizes are
-     * the emulator's address space, which is not the guest's (see the memory
-     * block above). These are the two files ps and top actually read -- status
-     * is not -- so leaving them alone would have left `ps` inside the guest
-     * reporting the emulator's VSZ and RSS. Tracked for refresh: every number
-     * in them moves as the process runs. */
+    /* /proc/<pid>/statm and /proc/<pid>/stat: their sizes are the emulator's
+     * address space, which is not the guest's (see the memory block above).
+     * These are the two files ps and top actually read -- status is not -- so
+     * leaving them alone would have left `ps` inside the guest reporting the
+     * emulator's VSZ and RSS, for every process including itself. Tracked for
+     * refresh: every number in them moves as the process runs. */
     s32 szpid = 0;
     const char *sztail = self_tail(canon);
     if (!sztail) {
@@ -1536,16 +1622,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         } else {
             as_procmem(&m->as, &pm);
             as_meminfo(&m->as, &lm);
-            /* statm is synthesized whole for ourselves, so a host that cannot
-             * sample the resident set would leave its `resident` and `shared`
-             * columns with nothing behind them. */
             if (lm.rss_ok) mi = &lm;
-            else if (is_statm) return 0;
         }
         int fd = synth_memfd();
         if (fd < 0) { *ret = synth_denied(); return 1; }
         int st = is_statm ? put_statm(fd, m, &pm, mi, canon)
-                          : put_pidstat(fd, m, &pm, mi, canon, &sttid);
+                          : put_pidstat(fd, m, &pm, mi, !szpid, canon, &sttid);
         if (st < 0) {
             close(fd);
             if (st == -1) return 0;   /* no host file: report that exactly */

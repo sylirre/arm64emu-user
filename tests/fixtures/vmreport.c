@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -48,9 +49,9 @@ static size_t slurp(const char *path) {
     return n;
 }
 
-/* One "Key:\t<number> kB" line of /proc/self/status, in bytes. ~0 if absent. */
-static unsigned long long status_kb(const char *key) {
-    if (!slurp("/proc/self/status")) return ~0ULL;
+/* One "Key:\t<number> kB" line of a status file, in bytes. ~0 if absent. */
+static unsigned long long status_kb_of(const char *path, const char *key) {
+    if (!slurp(path)) return ~0ULL;
     size_t kl = strlen(key);
     for (char *p = g_buf; *p; ) {
         char *nl = strchr(p, '\n');
@@ -60,6 +61,10 @@ static unsigned long long status_kb(const char *key) {
         p = nl + 1;
     }
     return ~0ULL;
+}
+
+static unsigned long long status_kb(const char *key) {
+    return status_kb_of("/proc/self/status", key);
 }
 
 /* The seven columns of /proc/self/statm, in bytes (they are page counts). */
@@ -176,6 +181,17 @@ int main(int argc, char **argv, char **envp) {
            a.m[1] == a.rss && a.srss <= a.size);
     printf("hwm_holds=%d\n", a.hwm >= a.rss && a.peak >= a.size);
 
+    /* ...and it is inside the space that holds it, in all three files. A
+     * kernel cannot report otherwise, and a reader computing VmSize - VmRSS in
+     * unsigned arithmetic depends on it. Where the emulator cannot sample the
+     * resident set -- another process's, or its own on a host that will not
+     * answer mincore(2) -- the figure it falls back to is the host's, whose
+     * process is the emulator, and unbounded that one exceeds the guest's
+     * whole address space. */
+    printf("rss_bounded=%d\n", a.rss <= a.size && a.hwm <= a.peak &&
+           a.hwm >= a.rss && a.m[1] <= a.m[0] && a.m[2] <= a.m[1] &&
+           a.srss <= a.vsize);
+
     /* The code span holds the code; statm's text column is VmExe. */
     unsigned long long mainaddr = (unsigned long long)(uintptr_t)&main;
     printf("code_span=%d\n", a.sc < a.ec && mainaddr >= a.sc &&
@@ -220,12 +236,15 @@ int main(int argc, char **argv, char **envp) {
      * answers. Under the emulator the two sides are different processes with
      * different address spaces, so the child's figures reach the parent only
      * because the child published them -- ps and top read exactly this, and
-     * for every process but themselves. The resident columns are left out:
-     * they are the one thing a reader cannot sample inside another address
-     * space, and stay the host's. */
+     * for every process but themselves. All three files are asked, because
+     * all three describe one address space and a reader may compare them --
+     * status saying 81804 kB where stat and statm said 9948 is worse than
+     * either figure alone. The resident columns are the one thing a reader
+     * cannot sample inside another address space and stay the host's, so they
+     * are held only to the bound a kernel keeps. */
     int pfd[2], gfd[2];
     if (pipe(pfd) != 0 || pipe(gfd) != 0) { printf("pipe failed\n"); return 1; }
-    unsigned long long mine[4], theirs[4];
+    unsigned long long mine[7], theirs[7] = {0};
     pid_t kid = fork();
     if (kid == 0) {
         close(pfd[0]);
@@ -233,12 +252,15 @@ int main(int argc, char **argv, char **envp) {
         void *q = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         (void)q;
-        unsigned long long v[4];
+        unsigned long long v[7];
         v[0] = stat_field(23);          /* vsize */
         v[1] = stat_field(26);          /* startcode */
         v[2] = stat_field(47);          /* start_brk */
         statm_bytes(a.m);
         v[3] = a.m[0];                  /* statm size */
+        v[4] = status_kb("VmSize");
+        v[5] = status_kb("VmData");
+        v[6] = status_kb("VmStk");
         if (write(pfd[1], v, sizeof v) != (ssize_t)sizeof v) _exit(1);
         /* Hold still, and holding still is all: the parent closes the far end
          * of the second pipe once it has finished looking. */
@@ -249,14 +271,14 @@ int main(int argc, char **argv, char **envp) {
     }
     close(pfd[1]);
     close(gfd[0]);
+    unsigned long long krss = 0, khwm = 0, kpeak = 0;
     int ok = kid > 0 && read(pfd[0], mine, sizeof mine) == (ssize_t)sizeof mine;
     if (ok) {
         char path[64];
         snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
         char *saved = g_buf;
         (void)saved;
-        theirs[0] = 0;
-        /* Read the child's stat and statm the way any onlooker would. */
+        /* Read the child's three files the way any onlooker would. */
         if (slurp(path)) {
             char *rp = strrchr(g_buf, ')');
             int i = 2;
@@ -269,13 +291,32 @@ int main(int argc, char **argv, char **envp) {
         }
         snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
         theirs[3] = slurp(path) ? strtoull(g_buf, NULL, 10) * 4096 : 0;
+        snprintf(path, sizeof path, "/proc/%d/status", (int)kid);
+        theirs[4] = status_kb_of(path, "VmSize");
+        theirs[5] = status_kb_of(path, "VmData");
+        theirs[6] = status_kb_of(path, "VmStk");
+        krss  = status_kb_of(path, "VmRSS");
+        khwm  = status_kb_of(path, "VmHWM");
+        kpeak = status_kb_of(path, "VmPeak");
     }
     printf("other_stat=%d\n", ok && theirs[0] == mine[0] &&
                               theirs[1] == mine[1] && theirs[2] == mine[2]);
     printf("other_statm=%d\n", ok && theirs[3] == mine[3]);
+    printf("other_status=%d\n", ok && theirs[4] == mine[4] &&
+                                theirs[5] == mine[5] && theirs[6] == mine[6] &&
+                                theirs[4] == theirs[3]);
+    printf("other_bounded=%d\n", ok && krss <= theirs[4] && khwm <= kpeak &&
+                                 khwm >= krss && kpeak >= theirs[4]);
     close(gfd[1]);          /* EOF: releases the child */
     close(pfd[0]);
     if (kid > 0) { int st; while (waitpid(kid, &st, 0) < 0) ; }
+
+    /* stat's rsslim is this process's own RLIMIT_RSS -- a property of the
+     * process, not of any measurement of it, so it has to stand even where the
+     * resident set two fields earlier could not be measured. */
+    struct rlimit rl = { 4096, 4096 };
+    printf("rsslim=%d\n", setrlimit(RLIMIT_RSS, &rl) == 0 &&
+                          stat_field(25) == 4096);
     printf("done\n");
     return 0;
 }
