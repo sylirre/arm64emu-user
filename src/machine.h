@@ -982,6 +982,14 @@ int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err)
  * lives in its own Machine (sys_seccomp.c evaluates it, the host never sees
  * it). Only the owner writes. _get returns 1 if the registry knows the pid --
  * mode 0 is the real answer "no seccomp", not "unknown". */
+/* ProcMem (mmu.h) is what a guest process publishes about its address space
+ * for the others to read. */
+void proctab_mem_publish(const ProcMem *pm);          /* the owner, on change */
+void proctab_mem_seed(int slot, const ProcMem *pm);   /* pre-fork, as seccomp */
+int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown */
+/* Drop the publisher's cached slot: a fork child inherits its parent's. */
+void proctab_fork_child(void);
+
 void proctab_seccomp_set(u8 mode, u32 nfilters);
 void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters); /* pre-fork */
 int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);

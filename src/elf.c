@@ -462,6 +462,11 @@ int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp
     proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
                      m->exec_path, m->cwd, m->environ, m->environ_len,
                      m->auxv, m->auxv_len);
+    /* ...and the address-space figures, which the mappings above published
+     * before the image spans they carry were recorded (those are assigned
+     * from the loader's results, after the last of them). The registration
+     * just above is also what created the slot to publish into. */
+    as_publish(&m->as);
     /* Present the guest program's name as this process's comm, so
      * /proc/<pid>/comm, status Name: and stat field 2 — which pass through to
      * the host — are right for every guest process, and host-side ps shows

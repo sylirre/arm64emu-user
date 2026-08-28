@@ -73,9 +73,10 @@ static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
  * path (procfs_pre_read) comes first in this file. */
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out);
-static int put_pidstat(int fd, struct Machine *m, const char *canon,
-                       s32 *tid_out);
-static void put_statm(int fd, struct Machine *m);
+static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
+                       const AsMem *mi, const char *canon, s32 *tid_out);
+static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
+                     const AsMem *mi, const char *canon);
 /* Leaf lock for the /proc/stat busy estimate — the writers run both with
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -798,14 +799,27 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
             m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* process is gone */
         break;
     }
-    case PF_STATM: put_statm(fd, m); break;
-    /* As PF_STATUS: the rewrite is of the host file, so a re-read has to go
-     * back to it, and the tid the open resolved names it directly. */
-    case PF_PIDSTAT: {
+    /* As PF_STATUS: what these say changes as the process runs, the figures
+     * for another guest come from its registry entry and the rest from its
+     * host file, and the tid the open resolved names that file directly. */
+    case PF_STATM: case PF_PIDSTAT: {
+        int self = m->pf_fds[i].self;
         char path[64];
-        snprintf(path, sizeof path, "/proc/%d/stat", (int)m->pf_fds[i].pid);
-        if (put_pidstat(fd, m, path, NULL) < 0)
-            m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
+        AsMem lm, *mi = NULL;
+        ProcMem pm;
+        snprintf(path, sizeof path, "/proc/%d/%s", (int)m->pf_fds[i].pid,
+                 m->pf_fds[i].kind == PF_STATM ? "statm" : "stat");
+        if (self) {
+            as_procmem(&m->as, &pm);
+            as_meminfo(&m->as, &lm);
+            if (lm.rss_ok) mi = &lm;
+        } else if (!proctab_mem_get(m->pf_fds[i].pid, &pm)) {
+            break;                       /* keep the snapshot we have */
+        }
+        int st = m->pf_fds[i].kind == PF_STATM
+                     ? put_statm(fd, m, &pm, mi, path)
+                     : put_pidstat(fd, m, &pm, mi, path, NULL);
+        if (st < 0) m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
         break;
     }
     }
@@ -938,31 +952,51 @@ static u64 vm_value_kb(struct Machine *m, const AsMem *mi, int k) {
     }
 }
 
-/* /proc/<pid>/statm: size resident shared text lib data dt, in guest pages.
- * `lib` has been 0 since 2.6 and `dt` since 2.6 as well -- the kernel prints
- * both as literals, so this does too. */
-static void put_statm(int fd, struct Machine *m) {
-    AsMem mi;
-    u64 text, lib;
-    as_meminfo(&m->as, &mi);
-    exe_text_lib(m, &mi, &text, &lib);
-    u64 shared = mi.rss_file + mi.rss_shmem;
-    u64 resident = shared + mi.rss_anon;
-    dprintf(fd, "%llu %llu %llu %llu 0 %llu 0\n",
-            (unsigned long long)(mi.size >> 12),
-            (unsigned long long)(resident >> 12),
-            (unsigned long long)(shared >> 12),
-            (unsigned long long)(text >> 12),
-            (unsigned long long)((mi.data + mi.stack) >> 12));
+/* The executable's code span out of a ProcMem, split as task_mem splits it. */
+static void pm_text_lib(const ProcMem *pm, u64 *text, u64 *lib) {
+    u64 t = 0;
+    if (pm->end_code > pm->start_code)
+        t = PG_UP_G(pm->end_code) - (pm->start_code & ~(u64)GUEST_PAGE_MASK);
+    if (t > pm->exec) t = pm->exec;
+    *text = t;
+    *lib = pm->exec - t;
 }
 
-/* Can the resident set be sampled at all? statm is synthesized whole, so on a
- * host that cannot answer there is nothing to fall back to except the host
- * file itself. */
-static int rss_available(struct Machine *m) {
-    AsMem mi;
-    as_meminfo(&m->as, &mi);
-    return mi.rss_ok;
+/* /proc/<pid>/statm: size resident shared text lib data dt, in guest pages.
+ * `lib` and `dt` have read 0 since 2.6 -- the kernel prints both as literals,
+ * so this does too.
+ *
+ * For our own process every column is ours. For another guest's, the sizes
+ * come from what it published and the two resident columns are kept from the
+ * host file: its resident set would take a mincore walk inside ITS address
+ * space, which a reader cannot do. Returns 0, or -1 when another process's
+ * host file could not be read. */
+static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
+                     const AsMem *mi, const char *canon) {
+    u64 text, lib;
+    pm_text_lib(pm, &text, &lib);
+    unsigned long long resident = 0, shared = 0;
+    if (mi) {
+        shared = (mi->rss_file + mi->rss_shmem) >> 12;
+        resident = shared + (mi->rss_anon >> 12);
+    } else {
+        char buf[256];
+        int hfd = open(canon, O_RDONLY | O_CLOEXEC);
+        if (hfd < 0) return -1;
+        ssize_t n = read(hfd, buf, sizeof buf - 1);
+        close(hfd);
+        if (n <= 0) return -1;
+        buf[n] = 0;
+        unsigned long long ign;
+        if (sscanf(buf, "%llu %llu %llu", &ign, &resident, &shared) != 3)
+            return -1;
+    }
+    (void)m;
+    dprintf(fd, "%llu %llu %llu %llu 0 %llu 0\n",
+            (unsigned long long)(pm->size >> 12), resident, shared,
+            (unsigned long long)(text >> 12),
+            (unsigned long long)((pm->data + pm->stack) >> 12));
+    return 0;
 }
 
 #define STATUS_MAX 16384    /* a status file is ~2 KB; Groups: is the long line */
@@ -1220,28 +1254,32 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
  * else there -- the pid, the state, the times, the scheduling numbers -- is a
  * real property of the task and stands. `rss` is in pages, the rest in bytes,
  * as the kernel prints them. Returns 0 for a field this does not answer. */
-static int pidstat_field(struct Machine *m, const AsMem *mi, int f, u64 *out) {
-    const AddrSpace *as = &m->as;
+static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
+                         int f, u64 *out) {
     switch (f) {
-    case 23: *out = mi->size; return 1;                       /* vsize */
+    case 23: *out = pm->size; return 1;                       /* vsize */
     case 24:                                                  /* rss, pages */
-        if (!mi->rss_ok) return 0;
+        /* Only for our own process: another guest's resident set would take a
+         * mincore walk inside its address space. Its host file's figure -- its
+         * emulator's -- stands. */
+        if (!mi || !mi->rss_ok) return 0;
         *out = (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 12;
         return 1;
     case 25:                                                  /* rsslim */
+        if (!mi) return 0;      /* another guest's limit table is its own */
         *out = m->rlim[G_RLIMIT_RSS].rlim_cur;
         if (*out == G_RLIM_INFINITY) *out = ~0ULL;
         return 1;
-    case 26: *out = as->start_code;  return 1;
-    case 27: *out = as->end_code;    return 1;
-    case 28: *out = as->start_stack; return 1;
-    case 45: *out = as->start_data;  return 1;
-    case 46: *out = as->end_data;    return 1;
-    case 47: *out = as->brk_start;   return 1;
-    case 48: *out = as->arg_start;   return 1;
-    case 49: *out = as->arg_end;     return 1;
-    case 50: *out = as->env_start;   return 1;
-    case 51: *out = as->env_end;     return 1;
+    case 26: *out = pm->start_code;  return 1;
+    case 27: *out = pm->end_code;    return 1;
+    case 28: *out = pm->start_stack; return 1;
+    case 45: *out = pm->start_data;  return 1;
+    case 46: *out = pm->end_data;    return 1;
+    case 47: *out = pm->start_brk;   return 1;
+    case 48: *out = pm->arg_start;   return 1;
+    case 49: *out = pm->arg_end;     return 1;
+    case 50: *out = pm->env_start;   return 1;
+    case 51: *out = pm->env_end;     return 1;
     default: return 0;
     }
 }
@@ -1253,8 +1291,8 @@ static int pidstat_field(struct Machine *m, const AsMem *mi, int f, u64 *out) {
  * The comm field is parenthesized and may itself contain spaces and
  * parentheses, so the split starts at the LAST ')' -- the same rule every
  * reader of this file has to follow. */
-static int put_pidstat(int fd, struct Machine *m, const char *canon,
-                       s32 *tid_out) {
+static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
+                       const AsMem *mi, const char *canon, s32 *tid_out) {
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
     if (hfd < 0) return -1;
     char buf[4096];
@@ -1268,14 +1306,12 @@ static int put_pidstat(int fd, struct Machine *m, const char *canon,
      * got here does not matter, and a refresh can reach it as /proc/<tid>. */
     if (tid_out) *tid_out = (s32)strtol(buf, NULL, 10);
 
-    AsMem mi;
-    as_meminfo(&m->as, &mi);
     *rp = 0;
     dprintf(fd, "%s)", buf);       /* pid and comm stand as the host has them */
     int f = 2;
     for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
         u64 v;
-        if (pidstat_field(m, &mi, ++f, &v))
+        if (pidstat_field(m, pm, mi, ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else
             dprintf(fd, " %s", tok);
@@ -1472,32 +1508,53 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
      * is not -- so leaving them alone would have left `ps` inside the guest
      * reporting the emulator's VSZ and RSS. Tracked for refresh: every number
      * in them moves as the process runs. */
+    s32 szpid = 0;
     const char *sztail = self_tail(canon);
+    if (!sztail) {
+        /* Another guest process's: its sizes come from what it published in
+         * the shared registry (proctab.c), the way its cmdline and seccomp
+         * state do. A pid that is not a guest process never reaches here --
+         * path.c has already routed it to the hidden view's ENOENT. */
+        const char *ot = proc_other_tail(canon, &szpid);
+        if (ot && szpid != (s32)getpid() && proctab_has(szpid)) sztail = ot;
+        else szpid = 0;
+    }
     if (sztail && (!strcmp(sztail, "statm") || !strcmp(sztail, "stat"))) {
         int is_statm = sztail[4] == 'm';
-        s32 sttid = 0;
+        /* The task a refresh must go back to: another guest's pid, or our own
+         * -- which put_pidstat replaces with the exact task the file named
+         * (a thread's task/<tid>/stat is not the leader's). */
+        s32 sttid = szpid ? szpid : (s32)getpid();
+        AsMem lm, *mi = NULL;
+        ProcMem pm;
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
-        /* statm is synthesized whole, so on a host that cannot sample the
-         * resident set there would be nothing behind its `resident` and
-         * `shared` columns. The host file is wrong in places, not useless. */
-        if (is_statm && !rss_available(m)) return 0;
+        if (szpid) {
+            /* Nothing published yet (the process is mid-registration): the
+             * host file is wrong in places, not useless. */
+            if (!proctab_mem_get(szpid, &pm)) return 0;
+        } else {
+            as_procmem(&m->as, &pm);
+            as_meminfo(&m->as, &lm);
+            /* statm is synthesized whole for ourselves, so a host that cannot
+             * sample the resident set would leave its `resident` and `shared`
+             * columns with nothing behind them. */
+            if (lm.rss_ok) mi = &lm;
+            else if (is_statm) return 0;
+        }
         int fd = synth_memfd();
         if (fd < 0) { *ret = synth_denied(); return 1; }
-        if (is_statm) {
-            put_statm(fd, m);
-        } else {
-            int st = put_pidstat(fd, m, canon, &sttid);
-            if (st < 0) {
-                close(fd);
-                if (st == -1) return 0;   /* no host file: report that exactly */
-                *ret = -ENOMEM;
-                return 1;
-            }
+        int st = is_statm ? put_statm(fd, m, &pm, mi, canon)
+                          : put_pidstat(fd, m, &pm, mi, canon, &sttid);
+        if (st < 0) {
+            close(fd);
+            if (st == -1) return 0;   /* no host file: report that exactly */
+            *ret = -ENOMEM;
+            return 1;
         }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        pf_track(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, 1);
+        pf_track(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, !szpid);
         *ret = fd;
         return 1;
     }

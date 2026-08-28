@@ -1869,7 +1869,7 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # its own process there, which is why it cannot be the oracle. Every row is a
 # relation a kernel keeps true for any process; compiled and run natively on
 # x86-64 the same program prints the same block.
-check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\ndone'
+check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\nother_stat=1\nother_statm=1\ndone'
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.

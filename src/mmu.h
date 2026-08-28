@@ -349,6 +349,28 @@ u64  as_data_bytes(AddrSpace *as);
  * the resident set (mincore over the host backing), so it also moves the
  * VmHWM high-water mark. Takes as_lock itself. */
 void as_meminfo(AddrSpace *as, AsMem *out);
+/* The address-space figures a guest process publishes for the others to read:
+ * what its own /proc/<pid>/{statm,stat} report, in bytes. Published by the
+ * owner on every change (as_publish), because another process's sizes live in
+ * its own emulator's region list and nothing else can see them -- without
+ * this, ps and top inside the guest read the emulator's VSZ for every process
+ * but the one doing the reading. The resident set is deliberately NOT here:
+ * sampling it costs a mincore walk over every region, far too much to run on
+ * each mmap, so another process's RSS stays the host's approximation. */
+typedef struct ProcMem {
+    u64 size, data, stack, exec, peak, pgtables;
+    u64 start_code, end_code, start_data, end_data;
+    u64 start_stack, start_brk;
+    u64 arg_start, arg_end, env_start, env_end;
+} ProcMem;
+
+/* This address space's figures in that form. */
+void as_procmem(AddrSpace *as, ProcMem *out);
+/* Republish this address space's figures into the shared registry. Done for
+ * free by every mapping call; needed explicitly only where something OTHER
+ * than a mapping changed them -- the ELF loader recording the image spans, and
+ * the fork path seeding its child's slot. */
+void as_publish(AddrSpace *as);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
 /* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.

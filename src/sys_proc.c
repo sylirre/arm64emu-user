@@ -494,6 +494,14 @@ SYSDEF(clone) {
         u8 md = (u8)seccomp_status(m, &nf);
         proctab_seccomp_seed(rsv, md, nf);
     }
+    /* The address space is inherited whole, so the child's figures are this
+     * process's -- and the same timing argument again: ps can reach the child
+     * before it has run an instruction, and must not be told it holds no
+     * memory. The child republishes on its first mapping change. */
+    {
+        ProcMem pm;
+        if (proctab_mem_get((s32)getpid(), &pm)) proctab_mem_seed(rsv, &pm);
+    }
 
     emu_fork_check("the guest fork/clone syscall");
     pid_t pid = fork();

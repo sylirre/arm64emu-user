@@ -541,6 +541,11 @@ static void emu_atfork_parent(void) {
     jit_locks_drop();
 }
 static void emu_atfork_child(void) {
+    /* Not a lock: the shared registry's publisher caches a pointer to this
+     * process's own slot, and a fork child inherits one that names its
+     * parent's. Cleared here rather than where the child adopts its own slot,
+     * because a fork that found no free slot never gets there. */
+    proctab_fork_child();
     mem_locks_reinit();
     sigact_locks_reinit();
     sig_locks_reinit();

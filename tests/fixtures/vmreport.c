@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static char g_buf[65536];
@@ -212,6 +213,69 @@ int main(int argc, char **argv, char **envp) {
     printf("brk_is_data=%d\n", br != (void *)-1 &&
            (unsigned long long)(uintptr_t)br >= c.sbrk0 &&
            d.data == c.data + CHUNK && d.size == c.size + CHUNK);
+
+    /* ...and what ANOTHER process reads about this one. A child maps a known
+     * amount, reports what its own /proc says about it, and waits; the parent
+     * then asks /proc/<child>/ the same questions and must get the same
+     * answers. Under the emulator the two sides are different processes with
+     * different address spaces, so the child's figures reach the parent only
+     * because the child published them -- ps and top read exactly this, and
+     * for every process but themselves. The resident columns are left out:
+     * they are the one thing a reader cannot sample inside another address
+     * space, and stay the host's. */
+    int pfd[2], gfd[2];
+    if (pipe(pfd) != 0 || pipe(gfd) != 0) { printf("pipe failed\n"); return 1; }
+    unsigned long long mine[4], theirs[4];
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(pfd[0]);
+        close(gfd[1]);
+        void *q = mmap(NULL, CHUNK, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        (void)q;
+        unsigned long long v[4];
+        v[0] = stat_field(23);          /* vsize */
+        v[1] = stat_field(26);          /* startcode */
+        v[2] = stat_field(47);          /* start_brk */
+        statm_bytes(a.m);
+        v[3] = a.m[0];                  /* statm size */
+        if (write(pfd[1], v, sizeof v) != (ssize_t)sizeof v) _exit(1);
+        /* Hold still, and holding still is all: the parent closes the far end
+         * of the second pipe once it has finished looking. */
+        char x;
+        while (read(gfd[0], &x, 1) > 0)
+            ;
+        _exit(0);
+    }
+    close(pfd[1]);
+    close(gfd[0]);
+    int ok = kid > 0 && read(pfd[0], mine, sizeof mine) == (ssize_t)sizeof mine;
+    if (ok) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)kid);
+        char *saved = g_buf;
+        (void)saved;
+        theirs[0] = 0;
+        /* Read the child's stat and statm the way any onlooker would. */
+        if (slurp(path)) {
+            char *rp = strrchr(g_buf, ')');
+            int i = 2;
+            if (rp)
+                for (char *t = strtok(rp + 1, " \n"); t; t = strtok(NULL, " \n")) {
+                    if (++i == 23) theirs[0] = strtoull(t, NULL, 10);
+                    if (i == 26)   theirs[1] = strtoull(t, NULL, 10);
+                    if (i == 47) { theirs[2] = strtoull(t, NULL, 10); break; }
+                }
+        }
+        snprintf(path, sizeof path, "/proc/%d/statm", (int)kid);
+        theirs[3] = slurp(path) ? strtoull(g_buf, NULL, 10) * 4096 : 0;
+    }
+    printf("other_stat=%d\n", ok && theirs[0] == mine[0] &&
+                              theirs[1] == mine[1] && theirs[2] == mine[2]);
+    printf("other_statm=%d\n", ok && theirs[3] == mine[3]);
+    close(gfd[1]);          /* EOF: releases the child */
+    close(pfd[0]);
+    if (kid > 0) { int st; while (waitpid(kid, &st, 0) < 0) ; }
     printf("done\n");
     return 0;
 }

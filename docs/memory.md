@@ -311,9 +311,27 @@ a System V shm attachment is backed by a memfd mapped like any other file, so
 its pages land in `RssFile` where a kernel would say `RssShmem` — `VmRSS` and
 `statm`'s `shared` column add the two together either way.
 
-Only for **this** process. Another guest's sizes live in its own emulator's
-region list, which is not shared, so its files are left alone — as `limits` and
-the signal lines already are.
+Another guest process's sizes live in its own emulator's region list, which
+this one cannot see, so each process **publishes** its own into the shared PID
+registry (`ProcMem`, `proctab.c`) — the same place its cmdline, id maps and
+seccomp state already go. `as_publish` does it from the four `mem.c` entry
+points that can change the region list, so no mapping path can forget to, and
+the fork path seeds the child's slot before the child exists (a parent can read
+`/proc/<child>/stat` before the child has run an instruction). The publisher
+caches its own slot: resolving it costs a `getpid(2)` and, from a guest thread
+that never registered, a scan of the table — per `mmap`, that is not free. On a
+loop that does nothing but map and unmap 64 KB two hundred thousand times, the
+whole of this costs about 14% (≈0.6 µs a pair); on anything that also computes,
+it is noise.
+
+The **resident** set is the one thing that does not travel: sampling it means a
+`mincore` walk over the target's regions, which is far too much to run on every
+`mmap` and impossible to do from outside. So another process's `RssAnon` and
+friends, its `VmRSS`, and the `resident`/`shared` columns of its `statm` stay
+the host's approximation — its emulator's resident set, which holds that
+guest's pages plus its own overhead. Everything else about it — `VmSize`, the
+`statm` size and data columns, `stat`'s `vsize` and every address span — is
+exact. That is what `ps` and `top` read for the processes they list.
 
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max

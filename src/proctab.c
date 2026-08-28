@@ -102,6 +102,14 @@ struct ProcEnt {
      * and a count that were true together. */
     u32 seccomp;                 /* mode << 16 | filter count */
 
+    /* The owner's address-space sizes and image spans, for another process
+     * reading its /proc/<pid>/{statm,stat} (sys_procfs.c). Inside the seqlock,
+     * because unlike `seccomp` this is a block of words that must be read as
+     * one -- a reader that took `size` from before a mapping and `data` from
+     * after it would report an address space that never existed. Owner-written
+     * only, and often: every mapping change republishes it. */
+    ProcMem mem;
+
     /* Host tasks in the owner's thread group that are NOT guest threads, so
      * that another process can strike them out of what the guest sees of this
      * one (sys_file.c's task-directory listing, sys_procfs.c's Threads:).
@@ -2058,6 +2066,15 @@ void proctab_init(const char *rootfs_key) {
  * and it needs nothing: registration is per process. */
 static __thread int g_own_slot = -1;
 
+/* The address-space publisher's own entry, cached. That publisher is the one
+ * writer here which runs often enough to care what own_entry() costs -- a
+ * getpid(2), and from a guest thread that never registered a scan of the whole
+ * table, on every guest mmap. Invalidated wherever this process's slot or
+ * identity can change: the two places that set g_own_slot, the one that clears
+ * it, and fork, whose child would otherwise inherit a pointer into its
+ * PARENT's slot and publish its own sizes there. */
+static struct ProcEnt *g_mem_ent;
+
 /* A free slot, claimed for a process that does not exist yet. The pid field
  * takes a sentinel that no scan will match, and the entry is cleared here --
  * before the fork, where nothing else can be looking at it. The point is that
@@ -2099,7 +2116,7 @@ void proctab_release(int slot) {
 }
 
 /* In the fork child: the slot our parent reserved for us is ours. */
-void proctab_slot_adopt(int slot) { g_own_slot = slot; }
+void proctab_slot_adopt(int slot) { g_own_slot = slot; g_mem_ent = NULL; }
 
 /* Register/refresh this process's entry: use the slot reserved for it, reuse
  * its own (execve), or CAS-claim a free one. `start` is sampled before the
@@ -2220,7 +2237,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     }
     /* Built: publish the slot under its real pid (see the claim above). */
     if (claimed || reserved) __atomic_store_n(&e->pid, pid, __ATOMIC_RELEASE);
-    if (pid == (s32)getpid()) g_own_slot = slot;
+    if (pid == (s32)getpid()) { g_own_slot = slot; g_mem_ent = NULL; }
 }
 
 void proctab_register(s32 pid, const char *cmd, u32 len,
@@ -2254,7 +2271,7 @@ void proctab_set_cwd(s32 pid, const char *cwd) {
 
 void proctab_unregister(s32 pid) {
     if (!g_tab || pid <= 0) return;
-    if (pid == (s32)getpid()) g_own_slot = -1;
+    if (pid == (s32)getpid()) { g_own_slot = -1; g_mem_ent = NULL; }
     for (int i = 0; i < g_tab_n; i++)
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) {
             __atomic_store_n(&g_tab[i].pid, 0, __ATOMIC_RELEASE);
@@ -2534,6 +2551,57 @@ int proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err) 
 /* Publish our own mode + filter count. Called on every install, and once by a
  * fork child for the chain it inherited (proctab_reserve zeroed the slot, and
  * the parent's concurrent register leaves a reservation's sub-record alone). */
+void proctab_fork_child(void) { g_mem_ent = NULL; }
+
+void proctab_mem_publish(const ProcMem *pm) {
+    struct ProcEnt *e = g_mem_ent;
+    if (!e) {
+        e = own_entry();
+        if (!e) return;              /* no table, or no slot for us */
+        g_mem_ent = e;
+    }
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* odd: write begins */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    e->mem = *pm;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* even: write done */
+}
+
+/* Seed a reservation with what the child is about to inherit, exactly as
+ * proctab_seccomp_seed does and for the same reason: fork(2) hands the parent
+ * a pid whose /proc the kernel answers immediately, and a reader that got
+ * there first would see a zeroed address space. The child republishes on its
+ * first mapping change anyway, but "on its first change" is too late. */
+void proctab_mem_seed(int slot, const ProcMem *pm) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return;
+    struct ProcEnt *e = &g_tab[slot];
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    e->mem = *pm;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);
+}
+
+/* Another process's figures, read under the seqlock. 0 when there is no entry
+ * or nothing has been published into it yet -- a size of zero is not an
+ * address space any live process has, so it doubles as "not known". */
+int proctab_mem_get(s32 pid, ProcMem *out) {
+    if (!g_tab || pid <= 0) return 0;
+    struct ProcEnt *e = entry_of(pid);
+    if (!e) return 0;
+    for (int try = 0; try < 8; try++) {
+        u32 s0 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;                     /* a write is in progress */
+        ProcMem tmp = e->mem;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s0) continue;
+        if (!tmp.size) return 0;
+        *out = tmp;
+        return 1;
+    }
+    return 0;
+}
+
 void proctab_seccomp_set(u8 mode, u32 nfilters) {
     struct ProcEnt *e = own_entry();
     if (!e) return;

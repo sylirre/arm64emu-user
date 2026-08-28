@@ -1225,14 +1225,48 @@ u64 as_data_bytes(AddrSpace *as) {
     return total;
 }
 
-/* Note a mapping that may have grown the address space: VmPeak is the highest
- * total the guest ever held, and only an unmap can lower the total, so every
- * path that adds a region passes through here. One region-list walk per
- * mapping call -- the same walk the limit checks above already make, on the
- * same syscalls, and never on a fault or an access. */
-static void as_peak_note(AddrSpace *as) {
-    u64 t = as_mapped_bytes(as);
-    if (t > as->peak) as->peak = t;
+/* One region-list walk after a change to the address space: raise the peak
+ * (VmPeak is the highest total the guest ever held) and publish the figures
+ * another guest process reads out of the shared registry, since nothing but
+ * this process can see its own region list. The walk is the same one the
+ * limit checks already make, on the same syscalls, and never on a fault or an
+ * access. Caller holds as_lock. */
+void as_procmem(AddrSpace *as, ProcMem *out) {
+    memset(out, 0, sizeof *out);
+    as_lock();
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        u64 len = r->end - r->start;
+        int stk = region_is_stack(as, r);
+        out->size += len;
+        if (stk) out->stack += len;
+        else if ((r->prot & PTE_W) && !r->shared) out->data += len;
+        if (!stk && (r->prot & PTE_X) && !(r->prot & PTE_W)) out->exec += len;
+    }
+    if (out->size > as->peak) as->peak = out->size;
+    out->peak        = as->peak;
+    out->pgtables    = (u64)as->npgtables * sizeof(struct L2Table);
+    out->start_code  = as->start_code;   out->end_code   = as->end_code;
+    out->start_data  = as->start_data;   out->end_data   = as->end_data;
+    out->start_stack = as->start_stack;  out->start_brk  = as->brk_start;
+    out->arg_start   = as->arg_start;    out->arg_end    = as->arg_end;
+    out->env_start   = as->env_start;    out->env_end    = as->env_end;
+    as_unlock();
+}
+
+static void as_account(AddrSpace *as) {
+    ProcMem pm;
+    as_procmem(as, &pm);   /* recursive lock: the caller already holds it */
+    proctab_mem_publish(&pm);
+}
+
+/* The same, for the callers outside this file: the ELF loader, which records
+ * the image spans only after the mappings that carried them are already in
+ * place, and the fork path, which seeds its child's slot. */
+void as_publish(AddrSpace *as) {
+    as_lock();
+    as_account(as);
+    as_unlock();
 }
 
 /* Resident bytes of one region, measured on the host backing that IS the
@@ -2055,7 +2089,7 @@ long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
 int guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     as_lock();
     int r = guest_map_anon_impl(as, addr, len, prot);
-    if (r == 0) as_peak_note(as);
+    if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -2064,7 +2098,7 @@ int guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int fd, u64 off,
                    int shared, const char *path) {
     as_lock();
     int r = guest_map_file_impl(as, addr, len, prot, fd, off, shared, path);
-    if (r == 0) as_peak_note(as);
+    if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -2072,6 +2106,7 @@ int guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int fd, u64 off,
 int guest_unmap(AddrSpace *as, u64 addr, u64 len) {
     as_lock();
     int r = guest_unmap_impl(as, addr, len);
+    if (r == 0) as_account(as);   /* shrinks too: the published total must fall */
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -2079,6 +2114,7 @@ int guest_unmap(AddrSpace *as, u64 addr, u64 len) {
 int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     as_lock();
     int r = guest_remap_move_impl(as, addr, len, dst);
+    if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();
     return r;
@@ -2086,7 +2122,7 @@ int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
 int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
     as_lock();
     int r = guest_remap_grow_impl(as, addr, old_len, new_len);
-    if (r == 0) as_peak_note(as);
+    if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();
     return r;
