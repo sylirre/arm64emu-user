@@ -48,6 +48,7 @@ u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len);
 u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va);
 u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt);
 u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va);
+u64 nl_getpeername(CPU *c, u64 addr_va, u64 size_va);
 
 /* Receives on a fake fd (nl_maybe_recvfrom also serves read(2), passed flags 0
  * and no address). Each returns 1 and stores the guest x0 in *ret when a

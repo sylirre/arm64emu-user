@@ -1893,7 +1893,7 @@ check_fixture mmwrap $'mmap_zerolen=22\nmmap_len_align0=12\nmmap_len_huge=12\nmm
 # else in the output. ----
 if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
         tests/fixtures/netns_ack.c 2>/dev/null; then
-    nl_common=$'empty=eagain\nself=own\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data\nfault=efault\nsendfault=ok\naddrfault=ok'
+    nl_common=$'empty=eagain\nself=own\npeer=kernel\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data\nfault=efault\nsendfault=ok\naddrfault=ok'
     for tier in real af_unix; do
         if [ "$tier" = af_unix ]; then
             # The substituted socket has no kernel behind it, so it acks every

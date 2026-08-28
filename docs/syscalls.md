@@ -631,7 +631,14 @@ go wrong:
   port id 0 — as its sender, not the socket itself, since that is how a caller
   tells a kernel reply from a message another socket sent it (glibc's
   `__netlink_request()` discards, then reads past, anything else); a socket
-  naming *itself*, via `getsockname`, still reports its own port id.
+  naming *itself*, via `getsockname`, still reports its own port id, while
+  `getpeername` names its **destination** — port id 0, the kernel — because
+  that is all a netlink socket ever has here: sends ignore the destination
+  address they are handed, `connect` records nothing, and reaching another
+  port would take `CAP_NET_ADMIN` on a real `NETLINK_ROUTE` socket anyway.
+  Answering `getpeername` from `getsockname`, as it once did, reported the
+  socket's own id as its peer's and was a way to tell the substituted tier from
+  a real socket by asking.
 
   A guest pointer the call cannot reach fails it here exactly as it would on
   any other socket, rather than becoming a successful empty operation. The

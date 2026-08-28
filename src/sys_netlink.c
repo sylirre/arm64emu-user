@@ -1487,6 +1487,26 @@ u64 nl_getsockname(CPU *c, u64 addr_va, u64 size_va)
                                         (uint32_t) getpid(), 0, 0);
 }
 
+/* getpeername(2) on a netlink socket names its DESTINATION, not itself:
+ * netlink_getname(peer=1) reports nlk->dst_portid/dst_group, which stay zero
+ * -- the kernel -- until a connect(2) names another port, and naming a
+ * non-zero one on NETLINK_ROUTE needs CAP_NET_ADMIN, so an unprivileged
+ * process sees 0 there whatever it asked for. (There is no ENOTCONN either:
+ * netlink has no connected state to be missing.)
+ *
+ * Zero is right here by construction and not merely by default. This
+ * emulation answers the kernel's own replies and nothing else: nl_sendto
+ * ignores the destination address it is handed, connect(2) on a fake fd
+ * records nothing, and no other port id is reachable through the substitute.
+ * Routing this to nl_getsockname, as it used to, reported the socket's own
+ * port as its peer's -- a guest that read it back saw itself where the kernel
+ * names the kernel, and the substituted tier could be told from a real
+ * netlink socket by asking. */
+u64 nl_getpeername(CPU *c, u64 addr_va, u64 size_va)
+{
+    return (u64)(s64) nl_write_sockname(c, addr_va, size_va, 0, 0, 0);
+}
+
 /* Guest ABI struct ifreq size (LP64): ifr_name[16] + a 24-byte union = 40. We
  * never memcpy a host struct ifreq (32 bytes on an ILP32 host build), so this
  * fixed stride keeps SIOCGIFCONF correct on 64-bit and 32-bit hosts alike. */

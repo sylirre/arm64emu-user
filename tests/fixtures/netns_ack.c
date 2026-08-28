@@ -7,12 +7,13 @@
  * in the host's namespace) with NLMSG_ERROR(-EPERM); the emulator must turn
  * that into a plain ack carrying the request's own sequence number.
  *
- * The socket-shaped checks (empty=, self=, src=) are the ones a guest could
- * use to tell the two tiers apart, so they must answer the same whether a real
- * netlink socket or the AF_UNIX substitute is underneath: an empty receive
+ * The socket-shaped checks (empty=, self=, peer=, src=) are the ones a guest
+ * could use to tell the two tiers apart, so they must answer the same whether a
+ * real netlink socket or the AF_UNIX substitute is underneath: an empty receive
  * queue reports EAGAIN rather than a zero-length message (which rtnetlink never
  * delivers, and which strands every caller that reads a dump until NLMSG_DONE),
- * a reply names the kernel as its sender, and the socket names itself.
+ * a reply names the kernel as its sender, the socket names itself, and it names
+ * the kernel as its peer.
  *
  * Prints one line per check so a failure names itself. Skips silently (with
  * the expected output) where the host hands out no netlink socket at all —
@@ -73,6 +74,24 @@ static const char *sockname(int fd) {
     if (sl != sizeof snl) { snprintf(out, sizeof out, "len%u", sl); return out; }
     if (snl.nl_family != AF_NETLINK) return "family";
     return snl.nl_pid != 0 ? "own" : "kernel";
+}
+
+/* ...and names its PEER as the kernel. getpeername(2) on a netlink socket
+ * reports the destination port, which is zero until a connect(2) names another
+ * one -- and naming a non-zero one on NETLINK_ROUTE needs CAP_NET_ADMIN, so an
+ * unprivileged process never sees anything else. Never the socket's own id,
+ * which is what the substituted tier used to answer with. */
+static const char *peername(int fd) {
+    static char out[64];
+    struct sockaddr_nl snl;
+    socklen_t sl = sizeof snl;
+
+    memset(&snl, 0xaa, sizeof snl);
+    if (getpeername(fd, (struct sockaddr *)&snl, &sl) < 0) return "fail";
+    if (sl != sizeof snl) { snprintf(out, sizeof out, "len%u", sl); return out; }
+    if (snl.nl_family != AF_NETLINK) return "family";
+    if (snl.nl_groups != 0) return "groups";
+    return snl.nl_pid == 0 ? "kernel" : "own";
 }
 
 /* Is @fd readable right now, according to each of the three mechanisms a guest
@@ -421,7 +440,7 @@ int main(void) {
     unsigned src_pid;
     int fd = nl_open();
     if (fd < 0) {   /* no real netlink here: the AF_UNIX fallback answers */
-        printf("empty=skip\nself=skip\nno_netns=skip\nunshare=1\n"
+        printf("empty=skip\nself=skip\npeer=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
                "addrfault=skip\n");
@@ -432,6 +451,7 @@ int main(void) {
      * find the queue empty rather than be handed a message of length zero. */
     printf("empty=%s\n", empty_read(fd));
     printf("self=%s\n", sockname(fd));
+    printf("peer=%s\n", peername(fd));
 
     /* Before any unshare: a refusal must reach the caller untouched. The host
      * may legitimately allow this (running as root), so accept either, but

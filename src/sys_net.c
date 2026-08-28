@@ -326,7 +326,7 @@ SYSDEF(getsockname) {
 }
 
 SYSDEF(getpeername) {
-    if (nl_is_fd(c->m, (int)a0)) return nl_getsockname(c, a1, a2);
+    if (nl_is_fd(c->m, (int)a0)) return nl_getpeername(c, a1, a2);
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getpeername((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
