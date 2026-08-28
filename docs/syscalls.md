@@ -231,12 +231,46 @@ without `openat2` (Android 7 runs 3.x kernels) takes the per-component loop,
 probed once; `A64_PINWALK_FORCE_LOOP` forces that tier so the suite runs the
 race test over both.
 
-The cost is therefore one syscall per resolved path — measured at no detectable
-change on `go build` and `node`, and about 5% on a `find` that does nothing but
-path syscalls (the per-component loop costs 30% there). The other cost is one
-descriptor held across the syscall, which is why `openat` hands its result back
-down to the lowest free number afterwards (`fd_relower`): the guest's fd numbers
-*are* the host's, and `open(2)` promises the lowest free one.
+The other cost is one descriptor held across the syscall, which is why `openat`
+hands its result back down to the lowest free number afterwards (`fd_relower`):
+the guest's fd numbers *are* the host's, and `open(2)` promises the lowest free
+one.
+
+### Resolving optimistically
+
+The walk asks the host one `readlink` per component just to learn that the
+component is **not** a symlink — on the test rootfs, seven per resolved path
+with 96% of them answering "no". Nearly every path a guest names holds no
+symlink at all, so `path_resolve_pin` assumes exactly that: it folds the path
+lexically (`path_walk`'s fast mode — the same fold, the same code, minus the
+readlinks) and then lets **the pin certify the assumption**, since pinning the
+parent is already a walk that refuses to traverse a symlink. If the pin
+succeeds, no component was one, so the fold it was built on is the answer the
+walk would have produced — and the pin the caller needs is in hand. One syscall
+per path, or two where the final component still has to be tested for being a
+symlink.
+
+The kernel makes that judgement, never the fold: a component that *is* a symlink
+comes back `ELOOP` — from `openat2`'s `RESOLVE_NO_SYMLINKS`, or from the loop's
+`O_NOFOLLOW` on a host without it, so this helps an old kernel too — and every
+other doubt falls through to the authoritative walk: a special zone (magic
+links), a mapping through a `--bind` (whose guest-side components lie *above*
+the trusted root the certification starts from, so they would go unchecked), a
+trailing slash, a final symlink, an unpinnable result, any error at all. The
+optimistic route can only ever be a shortcut to the same answer, never a
+different one.
+
+`A64_PATHFAST_OFF` takes the route out, and the suite runs the path-race test
+over both it and the two pin tiers. `A64_PATHFAST_VERIFY` resolves every path
+both ways and aborts on disagreement — a development knob for a *quiescent*
+tree, since the two walks run at different instants and a guest racing its own
+mounts (`tests/fixtures/bindrace.c`) makes them differ for a reason that is not
+a bug; the suite runs one such check over a deliberately quiescent workload.
+
+Net cost of containment, measured against a build from before any of it: `go
+build` and `node` unchanged, and a `find /` that does nothing but path syscalls
+is **30% faster** than it was — 15,049 path syscalls where the original walk
+made 70,572.
 
 What is trusted to be opened by name is the part above the containment area:
 the rootfs directory itself, a `--bind`'s source, a tmpfs backing directory, the

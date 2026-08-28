@@ -909,10 +909,14 @@ static size_t host_trusted_root(struct Machine *m, const char *host, size_t bind
 }
 
 /* `rootlen` (optional) receives that trusted prefix length for the path this
- * produced -- see host_trusted_root. */
+ * produced -- see host_trusted_root. `plain` (optional) is set to 1 only when
+ * the mapping is the bare rootfs prefix: no --bind matched and no special zone
+ * applied, which is what the optimistic walk (path_walk's fast mode) requires
+ * before it may trust a resolution it did not verify component by component. */
 static int canon_to_host(struct Machine *m, const char *canon, char *host_out,
-                         size_t *rootlen) {
+                         size_t *rootlen, int *plain) {
     size_t bindroot = 0;
+    if (plain) *plain = 0;
     int b = bind_match(m, canon, host_out, &bindroot);
     if (b < 0) return b;               /* bound, but the host path will not fit */
     if (b) {
@@ -938,6 +942,7 @@ static int canon_to_host(struct Machine *m, const char *canon, char *host_out,
     }
     int r = to_host(m, canon, host_out);
     if (rootlen) *rootlen = host_trusted_root(m, host_out, 0);
+    if (plain && r == 0) *plain = 1;         /* the bare rootfs prefix */
     return r;
 }
 
@@ -978,7 +983,7 @@ static int path_wants_dir(const char *s) {
 unsigned path_host_root(struct Machine *m, const char *canon) {
     char host[PATH_MAX];
     size_t rl = 0;
-    if (canon_to_host(m, canon, host, &rl) < 0) return 0;
+    if (canon_to_host(m, canon, host, &rl, NULL) < 0) return 0;
     return (unsigned)rl;
 }
 
@@ -1152,7 +1157,7 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
     parent[pl] = 0;
     if (!pl) strcpy(parent, "/");
     size_t rootlen = 0;
-    int cr = canon_to_host(m, parent, parhost, &rootlen);
+    int cr = canon_to_host(m, parent, parhost, &rootlen, NULL);
     if (cr < 0) return cr;                      /* the parent's mapping will not fit */
     if (!rootlen) return 0;                     /* the /proc zone */
 
@@ -1212,8 +1217,29 @@ void path_fd_spell(int fd, char *out) {
     snprintf(out, PATH_MAX, "/proc/self/fd/%d", fd);
 }
 
-int path_resolve(struct Machine *m, int dirfd, const char *gpath,
-                 unsigned flags, char *host_out, char *canon_out) {
+/* Is this canonical guest path inside one of the special zones? The optimistic
+ * walk refuses them: /proc is full of magic links whose targets it has to
+ * splice, and a /dev name can map to one (/dev/stdin -> /proc/self/fd/0). */
+static int zone_prefix(const struct Machine *m, const char *canon) {
+    if (!m->no_dev && !strncmp(canon, "/dev", 4) &&
+        (canon[4] == 0 || canon[4] == '/')) return 1;
+    if (!m->no_proc && !strncmp(canon, "/proc", 5) &&
+        (canon[5] == 0 || canon[5] == '/')) return 1;
+    return 0;
+}
+
+/* The walk. `fast`, when non-NULL, is the optimistic mode (see
+ * path_resolve_pin): the same fold, with the per-component readlink left out on
+ * the assumption that no component is a symlink -- an assumption the caller
+ * then has the KERNEL certify, and which nothing may act on until it has. It
+ * also refuses, by clearing *fast, every path where skipping those readlinks
+ * could change the answer even when the assumption holds: the special zones
+ * (magic links), a mapping through a --bind (whose guest-side components lie
+ * above the trusted root the certification starts from, so they would go
+ * unchecked), and a trailing slash (whose stat would be asking about a path
+ * nothing has verified yet). */
+static int path_walk(struct Machine *m, int dirfd, const char *gpath,
+                     unsigned flags, char *host_out, char *canon_out, int *fast) {
     char canon[PATH_MAX];      /* canonical guest path built so far */
     char rest[PATH_MAX];       /* components still to process */
     char hostbuf[PATH_MAX];
@@ -1266,13 +1292,18 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         int r = canon_push(canon, comp);
         if (r < 0) return r;
 
+        if (fast) {
+            if (zone_prefix(m, canon)) { *fast = 0; return 0; }
+            continue;                     /* assumed: not a symlink */
+        }
+
         /* Follow symlinks (last component only if the caller wants it). A
          * trailing slash overrides that: the kernel follows a final symlink
          * regardless, because the slash demands a directory to enter. */
         if (last && (flags & PATH_NOFOLLOW_LAST) && !want_dir) continue;
         char tgt[PATH_MAX];
         ssize_t tn;
-        r = canon_to_host(m, canon, hostbuf, NULL);
+        r = canon_to_host(m, canon, hostbuf, NULL, NULL);
         if (r < 0) return r;
         /* /proc self-link: splice in the guest target. The zone can be reached
          * under another name -- a sandbox that bound or pivot_root'd the rootfs
@@ -1322,8 +1353,10 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
         if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
     }
 
-    int r = canon_to_host(m, canon, host_out, NULL);   /* -bind > /dev,/proc > rootfs */
+    int plain = 0;
+    int r = canon_to_host(m, canon, host_out, NULL, &plain);   /* -bind > /dev,/proc > rootfs */
     if (r < 0) return r;
+    if (fast && (!plain || want_dir)) { *fast = 0; return 0; }
     if (want_dir) {
         struct stat st;
         if (stat(host_out, &st) == 0) {
@@ -1338,4 +1371,104 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
     }
     if (canon_out) strcpy(canon_out, canon);
     return 0;
+}
+
+int path_resolve(struct Machine *m, int dirfd, const char *gpath,
+                 unsigned flags, char *host_out, char *canon_out) {
+    return path_walk(m, dirfd, gpath, flags, host_out, canon_out, NULL);
+}
+
+/* Resolve a guest path and pin it in one step, taking the optimistic route
+ * where it applies.
+ *
+ * The walk above asks the host one readlink per component just to learn that
+ * the component is NOT a symlink -- on the test rootfs that is seven per
+ * resolved path, 96% of them answering "no". Nearly every path a guest names
+ * holds no symlink at all, so the optimistic route assumes exactly that: it
+ * folds the path lexically (path_walk's fast mode -- the same fold, the same
+ * code, minus the readlinks) and then has the pin CERTIFY the assumption, since
+ * pinning the parent is precisely a walk that refuses to traverse a symlink. If
+ * the pin succeeds, no component was one, so the fold it was built on is the
+ * answer the slow walk would have produced -- and the pin the caller needs is
+ * already in hand. One syscall, or two where the final component still has to
+ * be tested, instead of one per component plus the pin.
+ *
+ * The kernel makes that judgement, not us: a component that IS a symlink comes
+ * back ELOOP (from openat2's RESOLVE_NO_SYMLINKS, or from the loop's
+ * O_NOFOLLOW where that is unavailable -- so this helps an old host too, which
+ * pays the most per component), and every other doubt falls through to the
+ * authoritative walk: a zone, a --bind, a trailing slash, a final symlink, any
+ * error at all. The optimistic route can therefore only ever be a shortcut to
+ * the same answer, never a different one. A64_PATHFAST_OFF takes the route out
+ * entirely, which is how the suite checks that both routes contain a guest
+ * equally.
+ *
+ * A64_PATHFAST_VERIFY runs both and aborts on any disagreement. It is a
+ * development knob for a QUIESCENT tree: the two walks run at different
+ * instants, so a guest that is concurrently mounting or renaming under its own
+ * feet (tests/fixtures/bindrace.c, pathrace.c) makes them disagree for a reason
+ * that is not a bug -- each answer was true when it was taken. */
+static int pathfast_off(void) {
+    static int off = -1;
+    return PROBE_ONCE(off, getenv("A64_PATHFAST_OFF") != NULL);
+}
+static int pathfast_verify(void) {
+    static int v = -1;
+    return PROBE_ONCE(v, getenv("A64_PATHFAST_VERIFY") != NULL);
+}
+
+/* Would the slow walk have looked at the final component, and so possibly
+ * followed it? Then the optimistic route has to look too -- one readlinkat on
+ * the pinned parent -- and give up if it really is a symlink. */
+static int fast_final_ok(const PathPin *p, unsigned flags, const char *gpath) {
+    if ((flags & PATH_NOFOLLOW_LAST) && !path_wants_dir(gpath)) return 1;
+    if (!p->pinned) return 1;                  /* the guest root: no component */
+    char tgt[PATH_MAX];
+    return readlinkat(p->dfd, p->name, tgt, sizeof tgt - 1) < 0;
+}
+
+int path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
+                     unsigned flags, PathPin *pin, char *canon_out) {
+    char canon[PATH_MAX];
+    int fast = !pathfast_off();
+    if (fast) {
+        int r = path_walk(m, dirfd, gpath, flags, pin->host, canon, &fast);
+        /* A pin is what certifies the assumption, so an unpinned answer is an
+         * unchecked one and must not be taken -- the guest root is the one
+         * exception, being the trusted root itself with no component to doubt.
+         * This is also what catches a --bind that appeared between the walk's
+         * mapping and the pin's: the pin then names a different parent, the
+         * identity check inside path_pin fails, and the path falls through to
+         * the walk that will see the mount. */
+        if (r == 0 && fast && path_pin(m, canon, pin->host, pin) == 0 &&
+            (pin->pinned || !strcmp(canon, "/")) &&
+            fast_final_ok(pin, flags, gpath)) {
+            if (pathfast_verify()) {
+                char vhost[PATH_MAX], vcanon[PATH_MAX];
+                int vr = path_walk(m, dirfd, gpath, flags, vhost, vcanon, NULL);
+                if (vr != 0 || strcmp(vhost, pin->host) || strcmp(vcanon, canon)) {
+                    fprintf(stderr,
+                            "arm64chroot: PATHFAST divergence for '%s'\n"
+                            "  fast: canon='%s' host='%s'\n"
+                            "  walk: rc=%d canon='%s' host='%s'\n",
+                            gpath, canon, pin->host,
+                            vr, vr ? "" : vcanon, vr ? "" : vhost);
+                    abort();
+                }
+            }
+            if (canon_out) strcpy(canon_out, canon);
+            return 0;
+        }
+        path_unpin(pin);          /* nothing pinned, or the guess did not hold */
+    }
+    int r = path_walk(m, dirfd, gpath, flags, pin->host, canon, NULL);
+    if (r < 0) {
+        pin->dfd = AT_FDCWD;
+        pin->pinned = 0;
+        pin->name = pin->host;
+        pin->host[0] = 0;
+        return r;
+    }
+    if (canon_out) strcpy(canon_out, canon);
+    return path_pin(m, canon, pin->host, pin);
 }

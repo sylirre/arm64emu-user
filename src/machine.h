@@ -758,6 +758,14 @@ typedef struct {
     char base[256];        /* storage behind `name` when pinned */
 } PathPin;
 
+/* Resolve and pin in one step -- what a syscall handler wants. Takes the
+ * optimistic route where it applies (path.c): nearly every path holds no
+ * symlink, so the walk's per-component readlink can be skipped and the
+ * assumption left for the pin to certify, which is what pinning already does.
+ * Falls through to the plain walk for anything it cannot shortcut. Returns 0 or
+ * -errno; the caller must path_unpin(). */
+int  path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
+                      unsigned flags, PathPin *pin, char *canon_out);
 int  path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p);
 void path_unpin(PathPin *p);
 /* Path spelling of a pinned target for the syscalls with no *at form (the

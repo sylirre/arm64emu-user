@@ -1671,6 +1671,36 @@ done"
     fi
 fi
 
+# ---- the optimistic resolver must answer exactly what the walk answers. It
+# skips the walk's per-component readlink on the assumption that no component is
+# a symlink and has the pin certify that, so a mistake in the fold it builds
+# meanwhile would be a wrong path, not a refused one. A64_PATHFAST_VERIFY runs
+# both routes for every resolution and aborts the process on any disagreement;
+# the workload below is deliberately quiescent (the two walks run at different
+# instants, so a guest racing itself makes them differ for a reason that is not
+# a bug) and covers what the fold has to get right: deep paths, `..`, relative
+# paths through a changed cwd, a symlink chain, a :ro bind, /proc and /dev. ----
+if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
+    vprobe='ls -laR / >/dev/null 2>&1
+            find / -xdev >/dev/null
+            cd /usr/bin && ls ../lib >/dev/null && cd ../../etc && ls ./../etc >/dev/null
+            ln -sf /etc/passwd /tmp/ci_v_lnk && cat /tmp/ci_v_lnk >/dev/null
+            ln -sf /tmp/ci_v_lnk /tmp/ci_v_lnk2 && cat /tmp/ci_v_lnk2 >/dev/null
+            cat /ro/hostname >/dev/null 2>&1
+            cat /proc/self/cmdline >/dev/null; test -e /dev/null
+            rm -f /tmp/ci_v_lnk /tmp/ci_v_lnk2
+            echo routes-agree'
+    got=$(A64_PATHFAST_VERIFY=1 timeout -k 5 180 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
+              /bin/busybox sh -c "$vprobe" 2>&1 | tail -1)
+    rc=$?
+    if [ "$got" = "routes-agree" ] && [ "$rc" = 0 ]; then
+        pass=$((pass+1)); echo "PASS pathfast: optimistic route agrees with the walk"
+    else
+        fail=$((fail+1))
+        echo "FAIL pathfast: optimistic route agrees with the walk (rc=$rc, out='$got')"
+    fi
+fi
+
 # ---- the pinned parent directory must be closed on every path out of a
 # syscall. Containment names a target by a descriptor on its parent rather than
 # by a path (path.c), and a `return` between the pin and the unpin leaks that
@@ -1723,10 +1753,15 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ] && [ -w /tmp ]; then
         echo keep-me > /tmp/a64_toctou_unlinkme
         mkdir -p /tmp/a64_race_rmdir
         cp tests/fixtures/pathrace.bin "$ALPINE/tmp/ci_pathrace"
-        # Both tiers of the pin walk: one openat2, and the per-component loop a
-        # host kernel older than 5.6 is served by.
-        for tier in "" "A64_PINWALK_FORCE_LOOP=1"; do
-            lbl="fixture: pathrace${tier:+ (loop-tier)}"
+        # Every route into the pin: the optimistic resolver over one openat2,
+        # the same over the per-component loop a host kernel older than 5.6 is
+        # served by, and the plain walk with the optimistic route off.
+        for tier in "" "A64_PINWALK_FORCE_LOOP=1" "A64_PATHFAST_OFF=1"; do
+            case $tier in
+                "")                      lbl="fixture: pathrace";;
+                A64_PINWALK_FORCE_LOOP*) lbl="fixture: pathrace (loop-tier)";;
+                *)                       lbl="fixture: pathrace (walk-tier)";;
+            esac
             rm -rf "$ALPINE/a64race"
             got=$(env $tier timeout -k 5 120 "$EMU" "$ALPINE" /tmp/ci_pathrace 2 2>/dev/null)
             planted=$(ls -d /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \

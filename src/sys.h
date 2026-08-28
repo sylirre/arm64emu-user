@@ -120,11 +120,13 @@ static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
  * path_unpin() before it returns. `canon_out` is optional. */
 static inline int resolve_pin(CPU *c, int dirfd, u64 path_va, unsigned rflags,
                               PathPin *pin, char *canon_out) {
-    char canon[PATH_MAX];
-    int r = resolve_at(c, dirfd, path_va, rflags, pin->host, canon);
-    if (r < 0) { pin->dfd = AT_FDCWD; pin->pinned = 0; pin->name = pin->host; return r; }
-    if (canon_out) strcpy(canon_out, canon);
-    return path_pin(c->m, canon, pin->host, pin);
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, path_va, sizeof gpath);
+    if (n < 0) {
+        pin->dfd = AT_FDCWD; pin->pinned = 0; pin->name = pin->host; pin->host[0] = 0;
+        return (int)n;
+    }
+    return path_resolve_pin(c->m, dirfd, gpath, rflags, pin, canon_out);
 }
 
 /* Resolve, pin, and spell the target as a path for the syscalls that have no

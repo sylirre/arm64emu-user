@@ -295,6 +295,14 @@ static void help(void) {
                         "cores, as Android does)."},
         {"A64_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
                         "/proc/sys/kernel/overflow{u,g}id fallback."},
+        {"A64_PATHFAST_OFF", "Resolve every guest path by walking it one "
+                        "component at a time (a readlink each) instead of "
+                        "folding it and letting the pin certify that it held "
+                        "no symlink. Same answers, more syscalls."},
+        {"A64_PATHFAST_VERIFY", "Resolve every guest path BOTH ways and abort "
+                        "on any disagreement. For a quiescent tree: a guest "
+                        "racing its own mounts or renames makes the two walks "
+                        "differ for a reason that is not a bug."},
         {"A64_PINWALK_FORCE_LOOP", "Pin a resolved path's parent directory one "
                         "component at a time instead of in a single openat2 "
                         "(the tier a host kernel older than 5.6 is served by). "
