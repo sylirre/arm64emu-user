@@ -737,6 +737,17 @@ go wrong:
   the expected refusal, are left alone; `MSG_PEEK` keeps the note pending for
   the read that consumes the reply.
 
+  **This is presentation, not isolation, and the distinction matters here more
+  than anywhere else in the emulator.** A faked `CLONE_NEWNET` leaves the
+  guest's `AF_INET`/`AF_INET6` sockets in the host's network namespace: it can
+  still reach the host's loopback services, the local network and the internet,
+  and it now believes it cannot. Nothing in here can change that — an
+  unprivileged process cannot create a network namespace, and refusing the
+  `unshare` instead would only stop the sandbox helpers this exists for. A guest
+  that needs real network isolation has to be given it from outside (a real
+  namespace, a firewall), and README says so where the sandbox support is
+  described.
+
 Limits: one pending note per process (matching upstream), so a guest that
 pipelines two reconfiguring requests before reading either gets the ack only
 for whichever reply it reads first — the sequential request/ack pattern every

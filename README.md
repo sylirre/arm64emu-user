@@ -190,6 +190,18 @@ The rest is emulation, not containment — the sandbox is a rearranged view of
 the same rootfs, and the namespaces it thinks it created do not exist. It is
 enough for helpers that only check whether their setup calls succeeded.
 
+> **Do not treat a faked namespace as a security boundary.** `unshare(2)` and
+> `setns(2)` report success without creating anything, and the one with a
+> visible consequence is `CLONE_NEWNET`: the guest is told it owns a network
+> namespace, and rtnetlink refusals are rewritten into acks so its `ip`
+> commands appear to work, but ordinary `AF_INET`/`AF_INET6` sockets still
+> reach the **host** network exactly as before. A guest that relies on
+> `--unshare-net` (bubblewrap, flatpak) for network isolation does not have it.
+> The isolation this emulator does enforce is the rootfs path containment, the
+> per-rootfs abstract-socket namespace, the guest-visible process set, and
+> guest `seccomp` filters — all of which hold whether or not a namespace was
+> asked for.
+
 ### Fake identity
 
 Option `--fake-id` emulates specific UID and GID in guest environment, by
