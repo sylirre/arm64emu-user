@@ -1689,6 +1689,29 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- syscalls that take a host id the guest supplied. Self-checking:
+# qemu-user forwards every one of them raw, so it answers for the host process
+# (verified: getpgid/getsid/capget/sched_getaffinity all report "ok" under
+# qemu for the emulator's own host parent, and a dynamic CPU clockid reads
+# that process's CPU time). The witness is getppid(), which for the top-level
+# guest process names whatever started the emulator -- a live host process the
+# guest may not see. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/hostprobe.bin \
+            tests/fixtures/hostprobe.c 2>/dev/null; then
+        expect=$'clock-host-proc=EINVAL\nclock-host-thread=EINVAL\nclock-self-proc=ok\nclock-self-thread=ok\nclock-res-host=EINVAL\nclock-monotonic=ok\ngetpgid-host=ESRCH\ngetpgid-self=ok\ngetsid-host=ESRCH\ngetsid-self=ok\nsetpgid-host=ESRCH\naffinity-host=ESRCH\naffinity-self=ok\nsetaffinity-host=ESRCH\ncapget-host=ESRCH\ncapget-self=ok\ndone'
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/hostprobe.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: hostprobe"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: hostprobe"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        fx_rm tests/fixtures/hostprobe.bin
+    else
+        skip_build "fixtures/hostprobe"
+    fi
+fi
+
 # ---- the synthesized /proc must fail closed. Self-checking: qemu-user has no
 # synthesized /proc, so it cannot be the oracle. A64_PROCSYNTH_FORCE_FAIL is the
 # tier a host with neither memfd_create nor a writable directory is served by,

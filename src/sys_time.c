@@ -23,7 +23,31 @@ static int ts_out(CPU *c, u64 va, const struct timespec *ts) {
     return copy_to_guest(c, va, &g, sizeof g) < 0 ? -EFAULT : 0;
 }
 
+/* A NEGATIVE clockid is a dynamic clock, and the value carries the thing it
+ * names -- so the guest is naming something, and it takes the containment
+ * everything else it can name takes.
+ *
+ *   ((~pid) << 3) | which        a task's CPU-time clock
+ *   ((~fd)  << 3) | CLOCKFD(3)   a /dev/ptp descriptor's clock
+ *
+ * with bit 2 of `which` selecting the per-THREAD reading of the id. Forwarded
+ * raw, the first form let a guest read the CPU time any host process has
+ * burned, and -- since a clock naming a process that is not there is EINVAL --
+ * walk the host PID space asking which pids exist, which is exactly what the
+ * hidden-process view and kill(2)'s ESRCH exist to prevent. The fd form needs
+ * nothing: guest fd == host fd, so it can only name a descriptor the guest
+ * already holds. pid 0 is the caller's own. EINVAL is what the kernel answers
+ * for a CPU clock whose task it cannot find. */
+static int clockid_allowed(s32 id) {
+    if (id >= 0) return 1;                       /* CLOCK_REALTIME & friends */
+    if ((id & 7) == 3 /* CLOCKFD */) return 1;   /* names one of our own fds */
+    s32 pid = (s32)~(id >> 3);
+    if (pid == 0) return 1;                      /* this task */
+    return (id & 4 /* PERTHREAD */) ? proctab_has_task(pid) : proctab_has(pid);
+}
+
 SYSDEF(clock_gettime) {
+    if (!clockid_allowed((s32)a0)) return (u64)(s64)-EINVAL;
     struct timespec ts;
     if (clock_gettime((clockid_t)a0, &ts) < 0) return host_err();
     int r = ts_out(c, a1, &ts);
@@ -31,6 +55,7 @@ SYSDEF(clock_gettime) {
 }
 
 SYSDEF(clock_getres) {
+    if (!clockid_allowed((s32)a0)) return (u64)(s64)-EINVAL;
     struct timespec ts;
     if (clock_getres((clockid_t)a0, &ts) < 0) return host_err();
     if (!a1) return 0;
@@ -39,6 +64,7 @@ SYSDEF(clock_getres) {
 }
 
 SYSDEF(clock_nanosleep) {
+    if (!clockid_allowed((s32)a0)) return (u64)(s64)-EINVAL;
     struct timespec req, rem;
     int r = ts_in(c, a2, &req);
     if (r < 0) return (u64)(s64)r;
@@ -237,6 +263,7 @@ SYSDEF(timer_create) {
     /* Claim the slot first: its index is the guest timer id, and the
      * kernel-default notification (NULL sigevent) carries that id in
      * sival_int, so it must exist before the sigevent is built. */
+    if (!clockid_allowed((s32)a0)) return (u64)(s64)-EINVAL;
     int slot = -1;
     for (int i = 0; i < PTIMER_MAX; i++) {
         int free_slot = 0;

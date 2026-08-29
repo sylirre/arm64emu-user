@@ -1891,10 +1891,44 @@ SYSDEF(waitid) {
     }
 }
 
-SYSDEF(setpgid) { return setpgid((pid_t)(s32)a0, (pid_t)(s32)a1) < 0 ? host_err() : 0; }
-SYSDEF(getpgid) { pid_t r = getpgid((pid_t)(s32)a0); return r < 0 ? host_err() : (u64)r; }
+/* The process-group / session calls name a pid the guest supplies, and every
+ * id here is a host id (guest pid == host pid). Forwarded raw, the read side
+ * was a host PID-space probe -- getpgid/getsid answer a value for a live host
+ * process and ESRCH for a dead one, so a guest could walk the pid space and
+ * learn what else is running on the machine, which is what the hidden-process
+ * /proc view and kill(2)'s ESRCH exist to prevent. 0 means "me" and always
+ * passes; anything else has to be a guest process.
+ *
+ * Note what is NOT contained: the value getpgid(0)/getsid(0) reports for this
+ * process is the host's, and stays so. It has to be -- it is the id the guest
+ * hands back to setpgid and to tcsetpgrp, and a shell compares it against
+ * tcgetpgrp -- and it discloses one id rather than a way to enumerate them. */
+static int pid_visible(s32 pid) { return pid == 0 || proctab_has_task(pid); }
+
+SYSDEF(setpgid) {
+    s32 pid = (s32)a0, pgid = (s32)a1;
+    if (!pid_visible(pid)) return (u64)(s64)-ESRCH;
+    /* The group joined is a set the guest becomes signalable as part of (see
+     * owner_allowed in sys_file.c for the same rule): only one a guest process
+     * leads, so it holds guest processes and nothing else. 0 is "the target's
+     * own pid", which is either us or a guest process by the check above. */
+    if (pgid && pgid != (s32)getpid() && !proctab_has(pgid))
+        return (u64)(s64)-EPERM;
+    return setpgid((pid_t)pid, (pid_t)pgid) < 0 ? host_err() : 0;
+}
+SYSDEF(getpgid) {
+    s32 pid = (s32)a0;
+    if (!pid_visible(pid)) return (u64)(s64)-ESRCH;
+    pid_t r = getpgid((pid_t)pid);
+    return r < 0 ? host_err() : (u64)r;
+}
 SYSDEF(setsid)  { pid_t r = setsid(); return r < 0 ? host_err() : (u64)r; }
-SYSDEF(getsid)  { pid_t r = getsid((pid_t)(s32)a0); return r < 0 ? host_err() : (u64)r; }
+SYSDEF(getsid)  {
+    s32 pid = (s32)a0;
+    if (!pid_visible(pid)) return (u64)(s64)-ESRCH;
+    pid_t r = getsid((pid_t)pid);
+    return r < 0 ? host_err() : (u64)r;
+}
 
 /* Namespaces cannot be created in a user-mode chroot, but failing outright
  * breaks sandbox helpers (bubblewrap, flatpak) that only check the return
@@ -2342,7 +2376,11 @@ SYSDEF(sched_getscheduler) {
 }
 
 SYSDEF(sched_getaffinity) {
-    /* Report a single CPU (we interpret on one thread anyway). */
+    /* Report a single CPU (we interpret on one thread anyway). The target is
+     * still a tid the guest supplies, and its neighbours in this family all
+     * refuse one that is not a guest task -- answering for it regardless said
+     * "that task exists" about every host task on the machine. */
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     if (a1 < 8) return (u64)(s64)-EINVAL;
     u64 mask = 1;
     if (copy_to_guest(c, a2, &mask, 8) < 0) return (u64)(s64)-EFAULT;
@@ -2354,6 +2392,7 @@ SYSDEF(sched_setaffinity) {
      * is readable and names at least one CPU in the first 64 -- more than we
      * ever report -- then accept and ignore it. An empty set is EINVAL, as
      * from the kernel. */
+    if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
     size_t len = (size_t)a1 < 8 ? (size_t)a1 : 8;
     u64 mask = 0;
     if (len && copy_from_guest(c, &mask, a2, len) < 0) return (u64)(s64)-EFAULT;

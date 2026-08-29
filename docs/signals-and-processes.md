@@ -401,10 +401,30 @@ That identity cuts both ways: an id the guest supplies addresses **any** host
 task of the invoking user, guest or not. Every syscall that names another task
 by id therefore checks it against the PID registry first (`proctab_has_task`,
 `src/proctab.c`) — `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
-`getpriority`/`setpriority` and the `sched_*setparam`/`*scheduler`/
-`rr_get_interval` family. A host task outside the guest answers **`ESRCH`**, the
-same non-existence the `/proc` view reports for it, rather than `EPERM`, which
-would confirm it is there.
+`getpriority`/`setpriority`, the `sched_*setparam`/`*scheduler`/`*affinity`/
+`rr_get_interval` family, `getpgid`/`setpgid`/`getsid`, and `capget`'s header
+pid. A host task outside the guest answers **`ESRCH`**, the same non-existence
+the `/proc` view reports for it, rather than `EPERM`, which would confirm it is
+there.
+
+A guest-supplied id does not always look like one. A **negative `clockid_t`** is
+a dynamic clock, and the value carries what it names — `((~pid) << 3) | which`
+for a task's CPU-time clock, or `((~fd) << 3) | CLOCKFD` for a `/dev/ptp`
+descriptor's. The first form takes the same containment (`clock_gettime`,
+`clock_getres`, `clock_nanosleep`, `timer_create`; `EINVAL`, which is what the
+kernel answers for a CPU clock whose task it cannot find), since forwarded raw
+it read the CPU time of any host process and walked the host pid space asking
+which pids exist. The second needs none: guest fd **is** host fd, so it can only
+name a descriptor the guest already holds.
+
+A process **group** is a set rather than a task, so the rule differs: `F_SETOWN`
+with a negative id, `F_SETOWN_EX` with `F_OWNER_PGRP`, and `setpgid`'s target
+group are admitted only when a **guest process leads** the group. Membership is
+then knowable — a group holds its leader and the tasks that `setpgid` into it,
+and only a descendant in the same session can do that. Admitting a group because
+*some* guest process was in it admitted the emulator's own host process group,
+the shell pipeline that started it, and `SIGIO`/`SIGURG` went to host processes
+the guest cannot otherwise signal at all.
 
 What counts as a guest task: our own thread group (a process must be able to
 signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`

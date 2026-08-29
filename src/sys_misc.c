@@ -717,12 +717,14 @@ SYSDEF(capget) {
     }
 
     /* The header's pid was ignored outright, so asking about a process that
-     * does not exist reported a capability set for it. Guest pids are host
-     * pids, so the host can answer whether it is there; a pid we exist but may
-     * not signal comes back EPERM, which is not ESRCH and not our concern. */
+     * does not exist reported a capability set for it. Asking the HOST whether
+     * it is there -- kill(pid, 0) -- answered for every task on the machine
+     * instead, which made this a host PID-space probe: ESRCH for a dead one, 0
+     * for a live one, and a guest walking the range learns what else is
+     * running. The guest task set is the answer that matches what kill(2)
+     * itself reports to this guest and what its /proc shows it. */
     if (hdr.pid < 0) return (u64)(s64)-EINVAL;
-    if (hdr.pid && hdr.pid != getpid() &&
-        kill((pid_t)hdr.pid, 0) < 0 && errno == ESRCH)
+    if (hdr.pid && hdr.pid != getpid() && !proctab_has_task(hdr.pid))
         return (u64)(s64)-ESRCH;
 
     if (a1) {
