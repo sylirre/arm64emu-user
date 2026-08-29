@@ -1994,9 +1994,16 @@ SYSDEF(getgroups) {
         n = getgroups(0, NULL);
         if (n < 0) return host_err();
         if (n > 256) n = 256;
-        gid_t g[256];
-        if (a0 != 0) { n = getgroups(n, g); if (n < 0) return host_err(); }
-        for (int i = 0; i < n; i++) gg[i] = g[i];
+        /* The list is only fetched -- and only widened into gg -- when the
+         * guest asked for one. A size query (a0 == 0) leaves g untouched,
+         * so reading it here would be an uninitialized read on the most
+         * ordinary use of this syscall. */
+        if (a0 != 0) {
+            gid_t g[256];
+            n = getgroups(n, g);
+            if (n < 0) return host_err();
+            for (int i = 0; i < n; i++) gg[i] = g[i];
+        }
     }
     if (a0 == 0) return (u64)n;
     if ((int)a0 < n) return (u64)(s64)-EINVAL;
