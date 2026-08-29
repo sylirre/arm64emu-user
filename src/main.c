@@ -264,6 +264,10 @@ static void help(void) {
                         "like uid or uid:gid, default 0:0 (root)."},
         {"    --share-abstract-sockets", "Share abstract namespace sockets "
                         "of the host, disable per-rootfs socket isolation."},
+        {"    --host-keyring", "Forward keyctl/add_key/request_key to the host "
+                        "keyring. They report the facility as absent by default: "
+                        "keyrings are not scoped to a rootfs, so the guest would "
+                        "read, add to and revoke the invoking user's own keys."},
         {"    --keep-fds", "Let the guest inherit the open descriptors above "
                         "stdin/stdout/stderr that the caller left it. They are "
                         "closed before the guest starts by default: guest fd is "
@@ -692,6 +696,7 @@ int main(int argc, char **argv)
             else if (!strcmp(n, "no-proc"))      { if (val) opt_no_value(arg); m->no_proc = 1; }
             else if (!strcmp(n, "share-abstract-sockets")) { if (val) opt_no_value(arg); m->share_abstract = 1; }
             else if (!strcmp(n, "keep-fds"))     { if (val) opt_no_value(arg); m->keep_fds = 1; }
+            else if (!strcmp(n, "host-keyring")) { if (val) opt_no_value(arg); m->host_keyring = 1; }
             else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);

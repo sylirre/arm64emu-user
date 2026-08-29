@@ -799,16 +799,24 @@ SYSDEF(capset) {
     return (u64)(s64)-EPERM;
 }
 
-/* ---- kernel key management. Passes through to the host keyring (the guest
- * process is a host process, so its session keyring works); pointer arguments
- * are bounced through host buffers per operation. Used by PAM (pam_keyinit)
- * for `su -l` and by keyutils.
+/* ---- kernel key management.
+ *
+ * Absent by default: -ENOSYS from all three calls, like a kernel built without
+ * CONFIG_KEYS. The host keyring is not rootfs-scoped and cannot be made so from
+ * in here -- a fresh session keyring could be joined, but the user and
+ * user-session keyrings are per-uid and stay shared whatever we do, and an
+ * absolute key serial names a key directly -- so forwarding let the guest read,
+ * add to and revoke the invoking user's own keys.
+ *
+ * --host-keyring opts back in, for a caller that wants the passthrough (PAM's
+ * pam_keyinit for `su -l`, and keyutils). The guest process is a host process,
+ * so its session keyring works; pointer arguments are bounced through host
+ * buffers per operation.
  *
  * On Bionic (Termux) the Android 8+ app seccomp filter blocks the whole
- * family — a forwarded call raises SIGSYS instead of failing. Report the
- * facility as absent (-ENOSYS), like a kernel built without CONFIG_KEYS;
- * guests degrade the same way. A64_KEYRING_ENOSYS compile-checks that branch
- * on the glibc dev host. ---- */
+ * family -- a forwarded call raises SIGSYS instead of failing -- so there the
+ * option cannot be honoured and the family is absent unconditionally.
+ * A64_KEYRING_ENOSYS compile-checks that branch on the glibc dev host. ---- */
 #if defined(__BIONIC__) || defined(A64_KEYRING_ENOSYS)
 #define KEYRING_ENOSYS 1
 #endif
@@ -822,6 +830,12 @@ SYSDEF(capset) {
 #define G_KEYCTL_CAPABILITIES         30
 
 SYSDEF(keyctl) {
+#ifndef KEYRING_ENOSYS
+    if (!c->m->host_keyring) {   /* the host keyring is not the guest's */
+        (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+        return (u64)(s64)-ENOSYS;
+    }
+#endif
 #ifdef KEYRING_ENOSYS
     (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     return (u64)(s64)-ENOSYS;
@@ -868,6 +882,12 @@ SYSDEF(keyctl) {
 }
 
 SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
+#ifndef KEYRING_ENOSYS
+    if (!c->m->host_keyring) {   /* the host keyring is not the guest's */
+        (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+        return (u64)(s64)-ENOSYS;
+    }
+#endif
 #ifdef KEYRING_ENOSYS
     (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     return (u64)(s64)-ENOSYS;
@@ -896,6 +916,12 @@ SYSDEF(add_key) {   /* (type, desc, payload, plen, keyring) */
 }
 
 SYSDEF(request_key) {   /* (type, desc, callout-or-NULL, keyring) */
+#ifndef KEYRING_ENOSYS
+    if (!c->m->host_keyring) {   /* the host keyring is not the guest's */
+        (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+        return (u64)(s64)-ENOSYS;
+    }
+#endif
 #ifdef KEYRING_ENOSYS
     (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     return (u64)(s64)-ENOSYS;

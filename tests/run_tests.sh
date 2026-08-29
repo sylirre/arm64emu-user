@@ -1506,7 +1506,9 @@ if [ ! -x tests/fixtures/hugecount.bin ] && [ -n "$AGCC" ]; then
 fi
 if [ -x tests/fixtures/hugecount.bin ]; then
     expect=$'huge-sendfile 204800 1\nhuge-splice 1\nhuge-cfr 1\nshort-getrandom 4096 1\nhuge-addkey 1'
-    got=$(timeout -k 5 60 "$EMU" / tests/fixtures/hugecount.bin 2>/dev/null)
+    # --host-keyring: add_key reports the facility absent without it, and this
+    # row is about the count it bounds, which only the passthrough reaches.
+    got=$(timeout -k 5 60 "$EMU" --host-keyring / tests/fixtures/hugecount.bin 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: hugecount"
     else
         fail=$((fail+1)); echo "FAIL fixture: hugecount"
@@ -1686,6 +1688,39 @@ if [ -n "$AGCC" ]; then
         fx_rm tests/fixtures/fcntlcmd.bin
     else
         skip_build "fixtures/fcntlcmd"
+    fi
+fi
+
+# ---- the key-management family is absent unless --host-keyring asks for it.
+# Self-checking: the qemu oracle forwards all three to the host keyring, which
+# is the behaviour being removed. The passthrough row is skipped where the host
+# itself has no keyrings (a kernel without CONFIG_KEYS answers ENOSYS either
+# way, so it cannot tell the two tiers apart). ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/keyring_gate.bin \
+            tests/fixtures/keyring_gate.c 2>/dev/null; then
+        exp_off=$'keyctl=ENOSYS\nadd_key=ENOSYS\nrequest_key=ENOSYS\ndone'
+        got_off=$(timeout -k 5 60 "$EMU" / tests/fixtures/keyring_gate.bin 2>/dev/null)
+        if [ "$got_off" = "$exp_off" ]; then
+            pass=$((pass+1)); echo "PASS fixture: keyring_gate (absent)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: keyring_gate (absent)"
+            diff <(echo "$exp_off") <(echo "$got_off") | head -6 | sed 's/^/     /'
+        fi
+        got_on=$(timeout -k 5 60 "$EMU" --host-keyring / \
+                 tests/fixtures/keyring_gate.bin 2>/dev/null)
+        if [ "$got_on" = "$exp_off" ]; then
+            echo "SKIP keyring_gate (--host-keyring: host has no keyrings)"
+            skip=$((skip+1))
+        elif [ "$got_on" = $'keyctl=present\nadd_key=present\nrequest_key=present\ndone' ]; then
+            pass=$((pass+1)); echo "PASS fixture: keyring_gate (--host-keyring)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: keyring_gate (--host-keyring)"
+            echo "$got_on" | head -4 | sed 's/^/     /'
+        fi
+        fx_rm tests/fixtures/keyring_gate.bin
+    else
+        skip_build "fixtures/keyring_gate"
     fi
 fi
 

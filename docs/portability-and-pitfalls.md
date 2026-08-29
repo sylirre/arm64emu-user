@@ -31,7 +31,8 @@ all four targets.
   wrappers: Bionic's only use whitelisted numbers (e.g. `accept` → `accept4`).
   Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) app seccomp
   allow-list or be `__BIONIC__`-gated to a safe alternative (precedent: the
-  keyring family returns `-ENOSYS` on Bionic). The rule is checked by `make
+  keyring family, which is `-ENOSYS` everywhere unless `--host-keyring` asks
+  for the passthrough, and unconditionally so on Bionic). The rule is checked by `make
   test-seccomp`, which runs the whole differential suite with the emulator under
   a trap filter for the Oreo-blocked set — run by the committed CI on both the
   x86_64 and the arm64 host (see [android-termux.md](android-termux.md)).

@@ -382,6 +382,11 @@ struct Machine {
     u8 share_abstract;        /* --share-abstract-sockets: opt out of per-rootfs
                                * abstract-socket isolation, sharing the host's
                                * global abstract namespace (default: isolate) */
+    u8 host_keyring;          /* --host-keyring: forward the key-management
+                               * syscalls to the host keyring. Off by default:
+                               * keyrings are not rootfs-scoped, so the guest
+                               * would read, add to and revoke the invoking
+                               * user's own keys (see sys_misc.c) */
     u8 keep_fds;              /* --keep-fds: opt out of the startup descriptor
                                * sweep, letting the guest inherit whatever the
                                * caller left open above 0/1/2 (default: close

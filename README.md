@@ -86,6 +86,11 @@ arm64chroot [options] <rootfs> <program> [args...]
       --share-abstract-sockets  Do not isolate abstract-namespace AF_UNIX sockets
                           per rootfs; share the host's global abstract namespace
                           (default: isolate, like pathname sockets)
+      --host-keyring      Forward keyctl/add_key/request_key to the host keyring
+                          (default: report the facility absent, as a kernel built
+                          without CONFIG_KEYS does -- keyrings are not scoped to a
+                          rootfs, so the guest would otherwise read, add to and
+                          revoke the invoking user's own keys)
       --keep-fds          Let the guest inherit the open descriptors above
                           stdin/stdout/stderr that the caller left it (default:
                           close them before the guest starts -- guest fd is host
