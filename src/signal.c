@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
@@ -235,11 +236,18 @@ static void sigq_gate(void *uctx) {
     ucontext_t *uc = uctx;
     /* The kernel's own sigset -- 64 bits on every Linux architecture -- sits
      * at the front of this field whatever width the libc declares for it, and
-     * rt_sigreturn restores the thread's mask from exactly there. (Bionic's
-     * 32-bit sigset_t aliases the 64-bit one in a union; a libc that offers
-     * only the narrow form can express only the low signals, so gate those.) */
+     * rt_sigreturn restores the thread's mask from exactly there. Bionic's
+     * 32-bit sigset_t is four bytes (it aliases the 64-bit one in a union), so
+     * taking the declared width there gated only signals 1..32 -- and the RT
+     * signals a flood is made of are all above that, which is why the gate did
+     * nothing on an armv7 Android device and the queue went back to dropping.
+     * The full width is used wherever the field demonstrably has the room for
+     * it, which is the same thing the kernel already relies on. */
     u64 m = 0;
     size_t w = sizeof uc->uc_sigmask;
+    if (w < sizeof m &&
+        sizeof(ucontext_t) - offsetof(ucontext_t, uc_sigmask) >= sizeof m)
+        w = sizeof m;
     if (w > sizeof m) w = sizeof m;
     memcpy(&m, &uc->uc_sigmask, w);
     u64 gate = 0;
@@ -250,6 +258,24 @@ static void sigq_gate(void *uctx) {
     m |= gate;
     memcpy(&uc->uc_sigmask, &m, w);
     __atomic_fetch_or(&sigq_gated, gate, __ATOMIC_RELAXED);
+}
+
+/* Unblock a set given as the kernel's own 64-bit mask. A libc's sigset_t may
+ * be narrower (Bionic's 32-bit one is four bytes, and its sigaddset refuses
+ * every RT signal), and RT signals are exactly what the gate holds, so the raw
+ * syscall is the only thing that can express the set. */
+static void host_unblock_mask(u64 mask) {
+    if (!mask) return;
+#ifdef SYS_rt_sigprocmask
+    u64 k = mask;
+    if (syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &k, (void *)0, (size_t)8) == 0)
+        return;
+#endif
+    sigset_t s;
+    sigemptyset(&s);
+    for (int i = 1; i <= 64; i++)
+        if (mask & (1ULL << (i - 1))) sigaddset(&s, i);
+    pthread_sigmask(SIG_UNBLOCK, &s, NULL);
 }
 
 /* Ordinary context: open the gate, whatever the queue looks like. The kernel
@@ -266,12 +292,7 @@ static void sigq_ungate_now(void) {
     u64 keep = g_tls.sigmask & ((1ULL << (SIGTTOU - 1)) | (1ULL << (SIGTTIN - 1)) |
                                 (1ULL << (SIGTSTP - 1)));
     host &= ~keep;
-    if (!host) return;
-    sigset_t s;
-    sigemptyset(&s);
-    for (int i = 1; i <= 64; i++)
-        if (host & (1ULL << (i - 1))) sigaddset(&s, i);
-    pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+    host_unblock_mask(host);
 }
 
 /* ...and the same, once there is room for what comes back through it. This is
