@@ -1983,32 +1983,58 @@ SYSDEF(prctl) {
     }
 }
 
+/* getgroups(2). The size query (a0 == 0) is answered from the count alone and
+ * never touches a list buffer, which is also what keeps it from reading one
+ * nothing filled.
+ *
+ * The host's supplementary list has no fixed length -- the kernel's ceiling is
+ * NGROUPS_MAX, 65536 -- so a count that outgrows the stack buffer is fetched
+ * into a heap one. Clamping it to the buffer instead turned a legitimate call
+ * into a failure: the clamped count went to the host as the size of the buffer
+ * it should fill, and the host answers EINVAL for one too small to hold its own
+ * list, so a guest that had asked with room for every group got an error where
+ * the kernel would have handed it the groups. Widening to the guest's u32 gid_t
+ * happens a chunk at a time on the way out, so the length of the list does not
+ * decide how much of it has to be held twice. */
 SYSDEF(getgroups) {
     struct Machine *m = c->m;
-    u32 gg[256];
-    int n;
+    enum { CHUNK = 64 };
+    u32 gg[CHUNK];
+    gid_t sg[CHUNK], *g = sg;
+    int n, got;
+    u64 r;
+
     if (m->fake_id) {
+        /* The faked list is already held in the guest's own u32 form, so it
+         * goes out as it stands -- no host type is involved to convert. */
         n = m->cred.ngroups;
-        for (int i = 0; i < n; i++) gg[i] = m->cred.groups[i];
-    } else {
-        n = getgroups(0, NULL);
-        if (n < 0) return host_err();
-        if (n > 256) n = 256;
-        /* The list is only fetched -- and only widened into gg -- when the
-         * guest asked for one. A size query (a0 == 0) leaves g untouched,
-         * so reading it here would be an uninitialized read on the most
-         * ordinary use of this syscall. */
-        if (a0 != 0) {
-            gid_t g[256];
-            n = getgroups(n, g);
-            if (n < 0) return host_err();
-            for (int i = 0; i < n; i++) gg[i] = g[i];
-        }
+        if (a0 == 0) return (u64)n;
+        if ((int)a0 < n) return (u64)(s64)-EINVAL;
+        if (copy_to_guest(c, a1, m->cred.groups, sizeof(u32) * (size_t)n) < 0)
+            return (u64)(s64)-EFAULT;
+        return (u64)n;
     }
+
+    n = getgroups(0, NULL);
+    if (n < 0) return host_err();
     if (a0 == 0) return (u64)n;
     if ((int)a0 < n) return (u64)(s64)-EINVAL;
-    if (copy_to_guest(c, a1, gg, sizeof(u32) * (size_t)n) < 0) return (u64)(s64)-EFAULT;
-    return (u64)n;
+    if (n > CHUNK) {
+        g = malloc((size_t)n * sizeof *g);
+        if (!g) return (u64)(s64)-ENOMEM;
+    }
+    got = getgroups(n, g);
+    if (got < 0) { r = host_err(); if (g != sg) free(g); return r; }
+
+    r = (u64)got;
+    for (int off = 0; off < got; off += CHUNK) {
+        int k = got - off < CHUNK ? got - off : CHUNK;
+        for (int i = 0; i < k; i++) gg[i] = g[off + i];
+        if (copy_to_guest(c, a1 + (u64)off * sizeof(u32), gg,
+                          sizeof(u32) * (size_t)k) < 0) { r = (u64)(s64)-EFAULT; break; }
+    }
+    if (g != sg) free(g);
+    return r;
 }
 
 SYSDEF(setgroups) {
