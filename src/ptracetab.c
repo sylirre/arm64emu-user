@@ -861,6 +861,19 @@ void ptrace_thread_child_stop(CPU *c) {
 static long ptrace_traceme(CPU *c) {
     if (!g_tab) return -EPERM;
     if (g_self_link) return -EPERM;   /* already traced */
+    /* The parent has to be a guest process. getppid() is the HOST parent, and
+     * for the top-level guest process that is whatever launched the emulator --
+     * a shell, a build system, an init. Recorded as the tracer it became a
+     * signal target: every stop this process later reaches sends that pid a
+     * SIGCHLD and the reserved RT kick (pt_wake_tracer), so a guest program
+     * that called TRACEME and raised SIGSTOP killed the process that started
+     * the emulator. Nothing would ever collect those stops either -- a host
+     * process outside the guest is not running the ptrace protocol. EPERM is
+     * the answer the kernel already gives when a tracing relationship cannot be
+     * established, and it matches the rest of the containment: to this guest
+     * that pid does not exist (kill(2) says ESRCH, /proc hides it). The tracer
+     * side (ATTACH/SEIZE) has always checked the registry this way. */
+    if (!proctab_has((s32)getppid())) return -EPERM;
     PtLink *e = pt_claim((s32)g_tls.tid, (s32)getpid());
     if (!e) return -ENOMEM;
     __atomic_store_n(&e->tracer, (s32)getppid(), __ATOMIC_RELEASE);
