@@ -712,6 +712,53 @@ void guest_fd_ceiling_init(void) {
 
 int guest_fd_ceiling(void) { return g_fd_ceiling; }
 
+/* Every descriptor the caller left open above 0/1/2, closed before the initial
+ * guest exec.
+ *
+ * Guest fd IS host fd here, which is what makes an inherited one a problem
+ * rather than a curiosity: a descriptor the invoking shell forgot to close is
+ * a live, numbered handle onto a host file the rootfs does not contain, the
+ * guest can read and write it without naming a path at all, and /dev/fd/<n> ->
+ * /proc/self/fd/<n> gives it the host path and a way to re-open it. The rest of
+ * the containment has nothing to say about it: no path is resolved, so nothing
+ * is checked.
+ *
+ * The walk is the one exec_close_cloexec uses -- /proc/self/fd, so only the
+ * handful actually open are touched rather than a loop to RLIMIT_NOFILE (2^20
+ * here), with a bounded probe where /proc is unavailable. It stops at
+ * guest_fd_ceiling() for the same reason both other sweeps do: above it sit the
+ * descriptors of whatever is running the emulator (valgrind parks its own
+ * there), which are not ours to close. 0/1/2 are the guest's own stdio and stay.
+ *
+ * --keep-fds opts out, for a caller that is passing a descriptor in on purpose. */
+void guest_fd_close_inherited(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        int dfd = dirfd(d);
+        int pend[64];
+        size_t n = 0;
+        struct dirent *de;
+        /* Collect first, close after: closing during the walk perturbs the
+         * directory stream this walk is reading. The batch is drained whenever
+         * it fills, so an unbounded number of descriptors still costs 64 ints. */
+        while ((de = readdir(d))) {
+            int fd = atoi(de->d_name);
+            if (fd < 3 || fd == dfd || fd >= g_fd_ceiling) continue;
+            pend[n++] = fd;
+            if (n == sizeof pend / sizeof pend[0]) {
+                for (size_t i = 0; i < n; i++) close(pend[i]);
+                n = 0;
+                rewinddir(d);   /* the stream's view of what is left changed */
+            }
+        }
+        for (size_t i = 0; i < n; i++) close(pend[i]);
+        closedir(d);
+        return;
+    }
+    int hi = g_fd_ceiling < 1024 ? g_fd_ceiling : 1024;
+    for (int fd = 3; fd < hi; fd++) close(fd);   /* matches the walks above */
+}
+
 static void exec_close_cloexec(struct Machine *m) {
     int stack[64], *cl = stack;
     size_t n = 0, cap = sizeof stack / sizeof stack[0];

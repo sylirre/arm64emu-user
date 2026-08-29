@@ -382,6 +382,12 @@ struct Machine {
     u8 share_abstract;        /* --share-abstract-sockets: opt out of per-rootfs
                                * abstract-socket isolation, sharing the host's
                                * global abstract namespace (default: isolate) */
+    u8 keep_fds;              /* --keep-fds: opt out of the startup descriptor
+                               * sweep, letting the guest inherit whatever the
+                               * caller left open above 0/1/2 (default: close
+                               * them -- guest fd IS host fd, so an inherited
+                               * one is a live handle onto a host file the
+                               * rootfs does not contain) */
     char abs_tag[16];         /* per-rootfs prefix spliced into guest abstract
                                * AF_UNIX names for isolation (see sys_net.c) */
     u8 abs_tag_len;           /* bytes of abs_tag in use */
@@ -472,6 +478,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
  * initial exec, since the guest may lower its own limit afterwards. */
 void guest_fd_ceiling_init(void);
 int  guest_fd_ceiling(void);
+/* Close every descriptor from 3 up to that ceiling, before any guest code
+ * runs. What the caller left open is a host handle the guest would otherwise
+ * hold by number, and /dev/fd names it. --keep-fds skips this. */
+void guest_fd_close_inherited(void);
 /* Host tasks in a guest process's thread group that are NOT guest threads.
  * "Guest tid == host tid and the emulator spawns no host threads of its own"
  * is assumed wherever the host task list stands in for the guest thread list --

@@ -86,6 +86,11 @@ arm64chroot [options] <rootfs> <program> [args...]
       --share-abstract-sockets  Do not isolate abstract-namespace AF_UNIX sockets
                           per rootfs; share the host's global abstract namespace
                           (default: isolate, like pathname sockets)
+      --keep-fds          Let the guest inherit the open descriptors above
+                          stdin/stdout/stderr that the caller left it (default:
+                          close them before the guest starts -- guest fd is host
+                          fd, so an inherited one is a live handle onto a host
+                          file outside the rootfs)
   -w, --work-dir DIR      Start the guest with this directory as its working
                           directory (a guest path resolved inside the rootfs);
                           default is '/'

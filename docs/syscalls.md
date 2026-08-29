@@ -192,6 +192,24 @@ containment.) `path_resolve` walks the guest path
   about to create the file gets `EISDIR`. A trailing slash also forces a final
   symlink to be followed even for callers that asked not to.
 
+### The descriptors the guest starts with
+
+Containment that only covers paths does not cover a descriptor the caller
+handed over. Guest fd **is** host fd, so an fd the invoking shell forgot to
+close is not a *description* of a host file — it is a live, numbered handle onto
+one that the rootfs does not contain, readable and writable without a path ever
+being resolved, and `/dev/fd/<n>` (which resolves to `/proc/self/fd/<n>`) hands
+over its host path and a way to re-open it. So `main()` closes everything from 3
+up to `guest_fd_ceiling()` before the initial `execve` — the same
+`/proc/self/fd` walk the CLOEXEC sweep and the broker's own shedding use, and
+the same ceiling, since above it sit the descriptors of whatever is running the
+emulator (valgrind parks its own there). `stdin`/`stdout`/`stderr` are the
+guest's own and stay. `--keep-fds` opts out, for a caller passing a descriptor
+in deliberately. Nothing the emulator itself needs survives as a held fd past
+startup either — the same identity is why every internal fd is dropped once its
+mapping exists (the proctab registry, the shm broker) — so there is nothing else
+to spare.
+
 ### The resolved path is a descriptor, not a string
 
 A walk that ends in a host path *string* is only half of containment: the

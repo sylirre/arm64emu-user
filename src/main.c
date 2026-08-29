@@ -264,6 +264,11 @@ static void help(void) {
                         "like uid or uid:gid, default 0:0 (root)."},
         {"    --share-abstract-sockets", "Share abstract namespace sockets "
                         "of the host, disable per-rootfs socket isolation."},
+        {"    --keep-fds", "Let the guest inherit the open descriptors above "
+                        "stdin/stdout/stderr that the caller left it. They are "
+                        "closed before the guest starts by default: guest fd is "
+                        "host fd, so an inherited one is a live handle onto a "
+                        "host file outside the rootfs."},
         {"-w, --work-dir DIR", "Use a given absolute path of the guest as "
                         "current working directory. Default is '/'."},
         {"    --",      "Stop option parsing."},
@@ -686,6 +691,7 @@ int main(int argc, char **argv)
             else if (!strcmp(n, "no-dev"))       { if (val) opt_no_value(arg); m->no_dev = 1; }
             else if (!strcmp(n, "no-proc"))      { if (val) opt_no_value(arg); m->no_proc = 1; }
             else if (!strcmp(n, "share-abstract-sockets")) { if (val) opt_no_value(arg); m->share_abstract = 1; }
+            else if (!strcmp(n, "keep-fds"))     { if (val) opt_no_value(arg); m->keep_fds = 1; }
             else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
@@ -898,6 +904,13 @@ int main(int argc, char **argv)
     /* What execve's CLOEXEC sweep may not close: read now, while the limit is
      * still the one this process started with and no guest code has run. */
     guest_fd_ceiling_init();
+    /* And what the caller left open below it: closed before any guest code can
+     * see it. Guest fd is host fd, so an inherited descriptor is a handle onto
+     * a host file the rootfs does not contain -- readable and writable by
+     * number, with its host path readable through /dev/fd. --keep-fds is for a
+     * caller passing one in deliberately. Everything the emulator itself needs
+     * from here on is a mapping, not a held descriptor (proctab.c). */
+    if (!m->keep_fds) guest_fd_close_inherited();
     /* Likewise for the host tasks in our thread group that are not ours: name
      * them now, while "this process has one thread" is still a fact. Everything
      * that reads the host task list as the guest thread list depends on it. */

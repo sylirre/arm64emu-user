@@ -1689,6 +1689,35 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- descriptors the caller left open must not reach the guest. Guest fd IS
+# host fd, so an inherited one is a live handle onto a host file outside the
+# rootfs -- readable by number, with its host path readable through /dev/fd.
+# Self-checking: qemu-user inherits them exactly as this did. Run twice with
+# fd 7 open on a file outside the rootfs: swept by default, kept under
+# --keep-fds, which is what that option is for. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/inheritfd.bin \
+            tests/fixtures/inheritfd.c 2>/dev/null; then
+        probe=$(mktemp)
+        printf 'host-only payload\n' > "$probe"
+        exp_s=$'fd7-open=0\nfd7-readable=0\nfd7-named=0\nfd7-reopen=0\nstdio=1\nmode=swept\ndone'
+        exp_k=$'fd7-open=1\nfd7-readable=1\nfd7-named=1\nfd7-reopen=1\nstdio=1\nmode=keep\ndone'
+        got_s=$(timeout -k 5 60 "$EMU" / tests/fixtures/inheritfd.bin 7<"$probe" 2>/dev/null)
+        got_k=$(timeout -k 5 60 "$EMU" --keep-fds / tests/fixtures/inheritfd.bin keep 7<"$probe" 2>/dev/null)
+        if [ "$got_s" = "$exp_s" ] && [ "$got_k" = "$exp_k" ]; then
+            pass=$((pass+1)); echo "PASS fixture: inheritfd"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: inheritfd"
+            diff <(echo "$exp_s") <(echo "$got_s") | head -6 | sed 's/^/     /'
+            diff <(echo "$exp_k") <(echo "$got_k") | head -6 | sed 's/^/     /'
+        fi
+        rm -f "$probe"
+        fx_rm tests/fixtures/inheritfd.bin
+    else
+        skip_build "fixtures/inheritfd"
+    fi
+fi
+
 # ---- syscalls that take a host id the guest supplied. Self-checking:
 # qemu-user forwards every one of them raw, so it answers for the host process
 # (verified: getpgid/getsid/capget/sched_getaffinity all report "ok" under
