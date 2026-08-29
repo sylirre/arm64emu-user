@@ -216,7 +216,37 @@ int proc_own_fd_denied(const char *host) {
  * guest target to tgt (>= PATH_MAX) and returns 1; 0 if not magic; negative
  * (an errno) for a guest process we admit exists but have no guest target for —
  * denying is the only safe answer there, since falling through would report the
- * host link, and that names the emulator's own binary and the host cwd. */
+ * host link, and that names the emulator's own binary and the host cwd. The
+ * map_files links are refused outright for the same reason, self included --
+ * see proc_map_files_link. */
+/* Per-task /proc files that describe an address space. Not one of them has a
+ * guest answer that could be read off the host file: the host's describe the
+ * EMULATOR -- its own mappings, at its own foreign-ISA addresses, naming its
+ * binary and its libraries -- and /proc/<pid>/mem is the emulator's memory
+ * itself, readable AND writable through a descriptor the guest asked for by
+ * name. map_files/ is the same view served as a directory of symlinks, and
+ * following one of those hands the guest a host descriptor for whatever the
+ * emulator has mapped, rootfs or not. "maps" is on the list because it is
+ * refused for another process too; for this process it never reaches here,
+ * procfs_open synthesizes it from the guest address space first. */
+int proc_addrspace_leaf(const char *t) {
+    static const char *n[] = {
+        "maps", "smaps", "smaps_rollup", "numa_maps", "pagemap",
+        "stack", "mem", "clear_refs", "syscall",
+    };
+    for (size_t i = 0; i < sizeof n / sizeof n[0]; i++)
+        if (!strcmp(t, n[i])) return 1;
+    return !strncmp(t, "map_files", 9) && (t[9] == 0 || t[9] == '/');
+}
+
+/* The symlink half of that class: /proc/<pid>/map_files/<start>-<end>. The
+ * regular files are refused where they are opened (procfs_open); these have to
+ * be refused during the walk as well, or readlinkat reports the host target and
+ * a following open reaches the host file through it. */
+static int proc_map_files_link(const char *t) {
+    return !strncmp(t, "map_files/", 10) && t[10];
+}
+
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     if (m->no_proc) return 0;   /* --no-proc: no /proc emulation at all */
     if (strncmp(canon, "/proc/", 6)) return 0;
@@ -227,6 +257,7 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
         if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
         if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }
         if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
+        if (proc_map_files_link(tail)) return -EACCES;
         return 0;
     }
 
@@ -236,6 +267,7 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     const char *ot = proc_other_tail(canon, &pid);
     if (!ot) return 0;
     if (pid == (s32)getpid() || !proctab_has(pid)) return 0;
+    if (proc_map_files_link(ot)) return -EACCES;
     if (!strcmp(ot, "root")) { strcpy(tgt, "/"); return 1; }
     int want_exe = !strcmp(ot, "exe"), want_cwd = !strcmp(ot, "cwd");
     if (!want_exe && !want_cwd) return 0;

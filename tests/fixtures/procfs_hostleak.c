@@ -133,6 +133,47 @@ int main(int argc, char **argv) {
     if (self_maps < 0) { printf("own maps unreadable\n"); denied = 0; }
     else close(self_maps);
 
+    /* The same files of THIS process. The deny list used to be applied only to
+     * another guest, so every one of these fell through to the host file --
+     * and /proc/self/mem is not a description of the emulator's address space,
+     * it IS that address space, opened O_RDWR by a guest that asked for it by
+     * name. Only "maps" has a guest answer (synthesized above); the rest have
+     * none, so they are refused here exactly as they are for a sibling. All
+     * three spellings of "this process" reach the same files. */
+    char own[64], owntask[80];
+    snprintf(own, sizeof own, "/proc/%d", (int)getpid());
+    snprintf(owntask, sizeof owntask, "/proc/self/task/%d", (int)getpid());
+    const char *sdirs[3] = { "/proc/self", own, owntask };
+    for (size_t i = 0; i < sizeof as / sizeof as[0]; i++) {
+        if (!strcmp(as[i], "maps")) continue;
+        for (int d = 0; d < 3; d++) {
+            char p[160];
+            snprintf(p, sizeof p, "%s/%s", sdirs[d], as[i]);
+            errno = 0;
+            int fd = open(p, O_RDONLY);
+            if (fd >= 0) { close(fd); printf("READABLE %s\n", p); denied = 0; }
+            else if (errno != EACCES && errno != ENOENT) {
+                printf("UNEXPECTED errno %d for %s\n", errno, p);
+                denied = 0;
+            }
+        }
+    }
+    /* map_files/ is the same view as a directory of symlinks: listing it names
+     * the emulator's mappings, and OPENING one hands back a host descriptor for
+     * whatever it has mapped -- its own binary, its libraries, anything outside
+     * the rootfs. The directory must not open and a link in it must not read. */
+    for (int d = 0; d < 3; d++) {
+        char p[160];
+        snprintf(p, sizeof p, "%s/map_files", sdirs[d]);
+        errno = 0;
+        int fd = open(p, O_RDONLY | O_DIRECTORY);
+        if (fd >= 0) { close(fd); printf("LISTABLE %s\n", p); denied = 0; }
+        char lp[192], t[256];
+        snprintf(lp, sizeof lp, "%s/map_files/400000-401000", sdirs[d]);
+        ssize_t ln = readlink(lp, t, sizeof t - 1);
+        if (ln > 0) { t[ln] = 0; printf("LINKED %s -> %s\n", lp, t); denied = 0; }
+    }
+
     kill(w, SIGKILL);
     waitpid(w, NULL, 0);
 

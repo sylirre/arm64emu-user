@@ -1463,22 +1463,6 @@ static int proc_other_cmdline(const char *canon, s32 *pid) {
     return t && !strcmp(t, "cmdline");
 }
 
-/* Per-process address-space files. Nothing in the registry can synthesize
- * these, and the host's answer describes the *emulator* -- its own mappings, at
- * its own foreign-ISA addresses, naming its binary and its libraries -- so for
- * another guest process they are refused rather than passed through. EACCES is
- * the shape of refusal a host already gives here: reading them needs
- * PTRACE_MODE_READ, which yama's ptrace_scope=1 denies between siblings. */
-static int proc_addrspace_leaf(const char *t) {
-    static const char *n[] = {
-        "maps", "smaps", "smaps_rollup", "numa_maps", "pagemap",
-        "stack", "mem", "clear_refs", "syscall",
-    };
-    for (size_t i = 0; i < sizeof n / sizeof n[0]; i++)
-        if (!strcmp(t, n[i])) return 1;
-    return 0;
-}
-
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
  * sets *ret to a host fd or -errno; returns 0 to fall through to the host. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
@@ -1569,9 +1553,11 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     }
 
     /* Address-space files of ANOTHER guest process: refused, never passed
-     * through (see proc_addrspace_leaf). Only for a pid we admit exists -- a
-     * non-guest one keeps path.c's ENOENT, so this cannot be used to probe
-     * which host pids are real. */
+     * through (see proc_addrspace_leaf in path.c). Only for a pid we admit
+     * exists -- a non-guest one keeps path.c's ENOENT, so this cannot be used
+     * to probe which host pids are real. EACCES is the shape of refusal a host
+     * already gives here: reading them needs PTRACE_MODE_READ, which yama's
+     * ptrace_scope=1 denies between siblings. */
     s32 apid;
     const char *atail = proc_other_tail(canon, &apid);
     if (atail && apid != (s32)getpid() && proc_addrspace_leaf(atail) &&
@@ -1708,6 +1694,17 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         else if (m->fake_userns && !strcmp(tail, "uid_map"))   kind = PF_UIDMAP;
         else if (m->fake_userns && !strcmp(tail, "gid_map"))   kind = PF_GIDMAP;
         else if (m->fake_userns && !strcmp(tail, "setgroups")) kind = PF_SETGROUPS;
+        /* The address-space files of THIS process. The deny above covered only
+         * another guest's, and everything under /proc that is not synthesized
+         * passes through -- so open("/proc/self/mem") handed the guest a
+         * read-write descriptor onto the emulator's own host address space, and
+         * /proc/self/map_files/ handed out host descriptors for everything the
+         * emulator has mapped. Neither is a leak of information the emulator
+         * could have answered differently: there is no guest answer at all for
+         * them, which is exactly why the same refusal is right here. "maps" is
+         * on that list too and never reaches this line -- it is synthesized
+         * above, from the guest address space, which is the whole point. */
+        else if (proc_addrspace_leaf(tail)) { *ret = -EACCES; return 1; }
         else return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS;   /* the /etc/mtab symlink usually lands here */

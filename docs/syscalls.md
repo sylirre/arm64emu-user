@@ -947,8 +947,15 @@ then make the consequences the caller depends on true:
   `clear_refs`, `syscall`) have no registry answer to give, and the host's
   describes the emulator's own mappings at its own foreign-ISA addresses, so
   they are refused with `EACCES` — the same refusal a host running yama
-  `ptrace_scope=1` already gives between siblings. This process's own stay
-  synthesized. Limits: beyond the registry cap extra guest processes fall back
+  `ptrace_scope=1` already gives between siblings. **This process's own are
+  refused the same way**, `maps` excepted: that one is synthesized from the
+  guest address space, and the rest have no guest answer either, so passing them
+  through handed the guest `/proc/self/mem` — not a description of the
+  emulator's address space but that address space itself, opened read-write by
+  name — and `/proc/self/map_files/`, whose symlinks reopen whatever the
+  emulator has mapped, rootfs or not. The `map_files` links are refused during
+  path resolution (`path_proc_magic`), so `readlink` cannot report the host
+  target either. Limits: beyond the registry cap extra guest processes fall back
   to the emulator cmdline and are hidden, and `stat`/`status` memory/state
   fields still describe the emulator process.
 

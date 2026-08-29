@@ -780,8 +780,13 @@ int  path_pin_final(const PathPin *p);
 void path_fd_spell(int fd, char *out);
 
 /* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
- * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic. */
+ * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic;
+ * -errno for a link that must be refused (map_files, see below). */
 int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
+/* Does this per-task /proc tail name an address-space file (maps, smaps, mem,
+ * pagemap, map_files/..., ...)? Their host answers describe the emulator, so
+ * none of them may pass through -- for another guest process or for this one. */
+int proc_addrspace_leaf(const char *tail);
 /* Tail after a "this process" /proc spelling (self, own pid, thread-self, our
  * own task/<tid>), or NULL. */
 const char *proc_self_tail(const char *canon);
