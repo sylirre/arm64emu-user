@@ -141,6 +141,10 @@ for cfile in tests/c/*.c; do
     # host's permissions, not in the emulator. Such a test names what it needs.
     need_read=$(grep -m1 -o 'NEEDS-HOST-READ:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-READ: *//')
     need_ioctl=$(grep -m1 -o 'NEEDS-HOST-IOCTL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-IOCTL: *//')
+    # And what the EMULATOR's own process has to be able to do. Not the same
+    # question: the ARM32 build runs under qemu-user in CI, and qemu-user has
+    # defects a correct emulator cannot route around (hostenv.sh).
+    need_sys=$(grep -m1 -o 'NEEDS-HOST-SYSCALL:[^*]*' "$cfile" | sed 's/^NEEDS-HOST-SYSCALL: *//')
     # What the test needs the ORACLE itself to be able to do. Unlike the two
     # above it gates nothing up front: it is the fallback explanation for a
     # disagreement the host CPU could not arbitrate (diff_verdict).
@@ -166,6 +170,14 @@ for cfile in tests/c/*.c; do
     done
     if [ -n "$denied" ]; then
         skip=$((skip+1)); echo "SKIP c/${base} (host denies:$denied)"; continue
+    fi
+    lacks=
+    for ns in $need_sys; do
+        a64_emu_syscall_ok "$ns" || lacks="$lacks $ns"
+    done
+    if [ -n "$lacks" ]; then
+        skip=$((skip+1))
+        echo "SKIP c/${base} (the emulator's host cannot:$lacks)"; continue
     fi
     # A test needing a specific -march says so in a BUILDFLAGS: marker: the two
     # compilers disagree on how a source file may enable an AArch64 feature, so
@@ -2264,6 +2276,18 @@ fi
 for pt in tests/ptrace/*.c; do
     [ -e "$pt" ] || continue
     ptbin="${pt%.c}.bin"
+    # Same gate as the differential loop: what the emulator's own process must
+    # be able to do for the test to mean anything (hostenv.sh).
+    pt_sys=$(grep -m1 -o 'NEEDS-HOST-SYSCALL:[^*]*' "$pt" | sed 's/^NEEDS-HOST-SYSCALL: *//')
+    pt_lacks=
+    for ns in $pt_sys; do
+        a64_emu_syscall_ok "$ns" || pt_lacks="$pt_lacks $ns"
+    done
+    if [ -n "$pt_lacks" ]; then
+        skip=$((skip+1))
+        echo "SKIP ptrace: $(basename "$pt" .c) (the emulator's host cannot:$pt_lacks)"
+        continue
+    fi
     if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $A64_TESTLIBS 2>/dev/null; then
         skip_build "$pt"; continue
     fi

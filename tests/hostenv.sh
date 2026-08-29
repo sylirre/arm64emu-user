@@ -24,7 +24,8 @@
 # Sets:     AGCC, ORACLE_KIND (qemu|native|none), ORACLE_QEMU, ORACLE_DESC,
 #           ORACLE_GATE, A64_HOST_ARCH, A64_SYSROOT
 # Provides: oracle_run, oracle_run0, oracle_proot, oracle_proot_ok,
-#           host_missing_features, a64_oracle_ioctl_ok
+#           host_missing_features, a64_oracle_ioctl_ok,
+#           a64_emu_syscall_ok
 
 # The suite must behave the same whether or not the host injects an execve
 # shim through LD_PRELOAD (Termux's termux-exec, when enabled, rewrites
@@ -481,6 +482,108 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
         esac
     done
     printf '%s' "${_miss# }"
+}
+
+# ---- emulator-host syscall gating -------------------------------------------
+# A test can be blocked by what the environment the EMULATOR runs in can do,
+# which is not always the same thing as what this machine can do. The ARM32
+# build has no CI runner of its own, so it is exercised under qemu-user
+# (docs/jit.md), and qemu-user is an interposer with defects of its own. Three
+# of them stop correct tests dead, each reproducible in a few lines that never
+# touch the emulator:
+#
+#   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
+#                   (man 2 mremap). qemu-user aborts the process instead --
+#                   "page_set_flags: Assertion `start <= last' failed".
+#   sockopt-timeo   getsockopt(SO_RCVTIMEO) reports optlen 4 and writes
+#                   nothing, where a kernel returns the full struct timeval.
+#   waitid-rusage   waitid(2)'s fifth argument, the rusage no libc exposes, is
+#                   ignored outright; the buffer comes back untouched.
+#
+# A test that needs one says so with a marker line
+#
+#     NEEDS-HOST-SYSCALL: <name> [<name> ...]
+#
+# and is skipped, naming what is missing, where it cannot run. The probe is
+# BUILT AND RUN THE WAY THE EMULATOR IS -- same compiler, same ABI flags, so
+# the same interpreter picks it up -- because the question is what the
+# emulator's own process can do. On an ordinary host, and on real ARM32
+# silicon, every probe passes and every test runs; nothing is gated away on a
+# machine that can actually answer.
+A64_EMU_CC="${A64_EMU_CC:-${CC:-cc}}"
+A64_EMU_CFLAGS="${A64_EMU_CFLAGS:-}"
+
+a64_emu_syscall_src() {   # a64_emu_syscall_src <name> -> C on stdout
+    case "$1" in
+    mremap-dup) cat <<'EOF'
+#define _GNU_SOURCE
+#include <sys/mman.h>
+int main(void) {
+    char *a = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 1;
+    return mremap(a, 0, 4096, MREMAP_MAYMOVE) == MAP_FAILED;
+}
+EOF
+        ;;
+    sockopt-timeo) cat <<'EOF'
+#define _GNU_SOURCE
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+int main(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 1;
+    struct timeval tv = { 1, 250000 }, got;
+    if (setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv)) return 1;
+    memset(&got, 0, sizeof got);
+    socklen_t l = sizeof got;
+    if (getsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &got, &l)) return 1;
+    return !(l == sizeof got && got.tv_sec == 1 && got.tv_usec == 250000);
+}
+EOF
+        ;;
+    waitid-rusage) cat <<'EOF'
+#define _GNU_SOURCE
+#include <signal.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    pid_t k = fork();
+    if (k < 0) return 1;
+    if (k == 0) _exit(0);
+    siginfo_t si;
+    char ru[256];
+    memset(&si, 0, sizeof si);
+    memset(ru, 0xAA, sizeof ru);
+    if (syscall(SYS_waitid, P_PID, k, &si, WEXITED, ru) != 0) return 1;
+    for (unsigned i = 0; i < sizeof ru; i++)
+        if ((unsigned char)ru[i] != 0xAA) return 0;   /* written: capable */
+    return 1;                                        /* untouched: ignored */
+}
+EOF
+        ;;
+    esac
+}
+
+a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
+    _v=$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')
+    eval "_c=\${A64_SYSPROBE_$_v-}"
+    if [ -z "$_c" ]; then
+        _c=yes
+        _s=$(a64_emu_syscall_src "$1")
+        if [ -n "$_s" ]; then
+            _t=$(mktemp -d) || return 0
+            if printf '%s\n' "$_s" | $A64_EMU_CC $A64_EMU_CFLAGS -O1 -x c - \
+                   -o "$_t/probe" 2>/dev/null; then
+                "$_t/probe" >/dev/null 2>&1 || _c=no
+            fi   # cannot build the probe: do not gate on an unasked question
+            rm -rf "$_t"
+        fi
+        eval "A64_SYSPROBE_$_v=\$_c"
+    fi
+    [ "$_c" = yes ]
 }
 
 # ---- host-capability gating -------------------------------------------------

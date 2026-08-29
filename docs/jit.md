@@ -670,3 +670,35 @@ device, both before and after the fix). An emulated tier caught what the
 hardware tier could not. `insnfuzz: chaos` and `seq` pass
 too, and they are the checks that referee the engines against *each other*
 rather than against an oracle.
+
+### What the tier genuinely cannot check
+
+The 44 were all ours, and so were the three FP rows. Three others are not, and
+they are gated rather than chased, because the thing that fails is `qemu-arm`
+itself and no emulator change can route around it. Each is reproducible in a
+few lines that never touch the emulator:
+
+| what | `qemu-arm` | a kernel |
+|---|---|---|
+| `mremap(old_size=0)` on a shareable mapping (`man 2 mremap`) | `page_set_flags: Assertion 'start <= last' failed`, SIGABRT | duplicates the mapping |
+| `getsockopt(SO_RCVTIMEO)` | reports `optlen=4`, writes nothing | returns the full `struct timeval` |
+| `waitid(2)`'s fifth rusage argument | ignored; the buffer comes back untouched | filled |
+
+`tests/c/mremapsem.c`, `tests/c/socktimeo.c` and `tests/ptrace/wait_rusage.c`
+declare what they need with a `NEEDS-HOST-SYSCALL:` marker, and `hostenv.sh`
+answers it by **building and running a probe the way the emulator itself was
+built** — same compiler, same ABI flags, so the same interpreter picks it up.
+The question is what the emulator's own process can do, not what this machine
+can do, and only a probe built that way asks it (`test32`/`test32-jit` pass
+`M32CC` down for exactly this). On an ordinary host, and on real armv7 silicon,
+every probe passes and all three rows run in full; under `qemu-arm` they skip
+naming the missing capability, so the zero-failure gate keeps its meaning
+instead of being read against a baseline again.
+
+The `SO_RCVTIMEO` one paid for itself before it was skipped. Chasing it found
+that the emulator's own conversion for that option used an uninitialized
+`struct timeval` and ignored the length the host reported, so a host that wrote
+a short struct handed the guest whatever was on the emulator's stack — the same
+disclosure shape as the ioctl table's `memset`. A kernel never writes short
+here, so nothing on an ordinary host could show it; `qemu-arm` writes nothing
+at all, and the guest read back a `tv_usec` of 2^32. Fixed separately.

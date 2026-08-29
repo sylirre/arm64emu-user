@@ -6,6 +6,12 @@
  * (LP64 hosts were already right by identity; the ILP32 build is what this
  * test exercises, via make test32).
  *
+ * NEEDS-HOST-SYSCALL: sockopt-timeo
+ * The ILP32 build is exercised under qemu-user, whose getsockopt answers
+ * optlen 4 for this option and writes nothing at all -- so the value the
+ * emulator has to convert never arrives, and no emulator change can conjure
+ * it. See hostenv.sh; on real ARM32 silicon the probe passes and this runs.
+ *
  * NEEDS-ORACLE: so_rcvtimeo
  * The same qemu build that cannot syncfs (see tests/c/mfdsync.c) also loses
  * this roundtrip: set 1.252 s, read back zeroes and a zero length, where the

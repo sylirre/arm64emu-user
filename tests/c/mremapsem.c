@@ -4,7 +4,13 @@
  * writes through to its file, a grown one keeps its protection, and the pages
  * a grow adds to a file mapping are the file's next pages -- not fresh zeros.
  * Backed by a memfd so both sides of the differential see the same file (the
- * oracle runs on the host, the emulator inside a rootfs). */
+ * oracle runs on the host, the emulator inside a rootfs).
+ *
+ * NEEDS-HOST-SYSCALL: mremap-dup
+ * Moving a MAP_SHARED region is done with mremap(old_size=0), the documented
+ * way to duplicate a shareable mapping. qemu-user aborts on it outright
+ * ("page_set_flags: Assertion `start <= last' failed"), so the ARM32 build
+ * cannot be exercised for this under it -- see hostenv.sh. */
 #include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>

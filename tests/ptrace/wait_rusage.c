@@ -9,6 +9,12 @@
  * stack and printed absurd, sometimes negative, times. waitid ignored its fifth
  * argument outright, on every path.
  *
+ * NEEDS-HOST-SYSCALL: waitid-rusage
+ * That fifth argument is also the one qemu-user drops: it ignores it and
+ * leaves the buffer untouched, so under it the guest can only ever be told
+ * zero. The ARM32 build runs there in CI, and the row means nothing until the
+ * host itself will answer -- see hostenv.sh.
+ *
  * Asserted here:
  *
  *   1. a stop fills the buffer -- the poison pattern is gone and the timevals

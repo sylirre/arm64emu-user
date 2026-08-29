@@ -190,7 +190,9 @@ m32_runnable = t=$$(mktemp -d) || exit 1; \
 
 test32:
 	@if $(m32_runnable); then \
-	    $(MAKE) --no-print-directory arm64chroot32 && bash tests/run_tests.sh ./arm64chroot32; \
+	    $(MAKE) --no-print-directory arm64chroot32 && \
+	    A64_EMU_CC="$(M32CC)" A64_EMU_CFLAGS="$(CFLAGS) $(M32FLAGS)" \
+	      bash tests/run_tests.sh ./arm64chroot32; \
 	else \
 	    echo "SKIP test32: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
 	fi
@@ -208,7 +210,8 @@ test32-jit:
 	    sh tests/run_consist.sh ./arm64chroot32; \
 	    printf '#!%s\nexec ./arm64chroot32 --jit "$$@"\n' "$$(command -v sh)" > tests/jit32_emu.sh; \
 	    chmod +x tests/jit32_emu.sh; \
-	    bash tests/run_tests.sh tests/jit32_emu.sh; \
+	    A64_EMU_CC="$(M32CC)" A64_EMU_CFLAGS="$(CFLAGS) $(M32FLAGS)" \
+	      bash tests/run_tests.sh tests/jit32_emu.sh; \
 	    rm -f tests/jit32_emu.sh; \
 	else \
 	    echo "SKIP test32-jit: no runnable 32-bit host toolchain ($(M32CC) $(M32FLAGS))"; \
