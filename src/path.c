@@ -1430,6 +1430,18 @@ static int fast_final_ok(const PathPin *p, unsigned flags, const char *gpath) {
 int path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
                      unsigned flags, PathPin *pin, char *canon_out) {
     char canon[PATH_MAX];
+    /* Unpinned to begin with. The caller hands over a bare `PathPin pin;` off
+     * its stack, and path_pin -- which is what normally establishes the state
+     * below -- is not reached on every route out of the optimistic attempt: the
+     * fold can fail, and it can also decline (a zone, a --bind, a trailing
+     * slash), and both then reach the path_unpin() that gives the route up.
+     * Without this, that unpin closes whatever the caller's stack happened to
+     * hold in `dfd`, which is a live host descriptor whenever the leftover is a
+     * small non-negative number. */
+    pin->dfd = AT_FDCWD;
+    pin->pinned = 0;
+    pin->name = pin->host;
+    pin->host[0] = 0;
     int fast = !pathfast_off();
     if (fast) {
         int r = path_walk(m, dirfd, gpath, flags, pin->host, canon, &fast);

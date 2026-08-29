@@ -88,6 +88,23 @@ int main(void) {
         IGN(setxattr("/ro/passwd", "user.x", "v", 1, 0));
         IGN(utimensat(AT_FDCWD, "/ro/passwd", NULL, 0));
 
+        /* Resolution's optimistic route declines these rather than failing on
+         * them -- a trailing slash and a magic zone are both answers the
+         * lexical fold may not give -- and hands them to the authoritative
+         * walk. That handover releases whatever the fast attempt held, so it
+         * is a route out of the pin like any other, and one no path above
+         * takes. Successful calls, deliberately: the giveup happens before the
+         * syscall's own verdict, so the count must hold for both. */
+        IGN(stat("/etc/", &st));
+        IGN(stat("/nope/nope/", &st));
+        IGN(access("/etc/", R_OK));
+        IGN(stat("/proc/self/status", &st));
+        IGN(stat("/dev/null", &st));
+        int od = open("/etc/", O_RDONLY | O_DIRECTORY);
+        if (od >= 0) close(od);
+        od = open("/dev/null", O_RDONLY);
+        if (od >= 0) close(od);
+
         /* AF_UNIX paths take the same route. */
         struct sockaddr_un un;
         memset(&un, 0, sizeof un);
