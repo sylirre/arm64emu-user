@@ -357,7 +357,12 @@ SYSDEF(sendto) {
     struct sockaddr *dp = NULL;
     int dfd = -1;
     if (a4 && a5) {
-        if (addr_in(c, a4, (u32)a5, &ss, &sl) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+        /* addr_in's own answer, not a blanket EFAULT: an addrlen the kernel
+         * refuses to use (negative, or past sizeof(sockaddr_storage)) is
+         * EINVAL there, and reporting EFAULT for it sends a caller looking at
+         * its pointer instead of its length. bind/connect already pass it on. */
+        int ar = addr_in(c, a4, (u32)a5, &ss, &sl);
+        if (ar < 0) { free(buf); return (u64)(s64)ar; }
         int tr = unix_path_in(c, &ss, &sl, 1, &dfd);
         if (tr < 0) { free(buf); return (u64)(s64)tr; }
         dp = (struct sockaddr *)&ss;

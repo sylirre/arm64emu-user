@@ -218,6 +218,16 @@ int main(void) {
     errno = 0;
     int c_neg = connect(un4, (struct sockaddr *)&sa, (socklen_t)-1) == 0 ? 0 : errno;
     printf("addrlen ok=%d big=%d neg=%d\n", c_ok, c_big, c_neg);
+    /* sendto takes its destination through the same gate, and reported EFAULT
+     * for every refusal of it -- so a caller with an unusable LENGTH was sent
+     * looking at its pointer. */
+    errno = 0;
+    int st_ok = sendto(un4, "x", 1, 0, (struct sockaddr *)&sa, sizeof sin) < 0 ? errno : 0;
+    errno = 0;
+    int st_big = sendto(un4, "x", 1, 0, (struct sockaddr *)&sa, 4096) < 0 ? errno : 0;
+    errno = 0;
+    int st_neg = sendto(un4, "x", 1, 0, (struct sockaddr *)&sa, (socklen_t)-1) < 0 ? errno : 0;
+    printf("sendto-addrlen ok=%d big=%d neg=%d\n", st_ok, st_big, st_neg);
     close(un4);
 
     /* Inside a msghdr the rule differs by one detail: an over-long
