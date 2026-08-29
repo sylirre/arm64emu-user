@@ -214,8 +214,9 @@ typedef struct Region {
     u64  dev, ino;            /* the mapped file's identity, so a later truncate
                                * can find the mappings it invalidates */
     u32  hostmap;             /* backed by a real host mapping OF THE FILE, so a
-                               * page past end-of-file faults; the private
-                               * pread-into-anonymous fallback sets this to 0 */
+                               * page past end-of-file faults. True of every
+                               * file-backed region -- an anonymous one is the
+                               * only kind without it */
     u32  anon_shm;            /* MAP_SHARED|MAP_ANONYMOUS: the backing is a memfd
                                * this emulator made and sized, not a file the
                                * guest named -- so mremap cannot grow it in

@@ -816,7 +816,6 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
         return -EINVAL;
     u8 *host;
     u64 pad = 0;
-    int filemap = 1;   /* cleared by the anonymous pread fallback below */
     if (shared) {
         /* MAP_SHARED must be a real host mapping so stores reach the file.
          * Host prot mirrors guest write permission (host write to a read-only
@@ -843,17 +842,34 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
         void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, host_fd,
                        (off_t)off);
         if (p == MAP_FAILED) {
-            /* Offset not host-page aligned (host page > 4 KB): fall back to an
-             * anonymous copy. */
-            host = host_alloc(len, PROT_READ | PROT_WRITE);
-            if (!host) return -ENOMEM;
-            ssize_t rd = pread(host_fd, host, len, (off_t)off);
-            if (rd < 0) {
-                int e = errno;            /* munmap(2) would overwrite it */
-                munmap(host, len);
-                return -e;
-            }
-            filemap = 0;   /* anonymous copy: no end-of-file to run past */
+            /* Host page > 4 KB (Android 16 KB kernels): the guest's offsets are
+             * only 4 KB aligned and mmap wants host-page alignment, exactly as
+             * in the MAP_SHARED case above -- so take the same way out, a
+             * mapping from the aligned offset below with a padded view on top.
+             *
+             * What this did instead was read the range into anonymous memory
+             * and record the region as not host-mapped, and that is not the
+             * same mapping. A file
+             * mapping may legally extend past end-of-file, and touching a page
+             * wholly beyond it is a bus error; the hole logic below is what
+             * turns that into the guest's SIGBUS. An anonymous copy has no
+             * end-of-file, so those pages read as zeroes instead, and a
+             * mapping that stopped being a mapping of the file could not be
+             * revalidated when the file grew either. It also swallowed every
+             * OTHER mmap failure -- a file the host will not map privately at
+             * all became a silent anonymous copy where the kernel says ENODEV.
+             * So only the alignment case is retried, and its answer is a real
+             * mapping of the file -- which leaves every private file mapping
+             * host-mapped, the way every shared one already was. */
+            if (errno != EINVAL || g_host_pagesz <= (long)GUEST_PAGE_SIZE ||
+                !(off & (u64)(g_host_pagesz - 1)))
+                return -errno;
+            u64 aligned = off & ~(u64)(g_host_pagesz - 1);
+            pad = off - aligned;
+            p = mmap(NULL, len + pad, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                     host_fd, (off_t)aligned);
+            if (p == MAP_FAILED) return -errno;
+            host = (u8 *)p + pad;
         } else host = p;
     }
     region_punch(as, addr, addr + len);
@@ -873,9 +889,9 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
      *
      * Leave those pages out of the page table instead. An access then takes the
      * ordinary translation-fault path, which recognises a hole in a file
-     * mapping and raises the guest's bus error (see raise_dabort). Only a real
-     * host mapping of the file can fault this way; the private
-     * pread-into-anonymous fallback above has no end-of-file. */
+     * mapping and raises the guest's bus error (see raise_dabort). Every file
+     * mapping made here is a real host mapping of the file, shared or private,
+     * so every one of them can fault this way. */
     struct stat fst;
     int have_st = fstat(host_fd, &fst) == 0;
     u64 eof = have_st ? PG_UP((u64)fst.st_size) : 0;
@@ -885,9 +901,9 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                  .path = path ? strdup(path) : NULL, .file_off = off,
                  .dev = have_st ? (u64)fst.st_dev : 0,
                  .ino = have_st ? (u64)fst.st_ino : 0,
-                 .hostmap = (u32)filemap };
+                 .hostmap = 1 };
     region_insert(as, r);
-    if (filemap && have_st && off + len > eof) {
+    if (have_st && off + len > eof) {
         u64 mapped = off < eof ? eof - off : 0;
         if (mapped) pte_set_range(as, addr, mapped, host, prot);
         pte_set_range(as, addr + mapped, len - mapped, NULL, 0);
