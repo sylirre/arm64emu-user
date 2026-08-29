@@ -38,10 +38,22 @@ void cov_load(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cov: cannot open %s\n", path); return; }
     size_t cap = 4096; g_cov = malloc(cap * sizeof(u64)); g_cov_n = 0;
+    if (!g_cov) { fprintf(stderr, "cov: out of memory\n"); fclose(f); return; }
     char line[64];
     while (fgets(line, sizeof line, f)) {
         u64 v = strtoull(line, NULL, 16);
-        if (g_cov_n == cap) { cap *= 2; g_cov = realloc(g_cov, cap * sizeof(u64)); }
+        if (g_cov_n == cap) {
+            /* A short read must leave the set empty rather than half-loaded:
+             * the step hook treats every PC outside it as a divergence, so a
+             * truncated set would report the first PC past the cut. Its guard
+             * is g_cov_n, which zero here disarms. */
+            u64 *grown = realloc(g_cov, cap * 2 * sizeof(u64));
+            if (!grown) {
+                fprintf(stderr, "cov: out of memory\n");
+                free(g_cov); g_cov = NULL; g_cov_n = 0; fclose(f); return;
+            }
+            cap *= 2; g_cov = grown;
+        }
         g_cov[g_cov_n++] = v;
     }
     fclose(f);
