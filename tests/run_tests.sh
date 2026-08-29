@@ -844,7 +844,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/seccomp_probe.bin \
             tests/fixtures/seccomp_probe.c 2>/dev/null; then
         got=$("$EMU" / tests/fixtures/seccomp_probe.bin 2>/dev/null)
-        expect=$'nonnp=-1 1\nnnp=0\nstrict=1 sig=1\nempty=1\nbadinsn=1\nbadflag=1\ninstall=0\nchdir=-1 1\ngetpid_ok=1\nmode=2\ninstall2=0\nwrite99=-1 1\nwrite1=0\nchdir2=-1 1\ninstall3=0\nchdir3=-1 1\ninstall4=0\ntrap sig=1 code=1 nr=1 arch=1 ret=-1 errno=1 data=1\nforked=1\nkilled=1 sig=1\nalu_neg=1\nnoswitch=1\ndone'
+        expect=$'nonnp=-1 1\nnnp=0\nstrict=1 sig=1\nempty=1\nbadinsn=1\nbadflag=1\ndiv0=1\nmod0=1\ninstall=0\nchdir=-1 1\ngetpid_ok=1\nmode=2\ninstall2=0\nwrite99=-1 1\nwrite1=0\nchdir2=-1 1\ninstall3=0\nchdir3=-1 1\ninstall4=0\ntrap sig=1 code=1 nr=1 arch=1 ret=-1 errno=1 data=1\nforked=1\nkilled=1 sig=1\nalu_neg=1\nnoswitch=1\ndone'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: seccomp_probe"
         else
             fail=$((fail+1)); echo "FAIL fixture: seccomp_probe"

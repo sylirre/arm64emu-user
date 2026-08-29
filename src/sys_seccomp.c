@@ -119,6 +119,16 @@ static int bpf_validate(const GSockFilter *f, u32 len) {
             /* A constant shift past the word width is rejected, as there. */
             if ((code == (BPF_ALU | BPF_LSH | BPF_K) ||
                  code == (BPF_ALU | BPF_RSH | BPF_K)) && k >= 32) return -EINVAL;
+            /* And so is a constant division or modulo by zero: it is knowable
+             * at load time, so bpf_check_classic refuses the program rather
+             * than let the interpreter meet it. Accepting it here installed a
+             * filter that looked valid and then killed the thread the first
+             * time that instruction was reached -- the guest heard about its
+             * own broken filter as a death rather than as an EINVAL from
+             * seccomp(2). The BPF_X forms stay runtime checks, as there:
+             * whether X is zero is not knowable until the filter runs. */
+            if ((code == (BPF_ALU | BPF_DIV | BPF_K) ||
+                 code == (BPF_ALU | BPF_MOD | BPF_K)) && k == 0) return -EINVAL;
             break;
         case BPF_JMP | BPF_JA:
             if (k >= len - pc - 1) return -EINVAL;   /* forward, in range */

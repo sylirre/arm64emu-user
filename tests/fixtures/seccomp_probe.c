@@ -104,6 +104,26 @@ int main(void) {
     printf("badinsn=%d\n", r < 0 && errno == EINVAL);
     r = seccomp_(SECCOMP_SET_MODE_FILTER, 1 << 20, &empty);
     printf("badflag=%d\n", r < 0 && errno == EINVAL);
+    /* A constant division or modulo by zero is knowable when the program is
+     * loaded, so bpf_check_classic refuses the program rather than let the
+     * interpreter meet it. Accepted instead, the filter installs and then
+     * kills the thread the first time that instruction is reached -- the
+     * guest hears about its own broken filter as a death. The BPF_X forms
+     * stay legal: whether X is zero is not knowable until the filter runs. */
+    struct sock_filter div0[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_STMT(BPF_ALU | BPF_DIV | BPF_K, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    r = install(div0, 3);
+    printf("div0=%d\n", r < 0 && errno == EINVAL);
+    struct sock_filter mod0[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    r = install(mod0, 3);
+    printf("mod0=%d\n", r < 0 && errno == EINVAL);
 
     /* ERRNO on one syscall; everything else still runs. */
     printf("install=%d\n", install(deny_chdir,
