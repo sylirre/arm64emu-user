@@ -512,14 +512,26 @@ SYSDEF(getsockopt) {
      * tv_sec. Same macro-renumbering note as there. */
     if ((SO_RCVTIMEO != 20 || sizeof(struct timeval) != 16) &&
         (int)a1 == SOL_SOCKET && ((int)a2 == 20 || (int)a2 == 21)) {
+        /* Zeroed before the call, and the length the host reports is what
+         * decides how much of it is real. A kernel always writes the whole
+         * struct here, so trusting it is invisible on a kernel -- but this is
+         * the emulator's own stack, and handing the guest the part of it the
+         * host did not write is the same disclosure the ioctl table's memset
+         * and the SIMD-pair fix exist to prevent. It is not hypothetical: run
+         * the ILP32 build under qemu-user, whose getsockopt reports optlen 4
+         * for this option and writes nothing at all, and the guest read back a
+         * tv_usec of 2^32 -- a leftover from this frame, not a timeout. */
         struct timeval tv;
+        memset(&tv, 0, sizeof tv);
         socklen_t tl = sizeof tv;
         if (getsockopt((int)a0, SOL_SOCKET,
                        (int)a2 == 20 ? SO_RCVTIMEO : SO_SNDTIMEO, &tv, &tl) < 0)
             return host_err();
         u8 g[16];
-        s64 v = (s64)tv.tv_sec;  memcpy(g, &v, 8);
-        v = (s64)tv.tv_usec;     memcpy(g + 8, &v, 8);
+        memset(g, 0, sizeof g);
+        s64 v;
+        if (tl >= sizeof tv.tv_sec) { v = (s64)tv.tv_sec; memcpy(g, &v, 8); }
+        if (tl >= sizeof tv) { v = (s64)tv.tv_usec; memcpy(g + 8, &v, 8); }
         u32 outl = (u32)glen < 16 ? (u32)glen : 16;   /* kernel: len = min(len, lv) */
         if (outl && copy_to_guest(c, a3, g, outl) < 0) return (u64)(s64)-EFAULT;
         if (copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
