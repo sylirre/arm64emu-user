@@ -262,6 +262,12 @@ SYSDEF(timer_create) {
             err = -EFAULT;
         } else switch (g.sigev_notify) {
         case G_SIGEV_THREAD_ID:
+            /* The kernel takes only a thread of the caller's own group here
+             * (good_sigevent; anything else is EINVAL), and our group holds
+             * one task that is not a guest thread wherever an interposer is
+             * underneath us -- struck out of everything the guest is shown, so
+             * a timer must not be armed at it either. Normally an empty set. */
+            if (proc_task_is_foreign((s32)g.sigev_tid)) { err = -EINVAL; break; }
 #ifdef sigev_notify_thread_id
             sev.sigev_notify_thread_id = (pid_t)g.sigev_tid;
 #else

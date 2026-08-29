@@ -2390,7 +2390,15 @@ static int own_thread(s32 tid) {
 int proctab_has_task(s32 tid) {
     if (tid <= 0) return 0;
     s32 self = (s32)getpid();
-    if (tid == self || own_thread(tid)) return 1;
+    if (tid == self) return 1;
+    /* One of our own threads -- as the kernel's pairing rule reports it, which
+     * says the task is in this thread group and nothing more. Our thread group
+     * is not all guest threads either: an interposer keeps a thread of its own
+     * in here (proc_foreign_sample), and this early yes was the one place the
+     * filter below never got to see it, so the guest could name it wherever a
+     * tid is contained -- tkill, an fd owner, the scheduler calls. The set is
+     * process-local and normally empty. */
+    if (own_thread(tid)) return !proc_task_is_foreign(tid);
     s32 tgid = proctab_has(tid) ? tid : proctab_task_tgid(tid);
     if (tgid <= 0 || !proctab_has(tgid)) return 0;
     /* A guest process's host tasks are not all guest threads: an interposer

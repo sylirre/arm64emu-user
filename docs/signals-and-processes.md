@@ -406,12 +406,18 @@ by id therefore checks it against the PID registry first (`proctab_has_task`,
 same non-existence the `/proc` view reports for it, rather than `EPERM`, which
 would confirm it is there.
 
-What counts as a guest task: our own thread group always (a process must be able
-to signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`
+What counts as a guest task: our own thread group (a process must be able to
+signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`
 answers it without a `/proc` read, which is what keeps a Go runtime's per-
-preemption `tgkill` cheap), a registered guest PID, or a thread of one minus the
-non-guest tasks that process published (`proctab_foreign_tasks` — an
-interposer's own threads, which the guest is never shown either).
+preemption `tgkill` cheap), a registered guest PID, or a thread of one — in
+every case **minus** the non-guest tasks that process published
+(`proctab_foreign_tasks` — an interposer's own threads, which the guest is never
+shown either). Our own group is not exempt from that subtraction: the kernel's
+pairing rule proves a tid is in this thread group and proves nothing more, so an
+interposer's thread passed the fast answer and could be named wherever a tid is
+contained — `tkill`, an fd owner, a `SIGEV_THREAD_ID` timer, the scheduler
+calls. The set is process-local and normally empty, so the fast path pays a
+compare against zero.
 
 `kill` with a non-positive pid cannot be handed to the host at all:
 `kill(-1, SIGKILL)` there kills every process of the user — their shell, their

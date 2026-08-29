@@ -317,6 +317,17 @@ SYSDEF(tgkill) {
     if (tgid != (s32)getpid()) {
         if (!proctab_has(tgid) || !proctab_has_task(tid))
             return (u64)(s64)-ESRCH;
+    } else if (proc_task_is_foreign(tid)) {
+        /* The kernel's pairing rule proves the tid is in this thread group, and
+         * that is all it proves: an interposer underneath us keeps a task here
+         * that is not a guest thread, and the guest is never shown it (it is
+         * struck out of /proc/<pid>/task and of Threads:). Naming it anyway --
+         * a hostile guest can simply try every tid -- delivered a guest signal
+         * onto a thread that has no guest state for the capture handler to
+         * push it into. The set is process-local and normally empty, so the
+         * hot path this check sits on (a Go runtime aims a tgkill at a sibling
+         * on every preemption) pays a compare against zero. */
+        return (u64)(s64)-ESRCH;
     }
     if (tid == (s32)g_tls.tid && tgid == getpid()) {
         /* Self thread: route a traced self-stop through ptrace. */

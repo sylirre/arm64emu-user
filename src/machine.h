@@ -483,6 +483,9 @@ int  guest_fd_ceiling(void);
 void proc_foreign_sample(void);              /* main() and the fork child */
 int  proc_foreign_self(const s32 **tids);    /* ours, for the registry publish */
 int  proc_foreign_tasks(s32 pid, s32 *out, int max);   /* count written */
+/* Is `tid` one of THIS process's non-guest host tasks? For the callers that
+ * already know the tid is in our thread group and need to know no more. */
+int  proc_task_is_foreign(s32 tid);
 
 /* Run-loop safepoint: called out of line when m->stop_gen no longer matches
  * this thread's copy. Adopts a newly exec'd image, joins a de_thread

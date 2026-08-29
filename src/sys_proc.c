@@ -871,6 +871,13 @@ static int is_foreign_task(s32 tid) {
     return 0;
 }
 
+/* The same question from outside this file, for the containment checks that
+ * can take the kernel's own thread-group pairing rule as proof the tid is one
+ * of ours -- which it is, and which is exactly why it is not proof the tid is
+ * a GUEST thread (machine.h). Process-local and normally an empty set, so it
+ * costs nothing on the paths that ask on every signal. */
+int proc_task_is_foreign(s32 tid) { return is_foreign_task(tid); }
+
 /* The set for any guest pid: ours first-hand (it is also the one answer that
  * survives a registry the host would not give us), anyone else's from the
  * shared registry, where each process publishes its own. */
