@@ -1286,7 +1286,14 @@ fi
 #                              guest-set mode of leg 4 is the one the broker
 #                              registry holds and not the host's. Without it
 #                              that leg's fchmod simply works here and the
-#                              whole holding path goes untested.
+#                              whole holding path goes untested;
+#   A64_MEMFD_FORCE_FILE       makes the guest's memfds the fallback tier's
+#                              unlinked files, which is what a kernel without
+#                              memfd_create serves -- and that changes what the
+#                              two above are working on: the /proc link names a
+#                              backing file rather than "/memfd:...", so the
+#                              re-open fallback has to recognise it and build
+#                              its snapshot the same way, seals and all.
 # --fake-id because the permission check takes a different branch for a faked
 # identity, and every fallback has to be right in both.
 if [ -x tests/fixtures/ownfdexec.bin ]; then
@@ -1294,22 +1301,27 @@ if [ -x tests/fixtures/ownfdexec.bin ]; then
     for ofx_id in "" "--fake-id"; do
         for ofx_deny in 0 1; do
             for ofx_chmod in 0 1; do
-                ofx_tag="ownfdexec${ofx_id:+ $ofx_id}"
-                ofx_env=""
-                [ "$ofx_deny" = 1 ] && {
-                    ofx_tag="$ofx_tag (path-denied tier)"
-                    ofx_env="$ofx_env A64_OWNFD_FORCE_DENY=1"; }
-                [ "$ofx_chmod" = 1 ] && {
-                    ofx_tag="$ofx_tag (chmod-denied tier)"
-                    ofx_env="$ofx_env A64_MEMFD_CHMOD_FORCE_DENY=1"; }
-                got=$(env $ofx_env timeout -k 5 60 "$EMU" $ofx_id / \
-                          tests/fixtures/ownfdexec.bin 2>/dev/null)
-                if [ "$got" = "$expect" ]; then
-                    pass=$((pass+1)); echo "PASS fixture: $ofx_tag"
-                else
-                    fail=$((fail+1)); echo "FAIL fixture: $ofx_tag"
-                    diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
-                fi
+                for ofx_tier in 0 1; do
+                    ofx_tag="ownfdexec${ofx_id:+ $ofx_id}"
+                    ofx_env=""
+                    [ "$ofx_deny" = 1 ] && {
+                        ofx_tag="$ofx_tag (path-denied tier)"
+                        ofx_env="$ofx_env A64_OWNFD_FORCE_DENY=1"; }
+                    [ "$ofx_chmod" = 1 ] && {
+                        ofx_tag="$ofx_tag (chmod-denied tier)"
+                        ofx_env="$ofx_env A64_MEMFD_CHMOD_FORCE_DENY=1"; }
+                    [ "$ofx_tier" = 1 ] && {
+                        ofx_tag="$ofx_tag (memfd-tier)"
+                        ofx_env="$ofx_env A64_MEMFD_FORCE_FILE=1"; }
+                    got=$(env $ofx_env timeout -k 5 60 "$EMU" $ofx_id / \
+                              tests/fixtures/ownfdexec.bin 2>/dev/null)
+                    if [ "$got" = "$expect" ]; then
+                        pass=$((pass+1)); echo "PASS fixture: $ofx_tag"
+                    else
+                        fail=$((fail+1)); echo "FAIL fixture: $ofx_tag"
+                        diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+                    fi
+                done
             done
         done
     done

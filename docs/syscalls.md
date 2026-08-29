@@ -1122,11 +1122,16 @@ the `/proc/self/fd/N` spelling of the same object, and into `exec_perm_check`
 answering about the host's mode. Unlike the seals it is not monotonic, so
 nothing caches it. `A64_MEMFD_CHMOD_FORCE_DENY=1` forces that tier on any host.
 
-`A64_MEMFD_FORCE_FILE=1` forces the tier on
+`A64_MEMFD_FORCE_FILE=1` forces the file tier on
 any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
 (`(memfd-tier)` rows). `MFD_HUGETLB` is refused (`EINVAL`) on the tier —
-there is nothing to build a hugetlb mapping from on such a host.
+there is nothing to build a hugetlb mapping from on such a host. The two tiers
+compose, and `tests/fixtures/ownfdexec.c` is run over the cross product: the
+descriptor fallback for a re-open has to recognise a tier memfd's backing file
+where it recognised `"/memfd:…"`, and build its sealed snapshot from another
+one — with the seals in the registry, since the host will not refuse a write to
+a plain file.
 
 ## `execve`
 

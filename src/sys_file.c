@@ -666,19 +666,34 @@ static void l2s_fix_fd(int fd, struct stat *st) {
  * Android's SELinux denies opening /proc/self/fd/N when N is a memfd (sealed
  * or not, EACCES), and apk-tools' triggers are scripts in a sealed memfd that
  * the interpreter re-opens exactly that way. Read access can still be granted
- * faithfully: snapshot the contents into a fresh memfd and seal it, so writes
- * keep failing (EPERM, as they would on apk's own sealed original). Gated on
- * the link target actually naming a memfd -- a plain file's EACCES stays the
- * host's answer, keeping normal permission semantics intact. Returns the new
- * fd, or -1 with errno for host_err(). */
-static int own_memfd_reopen(int own, int gflags) {
+ * faithfully: snapshot the contents into a fresh anonymous object and seal it,
+ * so writes keep failing (as they would on apk's own sealed original). Gated
+ * on the link target actually naming a memfd -- a plain file's EACCES stays
+ * the host's answer, keeping normal permission semantics intact.
+ *
+ * BOTH ends of that have to work on a host with no memfd_create, where the
+ * guest's memfds are the fallback tier's unlinked files (sys_misc.c): the link
+ * then names a backing file rather than "/memfd:...", and the snapshot has to
+ * be another such file, whose seals the broker registry holds because the host
+ * cannot. Reading the link into 64 bytes was the other half of that -- a
+ * backing path does not fit, so the tier's own memfds failed the gate on the
+ * spelling alone. *tiered says the returned fd needs the emulator's seal
+ * enforcement, since the host will not refuse a write to a plain file.
+ * Returns the new fd, or -1 with errno for host_err(). */
+static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
 #ifndef F_ADD_SEALS
 #define F_ADD_SEALS (1024 + 9)
 #endif
-    char link[64], tgt[64];
+    char link[64], tgt[PATH_MAX];
+    *tiered = 0;
     snprintf(link, sizeof link, "/proc/self/fd/%d", own);
     ssize_t tn = readlink(link, tgt, sizeof tgt - 1);
-    if (tn < 8 || memcmp(tgt, "/memfd:", 7)) { errno = EACCES; return -1; }
+    if (tn < 8) { errno = EACCES; return -1; }
+    tgt[tn] = 0;
+    if (memcmp(tgt, "/memfd:", 7) && !strstr(tgt, "/a64-memfd.")) {
+        errno = EACCES;
+        return -1;
+    }
     if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & G_O_DIRECTORY)) {
         errno = EACCES;
         return -1;
@@ -690,7 +705,11 @@ static int own_memfd_reopen(int own, int gflags) {
 #else
     int nfd = memfd_create("fdreopen", MFD_ALLOW_SEALING);
 #endif
-    if (nfd < 0) { errno = EACCES; return -1; }
+    if (nfd < 0) {
+        nfd = a64_mfdfile(0);                    /* the tier's own backing */
+        if (nfd < 0) { errno = EACCES; return -1; }
+        *tiered = 1;
+    }
     char buf[65536];
     off_t off = 0;
     for (;;) {
@@ -703,8 +722,21 @@ static int own_memfd_reopen(int own, int gflags) {
         }
         off += rd;
     }
-    /* Seal best-effort: still a correct read-only view if the kernel refuses. */
-    fcntl(nfd, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
+    if (*tiered) {
+        /* Sealed where the seals live for this tier. Without the registry
+         * there is nothing to enforce them, and handing back a writable
+         * snapshot of a sealed original would be worse than refusing. */
+        if (mfdbroker_reg(c->m, nfd, 0xf /* SEAL|SHRINK|GROW|WRITE */,
+                          "fdreopen") < 0) {
+            close(nfd);
+            errno = EACCES;
+            return -1;
+        }
+    } else {
+        /* Seal best-effort: still a correct read-only view if the kernel
+         * refuses. */
+        fcntl(nfd, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
+    }
     if (gflags & O_CLOEXEC) fcntl(nfd, F_SETFD, FD_CLOEXEC);
     return nfd;   /* offset 0, like the re-open the host denied */
 }
@@ -768,10 +800,11 @@ SYSDEF(openat) {
         if (fd >= 0 && dfd >= 0 && fd > dfd) fd = fd_relower(fd, gflags & O_CLOEXEC);
         errno = e;
     }
+    int snap_tiered = 0;
     if (fd < 0 && (errno == EACCES || errno == EPERM)) {
         int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
         int own = proc_own_fd_path(host);
-        if (own >= 0) fd = own_memfd_reopen(own, gflags);
+        if (own >= 0) fd = own_memfd_reopen(c, own, gflags, &snap_tiered);
         else errno = e;
     }
     if (fd >= 0) {
@@ -779,8 +812,9 @@ SYSDEF(openat) {
         /* A path re-open of a tier memfd (through a /proc fd link) hands
          * back a new fd to the sealed inode; the host would let write(2)
          * through where a real memfd's seal forbids it, so class the fd for
-         * the enforcement checks. */
-        if (strstr(host, "/a64-memfd.")) mfd_track_recv(fd);
+         * the enforcement checks. A tier-backed snapshot from the fallback
+         * above is the same case reached the other way. */
+        if (snap_tiered || strstr(host, "/a64-memfd.")) mfd_track_recv(fd);
     }
     return fd < 0 ? host_err() : (u64)fd;
 }
