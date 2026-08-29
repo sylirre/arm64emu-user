@@ -1859,11 +1859,23 @@ static int owner_allowed(s32 id, int pgrp) {
         return owner_allowed(-id, 1);        /* F_SETOWN: -pgid */
     }
     if (!pgrp) return proctab_has_task(id);
-    for (int i = 0, n = proctab_slots(); i < n; i++) {
-        s32 t = proctab_pid_at(i);
-        if (t > 0 && getpgid((pid_t)t) == (pid_t)id) return 1;
-    }
-    return getpgid(0) == (pid_t)id;          /* our own group, registry or not */
+    /* A process group is a SET, and the kernel signals every member of it.
+     * Admitting one because some guest process happened to be in it admitted
+     * the emulator's own host process group -- the shell pipeline that started
+     * it, whose other members are host processes -- and the "our own group,
+     * registry or not" fallback admitted it even when the registry could have
+     * said so. SIGIO/SIGURG then went to processes the guest cannot see and has
+     * no other way to signal (kill(2) walks the registry; these do not).
+     *
+     * The group is admitted here only when a guest process LEADS it, which is
+     * what makes its membership knowable: a group's members are its leader and
+     * the tasks setpgid into it, and only a descendant in the same session can
+     * do that -- so a group led by a guest process holds guest processes. Our
+     * own pid covers the registry being unavailable, and covers the ordinary
+     * case besides: an interactive shell puts each job in its own group, so
+     * the top-level guest process usually leads the group it is in. The IPC
+     * broker daemon setsid()s, so it is never a member of one of these. */
+    return id == (s32)getpid() || proctab_has(id);
 }
 
 SYSDEF(fcntl) {

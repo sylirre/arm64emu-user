@@ -15,12 +15,19 @@
  *    contained like kill(2): our own parent is a live host process outside the
  *    guest and must be refused. F_SETSIG carries a GUEST signal number, which
  *    for 32/33 rides a host carrier (those numbers are the host libc's own);
- *    F_GETSIG must give the guest's number back, not the carrier's. */
+ *    F_GETSIG must give the guest's number back, not the carrier's.
+ *  - A process GROUP owner (the negative spelling) is a whole set of tasks the
+ *    kernel will signal, so it is admitted only when a guest process leads it.
+ *    Admitting it because some guest was a member admitted the group the
+ *    emulator was started in -- a host shell's pipeline. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 static const char *r0(long r) {
     if (r >= 0) return "ok";
@@ -50,6 +57,41 @@ int main(void) {
     printf("setown_ex-host=%s\n", r0(fcntl(fd, F_SETOWN_EX, &ex)));
     ex.type = F_OWNER_PID; ex.pid = getpid();
     printf("setown_ex-self=%s\n", r0(fcntl(fd, F_SETOWN_EX, &ex)));
+
+    /* Process-group owners. The group we were started in is led by whatever
+     * started the emulator: a host shell running a script (so: refused), or
+     * ourselves if that shell gave the job a group of its own (so: allowed).
+     * Both are the same rule, which is what this prints. */
+    pid_t pg0 = getpgrp();
+    long pr = fcntl(fd, F_SETOWN, -(long)pg0);
+    printf("setown-pgrp-initial=%s\n",
+           (pr >= 0) == (pg0 == getpid()) ? "as-expected"
+                                          : (pr >= 0 ? "HOST-GROUP-ALLOWED" : "WRONGLY-REFUSED"));
+    /* A group this process leads. */
+    if (setpgid(0, 0) == 0)
+        printf("setown-pgrp-own=%s\n", r0(fcntl(fd, F_SETOWN, -(long)getpgrp())));
+    else
+        printf("setown-pgrp-own=setpgid-failed\n");
+    /* A group another GUEST process leads: still allowed, since every member
+     * of it is a descendant of that guest process. */
+    int sync[2];
+    if (pipe(sync) == 0) {
+        pid_t kid = fork();
+        if (kid == 0) {
+            setpgid(0, 0);
+            char c = 'g';
+            ssize_t w = write(sync[1], &c, 1); (void)w;
+            pause();
+            _exit(0);
+        }
+        char c = 0;
+        if (kid > 0 && read(sync[0], &c, 1) == 1)
+            printf("setown-pgrp-guest=%s\n", r0(fcntl(fd, F_SETOWN, -(long)kid)));
+        else
+            printf("setown-pgrp-guest=fork-failed\n");
+        if (kid > 0) { kill(kid, SIGKILL); waitpid(kid, NULL, 0); }
+        close(sync[0]); close(sync[1]);
+    }
 
     printf("setsig=%s\n", r0(fcntl(fd, F_SETSIG, 32)));
     printf("getsig=%d\n", fcntl(fd, F_GETSIG));

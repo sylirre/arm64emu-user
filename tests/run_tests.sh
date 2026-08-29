@@ -1676,7 +1676,7 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/fcntlcmd.bin \
             tests/fixtures/fcntlcmd.c 2>/dev/null; then
-        expect=$'unknown=EINVAL\nunknown-hi=EINVAL\nrw_hint=translated\nsetown-host=ESRCH\nsetown-self=ok\ngetown=1\nsetown_ex-host=ESRCH\nsetown_ex-self=ok\nsetsig=ok\ngetsig=32\nsetsig0=ok\ngetsig0=0\nsetsig-bad=EINVAL\npipesz=1\ngetlease=ok\ndone'
+        expect=$'unknown=EINVAL\nunknown-hi=EINVAL\nrw_hint=translated\nsetown-host=ESRCH\nsetown-self=ok\ngetown=1\nsetown_ex-host=ESRCH\nsetown_ex-self=ok\nsetown-pgrp-initial=as-expected\nsetown-pgrp-own=ok\nsetown-pgrp-guest=ok\nsetsig=ok\ngetsig=32\nsetsig0=ok\ngetsig0=0\nsetsig-bad=EINVAL\npipesz=1\ngetlease=ok\ndone'
         got=$(timeout -k 5 120 "$EMU" / tests/fixtures/fcntlcmd.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: fcntlcmd"
         else
