@@ -61,12 +61,20 @@ int main(void) {
     pid_t kid = fork();
     if (kid == 0) {
         close(pfd[0]);
+        /* Block it before saying "ready", and let sigsuspend be the only place
+         * it is unblocked. Otherwise the send races the child's walk from the
+         * write to the sigsuspend: the handler runs in that window, and the
+         * sigsuspend then waits for a second arrival that never comes. A
+         * kernel loses that race too; under emulation the guest walks it two
+         * orders of magnitude slower, and an armv7 device lost it every time. */
+        sigset_t u, old;
+        sigemptyset(&u);
+        sigaddset(&u, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &u, &old);
         signal(SIGUSR1, on_usr1);
         char c = 'r';
         ssize_t w = write(pfd[1], &c, 1);   /* ready */
-        sigset_t all;
-        sigemptyset(&all);
-        sigsuspend(&all);                  /* returns when SIGUSR1 arrives */
+        sigsuspend(&old);                  /* returns when SIGUSR1 arrives */
         c = 'g';
         w = write(pfd[1], &c, 1);
         (void)w;

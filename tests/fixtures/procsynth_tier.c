@@ -10,9 +10,13 @@
  * host mount table, maps its address space. They are denied instead.
  *
  * The host-global views (version, uptime) are the exception on purpose: they
- * carry no guest state, so the host's own answer is the truthful one and still
- * passes through. The run stamps SECRET into the emulator's environment, so a
- * leak of it through any file that IS served is unmistakable. */
+ * carry no guest state, so with no backing to synthesize into, the host's own
+ * answer is the truthful one and they fall through to it instead of being
+ * denied. What that answer is depends on the host -- Android refuses an app
+ * both files, and the guest reads EACCES ("err") there -- so the harness
+ * requires only that the fail-closed rule did not swallow them, i.e. not
+ * ENOENT. The run stamps SECRET into the emulator's environment, so a leak of
+ * it through any file that IS served is unmistakable. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

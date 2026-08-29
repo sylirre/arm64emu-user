@@ -190,6 +190,14 @@ unfiltered:
   `A64_PROCFS_FORCE_OLD` hides exactly those from an ordinary host's /proc so
   the append paths are reachable off the device.
 
+* **`/proc/version` and `/proc/uptime`** are denied to an app outright, which
+  is why both are synthesized. Where there is no anonymous backing to
+  synthesize into (`A64_PROCSYNTH_FORCE_FAIL`), they are the two views that
+  fall through to the host rather than being denied — and on Android the guest
+  then reads the host's EACCES. That is the truthful answer for a pass-through,
+  and what `tests/fixtures/procsynth_tier.c` requires there is only that the
+  fail-closed rule did not swallow them.
+
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
 

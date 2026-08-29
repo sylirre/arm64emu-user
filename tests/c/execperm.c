@@ -43,6 +43,22 @@ static int write_file(const char *path, const void *data, size_t len, mode_t mod
 int main(int argc, char **argv) {
     if (argc > 1) { printf("child ran\n"); return 0; }
 
+    /* Somewhere writable to put the two images, and a directory to try to
+     * execute. /tmp where it exists; the working directory where it does not
+     * -- Android has no /tmp, and hardcoding it made this row report "setup
+     * failed" on a device where the emulator was fine. The choice is made by
+     * the test itself rather than handed to it, because the guest does not
+     * inherit the host environment and both sides of the comparison have to
+     * make the same one. Only errnos are printed, so the spelling never
+     * reaches the output and a recorded answer stays valid either way. */
+    const char *tmp = "/tmp";
+    { int probe = open("/tmp/.xp_probe", O_CREAT | O_WRONLY, 0600);
+      if (probe < 0) tmp = ".";
+      else { close(probe); unlink("/tmp/.xp_probe"); } }
+    char pscript[512], pelf[512];
+    snprintf(pscript, sizeof pscript, "%s/xp_script", tmp);
+    snprintf(pelf, sizeof pelf, "%s/xp_elf", tmp);
+
     /* Control: an executable image still runs. Its own environment goes with
      * it -- the oracle side is reached through the host's binfmt handler,
      * which needs what it was given to find the guest's loader. */
@@ -51,28 +67,28 @@ int main(int argc, char **argv) {
 
     /* A script the guest may read but not execute. */
     static const char script[] = "#!/bin/sh\nexit 0\n";
-    if (write_file("/tmp/xp_script", script, sizeof script - 1, 0644) != 0) {
+    if (write_file(pscript, script, sizeof script - 1, 0644) != 0) {
         printf("setup failed\n"); return 1;
     }
-    char *const sargv[] = { (char *)"/tmp/xp_script", NULL };
-    try_exec("noexec-script", "/tmp/xp_script", sargv, noenv);
+    char *const sargv[] = { pscript, NULL };
+    try_exec("noexec-script", pscript, sargv, noenv);
 
     /* An ELF the guest may read but not execute: permission is decided before
      * anything is loaded, so the header need not be a real image. */
     static const char elf[] = "\177ELF\2\1\1";
-    if (write_file("/tmp/xp_elf", elf, sizeof elf - 1, 0644) != 0) {
+    if (write_file(pelf, elf, sizeof elf - 1, 0644) != 0) {
         printf("setup failed\n"); return 1;
     }
-    char *const eargv[] = { (char *)"/tmp/xp_elf", NULL };
-    try_exec("noexec-elf", "/tmp/xp_elf", eargv, noenv);
+    char *const eargv[] = { pelf, NULL };
+    try_exec("noexec-elf", pelf, eargv, noenv);
 
     /* Nothing but a regular file is executable, however permissive its mode. */
-    char *const dargv[] = { (char *)"/tmp", NULL };
-    try_exec("dir", "/tmp", dargv, noenv);
+    char *const dargv[] = { (char *)tmp, NULL };
+    try_exec("dir", tmp, dargv, noenv);
     char *const nargv[] = { (char *)"/dev/null", NULL };
     try_exec("devnull", "/dev/null", nargv, noenv);
 
-    unlink("/tmp/xp_script");
-    unlink("/tmp/xp_elf");
+    unlink(pscript);
+    unlink(pelf);
     return 0;
 }

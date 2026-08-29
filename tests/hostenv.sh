@@ -420,6 +420,19 @@ if [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ]; then
     done
 fi
 
+# ---- scratch directory for fixtures that make their own files ----------------
+# A self-checking fixture (no oracle) needs somewhere writable to work in, but
+# not the shared /tmp spelling the recorded answers are keyed by: nothing
+# compares its paths against another environment's. Hardcoding /tmp made those
+# fail outright on Android, which has none -- bindrace reported "setup failed"
+# on a device where the emulator was fine. They take this directory instead.
+A64_SCRATCH=/tmp
+if [ "$A64_HOST_TMP" = 0 ]; then
+    for _d in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
+        [ -n "$_d" ] && [ -w "$_d" ] && { A64_SCRATCH="$_d"; break; }
+    done
+fi
+
 # ---- link libraries the guest compiler actually has --------------------------
 # -lm -lpthread are right for glibc and for a cross sysroot, and wrong for
 # Bionic, where both live in libc and the standalone archives may not exist at

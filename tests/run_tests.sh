@@ -735,12 +735,13 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/bindrace.bin \
             tests/fixtures/bindrace.c $A64_TESTLIBS 2>/dev/null; then
         expect="resolved=1 wrong=0 garbage=0"
-        got=$(timeout -k 5 120 "$EMU" --fake-id / tests/fixtures/bindrace.bin 2>/dev/null)
+        got=$(timeout -k 5 120 "$EMU" --fake-id / tests/fixtures/bindrace.bin \
+              "$A64_SCRATCH" 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: bindrace"
         else
             fail=$((fail+1)); echo "FAIL fixture: bindrace (want '$expect' got '$got')"
         fi
-        rm -rf /tmp/a64bindrace
+        rm -rf "$A64_SCRATCH/a64bindrace"
         fx_rm tests/fixtures/bindrace.bin
     else
         skip_build "fixtures/bindrace"
@@ -913,12 +914,48 @@ fi
 # server alike. Before the L2 tables were freed on emptying, 900 extra 16 MB
 # mappings cost ~28 MB here; now it is flat. tests/maxrss.c does the wait4,
 # since /usr/bin/time is not portable enough to lean on. ----
+# One sample of a peak is not a measurement: on the armv7 device the SAME run
+# lands on either ~19.4 MB or ~27.6 MB whatever the mapping count, so a single
+# pair could differ by the whole threshold with nothing wrong. Upward noise is
+# all a peak-RSS sample can add, so the smallest of a few runs is the figure
+# actually attributable to the run -- and the minimum still moves by ~28 MB
+# under the regression this exists to catch.
+rss_min() {   # rss_min <runs> <args...>
+    local n="$1"; shift
+    local best="" v i=0
+    while [ "$i" -lt "$n" ]; do
+        v=$(./tests/maxrss.bin "$EMU" / "$@" 2>/dev/null)
+        if [ -n "$v" ] && { [ -z "$best" ] || [ "$v" -lt "$best" ]; }; then
+            best="$v"
+        fi
+        i=$((i+1))
+    done
+    echo "$best"
+}
+# The pair, measured cheaply and re-measured before it is believed: a peak-RSS
+# sample can only come out too HIGH, so a growth that looks real is the one
+# case worth spending more samples on, and a run that is going to pass pays
+# three apiece. 15 samples make the armv7 device's ~0.7 chance of landing high
+# a ~0.5% chance of doing it every time.
+vachurn_pair() {   # vachurn_pair [extra fixture args...] -> "<lo> <hi>"
+    local lo hi lo2 hi2
+    lo=$(rss_min 3 tests/fixtures/vachurn.bin 100 "$@")
+    hi=$(rss_min 3 tests/fixtures/vachurn.bin 1000 "$@")
+    if [ -n "$lo" ] && [ -n "$hi" ] && [ $((hi - lo)) -ge 8192 ]; then
+        lo2=$(rss_min 12 tests/fixtures/vachurn.bin 100 "$@")
+        hi2=$(rss_min 12 tests/fixtures/vachurn.bin 1000 "$@")
+        [ -n "$lo2" ] && [ "$lo2" -lt "$lo" ] && lo=$lo2
+        [ -n "$hi2" ] && [ "$hi2" -lt "$hi" ] && hi=$hi2
+    fi
+    echo "$lo $hi"
+}
 if [ -n "$AGCC" ] && [ -n "$HCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/vachurn.bin \
             tests/fixtures/vachurn.c $A64_TESTLIBS 2>/dev/null &&
        "$HCC" -O2 -o tests/maxrss.bin tests/maxrss.c 2>/dev/null; then
-        lo=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 100 2>/dev/null)
-        hi=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 1000 2>/dev/null)
+        read -r lo hi <<EOF
+$(vachurn_pair)
+EOF
         if [ -n "$lo" ] && [ -n "$hi" ]; then
             grew=$((hi - lo))
             # 900 extra mappings; 8 MB allows ~9 kB of slack apiece against a
@@ -939,8 +976,9 @@ if [ -n "$AGCC" ] && [ -n "$HCC" ]; then
         # asks whether that release still happens for a thread count past what
         # the epoch table used to hold -- a thread it cannot account for must
         # hold the quarantine shut, which is safe and reclaims nothing at all.
-        lo=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 100 300 2>/dev/null)
-        hi=$(./tests/maxrss.bin "$EMU" / tests/fixtures/vachurn.bin 1000 300 2>/dev/null)
+        read -r lo hi <<EOF
+$(vachurn_pair 300)
+EOF
         if [ -n "$lo" ] && [ -n "$hi" ]; then
             grew=$((hi - lo))
             # 32 touched pages per mapping: a quarantine that never drains shows
@@ -1662,9 +1700,18 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/procsynth_tier.bin \
             tests/fixtures/procsynth_tier.c 2>/dev/null; then
-        pst_run() {   # pst_run <label> <expected-verdict> [env...]
-            local label="$1" want="$2"; shift 2
-            local expect got
+        # <label> <per-process verdict> <host-global rule> [env...]. The
+        # per-process files are compared exactly. The two host-global ones are
+        # not: with a backing they are synthesized like the rest ("served"),
+        # and without one they are the exception that falls through to the host
+        # file instead of being denied -- so what the guest sees there is the
+        # host's own answer, and a host may well refuse it. Android denies an
+        # app /proc/version and /proc/uptime outright, and the guest then reads
+        # EACCES ("err"). The claim that check exists to make is that our
+        # fail-closed rule did not swallow them, which is exactly "not ENOENT".
+        pst_run() {
+            local label="$1" want="$2" hostrule="$3"; shift 3
+            local expect got rest vu bad
             expect="environ=$want
 cmdline=$want
 auxv=$want
@@ -1673,20 +1720,27 @@ mounts=$want
 mountinfo=$want
 limits=$want
 status=$want
-version=served
-uptime=served
 leak=0
 done"
             got=$(env SECRET=emulator-only "$@" timeout -k 5 120 "$EMU" / \
                   tests/fixtures/procsynth_tier.bin 2>/dev/null)
-            if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: procsynth_tier ($label)"
+            rest=$(echo "$got" | grep -v '^version=\|^uptime=')
+            bad=
+            [ "$rest" = "$expect" ] || bad="lines"
+            for vu in $(echo "$got" | grep '^version=\|^uptime=' | sed 's/.*=//'); do
+                case "$hostrule" in
+                served)   [ "$vu" = served ] || bad="${bad:+$bad,}version/uptime=$vu (want served)" ;;
+                passthru) [ "$vu" != ENOENT ] || bad="${bad:+$bad,}version/uptime denied (want the host's own answer)" ;;
+                esac
+            done
+            if [ -z "$bad" ]; then pass=$((pass+1)); echo "PASS fixture: procsynth_tier ($label)"
             else
-                fail=$((fail+1)); echo "FAIL fixture: procsynth_tier ($label)"
-                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+                fail=$((fail+1)); echo "FAIL fixture: procsynth_tier ($label) [$bad]"
+                diff <(echo "$expect") <(echo "$rest") | head -8 | sed 's/^/     /'
             fi
         }
-        pst_run "normal" served
-        pst_run "no-anonfd tier" ENOENT A64_PROCSYNTH_FORCE_FAIL=1
+        pst_run "normal" served served
+        pst_run "no-anonfd tier" ENOENT passthru A64_PROCSYNTH_FORCE_FAIL=1
         fx_rm tests/fixtures/procsynth_tier.bin
     else
         skip_build "fixtures/procsynth_tier"
