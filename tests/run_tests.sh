@@ -1706,6 +1706,21 @@ if [ -n "$AGCC" ]; then
             fail=$((fail+1)); echo "FAIL fixture: hostprobe"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
+        # syslog(2): the guest's kernel-log ring exists and is empty, and the
+        # host's dmesg must never come back through it. Unprivileged, then
+        # --fake-id root, which holds CAP_SYSLOG. Self-checking: the host's own
+        # answers depend on its dmesg_restrict and on what its log holds.
+        exp_u=$'syslog-read_all=ok bytes=0 untouched=1\nsyslog-size_buffer=ok\nsyslog-size_unread=EPERM\nsyslog-read=EPERM\nsyslog-read-null=EINVAL\nsyslog-close=EPERM\nsyslog-console-level=EPERM\nsyslog-console-bad=EPERM\nsyslog-unknown=EPERM\ndone'
+        exp_r=$'syslog-read_all=ok bytes=0 untouched=1\nsyslog-size_buffer=ok\nsyslog-size_unread=ok\nsyslog-read=ok\nsyslog-read-null=EINVAL\nsyslog-close=ok\nsyslog-console-level=ok\nsyslog-console-bad=EINVAL\nsyslog-unknown=EINVAL\ndone'
+        got_u=$(timeout -k 5 60 "$EMU" / tests/fixtures/hostprobe.bin syslog 2>/dev/null)
+        got_r=$(timeout -k 5 60 "$EMU" -u / tests/fixtures/hostprobe.bin syslog 2>/dev/null)
+        if [ "$got_u" = "$exp_u" ] && [ "$got_r" = "$exp_r" ]; then
+            pass=$((pass+1)); echo "PASS fixture: hostprobe (syslog)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: hostprobe (syslog)"
+            diff <(echo "$exp_u") <(echo "$got_u") | head -6 | sed 's/^/     /'
+            diff <(echo "$exp_r") <(echo "$got_r") | head -6 | sed 's/^/     /'
+        fi
         fx_rm tests/fixtures/hostprobe.bin
     else
         skip_build "fixtures/hostprobe"

@@ -31,7 +31,37 @@ static const char *r0(long r) {
 #define PROC_CLOCK(pid)   ((clockid_t)(((~(int)(pid)) << 3) | 2 /*SCHED*/))
 #define THREAD_CLOCK(tid) ((clockid_t)(((~(int)(tid)) << 3) | 2 | 4 /*PERTHREAD*/))
 
-int main(void) {
+/* syslog(2) reads the KERNEL log ring. There is no guest kernel, so the ring
+ * exists and is permanently empty; what must never come back is the host's own
+ * dmesg. The permission rule is the kernel's with dmesg_restrict off: only
+ * READ_ALL and SIZE_BUFFER are open to an unprivileged caller, so everything
+ * else -- an unknown command included -- is EPERM until --fake-id makes the
+ * guest root. Answering 0 to every command, which is what this did, reported
+ * success for commands that do not exist and for a read into a NULL buffer. */
+static int syslog_(int type, char *buf, int len) {
+    return (int)syscall(SYS_syslog, type, buf, len);
+}
+
+static int syslog_rows(void) {
+    char buf[256];
+    memset(buf, 'Z', sizeof buf);
+    int n = syslog_(3 /* READ_ALL */, buf, (int)sizeof buf);
+    printf("syslog-read_all=%s bytes=%d untouched=%d\n", r0(n), n < 0 ? -1 : n,
+           buf[0] == 'Z');
+    printf("syslog-size_buffer=%s\n", r0(syslog_(10, NULL, 0)));
+    printf("syslog-size_unread=%s\n", r0(syslog_(9, NULL, 0)));
+    printf("syslog-read=%s\n", r0(syslog_(2, buf, (int)sizeof buf)));
+    printf("syslog-read-null=%s\n", r0(syslog_(3, NULL, 128)));
+    printf("syslog-close=%s\n", r0(syslog_(0, NULL, 0)));
+    printf("syslog-console-level=%s\n", r0(syslog_(8, NULL, 4)));
+    printf("syslog-console-bad=%s\n", r0(syslog_(8, NULL, 99)));
+    printf("syslog-unknown=%s\n", r0(syslog_(99, NULL, 0)));
+    printf("done\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "syslog")) return syslog_rows();
     int host = (int)getppid(), self = (int)getpid();
     struct timespec ts;
 

@@ -671,9 +671,64 @@ SYSDEF(sethostname) {
     return (u64)(s64)-EPERM;
 }
 
+/* syslog(2) -- the kernel log ring, not the /dev/log one. There is no guest
+ * kernel, so the only honest thing to present is a ring buffer that exists and
+ * is permanently empty; what must never happen is forwarding to the host's,
+ * which would hand the guest the machine's dmesg (and, for the console and
+ * clear commands, let it act on it).
+ *
+ * Answering 0 to everything was neither. It reported success for commands that
+ * do not exist, for a read into a NULL buffer, and for the privileged console
+ * controls an unprivileged caller is refused -- so a guest could not tell a
+ * command it got wrong from one that worked, and dmesg(1) read a "successful"
+ * 0-byte answer either way. The command semantics below are the kernel's, over
+ * an empty ring:
+ *
+ * The permission rule comes first, as check_syslog_permissions does: only
+ * READ_ALL and SIZE_BUFFER are open to an unprivileged caller and every other
+ * command, an unknown one included, is CAP_SYSLOG. A --fake-id root guest
+ * holds it (capget already tells it so), so it gets them all. That is the
+ * dmesg_restrict=0 reading, which is the kernel's own default and the one that
+ * lets a guest `dmesg` report an empty log rather than a permission error --
+ * the truthful answer here, since the ring it is asking about is ours and is
+ * empty. The host's setting is deliberately not consulted: it governs access
+ * to the host's log, which is the one thing this call must never reach.
+ *
+ *   0 CLOSE, 1 OPEN            no-ops, 0 (they are no-ops in the kernel too)
+ *   2 READ, 3 READ_ALL,
+ *   4 READ_CLEAR               0 bytes; the buffer/len are validated first.
+ *                              READ blocks in the kernel until a message
+ *                              arrives -- nothing will ever write this ring,
+ *                              so blocking would be a hang with no wakeup and
+ *                              "no data" is the answer that ends the call.
+ *   5 CLEAR                    0 (nothing to clear)
+ *   6 CONSOLE_OFF, 7 ON        0
+ *   8 CONSOLE_LEVEL            the level is range-checked as the kernel does
+ *   9 SIZE_UNREAD              0 unread
+ *  10 SIZE_BUFFER              0: the ring holds nothing. dmesg(1) treats a
+ *                              non-positive size as "use my own default"
+ *
+ * Anything else is EINVAL, which is what the kernel answers a caller allowed
+ * to ask for a command it does not have. */
 SYSDEF(syslog) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return 0;
+    (void)a3; (void)a4; (void)a5;
+    int type = (int)(s32)a0;
+    s64 len = (s64)(s32)a2;
+    int priv = c->m->fake_id && c->m->cred.euid == 0;
+    if (!priv && type != 3 && type != 10) return (u64)(s64)-EPERM;
+    switch (type) {
+    case 0: case 1: case 5: case 6: case 7:
+        return 0;
+    case 2: case 3: case 4:
+        if (!a1 || len < 0) return (u64)(s64)-EINVAL;
+        return 0;                       /* the ring is empty: 0 bytes read */
+    case 8:
+        return (len < 1 || len > 8) ? (u64)(s64)-EINVAL : 0;
+    case 9: case 10:
+        return 0;
+    default:
+        return (u64)(s64)-EINVAL;
+    }
 }
 
 SYSDEF(personality) {
