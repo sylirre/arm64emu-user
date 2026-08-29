@@ -104,6 +104,19 @@ int  mfd_ftruncate_denied(CPU *c, int fd, u64 newsize);
 int  mfd_fallocate_denied(CPU *c, int fd, int mode, u64 off, u64 len);
 int  mfd_fcntl(CPU *c, int fd, int cmd, u64 arg, u64 *ret); /* 1 = handled */
 int  mfd_link_rewrite(CPU *c, const char *hostlink, char *buf /*PATH_MAX*/);
+void mfd_track_native(int fd, u64 dev, u64 ino);   /* a real kernel memfd */
+
+/* ---- the mode of a memfd a host will not let the guest change -------------
+ * Android's SELinux policy refuses an app every mode change on a memfd, so a
+ * guest that takes the execute bit off one of its own is told EACCES by a
+ * call Linux allows, and the exec check then judges the 0777 the kernel
+ * handed out. The mode moves into the broker registry there (proctab.c),
+ * beside the seals, and these three are how the rest of the emulator sees it.
+ * mfd_chmod_blocked() is the gate: false on an ordinary host, where no
+ * override can exist and none of this costs anything. */
+int  mfd_chmod_blocked(void);
+int  mfd_chmod_hold(struct Machine *m, int fd, u32 mode);  /* 1 = we hold it */
+void mfd_stat_fixup(struct Machine *m, int fd, struct stat *st);
 
 /* Copy a guest path string and resolve it against the rootfs.
  * rflags: PATH_NOFOLLOW_LAST etc. Returns 0 or -errno. */

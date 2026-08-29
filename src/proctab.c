@@ -434,8 +434,15 @@ enum {                        /* BReq.op */
                                * resp.size = name length (name payload
                                * follows the BResp) */
     REQ_MFDSEAL,              /* mtype/size = dev/ino, val = mask to add */
-    REQ_MFDMAP                /* mtype/size = dev/ino, val = +1/-1 writable
+    REQ_MFDMAP,               /* mtype/size = dev/ino, val = +1/-1 writable
                                * MAP_SHARED mappings held by q->pid */
+    REQ_MFDMODE               /* the guest-set mode of a memfd whose host
+                               * refuses to hold one (Android). arg = 0: read
+                               * it (mtype/size = dev/ino) -> ret = mode, or
+                               * -ENOENT when none was ever set. arg = 1: set
+                               * it (fd rides SCM_RIGHTS so an entry can be
+                               * made for a native memfd that had none),
+                               * val = mode */
 };
 
 struct BReq {
@@ -521,6 +528,21 @@ struct Mfd {
     char name[MFD_NAME_MAX];  /* guest-visible memfd name, for /proc views */
     struct MfdWr wr[MFD_WR_TRACK];
     int nwr;
+    /* A mode the host would not hold. Android's SELinux policy refuses an app
+     * every mode change on a memfd, so a guest that takes the execute bit off
+     * one of its own gets EACCES from a call Linux allows -- and the exec
+     * check then judges the 0777 the kernel handed out and runs an image the
+     * guest had made non-executable. The mode is an inode property like the
+     * seals above, so it lives here for the same reasons: it must survive
+     * execve and be visible to every process the fd reaches by fork or
+     * SCM_RIGHTS. Unlike the seals it is NOT monotonic, so no client caches
+     * it. `tier` separates the two kinds of entry: a file-backed tier memfd
+     * (1), whose seals only this registry knows, from a native memfd
+     * registered solely to hold a mode (0), whose seals remain the kernel's
+     * -- a lookup must not answer for the latter's seals. */
+    u32 mode;                 /* meaningful only when has_mode */
+    u8  has_mode;
+    u8  tier;                 /* 1 = the file-backed memfd_create tier */
 };
 static struct Mfd g_mfd[MFD_TAB_MAX];
 
@@ -551,7 +573,7 @@ static s32 mfd_do_reg(struct BReq *q, int rfd, int cfd) {
     } else if (e->fd >= 0)
         close(e->fd);                    /* re-register: shouldn't happen */
     memset(e, 0, sizeof *e);
-    e->used = 1; e->dev = st.st_dev; e->ino = st.st_ino;
+    e->used = 1; e->tier = 1; e->dev = st.st_dev; e->ino = st.st_ino;
     e->seals = (u32)q->val;
     e->fd = dup(rfd);                    /* the pin (caller closes rfd) */
     memcpy(e->name, name, sizeof e->name);
@@ -566,7 +588,7 @@ static void mfd_wr_reclaim(struct Mfd *e) {
 }
 static s32 mfd_do_seal(struct BReq *q) {
     struct Mfd *e = mfd_find((u64)q->mtype, q->size);
-    if (!e) return -EINVAL;
+    if (!e || !e->tier) return -EINVAL;   /* a native memfd's seals are the kernel's */
     u32 mask = (u32)q->val & 0x3f;
     if (e->seals & 0x1 /* F_SEAL_SEAL */) return -EPERM;
     if (mask & 0x8 /* F_SEAL_WRITE */) {
@@ -577,9 +599,40 @@ static s32 mfd_do_seal(struct BReq *q) {
     e->seals |= mask;
     return 0;
 }
+/* Read or set the held mode (see struct Mfd). A set arrives with the fd so a
+ * native memfd, which the tier never registered, can get an entry here on its
+ * first chmod -- and that entry takes the same daemon-held dup as a tier one,
+ * pinning the inode so its number cannot recycle into an unrelated file while
+ * the entry can still match it. */
+static s32 mfd_do_mode(struct BReq *q, int rfd) {
+    if (!q->arg) {                                  /* read */
+        struct Mfd *e = mfd_find((u64)q->mtype, q->size);
+        if (!e || !e->has_mode) return -ENOENT;
+        return (s32)e->mode;
+    }
+    if (rfd < 0) return -EINVAL;
+    struct stat st;
+    if (fstat(rfd, &st) < 0) return -EINVAL;
+    struct Mfd *e = mfd_find((u64)st.st_dev, (u64)st.st_ino);
+    if (!e) {
+        for (int i = 0; i < MFD_TAB_MAX && !e; i++)
+            if (!g_mfd[i].used) e = &g_mfd[i];
+        if (!e) return -ENFILE;
+        memset(e, 0, sizeof *e);
+        e->used = 1; e->dev = (u64)st.st_dev; e->ino = (u64)st.st_ino;
+        e->fd = dup(rfd);                           /* the pin (caller closes) */
+    }
+    e->mode = (u32)q->val & 07777u;
+    e->has_mode = 1;
+    return 0;
+}
+
 static s32 mfd_do_map(struct BReq *q) {
     struct Mfd *e = mfd_find((u64)q->mtype, q->size);
-    if (!e) return 0;                    /* entry gone: nothing to count */
+    /* Entry gone, or one that exists only to hold a native memfd's mode: no
+     * seal of ours is going to be applied to it, so there is nothing to
+     * count. */
+    if (!e || !e->tier) return 0;
     int i;
     for (i = 0; i < e->nwr; i++)
         if (e->wr[i].pid == q->pid) break;
@@ -1789,7 +1842,9 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
     case REQ_MFDREG:  r.ret = mfd_do_reg(q, reqfd, cfd); break;
     case REQ_MFDLOOK: {
         struct Mfd *e = mfd_find((u64)q->mtype, q->size);
-        if (!e) { r.ret = -ENOENT; break; }
+        /* A mode-only entry describes a NATIVE memfd: its seals are the
+         * kernel's, and answering from here would hide them. */
+        if (!e || !e->tier) { r.ret = -ENOENT; break; }
         r.ret = (s32)e->seals;
         r.size = strlen(e->name);
         mfd_name = e->name;              /* payload follows the BResp */
@@ -1797,6 +1852,7 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
     }
     case REQ_MFDSEAL: r.ret = mfd_do_seal(q); break;
     case REQ_MFDMAP:  r.ret = mfd_do_map(q); break;
+    case REQ_MFDMODE: r.ret = mfd_do_mode(q, reqfd); break;
 
     default: r.ret = -EINVAL; break;   /* incl. REQ_CANCEL on a fresh connection */
     }
@@ -2823,6 +2879,22 @@ s32 mfdbroker_addseals(struct Machine *m, u64 dev, u64 ino, u32 mask) {
     q.op = REQ_MFDSEAL; q.mtype = (s64)dev; q.size = ino; q.val = (s32)mask;
     struct BResp r;
     if (mfd_rpc(m, &q, &r, -1, NULL, 0, NULL) < 0) return -EINVAL;
+    return r.ret;
+}
+
+s32 mfdbroker_mode_get(struct Machine *m, u64 dev, u64 ino) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_MFDMODE; q.mtype = (s64)dev; q.size = ino; q.arg = 0;
+    struct BResp r;
+    if (mfd_rpc(m, &q, &r, -1, NULL, 0, NULL) < 0) return -ENOENT;
+    return r.ret;
+}
+
+s32 mfdbroker_mode_set(struct Machine *m, int fd, u32 mode) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_MFDMODE; q.val = (s32)(mode & 07777u); q.arg = 1;
+    struct BResp r;
+    if (mfd_rpc(m, &q, &r, fd, NULL, 0, NULL) < 0) return -ENOSPC;
     return r.ret;
 }
 

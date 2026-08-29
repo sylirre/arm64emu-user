@@ -1100,6 +1100,7 @@ SYSDEF(fstat) {
 #ifdef L2S_ENABLED
     if (c->m->link2symlink) l2s_fix_fd((int)a0, &st);
 #endif
+    mfd_stat_fixup(c->m, (int)a0, &st);
     GStat g;
     gstat_from_host(c->m, &g, &st);
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
@@ -1118,6 +1119,7 @@ SYSDEF(newfstatat) {
 #ifdef L2S_ENABLED
             if (c->m->link2symlink) l2s_fix_fd((int)(s32)a0, &st);
 #endif
+            mfd_stat_fixup(c->m, (int)(s32)a0, &st);
             goto out;
         }
         if (n < 0) return (u64)(s64)n;
@@ -1140,6 +1142,10 @@ SYSDEF(newfstatat) {
          * magic link must report the link. */
         int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
         r = fstatat(pin.dfd, pin.name, &st, hf);
+        /* The path spelling of one of our own fds must agree with the fd's own
+         * stat: a memfd whose mode the registry holds reads the same either
+         * way. (The host answers this stat even where it refuses the open.) */
+        if (r == 0) mfd_stat_fixup(c->m, proc_own_fd_path(pin.host), &st);
         u64 e = r < 0 ? host_err() : 0;
         path_unpin(&pin);
         if (r < 0) return e;
@@ -2539,6 +2545,14 @@ static u64 chattr_result(struct Machine *m, int rr) {
 
 SYSDEF(fchmod) {
     if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    /* A memfd on a host that will not hold its mode: the registry holds it
+     * instead and the guest is told what Linux would have told it. Asked
+     * before the host call rather than after it, because on such a host the
+     * call cannot succeed -- and because the forced tier stands in for that
+     * host on one where it would. Anything that is not one of our memfds
+     * (a tier memfd is a plain file, and its chmod works) says so and the
+     * host answers as it always did. */
+    if (mfd_chmod_blocked() && mfd_chmod_hold(c->m, (int)a0, (u32)a1)) return 0;
     return chattr_result(c->m, fchmod((int)a0, (mode_t)a1));
 }
 
@@ -2547,6 +2561,16 @@ SYSDEF(fchmodat) {
     int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    /* The path spelling of one of our own fds: same object, same answer as
+     * fchmod above, and on the host this exists for the path form is refused
+     * as flatly as the fd one. */
+    if (mfd_chmod_blocked()) {
+        int ofd = proc_own_fd_path(pin.host);
+        if (ofd >= 0 && mfd_chmod_hold(c->m, ofd, (u32)a2)) {
+            path_unpin(&pin);
+            return 0;
+        }
+    }
     /* As truncate: fchmodat's AT_SYMLINK_NOFOLLOW is ENOTSUP on Linux, so the
      * final component is pinned and reached through its own descriptor. */
     int ffd = path_pin_final(&pin);
@@ -2831,6 +2855,19 @@ static void statx_from_stat(u8 *buf, const struct stat *st) {
     v32 = (u32)minor(st->st_dev);        memcpy(buf + 140, &v32, 4);
 }
 
+/* mfd_stat_fixup for the statx buffer: stx_mode is a u16 at offset 28. */
+static void mfd_statx_fixup(struct Machine *m, int fd, u8 *buf) {
+    if (fd < 0 || !mfd_chmod_blocked()) return;
+    struct stat st;
+    memset(&st, 0, sizeof st);
+    u16 v16;
+    memcpy(&v16, buf + 28, 2);
+    st.st_mode = v16;
+    mfd_stat_fixup(m, fd, &st);
+    v16 = (u16)st.st_mode;
+    memcpy(buf + 28, &v16, 2);
+}
+
 SYSDEF(statx) {
     /* struct statx is a fixed-layout kernel ABI (same on all arches). */
     char gpath[PATH_MAX];
@@ -2847,6 +2884,7 @@ SYSDEF(statx) {
             r = fstat((int)(s32)a0, &st);
             if (r == 0) statx_from_stat(buf, &st);
         }
+        if (r == 0) mfd_statx_fixup(c->m, (int)(s32)a0, buf);
     } else {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
         char canon[PATH_MAX];
@@ -2876,6 +2914,7 @@ SYSDEF(statx) {
                 r = fstatat(pin.dfd, pin.name, &st, hf);
                 if (r == 0) statx_from_stat(buf, &st);
             }
+            if (r == 0) mfd_statx_fixup(c->m, proc_own_fd_path(host), buf);
         }
         path_unpin(&pin);
     }

@@ -1108,6 +1108,20 @@ validation that a kernel performs first (`offset < 0 || len <= 0` → `EINVAL`) 
 made in the emulator rather than left to the host, so the tier cannot answer a
 seal (`EPERM`) for a pair the kernel never gets far enough to consider.
 
+The registry holds one more inode property a host may refuse to: the **mode**.
+Android's SELinux policy gives an app no `setattr` on a memfd, so `fchmod` of
+one is `EACCES` however it is reached, and a guest that takes the execute bit
+off a memfd it owns would be told no by a call Linux allows — while the exec
+check went on judging the 0777 `memfd_create` handed out and ran an image the
+guest had made non-executable. Where the host refuses, the guest-set mode is
+recorded in the registry instead (a *native* memfd is registered lazily, on its
+first refused chmod, so nothing is paid on a host that simply allows it) and
+spliced back into every descriptor-addressed `fstat`/`newfstatat`/`statx`, into
+the `/proc/self/fd/N` spelling of the same object, and into `exec_perm_check`
+— which then applies the kernel's rule by hand, since `access(2)` would be
+answering about the host's mode. Unlike the seals it is not monotonic, so
+nothing caches it. `A64_MEMFD_CHMOD_FORCE_DENY=1` forces that tier on any host.
+
 `A64_MEMFD_FORCE_FILE=1` forces the tier on
 any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier

@@ -1042,6 +1042,12 @@ s32  shmbroker_ctl(struct Machine *m, s32 shmid, int cmd, struct ShmStat *st);
 int  mfdbroker_reg(struct Machine *m, int fd, u32 seals0, const char *name);
 s32  mfdbroker_lookup(struct Machine *m, u64 dev, u64 ino, char *name_out);
 s32  mfdbroker_addseals(struct Machine *m, u64 dev, u64 ino, u32 mask);
+/* The mode of a memfd whose host refuses to hold one (Android denies an app
+ * every mode change on a memfd). Read: the mode, or negative when none was
+ * ever set. Set: registers the fd on first use so a native memfd, which the
+ * file-backed tier never registered, gets an entry. */
+s32  mfdbroker_mode_get(struct Machine *m, u64 dev, u64 ino);
+s32  mfdbroker_mode_set(struct Machine *m, int fd, u32 mode);
 void mfdbroker_mapadj(struct Machine *m, u64 dev, u64 ino, int delta);
 
 /* System V semaphores and message queues live entirely in the broker daemon:

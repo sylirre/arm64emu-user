@@ -162,6 +162,22 @@ unfiltered:
   and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
   without `--fake-id`, requiring identical output.
 
+* **Changing the mode of a memfd** is denied too, by the same policy: an app
+  has no `setattr` on one, so `fchmod(memfd, ...)` is EACCES whether it is
+  reached by descriptor or through `/proc/self/fd/N` (an ordinary file in the
+  app's own directories takes a `fchmod` fine — it is the object, not the
+  operation, that the policy refuses). Forwarding that to the guest is wrong
+  twice over: Linux allows the call, and the exec check then goes on judging
+  the 0777 `memfd_create` handed out, so an image the guest had deliberately
+  made non-executable still runs. The mode is an inode property the host will
+  not hold, exactly like the fallback tier's seals, so it goes where they go —
+  the broker registry (`proctab.c`), keyed by (dev, ino), surviving `execve`
+  and visible to every process the fd reaches by `fork` or `SCM_RIGHTS`. A
+  native memfd is registered lazily, on its first refused chmod, so nothing is
+  paid on a host that simply allows it. `A64_MEMFD_CHMOD_FORCE_DENY` forces the
+  tier anywhere, and `tests/fixtures/ownfdexec.c`'s fourth leg is what it is
+  for.
+
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
 

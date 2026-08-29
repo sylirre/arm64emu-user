@@ -1206,6 +1206,7 @@ static int exec_perm_check(struct Machine *m, const PathPin *p) {
     struct stat st;
     int by_fd = 0;
     int hf = p->pinned ? AT_SYMLINK_NOFOLLOW : 0;   /* the walk already followed */
+    int ofd = proc_own_fd_path(host);
     if (proc_own_fd_denied(host) ? (errno = EACCES, 1)
                                  : fstatat(p->dfd, p->name, &st, hf) != 0) {
         /* One of our own fds on a host that refuses to re-open it (Android
@@ -1213,19 +1214,26 @@ static int exec_perm_check(struct Machine *m, const PathPin *p) {
          * keeps the errno the host gave -- a path that names nothing (a
          * dangling symlink, say) is ENOENT, not a permission answer. */
         int e = errno;
-        int ofd = proc_own_fd_path(host);
         if (ofd < 0) return -e;
         if (fstat(ofd, &st) != 0) return -errno;
         by_fd = 1;
     }
     if (!S_ISREG(st.st_mode)) return -EACCES;
+    /* A memfd whose mode the host would not let the guest change is held in
+     * the broker registry (sys_misc.c). The mode that decides this is the
+     * guest's, not the 0777 memfd_create handed out -- and once it is, the
+     * host's own access(2) is answering about the wrong mode, so the rule
+     * below has to be applied by hand exactly as it is for the fd fallback. */
+    mode_t was = st.st_mode;
+    mfd_stat_fixup(m, ofd, &st);
+    int held = st.st_mode != was;
     if (!m->fake_id) {
         /* The path answered the stat, so it will answer this too, and access(2)
          * is the exact answer -- supplementary groups, ACLs, capabilities.
          * (The denial knob is asked here as well even though !by_fd means the
          * path just worked: it keeps the simulated tier honest, so a change
          * that put access(2) back on the fallback path would be caught.) */
-        if (!by_fd)
+        if (!by_fd && !held)
             return (proc_own_fd_denied(host) ? (errno = EACCES, -1)
                                              : access_pinned(p, X_OK)) == 0
                        ? 0 : -EACCES;

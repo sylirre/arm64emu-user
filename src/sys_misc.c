@@ -378,6 +378,16 @@ void mfd_track_recv(int fd) {
     if (fd < 0 || fd >= MFDC_N) return;
     mfdc_cls[fd] = 2; mfdc_hint[fd] = 0;
 }
+/* A real kernel memfd. Not a tier one -- its seals are the kernel's and
+ * mfd_resolve must keep saying so -- but it is still one of OUR anonymous
+ * objects, and on a host that refuses to hold its mode (mfd_chmod_blocked)
+ * that is the class the mode override is looked up for. */
+void mfd_track_native(int fd, u64 dev, u64 ino) {
+    if (fd < 0 || fd >= MFDC_N) return;
+    if (!mfd_chmod_blocked()) { mfd_track_close(fd); return; }   /* nothing to hold */
+    mfdc_any = 1;
+    mfdc_cls[fd] = 3; mfdc_dev[fd] = dev; mfdc_ino[fd] = ino; mfdc_hint[fd] = 0;
+}
 void mfd_track_dup(int oldfd, int newfd) {
     if (!mfdc_any || newfd < 0 || newfd >= MFDC_N) return;
     if (oldfd < 0 || oldfd >= MFDC_N) { mfdc_cls[newfd] = 2; mfdc_hint[newfd] = 0; return; }
@@ -401,9 +411,12 @@ s32 mfd_resolve(CPU *c, int fd, u64 *dev, u64 *ino, char *name_out) {
         if (idx >= 0) mfdc_cls[idx] = 0;
         return -1;
     }
-    if (idx >= 0 && mfdc_cls[idx] == 1 &&
+    if (idx >= 0 && (mfdc_cls[idx] == 1 || mfdc_cls[idx] == 3) &&
         (mfdc_dev[idx] != (u64)st.st_dev || mfdc_ino[idx] != (u64)st.st_ino))
         mfdc_cls[idx] = 2;               /* number reused behind our back */
+    /* A native memfd whose identity still matches is certainly not a tier one,
+     * and asking the broker would only learn that again. */
+    if (idx >= 0 && mfdc_cls[idx] == 3) return -1;
     s32 seals = mfdbroker_lookup(c->m, (u64)st.st_dev, (u64)st.st_ino, name_out);
     if (seals < 0) {
         if (idx >= 0) mfdc_cls[idx] = 0;
@@ -509,6 +522,95 @@ int mfd_link_rewrite(CPU *c, const char *hostlink, char *buf) {
     return 1;
 }
 
+/* ---- the mode of a memfd the host will not let the guest change -----------
+ * Android's SELinux policy gives an app no setattr on a memfd: fchmod is
+ * EACCES, sealed or not, and so is chmod through the /proc/self/fd spelling.
+ * Forwarding that to the guest is wrong twice over -- Linux allows the call,
+ * and the exec check then judges the 0777 memfd_create handed out, so an
+ * image the guest deliberately made non-executable still runs.
+ *
+ * The mode is an inode property, exactly like the seals, so it goes where they
+ * go: the broker registry, which survives execve and is visible to every
+ * process the fd reaches by fork or SCM_RIGHTS. Unlike the seals it is not
+ * monotonic -- any holder may chmod it again -- so nothing here caches it; the
+ * lookup is asked each time, the same cost model the seal checks already
+ * accept. All of it is gated on a host that actually refuses, so an ordinary
+ * Linux host pays one probe per process and nothing else.
+ *
+ * A64_MEMFD_CHMOD_FORCE_DENY forces the tier on any host: without it these
+ * paths are reachable on a device and nowhere else. */
+int mfd_chmod_blocked(void) {
+    static int on = -1;
+    return PROBE_ONCE(on, ({
+        int v = getenv("A64_MEMFD_CHMOD_FORCE_DENY") != NULL;
+        if (!v) {
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+            int p = (int)syscall(SYS_memfd_create, "a64-chmod-probe", 1 /*CLOEXEC*/);
+#else
+            int p = memfd_create("a64-chmod-probe", MFD_CLOEXEC);
+#endif
+            if (p >= 0) {                   /* no memfd_create: the tier's own
+                                             * backing file takes a chmod fine */
+                struct stat ps;
+                if (fstat(p, &ps) == 0 && fchmod(p, ps.st_mode & 07777) != 0)
+                    v = 1;
+                close(p);
+            }
+        }
+        v; }));
+}
+
+/* Is this fd one of the kernel memfds we handed the guest? The class cache
+ * answers for one we created or duped; anything else is settled by the /proc
+ * link, whose target the kernel spells "/memfd:<name> (deleted)" -- reading it
+ * is allowed even on the host that refuses to open it. Fills dev/ino. */
+static int mfd_is_native(int fd, u64 *dev, u64 *ino) {
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) return 0;
+    int idx = fd < MFDC_N ? fd : -1;
+    if (idx >= 0 && mfdc_cls[idx] == 3 &&
+        mfdc_dev[idx] == (u64)st.st_dev && mfdc_ino[idx] == (u64)st.st_ino) {
+        *dev = (u64)st.st_dev; *ino = (u64)st.st_ino;
+        return 1;
+    }
+    if (idx >= 0 && (mfdc_cls[idx] == 0 || mfdc_cls[idx] == 1)) return 0;
+    char link[64], tgt[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, tgt, sizeof tgt - 1);
+    if (n <= 0) return 0;
+    tgt[n] = 0;
+    if (strncmp(tgt, "/memfd:", 7)) return 0;
+    *dev = (u64)st.st_dev; *ino = (u64)st.st_ino;
+    if (idx >= 0) {
+        mfdc_any = 1;
+        mfdc_cls[idx] = 3; mfdc_dev[idx] = *dev; mfdc_ino[idx] = *ino;
+        mfdc_hint[idx] = 0;
+    }
+    return 1;
+}
+
+/* The guest's chmod of a memfd the host refused. 1 when the registry took it
+ * and the guest may be told the call succeeded. */
+int mfd_chmod_hold(struct Machine *m, int fd, u32 mode) {
+    if (!mfd_chmod_blocked()) return 0;
+    u64 dev, ino;
+    if (!mfd_is_native(fd, &dev, &ino)) return 0;
+    return mfdbroker_mode_set(m, fd, mode) == 0;
+}
+
+/* Splice a held mode into a stat the host answered. Every guest-visible stat
+ * of a descriptor goes through here, so fstat and the exec check agree. */
+void mfd_stat_fixup(struct Machine *m, int fd, struct stat *st) {
+    if (!mfd_chmod_blocked() || !S_ISREG(st->st_mode)) return;
+    if (fd >= 0 && fd < MFDC_N && (mfdc_cls[fd] == 0 || mfdc_cls[fd] == 1)) return;
+    u64 dev, ino;
+    if (!mfd_is_native(fd, &dev, &ino)) return;
+    s32 mode = mfdbroker_mode_get(m, dev, ino);
+    if (mode < 0) return;
+    st->st_mode = (st->st_mode & ~(mode_t)07777) | ((mode_t)mode & 07777);
+}
+
 SYSDEF(memfd_create) {
     /* MFD_* flag values are arch-uniform, the fd is 1:1. The kernel caps the
      * name at 249 chars, so a string that overflows the buffer would be its
@@ -528,6 +630,8 @@ SYSDEF(memfd_create) {
         if (r >= 0) {
             struct stat st;                  /* class the native fd too: its */
             if (fstat(r, &st) == 0)          /* number may shadow a stale    */
+                mfd_track_native(r, (u64)st.st_dev, (u64)st.st_ino);
+            else
                 mfd_track_close(r);          /* tier slot from a reuse       */
             return (u64)r;
         }

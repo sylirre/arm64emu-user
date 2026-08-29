@@ -1275,32 +1275,42 @@ if [ ! -x tests/fixtures/ownfdexec.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null || true
 fi
 #
-# Run four times, and every run must print the same thing. A64_OWNFD_FORCE_DENY
-# makes this host refuse the path spelling of one of our own fds the way that
-# policy does -- harsher, in fact, since it refuses stat and access as well as
-# open, so a host that denies only the open is covered a fortiori -- and that is
-# the only way to reach those fallbacks off a device. --fake-id because the
-# permission check takes a different branch for a faked identity, and the
-# fallback has to be right in both.
+# Run over every tier, and every run must print the same thing. Two knobs stand
+# in for what Android's policy does to a memfd, and they are the only way to
+# reach those fallbacks off a device:
+#   A64_OWNFD_FORCE_DENY       refuses the path spelling of one of our own fds
+#                              -- harsher than the device, since it refuses
+#                              stat and access as well as open, so a host that
+#                              denies only the open is covered a fortiori;
+#   A64_MEMFD_CHMOD_FORCE_DENY refuses every mode change on a memfd, so the
+#                              guest-set mode of leg 4 is the one the broker
+#                              registry holds and not the host's. Without it
+#                              that leg's fchmod simply works here and the
+#                              whole holding path goes untested.
+# --fake-id because the permission check takes a different branch for a faked
+# identity, and every fallback has to be right in both.
 if [ -x tests/fixtures/ownfdexec.bin ]; then
     expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\nnoexec=13\ndone'
     for ofx_id in "" "--fake-id"; do
         for ofx_deny in 0 1; do
-            ofx_tag="ownfdexec${ofx_id:+ $ofx_id}"
-            if [ "$ofx_deny" = 1 ]; then
-                ofx_tag="$ofx_tag (path-denied tier)"
-                got=$(A64_OWNFD_FORCE_DENY=1 timeout -k 5 60 "$EMU" $ofx_id / \
+            for ofx_chmod in 0 1; do
+                ofx_tag="ownfdexec${ofx_id:+ $ofx_id}"
+                ofx_env=""
+                [ "$ofx_deny" = 1 ] && {
+                    ofx_tag="$ofx_tag (path-denied tier)"
+                    ofx_env="$ofx_env A64_OWNFD_FORCE_DENY=1"; }
+                [ "$ofx_chmod" = 1 ] && {
+                    ofx_tag="$ofx_tag (chmod-denied tier)"
+                    ofx_env="$ofx_env A64_MEMFD_CHMOD_FORCE_DENY=1"; }
+                got=$(env $ofx_env timeout -k 5 60 "$EMU" $ofx_id / \
                           tests/fixtures/ownfdexec.bin 2>/dev/null)
-            else
-                got=$(timeout -k 5 60 "$EMU" $ofx_id / \
-                          tests/fixtures/ownfdexec.bin 2>/dev/null)
-            fi
-            if [ "$got" = "$expect" ]; then
-                pass=$((pass+1)); echo "PASS fixture: $ofx_tag"
-            else
-                fail=$((fail+1)); echo "FAIL fixture: $ofx_tag"
-                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
-            fi
+                if [ "$got" = "$expect" ]; then
+                    pass=$((pass+1)); echo "PASS fixture: $ofx_tag"
+                else
+                    fail=$((fail+1)); echo "FAIL fixture: $ofx_tag"
+                    diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+                fi
+            done
         done
     done
     fx_rm tests/fixtures/ownfdexec.bin
