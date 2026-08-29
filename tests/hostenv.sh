@@ -538,7 +538,14 @@ int main(void) {
     memset(&got, 0, sizeof got);
     socklen_t l = sizeof got;
     if (getsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &got, &l)) return 1;
-    return !(l == sizeof got && got.tv_sec == 1 && got.tv_usec == 250000);
+    /* The full length and a plausible value -- NOT the exact microseconds.
+     * The kernel keeps this timeout in jiffies, so what comes back is
+     * quantized: an Android device at HZ=250 turns 250000 us into 63 jiffies
+     * and reports 252000. Demanding equality gated the test away on real
+     * hardware, which is the one thing this probe must never do. What is being
+     * asked is whether the option came back at all: the host being gated
+     * against reports optlen 4 and writes nothing, leaving these zeroed. */
+    return !(l == sizeof got && got.tv_sec == 1);
 }
 EOF
         ;;
