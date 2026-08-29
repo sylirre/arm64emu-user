@@ -2394,8 +2394,18 @@ static u64 sqdmull_sat(s64 sa, s64 sb, unsigned e) {
 static void simd_three_diff(CPU *c, u32 insn) {
     unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
     unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    /* Every form in this group writes elements twice the source width, so
+     * size==0b11 (64-bit sources, a 128-bit destination element) is
+     * UNDEFINED throughout it -- and executing it is not merely a wrong
+     * answer: esize would be 64 and the narrowing path below would shift a
+     * 64-bit value right by 64. The doubling saturating forms
+     * (SQDMLAL/SQDMLSL/SQDMULL, opcode 9/b/d) have no 8-bit source form
+     * either, so size==0b00 is UNDEFINED for those three as well. */
+    if (size == 3 || (size == 0 && (opc == 0x9 || opc == 0xb || opc == 0xd))) {
+        fpsimd_undef(c, insn); return;
+    }
     unsigned esize = 8u << size, ndest = 64u / esize, base = Q ? ndest : 0, dsize = size + 1;
-    u64 emask = (esize >= 64) ? ~0ULL : ((1ULL << esize) - 1);   /* 8/16/32 allocated */
+    u64 emask = (1ULL << esize) - 1;                   /* esize is 8/16/32 here */
     u64 dmask = (2 * esize >= 64) ? ~0ULL : ((1ULL << (2 * esize)) - 1);
     V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
 

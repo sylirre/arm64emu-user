@@ -4,7 +4,8 @@
  * 32-bit, ROR on add/sub, extended-register imm3>4, sf=0 widening
  * multiplies, SIMD&FP Q-form with size!=0, SIMD&FP forms in the LDTR/STTR
  * space) plus reserved AdvSIMD-copy imm5/imm4/Q combinations (gated in both
- * the interpreter and the JIT frontend). Each probe prints "sigill" or
+ * the interpreter and the JIT frontend) and the sizes the AdvSIMD
+ * three-different group does not allocate. Each probe prints "sigill" or
  * "ran"; qemu is the oracle, so a divergence in either direction — an
  * encoding we still accept, or one we over-tightened — shows as a diff. */
 #include <stdio.h>
@@ -96,6 +97,21 @@ int main(void) {
     PROBE("stp v, opc=3, pre",   0xED800420);
     PROBE("ldp v, opc=3, pre",   0xEDC00420);
 
+    /* ---- unallocated: AdvSIMD three-different ----
+     * Every form in the group widens, so size==0b11 has no allocation
+     * anywhere in it, and the three doubling saturating forms have no
+     * 8-bit source either. Accepting size==0b11 was not just a wrong
+     * answer: the narrowing opcodes shifted a 64-bit value by 64. */
+    PROBE("saddl size=3",        0x0EE00020);
+    PROBE("uaddw size=3",        0x2EE01020);
+    PROBE("addhn size=3",        0x0EE04020);
+    PROBE("raddhn size=3",       0x2EE04020);
+    PROBE("umull size=3",        0x2EE0C020);
+    PROBE("sqdmull size=3",      0x0EE0D020);
+    PROBE("sqdmlal size=0",      0x0E209020);
+    PROBE("sqdmlsl size=0",      0x0E20B020);
+    PROBE("sqdmull size=0",      0x0E20D020);
+
     /* ---- unallocated: AdvSIMD copy ---- */
     PROBE("dup v.2d q=0",        0x0E080400);  /* .d element form needs Q=1 */
     PROBE("copy imm5=0",         0x0E000420);  /* no allocated element size */
@@ -122,6 +138,10 @@ int main(void) {
     PROBE("ldtr x0, [x1]",       0xF8400820);  /* integer LDTR: LDR at EL0 */
     PROBE("ldp q0, q1, [x1]",    0xAD400420);  /* opc=2: the valid Q pair */
     PROBE("stp q0, q1, [x1]",    0xAD000420);
+    PROBE("saddl v.4s",          0x0EA00020);  /* three-different, size=2 */
+    PROBE("addhn v.2s",          0x0EA04020);
+    PROBE("sqdmull v.4s",        0x0E60D020);  /* doubling forms: size 1 and 2 */
+    PROBE("sqdmull v.2d",        0x0EA0D020);
     PROBE("dup v.2d q=1",        0x4E080420);
     PROBE("smov w, v.b",         0x0E012C20);
     PROBE("movz w, lsl #16",     0x52A00020);  /* hw=1: the allowed neighbour */
