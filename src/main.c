@@ -290,6 +290,11 @@ static void help(void) {
         {"A64_JIT_NOVRA", "Disable the V-register cache."},
         {"A64_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
         {"A64_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
+        {"A64_PROCFS_FORCE_OLD", "Hide from the host's /proc what a kernel "
+                        "older than the advertised one does not have -- stat "
+                        "past field 44 (3.3) and status's Rss* component "
+                        "lines (4.5) -- so the synthesized views must supply "
+                        "them (exercises the Android 7 tier)."},
         {"A64_PROCSTAT_HOTPLUG_SIM", "Walk the online-CPU count down on every "
                         "/proc/stat sample (simulates a host that hotplugs "
                         "cores, as Android does)."},

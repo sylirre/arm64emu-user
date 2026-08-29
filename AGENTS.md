@@ -195,6 +195,7 @@ Behavior fallbacks:
 * `A64_PATHFAST_VERIFY`: resolves every guest path BOTH ways and aborts on any disagreement. Development knob, and only for a quiescent tree: the two walks run at different instants, so a guest racing its own mounts/renames (tests/fixtures/bindrace.c) makes them differ for a reason that is not a bug.
 * `A64_PINWALK_FORCE_LOOP`: pins a resolved path's parent one component at a time (openat/O_NOFOLLOW) instead of in a single `openat2(RESOLVE_NO_SYMLINKS)` — the tier a host kernel older than 5.6 is served by. Same containment, one syscall per component instead of one per path.
 * `A64_PROCSTAT_FORCE_SYNTH`: forces the synthetic /proc/stat fallback.
+* `A64_PROCFS_FORCE_OLD`: hides from the host's own /proc what a kernel older than the advertised one does not have — `/proc/<pid>/stat` past field 44 (start_data..exit_code are 3.3) and `status`'s RssAnon/RssFile/RssShmem lines (4.5) — so the synthesized views must supply them rather than rewrite them; the tier an Android 7 device (3.1) is permanently on, where a guest could otherwise not find its own argv, its own brk, or the parts of its own resident set. The suite's `vmreport (old-procfs tier)` rows run over it.
 * `A64_PROCSTAT_HOTPLUG_SIM`: walks the online-CPU count down on every
   /proc/stat sample, simulating a host that hotplugs cores (Android does, for
   power) — the condition under which the synthesized counters must stay

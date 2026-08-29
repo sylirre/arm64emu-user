@@ -178,6 +178,18 @@ unfiltered:
   tier anywhere, and `tests/fixtures/ownfdexec.c`'s fourth leg is what it is
   for.
 
+* **The host's own /proc is older than the kernel the guest is told about.**
+  A device on 3.1 has no `start_data`..`exit_code` in `/proc/<pid>/stat`
+  (fields 45–52, added in 3.3) and no `RssAnon`/`RssFile`/`RssShmem` in
+  `status` (4.5). The synthesized views work by *rewriting* the host's lines,
+  and a rewrite cannot conjure a line that is not there — so a guest read its
+  own `stat` and could not find its argv, its environment or its brk (all
+  zero), and read a `VmRSS` whose three components were missing entirely.
+  Both are now appended when the host file stops short, which is what the rest
+  of the Vm block, `NoNewPrivs` and `Seccomp` already did.
+  `A64_PROCFS_FORCE_OLD` hides exactly those from an ordinary host's /proc so
+  the append paths are reachable off the device.
+
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
 (rule and precedents: [portability-and-pitfalls.md](portability-and-pitfalls.md)).
 

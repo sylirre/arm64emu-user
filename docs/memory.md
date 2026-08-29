@@ -355,6 +355,23 @@ leaving it alone: the same process reported `VmSize: 81804 kB` there while its
 `stat` and `statm` reported 9948, so a reader that consulted two of the three
 got a contradiction rather than an approximation.
 
+Two of those files are **rewritten** from the host's, which only works for a
+line or a field the host actually printed. A host kernel older than the one
+`sys_uname` advertises does not print them all: `/proc/<pid>/stat` gained
+`start_data`..`exit_code` (fields 45–52) in 3.3, and `status` gained
+`RssAnon`/`RssFile`/`RssShmem` in 4.5. On an Android 7 device (3.1) the guest
+therefore read zero for every address span in its own `stat` — it could not
+locate its own argv, environment or brk — and a `VmRSS` with no components
+under it. Both are appended when the host file stops short, the way the rest of
+the Vm block already was. Where there is also no `mincore` sample to split the
+resident set with, the components have no host figures to be bounded by either:
+what is left of the bounded `VmRSS` is resident and unattributed, and anonymous
+is what it is — which is what the sampled tier reports too (a guest's images
+are read into anonymous guest pages, so `RssFile` and `RssShmem` are zero
+there), and it keeps the three summing to `VmRSS`. `A64_PROCFS_FORCE_OLD`
+hides those fields and lines from an ordinary host's /proc so the suite reaches
+both append paths, crossed with `A64_MINCORE_FORCE_FAIL` for the split.
+
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max
 address space" nothing was enforcing while hiding the one that was.

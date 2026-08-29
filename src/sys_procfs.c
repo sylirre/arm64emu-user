@@ -318,6 +318,18 @@ static int stat_blocked(void) {
     return PROBE_ONCE(blocked, stat_probe_blocked());
 }
 
+/* A host kernel whose /proc is older than the one sys_uname advertises, so
+ * whole fields and lines the guest ABI promises are simply not there to
+ * rewrite: /proc/<pid>/stat stops at field 44 (start_data..exit_code are 3.3)
+ * and status has no RssAnon/RssFile/RssShmem (4.5). Real on an Android 7
+ * device (3.1) and nowhere else, so A64_PROCFS_FORCE_OLD stands in for one --
+ * it hides exactly those from the host's own files, which is what makes the
+ * emulator's two append paths reachable on an ordinary machine. */
+static int procfs_old_host(void) {
+    static int on = -1;
+    return PROBE_ONCE(on, getenv("A64_PROCFS_FORCE_OLD") != NULL);
+}
+
 /* Same try-host-first gate for /proc/sys/kernel/overflow{u,g}id, which Android
  * SELinux denies an app along with the rest of /proc/sys. A guest that cannot
  * read them is not a hypothetical: it is the first thing bubblewrap does, and
@@ -1248,6 +1260,9 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
              * RssFile and RssShmem are 4.5 and later. */
             for (int k = 0; k < VM_NKEYS; k++) {
                 if (!is_key(p, vm_keys[k])) continue;
+                /* Stand in for a host too old to have this line at all. */
+                if (procfs_old_host() && k >= VM_RSSANON && k <= VM_RSSSHMEM)
+                    goto next_line;
                 u64 v = (k >= VM_RSSFIRST && k <= VM_RSSLAST)
                             ? rss_line_kb(&pm, mi, k, p, &budget)
                             : vm_value_kb(&pm, mi, k);
@@ -1310,12 +1325,28 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     if (pm_ok)
         for (int k = 0; k < VM_NKEYS; k++) {
             if (vseen & (1u << k)) continue;
-            /* A resident line the host file does not have is one there is no
-             * figure to bound, and no sample of our own to print instead: a
-             * kernel too old for it prints nothing, and so does this. */
-            if (!mi && k >= VM_RSSFIRST && k <= VM_RSSLAST) continue;
-            dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k],
-                    (unsigned long long)vm_value_kb(&pm, mi, k));
+            u64 v;
+            if (mi || k < VM_RSSFIRST || k > VM_RSSLAST) {
+                v = vm_value_kb(&pm, mi, k);
+            } else if (k == VM_RSSANON) {
+                /* No sample of our own, and a host file with no split to
+                 * bound: what is left of the bounded VmRSS is resident and
+                 * unattributed, and anonymous is what it is. That is also what
+                 * the sampled tier reports -- the guest's images are read into
+                 * anonymous guest pages, so RssFile and RssShmem are zero
+                 * there too -- and it keeps the three summing to VmRSS, which
+                 * is the one thing every reader of this file relies on. On a
+                 * host too old for these lines (they are 4.5) the components
+                 * used to be dropped entirely, so a guest read its own VmRSS
+                 * against three zeroes. */
+                v = budget;
+                budget = 0;
+            } else if (k == VM_RSSFILE || k == VM_RSSSHMEM) {
+                v = 0;
+            } else {
+                continue;   /* VmHWM / VmRSS: no host figure, nothing to bound */
+            }
+            dprintf(fd, "%s:\t%8llu kB\n", vm_keys[k], (unsigned long long)v);
         }
     if (self && !saw_nnp)
         dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0);
@@ -1395,12 +1426,31 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
     *rp = 0;
     dprintf(fd, "%s)", buf);       /* pid and comm stand as the host has them */
     int f = 2;
+    int shorth = procfs_old_host();
     for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
         u64 v;
+        if (shorth && f >= 44) break;      /* stand in for a pre-3.3 kernel */
         if (pidstat_field(m, pm, mi, self, tok, ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else
             dprintf(fd, " %s", tok);
+    }
+    /* Rewriting a field cannot conjure one the host never printed. A kernel
+     * older than 3.3 stops at field 44 -- start_data, end_data, start_brk,
+     * arg_start, arg_end, env_start, env_end and exit_code were all added
+     * there -- and a guest that sys_uname has told it is on a modern kernel
+     * then reads zero for every one of them: on an Android 7 device (3.1) the
+     * guest could not find its own argv or environment in its own stat line,
+     * and neither could anything reading another guest's. The seven that
+     * describe the address space are exactly the ones synthesized above;
+     * exit_code is 0 for a task that is still running, which every task this
+     * file is opened for is. */
+    while (f < 52) {
+        u64 v;
+        if (pidstat_field(m, pm, mi, self, "0", ++f, &v))
+            dprintf(fd, " %llu", (unsigned long long)v);
+        else
+            dprintf(fd, " 0");
     }
     dprintf(fd, "\n");
     return 0;

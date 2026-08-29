@@ -1870,8 +1870,8 @@ fi
 
 # ---- self-checking fixtures for syscalls qemu-user cannot model (it
 # returns ENOSYS for set/get_robust_list and mlock2) ----
-check_fixture() {   # check_fixture <name> <expected> [VAR=VAL] [tier-label]
-    local name="$1" expect="$2" tenv="${3-}" tlabel="${4-}"
+check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label>]...
+    local name="$1" expect="$2"; shift 2
     "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
         skip_build "fixtures/$name"; return; }
     local got
@@ -1881,17 +1881,20 @@ check_fixture() {   # check_fixture <name> <expected> [VAR=VAL] [tier-label]
         fail=$((fail+1)); echo "FAIL fixture: $name"
         diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
     fi
-    # A fallback tier the same expectations have to survive: what the guest
-    # reads must not depend on which tier the host let the emulator use.
-    if [ -n "$tenv" ]; then
-        got=$(env "$tenv" "$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
+    # The fallback tiers the same expectations have to survive: what the guest
+    # reads must not depend on which tier the host let the emulator use. Each
+    # is an environment (unquoted on purpose -- a tier may need more than one
+    # variable) and the label the row is reported under.
+    while [ $# -ge 2 ]; do
+        got=$(env $1 "$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
         if [ "$got" = "$expect" ]; then
-            pass=$((pass+1)); echo "PASS fixture: $name ($tlabel)"
+            pass=$((pass+1)); echo "PASS fixture: $name ($2)"
         else
-            fail=$((fail+1)); echo "FAIL fixture: $name ($tlabel)"
+            fail=$((fail+1)); echo "FAIL fixture: $name ($2)"
             diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
         fi
-    fi
+        shift 2
+    done
     fx_rm "tests/fixtures/$name.bin"
 }
 check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
@@ -1909,8 +1912,18 @@ check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22
 # also the tier every reader of ANOTHER process is on). The expectations do not
 # change: the sizes are the guest's either way, and the resident figures the
 # emulator falls back to are bounded so that the same relations still hold.
+#
+# And again on a host whose own /proc is older than the kernel this emulator
+# says it is (A64_PROCFS_FORCE_OLD): stat stops at field 44 and status has no
+# Rss* components, so rewriting the host's files cannot produce them and they
+# have to be appended. An Android 7 device (3.1) is such a host, and there the
+# guest could not find its own argv, its own brk, or the parts of its own
+# resident set. Crossed with the no-mincore tier because that is the
+# combination that has to invent the split with no host figures to bound.
 check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\nrss_bounded=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\nother_stat=1\nother_statm=1\nother_status=1\nother_bounded=1\nrsslim=1\ndone' \
-              A64_MINCORE_FORCE_FAIL=1 "no-mincore tier"
+              A64_MINCORE_FORCE_FAIL=1 "no-mincore tier" \
+              A64_PROCFS_FORCE_OLD=1 "old-procfs tier" \
+              "A64_PROCFS_FORCE_OLD=1 A64_MINCORE_FORCE_FAIL=1" "old-procfs, no-mincore tier"
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
