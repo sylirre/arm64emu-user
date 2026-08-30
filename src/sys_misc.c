@@ -136,7 +136,25 @@ SYSDEF(getrandom) {
  * table too -- so the guest reads back one coherent set -- and also applied to
  * the host, which is what actually enforces those. */
 static int rlim_virtual(int res) {
-    return res == G_RLIMIT_AS || res == G_RLIMIT_DATA || res == G_RLIMIT_STACK;
+    return res == G_RLIMIT_AS || res == G_RLIMIT_DATA || res == G_RLIMIT_STACK ||
+           res == G_RLIMIT_NOFILE;
+}
+
+/* NOFILE is virtual for a different reason than the three above, and it needs
+ * one thing done to the host to make that work: the host's soft limit goes to
+ * its hard one, once, so the descriptors the containment takes for itself
+ * (path.c pins one parent per path syscall, two where the final component is
+ * pinned too) come out of headroom rather than out of the guest's allowance.
+ * What the guest may hold is then fd_nofile_cap (sys.h), enforced wherever a
+ * descriptor is handed over. Best effort: without privilege the hard limit is
+ * the ceiling, and a host that has no room above the soft limit simply keeps
+ * the old, one-tighter behaviour. */
+static void rlim_nofile_unbind(void) {
+    struct rlimit h;
+    if (getrlimit(RLIMIT_NOFILE, &h) != 0) return;
+    if (h.rlim_max == h.rlim_cur) return;
+    struct rlimit n = { h.rlim_max, h.rlim_max };
+    setrlimit(RLIMIT_NOFILE, &n);
 }
 
 /* Seed the guest's table from the host's, once, at startup. Every later change
@@ -154,6 +172,9 @@ void rlim_init(struct Machine *m) {
             m->rlim[r].rlim_cur = m->rlim[r].rlim_max = G_RLIM_INFINITY;
         }
     }
+    /* Seeded from the host's soft limit above, so the guest inherits the number
+     * it would have inherited; the host's own is lifted only afterwards. */
+    rlim_nofile_unbind();
 }
 
 /* Apply one guest limit, table first and host after where the host is the one
@@ -655,6 +676,7 @@ SYSDEF(memfd_create) {
     if (!(eff & G_MFD_ALLOW_SEALING)) seals0 |= G_F_SEAL_SEAL;
     int fd = a64_mfdfile((gf & G_MFD_CLOEXEC) != 0);
     if (fd < 0) return (u64)(s64)-ENOMEM;
+    if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return (u64)(s64)-ENOMEM; }
     if (mfdbroker_reg(c->m, fd, seals0, name) < 0) {

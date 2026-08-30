@@ -158,6 +158,7 @@ SYSDEF(getitimer) {
  * guest struct itimerspec: 2 x GTimespec {it_interval, it_value}. */
 SYSDEF(timerfd_create) {
     int r = timerfd_create((int)(s32)a0, (int)(s32)a1);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
     return r < 0 ? host_err() : (u64)r;
 }
 

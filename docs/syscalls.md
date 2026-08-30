@@ -296,6 +296,49 @@ tree, since the two walks run at different instants and a guest racing its own
 mounts (`tests/fixtures/bindrace.c`) makes them differ for a reason that is not
 a bug; the suite runs one such check over a deliberately quiescent workload.
 
+### What the pin costs the guest: `RLIMIT_NOFILE`
+
+Naming the target by a descriptor means a path syscall *holds* one while it
+runs — one for the parent, two for the calls that pin the final component as
+well (`chmod`, `truncate`, `statfs`). Guest fd is host fd, so the kernel charges
+those to the same soft `RLIMIT_NOFILE` the guest's own descriptors come out of,
+and handing that limit straight to the host made the guest pay for them: with
+`ulimit -n 64` it could open 60 files where a kernel allows 61, and `statfs`
+answered `EMFILE` with a slot still free — for a call that needs no descriptor
+at all.
+
+So `NOFILE` joins `RLIMIT_AS`/`DATA`/`STACK` as a limit answered from the
+guest's own table (`rlim_virtual`). The host is put at its **hard** limit once
+at startup, and the guest's soft limit is enforced where a descriptor is handed
+over instead: `fd_within_limit` (`sys.h`) closes one that came back at or above
+`fd_nofile_cap` and answers `EMFILE`. Since the kernel allocates the lowest free
+descriptor, that can only happen once the guest really holds its whole
+allowance — which is exactly when a kernel refuses — and everything the emulator
+takes for itself then sits above the highest number the guest can name.
+
+Every route a descriptor reaches the guest by is checked: `openat` (including
+the synthesized `/proc` views and the memfd re-open), `dup`, `pipe2`,
+`eventfd2`, `inotify_init1`, `epoll_create1`, `socket`, `socketpair`, `accept`,
+`accept4`, `signalfd4`, `timerfd_create`, `memfd_create`, and the `SCM_RIGHTS`
+descriptors a `recvmsg` installs — which are trimmed the way `scm_detach_fds`
+trims them, keeping the ones that fit and raising `MSG_CTRUNC`. Two calls let
+the guest *name* the number, and there the limit is a plain argument check with
+its own errno: `dup3` above the limit is `EBADF`, `fcntl(F_DUPFD)` is `EINVAL`.
+
+`openat` refuses *before* it opens anything rather than after: the kernel takes
+its descriptor first (`get_unused_fd_flags`, ahead of the lookup), so an open
+with none to return creates no file, and the pin — this emulator's own first
+allocation, at the lowest free number — is what says the guest holds everything
+it may have. The rest close and answer `EMFILE` after the fact, which is
+indistinguishable except for `accept`, where at exact exhaustion the connection
+is dequeued before being refused rather than left queued.
+
+The hard limit is not ours to raise, so a host whose hard limit equals its soft
+one — or a guest that has raised its own to the hard ceiling — has no headroom
+to take and is back to being one descriptor tighter than a kernel. That is the
+old behaviour rather than a new failure, and it is the only case left.
+`tests/c/fdlimit.c` is the differential record.
+
 Net cost of containment, measured against a build from before any of it: `go
 build` and `node` unchanged, and a `find /` that does nothing but path syscalls
 is **30% faster** than it was — 15,049 path syscalls where the original walk

@@ -75,6 +75,59 @@ static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
     return done;
 }
 
+/* ---- the guest's own descriptor ceiling ---------------------------------
+ * RLIMIT_NOFILE is the one limit where the guest and the emulator compete for
+ * the same table, because guest fd IS host fd. Containment names a path target
+ * by a DESCRIPTOR rather than by a name (path.c), so a path syscall holds one
+ * of its own while it runs -- two for the calls that pin the final component as
+ * well (chmod, truncate, statfs) -- and the kernel charges those to the very
+ * soft limit the guest's descriptors come out of. Handed straight to the host,
+ * as it used to be, that limit therefore cost the guest a descriptor: at
+ * saturation it opened one fewer file than a kernel allows, and chmod/statfs/
+ * truncate answered EMFILE with one slot free, where a kernel needs no
+ * descriptor at all.
+ *
+ * So NOFILE joins the limits answered from the guest's own table (rlim_virtual,
+ * sys_misc.c). The host runs at its hard limit and the guest's soft limit is
+ * enforced HERE: since the kernel hands out the lowest free descriptor, a
+ * number at or above the guest's limit is one that a kernel with that limit
+ * would have refused -- so it is closed and the call answers EMFILE, which is
+ * exactly when a kernel answers it. Everything the emulator takes for itself
+ * then lives above the highest number the guest can ever hold.
+ *
+ * The hard limit is not ours to raise, so a host whose hard limit equals its
+ * soft one -- or a guest that has raised its own limit to the hard ceiling --
+ * has no headroom to take and is back to one descriptor tighter than a kernel.
+ * That is the old behaviour, not a new failure, and it is the only case left.
+ */
+
+/* The guest's soft RLIMIT_NOFILE as an fd number: the first one it may not
+ * have. INT_MAX when it has no limit worth enforcing. */
+static inline int fd_nofile_cap(const struct Machine *m) {
+    u64 n = m->rlim[G_RLIMIT_NOFILE].rlim_cur;
+    return (n == G_RLIM_INFINITY || n > (u64)INT_MAX) ? INT_MAX : (int)n;
+}
+
+/* An fd the emulator is about to hand the guest. Returns 1 when it is the
+ * guest's to keep; otherwise the descriptor has been closed and the caller must
+ * answer -EMFILE, which is what the kernel would have answered instead of
+ * allocating it. */
+static inline int fd_within_limit(CPU *c, int fd) {
+    if (fd < fd_nofile_cap(c->m)) return 1;
+    close(fd);
+    return 0;
+}
+
+/* The same for a call that allocates a pair (pipe2, socketpair). The kernel
+ * releases the one it got when the second will not fit, so neither survives. */
+static inline int fd_pair_within_limit(CPU *c, int a, int b) {
+    int cap = fd_nofile_cap(c->m);
+    if (a < cap && b < cap) return 1;
+    close(a);
+    close(b);
+    return 0;
+}
+
 /* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
  * the host kernel predates it (< 3.17 — Android 7 devices). */
 int a64_anonfd(const char *name);

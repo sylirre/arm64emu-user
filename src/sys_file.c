@@ -768,6 +768,19 @@ SYSDEF(openat) {
     if ((gflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) rf |= PATH_NOFOLLOW_LAST;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
     if (r < 0) return (u64)(s64)r;
+    /* The kernel takes the descriptor FIRST (get_unused_fd_flags, ahead of the
+     * lookup), so an open that has no descriptor to return creates nothing.
+     * The pin walk's FIRST allocation is what the kernel would have handed a
+     * guest asking at that moment -- the lowest free number -- so one at or
+     * above the guest's ceiling means the guest holds everything it may have,
+     * and the open has to be refused here, before O_CREAT leaves behind a file
+     * a kernel would never have made. (`lowfd`, not `dfd`: the per-component
+     * tier walks with two descriptors open at once and ends one above where it
+     * started, which would refuse a guest that still had a slot.) */
+    if (pin.pinned && pin.lowfd >= 0 && pin.lowfd >= fd_nofile_cap(c->m)) {
+        path_unpin(&pin);
+        return (u64)(s64)-EMFILE;
+    }
     const char *host = pin.host;
     /* Write intent (non-RDONLY, or create/truncate) into a :ro bind -> EROFS.
      * O_CREAT/O_TRUNC/O_ACCMODE are in the pass-through set, so the host bits
@@ -784,7 +797,12 @@ SYSDEF(openat) {
                        : (proc_zone_path(host) ? host : NULL);
     if (pcanon) {
         s64 pf;
-        if (procfs_open(c, pcanon, gflags, &pf)) { path_unpin(&pin); return (u64)pf; }
+        if (procfs_open(c, pcanon, gflags, &pf)) {
+            path_unpin(&pin);
+            /* A synthesized view is still a descriptor the guest keeps. */
+            if (pf >= 0 && !fd_within_limit(c, (int)pf)) return (u64)(s64)-EMFILE;
+            return (u64)pf;
+        }
     }
     int fd;
     if (proc_own_fd_denied(host)) { fd = -1; errno = EACCES; }
@@ -807,6 +825,10 @@ SYSDEF(openat) {
         if (own >= 0) fd = own_memfd_reopen(c, own, gflags, &snap_tiered);
         else errno = e;
     }
+    /* Before any bookkeeping is hung on the number: the kernel hands out the
+     * lowest free descriptor, so one at or above the guest's own limit is one
+     * it would have refused to allocate at all (sys.h). */
+    if (fd >= 0 && !fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     if (fd >= 0) {
         mfd_track_close(fd);   /* fresh number: drop any stale class */
         /* A path re-open of a tier memfd (through a /proc fd link) hands
@@ -1883,7 +1905,14 @@ SYSDEF(fcntl) {
     switch (cmd) {
         case F_DUPFD:
         case F_DUPFD_CLOEXEC: {
+            /* The argument is a FLOOR the guest names, and the kernel refuses
+             * one at or above the soft limit with EINVAL before it looks for a
+             * free descriptor; the descriptor it then finds is subject to the
+             * limit like any other (dup(2) above). */
+            if ((s32)a2 < 0 || (s32)a2 >= fd_nofile_cap(c->m))
+                return (u64)(s64)-EINVAL;
             int r = fcntl(fd, cmd, (int)a2);
+            if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
             if (r >= 0) { sigfd_track_dup(c->m, fd, r); mfd_track_dup(fd, r); }
             return r < 0 ? host_err() : (u64)r;         /* as dup(2) above */
         }
@@ -2037,11 +2066,19 @@ SYSDEF(fcntl) {
 
 SYSDEF(dup) {
     int r = dup((int)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
     if (r >= 0) { sigfd_track_dup(c->m, (int)a0, r); mfd_track_dup((int)a0, r); }
     return r < 0 ? host_err() : (u64)r;             /* a signalfd's second name */
 }
 
 SYSDEF(dup3) {
+    /* The guest NAMES the descriptor here, and the kernel refuses one at or
+     * above the soft limit outright -- EBADF, decided in ksys_dup3 after only
+     * the flags and the oldfd == newfd EINVAL, and before oldfd is looked at.
+     * Asked before the unmarking below, which must not run for a call that
+     * never replaces anything. */
+    if ((s32)a0 != (s32)a1 && (s32)a1 >= fd_nofile_cap(c->m))
+        return (u64)(s64)-EBADF;
     /* dup2/dup3 also *replace* newfd, so whatever it named is gone. */
     sigfd_unmark_fd(c->m, (int)a1);
     procfs_unmark_fd(c->m, (int)a1);
@@ -2055,6 +2092,7 @@ SYSDEF(dup3) {
 SYSDEF(pipe2) {
     int fds[2];
     if (pipe2(fds, oflags_g2h((int)a1)) < 0) return host_err();
+    if (!fd_pair_within_limit(c, fds[0], fds[1])) return (u64)(s64)-EMFILE;
     s32 gfds[2] = { fds[0], fds[1] };
     if (copy_to_guest(c, a0, gfds, sizeof gfds) < 0) {
         /* The kernel releases both descriptors before returning EFAULT. Leaving
@@ -3190,6 +3228,7 @@ SYSDEF(fadvise64) {
 
 SYSDEF(eventfd2) {
     int r = eventfd((unsigned)a0, (int)a1);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
     return r < 0 ? host_err() : (u64)r;
 }
 
@@ -3199,6 +3238,7 @@ SYSDEF(eventfd2) {
  * the fd and its event stream pass through 1:1. */
 SYSDEF(inotify_init1) {
     int r = inotify_init1((int)(s32)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
     return r < 0 ? host_err() : (u64)r;
 }
 
@@ -3224,6 +3264,7 @@ SYSDEF(inotify_rm_watch) {
 
 SYSDEF(epoll_create1) {
     int r = epoll_create1((int)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
     return r < 0 ? host_err() : (u64)r;
 }
 

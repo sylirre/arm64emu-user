@@ -43,6 +43,7 @@ SYSDEF(socket) {
     if (domain == AF_NETLINK && protocol == NETLINK_ROUTE && nl_host_blocks()) {
         int fd = socket(AF_UNIX, SOCK_DGRAM | (type & (SOCK_CLOEXEC | SOCK_NONBLOCK)), 0);
         if (fd < 0) return host_err();
+        if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
         nl_mark_fd(c->m, fd);
         return (u64)fd;
     }
@@ -57,6 +58,7 @@ SYSDEF(socket) {
             return (u64)(s64)-EPROTONOSUPPORT;
         return host_err();
     }
+    if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     /* A real NETLINK_ROUTE socket still needs the ack emulation when the guest
      * believes it configures a network namespace of its own (sys_netlink.c). */
     if (domain == AF_NETLINK && protocol == NETLINK_ROUTE)
@@ -67,6 +69,7 @@ SYSDEF(socket) {
 SYSDEF(socketpair) {
     int sv[2];
     if (socketpair((int)a0, (int)a1, (int)a2, sv) < 0) return host_err();
+    if (!fd_pair_within_limit(c, sv[0], sv[1])) return (u64)(s64)-EMFILE;
     s32 g[2] = { sv[0], sv[1] };
     if (copy_to_guest(c, a3, g, sizeof g) < 0) {
         /* The guest never learns the two numbers, so nothing it does can ever
@@ -310,6 +313,7 @@ SYSDEF(accept) {
     socklen_t sl = sizeof ss;
     int fd = accept((int)a0, (struct sockaddr *)&ss, &sl);
     if (fd < 0) return host_err();
+    if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     u64 e = addr_out(c, a1, a2, &ss, sl, 1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
@@ -320,6 +324,7 @@ SYSDEF(accept4) {
     socklen_t sl = sizeof ss;
     int fd = accept4((int)a0, (struct sockaddr *)&ss, &sl, (int)a3);
     if (fd < 0) return host_err();
+    if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     u64 e = addr_out(c, a1, a2, &ss, sl, 1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
@@ -624,13 +629,56 @@ static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
 /* Host control buffer -> guest, in the guest's layout and bounded by the
  * guest's buffer. Sets *ctrunc when anything had to be dropped or cut short. */
 static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
-                       int *ctrunc) {
+                       int *ctrunc, int fdcap) {
     size_t hoff = 0, goff = 0;
     while (hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) <= hlen) {
         struct cmsghdr ch;
         memcpy(&ch, hb + hoff, sizeof ch);
         size_t clen = ch.cmsg_len;
         if (clen < CMSG_LEN(0) || clen > hlen - hoff) break;
+        /* The element as the HOST laid it out. The SCM_RIGHTS trim below can
+         * shorten what is passed on, and the walk still has to step over the
+         * whole of what arrived. */
+        size_t hstep = CMSG_ALIGN(clen);
+        {
+            s32 lvl = ch.cmsg_level, typ = ch.cmsg_type;
+            if (lvl == SOL_SOCKET && typ == SCM_RIGHTS) {
+                /* Every arriving descriptor is subject to the guest's own
+                 * RLIMIT_NOFILE. The host installed them against ITS limit,
+                 * which is the hard one (sys.h), so any that landed at or above
+                 * the guest's ceiling are ones scm_detach_fds would never have
+                 * installed: it stops at the first it cannot place, keeps the
+                 * ones before it and raises MSG_CTRUNC. So does this -- and the
+                 * ones it drops are closed here, since the guest never learns
+                 * the numbers and could not close them itself.
+                 *
+                 * The survivors are then classified: they may be another
+                 * process's tier memfds, and the cache must stop assuming these
+                 * numbers are plain files. */
+                size_t nfd = (clen - CMSG_LEN(0)) / sizeof(int);
+                const u8 *fdp = hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr));
+                size_t keep = nfd;
+                int rfd;
+                for (size_t i = 0; i < nfd; i++) {
+                    memcpy(&rfd, fdp + i * sizeof(int), sizeof rfd);
+                    if (rfd >= fdcap) { keep = i; break; }
+                }
+                for (size_t i = keep; i < nfd; i++) {
+                    memcpy(&rfd, fdp + i * sizeof(int), sizeof rfd);
+                    close(rfd);
+                }
+                for (size_t i = 0; i < keep; i++) {
+                    memcpy(&rfd, fdp + i * sizeof(int), sizeof rfd);
+                    mfd_track_recv(rfd);
+                }
+                if (keep < nfd) {
+                    *ctrunc = 1;
+                    /* Nothing placed: the kernel emits no element at all. */
+                    if (!keep) { hoff += hstep; continue; }
+                    clen = CMSG_LEN(keep * sizeof(int));
+                }
+            }
+        }
         size_t dlen = clen - CMSG_LEN(0);
         u64 gel = GCMSG_HDRLEN + (u64)dlen;
         size_t avail = gcap - goff;
@@ -648,19 +696,6 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
         size_t gstep = (size_t)GCMSG_ALIGN(gel);
         if (gstep > avail) gstep = avail;      /* last element: no room to pad */
         s32 level = ch.cmsg_level, type = ch.cmsg_type;
-        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
-            /* Arriving descriptors may be another process's tier memfds: the
-             * classification cache must stop assuming these numbers are
-             * plain files (full element, not the possibly truncated copy --
-             * the fds are installed either way). */
-            size_t nfd = (clen - CMSG_LEN(0)) / sizeof(int);
-            for (size_t i = 0; i < nfd; i++) {
-                int rfd;
-                memcpy(&rfd, hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) +
-                             i * sizeof(int), sizeof rfd);
-                mfd_track_recv(rfd);
-            }
-        }
         memset(gb + goff, 0, gstep);
         memcpy(gb + goff, &gel, 8);
         memcpy(gb + goff + 8, &level, 4);
@@ -668,7 +703,7 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
         memcpy(gb + goff + GCMSG_HDRLEN,
                hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)), dlen);
         goff += gstep;
-        hoff += CMSG_ALIGN(clen);
+        hoff += hstep;
     }
     if (hoff < hlen) *ctrunc = 1;   /* elements left over that never fit */
     return goff;
@@ -853,7 +888,8 @@ static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
         size_t gcap = g->msg_controllen > MSG_CTRL_MAX ? MSG_CTRL_MAX
                                                        : (size_t)g->msg_controllen;
         int ctrunc = 0;
-        size_t gl = cmsg_h2g(ctrl, h->msg_controllen, gctrl, gcap, &ctrunc);
+        size_t gl = cmsg_h2g(ctrl, h->msg_controllen, gctrl, gcap, &ctrunc,
+                             fd_nofile_cap(c->m));
         if (gl && copy_to_guest(c, g->msg_control, gctrl, gl) < 0) return -EFAULT;
         if (ctrunc) h->msg_flags |= MSG_CTRUNC;
         g->msg_controllen = gl;

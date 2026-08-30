@@ -531,6 +531,7 @@ SYSDEF(signalfd4) {
     if (a3 & G_SFD_NONBLOCK) eflags |= EFD_NONBLOCK;
     int nfd = eventfd(0, eflags);
     if (nfd < 0) return host_err();
+    if (!fd_within_limit(c, nfd)) return (u64)(s64)-EMFILE;
     struct stat st;
     if (fstat(nfd, &st) != 0) { u64 e = host_err(); close(nfd); return e; }
     EMU_LOCK(&sfd_lock, EMU_LK_SFD);

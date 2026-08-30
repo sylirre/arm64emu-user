@@ -1945,6 +1945,34 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
     fi
 fi
 
+# ---- the same descriptors, counted against the guest's own RLIMIT_NOFILE.
+# c/fdlimit ran against the default pin tier in the loop above; the row here is
+# the per-component one a host kernel older than 5.6 is served by (and that a
+# seccomp filter over openat2 puts a modern host on). It walks with TWO
+# descriptors open at once and ends one above the number it started at, so the
+# "is the guest out of descriptors?" question has to be asked of the walk's
+# FIRST allocation and not its last -- asked of the last, this tier refused an
+# open while the guest still had a slot, which is exactly the bug the whole
+# fd_nofile_cap machinery exists to remove. ----
+FDLBIN="tests/c/fdlimit_static.bin"
+if [ "$ORACLE_KIND" = recorded ]; then
+    skip=$((skip+1)); echo "SKIP c/fdlimit(loop-tier) (same-host-only)"
+elif [ -x "$FDLBIN" ]; then
+    rm -f /tmp/ci_fdlim_new
+    out_q=$(oracle_run "$FDLBIN" 2>/dev/null); rc_q=$?
+    rm -f /tmp/ci_fdlim_new
+    out_e=$(A64_PINWALK_FORCE_LOOP=1 timeout -k 5 60 "$EMU" / "$FDLBIN" 2>/dev/null); rc_e=$?
+    rm -f /tmp/ci_fdlim_new
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/fdlimit(loop-tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/fdlimit(loop-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -8 | sed 's/^/     /'
+    fi
+else
+    skip_build "c/fdlimit(loop-tier)"
+fi
+
 # ---- rootfs containment against a path race. The emulator resolves a guest
 # path itself and then asks the host to resolve the result again; a guest thread
 # renaming a symlink into that path between the two used to redirect the syscall

@@ -1098,14 +1098,16 @@ static int pin_walk_at2(int rootfd, const char *rest) {
  * traversed. Returns the fd or -errno -- the errno the syscall would have
  * reported for that path anyway (ENOENT, ENOTDIR, EACCES), plus ELOOP for a
  * component that turned into a symlink after the walk. */
-static int pin_walk(const char *host, size_t rootlen) {
+static int pin_walk(const char *host, size_t rootlen, int *lowfd) {
     char root[PATH_MAX];
     size_t hl = strlen(host);
+    *lowfd = -1;
     if (!rootlen || rootlen > hl || rootlen >= sizeof root) return -EINVAL;
     if (rootlen == hl) {                           /* the trusted root itself */
         memcpy(root, host, rootlen);
         root[rootlen] = 0;
         int rfd = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (rfd >= 0) *lowfd = rfd;
         return rfd < 0 ? -errno : rfd;
     }
 
@@ -1119,7 +1121,7 @@ static int pin_walk(const char *host, size_t rootlen) {
      * the two-call form below answers it authoritatively. */
     if (host[0] == '/') {
         int nfd = pin_walk_at2(AT_FDCWD, host);
-        if (nfd >= 0) return nfd;
+        if (nfd >= 0) { *lowfd = nfd; return nfd; }
         if (errno != ENOSYS && errno != ELOOP) return -errno;
     }
 
@@ -1127,6 +1129,7 @@ static int pin_walk(const char *host, size_t rootlen) {
     root[rootlen] = 0;
     int dfd = open(root, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return -errno;
+    *lowfd = dfd;                 /* the lowest free number, before the walk */
     {   /* The one-call form, where the host has it. */
         const char *rest = host + rootlen;
         while (*rest == '/') rest++;
@@ -1165,6 +1168,7 @@ static int pin_walk(const char *host, size_t rootlen) {
 int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p) {
     p->dfd = AT_FDCWD;
     p->pinned = 0;
+    p->lowfd = -1;
     p->base[0] = 0;
     if (host != p->host) {
         if (strlen(host) + 1 > sizeof p->host) return -ENAMETOOLONG;
@@ -1203,7 +1207,7 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
     strcat(joined, slash + 1);
     if (strcmp(joined, p->host)) return 0;
 
-    int dfd = pin_walk(parhost, rootlen);
+    int dfd = pin_walk(parhost, rootlen, &p->lowfd);
     if (dfd < 0) return dfd;
     p->dfd = dfd;
     strcpy(p->base, slash + 1);
@@ -1216,6 +1220,7 @@ void path_unpin(PathPin *p) {
     if (p->dfd >= 0) close(p->dfd);
     p->dfd = AT_FDCWD;
     p->pinned = 0;
+    p->lowfd = -1;
     p->name = p->host;
 }
 
@@ -1492,6 +1497,7 @@ int path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
      * small non-negative number. */
     pin->dfd = AT_FDCWD;
     pin->pinned = 0;
+    pin->lowfd = -1;
     pin->name = pin->host;
     pin->host[0] = 0;
     int fast = !pathfast_off();
@@ -1529,6 +1535,7 @@ int path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
     if (r < 0) {
         pin->dfd = AT_FDCWD;
         pin->pinned = 0;
+        pin->lowfd = -1;
         pin->name = pin->host;
         pin->host[0] = 0;
         return r;

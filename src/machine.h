@@ -184,11 +184,23 @@ struct Machine {
      * order of magnitude under the C library's own floor.
      *
      * So RLIMIT_AS, RLIMIT_DATA and RLIMIT_STACK are answered and enforced from
-     * this table and never reach the host (rlim_virtual, sys_misc.c). The rest
-     * are stored here too -- so the guest reads back one coherent set -- and
-     * also applied to the host, where the host is the thing that enforces them:
-     * RLIMIT_NOFILE above all, since guest fd == host fd and fd allocation
-     * consults the host's (sys_proc.c). */
+     * this table and never reach the host (rlim_virtual, sys_misc.c).
+     *
+     * RLIMIT_NOFILE is the fourth, for a different reason. Guest fd IS host fd,
+     * so passing it through does work -- but the emulator needs descriptors of
+     * its own out of the same table: containment names a path target by a
+     * DESCRIPTOR rather than by a name (path.c), one per path syscall and two
+     * where the final component is pinned as well. Charged to the guest's own
+     * limit, those cost it a descriptor -- it opened one fewer file than a
+     * kernel allows, and chmod/statfs/truncate answered EMFILE with a slot
+     * still free. So the host runs at its hard limit and the guest's soft limit
+     * is enforced on the way out instead (fd_nofile_cap / fd_within_limit,
+     * sys.h), which puts the emulator's own descriptors above every number the
+     * guest can hold. tests/c/fdlimit.c is the differential record.
+     *
+     * The rest are stored here too -- so the guest reads back one coherent set
+     * -- and also applied to the host, where the host is the thing that
+     * enforces them. */
     GRlimit rlim[G_RLIM_NLIMITS];
 
     /* Guest signal state (process-wide per POSIX; signal.c). The blocked
@@ -772,6 +784,15 @@ typedef struct {
     int  dfd;              /* parent directory, or AT_FDCWD when not pinned */
     const char *name;      /* bare final component, or the absolute host path */
     int  pinned;           /* 1: `name` is a component under `dfd` */
+    /* The FIRST descriptor the pin walk allocated, which is what the kernel
+     * would have handed a guest asking for one at that moment -- the lowest
+     * free number. A caller about to allocate one for the guest reads the
+     * guest's descriptor ceiling off it (sys_file.c, openat): at or above the
+     * limit means the guest already holds everything it may. `dfd` cannot
+     * answer that, because the per-component tier walks with two descriptors
+     * open at once and ends one above where it started. -1 when nothing was
+     * opened. */
+    int  lowfd;
     char host[PATH_MAX];   /* the host path, as path_resolve produced it */
     char base[256];        /* storage behind `name` when pinned */
 } PathPin;
