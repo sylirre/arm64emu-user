@@ -1268,8 +1268,10 @@ static int zone_prefix(const struct Machine *m, const char *canon) {
  * could change the answer even when the assumption holds: the special zones
  * (magic links), a mapping through a --bind (whose guest-side components lie
  * above the trusted root the certification starts from, so they would go
- * unchecked), and a trailing slash (whose stat would be asking about a path
- * nothing has verified yet). */
+ * unchecked), a trailing slash (whose stat would be asking about a path
+ * nothing has verified yet), and a ".." that cancels a component (which the
+ * certification then never looks at, and which "link/.." makes the wrong
+ * answer rather than merely an unchecked one). */
 static int path_walk(struct Machine *m, int dirfd, const char *gpath,
                      unsigned flags, char *host_out, char *canon_out, int *fast) {
     char canon[PATH_MAX];      /* canonical guest path built so far */
@@ -1317,7 +1319,23 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
 
         if (!strcmp(comp, ".")) continue;
         if (!strcmp(comp, "..")) {
-            if (strcmp(canon, croot)) canon_pop(canon);   /* clamp at chroot root */
+            /* The optimistic route cannot fold a ".." that actually removes a
+             * component. Its whole warrant is that the PIN certifies the fold,
+             * and the pin walks the components the fold LEFT -- a component
+             * this cancels is gone from the canonical path before the pin ever
+             * sees it, so nothing would ever ask whether it was a symlink. And
+             * that is the one thing that changes the answer: "link/.." is not
+             * the link's parent, because the kernel resolves the link first and
+             * climbs from its TARGET. With `a/b -> ../c`, /a/b/../x is /x on a
+             * kernel and /a/x if the fold is trusted -- a different existing
+             * file, or a spurious ENOENT for a `bin -> real/bin` layout naming
+             * ../lib. The authoritative walk splices the link and gets it
+             * right, so hand these to it. A ".." at the chroot root removes
+             * nothing (the clamp below) and stays on the fast route. */
+            if (strcmp(canon, croot)) {
+                if (fast) { *fast = 0; return 0; }
+                canon_pop(canon);                        /* clamp at chroot root */
+            }
             continue;
         }
 
@@ -1429,10 +1447,12 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
  * back ELOOP (from openat2's RESOLVE_NO_SYMLINKS, or from the loop's
  * O_NOFOLLOW where that is unavailable -- so this helps an old host too, which
  * pays the most per component), and every other doubt falls through to the
- * authoritative walk: a zone, a --bind, a trailing slash, a final symlink, any
- * error at all. The optimistic route can therefore only ever be a shortcut to
- * the same answer, never a different one. A64_PATHFAST_OFF takes the route out
- * entirely, which is how the suite checks that both routes contain a guest
+ * authoritative walk: a zone, a --bind, a trailing slash, a final symlink, a
+ * ".." that cancels a component (the pin only certifies the components the
+ * fold LEFT, and "link/.." climbs from the link's target, not from its parent),
+ * any error at all. The optimistic route can therefore only ever be a shortcut
+ * to the same answer, never a different one. A64_PATHFAST_OFF takes the route
+ * out entirely, which is how the suite checks that both routes contain a guest
  * equally.
  *
  * A64_PATHFAST_VERIFY runs both and aborts on any disagreement. It is a

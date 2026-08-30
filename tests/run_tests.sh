@@ -1869,25 +1869,51 @@ fi
 # the workload below is deliberately quiescent (the two walks run at different
 # instants, so a guest racing itself makes them differ for a reason that is not
 # a bug) and covers what the fold has to get right: deep paths, `..`, relative
-# paths through a changed cwd, a symlink chain, a :ro bind, /proc and /dev. ----
+# paths through a changed cwd, a symlink chain, a `..` that cancels a symlink
+# (which the fold must decline outright -- see tests/c/pathdotdot.c for what the
+# answer then has to be), a :ro bind, /proc and /dev. ----
 if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
-    vprobe='ls -laR / >/dev/null 2>&1
-            find / -xdev >/dev/null
-            cd /usr/bin && ls ../lib >/dev/null && cd ../../etc && ls ./../etc >/dev/null
-            ln -sf /etc/passwd /tmp/ci_v_lnk && cat /tmp/ci_v_lnk >/dev/null
-            ln -sf /tmp/ci_v_lnk /tmp/ci_v_lnk2 && cat /tmp/ci_v_lnk2 >/dev/null
-            cat /ro/hostname >/dev/null 2>&1
-            cat /proc/self/cmdline >/dev/null; test -e /dev/null
+    # The abort is detected from each step's STATUS, not from its output. Almost
+    # every step here is a fork, so a divergence kills the child and leaves the
+    # shell to finish the script normally -- and the child's stderr is wherever
+    # the script redirected it, which for most of these is /dev/null. A death by
+    # SIGABRT is a status of 128+6, which nothing else in this workload returns,
+    # so `chk` names the step that died and the final line stops being the one
+    # the check below wants. Before this the row could not see any of it.
+    vprobe='vfail=
+            chk() { [ "$1" -ge 128 ] && vfail="$vfail:$2"; return 0; }
+            ls -laR / >/dev/null 2>&1; chk $? ls
+            find / -xdev >/dev/null 2>&1; chk $? find
+            cd /usr/bin && ls ../lib >/dev/null 2>&1 && cd ../../etc &&
+                ls ./../etc >/dev/null 2>&1; chk $? cwd
+            ln -sf /etc/passwd /tmp/ci_v_lnk; cat /tmp/ci_v_lnk >/dev/null 2>&1; chk $? lnk
+            ln -sf /tmp/ci_v_lnk /tmp/ci_v_lnk2; cat /tmp/ci_v_lnk2 >/dev/null 2>&1; chk $? lnk2
+            mkdir -p /tmp/ci_v_d/a /tmp/ci_v_d/c; : > /tmp/ci_v_d/a/f
+            : > /tmp/ci_v_d/c/f; : > /tmp/ci_v_d/f
+            ln -sf ../c /tmp/ci_v_d/a/b
+            cat /tmp/ci_v_d/a/b/../f >/dev/null 2>&1; chk $? dotdot
+            ls /tmp/ci_v_d/a/b/../ >/dev/null 2>&1; chk $? dotdotdir
+            rm -rf /tmp/ci_v_d
+            cat /ro/hostname >/dev/null 2>&1; chk $? ro
+            cat /proc/self/cmdline >/dev/null 2>&1; chk $? proc
+            test -e /dev/null; chk $? dev
             rm -f /tmp/ci_v_lnk /tmp/ci_v_lnk2
-            echo routes-agree'
-    got=$(A64_PATHFAST_VERIFY=1 timeout -k 5 180 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
-              /bin/busybox sh -c "$vprobe" 2>&1 | tail -1)
+            echo "routes-agree$vfail"'
+    vout=$(A64_PATHFAST_VERIFY=1 timeout -k 5 180 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
+               /bin/busybox sh -c "$vprobe" 2>&1)
     rc=$?
-    if [ "$got" = "routes-agree" ] && [ "$rc" = 0 ]; then
+    got=$(printf '%s\n' "$vout" | tail -1)
+    # The abort has to be looked for in the whole output, not just inferred from
+    # the last line: the shell forks for most of the workload, so a divergence
+    # kills the CHILD and the surviving shell goes on to print the final line
+    # with a zero status. Every row above was invisible to this until it looked.
+    if [ "$got" = "routes-agree" ] && [ "$rc" = 0 ] &&
+       ! printf '%s\n' "$vout" | grep -q 'PATHFAST divergence'; then
         pass=$((pass+1)); echo "PASS pathfast: optimistic route agrees with the walk"
     else
         fail=$((fail+1))
         echo "FAIL pathfast: optimistic route agrees with the walk (rc=$rc, out='$got')"
+        printf '%s\n' "$vout" | grep -A2 'PATHFAST divergence' | head -6 | sed 's/^/     /'
     fi
 fi
 

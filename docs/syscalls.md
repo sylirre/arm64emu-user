@@ -274,9 +274,20 @@ comes back `ELOOP` — from `openat2`'s `RESOLVE_NO_SYMLINKS`, or from the loop'
 other doubt falls through to the authoritative walk: a special zone (magic
 links), a mapping through a `--bind` (whose guest-side components lie *above*
 the trusted root the certification starts from, so they would go unchecked), a
-trailing slash, a final symlink, an unpinnable result, any error at all. The
-optimistic route can only ever be a shortcut to the same answer, never a
-different one.
+trailing slash, a final symlink, a `..` that cancels a component, an unpinnable
+result, any error at all. The optimistic route can only ever be a shortcut to
+the same answer, never a different one.
+
+The `..` exclusion is the one that is about a wrong answer rather than an
+unchecked one. The pin walks the components the fold **left**, so a component a
+`..` cancels is gone before the pin can ask whether it was a symlink — and that
+question decides the answer, because `link/..` is not the link's parent: the
+kernel resolves the link and climbs from its *target*. With `a/b -> ../c`,
+`a/b/../x` is `/x` on a kernel and `/a/x` to a fold, which is a different
+existing file; the same shape gives a spurious `ENOENT` for the ordinary
+`bin -> real/bin` layout that names `../lib`. `tests/c/pathdotdot.c` is the
+differential record, and a `..` at the guest root cancels nothing (it is
+clamped) so it stays on the fast route.
 
 `A64_PATHFAST_OFF` takes the route out, and the suite runs the path-race test
 over both it and the two pin tiers. `A64_PATHFAST_VERIFY` resolves every path

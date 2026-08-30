@@ -195,7 +195,7 @@ JIT debugging environment variables:
 
 Behavior fallbacks:
 
-* `A64_PATHFAST_OFF`: resolves every guest path by walking it component by component (a readlink each) instead of folding it lexically and letting the pin certify that no component was a symlink. Same answers, more syscalls — the suite runs the path-race test over both routes.
+* `A64_PATHFAST_OFF`: resolves every guest path by walking it component by component (a readlink each) instead of folding it lexically and letting the pin certify that no component was a symlink. Same answers, more syscalls — the suite runs the path-race test over both routes. (The fold declines any path whose `..` cancels a component: the pin certifies only what the fold left, and `link/..` climbs from the link's target — `tests/c/pathdotdot.c`.)
 * `A64_PATHFAST_VERIFY`: resolves every guest path BOTH ways and aborts on any disagreement. Development knob, and only for a quiescent tree: the two walks run at different instants, so a guest racing its own mounts/renames (tests/fixtures/bindrace.c) makes them differ for a reason that is not a bug.
 * `A64_PINWALK_FORCE_LOOP`: pins a resolved path's parent one component at a time (openat/O_NOFOLLOW) instead of in a single `openat2(RESOLVE_NO_SYMLINKS)` — the tier a host kernel older than 5.6 is served by. Same containment, one syscall per component instead of one per path.
 * `A64_PROCSTAT_FORCE_SYNTH`: forces the synthetic /proc/stat fallback.
