@@ -157,9 +157,13 @@ unfiltered:
   fell back to the descriptor for the `stat` and then asked `access(path,
   X_OK)` — the same path, the same refusal — so on a host whose denial covers
   the path walk and not only the open, the fallback bought nothing and the exec
-  failed with `EACCES`. It now judges the mode the descriptor gave it, against
-  this process's real identity (the guest's, without `--fake-id`), by the
-  kernel's own rule. `A64_OWNFD_FORCE_DENY` makes an ordinary host refuse those
+  failed with `EACCES`. The whole check is now asked of the descriptor
+  (`access_fd`, `sys.h`), which also closes the rename window a name-based
+  answer leaves open: the `/proc` spelling of that descriptor first — the
+  device *does* allow `stat` and `access` through it, only the open is refused
+  — then `faccessat2`'s `AT_EMPTY_PATH`, and where neither can answer, the mode
+  the descriptor gave, judged against this process's real identity (the
+  guest's, without `--fake-id`) by the kernel's own rule. `A64_OWNFD_FORCE_DENY` makes an ordinary host refuse those
   path forms — stat and access included, so it is stricter than the device —
   and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
   without `--fake-id`, requiring identical output.
@@ -174,7 +178,12 @@ unfiltered:
   made non-executable still runs. The mode is an inode property the host will
   not hold, exactly like the fallback tier's seals, so it goes where they go —
   the broker registry (`proctab.c`), keyed by (dev, ino), surviving `execve`
-  and visible to every process the fd reaches by `fork` or `SCM_RIGHTS`. A
+  and visible to every process the fd reaches by `fork` or `SCM_RIGHTS`. What
+  makes that key safe is a `dup` the daemon keeps beside each row: while it is
+  open the inode cannot be freed, so its number cannot be recycled into an
+  unrelated file the row would then answer for. The row therefore only exists
+  if the pin does — a `dup` that fails (the daemon out of descriptors) refuses
+  the request rather than leaving a key nothing holds. A
   native memfd is registered lazily, on its first refused chmod, so nothing is
   paid on a host that simply allows it. `A64_MEMFD_CHMOD_FORCE_DENY` forces the
   tier anywhere, and `tests/fixtures/ownfdexec.c`'s fourth leg is what it is

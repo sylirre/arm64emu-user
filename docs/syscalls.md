@@ -922,7 +922,16 @@ then make the consequences the caller depends on true:
   if it cannot. The time-varying files (`loadavg`/`uptime`/`stat`) are
   regenerated when a read starts at offset 0: procps opens them once and
   `lseek(0)`+rereads every refresh cycle, so an open-time snapshot would
-  freeze `top`. The guest program's name is also set as the process `comm`
+  freeze `top`. That needs the descriptor in a small per-process table
+  (`PF_MAX_FDS`), whose rows are dropped when the guest closes or `dup2`s over
+  the fd — and by an identity check, on **device and inode**, for the closes
+  the table cannot see (`execve`'s CLOEXEC sweep). An open the guest's
+  `RLIMIT_NOFILE` refuses *after* the view was built drops its row before
+  closing the descriptor, in that order: once the number is closed it is
+  anyone's, and a row left behind would aim the next refresh's `ftruncate` at
+  whatever opened next — while eight of them fill the table, after which no
+  view is tracked at all and every one of them freezes
+  (`tests/c/procfsrefresh.c`). The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
   for every guest process. `status` is rebuilt line by line instead
   (`put_status`): most of it — `State`, `PPid`, `FDSize`, `Threads`, the
@@ -993,7 +1002,16 @@ then make the consequences the caller depends on true:
   each process publishes its NUL-joined argv, guest exe path, cwd, NUL-joined
   environ and raw auxv block keyed by PID at `load_elf` and in the `fork` child
   (and refreshes cwd on `chdir`/`fchdir`), with the `/proc/<pid>/stat` starttime
-  as a stale-slot guard against host PID reuse. A fork child's slot is reserved
+  as a stale-slot guard against host PID reuse — re-read not only before a
+  payload snapshot is trusted but by the **membership** answers themselves
+  (`proctab_has`, `proctab_pid_at`), which are the containment gate for the
+  hidden-process view below and for every syscall that names another process.
+  A process that dies without unregistering leaves its number standing in the
+  table, and guest PIDs are host PIDs: without that re-read, once the host
+  recycled the number onto an unrelated same-uid process the guest could read
+  its `/proc` and signal it. It is read through the entry's seqlock, since a
+  64-bit field is two stores on a 32-bit host and a torn one would call a
+  running guest process stale. A fork child's slot is reserved
   by its parent *before* the fork, so both know it without searching (see
   `CLONE_NEWUSER` above), and a slot stays invisible — a pid sentinel no scan
   matches — until its entry is built. Two things sit outside the owner-only
@@ -1236,18 +1254,38 @@ the guest may **execute** it, handles a `#!` shebang loop (depth 4, rebuilding
 argv), and for an ELF64/AArch64 file performs an **in-process reload**: tear down
 the address space, close CLOEXEC fds, reset signal handlers, and `load_elf`.
 
+**The image is opened once** (`exec_open_pinned`, `elf.c`), in the resolution
+loop, and every question after that is asked of *that descriptor*: the file
+type and mode, the permission, the header, the setuid bits, and the load
+itself. A name only answers about whatever is at it when it is asked — the pin
+stops a directory component turning into a symlink between the walk and the
+syscall, but not the final component being renamed — so re-opening the name for
+each question let a concurrent rename hand the guest an image that was never
+checked, with another file's setuid bits, and let the load fail on a file that
+was there a moment ago, past the point of no return where failing can only kill
+the process. A kernel opens once too (`do_open_execat`) and `bprm->file` is
+what everything downstream reads. The type gate is the kernel's `may_open`
+rule, applied before the open rather than after it: only a regular file is
+executable, so a fifo, socket or directory is `EACCES` rather than whatever
+`open(2)` makes of it, and `O_NONBLOCK|O_NOCTTY` keep a fifo or a tty appearing
+there in the race from blocking the open or taking a controlling terminal.
+
 The execute check has to be made here because nothing else asks it: the emulator
 only ever *reads* an image, so without it a file that is merely readable would
-run where a kernel answers `EACCES`, and so would a directory or a device node
-(only a regular file is executable). Without `--fake-id` the host's `access(2)`
-answers it for this process, supplementary groups and all; with one, the
-kernel's rule is applied to the guest's fake credentials against the file's
-*remapped* ownership — a fake root needs an execute bit somewhere, anyone else
-the bit for the class it falls into. It runs once per turn of the shebang loop,
-so the interpreter a script names must be executable too. Whether the image can
-be *read* — which the emulator, unlike a kernel, does need — is answered by the
-header read just below it, still ahead of the point of no return, and reported
-as the errno the open was refused with. No host `execve` and no dependency on
+run where a kernel answers `EACCES`. Without `--fake-id` the guest's identity is
+this process's, and the host's own `access(2)` is the exact answer —
+supplementary groups, ACLs, mount flags — asked about the descriptor rather than
+the name (`access_fd`, `sys.h`: the `/proc` spelling of the descriptor, which
+names that exact inode however the tree changes, then `faccessat2`'s
+`AT_EMPTY_PATH` where that spelling is refused, then the rule by hand against
+the descriptor's own mode). With `--fake-id` the kernel's rule is applied to the
+guest's fake credentials against the file's *remapped* ownership — a fake root
+needs an execute bit somewhere, anyone else the bit for the class it falls into
+(`mode_access_ok`, shared with `faccessat`). It runs once per turn of the
+shebang loop, so the interpreter a script names must be executable too. Whether
+the image can be *read* — which the emulator, unlike a kernel, does need — is
+answered by the open itself, still ahead of the point of no return, and reported
+as the errno it was refused with. No host `execve` and no dependency on
 the emulator's own path. `do_execve` takes private copies of argv/envp — the
 caller retains ownership (a subtle earlier use-after-free lives in the git
 history).
@@ -1262,8 +1300,11 @@ otherwise walk straight into `envp`. The shebang rewrite below relies on there
 being one too, since it replaces `argv[0]` with the script path.
 
 Everything else the loader can refuse is refused there too, by `elf_probe`
-(`elf.c`), which validates the ELF header and opens the interpreter it names
-*without touching the address space*. It has to run first because the reload is
+(`elf.c`), which validates the ELF header on that same descriptor and opens the
+interpreter it names *without touching the address space* — handing the
+interpreter's descriptor on to `load_elf`, so the file that was checked is the
+file that runs. `load_elf_binary` does exactly this: it opens the interpreter
+and reads its header before `begin_new_exec` and keeps the `struct file`. It has to run first because the reload is
 in-process: past the teardown there is no old image to return to, and a refusal
 could only kill the process, where a kernel answers `ENOEXEC` (wrong arch or
 format — what a shell's "cannot execute binary file" and an `execvp` `PATH` walk
@@ -1429,7 +1470,23 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   full set for fake-root as well, since `capget(2)` already reports one and
   zeros here would contradict it. See the `status` table above for the lines
   rewritten regardless of fake-id.
-- **Fail-soft `chown`/`chmod`** and a **`faccessat` root DAC-bypass**, plus
+- **`access(2)`/`faccessat`/`faccessat2`**: answered from the guest's
+  credentials against the file's *remapped* ownership, by the kernel's own
+  `generic_permission` (`mode_access_ok`, `sys.h` — the same rule `execve`
+  applies, asked for `X_OK`). The host cannot answer it: its identity is the
+  emulator's, which owns the whole rootfs, so a guest that dropped to a
+  non-root fake uid was told it could read and write files its own model says
+  belong to fake root, and one whose fake groups differ from the host's was
+  judged by the wrong triad. Fake root's DAC bypass falls out of that rule
+  (read and write whatever the mode says, execute only where an execute bit is
+  set) rather than being a fallback after the host's answer, and `AT_EACCESS`
+  now means something: it picks the effective ids where plain `access(2)` picks
+  the real ones, as the kernel does. The host is still asked what the guest
+  model cannot know — whether the file is there at all, and the refusals that
+  are not about ownership (`EROFS`, `ELOOP`, `ENAMETOOLONG`); a plain `EACCES`
+  or `EPERM` from it is an answer about the wrong identity and is discarded.
+  (`tests/fixtures/fakeidacc.c`.)
+- **Fail-soft `chown`/`chmod`**, plus
   `capget` reporting the full capability set for fake-root — its header protocol
   is answered too: an unrecognised version is written back as the preferred one
   (libcap probes with a bogus version and a NULL data pointer purely to read
