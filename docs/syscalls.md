@@ -1075,6 +1075,12 @@ them are the guest's own IPC model, not a host one.
   `$TMPDIR`, `/data/local/tmp`, …) when `memfd_create` is unavailable; if neither
   is possible `shmget` fails loud with `-ENOSPC` rather than handing back
   non-shared memory. `A64_SHM_FORCE_FILE` forces the file tier for testing.
+  That file gets a `mkstemp` name and is unlinked as soon as it exists: the
+  descriptor is the whole segment (attachers receive it over `SCM_RIGHTS`,
+  never by name), those directories are world-writable, and a predictable name
+  in one of them is a name someone else can plant a symlink at — which this
+  process would then have truncated and share-mapped under its own
+  credentials. Nothing is left behind for a later run to sweep either.
   Sizes are bounded as the kernel bounds them: `0` and anything above `SHMMAX`
   (`ULONG_MAX - 16 MiB`) are `EINVAL`, and a segment larger than the guest
   address space — which no attach could ever cover — is `ENOMEM`.

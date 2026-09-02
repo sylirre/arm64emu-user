@@ -231,8 +231,25 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * non-guest host tasks.) */
     snprintf(path, sizeof path, "%s/arm64chroot-proctab.v6.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    /* The name is fixed by design -- every invocation of this rootfs has to
+     * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
+     * world-writable, so anyone else on the host can get to that name first.
+     * O_NOFOLLOW refuses a symlink planted there: without it this open, the
+     * ftruncate below and the MAP_SHARED that follows would all land on
+     * whatever it pointed at, with our credentials. A plain file planted there
+     * is refused by the checks after it -- it must be a regular file, ours,
+     * with no other link to it, and reachable by nobody else, since the
+     * registry carries every guest process's argv, environment and cwd. */
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+        (u32)st.st_uid != (u32)geteuid() || (st.st_mode & 077)) {
+        close(fd);
+        fprintf(stderr, "arm64chroot: refusing shared registry %s: "
+                        "not a private regular file of this user\n", path);
+        return 0;   /* degrade to the anonymous per-invocation table */
+    }
     /* Grow-only ftruncate: idempotent under racing creators, and guarantees the
      * mapping is fully backed and zero-filled (a fresh file is an all-free table
      * since pid==0 means free). */
@@ -493,8 +510,8 @@ struct Seg {
     u32 uid, gid, cuid, cgid;
     s32 cpid, lpid;
     s64 atime, dtime, ctime;
-    int memfd;                /* daemon-owned backing fd */
-    char path[128];           /* file-tier backing path to unlink (else "") */
+    int memfd;                /* daemon-owned backing fd (the whole backing:
+                               * the file tier's file is unlinked at creation) */
     u64 nattch;
     int rmid;                 /* IPC_RMID pending: free at last detach */
     struct SegAtt att[SHM_ATT_TRACK];
@@ -661,8 +678,7 @@ static struct Seg *shm_find(s32 shmid) {
 }
 
 static void shm_free(struct Seg *s) {
-    if (s->memfd >= 0) close(s->memfd);
-    if (s->path[0]) unlink(s->path);
+    if (s->memfd >= 0) close(s->memfd);   /* the last reference: file tier or not */
     memset(s, 0, sizeof *s);   /* used = 0 */
 }
 
@@ -724,22 +740,32 @@ static s32 shm_alloc_id(void) {
 }
 
 /* Create a segment's backing: an anonymous memfd (the normal, Android-safe path)
- * or, when memfd_create is unavailable — or A64_SHM_FORCE_FILE forces it for a
- * test — a file in the first writable dir. `path_out` gets the file path (to
- * unlink on free) or "". Returns the fd, or -1 (no backing -> caller fails loud). */
-static int shm_make_backing(u64 size, s32 shmid, char *path_out, size_t path_sz) {
-    path_out[0] = 0;
+ * or, when memfd_create is unavailable -- or A64_SHM_FORCE_FILE forces it for a
+ * test -- a file in the first writable dir. Returns the fd, or -1 (no backing
+ * -> caller fails loud).
+ *
+ * The file tier has no name anyone can reach: mkstemp picks it and creates it
+ * O_EXCL, and it is unlinked the moment it exists. The fd IS the segment --
+ * clients receive it over SCM_RIGHTS, never by name -- so nothing needs the
+ * file to still have one, and a broker that is killed leaves nothing behind to
+ * sweep. The predictable <dir>/arm64chroot-shm.v1.<uid>.<shmid> this replaces
+ * was opened O_CREAT|O_TRUNC in a world-writable /tmp or /dev/shm, where
+ * anyone could plant a symlink at it and have this process truncate and
+ * share-map whatever it pointed at. */
+static int shm_make_backing(u64 size) {
     int fd = -1;
     if (!getenv("A64_SHM_FORCE_FILE")) fd = proctab_memfd();
     if (fd < 0) {
         const char *dir = shared_dir();
         if (!dir) return -1;
-        if ((size_t)snprintf(path_out, path_sz, "%s/arm64chroot-shm.v1.%u.%d",
-                             dir, (unsigned)getuid(), (int)shmid) >= path_sz) {
-            path_out[0] = 0; return -1;
-        }
-        fd = open(path_out, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0) { path_out[0] = 0; return -1; }
+        char tmpl[PATH_MAX + 32];
+        if ((size_t)snprintf(tmpl, sizeof tmpl, "%s/arm64chroot-shm.XXXXXX", dir) >=
+            sizeof tmpl)
+            return -1;
+        fd = mkstemp(tmpl);
+        if (fd < 0) return -1;
+        unlink(tmpl);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
     }
     /* Back the whole host-page span the client's mmap will round up to, so no
      * access past the requested size ever faults SIGBUS beyond end-of-file (host
@@ -747,11 +773,7 @@ static int shm_make_backing(u64 size, s32 shmid, char *path_out, size_t path_sz)
     long ps = sysconf(_SC_PAGESIZE);
     if (ps < 4096) ps = 4096;
     u64 backing = (size + (u64)ps - 1) & ~((u64)ps - 1);
-    if (ftruncate(fd, (off_t)backing) != 0) {
-        close(fd);
-        if (path_out[0]) { unlink(path_out); path_out[0] = 0; }
-        return -1;
-    }
+    if (ftruncate(fd, (off_t)backing) != 0) { close(fd); return -1; }
     return fd;
 }
 
@@ -783,8 +805,7 @@ static s32 shm_do_get(struct BReq *q) {
     if (slot < 0) return -ENOSPC;
     s32 id = shm_alloc_id();
     if (id < 0) return -ENOSPC;
-    char path[128];
-    int fd = shm_make_backing(q->size, id, path, sizeof path);
+    int fd = shm_make_backing(q->size);
     if (fd < 0) return -ENOSPC;                 /* fail-loud: no backing available */
     struct Seg *s = &g_seg[slot];
     memset(s, 0, sizeof *s);
@@ -793,7 +814,6 @@ static s32 shm_do_get(struct BReq *q) {
     s->uid = s->cuid = q->uid; s->gid = s->cgid = q->gid;
     s->cpid = q->pid; s->ctime = now;
     s->memfd = fd;
-    if (path[0]) snprintf(s->path, sizeof s->path, "%s", path);
     return id;
 }
 
@@ -2105,7 +2125,12 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
 void proctab_init(const char *rootfs_key) {
     size_t size = sizeof(struct ProcEnt) * PROCTAB_MAX;
     if (rootfs_key) {
-        if (proctab_open_broker(rootfs_key, size)) return;   /* diskless (normal) */
+        /* A64_PROCTAB_FORCE_FILE skips the diskless broker for the named-file
+         * tier below -- what a host with neither memfd_create nor abstract
+         * sockets is permanently on, and a tier no ordinary machine would
+         * otherwise reach. */
+        if (!getenv("A64_PROCTAB_FORCE_FILE") &&
+            proctab_open_broker(rootfs_key, size)) return;   /* diskless (normal) */
         if (proctab_open_shared(rootfs_key, size)) return;   /* named-file fallback */
     }
     /* Default / last resort: per-invocation table inherited across fork only. */

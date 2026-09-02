@@ -697,6 +697,73 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     rm -f "$ALPINE/tmp/apid"
 fi
 
+# ---- shared-proc: the named-file registry tier (A64_PROCTAB_FORCE_FILE) ----
+# The diskless broker above is what every ordinary host uses, so the named-file
+# fallback -- what a host with neither memfd_create nor abstract sockets is
+# permanently on -- is reached nowhere else in this suite. Two things about it.
+# It still shares the registry across invocations. And it refuses a name it did
+# not create: the name is fixed (every invocation of a rootfs has to find the
+# same file) and its directory is world-writable (/dev/shm, /tmp), so anyone can
+# plant a symlink at it -- which this process would otherwise open, ftruncate
+# and share-map, with its own credentials, over whatever the link pointed at.
+PTDIRS="/dev/shm ${XDG_RUNTIME_DIR:-} ${TMPDIR:-} /data/local/tmp /tmp"
+pt_registry() {   # the registry file this host's shared_dir() picked, if any
+    for d in $PTDIRS; do
+        [ -n "$d" ] || continue
+        for f in "$d"/arm64chroot-proctab.v6."$(id -u)".*; do
+            [ -f "$f" ] && { echo "$f"; return 0; }
+        done
+    done
+    return 1
+}
+if [ -x "$ALPINE/bin/busybox" ]; then
+    for d in $PTDIRS; do
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v6."$(id -u)".* 2>/dev/null
+    done
+    rm -f "$ALPINE/tmp/apid"
+    A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
+        /bin/busybox sh -c 'sleep 30 & echo $! > /tmp/apid; wait' &
+    sp_bg=$!
+    apid=""; n=0
+    while [ "$n" -lt 50 ]; do
+        if [ -s "$ALPINE/tmp/apid" ]; then apid=$(cat "$ALPINE/tmp/apid" 2>/dev/null); break; fi
+        sleep 0.1; n=$((n+1))
+    done
+    sleep 0.3
+    got=$(A64_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc -E APID="${apid:-0}" "$ALPINE" \
+        /bin/busybox sh -c 'tr "\0" " " < /proc/$APID/cmdline | sed "s/ $//"' 2>/dev/null)
+    reg=$(pt_registry) || reg=
+    kill "$sp_bg" 2>/dev/null; wait "$sp_bg" 2>/dev/null
+    rm -f "$ALPINE/tmp/apid"
+    if [ -z "$reg" ]; then
+        skip=$((skip+1)); echo "SKIP shared-proc: named-file tier (no writable shared dir)"
+    elif [ "$got" = "sleep 30" ]; then
+        pass=$((pass+1)); echo "PASS shared-proc: cross-invocation cmdline via named file"
+    else
+        fail=$((fail+1))
+        echo "FAIL shared-proc: cross-invocation cmdline via named file (want 'sleep 30' got '$got')"
+    fi
+    if [ -n "$reg" ]; then
+        # Now plant a symlink where the registry goes and confirm the target is
+        # not touched -- neither truncated nor mapped -- and the guest still runs.
+        victim="$(dirname "$reg")/ci_ptvictim.$$"   # absolute: a symlink target
+        printf 'do-not-truncate\n' > "$victim"
+        rm -f "$reg"; ln -s "$victim" "$reg"
+        out=$(A64_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc "$ALPINE" \
+              /bin/busybox echo ok 2>/dev/null)
+        if [ "$out" = "ok" ] && [ "$(cat "$victim")" = "do-not-truncate" ]; then
+            pass=$((pass+1)); echo "PASS shared-proc: planted symlink refused, target untouched"
+        else
+            fail=$((fail+1))
+            echo "FAIL shared-proc: planted symlink refused, target untouched (out='$out' victim='$(head -c 40 "$victim")')"
+        fi
+        rm -f "$reg" "$victim"
+    fi
+    for d in $PTDIRS; do
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v6."$(id -u)".* 2>/dev/null
+    done
+fi
+
 # ---- runtime bind mounts (guest mount --bind / umount, self-checking) ----
 # Emulator-only (qemu-aarch64 performs *real* mounts, so it can't be the oracle).
 # The bind table is process-shared, so a bind established by the `mount` child is

@@ -327,6 +327,11 @@ static void help(void) {
                         "the per-process files are denied, never served from "
                         "the host's own /proc."},
         {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
+        {"A64_PROCTAB_FORCE_FILE", "Skip the diskless guest-PID registry "
+                        "broker for the named-file tier (the tier a host with "
+                        "neither memfd_create nor abstract sockets is served "
+                        "by); the file is refused unless it is a regular file "
+                        "of this user that nobody else can reach."},
         {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "
                         "tier)."},
