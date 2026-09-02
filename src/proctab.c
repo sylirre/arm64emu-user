@@ -590,9 +590,17 @@ static s32 mfd_do_reg(struct BReq *q, int rfd, int cfd) {
     } else if (e->fd >= 0)
         close(e->fd);                    /* re-register: shouldn't happen */
     memset(e, 0, sizeof *e);
+    /* The pin (caller closes rfd). Without it nothing holds the inode, and a
+     * dev/ino this entry still matches on can be recycled into an unrelated
+     * file -- which would then be answered with these seals. So the entry only
+     * exists if the pin does: a dup that fails (the daemon out of descriptors)
+     * leaves the slot free and fails the guest's memfd_create, which is what
+     * its caller does with any refusal from here. */
+    int pin = dup(rfd);
+    if (pin < 0) { memset(e, 0, sizeof *e); return -EMFILE; }
     e->used = 1; e->tier = 1; e->dev = st.st_dev; e->ino = st.st_ino;
     e->seals = (u32)q->val;
-    e->fd = dup(rfd);                    /* the pin (caller closes rfd) */
+    e->fd = pin;
     memcpy(e->name, name, sizeof e->name);
     return 0;
 }
@@ -635,9 +643,14 @@ static s32 mfd_do_mode(struct BReq *q, int rfd) {
         for (int i = 0; i < MFD_TAB_MAX && !e; i++)
             if (!g_mfd[i].used) e = &g_mfd[i];
         if (!e) return -ENFILE;
+        /* The pin, on the same terms as mfd_do_reg's: no pin, no entry, or a
+         * recycled inode number would inherit this mode. The guest's chmod is
+         * then not held, and it gets the host's own refusal. */
+        int pin = dup(rfd);
+        if (pin < 0) return -EMFILE;
         memset(e, 0, sizeof *e);
         e->used = 1; e->dev = (u64)st.st_dev; e->ino = (u64)st.st_ino;
-        e->fd = dup(rfd);                           /* the pin (caller closes) */
+        e->fd = pin;
     }
     e->mode = (u32)q->val & 07777u;
     e->has_mode = 1;
