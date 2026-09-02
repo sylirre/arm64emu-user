@@ -1202,25 +1202,14 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
     return -ENOSYS;
 }
 
-/* The kernel's execute-permission rule, applied to one stat'ed mode against
- * one identity: uid 0 needs an execute bit somewhere, anyone else needs the
- * bit for the class it falls into. Both callers below need it -- the fake
- * identity judges the remapped ownership the guest sees, the real one judges
- * the host's -- and neither can reach for access(2). */
+/* The kernel's execute-permission rule against one identity -- the general
+ * rule (sys.h, mode_access_ok) asked for X_OK. Both callers below need it: the
+ * fake identity judges the remapped ownership the guest sees, the real one
+ * judges the host's, and neither can reach for access(2). */
 static int mode_exec_ok(u32 euid, u32 egid, const u32 *groups, int ngroups,
                         u32 fowner, u32 fgroup, mode_t mode) {
-    if (euid == 0)
-        return (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 0 : -EACCES;
-    mode_t bit = S_IXOTH;
-    if (euid == fowner) {
-        bit = S_IXUSR;
-    } else if (egid == fgroup) {
-        bit = S_IXGRP;
-    } else {
-        for (int i = 0; i < ngroups; i++)
-            if (groups[i] == fgroup) { bit = S_IXGRP; break; }
-    }
-    return (mode & bit) ? 0 : -EACCES;
+    return mode_access_ok(euid, egid, groups, ngroups, fowner, fgroup,
+                          (u32)mode, X_OK);
 }
 
 /* This process's own supplementary groups, for the rule above. Cold (an exec),

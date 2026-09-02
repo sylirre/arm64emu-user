@@ -1212,24 +1212,54 @@ out:;
     return copy_to_guest(c, a2, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
-/* Root's DAC bypass: existence and R/W are always granted; X requires at least
- * one execute bit. Applied only when fake-root, and only as a fallback after the
- * host check (so a genuinely-accessible file still succeeds normally). */
-static u64 access_fake_root(struct Machine *m, const PathPin *p, int mode) {
-    if (!fake_root(m)) return host_err();
+/* access(2) for a guest whose credentials are the fake ones (--fake-id).
+ *
+ * The host cannot answer this. Its identity is the emulator's, and the file's
+ * owner as the guest sees it is the REMAPPED owner that every stat reports --
+ * so a guest that dropped to a non-root fake uid was told it could write files
+ * its own model says belong to fake root, and a guest whose fake groups differ
+ * from the host's was judged by the wrong triad entirely. The decision is made
+ * here against the guest's credentials, the same way exec_perm_check makes it
+ * for execve. Fake root's DAC bypass falls out of mode_access_ok rather than
+ * being a special case bolted on after the host's answer.
+ *
+ * The host is still asked what the guest model cannot know: whether the file is
+ * there at all (the stat), and the refusals that are not about ownership -- a
+ * read-only mount's EROFS, ELOOP, ENAMETOOLONG. A plain EACCES or EPERM from it
+ * is a DAC answer about the wrong identity, and is discarded.
+ *
+ * `eff` picks the identity the kernel picks: access(2) and faccessat(2) ask
+ * about the real ids, faccessat2's AT_EACCESS about the effective ones. */
+static u64 access_faked(struct Machine *m, const PathPin *p, int mode, int eff) {
     struct stat st;
     if (fstatat(p->dfd, p->name, &st, p->pinned ? AT_SYMLINK_NOFOLLOW : 0) < 0)
         return host_err();                          /* keep ENOENT etc. */
-    if ((mode & X_OK) && !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
-        return (u64)(s64)-EACCES;
-    return 0;
+    /* The same mode every other guest-visible stat of this file reports: a
+     * memfd whose mode the host would not hold is the registry's (sys_misc.c). */
+    mfd_stat_fixup(m, proc_own_fd_path(p->host), &st);
+    int r = mode_access_ok(eff ? m->cred.euid : m->cred.ruid,
+                           eff ? m->cred.egid : m->cred.rgid,
+                           m->cred.groups, m->cred.ngroups,
+                           remap_uid(m, (u32)st.st_uid),
+                           remap_gid(m, (u32)st.st_gid),
+                           (u32)st.st_mode, mode);
+    if (r < 0) return (u64)(s64)r;
+    if (access_pinned(p, mode) == 0) return 0;
+    return (errno == EACCES || errno == EPERM) ? 0 : host_err();
+}
+
+/* The host's own answer, for a guest running on the emulator's real identity:
+ * access(2) then names the very credentials the guest has, ACLs and all. */
+static u64 access_host(const PathPin *p, int mode) {
+    return access_pinned(p, mode) == 0 ? 0 : host_err();
 }
 
 SYSDEF(faccessat) {
     PathPin pin;
     int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    u64 ret = access_pinned(&pin, (int)a2) == 0 ? 0 : access_fake_root(c->m, &pin, (int)a2);
+    u64 ret = c->m->fake_id ? access_faked(c->m, &pin, (int)a2, 0)
+                            : access_host(&pin, (int)a2);
     path_unpin(&pin);
     return ret;
 }
@@ -1239,12 +1269,12 @@ SYSDEF(faccessat2) {
      * honored by the resolver, and AT_EACCESS means nothing at host level --
      * the emulator never changes its host ids, so the host's real-id and
      * effective-id checks are the same check; the guest-visible difference
-     * exists only under --fake-id, where access_fake_root answers. Passing
-     * them through made every faccessat2 fail EINVAL on Bionic, whose
-     * faccessat wrapper rejects ANY flags -- dash's `test -r` uses
-     * AT_EACCESS, so apt-key read the Debian archive keyring as unreadable,
-     * silently verified against /dev/null instead, and every InRelease
-     * signature came back NO_PUBKEY. */
+     * exists only under --fake-id, where access_faked reads the flag off this
+     * `eff` argument. Passing them through made every faccessat2 fail EINVAL
+     * on Bionic, whose faccessat wrapper rejects ANY flags -- dash's `test -r`
+     * uses AT_EACCESS, so apt-key read the Debian archive keyring as
+     * unreadable, silently verified against /dev/null instead, and every
+     * InRelease signature came back NO_PUBKEY. */
     unsigned gf = (unsigned)a3;
     if (gf & ~(unsigned)(G_AT_SYMLINK_NOFOLLOW | G_AT_EACCESS))
         return (u64)(s64)-EINVAL;
@@ -1252,7 +1282,9 @@ SYSDEF(faccessat2) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    u64 ret = access_pinned(&pin, (int)a2) == 0 ? 0 : access_fake_root(c->m, &pin, (int)a2);
+    u64 ret = c->m->fake_id
+                  ? access_faked(c->m, &pin, (int)a2, (gf & G_AT_EACCESS) != 0)
+                  : access_host(&pin, (int)a2);
     path_unpin(&pin);
     return ret;
 }

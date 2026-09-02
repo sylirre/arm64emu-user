@@ -227,6 +227,32 @@ static inline int access_pinned(const PathPin *p, int mode) {
     return faccessat(p->dfd, p->name, mode, 0);
 }
 
+/* The kernel's generic_permission, asked about an explicit credential set
+ * rather than this process's: what the GUEST's identity makes of a file's
+ * guest-visible ownership and mode. `mode` is the access(2) bit set
+ * (F_OK/R_OK/W_OK/X_OK); returns 0 or -EACCES.
+ *
+ * Needed wherever --fake-id is in force, because the host can only answer for
+ * the emulator's own identity, and the owner the guest sees is the remapped
+ * one (remap_uid/remap_gid) it sees in every stat. Root's bypass is the
+ * kernel's own: CAP_DAC_OVERRIDE grants read and write whatever the mode says,
+ * and execute only where at least one execute bit is set. */
+static inline int mode_access_ok(u32 uid, u32 gid, const u32 *groups, int ngroups,
+                                 u32 fowner, u32 fgroup, u32 fmode, int mode) {
+    unsigned want = ((mode & R_OK) ? 4u : 0u) | ((mode & W_OK) ? 2u : 0u) |
+                    ((mode & X_OK) ? 1u : 0u);
+    if (!want) return 0;              /* F_OK: existence, and it was stat'able */
+    if (uid == 0) return ((want & 1u) && !(fmode & 0111u)) ? -EACCES : 0;
+    unsigned grant;
+    if (uid == fowner) grant = (fmode >> 6) & 7u;
+    else {
+        int ingrp = (gid == fgroup);
+        for (int i = 0; !ingrp && i < ngroups; i++) ingrp = groups[i] == fgroup;
+        grant = ingrp ? (fmode >> 3) & 7u : fmode & 7u;
+    }
+    return (want & ~grant) ? -EACCES : 0;
+}
+
 /* access(2) about an OPEN DESCRIPTOR rather than a name -- what execve needs,
  * since between an answer about a name and the load a rename can put a
  * different file there (a kernel checks MAY_EXEC on the inode it is opening,

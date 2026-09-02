@@ -379,6 +379,18 @@ if [ -x "$ALPINE/bin/busybox" ]; then
 vfork child=1 waited=1 exited=1 status=0
 fork done rc=0" "$ALPINE" /tmp/ci_vfork
     rm -f "$ALPINE/tmp/ci_vfork"; fx_rm tests/fixtures/vfork.bin
+    # access(2) has to answer from the GUEST's credentials against the file's
+    # REMAPPED ownership. It used to answer from the host's, with a bypass for
+    # fake root bolted on after: a guest that dropped to a non-root fake uid was
+    # told it could read and write files its own model says belong to fake root,
+    # and faccessat2's AT_EACCESS made no difference to anything.
+    "$AGCC" -O1 -static -o tests/fixtures/fakeidacc.bin tests/fixtures/fakeidacc.c 2>/dev/null &&
+        cp tests/fixtures/fakeidacc.bin "$ALPINE/tmp/ci_fakeidacc" &&
+        check_fakeid "access uses the fake credentials" "root r600=1 w600=1 x644=0 x755=1
+euid1000 real_r600=1 eff_r600=0
+uid1000 r600=0 r640=1 w640=0 x755=1" --fake-id "$ALPINE" /tmp/ci_fakeidacc
+    rm -f "$ALPINE/tmp/ci_fakeidacc" "$ALPINE"/tmp/ci_fa[0-9][0-9][0-9]
+    fx_rm tests/fixtures/fakeidacc.bin
     # adduser exercises vfork+exec of helpers under fake-root.
     check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
         --fake-id "$ALPINE" /bin/sh -c \
