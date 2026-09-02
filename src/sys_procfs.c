@@ -665,8 +665,9 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
     for (i = 0; i < m->pf_fds_count; i++)
         if (m->pf_fds[i].fd == fd) break;
     if (i == m->pf_fds_count) { EMU_UNLOCK(&pf_lock, EMU_LK_PF); return 0; }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino) {
+    struct stat st;   /* both halves of the identity: see procfs_pre_read */
+    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
+        (u64)st.st_dev != m->pf_fds[i].dev) {
         m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
         EMU_UNLOCK(&pf_lock, EMU_LK_PF);
         return 0;
@@ -752,14 +753,14 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
 static void pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
-    u64 ino = (u64)st.st_ino;
     EMU_LOCK(&pf_lock, EMU_LK_PF);
     if (m->pf_fds_count < PF_MAX_FDS) {
         m->pf_fds[m->pf_fds_count].fd = fd;
         m->pf_fds[m->pf_fds_count].kind = (u8)kind;
         m->pf_fds[m->pf_fds_count].self = (u8)self;
         m->pf_fds[m->pf_fds_count].pid = pid;
-        m->pf_fds[m->pf_fds_count].ino = ino;
+        m->pf_fds[m->pf_fds_count].dev = (u64)st.st_dev;
+        m->pf_fds[m->pf_fds_count].ino = (u64)st.st_ino;
         m->pf_fds_count++;
     }
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
@@ -785,7 +786,12 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
         if (m->pf_fds[i].fd == fd) break;
     if (i == m->pf_fds_count) goto out;
     struct stat st;
-    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino) {
+    /* Device and inode, not the inode alone: the number repeats across
+     * filesystems, and everything below rewrites this descriptor from byte
+     * zero -- an entry that matched a recycled fd by luck would truncate
+     * whatever the guest opened next. */
+    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
+        (u64)st.st_dev != m->pf_fds[i].dev) {
         m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
         goto out;
     }

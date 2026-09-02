@@ -799,8 +799,18 @@ SYSDEF(openat) {
         s64 pf;
         if (procfs_open(c, pcanon, gflags, &pf)) {
             path_unpin(&pin);
-            /* A synthesized view is still a descriptor the guest keeps. */
-            if (pf >= 0 && !fd_within_limit(c, (int)pf)) return (u64)(s64)-EMFILE;
+            /* A synthesized view is still a descriptor the guest keeps, so the
+             * guest's own RLIMIT_NOFILE applies to it (sys.h, fd_within_limit).
+             * Written out here rather than through that helper because the
+             * refresh table may have just started tracking this descriptor,
+             * and the tracking has to go BEFORE the descriptor does: once it is
+             * closed the number is anyone's, and an entry left behind would
+             * aim a later refresh's ftruncate at whatever opened next. */
+            if (pf >= 0 && (int)pf >= fd_nofile_cap(c->m)) {
+                procfs_unmark_fd(c->m, (int)pf);
+                close((int)pf);
+                return (u64)(s64)-EMFILE;
+            }
             return (u64)pf;
         }
     }

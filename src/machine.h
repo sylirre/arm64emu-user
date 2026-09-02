@@ -349,7 +349,11 @@ struct Machine {
         u8 self;              /* PF_STATUS: the file describes this Machine */
         s32 pid;              /* whose file: another guest PID or TID, or 0
                                * for ours (PF_STATUS always names a TID) */
-        u64 ino;              /* memfd inode: stale-entry check on fd reuse */
+        u64 dev, ino;         /* memfd identity: the stale-entry check on fd
+                               * reuse. Both halves -- an inode number alone
+                               * repeats across filesystems, and a match on a
+                               * recycled number would aim the refresh's
+                               * ftruncate at whatever file opened next. */
     } pf_fds[PF_MAX_FDS];
     int pf_fds_count;
 
