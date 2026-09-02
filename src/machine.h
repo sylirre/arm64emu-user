@@ -990,7 +990,10 @@ void proctab_release(int slot);     /* the fork failed */
 void proctab_slot_adopt(int slot);  /* in the child: that slot is now ours */
 void proctab_unregister(s32 pid);                          /* exit */
 void proctab_set_cwd(s32 pid, const char *cwd);            /* chdir / fchdir */
-int  proctab_has(s32 pid);                                 /* is a guest PID? */
+/* Is this a guest PID -- a slot whose stored starttime still matches the live
+ * process, so that a number a killed process left in the table and the host
+ * handed to someone else is not admitted as one of the guest's. */
+int  proctab_has(s32 pid);
 int  proctab_cmdline(s32 pid, char *out, u32 *len);        /* guest cmdline */
 int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap */
 
@@ -1008,7 +1011,8 @@ int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap 
  *                      non-guest tasks that process published (an interposer's
  *                      own threads, which the guest is never shown).
  *   proctab_slots      registry size, 0 when the table is unavailable, and
- *   proctab_pid_at     the live guest PID in one slot (0 = none), so a caller
+ *   proctab_pid_at     the live guest PID in one slot (0 = none, and 0 too for
+ *                      a slot whose process is gone), so a caller
  *                      can walk the whole registry -- the process-group and
  *                      "every process" signal fan-outs do -- without a
  *                      4096-entry buffer of its own. */

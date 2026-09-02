@@ -2335,13 +2335,50 @@ void proctab_unregister(s32 pid) {
         }
 }
 
-/* Membership only (no starttime reread): drives the hot readdir/path-gate paths.
- * A slot briefly stale after a missed unregister can momentarily surface a PID
- * that was reused by a non-guest process — self-heals on the next register. */
+/* Does the slot that matched `pid` still belong to the process that wrote it?
+ *
+ * The pid alone cannot say. A process that dies without unregistering -- a
+ * SIGKILL, a crash, anything that skips the exit path -- leaves its number
+ * standing in the table, and the host is free to hand that number to something
+ * else. Membership is not a bookkeeping detail here: it is what decides whether
+ * the guest may see a /proc/<pid> and whether it may signal or steer a task, so
+ * a stale slot admits a same-uid host process outside the rootfs as one of the
+ * guest's own. The starttime the registrar stored is the token that separates
+ * them -- it cannot be reused along with the pid -- and it is the same token
+ * proctab_get has always re-read for the payload snapshot.
+ *
+ * Read through the entry's seqlock: a 64-bit field is two stores on a 32-bit
+ * host, and a torn one compared against the live value would call a running
+ * guest process stale. A read that will not settle means a writer is inside
+ * this very entry, and an entry whose pid is already published and positive is
+ * only ever rewritten by its own process (a register that claims a slot for
+ * someone else publishes the pid last, and negative until then) -- so that is
+ * the same process, and it is current.
+ *
+ * A host that cannot answer starttime at all reads 0 both here and in the
+ * registrar, so the check degrades to plain membership rather than hiding
+ * every guest process from every other. */
+static int slot_current(struct ProcEnt *e, s32 pid) {
+    for (int t = 0; t < 64; t++) {
+        u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        if (s1 & 1) continue;                      /* writer active */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        u64 start = e->start;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1)
+            return start == proc_starttime(pid);
+    }
+    return 1;
+}
+
+/* Is `pid` a guest process? Drives the readdir/path gates, the /proc view and
+ * every syscall that names another process, so the answer is the slot's AND
+ * the starttime's (slot_current). */
 int proctab_has(s32 pid) {
     if (!g_tab || pid <= 0) return 0;
     for (int i = 0; i < g_tab_n; i++)
-        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) return 1;
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid)
+            return slot_current(&g_tab[i], pid);
     return 0;
 }
 
@@ -2355,7 +2392,10 @@ int proctab_slots(void) { return g_tab ? g_tab_n : 0; }
 s32 proctab_pid_at(int slot) {
     if (!g_tab || slot < 0 || slot >= g_tab_n) return 0;
     s32 pid = __atomic_load_n(&g_tab[slot].pid, __ATOMIC_ACQUIRE);
-    return pid > 0 ? pid : 0;
+    /* ...and the same staleness test the by-pid lookup makes: these callers
+     * signal and renice what the walk hands them, so a slot a killed process
+     * left behind would aim them at whoever inherited its number. */
+    return pid > 0 && slot_current(&g_tab[slot], pid) ? pid : 0;
 }
 
 /* Thread group of host task `tid` (/proc/<tid>/status Tgid -- guest tids are
