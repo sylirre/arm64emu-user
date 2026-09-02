@@ -1239,63 +1239,57 @@ static int self_groups(u32 *out, int max) {
     return n;
 }
 
-/* Is the guest allowed to execute this file? Nothing else asks, because the
+/* Is the guest allowed to execute this image? Nothing else asks, because the
  * emulator only ever READS an image: without this a file that is merely
  * readable runs, where a kernel answers EACCES, and so do a directory and a
  * device node (the kernel's do_open_execat refuses anything but a regular
  * file).
  *
+ * Asked about the DESCRIPTOR do_execve opened and will load from, never about
+ * the path again: a name answers about whatever is at it the moment it is
+ * asked, so a rename between two questions could have the guest load a file
+ * that was never checked. A kernel has the same rule and gets it the same way
+ * -- may_open checks MAY_EXEC on the inode it is opening, and everything past
+ * that reads bprm->file. `st_out` comes back with the stat the decision was
+ * made on, which is also where the setuid/setgid bits are read from.
+ *
  * The identity doing the asking is the guest's. Without --fake-id that is this
  * process, and the host's own access(2) answers it exactly -- supplementary
- * groups and all. With one, the guest's credentials are the fake ones and the
- * file's ownership is the remapped ownership it sees everywhere else, so the
- * kernel's rule is applied against those.
+ * groups, ACLs, mount flags and all -- asked of the descriptor (access_fd).
+ * With one, the guest's credentials are the fake ones and the file's ownership
+ * is the remapped ownership it sees everywhere else, so the kernel's rule is
+ * applied against those.
  *
  * Being allowed to execute is not the same as being readable, and the emulator
- * needs the second too -- but that is not this function's business: the header
- * read in do_execve's resolution loop reports it, still ahead of the point of
- * no return. */
-static int exec_perm_check(struct Machine *m, const PathPin *p) {
-    const char *host = p->host;
+ * needs the second too -- but that is not this function's business: the open
+ * in do_execve's resolution loop reports it, still ahead of the point of no
+ * return. */
+static int exec_perm_check(struct Machine *m, const PathPin *p, int fd,
+                           struct stat *st_out) {
     struct stat st;
-    int by_fd = 0;
-    int hf = p->pinned ? AT_SYMLINK_NOFOLLOW : 0;   /* the walk already followed */
-    int ofd = proc_own_fd_path(host);
-    if (proc_own_fd_denied(host) ? (errno = EACCES, 1)
-                                 : fstatat(p->dfd, p->name, &st, hf) != 0) {
-        /* One of our own fds on a host that refuses to re-open it (Android
-         * denies it for memfds): ask the descriptor itself. Anything else
-         * keeps the errno the host gave -- a path that names nothing (a
-         * dangling symlink, say) is ENOENT, not a permission answer. */
-        int e = errno;
-        if (ofd < 0) return -e;
-        if (fstat(ofd, &st) != 0) return -errno;
-        by_fd = 1;
-    }
+    if (fstat(fd, &st) != 0) return -errno;
     if (!S_ISREG(st.st_mode)) return -EACCES;
     /* A memfd whose mode the host would not let the guest change is held in
      * the broker registry (sys_misc.c). The mode that decides this is the
      * guest's, not the 0777 memfd_create handed out -- and once it is, the
      * host's own access(2) is answering about the wrong mode, so the rule
-     * below has to be applied by hand exactly as it is for the fd fallback. */
+     * below has to be applied by hand. The registry is keyed off the GUEST's
+     * descriptor, which the own-fd spelling of the image names; `fd` is a
+     * re-open (or a dup) the class cache has never been told about. */
     mode_t was = st.st_mode;
-    mfd_stat_fixup(m, ofd, &st);
+    mfd_stat_fixup(m, proc_own_fd_path(p->host), &st);
     int held = st.st_mode != was;
+    *st_out = st;
     if (!m->fake_id) {
-        /* The path answered the stat, so it will answer this too, and access(2)
-         * is the exact answer -- supplementary groups, ACLs, capabilities.
-         * (The denial knob is asked here as well even though !by_fd means the
-         * path just worked: it keeps the simulated tier honest, so a change
-         * that put access(2) back on the fallback path would be caught.) */
-        if (!by_fd && !held)
-            return (proc_own_fd_denied(host) ? (errno = EACCES, -1)
-                                             : access_pinned(p, X_OK)) == 0
-                       ? 0 : -EACCES;
-        /* It did not: the file was reached through the descriptor, and asking
-         * the same path again would reproduce the same refusal and hand it to
-         * the guest as its own EACCES -- so the fd fallback above would have
-         * bought nothing. Judge the mode the descriptor did give, against this
-         * process's real identity, which is the guest's identity here. */
+        if (!held) {
+            int a = access_fd(fd, X_OK, proc_own_fd_denied(p->host));
+            if (a >= 0) return a == 0 ? 0 : -EACCES;
+        }
+        /* Either the mode that decides this is the broker's rather than the
+         * host's, or the host could not be asked about the descriptor at all
+         * (no faccessat2 and a /proc link it refuses -- Android, for a memfd).
+         * Judge the mode the descriptor did give, against this process's real
+         * identity, which is the guest's identity here. */
         u32 gs[64];
         int ng = self_groups(gs, (int)(sizeof gs / sizeof gs[0]));
         return mode_exec_ok((u32)geteuid(), (u32)getegid(), gs, ng,
@@ -1330,59 +1324,53 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         argv = nv;
     }
 
+    int imgfd = -1;              /* the image, opened once (see below) */
+    /* ...and the stat exec_perm_check judged it by, which the setuid/setgid
+     * bits are read from below. Zeroed only so the compiler can see a value
+     * on every path: the loop below cannot reach its break without a check
+     * that filled this in. */
+    struct stat img_st = {0};
     for (int depth = 0; ; depth++) {
         if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }
         int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, pin.host, canon);
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
-        /* Pinned for everything this loop asks about the image -- permission,
-         * header, and (past the loop) the setuid bits -- so a rename cannot
-         * slip a different file in between the questions. */
+        /* Pinned so that no component of the path can be turned into a symlink
+         * between the walk and the open below. */
         r = path_pin(m, canon, pin.host, &pin);
         if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
-        const char *host = pin.host;
+        /* Open the image ONCE, here, and ask this descriptor everything that
+         * follows -- permission, the header, the setuid bits, the ELF probe
+         * and the load itself. A name only answers about whatever is at it
+         * when it is asked, so re-opening it for each of those questions lets
+         * a concurrent rename have the guest load a file that was never
+         * checked, and lets the load fail on a file that was there a moment
+         * ago -- past the point of no return, where failing means killing the
+         * guest. A kernel opens once too (do_open_execat) and passes
+         * bprm->file down. An unreadable image is refused right here, still
+         * ahead of that point; the own-fd fallback for a host that will not
+         * re-open one of our descriptors lives in exec_open_pinned. */
+        imgfd = exec_open_pinned(&pin);
+        if (imgfd < 0) {
+            r = imgfd; imgfd = -1;
+            path_unpin(&pin); free_strvec(argv);
+            return (u64)(s64)r;
+        }
         /* Both the script and the interpreter it names have to be executable,
          * which is why this sits inside the loop. */
-        r = exec_perm_check(m, &pin);
-        if (r < 0) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)r; }
+        r = exec_perm_check(m, &pin, imgfd, &img_st);
+        path_unpin(&pin);        /* nothing below names the image by path */
+        if (r < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)r; }
         unsigned char hdr[256];
         size_t n;
-        int hfd = proc_own_fd_denied(host)
-                      ? (errno = EACCES, -1)
-                      : openat(pin.dfd, pin.name,
-                               O_RDONLY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
-        if (hfd >= 0) {
-            ssize_t hn = pread(hfd, hdr, sizeof hdr, 0);
-            close(hfd);
-            if (hn < 0) {
-                path_unpin(&pin);
-                free_strvec(argv);
-                return host_err();
-            }
-            n = (size_t)hn;
-        } else {
-            /* The path names one of our own fds and the host refused the
-             * re-open (Android denies it for memfds — apk's triggers): read
-             * the header through the fd itself. pread leaves the guest's
-             * offset alone. Anything else that cannot be read is reported as
-             * what it was refused with -- an unreadable image is EACCES, not
-             * a missing one, and finding that out here keeps it ahead of the
-             * point of no return, where a load failure can only _exit. */
-            int e = errno;
-            int ofd = proc_own_fd_path(host);
-            ssize_t pn = ofd >= 0 ? pread(ofd, hdr, sizeof hdr, 0) : -1;
-            if (pn < 0) {
-                path_unpin(&pin);
-                free_strvec(argv);
-                return (u64)(s64)(ofd >= 0 ? -errno : -e);
-            }
-            n = (size_t)pn;
-        }
+        ssize_t hn = pread(imgfd, hdr, sizeof hdr, 0);  /* leaves the offset alone */
+        if (hn < 0) { close(imgfd); free_strvec(argv); return host_err(); }
+        n = (size_t)hn;
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
             /* shebang: rebuild argv = [interp, (arg), script, argv[1..]] */
             hdr[n < sizeof hdr ? n : sizeof hdr - 1] = 0;
             char *line = (char *)hdr + 2;
             char *nl = strchr(line, '\n');
-            if (!nl) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!nl) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
             *nl = 0;
             while (*line == ' ' || *line == '\t') line++;
             char *interp = line, *arg = NULL;
@@ -1392,11 +1380,11 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                 while (*sp == ' ' || *sp == '\t') sp++;
                 if (*sp) arg = sp;
             }
-            if (!*interp) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!*interp) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
             int oldc = 0;
             while (argv[oldc]) oldc++;
             char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));
-            if (!nv) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOMEM; }
+            if (!nv) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOMEM; }
             int k = 0;
             nv[k++] = strdup(interp);
             if (arg) nv[k++] = strdup(arg);
@@ -1407,18 +1395,18 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                 if (!nv[i]) {   /* a NULL hole would silently truncate argv */
                     for (int j = 0; j < k; j++) free(nv[j]);
                     free(nv);
-                    path_unpin(&pin);
+                    close(imgfd);
                     free_strvec(argv);
                     return (u64)(s64)-ENOMEM;
                 }
             free_strvec(argv);          /* free the previous working copy */
             argv = nv;
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
-            path_unpin(&pin);
+            close(imgfd);
             continue;
         }
-        if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;   /* pin held past here */
-        path_unpin(&pin);
+        if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;   /* imgfd held past here */
+        close(imgfd);
         free_strvec(argv);
         return (u64)(s64)-ENOEXEC;
     }
@@ -1426,16 +1414,26 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     /* Everything the loader can still refuse -- a foreign or malformed ELF, an
      * interpreter that is not there -- refused now, while there is a caller to
      * refuse it to. Past the point of no return below, load_elf's failure can
-     * only kill the process, where a kernel hands the shell its ENOEXEC. */
-    int pr = elf_probe(m, pathbuf);
-    if (pr < 0) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)pr; }
+     * only kill the process, where a kernel hands the shell its ENOEXEC. The
+     * interpreter it opened to check comes back as a descriptor, so the load
+     * runs the file the probe passed and not whatever the name means by then
+     * -- load_elf_binary keeps its interpreter's struct file the same way. */
+    int ifd = -1;
+    int pr = elf_probe(m, imgfd, &ifd);
+    if (pr < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)pr; }
 
     /* Copy envp too: load_elf reads it after as_destroy, and the caller's
      * copy must survive for its own free. */
     char **envp_copy = dup_strvec(envp);
-    if (!envp_copy) { path_unpin(&pin); free_strvec(argv); return (u64)(s64)-ENOMEM; }
+    if (!envp_copy) {
+        close(imgfd);
+        if (ifd >= 0) close(ifd);
+        free_strvec(argv);
+        return (u64)(s64)-ENOMEM;
+    }
 
-    /* setuid/setgid bit on the final ELF (`host` holds its resolved path).
+    /* setuid/setgid bit on the final ELF, read off the same stat the
+     * permission check judged -- the image's own descriptor, not its name.
      * "Disregard actual filesystem ownership": the file's guest-visible owner
      * is the remapped owner, so a rootfs binary owned by the host user confers
      * the fake identity. euid/fsuid (and saved id) take the file owner; the
@@ -1450,14 +1448,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     int raise_uid = 0, raise_gid = 0;
     u32 new_euid = 0, new_egid = 0;
     if (m->fake_id) {
-        struct stat est;
-        if (fstatat(pin.dfd, pin.name, &est,
-                    pin.pinned ? AT_SYMLINK_NOFOLLOW : 0) == 0) {
-            if (est.st_mode & S_ISUID)
-                { raise_uid = 1; new_euid = remap_uid(m, est.st_uid); }
-            if (est.st_mode & S_ISGID)
-                { raise_gid = 1; new_egid = remap_gid(m, est.st_gid); }
-        }
+        if (img_st.st_mode & S_ISUID)
+            { raise_uid = 1; new_euid = remap_uid(m, img_st.st_uid); }
+        if (img_st.st_mode & S_ISGID)
+            { raise_gid = 1; new_egid = remap_gid(m, img_st.st_gid); }
     }
 
     /* Last thing that can still be refused: empty the thread group, so nothing
@@ -1465,10 +1459,15 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * comes after resolution and the shebang loop deliberately -- ENOENT and
      * ENOEXEC must leave the group untouched, exactly as they do on a kernel,
      * where de_thread runs only once the binary is known to be loadable. */
-    path_unpin(&pin);        /* nothing below names the image by path again */
     int carrier_is_me = 1;
     int dt = dethread_begin(c, pathbuf, &carrier_is_me);
-    if (dt < 0) { free_strvec(argv); free_strvec(envp_copy); return (u64)(s64)dt; }
+    if (dt < 0) {
+        close(imgfd);
+        if (ifd >= 0) close(ifd);
+        free_strvec(argv);
+        free_strvec(envp_copy);
+        return (u64)(s64)dt;
+    }
 
     /* Point of no return: tear down and reload. */
     if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
@@ -1493,7 +1492,9 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     g_tls.clear_child_tid = 0;
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
 
-    int r = load_elf(m, pathbuf, argv, envp_copy);
+    int r = load_elf(m, imgfd, ifd, canon, argv, envp_copy);
+    close(imgfd);
+    if (ifd >= 0) close(ifd);
     free_strvec(argv);
     free_strvec(envp_copy);
     if (r < 0) {

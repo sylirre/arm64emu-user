@@ -227,6 +227,37 @@ static inline int access_pinned(const PathPin *p, int mode) {
     return faccessat(p->dfd, p->name, mode, 0);
 }
 
+/* access(2) about an OPEN DESCRIPTOR rather than a name -- what execve needs,
+ * since between an answer about a name and the load a rename can put a
+ * different file there (a kernel checks MAY_EXEC on the inode it is opening,
+ * inside do_open_execat, and reads bprm->file from then on).
+ *
+ * The /proc spelling of the descriptor names that exact inode however the tree
+ * changes, and costs no syscall the emulator does not already make everywhere.
+ * Where the spelling itself is refused -- Android's policy for a memfd, a host
+ * with no /proc -- F_OK is what separates "the file is not executable" from
+ * "the link could not be followed", and the answer is then asked of
+ * faccessat2 (Linux 5.8), which takes AT_EMPTY_PATH and needs no path at all.
+ * `no_proc_link` skips the spelling for a caller that already knows it is
+ * refused.
+ *
+ * Returns 0 (allowed), 1 (denied) or -1 (the host could not be asked).
+ * Like access(2) and unlike AT_EACCESS, the question is asked of the real
+ * identity -- which for this process is also the effective one. */
+static inline int access_fd(int fd, int mode, int no_proc_link) {
+    if (!no_proc_link) {
+        char spell[PATH_MAX];
+        path_fd_spell(fd, spell);
+        if (faccessat(AT_FDCWD, spell, mode, 0) == 0) return 0;
+        if (errno == EACCES && faccessat(AT_FDCWD, spell, F_OK, 0) == 0) return 1;
+    }
+#ifdef SYS_faccessat2
+    if (syscall(SYS_faccessat2, fd, "", mode, AT_EMPTY_PATH) == 0) return 0;
+    if (errno == EACCES) return 1;
+#endif
+    return -1;
+}
+
 /* Guest<->host open-flag translation. Most O_* values are shared between
  * asm-generic (arm64/arm32) and x86; the four below differ on x86/x86_64. */
 int oflags_g2h(int g);

@@ -739,14 +739,19 @@ _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
  * (see c2fe3ad). `site` describes what was about to fork. */
 void emu_fork_check(const char *site);
 
-/* elf.c: load `guest_path` (canonical guest path) into the address space and
- * prepare the initial stack. Returns 0 or -errno. */
-int load_elf(struct Machine *m, const char *guest_path,
+/* elf.c: load the image on `fd` (and, when it names one, the interpreter on
+ * `interp_fd`, or -1 to open it by path) into the address space and prepare
+ * the initial stack. `canon` is the image's canonical guest path, for the
+ * region names, AT_EXECFN and comm. The descriptors stay the caller's.
+ * Returns 0 or -errno. */
+int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
              char **argv, char **envp);
-/* Can execve load this program? Validates the ELF and the interpreter it names
- * without touching the address space, so a refusal still has a caller to reach
- * (elf.c). Returns 0 or -errno. */
-int elf_probe(struct Machine *m, const char *guest_path);
+/* Can execve load this program? Validates the ELF on `fd` and the interpreter
+ * it names without touching the address space, so a refusal still has a caller
+ * to reach (elf.c). The interpreter it opened comes back in *interp_fd (-1 for
+ * a static image) for load_elf, so nothing is re-opened by name in between.
+ * Returns 0 or -errno. */
+int elf_probe(struct Machine *m, int fd, int *interp_fd);
 
 /* path.c: resolve a guest path against the rootfs.
  * dirfd: guest fd for *at syscalls, or AT_FDCWD.
@@ -817,6 +822,12 @@ int  path_pin_spell(const PathPin *p, char *out);
  * path_fd_spell writes the spelling (out >= PATH_MAX). */
 int  path_pin_final(const PathPin *p);
 void path_fd_spell(int fd, char *out);
+
+/* elf.c: open an image for exec through an already-resolved pin -- the
+ * descriptor do_execve makes every remaining decision about the image on
+ * (permission, header, setuid bits, the load itself), so that a rename cannot
+ * come between two of them. Returns the fd or -errno. */
+int exec_open_pinned(const PathPin *p);
 
 /* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
  * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic;

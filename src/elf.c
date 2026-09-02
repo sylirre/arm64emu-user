@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 
 #include "machine.h"
 #include "guest_abi.h"
@@ -194,8 +195,41 @@ static u64 stack_push(struct Machine *m, u64 *sp, const void *data, size_t len) 
     return *sp;
 }
 
-/* Open a guest program for loading. `canon` may be NULL. Returns a descriptor
- * or -errno. */
+/* Open an image for exec through a pin the caller already resolved. The type
+ * gate comes first: a kernel refuses to execute anything that is not a regular
+ * file (may_open turns MAY_EXEC on a fifo, a socket or a directory into
+ * EACCES), and the open must not block on a fifo or pick up a controlling
+ * terminal on its way to being refused -- hence O_NONBLOCK|O_NOCTTY, which a
+ * regular file does not notice. What may NOT be decided here is whether the
+ * guest is allowed to execute the file: that is asked of the descriptor this
+ * returns, because between an answer about a name and the load a rename can
+ * put a different file at that name. Returns the fd or -errno. */
+int exec_open_pinned(const PathPin *p) {
+    const char *host_path = p->host;
+    int denied = proc_own_fd_denied(host_path);
+    struct stat gst;
+    int nf = p->pinned ? AT_SYMLINK_NOFOLLOW : 0;
+    if (!denied && fstatat(p->dfd, p->name, &gst, nf) == 0 && !S_ISREG(gst.st_mode))
+        return -EACCES;
+    int fd;
+    if (denied) { fd = -1; errno = EACCES; }
+    else fd = openat(p->dfd, p->name, O_RDONLY | O_CLOEXEC | O_NONBLOCK |
+                                          O_NOCTTY | (p->pinned ? O_NOFOLLOW : 0));
+    if (fd >= 0) return fd;
+    /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
+     * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --
+     * Android denies it for memfds. Every reader here uses pread, which
+     * never moves the shared offset, so a plain dup of the guest's fd is a
+     * faithful stand-in for the re-open. */
+    int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
+    int ownfd = proc_own_fd_path(host_path);
+    if (ownfd >= 0) fd = fcntl(ownfd, F_DUPFD_CLOEXEC, 0);
+    return fd >= 0 ? fd : (ownfd >= 0 ? -errno : -e);
+}
+
+/* Resolve a guest path and open it for loading. `canon` may be NULL. Only the
+ * interpreter comes through here now -- the executable itself is opened once
+ * by do_execve and handed down as a descriptor. Returns an fd or -errno. */
 static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
     PathPin pin;
     char own[PATH_MAX];
@@ -203,23 +237,8 @@ static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
     if (r < 0) return r;
     if (canon) strcpy(canon, own);
     if ((r = path_pin(m, own, pin.host, &pin)) < 0) return r;
-    const char *host_path = pin.host;
-    int fd;
-    if (proc_own_fd_denied(host_path)) { fd = -1; errno = EACCES; }
-    else fd = openat(pin.dfd, pin.name,
-                     O_RDONLY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
-    { int e = errno; path_unpin(&pin); errno = e; }
-    if (fd < 0) {
-        /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
-         * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --
-         * Android denies it for memfds. Every reader here uses pread, which
-         * never moves the shared offset, so a plain dup of the guest's fd is a
-         * faithful stand-in for the re-open. */
-        int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
-        int ownfd = proc_own_fd_path(host_path);
-        if (ownfd >= 0) fd = fcntl(ownfd, F_DUPFD_CLOEXEC, 0);
-        if (fd < 0) return ownfd >= 0 ? -errno : -e;
-    }
+    int fd = exec_open_pinned(&pin);
+    path_unpin(&pin);
     return fd;
 }
 
@@ -231,40 +250,53 @@ static int exec_open(struct Machine *m, const char *guest_path, char *canon) {
  * _exit the process, where a kernel answers ENOEXEC (wrong arch or format) or
  * ENOENT (no such interpreter) to the caller, which is what a shell's "cannot
  * execute binary file" and an execvp PATH walk are reading. The kernel makes
- * the same two checks in the same order, ahead of its own begin_new_exec. */
-int elf_probe(struct Machine *m, const char *guest_path) {
-    int fd = exec_open(m, guest_path, NULL);
-    if (fd < 0) return fd;
+ * the same two checks in the same order, ahead of its own begin_new_exec.
+ *
+ * `fd` is the descriptor do_execve opened, checked and will load from. The
+ * interpreter this opens to check comes back in *interp_fd (-1 for a static
+ * image) for load_elf to load from, so the file that was checked is the file
+ * that runs -- load_elf_binary does exactly this, opening the interpreter and
+ * reading its header before begin_new_exec and keeping the struct file. The
+ * caller owns both descriptors and closes them. */
+int elf_probe(struct Machine *m, int fd, int *interp_fd) {
+    *interp_fd = -1;
     char interp[PATH_MAX];
     int r = elf_header_check(fd, interp);
-    close(fd);
     if (r < 0 || !interp[0]) return r;
-    fd = exec_open(m, interp, NULL);
-    if (fd < 0) return fd;
-    r = elf_header_check(fd, NULL);
-    close(fd);
-    return r;
+    int ifd = exec_open(m, interp, NULL);
+    if (ifd < 0) return ifd;
+    r = elf_header_check(ifd, NULL);
+    if (r < 0) { close(ifd); return r; }
+    *interp_fd = ifd;
+    return 0;
 }
 
-int load_elf(struct Machine *m, const char *guest_path, char **argv, char **envp) {
-    char canon[PATH_MAX];
-    int fd = exec_open(m, guest_path, canon);
-    if (fd < 0) return fd;
+/* Load the image on `fd` (canonical guest path `canon`, used for the region
+ * names, AT_EXECFN and comm) and, when it names one, the interpreter on
+ * `interp_fd`. Both descriptors stay the caller's. */
+int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
+             char **argv, char **envp) {
     int r;
 
     LoadInfo exe = {0}, interp = {0};
     /* ET_EXEC ignores the base; ET_DYN main executables load at the fixed
      * ELF_ET_DYN_BASE analogue (the interpreter allocates from the mmap area). */
     r = load_one(m, fd, ET_DYN_BASE, &exe, canon);
-    close(fd);
     if (r < 0) return r;
 
     u64 entry = exe.entry, at_base = 0;
     if (exe.interp[0]) {
-        int ifd = exec_open(m, exe.interp, NULL);
-        if (ifd < 0) return ifd;
+        /* elf_probe read the same descriptor, so it has already opened this
+         * interpreter; the by-path open is only for a caller that skipped the
+         * probe. */
+        int ifd = interp_fd, own = 0;
+        if (ifd < 0) {
+            ifd = exec_open(m, exe.interp, NULL);
+            if (ifd < 0) return ifd;
+            own = 1;
+        }
         r = load_one(m, ifd, (u64)-1, &interp, exe.interp);
-        close(ifd);
+        if (own) close(ifd);
         if (r < 0) return r;
         entry = interp.entry;
         at_base = interp.base;
