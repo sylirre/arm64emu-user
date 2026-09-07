@@ -260,6 +260,48 @@ elif [ -x tests/c/l2s_rename_static.bin ]; then
     done
 fi
 
+# ---- -link2symlink: the calls that are told not to follow the last name ----
+# The C loop above already ran both of these with real hardlinks. With the
+# option on under the android-sim build, every name of a group becomes a
+# symlink to a hidden backing file -- and the resolver only hides that from
+# callers that FOLLOW the final component. Everything that says "do not follow
+# this one" was left holding the stand-in symlink: access judged its 0777 mode
+# instead of the file's, open O_NOFOLLOW answered ELOOP, and utimensat,
+# fchownat, the l*xattr calls, inotify's IN_DONT_FOLLOW and execveat all worked
+# on the link while reporting success.
+#
+# The oracle's real hardlinks are the truth: "do not follow" is a no-op there,
+# because there is nothing to follow, and that is the answer the emulated group
+# owes. l2s_access carries its own controls (an ordinary symlink and a dangling
+# one, which must go on answering for themselves), so it states both halves of
+# the property -- and its NEEDS-ORACLE names faccessat2 (Linux 5.8), which it
+# asks through raw rather than through the libc wrapper, since that wrapper
+# emulates the flag over fstatat and fstatat is a call the emulator ALREADY
+# presents the backing through.
+for l2snf in l2s_access l2s_nofollow; do
+    L2SBIN="tests/c/${l2snf}_static.bin"
+    [ -x "$L2SBIN" ] || continue
+    if [ ! -w /tmp ]; then
+        # Both worlds work in the same host /tmp here; Android has none.
+        skip=$((skip+1))
+        echo "SKIP c/${l2snf}(--link2symlink) (no writable /tmp on this host)"
+        continue
+    fi
+    rec_have "$L2SBIN" || {
+        skip=$((skip+1))
+        echo "SKIP c/${l2snf}(--link2symlink) (not in the test pack)"; continue; }
+    case $l2snf in l2s_access) NEEDS_ORACLE=faccessat2 ;; *) NEEDS_ORACLE= ;; esac
+    out_q=$(oracle_run "$L2SBIN" 2>/dev/null); rc_q=$?
+    out_e=$(timeout -k 5 60 "$EMU" --link2symlink / "$L2SBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/${l2snf}(--link2symlink)"
+    else
+        diff_verdict "c/${l2snf}(--link2symlink)" "$out_q" "$rc_q" "$out_e" "$rc_e" \
+                     "" "$L2SBIN"
+    fi
+    NEEDS_ORACLE=
+done
+
 # ---- System V shm: file-backed fallback tier ----
 # The shm tests already ran memfd-backed vs the qemu oracle in the C loop above.
 # Re-run them with A64_SHM_FORCE_FILE=1 so the broker backs each segment with a

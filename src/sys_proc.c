@@ -1592,6 +1592,12 @@ SYSDEF(execveat) {
             struct stat st;
             int isl = fstatat(pin.dfd, pin.name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
                       S_ISLNK(st.st_mode);
+            /* Unless it is one of the emulated-hardlink scheme's names, which
+             * is a symlink only to the host: the guest named a regular file
+             * and a host with real hardlinks would have executed it. The exec
+             * itself goes on naming `canon`, whose resolution follows the link
+             * to the same backing. */
+            if (isl && l2s_deref_pin(c->m, &pin)) isl = 0;
             path_unpin(&pin);
             if (isl) return (u64)(s64)-ELOOP;   /* kernel: refuse a final symlink */
         }

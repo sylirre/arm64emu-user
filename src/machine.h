@@ -825,6 +825,14 @@ int  path_pin_spell(const PathPin *p, char *out);
  * /proc/self/fd/<fd> then names that exact inode. Returns the fd or -errno;
  * path_fd_spell writes the spelling (out >= PATH_MAX). */
 int  path_pin_final(const PathPin *p);
+
+/* -link2symlink (sys_file.c): if `p` names one of the emulated-hardlink
+ * scheme's members, rewrite the pin to name the group's backing file instead,
+ * so a caller that told the host not to follow the final component still
+ * reaches the file the guest believes that name is. 1 when it rewrote the pin.
+ * Always 0 where the scheme is not compiled in or not switched on, so call
+ * sites need no #ifdef. */
+int  l2s_deref_pin(struct Machine *m, PathPin *p);
 void path_fd_spell(int fd, char *out);
 
 /* elf.c: open an image for exec through an already-resolved pin -- the

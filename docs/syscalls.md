@@ -366,6 +366,25 @@ performs is a bare name in a pinned directory, and "are these two names in the
 same directory?" is answered by the descriptors' inode identity rather than by
 comparing path strings.
 
+One asymmetry is left over that the walk cannot cover. A group member is a
+symlink to the host and a regular file to the guest, and resolving the final
+component hides that from every caller that follows it — but a caller that asks
+**not** to follow it is looking straight at the stand-in, whose mode is 0777 and
+whose inode holds none of the data. `l2s_deref_pin` rewrites such a pin to name
+the backing instead, which costs nothing in containment (the target is a bare
+basename in the directory the pin already holds open, since a group never
+spans two) and is what `faccessat2`'s `AT_SYMLINK_NOFOLLOW`, `open`'s
+`O_NOFOLLOW`, `utimensat`, `fchownat`, the `l*xattr` family,
+`inotify_add_watch`'s `IN_DONT_FOLLOW` and `execveat`'s `AT_SYMLINK_NOFOLLOW`
+all pass through. Without it each of those quietly worked on the link: `access`
+granted what the file forbade, `open` and `execveat` answered `ELOOP` for a name
+a real hardlink opens and runs, and the rest returned success having stamped,
+chowned or tagged an inode nothing can read back. The calls that operate on the
+name **as** a name — `unlink`, `rename`, `link`, `readlink` — deliberately do
+not deref: each keeps its own bookkeeping over the group. `open` looks the group
+up only after the host has already answered `ELOOP`, so the ordinary path pays
+nothing.
+
 Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `truncate` and `statfs` pin the final component itself and reach it through
 `/proc/self/fd/<fd>` — `fstatfs` directly where the kernel allows it on an

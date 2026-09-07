@@ -211,6 +211,24 @@ static inline int resolve_at_spell(CPU *c, int dirfd, u64 path_va, unsigned rfla
     return r;
 }
 
+/* resolve_at_spell for the calls that never follow the final component -- the
+ * l* xattr family, and inotify_add_watch under IN_DONT_FOLLOW. An emulated
+ * hardlink is a symlink to the host and a regular file to the guest, so the
+ * pin is aimed at the group's backing before the spelling is built: xattrs and
+ * watches belong to the data every name of the group shares, and the l*
+ * spelling would otherwise reach the stand-in symlink -- which for a user.*
+ * xattr means EPERM, a refusal no hardlink has ever earned. Where the scheme
+ * is not in force l2s_deref_pin does nothing at all. */
+static inline int resolve_at_spell_nofollow(CPU *c, int dirfd, u64 path_va,
+                                            PathPin *pin, char *spell) {
+    int r = resolve_pin(c, dirfd, path_va, PATH_NOFOLLOW_LAST, pin, NULL);
+    if (r < 0) return r;
+    l2s_deref_pin(c->m, pin);
+    r = path_pin_spell(pin, spell);
+    if (r < 0) path_unpin(pin);
+    return r;
+}
+
 /* faccessat(2) the syscall takes no flags -- only faccessat2 (Linux 5.8) does,
  * and AT_SYMLINK_NOFOLLOW is the one a pin needs, since the final component
  * must not be followed. Try the newer call first.

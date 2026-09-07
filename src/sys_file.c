@@ -329,7 +329,10 @@ static int l2s_find_marker(int dfd, unsigned long long ino, unsigned long *count
 
 /* If `p` names one of our l2s symlinks, fill `data` (the backing file's bare
  * name, in p's own directory) and *count (from the marker, 0 if the group is
- * broken). Returns 1 (ours), 0 (not ours), or -errno. */
+ * broken). A NULL `count` skips the marker hunt, which is a scan of the whole
+ * directory: a caller that only needs to know WHICH file a name stands for --
+ * l2s_deref_pin -- should not pay for a link count nobody reads.
+ * Returns 1 (ours), 0 (not ours), or -errno. */
 static int l2s_resolve(const PathPin *p, char *data, unsigned long *count) {
     if (!p->pinned) return 0;                     /* not a name we could have made */
     struct stat lst;
@@ -346,7 +349,7 @@ static int l2s_resolve(const PathPin *p, char *data, unsigned long *count) {
     unsigned long long ino;
     if (strchr(tgt, '/') || !l2s_parse_data(tgt, &ino)) return 0;
     if (l2s_data_name(data, ino) < 0) return 0;
-    if (l2s_find_marker(p->dfd, ino, count) != 0) *count = 0;
+    if (count && l2s_find_marker(p->dfd, ino, count) != 0) *count = 0;
     return 1;
 }
 
@@ -662,6 +665,45 @@ static void l2s_fix_fd(int fd, struct stat *st) {
 }
 #endif /* L2S_ENABLED */
 
+/* -link2symlink: a group member is a regular FILE to the guest, whatever flags
+ * the guest passed. The resolver already hides the symlink from every caller
+ * that follows the final component; this hides it from the ones that asked NOT
+ * to -- which the scheme otherwise left staring at a symlink of mode 0777 that
+ * no hardlink has ever been, so `open(name, O_NOFOLLOW)` answered ELOOP where
+ * the host would have opened the file, `access` granted whatever the file
+ * forbade, and utimensat/fchownat/the l*xattr calls quietly worked on the link
+ * instead of on the data every name of the group shares.
+ *
+ * Rewriting the pin costs nothing in containment. The target is a bare
+ * basename in the very directory the pin already holds open -- l2s_link
+ * refuses to spread a group across directories, and l2s_resolve refuses any
+ * target with a '/' in it -- so the parent stays the same pinned inode and
+ * only the final component changes. `host` deliberately keeps the guest's
+ * spelling: what reads it is the :ro-bind test and the own-fd test, and those
+ * are questions about the directory and about the /proc zone, which both names
+ * answer alike.
+ *
+ * NOT for the callers that operate on the name AS a name -- unlink, rename,
+ * link, readlink -- each of which does its own bookkeeping over the group; a
+ * deref would aim them at the shared backing instead of the single name asked
+ * about. Returns 1 when the pin was rewritten, 0 when there was nothing to do
+ * (including every build and every run where the scheme is not in force). */
+int l2s_deref_pin(struct Machine *m, PathPin *p) {
+#ifdef L2S_ENABLED
+    if (!m->link2symlink || !p->pinned) return 0;
+    char data[L2S_NAME_MAX];
+    if (l2s_resolve(p, data, NULL) != 1) return 0;
+    size_t n = strlen(data);
+    if (n >= sizeof p->base) return 0;
+    memcpy(p->base, data, n + 1);
+    p->name = p->base;      /* path_pin_spell and path_pin_final read `base` */
+    return 1;
+#else
+    (void)m; (void)p;
+    return 0;
+#endif
+}
+
 /* Fallback when the host refuses to re-open one of our own fds by path:
  * Android's SELinux denies opening /proc/self/fd/N when N is a memfd (sealed
  * or not, EACCES), and apk-tools' triggers are scripts in a sealed memfd that
@@ -822,6 +864,15 @@ SYSDEF(openat) {
                       * and O_NOFOLLOW is what refuses to walk into it. */
                      oflags_g2h(gflags) | (pin.pinned ? O_NOFOLLOW : 0),
                      (mode_t)a3);
+    /* A guest that passed O_NOFOLLOW about one of the emulated-hardlink
+     * scheme's names has just been told ELOOP about a name that is a regular
+     * file to it, and that a host with real hardlinks would have opened. Only
+     * then is the group looked up, so the ordinary path costs nothing: a guest
+     * that did NOT ask for O_NOFOLLOW never gets here, because the resolver
+     * followed the link and the pin already names the backing. */
+    if (fd < 0 && errno == ELOOP && (gflags & G_O_NOFOLLOW) &&
+        l2s_deref_pin(c->m, &pin))
+        fd = openat(pin.dfd, pin.name, oflags_g2h(gflags) | O_NOFOLLOW, (mode_t)a3);
     {   /* Close the pin before anything else allocates a descriptor. */
         int e = errno, dfd = pin.dfd;
         path_unpin(&pin);
@@ -1292,6 +1343,11 @@ SYSDEF(faccessat2) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
+    /* AT_SYMLINK_NOFOLLOW on a real hardlink is a no-op -- the kernel judges
+     * the file -- so an emulated one must be judged by its backing and not by
+     * the 0777 symlink standing in for it (faccessat itself takes no flags,
+     * so it always follows and there is nothing to undo there). */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
     u64 ret = c->m->fake_id
                   ? access_faked(c->m, &pin, (int)a2, (gf & G_AT_EACCESS) != 0)
                   : access_host(&pin, (int)a2);
@@ -1665,7 +1721,7 @@ SYSDEF(getxattr) {   /* (path, name, value, size) — follow */
 SYSDEF(lgetxattr) {  /* (path, name, value, size) — nofollow */
     char name[XATTR_NAME_BUF], spell[PATH_MAX];
     PathPin pin;
-    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0 ? (u64)(s64)nn : xattr_read(c, spell, -1, 0, name, a2, a3);
@@ -1690,7 +1746,7 @@ SYSDEF(listxattr) {  /* (path, list, size) — follow */
 SYSDEF(llistxattr) { /* (path, list, size) — nofollow */
     char spell[PATH_MAX];
     PathPin pin;
-    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     u64 ret = xattr_read(c, spell, -1, 0, NULL, a1, a2);
     path_unpin(&pin);
@@ -1714,7 +1770,7 @@ SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
 SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
     char name[XATTR_NAME_BUF], spell[PATH_MAX];
     PathPin pin;
-    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0            ? (u64)(s64)nn
@@ -1746,7 +1802,7 @@ SYSDEF(removexattr) {  /* (path, name) — follow */
 SYSDEF(lremovexattr) { /* (path, name) — nofollow */
     char name[XATTR_NAME_BUF], spell[PATH_MAX];
     PathPin pin;
-    int r = resolve_at_spell(c, G_AT_FDCWD, a0, PATH_NOFOLLOW_LAST, &pin, spell);
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0                  ? (u64)(s64)nn
@@ -2731,6 +2787,10 @@ SYSDEF(fchownat) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
+    /* lchown of an emulated hardlink is a chown of the file: the flag has no
+     * link to spare here, and ownership belongs to the data every name of the
+     * group shares (l2s_deref_pin). */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
     int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
     u64 ret = host_ro(c->m, pin.host)
                   ? (u64)(s64)-EROFS
@@ -2763,6 +2823,10 @@ SYSDEF(utimensat) {
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
+    /* As fchownat: timestamps belong to the shared data, so a no-follow stamp
+     * on an emulated hardlink has to land on the backing. Left alone, the call
+     * returned 0 and moved a timestamp nothing could ever read back. */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
     int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
     u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
             : utimensat(pin.dfd, pin.name, tsp, hf) < 0 ? host_err() : 0;
@@ -3288,7 +3352,8 @@ SYSDEF(inotify_add_watch) {
     PathPin pin;
     char spell[PATH_MAX];
     unsigned rf = ((u32)a2 & 0x02000000u /*IN_DONT_FOLLOW*/) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_at_spell(c, G_AT_FDCWD, a1, rf, &pin, spell);
+    int r = rf ? resolve_at_spell_nofollow(c, G_AT_FDCWD, a1, &pin, spell)
+               : resolve_at_spell(c, G_AT_FDCWD, a1, rf, &pin, spell);
     if (r < 0) return (u64)(s64)r;
     /* No *at form at all, so the pinned parent is named by its descriptor and
      * IN_DONT_FOLLOW keeps the host off the final component -- which the walk
