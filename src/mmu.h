@@ -381,6 +381,11 @@ u64  as_find_free(AddrSpace *as, u64 len);
 u32  as_page_prot(AddrSpace *as, u64 va);
 /* Name pathless regions in [start, end) (ELF images, for /proc/self/maps). */
 void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path);
+/* Duplicate a region's path label, the one piece of region metadata a caller
+ * outside mem.c also sets (sys_mm.c names a memfd mapping). NULL in, NULL out;
+ * an allocation failure ends the process, as it does for every other piece of
+ * this bookkeeping. See mem.c for why a label must not be dropped quietly. */
+char *as_path_dup(const char *path);
 /* Caller must hold as_lock: the region array is realloc'd/memmove'd by
  * concurrent mappers, and the returned pointer is only valid while held. */
 const Region *as_find_region(AddrSpace *as, u64 va);

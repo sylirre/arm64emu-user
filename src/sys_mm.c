@@ -296,7 +296,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             if (tn > 7 && !memcmp(tgt, "/memfd:", 7)) {
                 tgt[tn] = 0;
                 Region *reg = (Region *)as_find_region(as, addr);
-                if (reg && !reg->path) reg->path = strdup(tgt);
+                if (reg && !reg->path) reg->path = as_path_dup(tgt);
             }
         }
         if (r == 0 && is_mfd) {
@@ -308,7 +308,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
                 if (!reg->path) {
                     char nb[MFD_NAME_MAX + 24];
                     snprintf(nb, sizeof nb, "/memfd:%s (deleted)", mname);
-                    reg->path = strdup(nb);
+                    reg->path = as_path_dup(nb);
                 }
                 if (shared && fdwr &&
                     !(mseals & (G_F_SEAL_WRITE | G_F_SEAL_FUTURE_WRITE))) {

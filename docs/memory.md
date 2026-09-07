@@ -33,7 +33,13 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
   backs `munmap`/`mremap` splitting, `mprotect` bookkeeping,
   `/proc/self/maps` synthesis, and address-space teardown at `execve`/exit.
   The page table is the fast lookup; the region list is the authoritative
-  record.
+  record. Its bookkeeping fails **loudly**: the region array's `realloc`, an
+  L2 table's `calloc`, the `HostMap` record and a region's path label all end
+  the process rather than continue with a hole in the address space's own
+  account of itself. The label was once the exception, taking `strdup`'s answer
+  unchecked — and its failure was the only silent one, surfacing much later and
+  somewhere else, as a guest finding its executable or its `memfd` listed in
+  `/proc/self/maps` as anonymous memory.
 
 ## The `mem_*` seam
 

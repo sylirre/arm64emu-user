@@ -732,6 +732,26 @@ static void hmap_unref(AddrSpace *as, HostMap *hm) {
     }
 }
 
+/* Duplicate a region's path label -- what /proc/<pid>/maps names the mapping.
+ *
+ * An allocation failure here ends the process, as it does for every other piece
+ * of this bookkeeping: the region array's realloc, the L2 page tables' calloc
+ * and the HostMap record all exit(127) rather than carry on with a hole in
+ * their state. The label used to be the exception, taking strdup's answer
+ * unchecked, and its failure was the only silent one -- the mapping simply
+ * stopped having a name. That surfaces much later and somewhere else: a guest
+ * reading its own /proc/self/maps finds its executable, its libraries or the
+ * memfd it just mapped listed as anonymous memory, which is exactly the
+ * question the file is there to answer. A process that cannot duplicate a path
+ * has moments to live in any case; failing where the failure is is what makes
+ * it explicable. */
+char *as_path_dup(const char *path) {
+    if (!path) return NULL;
+    char *d = strdup(path);
+    if (!d) { perror("arm64chroot: strdup"); exit(127); }
+    return d;
+}
+
 /* Split any region that straddles `va` so that `va` becomes a region boundary.
  * mprotect needs this: it used to leave a partially covered region's recorded
  * protection alone and rely on the PTEs, but a file mapping's pages past
@@ -745,7 +765,7 @@ static void region_split_at(AddrSpace *as, u64 va) {
         tail.start = va;
         tail.host = r->host + (va - r->start);
         tail.file_off = r->file_off + (va - r->start);
-        tail.path = r->path ? strdup(r->path) : NULL;
+        tail.path = as_path_dup(r->path);
         tail.hmap->refs++;
         r->end = va;
         region_insert(as, tail);
@@ -780,7 +800,7 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
             tail.start = cut_hi;
             tail.host = r->host + (cut_hi - r->start);
             tail.file_off = r->file_off + (cut_hi - r->start);
-            tail.path = r->path ? strdup(r->path) : NULL;
+            tail.path = as_path_dup(r->path);
             tail.hmap->refs++;                 /* fragment shares the allocation */
             r->end = cut_lo;
             region_insert(as, tail);
@@ -898,7 +918,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     Region r = { .start = addr, .end = addr + len, .prot = prot,
                  .shared = (u32)shared, .file = 1, .wr_ok = (u32)wr_ok, .host = host,
                  .hmap = hmap_new(host - pad, len + pad),
-                 .path = path ? strdup(path) : NULL, .file_off = off,
+                 .path = as_path_dup(path), .file_off = off,
                  .dev = have_st ? (u64)fst.st_dev : 0,
                  .ino = have_st ? (u64)fst.st_ino : 0,
                  .hostmap = 1 };
@@ -1036,7 +1056,7 @@ int guest_remap_move_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
         nr.end = nr.start + (hi - pos);
         nr.host = src->host + (pos - src->start);
         nr.file_off = src->file_off + (pos - src->start);
-        nr.path = src->path ? strdup(src->path) : NULL;
+        nr.path = as_path_dup(src->path);
         nr.hmap->refs++;                  /* the copy shares the allocation */
         region_insert(as, nr);
         for (u64 off = 0; off < hi - pos; off += GUEST_PAGE_SIZE) {
@@ -2186,7 +2206,7 @@ void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path) {
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
         if (r->start < end && start < r->end && !r->path)
-            r->path = strdup(path);
+            r->path = as_path_dup(path);
     }
     as_unlock();
 }
