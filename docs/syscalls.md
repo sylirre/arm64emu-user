@@ -660,6 +660,49 @@ is an ordinary success and `addrlen` is never read. Nothing here special-cases
 Answering a half-supplied pair with a bare success told a guest its address had
 been written when nothing was.
 
+**A staging buffer is not an ABI limit.** Every socket payload has to be
+bounced through memory of the emulator's own — an `optval`, a control buffer, a
+gather/scatter vector — and the sizes it was willing to bounce used to be flat
+constants: 4 KB for an option value, 4 KB for ancillary data, 16 MiB for a
+vector. A kernel has none of those, so each one was a guest-visible refusal of
+something Linux accepts, and the control one was worse than a refusal:
+`cmsg_g2h` stops at the first element its buffer cannot hold, so a `sendmsg`
+whose ancillary data ran past 4 KB went out with the rest of it **missing** and
+reported success. Each is now staged at the size the guest asked for and
+bounded the way `read`/`write` already bound theirs — by the guest's own
+memory (`rw_room`, `sys.h`) — so the allocation is something the guest already
+owns rather than a number it merely named:
+
+- `setsockopt`'s `optlen` is an `int` in the kernel's own prototype, so the
+  high half of the register is dropped and only then is a negative value
+  `EINVAL` (`do_sock_setsockopt`). Reading it as a `size_t` and refusing
+  anything too big to stage arrived at that `EINVAL` by accident and refused an
+  ordinary 8 KB option with it. The value must be entirely in guest memory —
+  the copy would find that out a page later anyway, and demanding it first is
+  what bounds the allocation.
+- `getsockopt` stages what the guest asked for, clamped to what the guest's own
+  buffer can take, since anything past that could never have reached it: the
+  kernel's `copy_to_user` stops at the same page, and the writeback still
+  produces that `EFAULT`. The reported length is then never trusted past the
+  staging.
+- `msg_controllen` is bounded only by `INT_MAX` (`____sys_sendmsg`) and, on a
+  send, by the socket's own `optmem` budget — which is the kernel's to enforce,
+  and it can only do so once it is handed what the guest sent (`ENOBUFS`).
+- The iovec bounds are `__import_iovec`'s own: a segment whose length is
+  negative as an `ssize_t` is `EINVAL`, and the running total is *clamped* to
+  `MAX_RW_COUNT` rather than refused, so a vector past that is a short transfer
+  and not an error — the same rule `iov_from_guest` follows for `readv`/
+  `writev`, where a flat 16 MiB ceiling had made `sendmsg` refuse what `writev`
+  on the same fd accepted. A send demands every segment up front (`sendto`
+  does the same); a receive cannot, because shortening the vector would
+  truncate a datagram that is gone once received (`recvfrom` makes the same
+  distinction).
+
+`tests/c/msgbig.c` covers all four against the oracle — including a descriptor
+passed through an 8 KB control buffer whose `SCM_RIGHTS` element begins past
+the old 4 KB mark — and `tests/fixtures/sockoptlen.c` covers the `optlen` edges
+qemu-user cannot arbitrate, since it never passes `optlen` to the host at all.
+
 `getsockopt`'s `(optval, optlen)` pair is validated the same way and for the
 same reason — `sk_getsockopt` reads the caller's length before it looks at the
 option name, so an unreadable `optlen` is `EFAULT` and a negative one `EINVAL`
