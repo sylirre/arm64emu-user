@@ -387,6 +387,36 @@ EOF
             rm -f "$_p"
         fi
         [ "$A64_ORACLE_RCVTIMEO" = 1 ] ;;
+    faccessat2)
+        if [ -z "${A64_ORACLE_FACCESSAT2:-}" ]; then
+            A64_ORACLE_FACCESSAT2=1
+            _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64fa2.$$"
+            # The raw syscall, for the same reason the test that needs it uses
+            # one: the libc wrapper emulates the flags in user space wherever
+            # the kernel has no faccessat2, so it would answer "capable" on
+            # every host and gate nothing.
+            if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
+int main(void) {
+    /* Nothing of our own: "." is reachable for anyone, and the only question
+       is whether the kernel knows the call at all (Linux 5.8). */
+    if (syscall(SYS_faccessat2, AT_FDCWD, ".", F_OK, 0) == 0) return 0;
+    return errno == ENOSYS ? 1 : 0;
+}
+EOF
+            then
+                chmod +x "$_p" 2>/dev/null
+                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_FACCESSAT2=0
+            fi
+            rm -f "$_p"
+        fi
+        [ "$A64_ORACLE_FACCESSAT2" = 1 ] ;;
     *)  return 0 ;;                  # unknown name: nothing to gate on
     esac
 }

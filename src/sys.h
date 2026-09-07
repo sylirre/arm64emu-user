@@ -213,9 +213,27 @@ static inline int resolve_at_spell(CPU *c, int dirfd, u64 path_va, unsigned rfla
 
 /* faccessat(2) the syscall takes no flags -- only faccessat2 (Linux 5.8) does,
  * and AT_SYMLINK_NOFOLLOW is the one a pin needs, since the final component
- * must not be followed. Try the newer call and fall back to the old one, which
- * on a kernel without it leaves that component followed: a query, and the only
- * pinned operation that cannot be closed on such a host. */
+ * must not be followed. Try the newer call first.
+ *
+ * Where the host has no faccessat2 the old one is all there is, and it
+ * FOLLOWS. That host is not a museum piece: Android 7 runs a 3.x kernel, and
+ * Android Oreo's seccomp policy refuses the number outright on kernels that do
+ * have it (the emulator's SIGSYS net turns that into the same ENOSYS). Falling
+ * straight through to the flagless call answered about the wrong file twice
+ * over -- a guest asking about a symlink was told what its TARGET allows, and
+ * one asking about a dangling symlink was told ENOENT about a link plainly
+ * sitting there. So ask what the final component is first, and answer a
+ * symlink for itself.
+ *
+ * That answer is the kernel's own, not an invention: every Linux symlink is
+ * mode 0777 and has no permission operation to override generic_permission,
+ * so read, write and execute are granted to everyone. The one refusal ahead of
+ * the mode is a read-only mount (sb_permission), asked here of the parent
+ * directory -- which holds the symlink and is therefore on its mount.
+ *
+ * The stat also closes what this fallback used to leave open on such a host: a
+ * component that turned into a symlink after the walk is now SEEN as one
+ * rather than followed, which is the containment the pin exists for. */
 static inline int access_pinned(const PathPin *p, int mode) {
 #ifdef SYS_faccessat2
     if (p->pinned) {
@@ -224,6 +242,16 @@ static inline int access_pinned(const PathPin *p, int mode) {
         if (errno != ENOSYS) return -1;
     }
 #endif
+    if (p->pinned) {
+        struct stat lst;
+        if (fstatat(p->dfd, p->name, &lst, AT_SYMLINK_NOFOLLOW) < 0) return -1;
+        if (S_ISLNK(lst.st_mode)) {
+            if ((mode & W_OK) && faccessat(p->dfd, ".", W_OK, 0) < 0 &&
+                errno == EROFS)
+                return -1;
+            return 0;
+        }
+    }
     return faccessat(p->dfd, p->name, mode, 0);
 }
 

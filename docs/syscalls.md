@@ -371,11 +371,18 @@ Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `/proc/self/fd/<fd>` — `fstatfs` directly where the kernel allows it on an
 `O_PATH` descriptor. The `xattr` family and `inotify_add_watch` name the pinned
 parent the same way (`/proc/self/fd/<dfd>/<base>`) and use the `l*` /
-`IN_DONT_FOLLOW` spelling for the final component. `faccessat` is the one that
-cannot be closed on every host: only `faccessat2` (Linux 5.8) takes
-`AT_SYMLINK_NOFOLLOW`, so on an older kernel a raced final component is still
-followed — by a query, which reports whether a file is accessible and changes
-nothing.
+`IN_DONT_FOLLOW` spelling for the final component. `faccessat` is the one with no flag to
+pass: only `faccessat2` (Linux 5.8) takes `AT_SYMLINK_NOFOLLOW`, and the hosts
+without it are ones this project runs on — Android 7's 3.x kernel, and any
+kernel under Android Oreo's seccomp policy, which refuses the number. There the
+final component is `fstatat`ed first and a symlink answers for **itself**: mode
+0777 with no permission operation to override `generic_permission`, so read,
+write and execute are granted and a dangling link still exists, the one refusal
+ahead of the mode being a read-only mount, which the parent directory is asked
+about. Falling straight through to the flagless call instead followed the link,
+which answered a guest about the wrong file entirely — its target's permissions,
+or `ENOENT` for a dangling link plainly sitting there — and left a raced final
+component followed on exactly the hosts that can least afford it.
 
 `O_CREAT|O_EXCL` resolves with the final symlink **not** followed (the kernel's
 `LOOKUP_EXCL`): finding one there is `EEXIST` whether or not it points anywhere.
