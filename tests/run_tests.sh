@@ -2241,6 +2241,11 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     fx_rm "tests/fixtures/$name.bin"
 }
 check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
+# SO_GET_FILTER answers in instructions what it was asked in bytes, so the
+# caller's optlen bounds nothing the kernel writes: a 600-instruction filter
+# read back through a 4 KB staging buffer wrote 4800 bytes into it. Self-
+# checking because qemu-user answers EINVAL for the option.
+check_fixture sockfilter_get $'attach=0\ncount=0 len=600 wrote=0\nshort=0 len=600 wrote=4800 match=1\nfull=0 len=600 wrote=4800 match=1\nnone=0 len=0 wrote=0'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 # The guest's own memory footprint, as its own /proc reports it -- and as
 # another guest process's /proc reports that one. Self-checking:

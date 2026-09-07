@@ -112,6 +112,23 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   ILP32 host). A NULL program still goes through un-bounced, preserving the
   kernel's error order: a locked filter answers `EPERM` before the NULL
   answers `EINVAL` (`tests/c/sockfilter.c`).
+- *And an optlen does not always bound the answer.* Reading that filter back
+  with **`SO_GET_FILTER`** (the same option number, 26) is the one `getsockopt`
+  whose reply is not measured in the units it was asked in: `sk_get_filter`
+  compares the caller's **byte** length against the program's **instruction**
+  count, then copies the whole program — eight bytes per instruction, however
+  short the byte length was — and reports the instruction count back through
+  `optlen`. The caller's length therefore bounds nothing the kernel writes, and
+  staging the reply in the fixed 4 KB buffer the other options share let a
+  guest that attached a filter of more than 512 instructions overrun the
+  emulator's own stack by reading it back. It is staged in
+  `BPF_MAXINSNS * 8` bytes instead — the ceiling `bpf_check_classic` enforces at
+  attach time, so a constant rather than a first "how long is it?" enquiry a
+  sibling guest thread could invalidate — and handed back as the same
+  bytes-in/instructions-out answer the kernel gives, including the `optlen`-0
+  enquiry, which writes nothing and only reports the count.
+  `tests/fixtures/sockfilter_get.c` is the regression test: `qemu-user` answers
+  `EINVAL` for the option and is no oracle for it.
 - *`SO_RCVTIMEO`/`SO_SNDTIMEO` carry a `struct timeval`* — 16 bytes in the
   guest's LP64 ABI but 8 in an ILP32 host's old-style one, and a time64 32-bit
   libc (musl 1.2+) renumbers the option macros outright (66/67). Both

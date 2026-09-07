@@ -542,6 +542,48 @@ SYSDEF(getsockopt) {
         if (copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
         return 0;
     }
+    /* SO_GET_FILTER (== SO_ATTACH_FILTER, 26) does not answer in the unit it is
+     * asked in, so the caller's optlen is no bound at all on what the kernel
+     * writes: sk_get_filter compares the byte length it was handed against the
+     * attached program's INSTRUCTION count, then copies the whole program --
+     * eight bytes per instruction -- and reports that instruction count back as
+     * the length. A 600-instruction filter read back with an optlen of 600, or
+     * of 4096, has 4800 bytes written into the buffer. The buffer here was the
+     * emulator's own 4 KB stack array, so a guest that attached a filter of
+     * more than 512 instructions and read it back smashed the emulator's stack
+     * -- "*** stack smashing detected ***", from an ordinary unprivileged guest.
+     *
+     * Stage it where the kernel cannot outrun it. BPF_MAXINSNS is the ceiling
+     * bpf_check_classic enforces at attach time, so 4096 * 8 bytes bounds any
+     * program that can be attached -- including one a sibling guest thread
+     * swaps in between this call's steps, which is why the size is a constant
+     * and not a first "how long is it?" enquiry. The staging is zeroed, and the
+     * copy back is the eight-bytes-per-instruction the kernel really wrote:
+     * treating the reported length as a byte count copied stale bytes for a
+     * short program and, for the optlen-0 enquiry -- which writes nothing and
+     * only reports the count -- handed the guest that many bytes of the
+     * emulator's own memory. qemu-user answers EINVAL for this option and is no
+     * oracle for it; tests/fixtures/sockfilter_get.c checks it against the
+     * kernel's documented behaviour instead. */
+    if ((int)a1 == SOL_SOCKET && (int)a2 == 26 /*SO_GET_FILTER*/) {
+        size_t cap = (size_t)BPF_MAXINSNS * sizeof(struct sock_filter);
+        u8 *fb = calloc(1, cap);
+        if (!fb) return (u64)(s64)-ENOMEM;
+        socklen_t fl = (socklen_t)(u32)glen;
+        if (getsockopt((int)a0, SOL_SOCKET, SO_ATTACH_FILTER, fb, &fl) < 0) {
+            u64 e = host_err();
+            free(fb);
+            return e;
+        }
+        size_t wrote = glen ? (size_t)fl * sizeof(struct sock_filter) : 0;
+        if (wrote > cap) wrote = cap;
+        int bad = wrote && copy_to_guest(c, a3, fb, wrote) < 0;
+        free(fb);
+        if (bad) return (u64)(s64)-EFAULT;
+        u32 ninsn = (u32)fl;
+        if (copy_to_guest(c, a4, &ninsn, 4) < 0) return (u64)(s64)-EFAULT;
+        return 0;
+    }
     u8 buf[4096];
     socklen_t sl = (u32)glen > 4096 ? 4096 : (u32)glen;
     if (getsockopt((int)a0, (int)a1, (int)a2, buf, &sl) < 0) return host_err();
