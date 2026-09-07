@@ -96,11 +96,19 @@ flag bits. `MAP_SHARED` file mappings are the exception — they use a real host
 bit.
 
 Host pages larger than 4 KB (16 K Android, 64 K arm64 kernels) are detected at
-startup: anonymous maps over-allocate and slice; a file `MAP_PRIVATE` whose
-offset is not host-page-aligned falls back to `pread` into anonymous backing; a
-`MAP_SHARED` one is mapped from the nearest host-page-aligned offset with the
-region's host pointer advanced past the pad, so write-back still reaches the
-file. Host backing is refcounted per original `mmap` (`HostMap` in `mmu.h`):
+startup: anonymous maps over-allocate and slice; a file mapping — `MAP_SHARED`
+or `MAP_PRIVATE` — whose offset is not host-page-aligned is mapped from the
+nearest host-page-aligned offset below with the region's host pointer advanced
+past the pad, so it stays a real mapping of the file (write-back reaches it, and
+so do the end-of-file holes below). `mprotect` over such a region can only
+*widen* the host mapping's write access, rounded out to whole host pages: up to
+four guest pages share one host page there, so revoking would take write access
+away from a neighbour that still has it, while an over-permissive host mapping
+is harmless — guest read-only stays enforced by the software PTEs. A widening
+the host refuses is reported (`EACCES`) with the guest PTEs untouched, exactly
+as on an exact-page host: marking them writable over a host mapping that stayed
+read-only would turn the guest's next store into a host `SIGSEGV` inside the
+emulator. Host backing is refcounted per original `mmap` (`HostMap` in `mmu.h`):
 `munmap`/`mremap` trims and splits share the allocation, and the last region
 referencing it retires the whole thing at once — an interior slice can't be
 munmapped independently when host pages exceed the guest's 4 KB, and a trimmed

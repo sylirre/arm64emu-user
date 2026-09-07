@@ -1172,12 +1172,23 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
                  * access (align to whole host pages), never revoke it — a shared host
                  * page may still back a writable guest page, and guest RO stays
                  * enforced by the software PTEs, so an over-permissive host mapping is
-                 * harmless (the emulator never writes a non-PTE_W page). */
+                 * harmless (the emulator never writes a non-PTE_W page).
+                 *
+                 * The widening is checked like the exact-page one above, and for
+                 * the same reason: a refusal that goes unnoticed leaves the host
+                 * mapping read-only while the guest PTEs below are marked
+                 * writable, and the guest's next store -- performed by the
+                 * emulator through r->host -- is then a HOST SIGSEGV, which
+                 * cannot be delivered to the guest and takes every thread of the
+                 * process down with it. That is exactly the fault the wr_ok
+                 * check above exists to prevent, so it must not come back in
+                 * through the branch a 16 KB or 64 KB host takes. */
                 uintptr_t hpsz = (uintptr_t)g_host_pagesz;
                 uintptr_t a = (uintptr_t)(r->host + (lo - r->start)) & ~(hpsz - 1);
                 uintptr_t b = ((uintptr_t)(r->host + (hi - r->start)) + hpsz - 1)
                               & ~(hpsz - 1);
-                mprotect((void *)a, (size_t)(b - a), PROT_READ | PROT_WRITE);
+                if (mprotect((void *)a, (size_t)(b - a), PROT_READ | PROT_WRITE) < 0)
+                    return -EACCES;   /* PTEs untouched: guest protection unchanged */
             }
         }
         r->prot = prot;   /* fully covered after the splits above */
