@@ -178,9 +178,19 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   rolls the copy back and answers **`EFAULT`** with nothing consumed or sent —
   except that a datagram read still costs the datagram. Nothing addressable at
   all is `EFAULT` everywhere, answered before the fd is touched.
-  `tests/fixtures/iovroom.c` pins all eleven cases against a real kernel;
-  `qemu-user` disagrees with the kernel on seven of them (it validates each
-  segment's whole range up front), so it is not the oracle here.
+
+  How *long* a segment may be is `__import_iovec`'s rule, the same one the
+  socket calls follow (below): only a length that is negative as an `ssize_t`
+  is refused, and the running total is **clamped** to `MAX_RW_COUNT` — so a
+  vector naming more than any one call can move is a short transfer, not an
+  error. The flat 1 GiB ceiling that used to stand here answered `EINVAL` to
+  both, which made a `readv` of a large buffer fail where a `read(2)` of the
+  same buffer on the same fd went through: the scalar path has always clamped
+  to that same `MAX_RW_COUNT` and staged the same bounce for it, so the
+  ceiling bought no headroom either. `tests/fixtures/iovroom.c` pins all
+  fourteen cases against a real kernel; `qemu-user` disagrees with the kernel
+  on nine of them (it validates each segment's whole range up front), so it is
+  not the oracle here.
 - *How many segments is a guest `u64` too, and the two families disagree about
   it.* `readv`/`writev` pass `iovcnt` down to the kernel's own `unsigned
   nr_segs` and it is truncated there, so `readv(fd, iov, 1ULL<<32)` really is a
@@ -693,7 +703,8 @@ owns rather than a number it merely named:
   `MAX_RW_COUNT` rather than refused, so a vector past that is a short transfer
   and not an error — the same rule `iov_from_guest` follows for `readv`/
   `writev`, where a flat 16 MiB ceiling had made `sendmsg` refuse what `writev`
-  on the same fd accepted. A send demands every segment up front (`sendto`
+  on the same fd accepted (`iov_from_guest` had a 1 GiB one of its own until
+  the same rule replaced it). A send demands every segment up front (`sendto`
   does the same); a receive cannot, because shortening the vector would
   truncate a datagram that is gone once received (`recvfrom` makes the same
   distinction).

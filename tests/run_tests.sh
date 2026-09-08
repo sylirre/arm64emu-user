@@ -1760,7 +1760,14 @@ fi
 # everything the guest named, run the transfer and only then find the
 # destination missing, losing the bytes it had consumed. Self-checking: the
 # block below is what a real kernel prints for this program, natively, and
-# qemu-user disagrees with it on seven of the eleven rows. ----
+# qemu-user disagrees with it on nine of the fourteen rows.
+#
+# The last three rows are the other half of the same question: how long a
+# vector may be. A kernel refuses only a segment whose length is negative as an
+# ssize_t and CLAMPS the running total to MAX_RW_COUNT, so a vector naming more
+# than one call can move is a short transfer -- where a flat 1 GiB ceiling here
+# used to make it EINVAL, on the same buffer a read(2) of the same fd moved
+# without complaint. ----
 if [ ! -x tests/fixtures/iovroom.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o tests/fixtures/iovroom.bin \
         tests/fixtures/iovroom.c $A64_TESTLIBS 2>/dev/null || true
@@ -1770,6 +1777,9 @@ if [ -x tests/fixtures/iovroom.bin ]; then
 none-1gb           -1 14 left=11
 file-read          4 0 left=7 got='hell'
 file-read-1gb      8 0 left=3 got='hello wo'
+file-read-2gb      8 0 left=3 got='hello wo'
+file-read-sum      8 0 left=3 got='hello wo'
+neg-len            -1 22 left=11
 file-write         4 0 left=4
 pipe-read          -1 14 left=11
 pipe-write         -1 14 left=0

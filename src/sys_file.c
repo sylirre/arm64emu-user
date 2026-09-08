@@ -141,11 +141,28 @@ static int iov_from_guest(CPU *c, int fd, u64 iov_va, unsigned cnt,
      * the kernel checks the whole u64 there (see msg_import in sys_net.c). */
     if (cnt > 1024) return -EINVAL;
     if (copy_from_guest(c, gout, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
-    size_t asked = 0;
+    /* The segment bounds are __import_iovec's own: a length that is negative
+     * as an ssize_t is EINVAL (iovec_from_user refuses it before the vector is
+     * used for anything), and the running total is CLAMPED to MAX_RW_COUNT
+     * rather than refused, so a vector past that is a short transfer and not
+     * an error -- the same rule msg_import follows for the socket calls
+     * (sys_net.c). The flat 1 GiB ceiling that used to stand here refused both
+     * cases, which made a readv of a large buffer EINVAL where a read(2) of
+     * the same buffer on the same fd went through: the scalar path has always
+     * clamped to the same MAX_RW_COUNT (rw_count, sys.h) and staged the same
+     * bounce for it, so the ceiling bought no headroom either.
+     *
+     * Clamping the snapshot itself, rather than the sum, is what keeps the
+     * short-transfer bookkeeping below honest: a segment the clamp emptied is
+     * a segment the guest is not owed bytes in, which is exactly what a zero
+     * length says, and the cut detection then still means only "the guest
+     * could not back this". */
+    u64 asked = 0;
     for (unsigned i = 0; i < cnt; i++) {
-        if (gout[i].iov_len > (1ULL << 30)) return -EINVAL;
+        if ((s64)gout[i].iov_len < 0) return -EINVAL;
+        if (gout[i].iov_len > A64_MAX_RW_COUNT - asked)
+            gout[i].iov_len = A64_MAX_RW_COUNT - asked;
         asked += gout[i].iov_len;
-        if (asked > (1ULL << 30)) return -EINVAL;
     }
     /* Bound every segment by the guest's own memory, as rw_room does for the
      * scalar calls (sys.h). A kernel copies straight between the file and the

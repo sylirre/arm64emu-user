@@ -111,6 +111,43 @@ int main(void) {
            r < 0 ? e : 0, l, good + 0xff8);
     close(fd);
 
+    /* Lengths past MAX_RW_COUNT. A kernel does not refuse them: iovec_from_user
+     * turns down only a length that is negative as an ssize_t, and
+     * __import_iovec CLAMPS the running total to MAX_RW_COUNT, emptying
+     * whatever segments the clamp reached. So a vector naming more than any
+     * one call can transfer is a short transfer, not an error -- and here the
+     * guest's own memory makes it shorter still. The emulator used to refuse
+     * every one of these with EINVAL over a flat 1 GiB ceiling, where a
+     * read(2) of the same buffer on the same fd went straight through. */
+    fd = filled();
+    memset(good + 0xff8, 0, 8);
+    a[0].iov_base = good + 0xff8; a[0].iov_len = 2UL << 30;   /* > MAX_RW_COUNT */
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.8s'\n", "file-read-2gb", r,
+           r < 0 ? e : 0, l, good + 0xff8);
+    close(fd);
+
+    /* Two segments whose sum passes it: the first survives, the second is
+     * emptied by the clamp. */
+    fd = filled();
+    memset(good + 0xff8, 0, 8);
+    a[0].iov_base = good + 0xff8; a[0].iov_len = 1536UL << 20;
+    a[1].iov_base = good;         a[1].iov_len = 1536UL << 20;
+    errno = 0; r = syscall(SYS_readv, fd, a, 2); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.8s'\n", "file-read-sum", r,
+           r < 0 ? e : 0, l, good + 0xff8);
+    close(fd);
+
+    /* ...and the one length a kernel really does refuse, with the file
+     * untouched. */
+    fd = filled();
+    a[0].iov_base = good; a[0].iov_len = 1UL << 63;
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    row("neg-len", r, e, left(fd));
+    close(fd);
+
     /* Writing to a file: the same short transfer. */
     fd = (int)syscall(SYS_memfd_create, "iovroom", 0u);
     memset(good, 'w', 8);
