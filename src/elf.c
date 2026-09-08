@@ -271,11 +271,14 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
     return 0;
 }
 
-/* What a kernel lets a new image carry in argv+envp, measured the way
- * bprm_stack_limits measures it: a quarter of the guest's own stack limit,
- * capped at three quarters of the reference stack and floored at ARG_MAX --
- * and then the *pointer table* comes out of that budget before any of the
- * strings do, because it is built on the same stack. The execfn string counts
+/* What a kernel lets a new image carry in argv+envp, in two halves of one
+ * rule: exec_arg_budget is the budget in bytes, and exec_arg_limit measures a
+ * finished argument list against it.
+ *
+ * It is measured the way bprm_stack_limits measures it: a quarter of the
+ * guest's own stack limit, capped at three quarters of the reference stack and
+ * floored at ARG_MAX -- and then the *pointer table* comes out of that budget
+ * before any of the strings do, because it is built on the same stack. The execfn string counts
  * against it too: copy_string_kernel puts the filename on the stack ahead of
  * the strings, out of the same budget.
  *
@@ -299,18 +302,24 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
  * inside the load, past the point of no return -- the only thing the refusal
  * could do was kill the process (do_execve, sys_proc.c, calls this while
  * there is still a caller to refuse). */
+u64 exec_arg_budget(struct Machine *m) {
+    u64 limit = STACK_SIZE / 4 * 3;
+    u64 stkrl = m->rlim[G_RLIMIT_STACK].rlim_cur;
+
+    if (stkrl != G_RLIM_INFINITY && stkrl / 4 < limit) limit = stkrl / 4;
+    if (limit < G_ARG_MAX) limit = G_ARG_MAX;
+    return limit;
+}
+
 int exec_arg_limit(struct Machine *m, const char *canon,
                    char **argv, char **envp) {
     int argc = 0, envc = 0;
     u64 bytes = strlen(canon) + 1;
+    u64 limit = exec_arg_budget(m);
 
     while (argv[argc]) bytes += strlen(argv[argc]) + 1, argc++;
     while (envp[envc]) bytes += strlen(envp[envc]) + 1, envc++;
 
-    u64 limit = STACK_SIZE / 4 * 3;
-    u64 stkrl = m->rlim[G_RLIMIT_STACK].rlim_cur;
-    if (stkrl != G_RLIM_INFINITY && stkrl / 4 < limit) limit = stkrl / 4;
-    if (limit < G_ARG_MAX) limit = G_ARG_MAX;
     /* 8 bytes a pointer is the GUEST's width, LP64 whatever host this is built
      * for. max(argc, 1): a kernel counts a slot for argv[0] even when the
      * guest passed none, and gives the new image one either way. */

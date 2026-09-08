@@ -1441,6 +1441,18 @@ the emulator's own path. `do_execve` takes private copies of argv/envp — the
 caller retains ownership (a subtle earlier use-after-free lives in the git
 history).
 
+How **many** entries a vector may have is that same budget and nothing else:
+`import_strvec` charges each one its 8-byte pointer slot plus its bytes and a
+NUL, and stops when it has spent what `exec_arg_budget` allows — so the
+emulator's staging is bounded by the thing that bounds the guest's stack, and
+the exact measurement of the pair follows. A kernel has no count limit worth
+the name (`count()` stops at `MAX_ARG_STRINGS`, two billion); the flat 4096
+entries that used to stand here refused an ordinary `find | xargs rm` over more
+than four thousand short names — a list well inside the byte budget — with
+`E2BIG`. A single string longer than `MAX_ARG_STRLEN` (32 guest pages) is
+`E2BIG` too, which is `copy_strings`'s answer for one, rather than the
+`ENAMETOOLONG` the guest-memory walk that finds it would otherwise report.
+
 A **null** argv or envp is an empty vector, not a fault: `count()` in `fs/exec.c`
 walks the array only when the pointer is non-null, so `execve(path, NULL, NULL)`
 is a call a kernel accepts and `import_strvec` dereferencing it unconditionally

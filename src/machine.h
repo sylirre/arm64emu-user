@@ -756,6 +756,9 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
  * again for the initial exec, which has no such caller (elf.c). */
 int exec_arg_limit(struct Machine *m, const char *canon,
                    char **argv, char **envp);
+/* That budget on its own, in bytes: the bound the import of one of the two
+ * vectors is held to, before the pair can be measured exactly (elf.c). */
+u64 exec_arg_budget(struct Machine *m);
 /* Can execve load this program? Validates the ELF on `fd` and the interpreter
  * it names without touching the address space, so a refusal still has a caller
  * to reach (elf.c). The interpreter it opened comes back in *interp_fd (-1 for

@@ -96,6 +96,15 @@ int main(int argc, char **argv) {
     /* Comfortably inside the budget. */
     printf("fits=%s\n", attempt(self, 8 * MB, 1000, 100, 0, 0));
 
+    /* Many arguments rather than long ones. 20000 of them cost 200 KB of the
+     * budget, a tenth of what an 8 MB stack limit allows, and a kernel builds
+     * the list without noticing -- count() stops at MAX_ARG_STRINGS, two
+     * billion. `find | xargs rm` in a directory of more than four thousand
+     * short names makes exactly this call. Past the budget the count is
+     * bounded again, by the budget itself and not by a number. */
+    printf("many=%s\n", attempt(self, 8 * MB, 20000, 1, 0, 0));
+    printf("many_over=%s\n", attempt(self, 8 * MB, 300000, 1, 0, 0));
+
     /* The pointer table is what puts this one over: 8180 strings of 252 bytes
      * are ~35 KB short of the budget, and their 8182 pointers are ~65 KB, so
      * the strings fit and the argument list does not. Counting only the string

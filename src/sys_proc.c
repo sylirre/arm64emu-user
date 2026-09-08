@@ -618,9 +618,27 @@ SYSDEF(clone) {
  * vector is an empty one, not a fault: execve(2)'s count() walks the array only
  * `if (argv.ptr.native != NULL)` and returns 0 otherwise, so execve(path, NULL,
  * NULL) is a legal call. Dereferencing it unconditionally answered EFAULT for
- * one the kernel accepts. */
-static char **import_strvec(CPU *c, u64 va, int *err) {
+ * one the kernel accepts.
+ *
+ * How long the vector may be is @budget, the byte budget the new image's
+ * arguments have to fit in (exec_arg_budget, elf.c) -- the same one execve is
+ * about to measure the pair against exactly. Every entry costs at least its
+ * 8-byte pointer slot plus a NUL wherever it lands, so a vector that has spent
+ * the whole budget on its own cannot fit alongside the other one either, and
+ * the emulator's staging is bounded by the same thing that bounds the guest's
+ * stack. A flat ceiling of 4096 entries used to stand here instead. That is
+ * not a limit a kernel has -- count() stops at MAX_ARG_STRINGS, two billion --
+ * and it is a limit ordinary programs cross: `find | xargs rm` in a directory
+ * of more than four thousand short names builds exactly such a list, well
+ * inside the byte budget, and every one of those execs came back E2BIG.
+ *
+ * A string past MAX_ARG_STRLEN (32 guest pages, the size of the staging buffer
+ * below) is E2BIG as well, which is what copy_strings answers for one
+ * (valid_arg_len); the guest-memory walk that finds it calls it a name too
+ * long, which is the wrong error to hand an execve. */
+static char **import_strvec(CPU *c, u64 va, u64 budget, int *err) {
     int cap = 16, n = 0;
+    u64 used = 0;
     char **vec = malloc(sizeof(char *) * (size_t)cap);
     if (!vec) { *err = -ENOMEM; return NULL; }
     if (va == 0) { vec[0] = NULL; return vec; }
@@ -636,11 +654,13 @@ static char **import_strvec(CPU *c, u64 va, int *err) {
         if (!p) { vec[n] = NULL; return vec; }
         char buf[131072];
         long l = copy_str_from_guest(c, buf, p, sizeof buf);
+        if (l == -ENAMETOOLONG) l = -E2BIG;
         if (l < 0) { *err = (int)l; goto fail; }
+        used += 8 + (u64)l + 1;
+        if (used > budget) { *err = -E2BIG; goto fail; }
         vec[n] = strdup(buf);
         if (!vec[n]) { *err = -ENOMEM; goto fail; }
         n++;
-        if (n > 4096) { *err = -E2BIG; goto fail; }
     }
 fail:
     for (int i = 0; i < n; i++) free(vec[i]);
@@ -1566,9 +1586,10 @@ SYSDEF(execve) {
     long n = copy_str_from_guest(c, gpath, a0, sizeof gpath);
     if (n < 0) return (u64)(s64)n;
     int err = 0;
-    char **argv = import_strvec(c, a1, &err);
+    u64 budget = exec_arg_budget(c->m);
+    char **argv = import_strvec(c, a1, budget, &err);
     if (!argv) return (u64)(s64)err;
-    char **envp = import_strvec(c, a2, &err);
+    char **envp = import_strvec(c, a2, budget, &err);
     if (!envp) { free_strvec(argv); return (u64)(s64)err; }
     (void)a3; (void)a4; (void)a5;
     u64 r = do_execve(c, gpath, argv, envp);
@@ -1617,9 +1638,10 @@ SYSDEF(execveat) {
         snprintf(exec_path, sizeof exec_path, "%s", canon);
     }
     int err = 0;
-    char **argv = import_strvec(c, a2, &err);
+    u64 budget = exec_arg_budget(c->m);
+    char **argv = import_strvec(c, a2, budget, &err);
     if (!argv) return (u64)(s64)err;
-    char **envp = import_strvec(c, a3, &err);
+    char **envp = import_strvec(c, a3, budget, &err);
     if (!envp) { free_strvec(argv); return (u64)(s64)err; }
     (void)a5;
     u64 r = do_execve(c, exec_path, argv, envp);
