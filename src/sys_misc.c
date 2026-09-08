@@ -453,6 +453,24 @@ s32 mfd_resolve(CPU *c, int fd, u64 *dev, u64 *ino, char *name_out) {
     return seals;
 }
 
+/* Does the KERNEL hold F_SEAL_WRITE on this fd? Asked of the host, which is
+ * the point: it answers for a native memfd, and answers EINVAL -- the fast
+ * "no" -- for the tier's backing files and for every ordinary file, neither of
+ * which the host refuses a shared read-only mapping of. See sys.h. */
+int mfd_kernel_write_sealed(int fd) {
+    int s = fcntl(fd, 1034 /* F_GET_SEALS */);
+    return s >= 0 && (s & (int)G_F_SEAL_WRITE) != 0;
+}
+
+/* A64_MEMFD_SEAL_FORCE_OLD: refuse that mapping the way a pre-6.x kernel does,
+ * so the workaround is what serves the guest on a host that would have allowed
+ * it outright. Every current LTS kernel is on that tier -- and a 6.x developer
+ * machine is the one place it cannot otherwise be reached. */
+int mfd_seal_map_force_old(void) {
+    static int forced = -1;
+    return PROBE_ONCE(forced, getenv("A64_MEMFD_SEAL_FORCE_OLD") != NULL);
+}
+
 int mfd_write_denied(CPU *c, int fd) {
     if (!mfdc_any || fd < 0) return 0;
     if (fd < MFDC_N) {

@@ -129,15 +129,16 @@ for s in tests/asm/*.S; do
     run_diff "asm/$(basename "$s" .S)" "$b"
 done
 
-# ---- is this host's memfd of the vintage the tests were written against? ----
+# ---- is the ORACLE's memfd of the vintage the tests were written against? ---
 # One row of c/memfd_seals is kernel-vintage-dependent: a read-only MAP_SHARED
-# of a write-sealed memfd opened read-write, which 6.x allows (VM_MAYWRITE
-# stripped) and older kernels refuse. The emulator's unlinked-file tier
-# implements the former — the vintage sys_uname advertises — but wherever the
-# host HAS memfd_create the guest's mmap reaches the host kernel itself, so on
-# an older host that row is the host's answer either way. Probed rather than
-# guessed from `uname -r`, since kernels backport. Both users of this are
-# below: the C loop (against a recorded oracle) and the file-tier re-run.
+# of a write-sealed memfd, which 6.x admits (VM_MAYWRITE stripped) and older
+# kernels refuse outright. The EMULATOR answers 6.x on every host and both
+# tiers -- the file tier implements the seals itself, and on a refusing kernel
+# the native path serves the mapping from backing of its own (sys_mm.c) -- so
+# what decides whether this test is comparable is the vintage of the host the
+# ORACLE's answers come from. That is this host for a live oracle and the
+# recording host for a pack, which is why a recording run leaves its answer in
+# the pack. Probed rather than guessed from `uname -r`, since kernels backport.
 MEMFD_SEAL_HOST=unknown
 if [ -n "$HCC" ] &&
    "$HCC" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
@@ -148,8 +149,9 @@ fi
 # The same question asked of the host the ORACLE's answers come from. That is
 # this host for every live oracle, and the recording host for a pack -- which
 # is why a recording run leaves its own answer in the pack. Without it a replay
-# host could only assume, and the two rows below need to know: one of them is
-# comparable when the two hosts AGREE, the other when the oracle's host allows.
+# host could only assume, and assuming wrongly costs the rows either way: a
+# phone whose kernel refuses would skip rows its emulator now answers, and a
+# pack recorded on a refusing host would fail rows nothing could reconcile.
 if [ -n "${A64_RECORD:-}" ]; then
     mkdir -p "$A64_RECORD_DIR"
     printf '%s\n' "$MEMFD_SEAL_HOST" > "$A64_RECORD_DIR/MEMFD_SEAL"
@@ -191,20 +193,19 @@ for cfile in tests/c/*.c; do
        { [ -n "$need_read$need_ioctl" ] || grep -qm1 'SAME-HOST-ONLY' "$cfile"; }; then
         skip=$((skip+1)); echo "SKIP c/${base} (same-host-only; the recorded oracle ran elsewhere)"; continue
     fi
-    # The same idea, measured rather than declared: c/memfd_seals asks one
-    # question whose answer is the host kernel's vintage (MEMFD_SEAL_HOST,
-    # above) and not the emulator's doing, because a host that HAS memfd_create
-    # gets the guest's mmap forwarded to it. A live oracle is that same kernel
-    # and agrees; a recording made on a 6.x host does not, and no emulator
-    # change could make it. The file tier below runs this binary on every host,
-    # so the fallback the older host is really served by stays covered.
-    if [ "$ORACLE_KIND" = recorded ] && [ "$base" = memfd_seals ] &&
-       [ "$MEMFD_SEAL_HOST" != "$MEMFD_SEAL_ORACLE" ] &&
-       { [ "$MEMFD_SEAL_HOST" = refuse ] || [ "$MEMFD_SEAL_ORACLE" = refuse ]; }; then
-        skip=$((skip+1))
-        echo "SKIP c/${base} (read-only shared map of a write-sealed memfd: this host $MEMFD_SEAL_HOST, the recording's $MEMFD_SEAL_ORACLE)"
-        continue
-    fi
+    # The same idea, measured rather than declared: one row of c/memfd_seals is
+    # the vintage of the oracle's own kernel (MEMFD_SEAL_ORACLE, above). The
+    # emulator answers 6.x wherever it runs, deliberately, so a pre-6.x ORACLE
+    # is the one thing that makes the row incomparable -- and it is not the
+    # emulator that would be wrong. Skipped by name there; on every other host,
+    # including a phone replaying a pack recorded on a 6.x box, it runs.
+    case "$base" in memfd_seals|memfd_ro_share)
+        if [ "$MEMFD_SEAL_ORACLE" = refuse ]; then
+            skip=$((skip+1))
+            echo "SKIP c/${base} (the oracle's kernel refuses a read-only shared map of a write-sealed memfd; the emulator implements the 6.x semantics it advertises)"
+            continue
+        fi ;;
+    esac
     denied=
     for nf in $need_read; do
         head -c1 "$nf" >/dev/null 2>&1 || denied="$denied $nf"
@@ -1423,21 +1424,20 @@ fi
 # without memfd_create (Android 7's 3.x) is served by -- and require
 # identical semantics.
 #
-# The memfd_seals rows are gated on MEMFD_SEAL_HOST, measured before the C loop.
-for base in memfd_seals mfdsync mmap_eof; do
+# The memfd_seals rows are gated on the ORACLE's kernel vintage, the same way
+# and for the same reason as the C loop's own (MEMFD_SEAL_ORACLE, measured
+# above): the emulator answers 6.x on every tier, so only an oracle that does
+# not makes the comparison meaningless.
+for base in memfd_seals memfd_ro_share mfdsync mmap_eof; do
     MBIN="tests/c/${base}_static.bin"
     [ -x "$MBIN" ] || continue
-    # This row is the tier's 6.x semantics against whatever the oracle's host
-    # does, so it is the ORACLE's host that has to allow the mapping -- not
-    # necessarily this one. A live oracle runs here and the two are the same
-    # question; a recording made on a 6.x host is comparable even where the
-    # host replaying it refuses, which is the one place this tier is not a
-    # simulation but the real fallback the guest is served by.
-    if [ "$base" = memfd_seals ] && [ "$MEMFD_SEAL_ORACLE" = refuse ]; then
-        skip=$((skip+1))
-        echo "SKIP c/memfd_seals(memfd-tier) (the oracle's host kernel refuses a read-only shared map of a write-sealed memfd; the tier implements the 6.x semantics this emulator advertises)"
-        continue
-    fi
+    case "$base" in memfd_seals|memfd_ro_share)
+        if [ "$MEMFD_SEAL_ORACLE" = refuse ]; then
+            skip=$((skip+1))
+            echo "SKIP c/${base}(memfd-tier) (the oracle's kernel refuses a read-only shared map of a write-sealed memfd; the tier implements the 6.x semantics this emulator advertises)"
+            continue
+        fi ;;
+    esac
     rec_have "$MBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(memfd-tier) (not in the test pack)"; continue; }
     NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "tests/c/${base}.c" 2>/dev/null |
@@ -1448,6 +1448,40 @@ for base in memfd_seals mfdsync mmap_eof; do
         pass=$((pass+1)); echo "PASS c/${base}(memfd-tier)"
     else
         diff_verdict "c/${base}(memfd-tier)" "$out_q" "$rc_q" "$out_e" "$rc_e" "" "$MBIN"
+    fi
+done
+
+# ---- and the tier a pre-6.x host kernel puts the NATIVE memfd path on ----
+# F_SEAL_WRITE takes a deny-writable reference on the inode, and a kernel older
+# than 6.x counts every shared mapping against it before asking whether the
+# mapping could write at all -- so the mapping a sealed memfd exists to hand
+# out, a read-only shared view, is refused with EPERM there. Every current LTS
+# kernel is on that tier, and an Android 13 phone is where the guest first saw
+# it: the emulator forwarded the refusal while its own uname promised 6.x.
+# It now serves that mapping from backing of its own (sys_mm.c), and this row
+# is the check that the guest cannot tell -- the same binary, the same oracle,
+# with the direct route refused on a host that would have allowed it.
+#
+# The knob is about the NATIVE path, so on a host without memfd_create -- where
+# every guest memfd is the file tier's already -- it selects nothing and the row
+# repeats the C loop's. Harmless, and one row fewer to explain than a skip.
+for base in memfd_seals memfd_ro_share; do
+    MSBIN="tests/c/${base}_static.bin"
+    if [ "$MEMFD_SEAL_ORACLE" = refuse ]; then
+        skip=$((skip+1))
+        echo "SKIP c/${base}(old-seal-mmap tier) (the oracle's kernel refuses that mapping too)"
+        continue
+    fi
+    [ -x "$MSBIN" ] && rec_have "$MSBIN" || continue
+    NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "tests/c/${base}.c" 2>/dev/null |
+                   sed 's/^NEEDS-ORACLE: *//')
+    out_q=$(oracle_run "$MSBIN" 2>/dev/null); rc_q=$?
+    out_e=$(A64_MEMFD_SEAL_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$MSBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/${base}(old-seal-mmap tier)"
+    else
+        diff_verdict "c/${base}(old-seal-mmap tier)" "$out_q" "$rc_q" \
+                     "$out_e" "$rc_e" "" "$MSBIN"
     fi
 done
 NEEDS_ORACLE=

@@ -284,7 +284,49 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
              * kernel admits it with VM_MAYWRITE stripped, which below turns
              * into wr_ok = 0 (mprotect to writable answers EACCES). */
         }
-        r = guest_map_file(as, addr, len, pte, fd, off, shared, NULL);
+        /* The same read-only mapping of a NATIVE memfd, on a host kernel that
+         * refuses it. F_SEAL_WRITE takes a deny-writable reference on the
+         * inode, and until 6.x every MAP_SHARED mapping was counted against
+         * that reference before the kernel asked whether the mapping could
+         * write at all -- so the mapping a sealed memfd exists to hand out,
+         * a read-only shared view, came back EPERM on the very fd the sealer
+         * passed on. 6.x, the vintage this emulator's uname claims, admits it
+         * and strips VM_MAYWRITE; every current LTS kernel does not, and an
+         * Android 13 phone was where the guest first saw the difference.
+         *
+         * Serve the 6.x answer by backing the region privately. Nothing about
+         * that is visible to the guest HERE, and only here: F_SEAL_WRITE means
+         * the file can no longer change -- write(2), pwrite, fallocate and
+         * every writable shared mapping are refused, and the seal itself is
+         * EBUSY while one exists -- so a private read-only mapping of it sees
+         * the same bytes as a shared one, for as long as it lives. What could
+         * tell them apart is stopped at the two places it would show: the
+         * region stays SHARED in the emulator's own record, so /proc/maps
+         * spells it `s` and a poke into it is EIO, and wr_ok = 0 keeps
+         * mprotect(PROT_WRITE) answering the EACCES a stripped VM_MAYWRITE
+         * would. A writable mapping never reaches this -- seal_ro excludes
+         * it, and every kernel refuses it, as does the tier above -- and
+         * neither does F_SEAL_FUTURE_WRITE, which grandfathers a live writer
+         * and is therefore NOT immutable: the host admits its read-only
+         * shared mappings anyway, having taken no reference for it.
+         *
+         * The retry is driven by the host's own refusal rather than by a
+         * version test, so a backported kernel is judged by what it does.
+         * A64_MEMFD_SEAL_FORCE_OLD refuses the direct route to reach the same
+         * path from a host that would have allowed it. */
+        int seal_ro = shared && !is_mfd && !(pte & PTE_W);
+        int forced = seal_ro && mfd_seal_map_force_old() &&
+                     mfd_kernel_write_sealed(fd);
+        r = forced ? -EPERM
+                   : guest_map_file(as, addr, len, pte, fd, off, shared, NULL);
+        if (r == -EPERM && seal_ro &&
+            (forced || mfd_kernel_write_sealed(fd))) {
+            r = guest_map_file(as, addr, len, pte, fd, off, 0, NULL);
+            if (r == 0) {
+                Region *reg = (Region *)as_find_region(as, addr);
+                if (reg) { reg->shared = 1; reg->wr_ok = 0; }
+            }
+        }
         if (r == 0 && !is_mfd) {
             /* A NATIVE memfd deserves its kernel name in the synthesized
              * maps too (regions are otherwise named only for ELF images;

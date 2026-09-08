@@ -1295,7 +1295,32 @@ start-time like shm attach rows). A writable shared `mmap` of a sealed
 memfd answers `EPERM`; a read-only one is admitted with `wr_ok` stripped,
 which is what turns a later `mprotect(PROT_WRITE)` into `EACCES`, exactly
 the kernel's stripped-`VM_MAYWRITE` behaviour (`F_SEAL_FUTURE_WRITE`
-grandfathers mappings that existed before the seal). `/proc` keeps the
+grandfathers mappings that existed before the seal).
+
+That last rule is one the emulator has to apply on the **native** path too,
+where the memfd is the host kernel's own and the guest's `mmap` reaches it
+directly. `F_SEAL_WRITE` takes a deny-writable reference on the inode, and a
+kernel older than 6.x counts *every* `MAP_SHARED` mapping against that
+reference before asking whether the mapping could write at all — so the very
+mapping a sealed memfd exists to hand out came back `EPERM`, on the fd the
+sealer passed on and on any other. Every current LTS kernel is on that tier;
+an Android 13 phone is where a guest first saw it, against a `uname` promising
+6.x. The emulator now backs such a mapping **privately** instead of forwarding
+the refusal (`sys_mm.c`), which is invisible precisely here: under
+`F_SEAL_WRITE` the file can no longer change — `write`, `pwrite`, `fallocate`
+and every writable shared mapping are refused, and the seal itself is `EBUSY`
+while such a mapping exists — so a private read-only view of it shows the same
+bytes for as long as it lives. The two places the difference would surface are
+held: the region stays *shared* in the emulator's own record, so `/proc/maps`
+spells it `s` and a poke into it is `EIO`, and `wr_ok = 0` keeps
+`mprotect(PROT_WRITE)` answering `EACCES` as a stripped `VM_MAYWRITE` would.
+The retry is driven by the host's own `EPERM` rather than by a version test, so
+a backported kernel is judged by what it does; `A64_MEMFD_SEAL_FORCE_OLD=1`
+refuses the direct route on a host that would have allowed it, which is how the
+suite's `(old-seal-mmap tier)` row reaches this path from a 6.x machine.
+`F_SEAL_FUTURE_WRITE` is deliberately not covered by any of it: it grandfathers
+a live writer, so the file is *not* immutable — and no kernel refuses its
+read-only shared mappings, having taken no reference for it. `/proc` keeps the
 kernel's spelling: fd links and `maps` show `/memfd:name (deleted)` instead
 of leaking the backing path. `fallocate` follows `shmem_fallocate`'s own order and reading of the seals: a
 hole punch is decided by the write seals and returns before `F_SEAL_GROW` is

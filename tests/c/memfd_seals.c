@@ -100,9 +100,22 @@ int main(int argc, char **argv) {
            mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) ==
                    MAP_FAILED ? strerror(errno) : "ALLOWED");
     errno = 0;
-    printf("mmap_r_rdwrfd=%s\n",
-           mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0) == MAP_FAILED
-               ? strerror(errno) : "ALLOWED");
+    void *rmap = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    printf("mmap_r_rdwrfd=%s\n", rmap == MAP_FAILED ? strerror(errno)
+                                                    : "ALLOWED");
+    /* That mapping is the one the seal exists to hand out, so what it is
+     * worth is checked too: it shows the file's bytes, and mprotect cannot put
+     * the write back -- the kernel admitted it with VM_MAYWRITE stripped.
+     * (A kernel older than 6.x refuses the mapping outright, on any fd; the
+     * emulator serves it from backing of its own, and run_tests.sh drives that
+     * tier from a modern host with A64_MEMFD_SEAL_FORCE_OLD.) */
+    printf("mmap_r_data=%.5s\n",
+           rmap == MAP_FAILED ? "n/a" : (const char *)rmap);
+    errno = 0;
+    printf("mmap_r_mprotect=%s\n",
+           rmap == MAP_FAILED ? "n/a"
+           : mprotect(rmap, 4096, PROT_READ | PROT_WRITE) < 0 ? strerror(errno)
+                                                              : "ALLOWED");
     /* reading keeps working, and the content is intact */
     char b[8] = { 0 };
     printf("read_back=%zd:%.5s\n", pread(fd, b, 5, 0), b);
@@ -142,14 +155,21 @@ int main(int argc, char **argv) {
     void *m0 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
     (void)m0;
     int found = 0;
+    char perms[8] = "?";
     FILE *mp = fopen("/proc/self/maps", "r");
     if (mp) {
         char line[256];
         while (fgets(line, sizeof line, mp))
-            if (strstr(line, "memfd:t")) { found = 1; break; }
+            if (strstr(line, "memfd:t")) {
+                /* the permission field, so a read-only shared mapping is
+                 * still spelled shared however the emulator backed it */
+                if (sscanf(line, "%*s %7s", perms) != 1) perms[0] = '?';
+                found = 1;
+                break;
+            }
         fclose(mp);
     }
-    printf("maps_memfd=%d\n", found);
+    printf("maps_memfd=%d perms=%s\n", found, perms);
 
     /* seals ride the fd through execve (apk-tools seals, then execs) */
     fcntl(f0, F_ADD_SEALS, 0);                       /* no-op, keeps errno sane */

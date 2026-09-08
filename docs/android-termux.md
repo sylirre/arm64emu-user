@@ -140,6 +140,15 @@ unfiltered:
   the app-writable backing dir plus broker-held seals, so apk-tools 3's
   sealed install triggers work even where the host kernel has no memfd at
   all.
+* **A write-sealed memfd mapped read-only and shared** is refused (`EPERM`) by
+  every kernel older than 6.x — the deny-writable reference `F_SEAL_WRITE`
+  takes is counted against the mapping before the kernel asks whether it could
+  write at all — and the arm64 rig (Android 13, 5.15) is one of them, as is
+  every current LTS kernel. That is the mapping a sealed memfd exists to hand
+  out, so the emulator serves it from backing of its own rather than forwarding
+  a refusal its `uname` says cannot happen; `docs/syscalls.md` has why the
+  guest cannot tell, and `A64_MEMFD_SEAL_FORCE_OLD` reaches the path from a
+  modern host.
 
 * **Re-opening a memfd through `/proc/self/fd/N`** is denied by Android's
   SELinux policy (EACCES, sealed or not) — and that is exactly how apk-tools
@@ -324,9 +333,10 @@ in, syscall and filesystem vintages), the proot-driven Alpine shell
 comparison, and anything whose binary or recording is missing from the
 pack — each named in the output.
 
-Six rows came out of the device runs themselves, none of them an emulator
-defect. Four are host answers a recording made elsewhere cannot referee, and
-two were tests that hardcoded a `/tmp` the device has none of:
+Six rows came out of the device runs themselves. One turned out to be a real
+gap in the emulator (`c/memfd_seals`, below); of the rest, three are host
+answers a recording made elsewhere cannot referee, and two were tests that
+hardcoded a `/tmp` the device has none of:
 
 * **`c/socktimeo`** — the kernel keeps `SO_RCVTIMEO` in jiffies, so what comes
   back is quantized by the host's `HZ`. The arm64 rig runs at 250, which turns
@@ -340,13 +350,16 @@ two were tests that hardcoded a `/tmp` the device has none of:
   last row documents comes back `EACCES` where an ordinary kernel answers
   `ENOTTY`. Both are the host's answer; the test is `SAME-HOST-ONLY`.
 * **`c/memfd_seals`** — a read-only shared map of a write-sealed memfd, which
-  6.x allows and the arm64 rig's kernel refuses. Wherever the host *has*
-  `memfd_create` the guest's mmap reaches that kernel, so this row is the
-  host's answer either way. A recording run now stores what its own host
-  answered in `tests/.cache/recorded/MEMFD_SEAL` and a replay compares the
-  two, which also lets the **file-tier** re-run go ahead on a refusing host —
-  the one place that tier is not a simulation but the fallback the guest is
-  really served by.
+  6.x admits and the arm64 rig's kernel refuses outright. That one was the
+  emulator's after all, though not in the row that reported it: wherever the
+  host *has* `memfd_create` the guest's mmap reached that kernel, so the guest
+  was told `EPERM` by a `uname` promising 6.x. The emulator now serves that
+  mapping from backing of its own (see `docs/syscalls.md`), on every host whose
+  kernel refuses it, and the row is compared against the **oracle's** kernel
+  vintage rather than this host's — a recording run stores what its own host
+  answered in `tests/.cache/recorded/MEMFD_SEAL`, so a phone replaying a pack
+  from a 6.x box runs the row (and the file-tier one) instead of skipping it.
+  `A64_MEMFD_SEAL_FORCE_OLD` drives the same path from a modern host.
 * **`fixtures/sockfilter_get`** — `SO_GET_FILTER` is Linux 3.8 and the armv7
   rig runs 3.1. The emulator forwards the option and has no filter state of
   its own to answer from, so the fixture asks first and prints a single

@@ -352,6 +352,10 @@ static void help(void) {
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "
                         "by)."},
+        {"A64_MEMFD_SEAL_FORCE_OLD", "Refuse a read-only shared mapping of a "
+                        "write-sealed memfd the way a kernel older than 6.x "
+                        "does, so the emulator's own backing is what serves "
+                        "the guest that mapping."},
         {"A64_SIGRT_MAX=N", "Reserve the emulator's own host signals below N "
                         "instead of at the top of the RT range (exercises the "
                         "tier a host that cannot deliver its top RT signals is "

@@ -159,6 +159,20 @@ int  mfd_fcntl(CPU *c, int fd, int cmd, u64 arg, u64 *ret); /* 1 = handled */
 int  mfd_link_rewrite(CPU *c, const char *hostlink, char *buf /*PATH_MAX*/);
 void mfd_track_native(int fd, u64 dev, u64 ino);   /* a real kernel memfd */
 
+/* ---- a write-sealed memfd, mapped read-only and shared --------------------
+ * F_SEAL_WRITE takes a deny-writable reference on the inode's address space,
+ * and a kernel older than 6.x counts EVERY shared mapping against it before
+ * asking whether that mapping could write at all -- so a read-only MAP_SHARED
+ * view of a sealed memfd is refused with EPERM there, however it was asked
+ * for. The kernel this emulator's uname claims admits it and strips
+ * VM_MAYWRITE instead (mprotect back to writable is then EACCES), which is
+ * what sys_mm.c serves the guest on either host. These two are how it tells
+ * the two apart: the seal is the KERNEL's, so a tier memfd (whose seals are
+ * the broker's, and whose backing the host will map either way) answers no,
+ * and so does every ordinary file. */
+int  mfd_kernel_write_sealed(int fd);
+int  mfd_seal_map_force_old(void);   /* A64_MEMFD_SEAL_FORCE_OLD */
+
 /* ---- the mode of a memfd a host will not let the guest change -------------
  * Android's SELinux policy refuses an app every mode change on a memfd, so a
  * guest that takes the execute bit off one of its own is told EACCES by a
