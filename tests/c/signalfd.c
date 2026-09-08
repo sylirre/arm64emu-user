@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/signalfd.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -144,6 +145,27 @@ int main(void) {
     sigtimedwait(&only1, NULL, &zero);   /* drain */
     close(s1);
     close(s2);
+
+    /* A vectored read of no bytes at all. readv answers 0 before the file is
+     * consulted -- do_iter_read returns the moment the imported total is zero
+     * -- while read(2) has no such shortcut, so signalfd_read sees the zero
+     * itself and calls a buffer that cannot hold one record EINVAL. The queued
+     * signal must survive both and still be there to read afterwards. */
+    sigset_t only_u1;
+    sigemptyset(&only_u1);
+    sigaddset(&only_u1, SIGUSR1);
+    int zfd = signalfd(-1, &only_u1, SFD_NONBLOCK);
+    raise(SIGUSR1);
+    struct iovec ziov[2] = { { NULL, 0 }, { si, 0 } };
+    printf("zero_cnt0=%zd\n", readv(zfd, ziov, 0));
+    printf("zero_len0=%zd\n", readv(zfd, ziov + 1, 1));
+    printf("zero_two=%zd\n", readv(zfd, ziov, 2));
+    n = read(zfd, si, 0);
+    printf("zero_read=%zd einval=%d\n", n, n < 0 && errno == EINVAL);
+    struct iovec zreal = { si, sizeof si[0] };
+    n = readv(zfd, &zreal, 1);
+    printf("zero_kept=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    close(zfd);
 
     /* Bad arguments. */
     printf("badflags=%d\n", signalfd(-1, &just_usr, 1 << 30) < 0 && errno == EINVAL);

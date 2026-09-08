@@ -977,6 +977,14 @@ SYSDEF(readv) {
     if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: filled from the ring */
         size_t tot = 0;
         for (int i = 0; i < cnt; i++) tot += iov[i].iov_len;
+        /* A vector of no bytes never reaches the file at all: do_iter_read
+         * answers 0 the moment the imported total is zero, ahead of every
+         * read handler. Handed to sigfd_fill it became instead the EINVAL a
+         * buffer too small for one signalfd_siginfo earns -- which is the
+         * right answer for read(fd, buf, 0), where vfs_read has no such
+         * shortcut and signalfd_read sees the zero itself, and the wrong one
+         * for readv(fd, iov, 0). Both measured against a kernel. */
+        if (!tot) { free(bounce); return 0; }
         u8 *flat = malloc(tot ? tot : 1);
         if (!flat) { free(bounce); return (u64)(s64)-ENOMEM; }
         s64 r = sigfd_fill(c, (int)a0, flat, tot);

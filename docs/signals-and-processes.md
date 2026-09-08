@@ -220,6 +220,12 @@ Two consequences worth knowing:
   fd unmarks it explicitly (`close`, `dup2` over an fd, and **`execve`'s CLOEXEC
   sweep**; a stale entry there let a timerfd inherit a dead signalfd's number
   and have its `read` answered from the signal ring).
+- `readv` with **no bytes** in it (`iovcnt == 0`, or every segment empty) is 0,
+  not the `EINVAL` a buffer too small for one `signalfd_siginfo` earns: a vector
+  of no bytes never reaches the file, since `do_iter_read` returns as soon as
+  the imported total is zero. `read(fd, buf, 0)` really is `EINVAL` — `vfs_read`
+  has no such shortcut, so `signalfd_read` sees the zero itself — and the two
+  answers differing is the kernel's own asymmetry, not a rounding of ours.
 
 ### `sigaltstack(2)` and `SA_ONSTACK`
 
