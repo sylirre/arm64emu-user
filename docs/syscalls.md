@@ -849,7 +849,14 @@ go wrong:
   gathered message (`nlr_note_request`, `sys_net.c`): noted from the first
   segment, one shorter than a header was not recognised as a reconfiguring
   request at all, and the kernel's refusal was passed through where a guest
-  whose namespace was faked is owed the ack.
+  whose namespace was faked is owed the ack. That note is taken on **every**
+  face a request can be sent through, `write` and `writev` included
+  (`sys_file.c`) — a netlink socket needs no destination address, so a
+  reconfiguring request arrives through them as readily as a dump request does
+  (which is the face busybox's `ip` already uses for its dumps, above). With
+  those two unnoted the same request came back acked through `sendmsg` and
+  refused through `write`, which is a way for a guest to tell the two tiers
+  apart: the substitute answers all four faces alike.
 
   The iovec array is imported **once and up front** for the receives as well,
   and not read piecemeal while scattering into it: an array the guest cannot

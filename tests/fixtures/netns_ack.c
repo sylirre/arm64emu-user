@@ -599,6 +599,32 @@ static const char *split_send(int fd) {
     return "ok";
 }
 
+/* The reconfiguring request the ack rewrite is about, and what came back for
+ * it: an ack (the emulator's answer for a guest whose namespace was faked) or
+ * the refusal rtnetlink really gave. */
+static void newaddr_req(struct nlmsghdr *n, struct ifaddrmsg *i, unsigned seq) {
+    memset(n, 0, NLMSG_LENGTH(sizeof *i));
+    n->nlmsg_len = NLMSG_LENGTH(sizeof *i);
+    n->nlmsg_type = RTM_NEWADDR;
+    n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    n->nlmsg_seq = seq;
+    i->ifa_family = AF_INET;
+    i->ifa_prefixlen = 8;
+    i->ifa_index = 1;
+}
+
+static const char *ack_reply(int fd, unsigned seq) {
+    char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof buf, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+
+    if (n < (ssize_t)NLMSG_HDRLEN) return "short";
+    if (h->nlmsg_type != NLMSG_ERROR) return "nonerror";
+    if (h->nlmsg_seq != seq) return "badseq";
+    struct nlmsgerr *e = NLMSG_DATA(h);
+    return e->error == 0 ? "ack" : "refused";
+}
+
 /* ...and the ack rewrite is keyed on the same gathered message: a request
  * whose header straddles segments has to be recognised as the reconfiguring
  * request it is, or the kernel's refusal is passed through where the guest
@@ -609,30 +635,37 @@ static const char *split_ack(int fd, unsigned seq) {
     struct { struct nlmsghdr n; struct ifaddrmsg i; } r;
     struct iovec iov[2];
     struct msghdr mh;
-    char buf[4096];
 
-    memset(&r, 0, sizeof r);
-    r.n.nlmsg_len = NLMSG_LENGTH(sizeof r.i);
-    r.n.nlmsg_type = RTM_NEWADDR;
-    r.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-    r.n.nlmsg_seq = seq;
-    r.i.ifa_family = AF_INET;
-    r.i.ifa_prefixlen = 8;
-    r.i.ifa_index = 1;
-
+    newaddr_req(&r.n, &r.i, seq);
     iov[0].iov_base = &r;                iov[0].iov_len = 8;
     iov[1].iov_base = (char *)&r + 8;    iov[1].iov_len = r.n.nlmsg_len - 8;
     memset(&mh, 0, sizeof mh);
     mh.msg_iov = iov;
     mh.msg_iovlen = 2;
     if (sendmsg(fd, &mh, 0) != (ssize_t)r.n.nlmsg_len) return "sendfail";
-    ssize_t n = recv(fd, buf, sizeof buf, 0);
-    struct nlmsghdr *h = (struct nlmsghdr *)buf;
-    if (n < (ssize_t)NLMSG_HDRLEN) return "short";
-    if (h->nlmsg_type != NLMSG_ERROR) return "nonerror";
-    if (h->nlmsg_seq != seq) return "badseq";
-    struct nlmsgerr *e = NLMSG_DATA(h);
-    return e->error == 0 ? "ack" : "refused";
+    return ack_reply(fd, seq);
+}
+
+/* ...and the rewrite has to reach every face a request can be sent through. A
+ * netlink socket needs no destination address, so busybox's `ip` configures an
+ * interface with plain write(2) -- and writev(2) is the same message in a
+ * vector. The substituted socket answers all four faces alike; the real one is
+ * noted per send, and these two were not noted at all, so the same request
+ * came back acked one way and refused the other. Sending it both ways is all
+ * it took for a guest to tell the tiers apart. */
+static const char *plain_ack(int fd, unsigned seq, int vectored) {
+    struct { struct nlmsghdr n; struct ifaddrmsg i; } r;
+    struct iovec iov;
+
+    newaddr_req(&r.n, &r.i, seq);
+    if (vectored) {
+        iov.iov_base = &r;
+        iov.iov_len = r.n.nlmsg_len;
+        if (writev(fd, &iov, 1) != (ssize_t)r.n.nlmsg_len) return "sendfail";
+    } else if (write(fd, &r, r.n.nlmsg_len) != (ssize_t)r.n.nlmsg_len) {
+        return "sendfail";
+    }
+    return ack_reply(fd, seq);
 }
 
 int main(void) {
@@ -642,7 +675,7 @@ int main(void) {
         printf("empty=skip\nself=skip\npeer=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
 
@@ -666,7 +699,7 @@ int main(void) {
     if (fd < 0) {
         printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -709,7 +742,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"
-               "sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+               "sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
@@ -734,7 +767,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
     printf("ready=%s\n", readiness_cycle(fd));
@@ -745,7 +778,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
     printf("frame=%s\n", dump_walk(fd));
@@ -767,7 +800,7 @@ int main(void) {
     /* A destination the guest cannot write: EFAULT, not a silent short read. */
     fd = nl_open();
     if (fd < 0) {
-        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
+        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
         return 0;
     }
     printf("fault=%s\n", fault_recv(fd));
@@ -777,19 +810,19 @@ int main(void) {
      * a bad one must fail the call rather than become a successful empty
      * operation. */
     fd = nl_open();
-    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
+    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
     printf("sendfault=%s\n", fault_send(fd));
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
+    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
     printf("addrfault=%s\n", fault_addr(fd));
     close(fd);
 
     /* Calls that carry no bytes: what they answer, and that none of them
      * disturbs the reply the socket is holding. */
     fd = nl_open();
-    if (fd < 0) { printf("zerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
+    if (fd < 0) { printf("zerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
     printf("zerolen=%s\n", zero_len(fd));
     close(fd);
 
@@ -801,8 +834,19 @@ int main(void) {
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("splitack=skip\n"); return 0; }
+    if (fd < 0) { printf("splitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
     printf("splitack=%s\n", split_ack(fd, 1013));
+    close(fd);
+
+    /* The same request through the faces that carry no address of their own. */
+    fd = nl_open();
+    if (fd < 0) { printf("wrack=skip\nwvack=skip\n"); return 0; }
+    printf("wrack=%s\n", plain_ack(fd, 1014, 0));
+    close(fd);
+
+    fd = nl_open();
+    if (fd < 0) { printf("wvack=skip\n"); return 0; }
+    printf("wvack=%s\n", plain_ack(fd, 1015, 1));
     close(fd);
     return 0;
 }

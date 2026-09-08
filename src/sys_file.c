@@ -976,6 +976,13 @@ SYSDEF(write) {
     if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     s64 pr;
     if (procfs_pre_write(c, (int)a0, buf, len, -1, &pr)) { free(buf); return (u64)pr; }
+    /* A netlink socket needs no destination address, so a reconfiguring
+     * rtnetlink request arrives by write(2) as readily as by sendto -- which
+     * is how busybox's `ip` sends its. Note it here too, or the kernel's
+     * refusal is passed through to a guest whose network namespace was faked
+     * and which is owed the ack (sys_net.c does the same for the socket
+     * calls). Fake-netlink fds never reach this: they were routed above. */
+    if (len) nlr_note_request(c->m, (int)a0, buf, len);
     ssize_t n = write((int)a0, buf, len);
     u64 e = n < 0 ? host_err() : (u64)n;   /* before the free() -- see sys.h */
     free(buf);
@@ -1078,6 +1085,10 @@ SYSDEF(writev) {
     int consumed = procfs_pre_write(c, (int)a0, flat, tot, -1, &pr);
     if (cnt != 1) free(flat);
     if (consumed) { free(bounce); return (u64)pr; }
+    /* As in write above, and from the gathered bounce: the segments are one
+     * message, and the request the ack rewrite is keyed on is the whole of
+     * it. */
+    if (tot) nlr_note_request(c->m, (int)a0, bounce, tot);
     ssize_t n = writev((int)a0, iov, cnt);
     u64 e = n < 0 ? host_err() : 0;
     free(bounce);
