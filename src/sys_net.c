@@ -817,6 +817,14 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
     return goff;
 }
 
+/* The bytes a gathered vector carries: one message, however many segments the
+ * guest spread it over. */
+static size_t iov_total(const struct iovec *iov, int cnt) {
+    size_t n = 0;
+    for (int i = 0; i < cnt; i++) n += iov[i].iov_len;
+    return n;
+}
+
 /* Import a guest msghdr into a host one. `gbase_out` comes back holding the
  * guest base of every segment, taken from the single reading of the guest's
  * iovec array below: a receive has to write the data back to those bases after
@@ -1022,9 +1030,12 @@ SYSDEF(sendmsg) {
     int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, &ctrl, &ccap, 1, &dfd);
     if (cnt < 0) return (u64)(s64)cnt;   /* dfd == -1 on error: nothing to close */
     /* As in sendto: note a reconfiguring rtnetlink request from a guest with a
-     * faked network namespace. The message starts at the first iovec, which
-     * msg_import laid at the head of the bounce buffer. */
-    if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
+     * faked network namespace. msg_import gathered every segment into the
+     * bounce buffer, in order, so the message is the whole of it -- reading
+     * only the first segment's worth missed a request whose netlink header
+     * straddled two of them, and the refusal it drew was then passed through
+     * where the guest was owed the ack. */
+    if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov_total(iov, cnt));
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
     u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
     free(iov); free(gbase); free(bounce); free(ctrl);
@@ -1151,7 +1162,7 @@ SYSDEF(sendmmsg) {
         if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;   /* dfd == -1 */
         /* As sendmsg: note a reconfiguring rtnetlink request from a guest whose
          * network namespace was faked, so its refusal can be rewritten. */
-        if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov[0].iov_len);
+        if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov_total(iov, cnt));
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
         u64 e = n < 0 ? host_err() : 0;    /* before the close(2) below */
         free(iov); free(gbase); free(bounce); free(ctrl);

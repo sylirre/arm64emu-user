@@ -532,6 +532,109 @@ static const char *zero_len(int fd) {
     return "ok";
 }
 
+/* Is the datagram waiting on @fd part of a link dump? */
+static int dump_datagram(int fd) {
+    char buf[8192];
+    ssize_t n = recv(fd, buf, sizeof buf, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+
+    if (n < (ssize_t)NLMSG_HDRLEN) return 0;
+    return h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == NLMSG_DONE;
+}
+
+/* One netlink message spread over several iovec segments. A kernel gathers the
+ * whole vector into one message -- so the netlink header may straddle segments
+ * -- and copies all of it out of the caller's memory before queueing anything,
+ * so a tail segment the guest cannot back is EFAULT with nothing sent. Both
+ * tiers must do the same: the substituted socket has to parse the gathered
+ * request rather than whatever its first segment happened to hold, which for
+ * the split below is eight bytes of a twenty-byte header -- answered, before
+ * this was fixed, with an EINVAL for a message the guest had sent correctly. */
+static const char *split_send(int fd) {
+    struct { struct nlmsghdr n; struct rtgenmsg g; } req;
+    struct iovec iov[3];
+    struct msghdr mh;
+    char buf[256];
+    void *bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (bad == MAP_FAILED) return "nomap";
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = sizeof req;
+    req.n.nlmsg_type = RTM_GETLINK;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.n.nlmsg_seq = 1012;
+    req.g.rtgen_family = AF_UNSPEC;
+
+    /* The header itself split across two segments. */
+    iov[0].iov_base = &req;                iov[0].iov_len = 8;
+    iov[1].iov_base = (char *)&req + 8;    iov[1].iov_len = sizeof req - 8;
+    if (writev(fd, iov, 2) != (ssize_t)sizeof req) return "writev";
+    if (!dump_datagram(fd)) return "writev-reply";
+    drain(fd);
+
+    /* ...the same, through a msghdr. */
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 2;
+    if (sendmsg(fd, &mh, 0) != (ssize_t)sizeof req) return "sendmsg";
+    if (!dump_datagram(fd)) return "sendmsg-reply";
+    drain(fd);
+
+    /* ...and split three ways, the first of them shorter than the length
+     * field. */
+    iov[0].iov_base = &req;                iov[0].iov_len = 4;
+    iov[1].iov_base = (char *)&req + 4;    iov[1].iov_len = 8;
+    iov[2].iov_base = (char *)&req + 12;   iov[2].iov_len = sizeof req - 12;
+    if (writev(fd, iov, 3) != (ssize_t)sizeof req) return "writev3";
+    if (!dump_datagram(fd)) return "writev3-reply";
+    drain(fd);
+
+    /* A tail the guest cannot back: the message is not sent, so nothing comes
+     * back either. Only the head used to be demanded, and the send went
+     * through with a reply behind it. */
+    iov[0].iov_base = &req;  iov[0].iov_len = sizeof req;
+    iov[1].iov_base = bad;   iov[1].iov_len = 16;
+    if (writev(fd, iov, 2) != -1 || errno != EFAULT) return "badtail";
+    if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) >= 0) return "badtail-queued";
+    return "ok";
+}
+
+/* ...and the ack rewrite is keyed on the same gathered message: a request
+ * whose header straddles segments has to be recognised as the reconfiguring
+ * request it is, or the kernel's refusal is passed through where the guest
+ * whose namespace was faked is owed an ack. Read from the first segment
+ * alone, an eight-byte one was too short to hold a header and was not
+ * recognised at all. */
+static const char *split_ack(int fd, unsigned seq) {
+    struct { struct nlmsghdr n; struct ifaddrmsg i; } r;
+    struct iovec iov[2];
+    struct msghdr mh;
+    char buf[4096];
+
+    memset(&r, 0, sizeof r);
+    r.n.nlmsg_len = NLMSG_LENGTH(sizeof r.i);
+    r.n.nlmsg_type = RTM_NEWADDR;
+    r.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    r.n.nlmsg_seq = seq;
+    r.i.ifa_family = AF_INET;
+    r.i.ifa_prefixlen = 8;
+    r.i.ifa_index = 1;
+
+    iov[0].iov_base = &r;                iov[0].iov_len = 8;
+    iov[1].iov_base = (char *)&r + 8;    iov[1].iov_len = r.n.nlmsg_len - 8;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 2;
+    if (sendmsg(fd, &mh, 0) != (ssize_t)r.n.nlmsg_len) return "sendfail";
+    ssize_t n = recv(fd, buf, sizeof buf, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+    if (n < (ssize_t)NLMSG_HDRLEN) return "short";
+    if (h->nlmsg_type != NLMSG_ERROR) return "nonerror";
+    if (h->nlmsg_seq != seq) return "badseq";
+    struct nlmsgerr *e = NLMSG_DATA(h);
+    return e->error == 0 ? "ack" : "refused";
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
@@ -539,7 +642,7 @@ int main(void) {
         printf("empty=skip\nself=skip\npeer=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
 
@@ -563,7 +666,7 @@ int main(void) {
     if (fd < 0) {
         printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -606,7 +709,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"
-               "sendfault=skip\naddrfault=skip\nzerolen=skip\n");
+               "sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
@@ -631,7 +734,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
     printf("ready=%s\n", readiness_cycle(fd));
@@ -642,7 +745,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
     printf("frame=%s\n", dump_walk(fd));
@@ -664,7 +767,7 @@ int main(void) {
     /* A destination the guest cannot write: EFAULT, not a silent short read. */
     fd = nl_open();
     if (fd < 0) {
-        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\n");
+        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n");
         return 0;
     }
     printf("fault=%s\n", fault_recv(fd));
@@ -674,20 +777,32 @@ int main(void) {
      * a bad one must fail the call rather than become a successful empty
      * operation. */
     fd = nl_open();
-    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\n"); return 0; }
+    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
     printf("sendfault=%s\n", fault_send(fd));
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\n"); return 0; }
+    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
     printf("addrfault=%s\n", fault_addr(fd));
     close(fd);
 
     /* Calls that carry no bytes: what they answer, and that none of them
      * disturbs the reply the socket is holding. */
     fd = nl_open();
-    if (fd < 0) { printf("zerolen=skip\n"); return 0; }
+    if (fd < 0) { printf("zerolen=skip\nsplit=skip\nsplitack=skip\n"); return 0; }
     printf("zerolen=%s\n", zero_len(fd));
+    close(fd);
+
+    /* One message, several segments: gathered, demanded whole, and recognised
+     * for what it is. */
+    fd = nl_open();
+    if (fd < 0) { printf("split=skip\nsplitack=skip\n"); return 0; }
+    printf("split=%s\n", split_send(fd));
+    close(fd);
+
+    fd = nl_open();
+    if (fd < 0) { printf("splitack=skip\n"); return 0; }
+    printf("splitack=%s\n", split_ack(fd, 1013));
     close(fd);
     return 0;
 }

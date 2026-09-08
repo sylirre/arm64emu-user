@@ -837,6 +837,20 @@ go wrong:
   header fields a receive writes are checked too: a writeback that faults is
   what the call returns, byte count or not, and the datagram is gone either
   way — which is what `netlink_recvmsg` does with an skb it could not copy out.
+  **A message is the whole vector**, not its first segment. A kernel gathers
+  every segment into one message (`memcpy_from_msg` over the iterator), so a
+  netlink header may straddle two of them, and all of it must be readable
+  before anything is queued. The substitute gathers the head it parses the same
+  way: taken from the first segment alone, an eight-byte one was read as the
+  whole of a twenty-byte request and answered with `EINVAL` for a message the
+  guest had sent correctly. The tail is demanded too — before, a send whose
+  second segment the guest could not back went through, with a reply queued
+  behind it. The **ack rewrite** on a *real* socket is keyed on that same
+  gathered message (`nlr_note_request`, `sys_net.c`): noted from the first
+  segment, one shorter than a header was not recognised as a reconfiguring
+  request at all, and the kernel's refusal was passed through where a guest
+  whose namespace was faked is owed the ack.
+
   The iovec array is imported **once and up front** for the receives as well,
   and not read piecemeal while scattering into it: an array the guest cannot
   read is `import_iovec`'s `EFAULT` with the datagram still queued, where
