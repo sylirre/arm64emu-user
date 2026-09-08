@@ -81,7 +81,20 @@ static void rm(const char *rel)
 
 int main(void)
 {
-    snprintf(base, sizeof base, "/tmp/ci_pdd.XXXXXX");
+    /* Somewhere writable to build the tree in: /tmp where it exists, the
+     * working directory where it does not -- Android has none, and hardcoding
+     * it made every row below report a failed mkdtemp on a device where the
+     * resolver was fine. The test makes that choice itself rather than being
+     * handed one, because the guest does not inherit the host environment and
+     * both sides of the comparison have to arrive at the same answer unaided
+     * (c/execperm does the same). No path is ever printed -- only the labels
+     * and the file each one reached -- so a recorded answer stays valid
+     * whichever directory it was recorded in. */
+    const char *tmp = "/tmp";
+    { int probe = open("/tmp/.pdd_probe", O_CREAT | O_WRONLY, 0600);
+      if (probe < 0) tmp = ".";
+      else { close(probe); unlink("/tmp/.pdd_probe"); } }
+    snprintf(base, sizeof base, "%s/ci_pdd.XXXXXX", tmp);
     if (!mkdtemp(base)) { printf("mkdtemp errno=%d\n", errno); return 0; }
 
     mk("x", "top-x");

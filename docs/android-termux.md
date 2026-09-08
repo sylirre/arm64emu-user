@@ -324,6 +324,44 @@ in, syscall and filesystem vintages), the proot-driven Alpine shell
 comparison, and anything whose binary or recording is missing from the
 pack — each named in the output.
 
+Six rows came out of the device runs themselves, none of them an emulator
+defect. Four are host answers a recording made elsewhere cannot referee, and
+two were tests that hardcoded a `/tmp` the device has none of:
+
+* **`c/socktimeo`** — the kernel keeps `SO_RCVTIMEO` in jiffies, so what comes
+  back is quantized by the host's `HZ`. The arm64 rig runs at 250, which turns
+  250000 us into 63 jiffies and reports 252000 — the kernel being right. The
+  test prints whether the value landed within one jiffy of what was set (the
+  coarsest `HZ` in use is 100) instead of the microseconds themselves, which
+  keeps the ILP32 timeval conversion it exists for fully under test and takes
+  the host's clock out of the comparison. It runs on every host.
+* **`c/tiocpkt`** — Android's SELinux policy whitelists the ioctls an app may
+  issue on a devpts slave and `TIOCPKT` is not among them, so the forward the
+  last row documents comes back `EACCES` where an ordinary kernel answers
+  `ENOTTY`. Both are the host's answer; the test is `SAME-HOST-ONLY`.
+* **`c/memfd_seals`** — a read-only shared map of a write-sealed memfd, which
+  6.x allows and the arm64 rig's kernel refuses. Wherever the host *has*
+  `memfd_create` the guest's mmap reaches that kernel, so this row is the
+  host's answer either way. A recording run now stores what its own host
+  answered in `tests/.cache/recorded/MEMFD_SEAL` and a replay compares the
+  two, which also lets the **file-tier** re-run go ahead on a refusing host —
+  the one place that tier is not a simulation but the fallback the guest is
+  really served by.
+* **`fixtures/sockfilter_get`** — `SO_GET_FILTER` is Linux 3.8 and the armv7
+  rig runs 3.1. The emulator forwards the option and has no filter state of
+  its own to answer from, so the fixture asks first and prints a single
+  `SKIP: <reason>` line; the harness counts that as a named skip rather than
+  reporting the missing kernel option as a defect. Any self-checking fixture
+  may do the same.
+* **`c/pathdotdot`** and the seccomp-mimic **`statx`** row were not host
+  answers but a hardcoded `/tmp` the device has none of. `c/pathdotdot` probes
+  for a writable directory and falls back to the working directory the way
+  `c/execperm` does — it prints no paths, only what each resolution reached,
+  so a recorded answer stays valid either way, and the row keeps running on
+  the devices. The seccomp row re-runs `c/statx`, which is `SAME-HOST-ONLY`
+  for the same reason, so it skips with that named; the keyring leg beside it
+  needs no oracle and still runs.
+
 A binary the pack shipped counts as missing once it stops matching the
 checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That
 only happens on a device that also has a working toolchain — an aarch64

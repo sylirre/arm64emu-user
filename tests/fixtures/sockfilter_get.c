@@ -42,6 +42,20 @@ int main(void) {
         printf("socketpair=-%d\n", errno);
         return 0;
     }
+    /* The option itself is Linux 3.8. Where the host kernel predates it the
+     * emulator forwards the call and gets the kernel's ENOPROTOOPT -- there is
+     * no filter state of its own to answer from -- so every row below would
+     * report that kernel as a defect. Asked here of the end that never gets a
+     * filter, where a kernel that HAS the option answers 0 with a count of 0.
+     * The armv7 rig runs a 3.1 kernel and is the host this was found on. */
+    {
+        socklen_t pl = 0;
+        if (getsockopt(sv[1], SOL_SOCKET, SO_GET_FILTER, NULL, &pl) != 0 &&
+            errno == ENOPROTOOPT) {
+            printf("SKIP: this host kernel has no SO_GET_FILTER (Linux 3.8)\n");
+            return 0;
+        }
+    }
     for (int i = 0; i < NINS - 1; i++) {   /* A = i */
         prog[i].code = 0x00;               /* BPF_LD | BPF_W | BPF_IMM */
         prog[i].k = (unsigned)i;

@@ -34,9 +34,20 @@ int main(void) {
     struct timeval got;
     socklen_t gl = sizeof got;
     memset(&got, 0, sizeof got);
-    printf("get_rcv=%d sec=%ld usec=%ld len=%u\n",
+    /* The microseconds are not printed as an absolute value: the kernel keeps
+     * this timeout in jiffies, so what comes back is quantized by the host's
+     * HZ -- an Android device at HZ=250 turns 250000 us into 63 jiffies and
+     * reports 252000, which is the kernel being right. The rounding is always
+     * upward and never by more than one jiffy, and the coarsest HZ in use is
+     * 100, so anything a kernel can answer lands under 260000. That window is
+     * what the conversion this test exists for has to hit: the ILP32 bug it
+     * caught read back a tv_usec of 2^32 out of the emulator's own frame, and
+     * a host that writes nothing at all leaves it zero. (Same reasoning as
+     * c/statx printing ans_ok= rather than absolute nanoseconds.) */
+    printf("get_rcv=%d sec=%ld usec_ok=%d len=%u\n",
            getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &got, &gl) ? -errno : 0,
-           (long)got.tv_sec, (long)got.tv_usec, (unsigned)gl);
+           (long)got.tv_sec,
+           got.tv_usec >= 250000 && got.tv_usec < 260000, (unsigned)gl);
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;

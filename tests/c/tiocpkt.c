@@ -1,3 +1,9 @@
+/* SAME-HOST-ONLY: the answers are the host's pty policy. Android's SELinux
+ * whitelists the ioctls an app may issue on a devpts slave, and TIOCPKT is not
+ * among them, so the forward the last row documents comes back EACCES there
+ * where an ordinary kernel answers ENOTTY -- both of them the host's answer,
+ * neither of them the emulator's. A replay host is compared against another
+ * host's recording and would report that as a divergence. */
 #define _XOPEN_SOURCE 600
 #include <stdio.h>
 #include <stdlib.h>

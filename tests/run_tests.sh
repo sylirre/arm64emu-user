@@ -129,6 +129,38 @@ for s in tests/asm/*.S; do
     run_diff "asm/$(basename "$s" .S)" "$b"
 done
 
+# ---- is this host's memfd of the vintage the tests were written against? ----
+# One row of c/memfd_seals is kernel-vintage-dependent: a read-only MAP_SHARED
+# of a write-sealed memfd opened read-write, which 6.x allows (VM_MAYWRITE
+# stripped) and older kernels refuse. The emulator's unlinked-file tier
+# implements the former — the vintage sys_uname advertises — but wherever the
+# host HAS memfd_create the guest's mmap reaches the host kernel itself, so on
+# an older host that row is the host's answer either way. Probed rather than
+# guessed from `uname -r`, since kernels backport. Both users of this are
+# below: the C loop (against a recorded oracle) and the file-tier re-run.
+MEMFD_SEAL_HOST=unknown
+if [ -n "$HCC" ] &&
+   "$HCC" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
+    ./tests/memfd_seal_probe.bin
+    case $? in 0) MEMFD_SEAL_HOST=allow ;; 1) MEMFD_SEAL_HOST=refuse ;; esac
+    rm -f tests/memfd_seal_probe.bin
+fi
+# The same question asked of the host the ORACLE's answers come from. That is
+# this host for every live oracle, and the recording host for a pack -- which
+# is why a recording run leaves its own answer in the pack. Without it a replay
+# host could only assume, and the two rows below need to know: one of them is
+# comparable when the two hosts AGREE, the other when the oracle's host allows.
+if [ -n "${A64_RECORD:-}" ]; then
+    mkdir -p "$A64_RECORD_DIR"
+    printf '%s\n' "$MEMFD_SEAL_HOST" > "$A64_RECORD_DIR/MEMFD_SEAL"
+fi
+MEMFD_SEAL_ORACLE="$MEMFD_SEAL_HOST"
+if [ "$ORACLE_KIND" = recorded ]; then
+    MEMFD_SEAL_ORACLE=unknown       # a pack from before this was recorded
+    [ -f "$A64_RECORD_DIR/MEMFD_SEAL" ] &&
+        MEMFD_SEAL_ORACLE=$(cat "$A64_RECORD_DIR/MEMFD_SEAL")
+fi
+
 # ---- C tests: static and dynamic ----
 for cfile in tests/c/*.c; do
     base="$(basename "$cfile" .c)"
@@ -158,6 +190,20 @@ for cfile in tests/c/*.c; do
     if [ "$ORACLE_KIND" = recorded ] &&
        { [ -n "$need_read$need_ioctl" ] || grep -qm1 'SAME-HOST-ONLY' "$cfile"; }; then
         skip=$((skip+1)); echo "SKIP c/${base} (same-host-only; the recorded oracle ran elsewhere)"; continue
+    fi
+    # The same idea, measured rather than declared: c/memfd_seals asks one
+    # question whose answer is the host kernel's vintage (MEMFD_SEAL_HOST,
+    # above) and not the emulator's doing, because a host that HAS memfd_create
+    # gets the guest's mmap forwarded to it. A live oracle is that same kernel
+    # and agrees; a recording made on a 6.x host does not, and no emulator
+    # change could make it. The file tier below runs this binary on every host,
+    # so the fallback the older host is really served by stays covered.
+    if [ "$ORACLE_KIND" = recorded ] && [ "$base" = memfd_seals ] &&
+       [ "$MEMFD_SEAL_HOST" != "$MEMFD_SEAL_ORACLE" ] &&
+       { [ "$MEMFD_SEAL_HOST" = refuse ] || [ "$MEMFD_SEAL_ORACLE" = refuse ]; }; then
+        skip=$((skip+1))
+        echo "SKIP c/${base} (read-only shared map of a write-sealed memfd: this host $MEMFD_SEAL_HOST, the recording's $MEMFD_SEAL_ORACLE)"
+        continue
     fi
     denied=
     for nf in $need_read; do
@@ -1377,25 +1423,19 @@ fi
 # without memfd_create (Android 7's 3.x) is served by -- and require
 # identical semantics.
 #
-# One row of memfd_seals is kernel-vintage-dependent: a read-only MAP_SHARED of
-# a write-sealed memfd opened read-write, which 6.x allows (VM_MAYWRITE
-# stripped) and older kernels refuse. The tier implements the former — the
-# vintage sys_uname advertises — while the oracle here IS the host's own
-# memfd, so on an older host the row compares kernels, not implementations.
-# Probed rather than guessed from `uname -r`, since kernels backport.
-MEMFD_SEAL_HOST=unknown
-if [ -n "$HCC" ] &&
-   "$HCC" -O0 -o tests/memfd_seal_probe.bin tests/memfd_seal_probe.c 2>/dev/null; then
-    ./tests/memfd_seal_probe.bin
-    case $? in 0) MEMFD_SEAL_HOST=allow ;; 1) MEMFD_SEAL_HOST=refuse ;; esac
-    rm -f tests/memfd_seal_probe.bin
-fi
+# The memfd_seals rows are gated on MEMFD_SEAL_HOST, measured before the C loop.
 for base in memfd_seals mfdsync mmap_eof; do
     MBIN="tests/c/${base}_static.bin"
     [ -x "$MBIN" ] || continue
-    if [ "$base" = memfd_seals ] && [ "$MEMFD_SEAL_HOST" = refuse ]; then
+    # This row is the tier's 6.x semantics against whatever the oracle's host
+    # does, so it is the ORACLE's host that has to allow the mapping -- not
+    # necessarily this one. A live oracle runs here and the two are the same
+    # question; a recording made on a 6.x host is comparable even where the
+    # host replaying it refuses, which is the one place this tier is not a
+    # simulation but the real fallback the guest is served by.
+    if [ "$base" = memfd_seals ] && [ "$MEMFD_SEAL_ORACLE" = refuse ]; then
         skip=$((skip+1))
-        echo "SKIP c/memfd_seals(memfd-tier) (host kernel refuses a read-only shared map of a write-sealed memfd; the tier implements the 6.x semantics this emulator advertises)"
+        echo "SKIP c/memfd_seals(memfd-tier) (the oracle's host kernel refuses a read-only shared map of a write-sealed memfd; the tier implements the 6.x semantics this emulator advertises)"
         continue
     fi
     rec_have "$MBIN" || {
@@ -2211,6 +2251,27 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
     fi
 fi
 
+# One self-checking fixture's verdict. A fixture whose expectations the HOST
+# cannot pose the question for -- a syscall or socket option its kernel is too
+# old to have, which the emulator forwards and has no state of its own to
+# answer from -- says so by printing a single "SKIP: <reason>" line and nothing
+# else, and is counted as a skip that names the reason rather than as a failure
+# against a kernel that was never in question. Every other output is compared
+# exactly, as before.
+fixture_verdict() {   # fixture_verdict <label> <expected> <got>
+    local label="$1" expect="$2" got="$3"
+    # A lone line, nothing else: a fixture that printed one among its ordinary
+    # rows is reporting something, not opting out.
+    if [ "${got#SKIP: }" != "$got" ] && [ "${got%$'\n'*}" = "$got" ]; then
+        skip=$((skip+1)); echo "SKIP fixture: $label (${got#SKIP: })"; return
+    fi
+    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: $label"
+    else
+        fail=$((fail+1)); echo "FAIL fixture: $label"
+        diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
+    fi
+}
+
 # ---- self-checking fixtures for syscalls qemu-user cannot model (it
 # returns ENOSYS for set/get_robust_list and mlock2) ----
 check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label>]...
@@ -2219,23 +2280,14 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
         skip_build "fixtures/$name"; return; }
     local got
     got=$("$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
-    if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: $name"
-    else
-        fail=$((fail+1)); echo "FAIL fixture: $name"
-        diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
-    fi
+    fixture_verdict "$name" "$expect" "$got"
     # The fallback tiers the same expectations have to survive: what the guest
     # reads must not depend on which tier the host let the emulator use. Each
     # is an environment (unquoted on purpose -- a tier may need more than one
     # variable) and the label the row is reported under.
     while [ $# -ge 2 ]; do
         got=$(env $1 "$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
-        if [ "$got" = "$expect" ]; then
-            pass=$((pass+1)); echo "PASS fixture: $name ($2)"
-        else
-            fail=$((fail+1)); echo "FAIL fixture: $name ($2)"
-            diff <(echo "$expect") <(echo "$got") | head -6 | sed 's/^/     /'
-        fi
+        fixture_verdict "$name ($2)" "$expect" "$got"
         shift 2
     done
     fx_rm "tests/fixtures/$name.bin"
@@ -2426,18 +2478,28 @@ if [ -n "$HCC" ] && [ "$(od -An -j4 -N1 -tu1 "$EMU" | tr -d ' ')" = "2" ]; then
         wrap_ok=1
     fi
 fi
-if [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ] &&
-   ! rec_have tests/c/statx_static.bin; then
-    echo "SKIP seccomp-mimic (statx not in the test pack)"; skip=$((skip+1))
-elif [ "$wrap_ok" = 1 ] && [ -x tests/c/statx_static.bin ]; then
-    out_q=$(oracle_run tests/c/statx_static.bin 2>/dev/null); rc_q=$?
-    out_e=$("$WRAP" "$EMU" / tests/c/statx_static.bin 2>/dev/null); rc_e=$?
-    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
-        pass=$((pass+1)); echo "PASS seccomp: trapped statx -> ENOSYS fallback"
-    else
-        fail=$((fail+1)); echo "FAIL seccomp: trapped statx (qemu rc=$rc_q, ours rc=$rc_e)"
-        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+if [ "$wrap_ok" = 1 ]; then
+    # The statx leg is differential, and c/statx is SAME-HOST-ONLY: it builds
+    # its fixtures in the host /tmp and reads that filesystem's answers back.
+    # This row runs that same binary against that same oracle, only with the
+    # emulator wrapped -- so against a recording it compares two hosts, exactly
+    # as the C loop's own row would. The C loop names that skip; so does this.
+    if [ "$ORACLE_KIND" = recorded ]; then
+        skip=$((skip+1))
+        echo "SKIP seccomp: trapped statx (c/statx is same-host-only; the recorded oracle ran elsewhere)"
+    elif [ -x tests/c/statx_static.bin ]; then
+        out_q=$(oracle_run tests/c/statx_static.bin 2>/dev/null); rc_q=$?
+        out_e=$("$WRAP" "$EMU" / tests/c/statx_static.bin 2>/dev/null); rc_e=$?
+        if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+            pass=$((pass+1)); echo "PASS seccomp: trapped statx -> ENOSYS fallback"
+        else
+            fail=$((fail+1)); echo "FAIL seccomp: trapped statx (qemu rc=$rc_q, ours rc=$rc_e)"
+            diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+        fi
     fi
+    # The keyring leg needs no oracle at all -- the three calls must answer
+    # ENOSYS whatever the host would have done -- so it runs wherever the
+    # wrapper does, replay hosts included.
     if "$AGCC" -static -O2 -o tests/fixtures/keyring_enosys.bin \
             tests/fixtures/keyring_enosys.c 2>/dev/null; then
         out=$("$WRAP" "$EMU" / tests/fixtures/keyring_enosys.bin 2>/dev/null)
