@@ -271,12 +271,67 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
     return 0;
 }
 
+/* What a kernel lets a new image carry in argv+envp, measured the way
+ * bprm_stack_limits measures it: a quarter of the guest's own stack limit,
+ * capped at three quarters of the reference stack and floored at ARG_MAX --
+ * and then the *pointer table* comes out of that budget before any of the
+ * strings do, because it is built on the same stack. The execfn string counts
+ * against it too: copy_string_kernel puts the filename on the stack ahead of
+ * the strings, out of the same budget.
+ *
+ * Counting only the string bytes let an exec through that a kernel refuses. A
+ * guest passing very many very short arguments spends 8 bytes on a pointer
+ * against 2 bytes of string for "a", so the table is most of what the argument
+ * list actually costs.
+ *
+ * The cap is written against STACK_SIZE and not the kernel's _STK_LIM because
+ * STACK_SIZE is the stack this really builds, whatever the guest's limit says
+ * -- the two are the same 8 MB, and it is that stack the budget has to leave
+ * the program room in. A guest that lowered its limit gets the kernel's E2BIG
+ * at the same place; one that raised it, or has none, is held to the same
+ * three quarters a kernel holds an 8 MB stack to. Every boundary here was
+ * measured against a kernel.
+ *
+ * Separate from the load, and exported, because the answer is owed to the
+ * caller of execve(2): a kernel measures this long before begin_new_exec
+ * commits to the new image, so an argument list that will not fit comes back
+ * as an error with the old image still running. Left where it used to be --
+ * inside the load, past the point of no return -- the only thing the refusal
+ * could do was kill the process (do_execve, sys_proc.c, calls this while
+ * there is still a caller to refuse). */
+int exec_arg_limit(struct Machine *m, const char *canon,
+                   char **argv, char **envp) {
+    int argc = 0, envc = 0;
+    u64 bytes = strlen(canon) + 1;
+
+    while (argv[argc]) bytes += strlen(argv[argc]) + 1, argc++;
+    while (envp[envc]) bytes += strlen(envp[envc]) + 1, envc++;
+
+    u64 limit = STACK_SIZE / 4 * 3;
+    u64 stkrl = m->rlim[G_RLIMIT_STACK].rlim_cur;
+    if (stkrl != G_RLIM_INFINITY && stkrl / 4 < limit) limit = stkrl / 4;
+    if (limit < G_ARG_MAX) limit = G_ARG_MAX;
+    /* 8 bytes a pointer is the GUEST's width, LP64 whatever host this is built
+     * for. max(argc, 1): a kernel counts a slot for argv[0] even when the
+     * guest passed none, and gives the new image one either way. */
+    u64 ptrtab = ((u64)(argc > 1 ? argc : 1) + (u64)envc) * 8;
+    if (limit <= ptrtab || bytes > limit - ptrtab) return -E2BIG;
+    return 0;
+}
+
 /* Load the image on `fd` (canonical guest path `canon`, used for the region
  * names, AT_EXECFN and comm) and, when it names one, the interpreter on
  * `interp_fd`. Both descriptors stay the caller's. */
 int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
              char **argv, char **envp) {
     int r;
+
+    /* Ahead of everything else, and ahead of any mapping: the initial exec
+     * arrives here without passing through do_execve, and an image whose
+     * arguments cannot fit must not be half-built before that is noticed.
+     * (An execve has been refused this already, on the same list.) */
+    r = exec_arg_limit(m, canon, argv, envp);
+    if (r < 0) return r;
 
     LoadInfo exe = {0}, interp = {0};
     /* ET_EXEC ignores the base; ET_DYN main executables load at the fixed
@@ -333,14 +388,6 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     size_t strtab = strlen(canon) + 1;
     for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
-    /* The kernel caps argv+envp at RLIMIT_STACK/4 (E2BIG past it). The guest's
-     * own limit is what a kernel would measure, but the stack this actually
-     * builds is STACK_SIZE whatever the guest says, so the smaller of the two
-     * governs: a guest that lowered the limit gets the kernel's E2BIG, and one
-     * that raised it (or has none) still cannot outgrow the real stack. */
-    u64 scap = m->rlim[G_RLIMIT_STACK].rlim_cur;
-    if (scap == G_RLIM_INFINITY || scap > STACK_SIZE) scap = STACK_SIZE;
-    if (strtab > scap / 4) { free(argvp); free(envpp); return -E2BIG; }
     u64 sp = STACK_TOP - strtab;
     u64 str = sp;
     /* The argv+envp string block starts here: setup_arg_pages records exactly

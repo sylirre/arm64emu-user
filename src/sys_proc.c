@@ -1400,6 +1400,19 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         return (u64)(s64)-ENOEXEC;
     }
 
+    /* The argument list is measured here, while an oversized one can still be
+     * answered: a kernel does it in bprm_stack_limits, before it opens the
+     * binary handler at all, and hands the caller E2BIG with its old image
+     * untouched. Measured on the FINAL list, so the strings a shebang line
+     * prepended are counted -- a kernel charges those against the same budget
+     * as it copies them (copy_strings, bprm->argmin), having sized it from the
+     * original list. The one thing that ordering costs is that a non-ELF file
+     * named with an oversized argv is refused for being non-ELF first.
+     * Left to the loader, this refusal came from past the point of no return
+     * and could only kill the process. */
+    int ar = exec_arg_limit(m, canon, argv, envp);
+    if (ar < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)ar; }
+
     /* Everything the loader can still refuse -- a foreign or malformed ELF, an
      * interpreter that is not there -- refused now, while there is a caller to
      * refuse it to. Past the point of no return below, load_elf's failure can

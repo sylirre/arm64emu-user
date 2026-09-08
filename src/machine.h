@@ -750,6 +750,12 @@ void emu_fork_check(const char *site);
  * Returns 0 or -errno. */
 int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
              char **argv, char **envp);
+/* Does this argument list fit the budget a new image gets for argv+envp
+ * (bprm_stack_limits: a share of RLIMIT_STACK, minus the pointer table)?
+ * 0 or -E2BIG. Asked by execve while it can still refuse; load_elf asks it
+ * again for the initial exec, which has no such caller (elf.c). */
+int exec_arg_limit(struct Machine *m, const char *canon,
+                   char **argv, char **envp);
 /* Can execve load this program? Validates the ELF on `fd` and the interpreter
  * it names without touching the address space, so a refusal still has a caller
  * to reach (elf.c). The interpreter it opened comes back in *interp_fd (-1 for

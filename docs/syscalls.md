@@ -1433,6 +1433,29 @@ entitled to an `argv[0]`, and a program that starts reading at `argv[1]` would
 otherwise walk straight into `envp`. The shebang rewrite below relies on there
 being one too, since it replaces `argv[0]` with the script path.
 
+The **argument budget** is measured there too, and for the same reason. A
+kernel sizes it in `bprm_stack_limits`, before it reaches a binary handler at
+all: a quarter of the guest's `RLIMIT_STACK`, capped at three quarters of the
+8 MB reference stack (`_STK_LIM`) and floored at `ARG_MAX` — and then the
+**pointer table**, `(max(argc,1) + envc)` slots of 8 bytes, comes out of that
+budget before any of the strings do, since it is built on the same stack. The
+argv and envp strings share what is left, and so does the execfn, which
+`copy_string_kernel` pushes ahead of them. `exec_arg_limit` (`elf.c`) is that
+formula, applied to the *final* argument list — the one a shebang rewrite may
+have grown — while there is still a caller to hand `E2BIG` to.
+
+Counting only the string bytes, as this used to, admitted lists a kernel
+refuses: a guest passing very many very short arguments spends 8 bytes on a
+pointer against 2 bytes of string for `"a"`, so the table is most of what the
+list actually costs. And measuring it from inside `load_elf`, as this used to,
+put the refusal past the point of no return, where the only thing left to do
+with it was kill the process — over an argv a kernel simply declines. The cap
+is written against the emulator's own `STACK_SIZE` rather than `_STK_LIM`
+because that, and not the guest's limit, is the stack this really builds; the
+two are the same 8 MB, and it is that stack the budget has to leave the program
+room in. `tests/fixtures/execarglimit.c` pins every boundary, and prints the
+same lines when it is built for the host and run on a real kernel.
+
 Everything else the loader can refuse is refused there too, by `elf_probe`
 (`elf.c`), which validates the ELF header on that same descriptor and opens the
 interpreter it names *without touching the address space* — handing the

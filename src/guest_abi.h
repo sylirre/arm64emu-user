@@ -422,6 +422,10 @@ typedef struct { u64 rlim_cur; u64 rlim_max; } GRlimit;
 #define G_RLIM_NLIMITS      16
 #define G_RLIM_INFINITY     (~0ULL)
 
+/* The floor under what execve lets argv+envp carry, whatever RLIMIT_STACK
+ * says: a fixed 131072 in the kernel's uapi, not a page-size multiple. */
+#define G_ARG_MAX           131072ULL
+
 /* struct sigevent (LP64, 64 bytes total = SIGEV_MAX_SIZE): the sigval union,
  * signo, notify, then the notify union whose first word is the target tid for
  * SIGEV_THREAD_ID (the SIGEV_THREAD function/attribute pointers never reach
