@@ -674,6 +674,14 @@ static void free_strvec(char **v) {
     free(v);
 }
 
+/* An exec's two working vectors, freed together. do_execve owns both from the
+ * moment it takes them -- which is after the image is open -- and every
+ * refusal before that point passes the NULLs they start as. */
+static void free_execvecs(char **argv, char **envp) {
+    free_strvec(argv);
+    free_strvec(envp);
+}
+
 /* execve: resolve through the rootfs, handle shebangs, reload in-process. */
 /* Deep-copy a NULL-terminated string vector. */
 static char **dup_strvec(char **v) {
@@ -689,8 +697,58 @@ static char **dup_strvec(char **v) {
     return out;
 }
 
-/* Resolve and reload the guest image. Does NOT take ownership of the caller's
- * argv/envp (it works on private copies), so the caller still frees them. */
+/* The argv/envp an exec is to run with, as do_execve's own private vectors:
+ * imported from the guest's memory, or copied from the host vectors the
+ * initial exec hands over (main.c, whose own copies must survive this). The
+ * import is bounded by the argument budget -- see import_strvec -- and its
+ * E2BIG, like its EFAULT, belongs to the caller of execve(2): this runs where
+ * a kernel's count() does, with the image already open. Returns 0 or -errno,
+ * and leaves both NULL on failure. */
+static int exec_vecs_take(CPU *c, ExecVec av, ExecVec ev,
+                          char ***argv, char ***envp) {
+    int err = 0;
+
+    if (av.vec) {                      /* the initial exec: already host-side */
+        *argv = dup_strvec(av.vec);
+        *envp = dup_strvec(ev.vec);
+    } else {
+        u64 budget = exec_arg_budget(c->m);
+        *argv = import_strvec(c, av.va, budget, &err);
+        if (*argv) *envp = import_strvec(c, ev.va, budget, &err);
+    }
+    if (!*argv || !*envp) {
+        free_execvecs(*argv, *envp);
+        *argv = *envp = NULL;
+        return err ? err : -ENOMEM;
+    }
+    /* An empty argv becomes a single empty string, as do_execveat_common has
+     * done since v5.18: the new image is entitled to an argv[0], and a program
+     * that starts reading at argv[1] would otherwise walk straight into envp.
+     * The shebang rewrite in do_execve drops argv[0] and relies on there being
+     * one. A kernel does this before it measures the list, and so does this --
+     * the byte it adds is part of what is measured. */
+    if (!(*argv)[0]) {
+        char **nv = malloc(sizeof(char *) * 2);
+        if (nv) {
+            nv[0] = strdup("");
+            nv[1] = NULL;
+        }
+        if (!nv || !nv[0]) {
+            free(nv);
+            free_execvecs(*argv, *envp);
+            *argv = *envp = NULL;
+            return -ENOMEM;
+        }
+        free_strvec(*argv);
+        *argv = nv;
+    }
+    return 0;
+}
+
+/* Resolve and reload the guest image. The argument vectors are do_execve's own
+ * from the moment it takes them (exec_vecs_take, above): imported out of guest
+ * memory for an execve, or copied from the host vectors the initial exec hands
+ * over -- which stay the caller's to free. */
 /* Close the fds a real execve would close, and drop each one from the tables
  * that shadow an fd number (fake netlink, synthesized /proc file, signalfd)
  * exactly as close(2) does. Skipping the unmark leaves an entry pointing at a
@@ -1309,7 +1367,7 @@ static int exec_perm_check(struct Machine *m, const PathPin *p, int fd,
                         remap_gid(m, (u32)st.st_gid), st.st_mode);
 }
 
-u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
+u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     struct Machine *m = c->m;
     PathPin pin;
     char canon[PATH_MAX];
@@ -1317,21 +1375,9 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
 
     snprintf(pathbuf, sizeof pathbuf, "%s", gpath);
 
-    char **argv = dup_strvec(argv_in);   /* private working copy */
-    if (!argv) return (u64)(s64)-ENOMEM;
-    /* An empty argv becomes a single empty string, as do_execveat_common has
-     * done since v5.18: the new image is entitled to an argv[0], and a program
-     * that starts reading at argv[1] would otherwise walk straight into envp.
-     * The shebang rewrite below drops argv[0] and relies on there being one. */
-    if (!argv[0]) {
-        char **nv = malloc(sizeof(char *) * 2);
-        if (!nv) { free_strvec(argv); return (u64)(s64)-ENOMEM; }
-        nv[0] = strdup("");
-        if (!nv[0]) { free(nv); free_strvec(argv); return (u64)(s64)-ENOMEM; }
-        nv[1] = NULL;
-        free_strvec(argv);
-        argv = nv;
-    }
+    /* Taken once the image is open and not before (see the loop); NULL until
+     * then, which is what every refusal above that point frees. */
+    char **argv = NULL, **envp = NULL;
 
     int imgfd = -1;              /* the image, opened once (see below) */
     /* ...and the stat exec_perm_check judged it by, which the setuid/setgid
@@ -1340,13 +1386,13 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * that filled this in. */
     struct stat img_st = {0};
     for (int depth = 0; ; depth++) {
-        if (depth > 4) { free_strvec(argv); return (u64)(s64)-ELOOP; }
+        if (depth > 4) { free_execvecs(argv, envp); return (u64)(s64)-ELOOP; }
         int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, pin.host, canon);
-        if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        if (r < 0) { free_execvecs(argv, envp); return (u64)(s64)r; }
         /* Pinned so that no component of the path can be turned into a symlink
          * between the walk and the open below. */
         r = path_pin(m, canon, pin.host, &pin);
-        if (r < 0) { free_strvec(argv); return (u64)(s64)r; }
+        if (r < 0) { free_execvecs(argv, envp); return (u64)(s64)r; }
         /* Open the image ONCE, here, and ask this descriptor everything that
          * follows -- permission, the header, the setuid bits, the ELF probe
          * and the load itself. A name only answers about whatever is at it
@@ -1361,25 +1407,45 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
         imgfd = exec_open_pinned(&pin);
         if (imgfd < 0) {
             r = imgfd; imgfd = -1;
-            path_unpin(&pin); free_strvec(argv);
+            path_unpin(&pin); free_execvecs(argv, envp);
             return (u64)(s64)r;
         }
         /* Both the script and the interpreter it names have to be executable,
          * which is why this sits inside the loop. */
         r = exec_perm_check(m, &pin, imgfd, &img_st);
         path_unpin(&pin);        /* nothing below names the image by path */
-        if (r < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)r; }
+        if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
+
+        /* The argument vectors are taken here: the image is open and judged,
+         * and nothing of its contents has been read. That is the window a
+         * kernel takes them in -- do_open_execat, then count(), then
+         * bprm_stack_limits, and only then a binfmt handler that looks at the
+         * file at all. Read before the open, as they used to be, the E2BIG of
+         * a list too long came back where a kernel answers ENOENT for a file
+         * that is not there or EACCES for one that may not be run, and the
+         * EFAULT of an argv the guest cannot back did the same. */
+        if (!argv) {
+            r = exec_vecs_take(c, argv_in, envp_in, &argv, &envp);
+            if (r < 0) { close(imgfd); return (u64)(s64)r; }
+        }
+        /* ...and measured, which is bprm_stack_limits' place in that same
+         * window: ahead of the ENOEXEC of a file that is no executable format
+         * at all, and ahead of the ENOENT of a #! interpreter that is not
+         * there. Measured again on each turn of the loop, since the shebang
+         * rewrite below adds to the list. */
+        r = exec_arg_limit(m, canon, argv, envp);
+        if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
         unsigned char hdr[256];
         size_t n;
         ssize_t hn = pread(imgfd, hdr, sizeof hdr, 0);  /* leaves the offset alone */
-        if (hn < 0) { close(imgfd); free_strvec(argv); return host_err(); }
+        if (hn < 0) { close(imgfd); free_execvecs(argv, envp); return host_err(); }
         n = (size_t)hn;
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
             /* shebang: rebuild argv = [interp, (arg), script, argv[1..]] */
             hdr[n < sizeof hdr ? n : sizeof hdr - 1] = 0;
             char *line = (char *)hdr + 2;
             char *nl = strchr(line, '\n');
-            if (!nl) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!nl) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOEXEC; }
             *nl = 0;
             while (*line == ' ' || *line == '\t') line++;
             char *interp = line, *arg = NULL;
@@ -1389,11 +1455,11 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                 while (*sp == ' ' || *sp == '\t') sp++;
                 if (*sp) arg = sp;
             }
-            if (!*interp) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOEXEC; }
+            if (!*interp) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOEXEC; }
             int oldc = 0;
             while (argv[oldc]) oldc++;
             char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));
-            if (!nv) { close(imgfd); free_strvec(argv); return (u64)(s64)-ENOMEM; }
+            if (!nv) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOMEM; }
             int k = 0;
             nv[k++] = strdup(interp);
             if (arg) nv[k++] = strdup(arg);
@@ -1405,33 +1471,30 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
                     for (int j = 0; j < k; j++) free(nv[j]);
                     free(nv);
                     close(imgfd);
-                    free_strvec(argv);
+                    free_execvecs(argv, envp);
                     return (u64)(s64)-ENOMEM;
                 }
             free_strvec(argv);          /* free the previous working copy */
             argv = nv;
+            /* The rewritten list is measured before the interpreter is looked
+             * for, as load_script measures it: copy_string_kernel puts the
+             * interpreter's name on the stack -- against the budget sized from
+             * the original argv -- and the interpreter is opened only after
+             * that. So a list the rewrite pushed over is E2BIG, and not the
+             * ENOENT of an interpreter that is not there. `canon` is still the
+             * script's, which is the execfn a kernel measures here too: the
+             * rewrite changes bprm->interp, never bprm->filename. */
+            r = exec_arg_limit(m, canon, argv, envp);
+            if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
             close(imgfd);
             continue;
         }
         if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;   /* imgfd held past here */
         close(imgfd);
-        free_strvec(argv);
+        free_execvecs(argv, envp);
         return (u64)(s64)-ENOEXEC;
     }
-
-    /* The argument list is measured here, while an oversized one can still be
-     * answered: a kernel does it in bprm_stack_limits, before it opens the
-     * binary handler at all, and hands the caller E2BIG with its old image
-     * untouched. Measured on the FINAL list, so the strings a shebang line
-     * prepended are counted -- a kernel charges those against the same budget
-     * as it copies them (copy_strings, bprm->argmin), having sized it from the
-     * original list. The one thing that ordering costs is that a non-ELF file
-     * named with an oversized argv is refused for being non-ELF first.
-     * Left to the loader, this refusal came from past the point of no return
-     * and could only kill the process. */
-    int ar = exec_arg_limit(m, canon, argv, envp);
-    if (ar < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)ar; }
 
     /* Everything the loader can still refuse -- a foreign or malformed ELF, an
      * interpreter that is not there -- refused now, while there is a caller to
@@ -1442,17 +1505,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
      * -- load_elf_binary keeps its interpreter's struct file the same way. */
     int ifd = -1;
     int pr = elf_probe(m, imgfd, &ifd);
-    if (pr < 0) { close(imgfd); free_strvec(argv); return (u64)(s64)pr; }
-
-    /* Copy envp too: load_elf reads it after as_destroy, and the caller's
-     * copy must survive for its own free. */
-    char **envp_copy = dup_strvec(envp);
-    if (!envp_copy) {
-        close(imgfd);
-        if (ifd >= 0) close(ifd);
-        free_strvec(argv);
-        return (u64)(s64)-ENOMEM;
-    }
+    if (pr < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)pr; }
 
     /* setuid/setgid bit on the final ELF, read off the same stat the
      * permission check judged -- the image's own descriptor, not its name.
@@ -1486,8 +1539,7 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     if (dt < 0) {
         close(imgfd);
         if (ifd >= 0) close(ifd);
-        free_strvec(argv);
-        free_strvec(envp_copy);
+        free_execvecs(argv, envp);
         return (u64)(s64)dt;
     }
 
@@ -1514,11 +1566,10 @@ u64 do_execve(CPU *c, const char *gpath, char **argv_in, char **envp) {
     g_tls.clear_child_tid = 0;
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
 
-    int r = load_elf(m, imgfd, ifd, canon, argv, envp_copy);
+    int r = load_elf(m, imgfd, ifd, canon, argv, envp);
     close(imgfd);
     if (ifd >= 0) close(ifd);
-    free_strvec(argv);
-    free_strvec(envp_copy);
+    free_execvecs(argv, envp);
     if (r < 0) {
         /* Nothing can be returned any more: the caller's image is gone. A
          * kernel is in the same position and answers it the same way --
@@ -1585,17 +1636,11 @@ SYSDEF(execve) {
     char gpath[PATH_MAX];
     long n = copy_str_from_guest(c, gpath, a0, sizeof gpath);
     if (n < 0) return (u64)(s64)n;
-    int err = 0;
-    u64 budget = exec_arg_budget(c->m);
-    char **argv = import_strvec(c, a1, budget, &err);
-    if (!argv) return (u64)(s64)err;
-    char **envp = import_strvec(c, a2, budget, &err);
-    if (!envp) { free_strvec(argv); return (u64)(s64)err; }
     (void)a3; (void)a4; (void)a5;
-    u64 r = do_execve(c, gpath, argv, envp);
-    free_strvec(argv);
-    free_strvec(envp);
-    return r;
+    /* The vectors stay in guest memory until do_execve has the image open:
+     * that is where a kernel reads them (exec_vecs_take). */
+    ExecVec av = { NULL, a1 }, ev = { NULL, a2 };
+    return do_execve(c, gpath, av, ev);
 }
 
 SYSDEF(execveat) {
@@ -1637,17 +1682,9 @@ SYSDEF(execveat) {
         }
         snprintf(exec_path, sizeof exec_path, "%s", canon);
     }
-    int err = 0;
-    u64 budget = exec_arg_budget(c->m);
-    char **argv = import_strvec(c, a2, budget, &err);
-    if (!argv) return (u64)(s64)err;
-    char **envp = import_strvec(c, a3, budget, &err);
-    if (!envp) { free_strvec(argv); return (u64)(s64)err; }
     (void)a5;
-    u64 r = do_execve(c, exec_path, argv, envp);
-    free_strvec(argv);
-    free_strvec(envp);
-    return r;
+    ExecVec av = { NULL, a2 }, ev = { NULL, a3 };
+    return do_execve(c, exec_path, av, ev);
 }
 
 /* struct rusage marshalling (timevals + 14 longs). */

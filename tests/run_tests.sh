@@ -2381,6 +2381,15 @@ check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nho
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;
 # these are a real kernel's answers, taken natively.
+# The order execve refuses things in (sys_proc.c): the image first (ENOENT,
+# EACCES), then the argument arrays (EFAULT), then their size (E2BIG), and the
+# file's format (ENOEXEC, and a #! interpreter's own ENOENT) last -- which is
+# what decides the answer whenever more than one of them is wrong at once.
+# Self-checking: qemu-user validates and copies the vectors in its own execve
+# emulation before the host sees the path, and disagrees on three rows. The
+# expected output is what this same fixture prints built for the host and run
+# on a real kernel. No filesystem: the unloadable images are memfds.
+check_fixture execorder $'nonelf_big=e2big\nnonelf_small=enoexec\nscript_big=e2big\nscript_small=enoent\nnotreg_big=eacces\nmissing_big=enoent\nbadptr_missing=enoent\nbadptr_nonelf=efault\ndone'
 # The stack a new image gets is its RLIMIT_STACK (elf.c), which is what a
 # kernel's grows to and no further -- so `ulimit -s` before an exec really does
 # decide how deep the program may recurse, in both directions. Self-checking:

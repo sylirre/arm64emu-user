@@ -490,7 +490,14 @@ void syscall_wait_begin_ms(int *ms);
 
 /* sys_proc.c: resolve+load a program (shebang-aware); returns 0 or -errno.
  * Does not take ownership of argv/envp. */
-u64 do_execve(CPU *c, const char *gpath, char **argv, char **envp);
+/* Where an exec's argv/envp still are. `vec` is a host vector the caller owns
+ * and keeps (the initial exec, whose argv is the emulator's own command line);
+ * with `vec` NULL they are still in the guest's memory at `va`, and do_execve
+ * reads them only once the image is open -- a kernel's count() runs after
+ * do_open_execat, so a file that is missing or may not be run is refused
+ * before the argument list is looked at at all. */
+typedef struct { char **vec; u64 va; } ExecVec;
+u64 do_execve(CPU *c, const char *gpath, ExecVec argv, ExecVec envp);
 /* Lowest fd number the guest cannot own — the hard RLIMIT_NOFILE this process
  * started with. An fd from there up belongs to whatever is running the emulator
  * (valgrind parks its own above the limit it lowers for its client), so neither

@@ -933,7 +933,8 @@ int main(int argc, char **argv)
     /* Route the initial exec through do_execve so shebang scripts and PATH-less
      * relative programs behave exactly as an in-guest execve would. */
     if (argv0) gargv[0] = (char *)argv0;
-    u64 r = do_execve(&m->cpu, prog, gargv, genv);
+    ExecVec av = { gargv, 0 }, ev = { genv, 0 };
+    u64 r = do_execve(&m->cpu, prog, av, ev);
     if ((s64)r < 0) {
         fprintf(stderr, "arm64chroot: cannot execute %s: %s\n", prog,
                 strerror((int)-(s64)r));

@@ -1441,6 +1441,21 @@ the emulator's own path. `do_execve` takes private copies of argv/envp — the
 caller retains ownership (a subtle earlier use-after-free lives in the git
 history).
 
+**When** all of this is measured decides the answer whenever more than one
+thing is wrong at once, and a kernel's sequence is fixed: `do_open_execat`
+(`ENOENT`, `EACCES`), then `count()` over the argument arrays (`EFAULT`), then
+`bprm_stack_limits` and `copy_strings` (`E2BIG`), and only then a binfmt
+handler that looks at the file at all (`ENOEXEC`, and a `#!` interpreter's own
+`ENOENT`). `do_execve` takes the vectors in that same window — inside the
+resolution loop, once the image is open and its permission judged and before a
+byte of its contents is read (`exec_vecs_take`) — and measures them right
+after, on every turn of the loop, since a shebang line adds to the list. Read
+in the syscall entry point as they used to be, the `E2BIG` of a long list and
+the `EFAULT` of an argv the guest could not back came back for a file that was
+missing or unrunnable, where a kernel answers for the file; measured after the
+format was judged, that same `E2BIG` lost to `ENOEXEC`.
+`tests/fixtures/execorder.c` pins the whole sequence.
+
 How **many** entries a vector may have is that same budget and nothing else:
 `import_strvec` charges each one its 8-byte pointer slot plus its bytes and a
 NUL, and stops when it has spent what `exec_arg_budget` allows — so the
