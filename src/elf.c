@@ -18,7 +18,25 @@
 #include "guest_abi.h"
 
 #define STACK_TOP   0x7ffffff000ULL
-#define STACK_SIZE  (8ULL << 20)
+/* The kernel's own _STK_LIM: the 8 MB reference stack its argument budget is
+ * measured against (bprm_stack_limits), and the stack a guest whose
+ * RLIMIT_STACK is infinite gets here -- a stack that really is unbounded is
+ * not something a loader that lays one out in a single piece can give. */
+#define STK_LIM     (8ULL << 20)
+/* ...and how far the guest's own limit is honoured. A kernel grows the stack a
+ * page at a time and needs no such ceiling; this maps it whole, so a limit
+ * past this one is capped. The mapping itself is lazy host memory -- nothing
+ * is committed until the guest touches it -- but its page-table entries are
+ * built up front and the guest's own VmSize counts every byte of it, which is
+ * what the ceiling is for. 64 MB is the `ulimit -s 65536` a deeply recursive
+ * workload asks for, and costs 16 K page-table entries when it does. */
+#define STACK_MAX   (64ULL << 20)
+/* What the initial stack holds besides the argument strings and the pointer
+ * vectors: the auxv array, the AT_RANDOM and platform blocks it points at, and
+ * the alignment between them. exec_arg_limit counts it against the stack the
+ * image will get; the assertion in load_elf keeps the number honest as the
+ * auxv grows. */
+#define STACK_FIXED 1024ULL
 #define ET_DYN_BASE 0x5500000000ULL
 
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
@@ -287,13 +305,12 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
  * against 2 bytes of string for "a", so the table is most of what the argument
  * list actually costs.
  *
- * The cap is written against STACK_SIZE and not the kernel's _STK_LIM because
- * STACK_SIZE is the stack this really builds, whatever the guest's limit says
- * -- the two are the same 8 MB, and it is that stack the budget has to leave
- * the program room in. A guest that lowered its limit gets the kernel's E2BIG
- * at the same place; one that raised it, or has none, is held to the same
- * three quarters a kernel holds an 8 MB stack to. Every boundary here was
- * measured against a kernel.
+ * The cap is _STK_LIM's, an 8 MB reference stack that has nothing to do with
+ * how big the guest's own stack turns out to be: a kernel bounds the argument
+ * list by it however large RLIMIT_STACK is, so a guest with a 64 MB limit
+ * still gets 6 MB of arguments and not 48. What the guest's real stack does
+ * bound is the block fitting in it at all, which is the second test below.
+ * Every boundary here was measured against a kernel.
  *
  * Separate from the load, and exported, because the answer is owed to the
  * caller of execve(2): a kernel measures this long before begin_new_exec
@@ -302,8 +319,28 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
  * inside the load, past the point of no return -- the only thing the refusal
  * could do was kill the process (do_execve, sys_proc.c, calls this while
  * there is still a caller to refuse). */
+/* The stack the new image gets: the guest's RLIMIT_STACK. A kernel's stack VMA
+ * grows on demand and can never pass that limit (acct_stack_growth), so the
+ * limit *is* the size of the stack the program ends up with -- which is why
+ * lowering it before an exec is how a shell bounds what the program may
+ * recurse to, and raising it is how a deeply recursive one is given room.
+ *
+ * A fixed 8 MB was laid out here whatever the guest asked for, so both were
+ * ignored. Measured against a kernel with the same recursion: at a 64 KB limit
+ * a kernel stops the program after 124 KB of frames and this let it run to
+ * 8124 KB -- sixty-six times past what it had been told it could have -- and
+ * at a 64 MB limit a kernel gave it 65016 KB while this killed it at the same
+ * 8124 KB, an eighth of the stack it had asked for and been granted. */
+static u64 stack_size_for(struct Machine *m) {
+    u64 rl = m->rlim[G_RLIMIT_STACK].rlim_cur;
+
+    if (rl == G_RLIM_INFINITY) return STK_LIM;
+    if (rl > STACK_MAX) return STACK_MAX;
+    return PG_UP(rl);
+}
+
 u64 exec_arg_budget(struct Machine *m) {
-    u64 limit = STACK_SIZE / 4 * 3;
+    u64 limit = STK_LIM / 4 * 3;
     u64 stkrl = m->rlim[G_RLIMIT_STACK].rlim_cur;
 
     if (stkrl != G_RLIM_INFINITY && stkrl / 4 < limit) limit = stkrl / 4;
@@ -325,6 +362,18 @@ int exec_arg_limit(struct Machine *m, const char *canon,
      * guest passed none, and gives the new image one either way. */
     u64 ptrtab = ((u64)(argc > 1 ? argc : 1) + (u64)envc) * 8;
     if (limit <= ptrtab || bytes > limit - ptrtab) return -E2BIG;
+    /* ...and all of it has to fit in the stack the image will get, which is
+     * that same RLIMIT_STACK. A kernel copies the strings into the stack VMA
+     * as it grows it and the growth stops at the limit, so get_arg_page fails
+     * there and copy_strings reports E2BIG -- measured: 100 KB of strings is
+     * refused at a 64 KB limit and accepted at a 128 KB one. The budget above
+     * does not imply this, since ARG_MAX floors it at 128 KB however small the
+     * limit is. The vector is counted too, which a kernel does not need to:
+     * it lays that out after expanding the stack, while this writes strings
+     * and vector into one mapping that has to hold both. STACK_FIXED covers
+     * what goes above them -- the auxv, the platform and random blocks, and
+     * the alignment between. */
+    if (bytes + ptrtab + STACK_FIXED > stack_size_for(m)) return -E2BIG;
     return 0;
 }
 
@@ -375,8 +424,11 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     m->as.start_data = exe.start_data;
     m->as.end_data = exe.end_data;
 
-    /* Stack. */
-    r = guest_map_anon(&m->as, STACK_TOP - STACK_SIZE, STACK_SIZE, PTE_R | PTE_W);
+    /* Stack, sized from the guest's RLIMIT_STACK (stack_size_for). The
+     * argument block was measured against this same size while there was
+     * still a caller to refuse (exec_arg_limit), so it fits. */
+    u64 stack_size = stack_size_for(m);
+    r = guest_map_anon(&m->as, STACK_TOP - stack_size, stack_size, PTE_R | PTE_W);
     if (r < 0) return r;
     m->as.stack_top = STACK_TOP;
 
@@ -484,6 +536,9 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
      * lowered it to the vector area, so it sits BELOW the string block rather
      * than at it, which is what a native run shows. */
     m->as.start_stack = sp;
+
+    _Static_assert(sizeof auxv + 16 + 8 + 32 <= STACK_FIXED,
+                   "STACK_FIXED must cover the auxv, its blocks and the padding");
 
     u64 va = sp;
     u64 argc64 = (u64)argc;

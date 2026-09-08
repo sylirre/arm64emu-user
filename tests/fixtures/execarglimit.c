@@ -121,6 +121,14 @@ int main(int argc, char **argv) {
      * quarter of 256 KB is 64 KB, but 109 KB of arguments still go through. */
     printf("floor=%s\n", attempt(self, 256 * 1024, 1000, 100, 0, 0));
 
+    /* Fitting the budget is not enough: the block also has to fit in the stack
+     * the image will get, which is RLIMIT_STACK itself. A kernel copies the
+     * strings into the stack VMA as it grows it and the growth stops there, so
+     * 100 KB of them is refused at a 64 KB limit and accepted at a 256 KB one
+     * -- while the budget, floored at ARG_MAX, would admit both. */
+    printf("stackfit=%s\n", attempt(self, 64 * 1024, 25, 4000, 0, 0));
+    printf("stackfit_ok=%s\n", attempt(self, 256 * 1024, 25, 4000, 0, 0));
+
     /* ...and three quarters of the reference stack is the ceiling over it,
      * however large the limit is: a quarter of 64 MB is 16 MB, but the budget
      * is 6 MB, so 5.2 MB of arguments go through and 7.3 MB do not. */

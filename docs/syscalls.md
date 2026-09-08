@@ -1479,11 +1479,22 @@ pointer against 2 bytes of string for `"a"`, so the table is most of what the
 list actually costs. And measuring it from inside `load_elf`, as this used to,
 put the refusal past the point of no return, where the only thing left to do
 with it was kill the process — over an argv a kernel simply declines. The cap
-is written against the emulator's own `STACK_SIZE` rather than `_STK_LIM`
-because that, and not the guest's limit, is the stack this really builds; the
-two are the same 8 MB, and it is that stack the budget has to leave the program
-room in. `tests/fixtures/execarglimit.c` pins every boundary, and prints the
-same lines when it is built for the host and run on a real kernel.
+is `_STK_LIM`'s 8 MB reference stack, which has nothing to do with how big the
+guest's own stack turns out to be: a kernel bounds the argument list by it
+however large `RLIMIT_STACK` is, so a guest with a 64 MB limit still gets 6 MB
+of arguments and not 48.
+
+**The block has to fit in the stack the image will get, too**, and that is a
+second refusal with the same `E2BIG`: a kernel copies the argument strings into
+the stack VMA as it grows it, and the growth stops at `RLIMIT_STACK`, so
+`get_arg_page` fails there and `copy_strings` reports it (measured: 100 KB of
+strings is refused at a 64 KB limit and accepted at a 128 KB one). The budget
+does not imply it, since `ARG_MAX` floors the budget at 128 KB however small
+the limit is. The emulator counts the pointer vector into that test as well,
+which a kernel need not: it lays the vector out after expanding the stack,
+while this writes strings and vector into one mapping that has to hold both.
+`tests/fixtures/execarglimit.c` pins every boundary, and prints the same lines
+when it is built for the host and run on a real kernel.
 
 Everything else the loader can refuse is refused there too, by `elf_probe`
 (`elf.c`), which validates the ELF header on that same descriptor and opens the
@@ -1512,6 +1523,36 @@ a check: segment content is `pread` into anonymous backing rather than mapped
 from the file, so an image naming content past the end of its file is refused
 here, where a kernel maps the hole, execs successfully and delivers `SIGBUS`
 when the guest touches it.
+
+### The stack the new image gets
+
+`RLIMIT_STACK`, and not a fixed size. A kernel's stack VMA grows on demand and
+`acct_stack_growth` refuses to take it past that limit, so the limit *is* the
+stack the program ends up with — which is why `ulimit -s N` before running
+something really does decide how deep it may recurse. `stack_size_for`
+(`elf.c`) reads the same limit and maps that much at exec time; it used to map
+a fixed 8 MB and ignore the limit in both directions. Measured against a kernel
+with the same recursion, before and after: at a 64 KB limit a kernel stops the
+program after 56 KB of frames and this let it run to 8124 KB — sixty-six times
+past what it had been told it could have — while at a 64 MB limit a kernel gave
+it 65020 KB and this killed it at that same 8124 KB, an eighth of the stack it
+had asked for and been granted. It now lands within one frame of the kernel at
+every limit (`tests/fixtures/stackrlimit.c`; `qemu-user` is no oracle here
+either, since it sizes the guest stack from its own `-s` option).
+
+Two things follow from laying the stack out whole rather than growing it:
+
+- **A limit past `STACK_MAX` (64 MB) is capped**, and an infinite one gets
+  `_STK_LIM`'s 8 MB. Nothing can lay out a stack that is genuinely unbounded,
+  and the mapping is not free even when it is never touched: the host memory
+  behind it is lazy, but its page-table entries are built up front and the
+  guest's own `VmSize` counts every byte — so a guest that also sets
+  `RLIMIT_AS` has that much less room under it than it would on a kernel.
+- **A `setrlimit` *after* the exec does not resize the stack.** A kernel grows
+  against the limit in force at the moment of the fault, so raising it
+  mid-flight gives the running program more room; here the size is settled when
+  the image is built. Lowering or raising it and *then* exec'ing — which is
+  what a shell's `ulimit -s` does, and the case that matters — is exact.
 
 ### `de_thread`: exec from a thread group with more than one thread
 

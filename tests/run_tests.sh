@@ -2381,6 +2381,13 @@ check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nho
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;
 # these are a real kernel's answers, taken natively.
+# The stack a new image gets is its RLIMIT_STACK (elf.c), which is what a
+# kernel's grows to and no further -- so `ulimit -s` before an exec really does
+# decide how deep the program may recurse, in both directions. Self-checking:
+# qemu-user sizes the guest stack from its own -s option and ignores the
+# guest's limit entirely (it answers 0/0/1/0/0 here). The bands were measured
+# against a real kernel with this same program built for the host.
+check_fixture stackrlimit $'tiny=1\nsmall=1\ndefault=1\nlarge=1\nscales=1\ndone'
 # execve's argument-limit accounting (elf.c and the argv/envp import in
 # sys_proc.c). A kernel measures argv+envp
 # against a share of RLIMIT_STACK -- floored at ARG_MAX, capped at three
@@ -2392,7 +2399,7 @@ check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nho
 # process's and whose argv carries qemu's own prefix. The expected output is
 # byte-for-byte what this same fixture prints built for the host and run on a
 # real kernel.
-check_fixture execarglimit $'fits=ok\nmany=ok\nmany_over=e2big\nstrings_only=1\nptrtab=e2big\nstrings=e2big\nfloor=ok\ncap_ok=ok\ncap_over=e2big\ndone'
+check_fixture execarglimit $'fits=ok\nmany=ok\nmany_over=e2big\nstrings_only=1\nptrtab=e2big\nstrings=e2big\nfloor=ok\nstackfit=e2big\nstackfit_ok=ok\ncap_ok=ok\ncap_over=e2big\ndone'
 check_fixture mmwrap $'mmap_zerolen=22\nmmap_len_align0=12\nmmap_len_huge=12\nmmap_fixed_wrap=12\nmmap_hint_wrap=0\nmmap_notype=22\nmmap_anon_validate=22\nmmap_type15=22\nmmap_file_notype=22\nmmap_file_validate=0\nmremap_old_wrap=14\nmremap_old_wrap_grow=14\nmremap_newlen_align0=22\nmremap_oldlen_align0=22\nmremap_zero_oldlen=22\nmunmap_zerolen=22\nmunmap_len_align0=22\nmunmap_wrap=22\nmprotect_zerolen=0\nmprotect_len_align0=12\nmprotect_wrap=12\nkeep=1\ndone'
 
 
