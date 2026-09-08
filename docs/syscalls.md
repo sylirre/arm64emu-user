@@ -1158,7 +1158,13 @@ then make the consequences the caller depends on true:
   away — yields an empty file, or `ENOENT` for `exe`/`cwd`, as the kernel does
   for a process whose data is gone. Falling through on either would hand the
   guest the host file, which for a guest process describes the *emulator*: its
-  command line, its binary path, and its entire environment. The same registry
+  command line, its binary path, and its entire environment. **This process's
+  own three** are answered on the same terms, from the copies the loader made
+  (`m->cmdline`/`environ`/`auxv`): a copy the loader could not make — an
+  allocation that failed while the image was being built — leaves the view
+  empty, never falls back to the host's file, and never keeps the *previous*
+  image's, which the process is no longer running (`elf.c` drops the old copies
+  whether or not the new ones can be recorded). The same registry
   powers a **hidden-process view**: the
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
   PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so

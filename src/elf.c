@@ -486,14 +486,21 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     free(envpp);
 
     /* /proc/self/auxv content: the guest auxv block just laid out (the host
-     * file shows the emulator's own auxv — the wrong ISA's AT_HWCAP). */
+     * file shows the emulator's own auxv — the wrong ISA's AT_HWCAP).
+     *
+     * The three views below describe the image that was just built, and the
+     * old one's are dropped whether or not the new one's can be recorded. On
+     * an allocation failure this used to leave the previous image's, which
+     * the process no longer is: a guest reading its own /proc/self/cmdline --
+     * or another guest process reading it out of the shared registry, which is
+     * published from these same fields -- was told what it used to be running.
+     * Nothing is a truer answer than something wrong, and it is the answer the
+     * readers already handle (sys_procfs.c serves an empty file for it). */
     char *aux = malloc(sizeof auxv);
-    if (aux) {
-        memcpy(aux, auxv, sizeof auxv);
-        free(m->auxv);
-        m->auxv = aux;
-        m->auxv_len = (u32)sizeof auxv;
-    }
+    if (aux) memcpy(aux, auxv, sizeof auxv);
+    free(m->auxv);
+    m->auxv = aux;
+    m->auxv_len = aux ? (u32)sizeof auxv : 0;
 
     m->entry = exe.entry;
     m->interp_base = at_base;
@@ -513,10 +520,10 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
             memcpy(cmd + off, argv[i], l);
             off += l;
         }
-        free(m->cmdline);
-        m->cmdline = cmd;
-        m->cmdline_len = (u32)cl;
     }
+    free(m->cmdline);
+    m->cmdline = cmd;
+    m->cmdline_len = cmd ? (u32)cl : 0;
     /* /proc/self/environ content: the guest envp, NUL-joined (the host file
      * shows the emulator's own environment). */
     size_t el = 0;
@@ -529,10 +536,10 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
             memcpy(env + off, envp[i], l);
             off += l;
         }
-        free(m->environ);
-        m->environ = env;
-        m->environ_len = (u32)el;
     }
+    free(m->environ);
+    m->environ = env;
+    m->environ_len = env ? (u32)el : 0;
     /* Publish the guest command line, exe path, cwd, environ and auxv in the
      * shared PID registry so other guest processes' ps/top and /proc/<pid>/
      * {cmdline,environ,auxv,exe,cwd} see the guest view (and this process counts

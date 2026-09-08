@@ -1731,9 +1731,6 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     } else {
         return 0;
     }
-    if (kind == PF_CMDLINE && !m->cmdline) return 0;
-    if (kind == PF_ENVIRON && !m->environ) return 0;
-    if (kind == PF_AUXV    && !m->auxv)    return 0;
     int writable = kind == PF_UIDMAP || kind == PF_GIDMAP || kind == PF_SETGROUPS;
     if (!writable && (gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
     if (gflags & G_O_DIRECTORY)                        { *ret = -ENOTDIR; return 1; }
@@ -1754,11 +1751,17 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         return 1;
     }
 
+    /* A view the loader could not record (an allocation that failed while the
+     * image was being built, elf.c) is served EMPTY, exactly as a dry registry
+     * lookup for another process's is above. It used to fall through to the
+     * host's own file instead, which is the emulator's command line, the
+     * emulator's environment and an auxv for the wrong ISA -- the very thing
+     * these three views exist to keep out of the guest's sight. */
     ssize_t wr = 0;
     switch (kind) {
-    case PF_CMDLINE:    wr = write(fd, m->cmdline, m->cmdline_len); break;
-    case PF_ENVIRON:    wr = write(fd, m->environ, m->environ_len); break;
-    case PF_AUXV:       wr = write(fd, m->auxv, m->auxv_len); break;
+    case PF_CMDLINE:    if (m->cmdline) wr = write(fd, m->cmdline, m->cmdline_len); break;
+    case PF_ENVIRON:    if (m->environ) wr = write(fd, m->environ, m->environ_len); break;
+    case PF_AUXV:       if (m->auxv)    wr = write(fd, m->auxv, m->auxv_len); break;
     case PF_MAPS:       put_maps(fd, m); break;
     case PF_MOUNTS:     put_mounts(fd, m, MNT_MOUNTS); break;
     case PF_MOUNTINFO:  put_mounts(fd, m, MNT_MOUNTINFO); break;
