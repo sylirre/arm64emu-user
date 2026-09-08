@@ -826,6 +826,29 @@ go wrong:
   header fields a receive writes are checked too: a writeback that faults is
   what the call returns, byte count or not, and the datagram is gone either
   way — which is what `netlink_recvmsg` does with an skb it could not copy out.
+  The iovec array is imported **once and up front** for the receives as well,
+  and not read piecemeal while scattering into it: an array the guest cannot
+  read is `import_iovec`'s `EFAULT` with the datagram still queued, where
+  discovering it mid-scatter had already taken the datagram off the socket and
+  then lost it to the error.
+
+  Calls that carry **no bytes at all** get three different answers, and the
+  substituted socket owes the guest all three. A vectored read or write of an
+  empty vector — `iovcnt == 0`, or every segment empty — is 0 with the socket
+  never consulted at all: `do_iter_read`/`do_iter_write` return the moment the
+  imported total is zero. So is `read(fd, buf, 0)`, by `sock_read_iter`'s own
+  "Match SYS5 behaviour" shortcut. A `write`/`send`/`sendmsg` of no bytes has
+  no such shortcut and reaches `netlink_sendmsg`, which refuses an empty
+  message with `ENODATA` rather than queue an empty skb (a 5.x-and-later
+  answer, and 6.1 is what this emulator advertises; an older kernel took the
+  skb and answered 0, still drawing no reply). `recvfrom`/`recvmsg` have none
+  either, and really do take the datagram off the socket to report the zero.
+  What all of them share is that a reply already queued must still be there
+  afterwards: consuming it for a read the kernel treats as a no-op threw the
+  answer away, and rebuilding the reply slot for a send that never happened
+  replaced it with an ack for a message the guest never sent, carrying
+  sequence number zero. `tests/fixtures/netns_ack.c` (`zerolen=`) holds both
+  tiers to it.
 
   The reply is handed back one datagram at a time, with the `NLMSG_DONE` that
   ends a dump in a datagram of its own — which is how the kernel frames one,

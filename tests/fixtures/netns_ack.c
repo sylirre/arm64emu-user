@@ -436,6 +436,102 @@ static const char *fault_addr(int fd) {
     return "ok";
 }
 
+/* A request that draws exactly one datagram: the ack (or refusal) rtnetlink
+ * answers an RTM_NEWADDR with. */
+static int ask_ack(int fd, unsigned seq) {
+    struct { struct nlmsghdr n; struct ifaddrmsg i; } r;
+    struct sockaddr_nl snl;
+
+    memset(&snl, 0, sizeof snl);
+    snl.nl_family = AF_NETLINK;
+    memset(&r, 0, sizeof r);
+    r.n.nlmsg_len = NLMSG_LENGTH(sizeof r.i);
+    r.n.nlmsg_type = RTM_NEWADDR;
+    r.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    r.n.nlmsg_seq = seq;
+    r.i.ifa_family = AF_INET;
+    r.i.ifa_prefixlen = 8;
+    r.i.ifa_index = 1;
+    return sendto(fd, &r, r.n.nlmsg_len, 0,
+                  (struct sockaddr *)&snl, sizeof snl) == (ssize_t)r.n.nlmsg_len;
+}
+
+/* The sequence number of the datagram waiting on @fd, left where it is
+ * (@consume takes it instead); -1 when there is none. */
+static long head_seq(int fd, int consume) {
+    char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof buf,
+                     MSG_DONTWAIT | (consume ? 0 : MSG_PEEK));
+
+    if (n < (ssize_t)NLMSG_HDRLEN) return -1;
+    return (long)((struct nlmsghdr *)buf)->nlmsg_seq;
+}
+
+/* Operations carrying no bytes at all. The vfs answers a vectored read or
+ * write of an empty vector before the socket is reached (do_iter_read /
+ * do_iter_write return the moment the imported total is zero), and so does a
+ * read(2) of no bytes (sock_read_iter's "Match SYS5 behaviour"): 0, with the
+ * queue untouched. A *send* of no bytes has no such shortcut -- it reaches
+ * netlink_sendmsg, which refuses an empty message rather than queue an empty
+ * skb -- and neither does recvfrom/recvmsg, which really do take the datagram
+ * off the socket and report the zero (covered by the checks above).
+ *
+ * What every one of them has in common is that the reply already queued must
+ * still be there afterwards, which is what this pins down. Consuming it for a
+ * read the kernel treats as a no-op threw the answer away; rebuilding the
+ * reply slot for a send that was never made replaced it with an ack for a
+ * message the guest never sent, carrying sequence number zero.
+ *
+ * The send's own answer is folded: ENODATA is what a kernel from 5.x on gives
+ * (and what the emulator gives, advertising 6.1), while an older host's real
+ * socket takes the empty skb and answers 0. Both tiers must agree on
+ * everything else. */
+static const char *zero_len(int fd) {
+    char buf[4096];
+    struct iovec iov[2] = { { NULL, 0 }, { buf, 0 } };
+    struct msghdr mh;
+    ssize_t r;
+
+    if (!ask_ack(fd, 1011)) return "sendfail";
+    if (head_seq(fd, 0) != 1011) return "noreply";
+
+    if (readv(fd, iov, 0) != 0) return "readv-cnt0";
+    if (head_seq(fd, 0) != 1011) return "readv-cnt0-lost";
+    if (readv(fd, iov + 1, 1) != 0) return "readv-len0";
+    if (head_seq(fd, 0) != 1011) return "readv-len0-lost";
+    if (readv(fd, iov, 2) != 0) return "readv-two";
+    if (head_seq(fd, 0) != 1011) return "readv-two-lost";
+    if (read(fd, buf, 0) != 0) return "read0";
+    if (head_seq(fd, 0) != 1011) return "read0-lost";
+    if (writev(fd, iov, 0) != 0) return "writev-cnt0";
+    if (head_seq(fd, 0) != 1011) return "writev-cnt0-lost";
+    if (writev(fd, iov + 1, 1) != 0) return "writev-len0";
+    if (head_seq(fd, 0) != 1011) return "writev-len0-lost";
+
+    r = write(fd, buf, 0);
+    if (r != 0 && !(r < 0 && errno == ENODATA)) return "write0";
+    if (head_seq(fd, 0) != 1011) return "write0-lost";
+    r = send(fd, buf, 0, 0);
+    if (r != 0 && !(r < 0 && errno == ENODATA)) return "send0";
+    if (head_seq(fd, 0) != 1011) return "send0-lost";
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 0;
+    r = sendmsg(fd, &mh, 0);
+    if (r != 0 && !(r < 0 && errno == ENODATA)) return "sendmsg-cnt0";
+    if (head_seq(fd, 0) != 1011) return "sendmsg-cnt0-lost";
+    mh.msg_iov = iov + 1;
+    mh.msg_iovlen = 1;
+    r = sendmsg(fd, &mh, 0);
+    if (r != 0 && !(r < 0 && errno == ENODATA)) return "sendmsg-len0";
+    if (head_seq(fd, 0) != 1011) return "sendmsg-len0-lost";
+
+    /* ...and it is still the one datagram it always was. */
+    if (head_seq(fd, 1) != 1011) return "gone";
+    if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) >= 0) return "extra";
+    return "ok";
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
@@ -443,7 +539,7 @@ int main(void) {
         printf("empty=skip\nself=skip\npeer=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\n");
+               "addrfault=skip\nzerolen=skip\n");
         return 0;
     }
 
@@ -467,7 +563,7 @@ int main(void) {
     if (fd < 0) {
         printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\n");
+               "addrfault=skip\nzerolen=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -510,7 +606,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"
-               "sendfault=skip\naddrfault=skip\n");
+               "sendfault=skip\naddrfault=skip\nzerolen=skip\n");
         return 0;
     }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
@@ -535,7 +631,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\n");
+               "addrfault=skip\nzerolen=skip\n");
         return 0;
     }
     printf("ready=%s\n", readiness_cycle(fd));
@@ -546,7 +642,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\n");
+               "addrfault=skip\nzerolen=skip\n");
         return 0;
     }
     printf("frame=%s\n", dump_walk(fd));
@@ -558,7 +654,8 @@ int main(void) {
      * the guest saw its own request echoed instead of a reply. */
     fd = nl_open();
     if (fd < 0) {
-        printf("mmsg=skip\nfault=skip\nsendfault=skip\naddrfault=skip\n");
+        printf("mmsg=skip\nfault=skip\nsendfault=skip\naddrfault=skip\n"
+               "zerolen=skip\n");
         return 0;
     }
     printf("mmsg=%s\n", mmsg_cycle(fd));
@@ -566,7 +663,10 @@ int main(void) {
 
     /* A destination the guest cannot write: EFAULT, not a silent short read. */
     fd = nl_open();
-    if (fd < 0) { printf("fault=skip\nsendfault=skip\naddrfault=skip\n"); return 0; }
+    if (fd < 0) {
+        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\n");
+        return 0;
+    }
     printf("fault=%s\n", fault_recv(fd));
     close(fd);
 
@@ -574,13 +674,20 @@ int main(void) {
      * a bad one must fail the call rather than become a successful empty
      * operation. */
     fd = nl_open();
-    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\n"); return 0; }
+    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\n"); return 0; }
     printf("sendfault=%s\n", fault_send(fd));
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("addrfault=skip\n"); return 0; }
+    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\n"); return 0; }
     printf("addrfault=%s\n", fault_addr(fd));
+    close(fd);
+
+    /* Calls that carry no bytes: what they answer, and that none of them
+     * disturbs the reply the socket is holding. */
+    fd = nl_open();
+    if (fd < 0) { printf("zerolen=skip\n"); return 0; }
+    printf("zerolen=%s\n", zero_len(fd));
     close(fd);
     return 0;
 }

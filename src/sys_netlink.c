@@ -1164,22 +1164,46 @@ static int nl_write_sockname(CPU *c, u64 addr_va, u64 size_va, uint32_t nl_pid,
  * The datagram is consumed either way (nl_take_reply), which is what
  * netlink_recvmsg does with an skb whose copy to user space failed -- it is
  * freed, not put back. */
-static ssize_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
+/* Import a guest iovec array once, ahead of the operation it belongs to, the
+ * way import_iovec and copy_msghdr_from_user do. The array is read in a single
+ * go -- a second read is a different array, since another thread sharing the
+ * address space can rewrite it (see iov_from_guest, sys_file.c) -- a segment
+ * whose length is negative as an ssize_t is EINVAL, and the running total is
+ * clamped to MAX_RW_COUNT rather than refused. Returns 0 with *total set, or a
+ * negative errno; a kernel answers those before it touches the socket, so
+ * nothing may be sent or consumed once this fails. @cnt must already be
+ * bounded by UIO_MAXIOV: what too many segments answers differs by caller. */
+static int nl_iov_import(CPU *c, u64 iov_va, unsigned cnt,
+                         GIovec *gi, u64 *total)
+{
+    *total = 0;
+    if (cnt == 0)
+        return 0;
+    if (iov_va == 0 ||
+        copy_from_guest(c, gi, iov_va, sizeof(GIovec) * (size_t)cnt) < 0)
+        return -EFAULT;
+    for (unsigned i = 0; i < cnt; i++) {
+        if ((s64)gi[i].iov_len < 0)
+            return -EINVAL;
+        if (gi[i].iov_len > A64_MAX_RW_COUNT - *total)
+            gi[i].iov_len = A64_MAX_RW_COUNT - *total;
+        *total += gi[i].iov_len;
+    }
+    return 0;
+}
+
+/* Deliver a datagram into an imported iovec array. */
+static ssize_t nl_scatter(CPU *c, const GIovec *gi, unsigned cnt,
                           const uint8_t *reply, size_t reply_len)
 {
     size_t done = 0;
-    if (iov_count > 1024)
-        iov_count = 1024;
-    for (u64 i = 0; i < iov_count && done < reply_len; i++) {
-        GIovec gi;
-        if (copy_from_guest(c, &gi, iov_va + i * sizeof(GIovec), sizeof gi) < 0)
-            return -EFAULT;
+    for (unsigned i = 0; i < cnt && done < reply_len; i++) {
         size_t chunk = reply_len - done;
-        if (chunk > gi.iov_len)
-            chunk = gi.iov_len;
+        if (chunk > gi[i].iov_len)
+            chunk = (size_t)gi[i].iov_len;
         if (chunk > 0 &&
-            (gi.iov_base == 0 ||
-             copy_to_guest(c, gi.iov_base, reply + done, chunk) < 0))
+            (gi[i].iov_base == 0 ||
+             copy_to_guest(c, gi[i].iov_base, reply + done, chunk) < 0))
             return -EFAULT;
         done += chunk;
     }
@@ -1205,17 +1229,15 @@ static ssize_t nl_scatter(CPU *c, u64 iov_va, u64 iov_count,
  * (net.core.wmem_default) and a guest setsockopt(SO_SNDBUF) on this fd reaches
  * it. Without that bound a guest could name a length no buffer could hold and
  * be told all of it was sent. */
-static int nl_request_check(CPU *c, int fd, u64 base, u64 blen)
+static int nl_request_check(CPU *c, int fd, u64 base, u64 blen, u64 total)
 {
     int sndbuf = 0;
     socklen_t sl = sizeof sndbuf;
     size_t len;
 
     if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &sl) == 0 &&
-        sndbuf > 32 && blen > (u64)(sndbuf - 32))
+        sndbuf > 32 && total > (u64)(sndbuf - 32))
         return -EMSGSIZE;
-    if (blen == 0)
-        return 0;                      /* an empty message is a valid one */
     len = rw_count(blen);
     if ((u64) len != blen || base == 0 ||
         rw_room(c, base, len, ACC_READ) < len)
@@ -1227,9 +1249,22 @@ static int nl_request_check(CPU *c, int fd, u64 base, u64 blen)
  * request as sent. Called for every message we accepted, even one we couldn't
  * parse: build_reply_into always leaves something behind, so no *successful*
  * send on this socket can strand a later read. */
-static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
+static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen, u64 total)
 {
-    int e = nl_request_check(c, fd, base, blen);
+    /* A message of no bytes is not a netlink message. netlink_sendmsg refuses
+     * one outright rather than queue an empty skb, so it never reaches
+     * rtnetlink and never draws a reply -- and it must not disturb one the
+     * socket already has, which rebuilding the reply slot for it did: a guest
+     * that had asked for something got an ack for a message it never sent,
+     * carrying sequence number zero, in place of the answer it was waiting
+     * for. ENODATA is a 6.x kernel's answer and 6.x is what this emulator
+     * advertises; an older one took the empty skb and answered 0, still with
+     * no reply behind it. (writev never gets here with an empty vector: one
+     * does not reach the socket at all -- see nl_writev.) */
+    int e;
+
+    if (total == 0) return (u64)(s64)-ENODATA;
+    e = nl_request_check(c, fd, base, blen, total);
     if (e < 0) return (u64)(s64) e;
 
     EMU_LOCK(&nl_lock, EMU_LK_NL);
@@ -1250,39 +1285,30 @@ static u64 nl_take_request(CPU *c, int fd, u64 base, u64 blen)
      * that waits for POLLIN before receiving is the common shape. */
     nl_sync_ready(c->m, i);
     EMU_UNLOCK(&nl_lock, EMU_LK_NL);
-    return (u64)blen;
+    return total;
 }
 
-/* First segment of a guest iovec array, which is where the netlink callers we
- * care about put their (single) message: multi-iovec netlink requests don't
- * occur for bwrap / glibc / iproute2.
- *
- * An empty vector is an empty message (zeroed, and sent as one). An array the
- * guest cannot back is -EFAULT, which is what import_iovec makes of it -- a
- * pointer that cannot be read is not a message of no bytes. One longer than
- * UIO_MAXIOV is refused with @toobig, which differs by caller: iovec_from_user
- * answers EINVAL for writev, while copy_msghdr_from_user answers EMSGSIZE for
- * sendmsg (mirrors iov_from_guest / msg_import, sys_file.c and sys_net.c). */
-static int nl_first_iovec(CPU *c, u64 iov_va, u64 iov_cnt, int toobig,
-                          u64 *base, u64 *len)
+/* The head of the message a vectored send carries. A kernel gathers every
+ * segment into one message; only its head is ever parsed here (build_reply_into
+ * reads 256 bytes at most) and multi-iovec netlink requests don't occur for
+ * bwrap / glibc / iproute2, so the head is the first segment that has any bytes
+ * in it and the rest are counted (the send reports the whole length, as a
+ * kernel does) but not read. Leading empty segments are skipped rather than
+ * taken for the message: they carry none of it. */
+static void nl_iov_head(const GIovec *gi, unsigned cnt, u64 *base, u64 *len)
 {
-    GIovec gi;
-
     *base = *len = 0;
-    if (iov_cnt > 1024)
-        return toobig;
-    if (iov_cnt == 0)
-        return 0;
-    if (iov_va == 0 || copy_from_guest(c, &gi, iov_va, sizeof gi) < 0)
-        return -EFAULT;
-    *base = gi.iov_base;
-    *len  = gi.iov_len;
-    return 0;
+    for (unsigned i = 0; i < cnt; i++)
+        if (gi[i].iov_len) {
+            *base = gi[i].iov_base;
+            *len  = gi[i].iov_len;
+            return;
+        }
 }
 
 u64 nl_sendto(CPU *c, int fd, u64 buf, u64 len)
 {
-    return nl_take_request(c, fd, buf, len);
+    return nl_take_request(c, fd, buf, len, len);
 }
 
 u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va)
@@ -1293,7 +1319,8 @@ u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va)
      * -- reading it as "no segments" instead reported it as a successful send
      * of nothing, and left a reply behind for a receive that should never have
      * had one. */
-    u64 iov_va = 0, iov_count = 0, base, blen;
+    u64 iov_va = 0, iov_count = 0, base, blen, total;
+    GIovec gi[1024];
     int e;
 
     if (msghdr_va == 0)
@@ -1301,18 +1328,35 @@ u64 nl_sendmsg(CPU *c, int fd, u64 msghdr_va)
     if (copy_from_guest(c, &iov_va, msghdr_va + 16, 8) < 0 ||
         copy_from_guest(c, &iov_count, msghdr_va + 24, 8) < 0)
         return (u64)(s64)-EFAULT;
-    e = nl_first_iovec(c, iov_va, iov_count, -EMSGSIZE, &base, &blen);
+    /* copy_msghdr_from_user answers EMSGSIZE above UIO_MAXIOV, where
+     * iovec_from_user answers EINVAL for writev below. */
+    if (iov_count > 1024)
+        return (u64)(s64)-EMSGSIZE;
+    e = nl_iov_import(c, iov_va, (unsigned)iov_count, gi, &total);
     if (e < 0) return (u64)(s64) e;
-    return nl_take_request(c, fd, base, blen);
+    nl_iov_head(gi, (unsigned)iov_count, &base, &blen);
+    /* No vfs shortcut on this path: a sendmsg carrying no bytes reaches
+     * netlink_sendmsg, which refuses it (nl_take_request). */
+    return nl_take_request(c, fd, base, blen, total);
 }
 
 u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
 {
-    u64 base, blen;
-    int e = nl_first_iovec(c, iov_va, iov_cnt, -EINVAL, &base, &blen);
+    u64 base, blen, total;
+    GIovec gi[1024];
+    int e;
 
+    if (iov_cnt > 1024)
+        return (u64)(s64)-EINVAL;      /* iovec_from_user */
+    e = nl_iov_import(c, iov_va, (unsigned)iov_cnt, gi, &total);
     if (e < 0) return (u64)(s64) e;
-    return nl_take_request(c, fd, base, blen);
+    /* A vector of no bytes never reaches the socket at all: do_iter_write
+     * answers 0 as soon as the imported total is zero, so nothing is sent and
+     * no reply is drawn -- where write(fd, buf, 0) does reach netlink_sendmsg
+     * and is refused there. The kernel's own asymmetry, measured against one. */
+    if (total == 0) return 0;
+    nl_iov_head(gi, (unsigned)iov_cnt, &base, &blen);
+    return nl_take_request(c, fd, base, blen, total);
 }
 
 /* Hand the next pending datagram on @fd to a flat buffer (@buf, @len) or, when
@@ -1332,8 +1376,8 @@ u64 nl_writev(CPU *c, int fd, u64 iov_va, u64 iov_cnt)
  * behind (build_reply_into), so a read waits only when nothing was ever
  * asked. */
 static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
-                         u64 iov_va, u64 iov_cnt, int flags,
-                         size_t *datagram, ssize_t *taken)
+                         const GIovec *gi, unsigned gi_cnt, int use_iov,
+                         int flags, size_t *datagram, ssize_t *taken)
 {
     const uint8_t *reply = NULL;
 
@@ -1345,9 +1389,8 @@ static int nl_take_reply(CPU *c, int fd, u64 buf, u64 len,
         return 0;
     }
     *taken = 0;
-    if (iov_va != 0) {
-        if (iov_cnt > 0)
-            *taken = nl_scatter(c, iov_va, iov_cnt, reply, *datagram);
+    if (use_iov) {
+        *taken = nl_scatter(c, gi, gi_cnt, reply, *datagram);
     } else {
         size_t copied = len < *datagram ? len : *datagram;
         /* As nl_scatter: a destination that cannot be written is EFAULT, not a
@@ -1374,7 +1417,7 @@ int nl_maybe_recvfrom(CPU *c, int fd, u64 buf, u64 len, int flags,
     size_t datagram;
     ssize_t copied;
 
-    if (!nl_take_reply(c, fd, buf, len, 0, 0, flags, &datagram, &copied))
+    if (!nl_take_reply(c, fd, buf, len, NULL, 0, 0, flags, &datagram, &copied))
         return 0;                      /* let the real recvfrom(2) run */
     if (copied < 0) { *ret = (u64)copied; return 1; }
 
@@ -1397,13 +1440,25 @@ int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret)
 {
     size_t datagram;
     ssize_t scattered;
+    GIovec gi[1024];
+    u64 total;
 
     /* As iovec_from_user, and ahead of the receive: too many segments is
      * EINVAL whether or not a reply is waiting. */
     if (iov_cnt > 1024) { *ret = (u64)(s64)-EINVAL; return 1; }
-    if (iov_va == 0)                   /* nothing to scatter into */
+    /* Everything else the import refuses -- an array the guest cannot read, a
+     * segment no ssize_t could hold -- a kernel refuses before the socket is
+     * touched, and so does the generic readv path this falls through to: it
+     * answers the same errno with the reply left where it is. A vector of no
+     * bytes is that story with a different answer: do_iter_read returns 0 the
+     * moment the imported total is zero, ahead of every read handler, so the
+     * datagram waiting here stays waiting and the substitute socket's own
+     * zero-length read supplies the 0. Consuming the datagram for either made
+     * a readv the kernel treats as a no-op throw a reply away. */
+    if (nl_iov_import(c, iov_va, (unsigned)iov_cnt, gi, &total) < 0 || total == 0)
         return 0;
-    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_cnt, 0, &datagram, &scattered))
+    if (!nl_take_reply(c, fd, 0, 0, gi, (unsigned)iov_cnt, 1, 0,
+                       &datagram, &scattered))
         return 0;                      /* let the real readv(2) run */
     *ret = (u64)scattered;             /* -EFAULT rides back as the errno */
     return 1;
@@ -1415,6 +1470,8 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
     u32 in_namelen = 0;
     size_t datagram;
     ssize_t scattered;
+    GIovec gi[1024];
+    u64 total;
 
     if (msghdr_va == 0)                /* no header: let the real one EFAULT */
         return 0;
@@ -1430,8 +1487,16 @@ int nl_maybe_recvmsg(CPU *c, int fd, u64 msghdr_va, int flags, u64 *ret)
         return 1;
     }
     if (iov_count > 1024) { *ret = (u64)(s64)-EMSGSIZE; return 1; }
+    /* ...and the iovec array it names, which import_iovec reads before the
+     * receive too: an array that cannot be read is EFAULT with the datagram
+     * still queued, where reading it only to scatter into took the datagram
+     * off the socket first and lost it to the error. (A vector of no bytes is
+     * *not* the readv case: recvmsg reaches sock_recvmsg directly, so the
+     * datagram is dequeued and the zero reported. Both measured.) */
+    int ie = nl_iov_import(c, iov_va, (unsigned)iov_count, gi, &total);
+    if (ie < 0) { *ret = (u64)(s64) ie; return 1; }
 
-    if (!nl_take_reply(c, fd, 0, 0, iov_va, iov_count, flags,
+    if (!nl_take_reply(c, fd, 0, 0, gi, (unsigned)iov_count, 1, flags,
                        &datagram, &scattered))
         return 0;                      /* let the real recvmsg(2) run */
     /* Nothing of the header is written back on a fault: the kernel returns

@@ -913,9 +913,16 @@ SYSDEF(close) {
 SYSDEF(read) {
     /* read(2) on a netlink socket is recvfrom(2) with no address. A fake one
      * answers it from the reply the last request recorded, or falls through so
-     * the read waits on the substitute socket (sys_netlink.c). */
+     * the read waits on the substitute socket (sys_netlink.c).
+     *
+     * A read of no bytes is neither: sock_read_iter answers 0 before the
+     * socket is consulted at all ("Match SYS5 behaviour"), so the reply stays
+     * queued -- and the substitute socket answers the same 0 the same way.
+     * recvfrom(fd, buf, 0) is the opposite case and goes straight to
+     * sock_recvmsg, which really does take the datagram off the socket and
+     * report the zero; both measured against a kernel. */
     u64 nlret;
-    if (nl_is_fd(c->m, (int)a0) &&
+    if (a2 != 0 && nl_is_fd(c->m, (int)a0) &&
         nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
         return nlret;
     procfs_pre_read(c, (int)a0, -1);
