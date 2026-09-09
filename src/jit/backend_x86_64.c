@@ -1023,6 +1023,12 @@ static void vcvtph2ps_m(Emit *e, int xdst, s32 disp) {
     e8(e, (u8)(0x80 | ((xdst & 7) << 3) | (R14 & 7)));   /* mod=10, disp32 */
     e32(e, (u32)disp);
 }
+/* vcvtph2ps xmm_dst, xmm_src: the register form of the above. */
+static void vcvtph2ps_rr(Emit *e, int xdst, int xsrc) {
+    vex3(e, 0x02, xdst, xsrc);
+    e8(e, 0x13);
+    e8(e, (u8)(0xC0 | ((xdst & 7) << 3) | (xsrc & 7)));
+}
 /* vcvtps2ph xmm_dst, xmm_src, imm8: narrow 4 singles -> 4 halves (low 64b of
  * dst). imm bit2=0 selects rounding from imm[1:0]; 0 = round-to-nearest-even.
  * Encoding is store-shaped: ModRM.reg = source, ModRM.rm = dest. */
@@ -1055,6 +1061,16 @@ static void movq_xr(Emit *e, int xdst, int rsrc) {
     e8(e, 0x0F); e8(e, 0x6E);
     e8(e, (u8)(0xC0 | (xdst << 3) | (rsrc & 7)));
 }
+/* Widen ONE half -- Vn's low lane -- into xmm lane 0, the other three zero.
+ * A scalar half instruction reads only that lane, but vcvtph2ps takes the
+ * whole low 64 bits of its source, and it signals Invalid on a signaling NaN:
+ * widening straight from c->v[] therefore let three halves the instruction
+ * never reads raise IOC into the guest's FPSR (`fadd h0,h0,h1` with an sNaN
+ * sitting in Vn.h[1] came back with IOC where hardware raises nothing). Going
+ * through the 16 bits that are actually read costs three instructions and
+ * cannot see the others. Clobbers RAX, which is scratch in these recipes. */
+static void vcvtph2ps_lane0(Emit *e, int xdst, s32 disp);
+
 /* movq/movd rax, xmm (scalar result extraction; movd zero-extends) */
 static void movq_rax_x(Emit *e, int dbl, int xsrc) {
     e8(e, 0x66);
@@ -1062,6 +1078,13 @@ static void movq_rax_x(Emit *e, int dbl, int xsrc) {
     e8(e, 0x0F); e8(e, 0x7E);
     e8(e, (u8)(0xC0 | (xsrc << 3) | RAX));
 }
+static void vcvtph2ps_lane0(Emit *e, int xdst, s32 disp) {
+    ld32(e, RAX, R14, disp);
+    alu_ri32(e, 0, 4, RAX, 0xffff);      /* keep the one half, zero the rest */
+    movq_xr(e, xdst, RAX);
+    vcvtph2ps_rr(e, xdst, xdst);
+}
+
 /* psll/psrl/psra xmm, imm8: opc 71/72/73 per size, /ext selects the op. */
 static void sse_shift_i(Emit *e, u8 opc, unsigned ext, int xreg, u8 imm) {
     e8(e, 0x66);
@@ -2307,9 +2330,9 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             int with_zero = (insn >> 3) & 1;
             materialize_flags(be);               /* about to clobber EFLAGS */
             if (half) {                          /* widen halves -> single */
-                vcvtph2ps_m(e, 0, OFF_V(rn));
+                vcvtph2ps_lane0(e, 0, OFF_V(rn));
                 if (with_zero) sse_rr(e, 0x66, 0xEF, 1, 1);  /* pxor: +0.0 */
-                else vcvtph2ps_m(e, 1, OFF_V(rm));
+                else vcvtph2ps_lane0(e, 1, OFF_V(rm));
                 sse_rr(e, 0, 0x2E, 0, 1);                    /* ucomiss */
             } else {
                 u8 mpfx = dbl ? 0xF2 : 0xF3;
@@ -2817,7 +2840,7 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                 break;
             }
             materialize_flags(be);
-            vcvtph2ps_m(e, 0, OFF_V(rn));            /* widen Hn -> single */
+            vcvtph2ps_lane0(e, 0, OFF_V(rn));        /* widen Hn -> single */
             if (opc == 0x1) {                        /* FABS: clear sign */
                 sse_rr(e, 0x66, 0x76, 1, 1);         /* pcmpeqd ones */
                 sse_shift_i(e, 0x72, 2, 1, 1);       /* psrld 1 -> 0x7fffffff */
@@ -2844,13 +2867,22 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                          * FMAX/FMIN(NM) declined by be_vop_ok. */
             unsigned opc = (insn >> 12) & 0xf;
             materialize_flags(be);
-            vcvtph2ps_m(e, 0, OFF_V(rn));
-            vcvtph2ps_m(e, 1, OFF_V(rm));
+            vcvtph2ps_lane0(e, 0, OFF_V(rn));
+            vcvtph2ps_lane0(e, 1, OFF_V(rm));
+            /* Scalar (F3) forms, not packed. vcvtph2ps widens FOUR halves --
+             * the whole low 64 bits of Vn and Vm -- and a packed op then does
+             * the arithmetic on lanes the instruction never reads, raising
+             * their exceptions into the guest's FPSR. FDIV made it obvious:
+             * a scalar `fdiv h0,h0,h1` on a register pair whose upper halves
+             * were zero divided 0/0 three more times and came back with IOC
+             * set. The scalar forms leave those lanes holding the widened
+             * halves untouched, and narrowing a widened half back is exact,
+             * so vcvtps2ph raises nothing for them either. */
             switch (opc) {
-                case 0x1: sse_rr(e, 0, 0x5E, 0, 1); break;   /* FDIV */
-                case 0x2: sse_rr(e, 0, 0x58, 0, 1); break;   /* FADD */
-                case 0x3: sse_rr(e, 0, 0x5C, 0, 1); break;   /* FSUB */
-                default:  sse_rr(e, 0, 0x59, 0, 1); break;   /* FMUL / FNMUL */
+                case 0x1: sse_rr(e, 0xF3, 0x5E, 0, 1); break;   /* FDIV */
+                case 0x2: sse_rr(e, 0xF3, 0x58, 0, 1); break;   /* FADD */
+                case 0x3: sse_rr(e, 0xF3, 0x5C, 0, 1); break;   /* FSUB */
+                default:  sse_rr(e, 0xF3, 0x59, 0, 1); break;   /* FMUL / FNMUL */
             }
             sse_rr(e, 0, 0x2E, 0, 0);                /* ucomiss NaN? */
             u8 *slow = jcc_fwd(e, CC_P);
@@ -2894,7 +2926,7 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                 unsigned ftype = (insn >> 22) & 3, opc = (insn >> 15) & 0x3f;
                 if (opc == 0x4 || opc == 0x5) {      /* h -> s / d (widen) */
                     int dbl = (opc == 0x5);
-                    vcvtph2ps_m(e, 0, OFF_V(rn));    /* xmm0 lane0 = widen(h0) */
+                    vcvtph2ps_lane0(e, 0, OFF_V(rn)); /* xmm0 lane0 = widen(h0) */
                     if (dbl) sse_rr(e, 0xF3, 0x5A, 0, 0);     /* cvtss2sd */
                     sse_rr(e, dbl ? 0x66 : 0, 0x2E, 0, 0);    /* ucomis x0,x0 */
                     slow = jcc_fwd(e, CC_P);
@@ -3070,8 +3102,8 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
             u8 *jf = (cc == CC_ALWAYS) ? NULL : jcc_fwd(e, cc ^ 1);
             int half = ((insn >> 22) & 3) == 3;  /* taken: FCMP recompose */
             if (half) {                          /* widen halves -> single */
-                vcvtph2ps_m(e, 0, OFF_V(rn));
-                vcvtph2ps_m(e, 1, OFF_V(rm));
+                vcvtph2ps_lane0(e, 0, OFF_V(rn));
+                vcvtph2ps_lane0(e, 1, OFF_V(rm));
                 sse_rr(e, 0, 0x2E, 0, 1);        /* ucomiss */
             } else {
                 u8 mpfx = dbl ? 0xF2 : 0xF3;
