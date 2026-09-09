@@ -3311,7 +3311,14 @@ static void simd_shift_imm(CPU *c, u32 insn) {
             }
             case (1 << 5) | 0x08: {                                           /* SRI */
                 unsigned sh = 2 * esize - immhb;                              /* keep high sh bits of Vd */
-                v = ((a & emask) >> sh) | (velem_get(&c->v[Rd], size, i) & ~(emask >> sh));
+                /* shift == esize is architecturally valid (SRI .2d #64 and the
+                 * narrower .8b #8 / .4h #16 / .2s #32): nothing of the source
+                 * survives and the destination element is preserved whole. Only
+                 * the 64-bit lane can express it as a full-width C shift, which
+                 * is undefined — so gate rather than shift. */
+                u64 ins = (sh >= esize) ? 0 : (emask >> sh);                  /* mask of inserted bits */
+                v = ((sh >= esize) ? 0 : ((a & emask) >> sh)) |
+                    (velem_get(&c->v[Rd], size, i) & ~ins);
                 break;
             }
             /* shift-right (+accumulate, rounding) — via the register-shift kernel */
