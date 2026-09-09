@@ -1241,7 +1241,7 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             int oplo = is_cmn ? OP_ADD : OP_SUB;
             int ophi = is_cmn ? OP_ADC : OP_SBC;
             int alo = src_hv(be, HV(o->a, 0), R0);
-            if (is_imm) alu_ri_s(e, oplo, w ? 1 : 1, R2, alo, (u32)o->imm, R1);
+            if (is_imm) alu_ri_s(e, oplo, 1, R2, alo, (u32)o->imm, R1);
             else {
                 int blo = src_hv(be, HV(o->b, 0), R1);
                 dp_r(e, CC_AL, oplo, 1, R2, alo, blo, SH_LSL, 0);

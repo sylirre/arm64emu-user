@@ -1088,10 +1088,11 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 ir_put(ir, IRO_ASRI, w, e->rd, rx(e->rn), 0, 0, e->rm, 0);
             break;
         case PD_UBFX64: case PD_UBFX32:     /* (rn >> rm) & imm */
-            w = (e->op == PD_UBFX64);
             if (rx(e->rd) != VREG_ZERO) {
-                /* 64-bit ops: handlers use full-width >> and mask (the mask
-                 * already truncates for the 32-bit form) */
+                /* Both widths emit 64-bit ops, so there is no `w` to set here:
+                 * the handlers use a full-width >> and mask, and the mask
+                 * already truncates for the 32-bit form (its lsb+width never
+                 * passes 32, so nothing above bit 31 can reach the result). */
                 ir_put(ir, IRO_LSRI, 1, VREG_TMP0, rx(e->rn), 0, 0, e->rm, 0);
                 ir_put(ir, IRO_ANDI, 1, e->rd, VREG_TMP0, 0, 0, e->imm, 0);
             }

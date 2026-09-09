@@ -83,8 +83,7 @@ static void e64(Emit *e, u64 v) {
 static void rex(Emit *e, int w, int reg, int idx, int rm) {
     u8 r = (u8)(0x40 | (w << 3) | ((reg >> 3) << 2) | ((idx >> 3) << 1) |
                 (rm >> 3));
-    if (r != 0x40 || w) e8(e, r);
-    else if (r == 0x40 && 0) e8(e, r);
+    if (r != 0x40 || w) e8(e, r);   /* a bare 0x40 carries no bit: drop it */
 }
 
 /* reg-reg: opc reg, rm (direction per opcode) */
