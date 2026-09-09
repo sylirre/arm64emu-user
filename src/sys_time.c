@@ -41,7 +41,11 @@ static int ts_out(CPU *c, u64 va, const struct timespec *ts) {
 static int clockid_allowed(s32 id) {
     if (id >= 0) return 1;                       /* CLOCK_REALTIME & friends */
     if ((id & 7) == 3 /* CLOCKFD */) return 1;   /* names one of our own fds */
-    s32 pid = (s32)~(id >> 3);
+    /* CPUCLOCK_PID is ~(id >> 3) with the shift arithmetic, which is only
+     * implementation-defined C for the negative id this line is reached with.
+     * ~id is not negative, and ~(id >> 3) == (~id) >> 3 for an arithmetic
+     * shift, so the same pid comes out of a plain unsigned shift. */
+    s32 pid = (s32)((u32)~id >> 3);
     if (pid == 0) return 1;                      /* this task */
     return (id & 4 /* PERTHREAD */) ? proctab_has_task(pid) : proctab_has(pid);
 }
