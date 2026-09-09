@@ -2347,6 +2347,14 @@ check_fixture sockfilter_get $'attach=0\ncount=0 len=600 wrote=0\nshort=0 len=60
 # qemu-user never passes optlen to the host at all (it re-issues each option
 # with a length of its own), so it answers 0 where a kernel answers EINVAL.
 check_fixture sockoptlen $'plain=0\nhi32=0\nhi32_zero=-22\nneg=-22\nneg_min=-22\nget=0 on=1 len=4'
+# sendmsg's ancillary data: a malformed element is EINVAL and the message is
+# not sent at all, a well-formed one goes out even when its padding runs off
+# the end of the buffer, a non-zero msg_controllen the guest cannot back is
+# EFAULT (a null pointer included), and msg_controllen past INT_MAX is ENOBUFS
+# on a send and no limit at all on a receive. Self-checking: qemu-user re-parses
+# the control buffer with a walk of its own, accepting cmsg_len 0, 1 and 17
+# where a kernel answers EINVAL, and dies outright on the past-INT_MAX rows.
+check_fixture cmsgvalid $'short15 snd=-1 err=22 peer=-1 perr=11\nzerolen snd=-1 err=22 peer=-1 perr=11\nonelen  snd=-1 err=22 peer=-1 perr=11\nover17  snd=-1 err=22 peer=-1 perr=11\nover25  snd=-1 err=22 peer=-1 perr=11\nempty16 snd=1 err=0 peer=1 perr=0\nfd20/24 snd=1 err=0 peer=1 perr=0\nfd20/23 snd=1 err=0 peer=1 perr=0\nlvl16   snd=1 err=0 peer=1 perr=0\nnohdr8  snd=1 err=0 peer=1 perr=0\n2nd_bad snd=-1 err=22 peer=-1 perr=11\n2nd_ok  snd=1 err=0 peer=1 perr=0\nnullsnd=-1 err=14\nnullbig=-1 err=105\nnullrcv=1 err=0 ctrunc=1 ctl=0\nhugesnd=-1 err=105\nhugercv=1 err=0 ctl=0\npassfd snd=1 rcv=1 fd=1 ok=1\ndone'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
 # The guest's own memory footprint, as its own /proc reports it -- and as
 # another guest process's /proc reports that one. Self-checking:

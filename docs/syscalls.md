@@ -676,7 +676,7 @@ gather/scatter vector — and the sizes it was willing to bounce used to be flat
 constants: 4 KB for an option value, 4 KB for ancillary data, 16 MiB for a
 vector. A kernel has none of those, so each one was a guest-visible refusal of
 something Linux accepts, and the control one was worse than a refusal:
-`cmsg_g2h` stops at the first element its buffer cannot hold, so a `sendmsg`
+`cmsg_g2h` used to *stop* at the first element it could not take, so a `sendmsg`
 whose ancillary data ran past 4 KB went out with the rest of it **missing** and
 reported success. Each is now staged at the size the guest asked for and
 bounded the way `read`/`write` already bound theirs — by the guest's own
@@ -695,9 +695,33 @@ owns rather than a number it merely named:
   kernel's `copy_to_user` stops at the same page, and the writeback still
   produces that `EFAULT`. The reported length is then never trusted past the
   staging.
-- `msg_controllen` is bounded only by `INT_MAX` (`____sys_sendmsg`) and, on a
-  send, by the socket's own `optmem` budget — which is the kernel's to enforce,
-  and it can only do so once it is handed what the guest sent (`ENOBUFS`).
+- `msg_controllen` is bounded only by `INT_MAX` (`____sys_sendmsg`, which
+  answers `ENOBUFS` — not `EINVAL` — for more) and, on a send, by the socket's
+  own `optmem` budget, which is the kernel's to enforce and can only be
+  enforced once it is handed what the guest sent. A *receive* has no ceiling at
+  all: the length there is only the capacity the kernel may fill, so it is
+  clamped to what the guest's buffer can take rather than refused. A send then
+  copies the whole buffer in, so a non-zero length the guest cannot back is
+  `EFAULT` — `msg_control == NULL` included, which used to be taken for "no
+  ancillary data" and sent the message; a *receive* only writes through the
+  pointer, so a null one there is no error at all and the kernel raises
+  `MSG_CTRUNC` instead. The send's staging is one alignment step larger than
+  the guest's own length, because the last element's `cmsg_len` need not leave
+  room for its own padding — a message a kernel sends (`CMSG_NXTHDR` simply
+  finds no next header) and the conversion writes out padded.
+- **A malformed control element is `EINVAL`, and the message is not sent at
+  all.** The walk is `CMSG_FIRSTHDR`/`CMSG_OK`/`CMSG_NXTHDR`, element for
+  element: it starts only if a whole header fits, steps only to a header that
+  fits whole, and every element it reaches must have a `cmsg_len` no smaller
+  than a header and no larger than what is left of the buffer. Every send path
+  validates the buffer before it looks at anything in it (`__scm_send`,
+  `sock_cmsg_send`, `ip_cmsg_send`), so a message whose ancillary data is
+  malformed never goes out. Treating a bad element as a place to *stop*
+  instead sent the message with that element and everything after it silently
+  dropped, and reported success. `tests/fixtures/cmsgvalid.c` covers it, and is
+  self-checking: qemu-user re-parses the control buffer with a walk of its own,
+  accepting `cmsg_len` 0, 1 and 17 where a kernel answers `EINVAL`, and dies
+  outright on a `msg_controllen` past `INT_MAX`.
 - The iovec bounds are `__import_iovec`'s own: a segment whose length is
   negative as an `ssize_t` is `EINVAL`, and the running total is *clamped* to
   `MAX_RW_COUNT` rather than refused, so a vector past that is a short transfer

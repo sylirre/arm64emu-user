@@ -704,8 +704,19 @@ typedef struct {
 #define GCMSG_ALIGN(n) (((n) + 7u) & ~(u64)7u)
 
 /* Guest control buffer -> host. Returns the host controllen, or -1 if the
- * result would not fit (the caller reports EINVAL, as the kernel does for a
- * control buffer it cannot hold). */
+ * buffer is malformed or the result would not fit (the caller reports EINVAL,
+ * as the kernel does for a control buffer it cannot parse or cannot hold).
+ *
+ * The walk is the kernel's, element for element: it starts only if a whole
+ * header fits (CMSG_FIRSTHDR), steps only to a header that fits whole
+ * (CMSG_NXTHDR), and every element it does reach must satisfy CMSG_OK --
+ * cmsg_len no smaller than a header and no larger than what is left of the
+ * buffer. An element that fails that is an error, not a place to stop: every
+ * send path validates the control buffer before it looks at anything in it
+ * (__scm_send, sock_cmsg_send, ip_cmsg_send all bail with EINVAL), so a
+ * message whose ancillary data is malformed is never sent at all. Stopping
+ * instead used to send the message with the offending element and everything
+ * after it silently dropped, and report success. */
 static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
     size_t goff = 0, hoff = 0;
     while (goff + GCMSG_HDRLEN <= glen) {
@@ -716,7 +727,7 @@ static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
         memcpy(&type, gb + goff + 12, 4);
         /* Bound by subtraction: clen is a guest u64 and must not be trusted to
          * advance the walk (see the netlink walks for the same hazard). */
-        if (clen < GCMSG_HDRLEN || clen > glen - goff) break;
+        if (clen < GCMSG_HDRLEN || clen > glen - goff) return -1;
         size_t dlen = (size_t)(clen - GCMSG_HDRLEN);
         size_t hel = CMSG_LEN(dlen), hstep = CMSG_ALIGN(hel);
         if (hstep > hcap - hoff) return -1;
@@ -937,24 +948,48 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
      * went out with the rest of its control data missing, reported as a
      * success -- and cut a receive short with an MSG_CTRUNC the kernel would
      * not have raised. */
-    if (g->msg_control && g->msg_controllen) {
-        if (g->msg_controllen > INT_MAX) {
-            free(bounce); free(iov); free(gbase); return -EINVAL;
-        }
-        size_t cl = (size_t)g->msg_controllen;
+    /* A send refuses more than INT_MAX of it with ENOBUFS -- which is what
+     * ____sys_sendmsg answers, before it has looked at msg_control at all, so
+     * a null pointer is no escape from it. A receive has no such ceiling: the
+     * length is only the capacity the kernel may fill, so clamp rather than
+     * refuse, which is the same answer for any buffer a guest can actually
+     * back and keeps the size_t cast below from truncating on an ILP32 host. */
+    if (for_send && g->msg_controllen > INT_MAX) {
+        free(bounce); free(iov); free(gbase); return -ENOBUFS;
+    }
+    /* And a send then copies the whole of the buffer in, so a non-zero length
+     * the guest cannot back is EFAULT -- msg_control == NULL included, which
+     * used to be taken for "no ancillary data" and sent the message. A receive
+     * only ever writes through the pointer, so there a null one is not an
+     * error at all: the kernel has nowhere to put ancillary data and says so
+     * with MSG_CTRUNC, which is what the host raises for us. */
+    if (g->msg_controllen && (for_send || g->msg_control)) {
+        size_t cl = g->msg_controllen > INT_MAX ? (size_t)INT_MAX
+                                                : (size_t)g->msg_controllen;
         if (for_send) {
             /* The guest must back all of it, which is what bounds the
              * allocation (as for the iovecs above); the host kernel then
              * applies its own optmem ceiling to the converted buffer. Stage
              * the guest's bytes, then rebuild them in the host's cmsghdr
              * layout -- the two differ on an ILP32 host, where the host's
-             * element is the smaller of the two, so the guest's own length is
-             * always capacity enough for the conversion. */
+             * element is the smaller of the two, so no element ever grows.
+             *
+             * The staging is still one alignment step larger than the guest's
+             * own length: the last element's cmsg_len need not be a multiple
+             * of the alignment, and the kernel accepts one whose padded size
+             * runs off the end of the buffer (CMSG_NXTHDR simply finds no next
+             * header), while the conversion writes that element padded. Sizing
+             * the staging at the guest's length exactly made such a message
+             * EINVAL here where the host sends it. */
             if (rw_room(c, g->msg_control, cl, ACC_READ) < cl) {
                 free(bounce); free(iov); free(gbase); return -EFAULT;
             }
+            /* One guest alignment step of slack: that is the most the padded
+             * last element can run past the guest's own length, and the host's
+             * own step is never the larger of the two. */
+            size_t hcap = cl + (size_t)GCMSG_ALIGN(1);
             u8 *gctrl = malloc(cl);
-            u8 *hctrl = calloc(1, cl);
+            u8 *hctrl = calloc(1, hcap);
             if (!gctrl || !hctrl) {
                 free(gctrl); free(hctrl);
                 free(bounce); free(iov); free(gbase); return -ENOMEM;
@@ -963,14 +998,14 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
                 free(gctrl); free(hctrl);
                 free(bounce); free(iov); free(gbase); return -EFAULT;
             }
-            ssize_t hl = cmsg_g2h(gctrl, cl, hctrl, cl);
+            ssize_t hl = cmsg_g2h(gctrl, cl, hctrl, hcap);
             free(gctrl);
             if (hl < 0) {
                 free(hctrl);
                 free(bounce); free(iov); free(gbase); return -EINVAL;
             }
             *ctrl_out = hctrl;
-            *ctrl_cap_out = cl;
+            *ctrl_cap_out = hcap;
             h->msg_control = hctrl;
             h->msg_controllen = (size_t)hl;
         } else {
