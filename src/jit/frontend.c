@@ -660,6 +660,8 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
     }
 
     if (vclass == ~0u || !be_vop_ok(vclass, insn)) return 0;
+    /* Flush-to-zero has no inline form: back to exec_fpsimd (ir.h). */
+    if (ir->fpnondef && vop_fpcr_sensitive(vclass)) return 0;
     IROp *o = ir_put(ir, IRO_VOP, 0, gdst, gsrc, VREG_ZERO, 0, (u64)insn,
                      vclass | aux_extra);
     o->imm2pc = pc;

@@ -117,6 +117,14 @@ typedef struct JitEnv {
                                  * byte-shift masks; no RIP-relative pools) */
     u32 slowmem;                /* A64_JIT_SLOWMEM: every mem op takes the
                                  * helper path (fast-path codegen bisection) */
+    /* Sticky: this thread's guest has asked for a non-default FP mode
+     * (FPCR.FZ or FZ16) at least once, so no block translated from here on
+     * inlines floating point (ir.h's vop_fpcr_sensitive). Sticky rather than
+     * tracking the live bit because clearing it back would have to discard
+     * the cache again, and a guest that toggles the mode would then flush on
+     * every toggle; a program that sets flush-to-zero at startup and leaves
+     * it -- which is what -ffast-math startup code does -- pays one flush. */
+    u8 fpnondef;
 
     /* Indirect-branch target cache, probed inline by generated code for
      * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */

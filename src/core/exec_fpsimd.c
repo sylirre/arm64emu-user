@@ -268,6 +268,7 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
 #define FPSR_OFC 0x04u
 #define FPSR_UFC 0x08u
 #define FPSR_IXC 0x10u
+#define FPSR_IDC 0x80u
 #define FPSR_QC  (1u << 27)
 static u32 g_fpexc;                  /* software-raised pending FPSR bits */
 
@@ -288,6 +289,136 @@ void fpsr_sync(CPU *c) {
     fold_host_fpexc();
     c->fpsr |= g_fpexc;
     g_fpexc = 0;
+}
+
+/* ---------------- FPCR.FZ / FPCR.FZ16: flush-to-zero ----------------
+ * The architecture flushes a denormal *operand* to zero as it unpacks it
+ * (FPProcessDenorm, raising IDC) and a *result* whose value is below the
+ * smallest normal to zero as it rounds (FPRoundBase, raising UFC -- and only
+ * UFC: a value being replaced by zero does not report the inexactness of a
+ * rounding that no longer happens). FZ covers single and double precision,
+ * FZ16 covers half, and the two are independent. Neither is set in the FPCR a
+ * process starts with; a `-ffast-math` binary sets FZ from its startup code
+ * (gcc's crtfastmath.o) and never looks at it again, which is the case that
+ * matters -- denormal arithmetic is what the mode exists to avoid.
+ *
+ * The operations that never unpack their operand -- FMOV, FABS, FNEG, FCSEL,
+ * INS/DUP, and the forms that read a lane as an integer -- are unaffected, so
+ * they keep the plain accessors and the _raw half converters; every site that
+ * does unpack goes through fz_in_*, and every rounding either through
+ * fz_out_* or through a narrower that tests the exact operand itself.
+ *
+ * Per-thread because guest threads have their own FPCR, and unlike the sticky
+ * exception flags beside them these two decide a *result*, not a status bit.
+ * They cannot change under the instruction in flight, so exec_fpsimd latches
+ * them once per dispatch instead of threading a CPU pointer through every
+ * lane kernel.
+ *
+ * One deviation, and it is the tininess-detection difference already listed
+ * above wearing a different hat: for the single- and double-precision paths
+ * the host hands back a result that is already rounded, so a value whose
+ * exact magnitude sat just below the smallest normal but rounded up to it is
+ * kept here where the architecture (which tests the exponent before rounding)
+ * would flush it. It needs an exact FMUL/FDIV/fused-multiply result inside
+ * the last ULP below 2^-126 or 2^-1022 -- FADD and FSUB cannot reach it at
+ * all, since a subnormal difference of two normals is exact. The half
+ * pipeline computes in double and every narrowing convert below is
+ * pure-integer, so both have the exact value in hand and flush exactly. */
+#define FPCR_FZ16 (1u << 19)
+#define FPCR_FZ   (1u << 24)
+static __thread int g_fz, g_fz16;
+
+/* FPProcessDenorm: a denormal operand reads as zero of its own sign. */
+static double fz_in_d(double x) {
+    u64 b; memcpy(&b, &x, 8);
+    if (!g_fz || (b & 0x7ff0000000000000ULL) || !(b & 0x000fffffffffffffULL)) return x;
+    g_fpexc |= FPSR_IDC;
+    b &= 0x8000000000000000ULL; memcpy(&x, &b, 8);
+    return x;
+}
+static float fz_in_s(float x) {
+    u32 b; memcpy(&b, &x, 4);
+    if (!g_fz || (b & 0x7f800000u) || !(b & 0x007fffffu)) return x;
+    g_fpexc |= FPSR_IDC;
+    b &= 0x80000000u; memcpy(&x, &b, 4);
+    return x;
+}
+/* Half is the odd one: FZ16 flushes the operand and raises NOTHING. IDC
+ * reports a denormal that was thrown away, and the architecture carves the
+ * half-precision flush out of that -- FPUnpack's InputDenorm arm is
+ * conditioned on the operand not being 16-bit. Confirmed against
+ * qemu-aarch64, which has the same carve-out for the same reason. */
+static u16 fz_in_h(u16 h) {
+    if (!g_fz16 || (h & 0x7c00u) || !(h & 0x03ffu)) return h;
+    return (u16)(h & 0x8000u);
+}
+
+/* The same two, for the pure-integer paths that hold a value as its bit
+ * pattern (the reciprocal estimates). No Inexact is in flight there -- those
+ * raise their flags by hand -- so the result form needs no bookkeeping. */
+static u32 fz_in_bits_s(u32 v) {
+    if (!g_fz || (v & 0x7f800000u) || !(v & 0x007fffffu)) return v;
+    g_fpexc |= FPSR_IDC;
+    return v & 0x80000000u;
+}
+static u64 fz_in_bits_d(u64 v) {
+    if (!g_fz || (v & 0x7ff0000000000000ULL) || !(v & 0x000fffffffffffffULL)) return v;
+    g_fpexc |= FPSR_IDC;
+    return v & 0x8000000000000000ULL;
+}
+static u32 fz_out_bits_s(u32 v) {
+    if (!g_fz || (v & 0x7f800000u) || !(v & 0x007fffffu)) return v;
+    g_fpexc |= FPSR_UFC;
+    return v & 0x80000000u;
+}
+static u64 fz_out_bits_d(u64 v) {
+    if (!g_fz || (v & 0x7ff0000000000000ULL) || !(v & 0x000fffffffffffffULL)) return v;
+    g_fpexc |= FPSR_UFC;
+    return v & 0x8000000000000000ULL;
+}
+static u16 fz_out_h(u16 v) {
+    if (!g_fz16 || (v & 0x7c00u) || !(v & 0x03ffu)) return v;
+    g_fpexc |= FPSR_UFC;
+    return (u16)(v & 0x8000u);
+}
+
+/* FPRoundBase's flush of a denormal result. *flushed tells fz_release() to
+ * take back the Inexact the host raised reaching a value now discarded. */
+static double fz_out_d(double x, int *flushed) {
+    u64 b; memcpy(&b, &x, 8);
+    *flushed = 0;
+    if (!g_fz || (b & 0x7ff0000000000000ULL) || !(b & 0x000fffffffffffffULL)) return x;
+    g_fpexc |= FPSR_UFC; *flushed = 1;
+    b &= 0x8000000000000000ULL; memcpy(&x, &b, 8);
+    return x;
+}
+static float fz_out_s(float x, int *flushed) {
+    u32 b; memcpy(&b, &x, 4);
+    *flushed = 0;
+    if (!g_fz || (b & 0x7f800000u) || !(b & 0x007fffffu)) return x;
+    g_fpexc |= FPSR_UFC; *flushed = 1;
+    b &= 0x80000000u; memcpy(&x, &b, 4);
+    return x;
+}
+
+/* The UFC-without-IXC rule needs each rounding to own its view of the host's
+ * sticky flags, or a flushed lane would take a *neighbouring* lane's Inexact
+ * away with it: fz_bank() banks what is already pending and hands this one a
+ * clean slate, fz_release() folds the lane's own flags back, dropping IXC if
+ * the lane flushed. Both cost one fetestexcept unless something is actually
+ * pending, and neither exists at all for a guest that left FPCR alone. */
+static u32 fz_bank(void) {
+    if (!g_fz && !g_fz16) return 0;
+    fold_host_fpexc();
+    u32 pending = g_fpexc;
+    g_fpexc = 0;
+    return pending;
+}
+static void fz_release(u32 banked, int flushed) {
+    if (!g_fz && !g_fz16) return;
+    fold_host_fpexc();
+    if (flushed) g_fpexc &= ~FPSR_IXC;
+    g_fpexc |= banked;
 }
 
 static int is_snan_d(double v) {
@@ -405,7 +536,7 @@ static float fpnan_muladd_s(float r, float a, float n, float m) {
     return fpnan_s3(r, a, n, m);
 }
 
-static float f16_to_f32(u16 h) {
+static float f16_to_f32_raw(u16 h) {
     u32 sign = (u32)(h & 0x8000u) << 16;
     u32 exp  = (h >> 10) & 0x1fu;
     u32 mant = h & 0x3ffu;
@@ -426,6 +557,9 @@ static float f16_to_f32(u16 h) {
     }
     float f; memcpy(&f, &bits, 4); return f;
 }
+/* The unpacking form, for the arithmetic that widens half to single
+ * (FMLAL/FMLSL): FPUnpack honors FPCR.FZ16 there. */
+static float f16_to_f32(u16 h) { return f16_to_f32_raw(fz_in_h(h)); }
 
 /* Half -> double, the same pure unpack one level up: exact for every half
  * value, and NaNs keep BOTH payload and signaling-ness (half frac<9:0> lands
@@ -435,7 +569,7 @@ static float f16_to_f32(u16 h) {
  * a signaling NaN, after which fpnan_*'s sNaN-priority ranking, FCMP's
  * signaling detection and FPMulAdd's quiet-addend rule all see the wrong
  * class. */
-static double f16_to_f64(u16 h) {
+static double f16_to_f64_raw(u16 h) {
     u64 sign = (u64)(h & 0x8000u) << 48;
     u64 exp  = (h >> 10) & 0x1fu;
     u64 mant = h & 0x3ffu;
@@ -455,12 +589,22 @@ static double f16_to_f64(u16 h) {
     }
     double d; memcpy(&d, &bits, 8); return d;
 }
+/* The unpacking form: everything that reads a half lane as a number takes
+ * this one, so FPCR.FZ16 is honored in one place. FABS/FNEG (and the forms
+ * that read the lane as an integer) keep the _raw widen above. */
+static double f16_to_f64(u16 h) { return f16_to_f64_raw(fz_in_h(h)); }
 
 /* FCVT widen from half as a *conversion* (vs f16_to_f32's pure unpack, used
  * when a following arithmetic op will process the NaN itself): a signaling
- * NaN raises IOC and the result NaN is quieted, per FPConvertNaN. */
+ * NaN raises IOC and the result NaN is quieted, per FPConvertNaN.
+ *
+ * Flush-to-zero does not reach the half side of a precision change at all:
+ * FPConvert unpacks through FPUnpackCV and rounds through FPRoundCV, and both
+ * clear FZ16 before doing anything (FZ, and so the single/double side of the
+ * same instruction, is left alone). So this takes the raw widen, and the
+ * narrowing direction takes f64_to_f16_raw. */
 static float fcvt_h2s(u16 h) {
-    float f = f16_to_f32(h);
+    float f = f16_to_f32_raw(h);
     if ((h & 0x7c00) == 0x7c00 && (h & 0x3ff)) {   /* NaN */
         if (!(h & 0x200)) g_fpexc |= FPSR_IOC;     /* signaling */
         u32 b; memcpy(&b, &f, 4); b |= 0x400000;   /* quiet the payload copy */
@@ -475,8 +619,12 @@ static float fcvt_h2s(u16 h) {
  * Raises the conversion's FPSR flags into g_fpexc (pure-integer path, so the
  * host never sees them): sNaN -> IOC, overflow -> OFC|IXC (including a
  * round-up into Inf), tiny (before rounding, ARM's default) and inexact ->
- * UFC|IXC, plain inexact -> IXC. */
-static u16 f64_to_f16(double x) {
+ * UFC|IXC, plain inexact -> IXC. `fz` applies FPCR.FZ16 to the result: the
+ * operand is the exact pre-rounding value here, so the architecture's
+ * before-rounding tininess test is literally the tentative exponent, and a
+ * value that rounding would have carried up to the smallest normal is flushed
+ * like any other. UFC alone -- the discarded rounding reports nothing. */
+static u16 f64_to_f16_round(double x, int fz) {
     u64 b; memcpy(&b, &x, 8);
     u16 sign = (u16)((b >> 48) & 0x8000u);
     u64 mag  = b & 0x7fffffffffffffffULL;              /* |x| bit pattern */
@@ -503,6 +651,10 @@ static u16 f64_to_f16(double x) {
     if (he >= 0x1f) {                                  /* overflow -> Inf */
         g_fpexc |= FPSR_OFC | FPSR_IXC;
         return (u16)(sign | 0x7c00u);
+    }
+    if (fz && he <= 0) {                               /* FPCR.FZ16 */
+        g_fpexc |= FPSR_UFC;
+        return sign;
     }
 
     int shift;
@@ -533,6 +685,10 @@ static u16 f64_to_f16(double x) {
         g_fpexc |= FPSR_OFC | FPSR_IXC;
     return res;
 }
+/* The rounding form (every result that lands in a half lane) and the raw one
+ * (FABS/FNEG, which rewrite a sign bit and round nothing). */
+static u16 f64_to_f16(double x)     { return f64_to_f16_round(x, g_fz16); }
+static u16 f64_to_f16_raw(double x) { return f64_to_f16_round(x, 0); }
 
 /* IEEE-754 binary64 -> binary32 with round-to-ODD (FCVTXN). Round-to-odd is
  * truncation with the shifted-out remainder OR'd into the result LSB; unlike
@@ -550,6 +706,10 @@ static u32 f64_to_f32_round_odd(double x) {
         return sign | (mag > 0x7ff0000000000000ULL ? 0x7fc00000u : 0x7f800000u);
     }
     if (mag == 0) return sign;                         /* +/- zero */
+    if (g_fz && mag < 0x3810000000000000ULL) {         /* FPCR.FZ: |x| < 2^-126 */
+        g_fpexc |= FPSR_UFC;
+        return sign;
+    }
     if (mag < 0x36a0000000000000ULL) {                 /* |x| < 2^-149: tiny -> smallest odd subnormal */
         g_fpexc |= FPSR_UFC | FPSR_IXC;
         return sign | 1u;
@@ -572,6 +732,23 @@ static u32 f64_to_f32_round_odd(double x) {
 
     if (fe > 0) return sign | (u32)(((u32)(fe - 1) << 23) + (u32)rounded);  /* implicit 1 carries into exp */
     return sign | (u32)rounded;                        /* subnormal */
+}
+
+/* FPRound to single of a value held exactly in a double -- the narrowing FCVT
+ * and FCVTN. Under FPCR.FZ the tininess test is the architecture's, on the
+ * operand rather than on the rounded float: testing the result would miss an
+ * exact value that rounding carried up to the smallest normal, and would let
+ * the host raise an Inexact for a value about to be replaced by zero. */
+static float fz_cvt_s(double x) {
+    if (g_fz) {
+        u64 b; memcpy(&b, &x, 8);
+        u64 mag = b & 0x7fffffffffffffffULL;
+        if (mag && mag < 0x3810000000000000ULL) {      /* 0 < |x| < 2^-126 */
+            g_fpexc |= FPSR_UFC;
+            return (b >> 63) ? -0.0f : 0.0f;
+        }
+    }
+    return (float)x;
 }
 
 /* Per-lane FP <-> bits accessors for vector ops (lane i of a V128). */
@@ -1058,8 +1235,10 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         unsigned opc = BITS(20, 15);
         if (opc == 0x4 && ftype == 3) { fp_wr_s(c, Rd, fcvt_h2s(fp_rd_h(c, Rn))); return; }        /* FCVT Sd,Hn */
         if (opc == 0x5 && ftype == 3) { fp_wr_d(c, Rd, (double)fcvt_h2s(fp_rd_h(c, Rn))); return; } /* FCVT Dd,Hn */
-        if (opc == 0x7 && ftype == 0) { fp_wr_h(c, Rd, f64_to_f16((double)fp_rd_s(c, Rn))); return; } /* FCVT Hd,Sn */
-        if (opc == 0x7 && ftype == 1) { fp_wr_h(c, Rd, f64_to_f16(fp_rd_d(c, Rn))); return; }         /* FCVT Hd,Dn */
+        /* _raw: FPRoundCV ignores FZ16 (see fcvt_h2s); the operand is still
+         * the FZ side's, and flushes with it. */
+        if (opc == 0x7 && ftype == 0) { fp_wr_h(c, Rd, f64_to_f16_raw((double)fz_in_s(fp_rd_s(c, Rn)))); return; } /* FCVT Hd,Sn */
+        if (opc == 0x7 && ftype == 1) { fp_wr_h(c, Rd, f64_to_f16_raw(fz_in_d(fp_rd_d(c, Rn)))); return; }         /* FCVT Hd,Dn */
     }
 
     /* FMOV between a general register and a half register (ftype=3): a raw
@@ -1090,25 +1269,33 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         }
         if (o2 == 0 && BIT(14) == 1) {                    /* FP data-processing (1 source) */
             unsigned opc = BITS(20, 15); double r;
-            double x = f16_to_f64(fp_rd_h(c, Rn));
+            u16 hn = fp_rd_h(c, Rn);
+            /* FMOV/FABS/FNEG rewrite a sign bit and unpack nothing, so they
+             * take the raw widen and the raw narrow: FPCR.FZ16 must not turn
+             * a denormal operand -- or a denormal result -- into zero here.
+             * Every other form is an FPUnpack and takes the flushing one. */
+            double x = f16_to_f64_raw(hn);
+            int raw = (opc == 0x1 || opc == 0x2);
             switch (opc) {
-                case 0x0: fp_wr_h(c, Rd, fp_rd_h(c, Rn)); return;      /* FMOV  */
+                case 0x0: fp_wr_h(c, Rd, hn); return;                 /* FMOV  */
                 case 0x1: r = __builtin_fabs(x); break;               /* FABS  */
                 case 0x2: r = -x; break;                              /* FNEG  */
-                case 0x3: fsqrt_raise_d(x); r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
-                case 0x8: r = frint_d(x, 0, 0); break;                /* FRINTN */
-                case 0x9: r = frint_d(x, 1, 0); break;                /* FRINTP */
-                case 0xa: r = frint_d(x, 2, 0); break;                /* FRINTM */
-                case 0xb: r = frint_d(x, 3, 0); break;                /* FRINTZ */
-                case 0xc: r = frint_d(x, 4, 0); break;                /* FRINTA */
+                case 0x3: x = f16_to_f64(hn); fsqrt_raise_d(x);
+                          r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
+                case 0x8: r = frint_d(f16_to_f64(hn), 0, 0); break;   /* FRINTN */
+                case 0x9: r = frint_d(f16_to_f64(hn), 1, 0); break;   /* FRINTP */
+                case 0xa: r = frint_d(f16_to_f64(hn), 2, 0); break;   /* FRINTM */
+                case 0xb: r = frint_d(f16_to_f64(hn), 3, 0); break;   /* FRINTZ */
+                case 0xc: r = frint_d(f16_to_f64(hn), 4, 0); break;   /* FRINTA */
                 case 0xe: case 0xf:                                   /* FRINTX/I */
-                    r = frint_d(x, (int)((c->fpcr >> 22) & 3), opc == 0xe); break;
+                    r = frint_d(f16_to_f64(hn), (int)((c->fpcr >> 22) & 3), opc == 0xe); break;
                 default: fpsimd_undef(c, insn); return;
             }
-            fp_wr_h(c, Rd, f64_to_f16(r)); return;
+            fp_wr_h(c, Rd, raw ? f64_to_f16_raw(r) : f64_to_f16(r)); return;
         }
         if (o2 == 2) {                                    /* FP data-processing (2 source) */
             unsigned Rm = BITS(20, 16), opc = BITS(15, 12); double r;
+            if (opc > 0x8) { fpsimd_undef(c, insn); return; }  /* before the unpack */
             double a = f16_to_f64(fp_rd_h(c, Rn)), b = f16_to_f64(fp_rd_h(c, Rm));
             switch (opc) {
                 case 0x0: r = fpnan_d(a * b, a, b); break;        /* FMUL   */
@@ -1205,7 +1392,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 return;
             case (3 << 3) | 6: {  /* FJCVTZS (FEAT_JSCVT): D -> Wd, ECMAScript ToInt32 */
                 if (!dbl || sf) break;         /* only the double -> W form exists */
-                double v = fp_rd_d(c, Rn);
+                double v = fz_in_d(fp_rd_d(c, Rn));
                 u32 res; int exact = 0;
                 if (v != v || v == __builtin_inf() || v == -__builtin_inf()) {
                     res = 0;                   /* NaN / Inf -> 0, Z clear */
@@ -1246,7 +1433,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
          * independent of rmode — used by lround/llround). Even opcode = signed.
          * Saturation matches the architecture's clamping. */
         if (opcode <= 1 || opcode == 4 || opcode == 5) {
-            double v = dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn);
+            double v = dbl ? fz_in_d(fp_rd_d(c, Rn)) : (double)fz_in_s(fp_rd_s(c, Rn));
             double r;
             if (opcode >= 4) {
                 r = f_round(v);                  /* A: nearest, ties away */
@@ -1288,7 +1475,8 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
             return;
         }
         if (rmode == 3 && (opcode == 0 || opcode == 1)) {       /* FCVTZS / FCVTZU: fp -> fixed */
-            set_x(c, Rd, fcvt_fixed((dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn)) * pow2,
+            set_x(c, Rd, fcvt_fixed((dbl ? fz_in_d(fp_rd_d(c, Rn))
+                                         : (double)fz_in_s(fp_rd_s(c, Rn))) * pow2,
                                      opcode == 0, x64));
             return;
         }
@@ -1308,10 +1496,12 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
             bool with_zero = BIT(3);              /* opcode2<3>: compare with 0.0 */
             int cmp;
             if (dbl) {
-                double a = fp_rd_d(c, Rn), b = with_zero ? 0.0 : fp_rd_d(c, Rm);
+                double a = fz_in_d(fp_rd_d(c, Rn));
+                double b = with_zero ? 0.0 : fz_in_d(fp_rd_d(c, Rm));
                 cmp = fp_compare_d(a, b, BIT(4));
             } else {
-                float a = fp_rd_s(c, Rn), b = with_zero ? 0.0f : fp_rd_s(c, Rm);
+                float a = fz_in_s(fp_rd_s(c, Rn));
+                float b = with_zero ? 0.0f : fz_in_s(fp_rd_s(c, Rm));
                 cmp = fp_compare_s(a, b, BIT(4));
             }
             fp_set_flags(c, cmp);
@@ -1324,12 +1514,12 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x1: if (dbl) fp_wr_d(c, Rd, __builtin_fabs(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_fabsf(fp_rd_s(c, Rn))); return; /* FABS */
                 case 0x2: if (dbl) fp_wr_d(c, Rd, -fp_rd_d(c, Rn)); else fp_wr_s(c, Rd, -fp_rd_s(c, Rn)); return; /* FNEG */
                 case 0x3: {                                        /* FSQRT */
-                    if (dbl) { double x = fp_rd_d(c, Rn); fsqrt_raise_d(x); fp_wr_d(c, Rd, fpnan_d(__builtin_sqrt(x), x, x)); }
-                    else     { float  x = fp_rd_s(c, Rn); fsqrt_raise_s(x); fp_wr_s(c, Rd, fpnan_s(__builtin_sqrtf(x), x, x)); }
-                    return;
+                    if (dbl) { double x = fz_in_d(fp_rd_d(c, Rn)); fsqrt_raise_d(x); fp_wr_d(c, Rd, fpnan_d(__builtin_sqrt(x), x, x)); }
+                    else     { float  x = fz_in_s(fp_rd_s(c, Rn)); fsqrt_raise_s(x); fp_wr_s(c, Rd, fpnan_s(__builtin_sqrtf(x), x, x)); }
+                    return;                            /* sqrt of a normal is never denormal: no result flush */
                 }
-                case 0x4: if (ftype == 1) fp_wr_s(c, Rd, (float)fp_rd_d(c, Rn)); else fpsimd_undef(c, insn); return;  /* FCVT to single (from double) */
-                case 0x5: if (ftype == 0) fp_wr_d(c, Rd, (double)fp_rd_s(c, Rn)); else fpsimd_undef(c, insn); return; /* FCVT to double (from single) */
+                case 0x4: if (ftype == 1) fp_wr_s(c, Rd, fz_cvt_s(fz_in_d(fp_rd_d(c, Rn)))); else fpsimd_undef(c, insn); return;  /* FCVT to single (from double) */
+                case 0x5: if (ftype == 0) fp_wr_d(c, Rd, (double)fz_in_s(fp_rd_s(c, Rn))); else fpsimd_undef(c, insn); return;    /* FCVT to double (from single) */
                 /* FRINT<mode>: 0x8 N(even), 0x9 P, 0xa M, 0xb Z, 0xc A(away),
                  * 0xe X and 0xf I use the current FPCR.RMode (bits 23:22). */
                 case 0x8: case 0x9: case 0xa: case 0xb: case 0xc:
@@ -1347,8 +1537,8 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                             break;
                         }
                     }
-                    if (dbl) fp_wr_d(c, Rd, frint_d(fp_rd_d(c, Rn), rm, opc == 0xe));
-                    else     fp_wr_s(c, Rd, (float)frint_d((double)fp_rd_s(c, Rn), rm, opc == 0xe));
+                    if (dbl) fp_wr_d(c, Rd, frint_d(fz_in_d(fp_rd_d(c, Rn)), rm, opc == 0xe));
+                    else     fp_wr_s(c, Rd, (float)frint_d((double)fz_in_s(fp_rd_s(c, Rn)), rm, opc == 0xe));
                     return;
                 }
                 default: fpsimd_undef(c, insn); return;
@@ -1360,34 +1550,37 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
     if (o2 == 2) {                                /* FP data-processing (2 source) */
         unsigned Rm = BITS(20, 16), opc = BITS(15, 12);
         if (dbl) {
+            /* Every arm goes through fop_d, which is the same kernel the
+             * vector forms use: identical expressions to the open-coded ones
+             * these replace, and one place for NaN processing and FPCR.FZ. */
             double a = fp_rd_d(c, Rn), b = fp_rd_d(c, Rm), r;
             switch (opc) {
-                case 0x0: r = fpnan_d(a * b, a, b); break;     /* FMUL */
-                case 0x1: r = fpnan_d(a / b, a, b); break;     /* FDIV */
-                case 0x2: r = fpnan_d(a + b, a, b); break;     /* FADD */
-                case 0x3: r = fpnan_d(a - b, a, b); break;     /* FSUB */
+                case 0x0: r = fop_d(FOP_MUL, a, b, 0.0); break; /* FMUL */
+                case 0x1: r = fop_d(FOP_DIV, a, b, 0.0); break; /* FDIV */
+                case 0x2: r = fop_d(FOP_ADD, a, b, 0.0); break; /* FADD */
+                case 0x3: r = fop_d(FOP_SUB, a, b, 0.0); break; /* FSUB */
                 case 0x4: r = fop_d(FOP_MAX,   a, b, 0.0); break;  /* FMAX   */
                 case 0x5: r = fop_d(FOP_MIN,   a, b, 0.0); break;  /* FMIN   */
                 case 0x6: r = fop_d(FOP_MAXNM, a, b, 0.0); break;  /* FMAXNM */
                 case 0x7: r = fop_d(FOP_MINNM, a, b, 0.0); break;  /* FMINNM */
                 /* FPNeg after FPMul, and FPNeg flips a NaN's sign too, so the
                  * canonical result here is the NEGATIVE default NaN. */
-                case 0x8: r = -fpnan_d(a * b, a, b); break;    /* FNMUL */
+                case 0x8: r = -fop_d(FOP_MUL, a, b, 0.0); break;  /* FNMUL */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_d(c, Rd, r);
         } else {
             float a = fp_rd_s(c, Rn), b = fp_rd_s(c, Rm), r;
             switch (opc) {
-                case 0x0: r = fpnan_s(a * b, a, b); break;
-                case 0x1: r = fpnan_s(a / b, a, b); break;
-                case 0x2: r = fpnan_s(a + b, a, b); break;
-                case 0x3: r = fpnan_s(a - b, a, b); break;
+                case 0x0: r = fop_s(FOP_MUL, a, b, 0.0f); break;
+                case 0x1: r = fop_s(FOP_DIV, a, b, 0.0f); break;
+                case 0x2: r = fop_s(FOP_ADD, a, b, 0.0f); break;
+                case 0x3: r = fop_s(FOP_SUB, a, b, 0.0f); break;
                 case 0x4: r = fop_s(FOP_MAX,   a, b, 0.0f); break;  /* FMAX   */
                 case 0x5: r = fop_s(FOP_MIN,   a, b, 0.0f); break;  /* FMIN   */
                 case 0x6: r = fop_s(FOP_MAXNM, a, b, 0.0f); break;  /* FMAXNM */
                 case 0x7: r = fop_s(FOP_MINNM, a, b, 0.0f); break;  /* FMINNM */
-                case 0x8: r = -fpnan_s(a * b, a, b); break;    /* see above */
+                case 0x8: r = -fop_s(FOP_MUL, a, b, 0.0f); break;  /* see above */
                 default: fpsimd_undef(c, insn); return;
             }
             fp_wr_s(c, Rd, r);
@@ -1406,8 +1599,8 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
         unsigned Rm = BITS(20, 16), cond = BITS(15, 12), nzcv = BITS(3, 0);
         if (cond_holds(c, cond)) {
             int cmp;
-            if (dbl) { double a = fp_rd_d(c, Rn), b = fp_rd_d(c, Rm); cmp = fp_compare_d(a, b, BIT(4)); }
-            else     { float  a = fp_rd_s(c, Rn), b = fp_rd_s(c, Rm); cmp = fp_compare_s(a, b, BIT(4)); }
+            if (dbl) { double a = fz_in_d(fp_rd_d(c, Rn)), b = fz_in_d(fp_rd_d(c, Rm)); cmp = fp_compare_d(a, b, BIT(4)); }
+            else     { float  a = fz_in_s(fp_rd_s(c, Rn)), b = fz_in_s(fp_rd_s(c, Rm)); cmp = fp_compare_s(a, b, BIT(4)); }
             fp_set_flags(c, cmp);
         } else {
             c->nzcv = ((nzcv & 8) ? PS_N : 0) | ((nzcv & 4) ? PS_Z : 0) |
@@ -1451,7 +1644,9 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
          * backend can fuse (native fmadd on AArch64, FMA3 on x86-64); a host
          * without one keeps the exec_a64 helper and still matches bit-for-bit
          * (any correctly-rounded FMA is the same unique answer). */
-        double n = fp_rd_d(c, Rn), m = fp_rd_d(c, Rm), a = fp_rd_d(c, Ra), r;
+        double n = fz_in_d(fp_rd_d(c, Rn)), m = fz_in_d(fp_rd_d(c, Rm)),
+               a = fz_in_d(fp_rd_d(c, Ra)), r;
+        u32 banked = fz_bank();
         if (!o1 && !o0) r = a64_fma( n, m,  a);   /* FMADD  */
         else if (!o1)   r = a64_fma(-n, m,  a);   /* FMSUB  */
         else if (o1 && !o0) r = a64_fma(-n, m, -a); /* FNMADD */
@@ -1463,9 +1658,14 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)   { pa = a;  pn = -n; }        /* FMSUB  */
         else if (!o0)   { pa = -a; pn = -n; }        /* FNMADD */
         else            { pa = -a; pn =  n; }        /* FNMSUB */
-        fp_wr_d(c, Rd, fpnan_muladd_d(r, pa, pn, m));
+        r = fpnan_muladd_d(r, pa, pn, m);
+        int flushed; r = fz_out_d(r, &flushed);
+        fz_release(banked, flushed);
+        fp_wr_d(c, Rd, r);
     } else {
-        float n = fp_rd_s(c, Rn), m = fp_rd_s(c, Rm), a = fp_rd_s(c, Ra), r;
+        float n = fz_in_s(fp_rd_s(c, Rn)), m = fz_in_s(fp_rd_s(c, Rm)),
+              a = fz_in_s(fp_rd_s(c, Ra)), r;
+        u32 banked = fz_bank();
         if (!o1 && !o0) r = a64_fmaf( n, m,  a);
         else if (!o1)   r = a64_fmaf(-n, m,  a);
         else if (o1 && !o0) r = a64_fmaf(-n, m, -a);
@@ -1477,7 +1677,10 @@ static void exec_fp_dp3(CPU *c, u32 insn) {
         else if (!o1)   { pa = a;  pn = -n; }        /* FMSUB  */
         else if (!o0)   { pa = -a; pn = -n; }        /* FNMADD */
         else            { pa = -a; pn =  n; }        /* FNMSUB */
-        fp_wr_s(c, Rd, fpnan_muladd_s(r, pa, pn, m));
+        r = fpnan_muladd_s(r, pa, pn, m);
+        int flushed; r = fz_out_s(r, &flushed);
+        fz_release(banked, flushed);
+        fp_wr_s(c, Rd, r);
     }
 }
 
@@ -1901,28 +2104,40 @@ static float fop_s_raw(unsigned op, float n, float m, float d) {
  * the addend, so only they may let a NaN there mark the result propagated --
  * every other opcode ignores `d`, and callers routinely pass a dummy 0. */
 static double fop_d(unsigned op, double n, double m, double d) {
+    n = fz_in_d(n); m = fz_in_d(m);      /* FPUnpack, both operands */
+    if (op == FOP_MLA || op == FOP_MLS) d = fz_in_d(d);   /* only these read it */
+    u32 banked = fz_bank();
     double r = fop_d_raw(op, n, m, d);
     switch (op) {
-        case FOP_MLA: return fpnan_muladd_d(r, d,  n, m);   /* FPMulAdd(d,  n, m) */
-        case FOP_MLS: return fpnan_muladd_d(r, d, -n, m);   /* FPMulAdd(d, -n, m) */
-        case FOP_ABD: return __builtin_fabs(fpnan_d(r, n, m));  /* FPAbs last */
+        case FOP_MLA: r = fpnan_muladd_d(r, d,  n, m); break;  /* FPMulAdd(d,  n, m) */
+        case FOP_MLS: r = fpnan_muladd_d(r, d, -n, m); break;  /* FPMulAdd(d, -n, m) */
+        case FOP_ABD: r = __builtin_fabs(fpnan_d(r, n, m)); break;  /* FPAbs last */
         case FOP_RECPS:                     /* FPRecipStepFused / FPRSqrtStep- */
         case FOP_RSQRTS:                    /* Fused apply FPNeg(op1) BEFORE   */
-            return fpnan_d(r, -n, m);       /* the NaN processing, so a        */
-        default:      return fpnan_d(r, n, m);  /* propagated n comes back negated */
+            r = fpnan_d(r, -n, m); break;   /* the NaN processing, so a        */
+        default:      r = fpnan_d(r, n, m); break;  /* propagated n comes back negated */
     }
+    int flushed; r = fz_out_d(r, &flushed);
+    fz_release(banked, flushed);
+    return r;
 }
 static float fop_s(unsigned op, float n, float m, float d) {
+    n = fz_in_s(n); m = fz_in_s(m);
+    if (op == FOP_MLA || op == FOP_MLS) d = fz_in_s(d);
+    u32 banked = fz_bank();
     float r = fop_s_raw(op, n, m, d);
     switch (op) {
-        case FOP_MLA: return fpnan_muladd_s(r, d,  n, m);
-        case FOP_MLS: return fpnan_muladd_s(r, d, -n, m);
-        case FOP_ABD: return __builtin_fabsf(fpnan_s(r, n, m));
+        case FOP_MLA: r = fpnan_muladd_s(r, d,  n, m); break;
+        case FOP_MLS: r = fpnan_muladd_s(r, d, -n, m); break;
+        case FOP_ABD: r = __builtin_fabsf(fpnan_s(r, n, m)); break;
         case FOP_RECPS:
         case FOP_RSQRTS:
-            return fpnan_s(r, -n, m);
-        default:      return fpnan_s(r, n, m);
+            r = fpnan_s(r, -n, m); break;
+        default:      r = fpnan_s(r, n, m); break;
     }
+    int flushed; r = fz_out_s(r, &flushed);
+    fz_release(banked, flushed);
+    return r;
 }
 
 /* AdvSIMD three-same floating-point: opcodes 0x18..0x1f (FADD/FSUB/FMUL/FDIV/
@@ -1987,7 +2202,7 @@ static void simd_three_same_fp(CPU *c, u32 insn) {
             c->v[Rd] = r; return;
         }
         for (unsigned i = 0; i < n; i++) {
-            double x = vget_d(&vn, i), y = vget_d(&vm, i);
+            double x = fz_in_d(vget_d(&vn, i)), y = fz_in_d(vget_d(&vm, i));
             if (cmp) {
                 int t = (opc == 0x1c)
                       ? fcm_test_d(key == 0x1c ? FCM_EQ : key == 0x5c ? FCM_GE : FCM_GT, x, y)
@@ -2011,7 +2226,7 @@ static void simd_three_same_fp(CPU *c, u32 insn) {
         c->v[Rd] = r; return;
     }
     for (unsigned i = 0; i < n; i++) {
-        float x = vget_s(&vn, i), y = vget_s(&vm, i);
+        float x = fz_in_s(vget_s(&vn, i)), y = fz_in_s(vget_s(&vm, i));
         if (cmp) {
             int t = (opc == 0x1c)
                   ? fcm_test_s(key == 0x1c ? FCM_EQ : key == 0x5c ? FCM_GE : FCM_GT, x, y)
@@ -2059,6 +2274,9 @@ static void simd_three_same_fp16(CPU *c, u32 insn) {
         case 0x15: case 0x1d: cmp = 1; break;          /* FACGE / FACGT */
         default: fpsimd_undef(c, insn); return;
     }
+    /* Only FMLA/FMLS read Vd, so only they unpack it: widening it for every
+     * opcode would raise IDC from a register the instruction never reads. */
+    int mla = (op == FOP_MLA || op == FOP_MLS);
     if (pair) {
         for (unsigned i = 0; i < n; i++) {
             const V128 *src = (i < n/2) ? &vn : &vm;
@@ -2080,7 +2298,8 @@ static void simd_three_same_fp16(CPU *c, u32 insn) {
                                                        __builtin_fabs(y));
             r.h[i] = t ? 0xffffu : 0; continue;
         }
-        r.h[i] = f64_to_f16(fop_d(op, x, y, f16_to_f64(vd.h[i])));
+        r.h[i] = f64_to_f16(fop_d(op, x, y,
+                                  mla ? f16_to_f64(vd.h[i]) : f16_to_f64_raw(vd.h[i])));
     }
     c->v[Rd] = r;
 }
@@ -2217,8 +2436,10 @@ static void simd_indexed_fp(CPU *c, u32 insn) {
         unsigned idx = (H << 2) | (L << 1) | BIT(20);
         double e = f16_to_f64(vm.h[idx]);
         unsigned n = Q ? 8 : 4;
+        int mla = (op == FOP_MLA || op == FOP_MLS);   /* only these unpack Vd */
         for (unsigned i = 0; i < n; i++)
-            r.h[i] = f64_to_f16(fop_d(op, f16_to_f64(vn.h[i]), e, f16_to_f64(vd.h[i])));
+            r.h[i] = f64_to_f16(fop_d(op, f16_to_f64(vn.h[i]), e,
+                                      mla ? f16_to_f64(vd.h[i]) : f16_to_f64_raw(vd.h[i])));
         c->v[Rd] = r; return;
     }
     if (size == 3) {                              /* .2d (idx = H, L must be 0) */
@@ -2659,8 +2880,16 @@ static double frint_d(double v, int rmode, int exact) {
  * (FPRecipEstimate / FPRSqrtEstimate and the RecipEstimate / RecipSqrtEstimate
  * table functions), so the 8-bit-mantissa estimate matches the architecture
  * bit-for-bit (Newton-Raphson refinement via FRECPS/FRSQRTS depends on the
- * precise starting value). Pure-integer; assumes default rounding and
- * FPCR.FZ=0. Bit-exactness is validated against the qemu-aarch64 oracle. */
+ * precise starting value). Pure-integer; assumes default rounding.
+ * Bit-exactness is validated against the qemu-aarch64 oracle.
+ *
+ * Flush-to-zero enters at both ends. On the operand it is FPUnpack's, so a
+ * denormal reads as zero and takes the divide-by-zero arm. On the result only
+ * FRECPE needs it: 1/|x| for |x| at or above the reciprocal of the smallest
+ * normal is what the pseudocode's own FZ branch answers with zero and UFC,
+ * and that is exactly the estimate coming back denormal. FRSQRTE cannot
+ * produce one, and FRECPX rewrites an exponent it reads from the operand's
+ * bits, so flushing changes its IDC and not its answer. */
 static u64 bf_extract(u64 v, unsigned start, unsigned len) {
     return (v >> start) & (len >= 64 ? ~0ULL : ((1ULL << len) - 1));
 }
@@ -2718,6 +2947,7 @@ static u64 call_recip_sqrt_estimate(int *exp, int exp_off, u64 frac) {
     return (u64)estimate << 44;
 }
 static u32 recpe_f32(u32 v) {
+    v = fz_in_bits_s(v);
     u32 sbit = v & 0x80000000u, frac = v & 0x7fffff; int exp = (v >> 23) & 0xff;
     if (exp == 0xff) {                                             /* nan / inf->0 */
         if (frac) {                       /* FPProcessNaN: the operand itself,
@@ -2736,9 +2966,10 @@ static u32 recpe_f32(u32 v) {
         return sbit | 0x7f800000u;
     }
     u64 f = call_recip_estimate(&exp, 253, ((u64)frac) << 29);
-    return sbit | ((u32)(exp & 0xff) << 23) | (u32)((f >> 29) & 0x7fffff);
+    return fz_out_bits_s(sbit | ((u32)(exp & 0xff) << 23) | (u32)((f >> 29) & 0x7fffff));
 }
 static u32 rsqrte_f32(u32 v) {
+    v = fz_in_bits_s(v);
     u32 sbit = v & 0x80000000u, frac = v & 0x7fffff; int exp = (v >> 23) & 0xff;
     if (exp == 0xff && frac) {                                     /* nan */
         if (!(frac & 0x400000)) g_fpexc |= FPSR_IOC;
@@ -2754,6 +2985,7 @@ static u32 rsqrte_f32(u32 v) {
     return sbit | (((u32)exp << 23) & 0x7f800000u) | (u32)((f >> 29) & 0x7fffff);
 }
 static u64 recpe_f64(u64 v) {
+    v = fz_in_bits_d(v);
     u64 sbit = v & 0x8000000000000000ULL, frac = v & 0xfffffffffffffULL;
     int exp = (v >> 52) & 0x7ff;
     if (exp == 0x7ff) {
@@ -2772,9 +3004,10 @@ static u64 recpe_f64(u64 v) {
         return sbit | 0x7ff0000000000000ULL;
     }
     u64 f = call_recip_estimate(&exp, 2045, frac);   /* 52-bit frac: MSB already at bit 51 */
-    return sbit | ((u64)(exp & 0x7ff) << 52) | f;
+    return fz_out_bits_d(sbit | ((u64)(exp & 0x7ff) << 52) | f);
 }
 static u64 rsqrte_f64(u64 v) {
+    v = fz_in_bits_d(v);
     u64 sbit = v & 0x8000000000000000ULL, frac = v & 0xfffffffffffffULL;
     int exp = (v >> 52) & 0x7ff;
     if (exp == 0x7ff && frac) {
@@ -2794,6 +3027,7 @@ static u64 rsqrte_f64(u64 v) {
  * the exp offset follows the (2*bias-1)/(3*bias-1) pattern (bias=15 -> 29/44) and
  * the 10-bit fraction aligns its MSB at bit 51 (shift 42). */
 static u16 recpe_f16(u16 v) {
+    v = fz_in_h(v);
     u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
     if (exp == 0x1f) {                                             /* nan / inf -> 0 */
         if (frac) {
@@ -2808,9 +3042,10 @@ static u16 recpe_f16(u16 v) {
         return sbit | 0x7c00;
     }
     u64 f = call_recip_estimate(&exp, 29, ((u64)frac) << 42);
-    return sbit | ((u16)(exp & 0x1f) << 10) | (u16)((f >> 42) & 0x3ff);
+    return fz_out_h((u16)(sbit | ((u16)(exp & 0x1f) << 10) | (u16)((f >> 42) & 0x3ff)));
 }
 static u16 rsqrte_f16(u16 v) {
+    v = fz_in_h(v);
     u16 sbit = v & 0x8000; unsigned frac = v & 0x3ff; int exp = (v >> 10) & 0x1f;
     if (exp == 0x1f && frac) {                                     /* nan */
         if (!(frac & 0x200)) g_fpexc |= FPSR_IOC;
@@ -2825,6 +3060,7 @@ static u16 rsqrte_f16(u16 v) {
 /* Half-precision FRECPX (reciprocal of the exponent): sign kept, mantissa zeroed,
  * exponent ones-complemented (0x1e for a subnormal input). Mirrors the s/d form. */
 static u16 frecpx_f16(u16 x) {
+    x = fz_in_h(x);                    /* IDC only: a flushed operand has exp 0 either way */
     u16 sign = x & 0x8000; unsigned exp = (x >> 10) & 0x1f, mant = x & 0x3ff;
     if (exp == 0x1f && mant) {                                     /* NaN -> quiet */
         if (!(mant & 0x200)) g_fpexc |= FPSR_IOC;                  /* signaling */
@@ -2851,8 +3087,8 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
             c->v[Rd] = r; return;
         }
         unsigned base = Q ? 2 : 0;
-        vset_d(&r, 0, (double)vget_s(&vn, base));
-        vset_d(&r, 1, (double)vget_s(&vn, base + 1));
+        vset_d(&r, 0, (double)fz_in_s(vget_s(&vn, base)));
+        vset_d(&r, 1, (double)fz_in_s(vget_s(&vn, base + 1)));
         c->v[Rd] = r; return;
     }
     if (opc == 0x16) {                           /* FCVTN (U=0) / FCVTXN (U=1): .2d -> .2s, .4s -> .4h */
@@ -2860,18 +3096,18 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
             if (U) { fpsimd_undef(c, insn); return; }
             V128 res; unsigned hbase;
             if (Q) { res = c->v[Rd]; hbase = 4; } else { res.d[0] = res.d[1] = 0; hbase = 0; }
-            for (unsigned i = 0; i < 4; i++)
-                res.h[hbase + i] = f64_to_f16((double)vget_s(&vn, i));
+            for (unsigned i = 0; i < 4; i++)   /* _raw: FPRoundCV ignores FZ16 */
+                res.h[hbase + i] = f64_to_f16_raw((double)fz_in_s(vget_s(&vn, i)));
             c->v[Rd] = res; return;
         }
         V128 res; if (Q) res = c->v[Rd]; else { res.d[0] = res.d[1] = 0; }
         unsigned base = Q ? 2 : 0;
         if (U) {                                 /* FCVTXN/FCVTXN2: round-to-odd */
-            res.s[base]     = f64_to_f32_round_odd(vget_d(&vn, 0));
-            res.s[base + 1] = f64_to_f32_round_odd(vget_d(&vn, 1));
+            res.s[base]     = f64_to_f32_round_odd(fz_in_d(vget_d(&vn, 0)));
+            res.s[base + 1] = f64_to_f32_round_odd(fz_in_d(vget_d(&vn, 1)));
         } else {                                 /* FCVTN/FCVTN2: round-to-nearest-even */
-            vset_s(&res, base,     (float)vget_d(&vn, 0));
-            vset_s(&res, base + 1, (float)vget_d(&vn, 1));
+            vset_s(&res, base,     fz_cvt_s(fz_in_d(vget_d(&vn, 0))));
+            vset_s(&res, base + 1, fz_cvt_s(fz_in_d(vget_d(&vn, 1))));
         }
         c->v[Rd] = res; return;
     }
@@ -2879,8 +3115,17 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
     unsigned key = (U << 6) | (hsz << 5) | opc;
     int dbl = sz, x64 = sz;
     unsigned n = dbl ? (Q ? 2 : 1) : (Q ? 4 : 2);
+    /* FPUnpack's flush-to-zero, for the forms that unpack: FABS/FNEG (0x0f)
+     * rewrite a sign bit, SCVTF/UCVTF and URECPE/URSQRTE read the lane as an
+     * integer, and FRECPE/FRSQRTE unpack the raw bits themselves. Nothing
+     * here can round a *result* into the denormal range, so there is no
+     * matching flush on the way out. */
+    int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x18 || opc == 0x19 ||
+                 opc == 0x1a || opc == 0x1b || (opc == 0x1c && !hsz) || opc == 0x1f;
     for (unsigned i = 0; i < n; i++) {
-        double x = dbl ? vget_d(&vn, i) : (double)vget_s(&vn, i);
+        double x;
+        if (dbl) { double t = vget_d(&vn, i); x = unpack ? fz_in_d(t) : t; }
+        else     { float  t = vget_s(&vn, i); x = unpack ? (double)fz_in_s(t) : (double)t; }
         u64 ires; int is_int = 0, is_mask = 0; double res = 0; u64 mask = 0;
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS  */
@@ -2944,8 +3189,14 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
     unsigned key = (U << 6) | (hsz << 5) | opc;
     V128 vn = c->v[Rn], r; r.d[0] = r.d[1] = 0;
     unsigned n = Q ? 8 : 4;
+    /* Same split as the single/double page: FABS/FNEG unpack nothing (and so
+     * round nothing on the way back), SCVTF/UCVTF read the lane as an integer
+     * and the estimates take the raw bits. */
+    int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x18 || opc == 0x19 ||
+                 opc == 0x1a || opc == 0x1b || (opc == 0x1c && !hsz) || opc == 0x1f;
     for (unsigned i = 0; i < n; i++) {
-        double x = f16_to_f64(vn.h[i]), res = 0; int done = 0;
+        double x = unpack ? f16_to_f64(vn.h[i]) : f16_to_f64_raw(vn.h[i]);
+        double res = 0; int done = 0;
         switch (key) {
             case 0x2f: res = __builtin_fabs(x); break;                 /* FABS   */
             case 0x6f: res = -x; break;                                /* FNEG   */
@@ -2974,7 +3225,7 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
             case 0x7d: r.h[i] = rsqrte_f16(vn.h[i]); done = 1; break;   /* FRSQRTE */
             default: fpsimd_undef(c, insn); return;
         }
-        if (!done) r.h[i] = f64_to_f16(res);
+        if (!done) r.h[i] = unpack ? f64_to_f16(res) : f64_to_f16_raw(res);
     }
     c->v[Rd] = r;
 }
@@ -3104,7 +3355,13 @@ static void simd_scalar_cvt_fp16(CPU *c, u32 insn) {
     unsigned U = BIT(29), hsz = BIT(23), opc = BITS(16, 12);
     unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
     unsigned key = (U << 6) | (hsz << 5) | opc;
-    u16 h = c->v[Rn].h[0]; double x = f16_to_f64(h);
+    /* Only the converts and the compare-with-zero forms unpack the lane;
+     * SCVTF/UCVTF read it as an integer and FRECPE/FRSQRTE/FRECPX take the
+     * raw bits (see the vector page). */
+    int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x1a || opc == 0x1b ||
+                 (opc == 0x1c && !hsz);
+    u16 h = c->v[Rn].h[0];
+    double x = unpack ? f16_to_f64(h) : f16_to_f64_raw(h);
     V128 r; r.d[0] = r.d[1] = 0;
     switch (key) {
         case 0x1d: r.h[0] = f64_to_f16((double)(s16)h); break;     /* SCVTF */
@@ -3147,7 +3404,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
          * through fround_mode + fcvt_to_int rather than open-coding it is what
          * gets FCVTN*'s ties-to-even (f_round is ties-AWAY) and the FPToFixed
          * flags -- IOC on NaN or saturation, IXC when rounding lost bits. */
-        double v = dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn);
+        double v = dbl ? fz_in_d(fp_rd_d(c, Rn)) : (double)fz_in_s(fp_rd_s(c, Rn));
         int rmode = (opcode == 0x1a) ? (o2 ? 1 : 0)
                   : (opcode == 0x1b) ? (o2 ? 3 : 2) : 4;
         c->v[Rd].d[0] = fcvt_to_int(fround_mode(v, rmode), v, U == 0, dbl);
@@ -3156,7 +3413,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
     }
     if (opcode == 0x16 && U == 1 && o2 == 0 && sz == 1) {  /* FCVTXN Sd,Dn: round-to-odd .d -> .s */
         V128 r; r.d[0] = r.d[1] = 0;
-        r.s[0] = f64_to_f32_round_odd(vget_d(&c->v[Rn], 0));
+        r.s[0] = f64_to_f32_round_odd(fz_in_d(vget_d(&c->v[Rn], 0)));
         c->v[Rd] = r; return;
     }
 
@@ -3168,7 +3425,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
         c->v[Rd] = r; return;
     }
     if (opcode >= 0x0c && opcode <= 0x0e) {
-        double x = dbl ? vget_d(&c->v[Rn], 0) : (double)vget_s(&c->v[Rn], 0);
+        double x = dbl ? fz_in_d(vget_d(&c->v[Rn], 0)) : (double)fz_in_s(vget_s(&c->v[Rn], 0));
         int t = (opcode == 0x0c) ? fcm_test_d(U ? FCM_GE : FCM_GT, x, 0.0)
               : (opcode == 0x0d) ? fcm_test_d(U ? FCM_LE : FCM_EQ, x, 0.0)
                                  : fcm_test_d(FCM_LT, x, 0.0);
@@ -3179,7 +3436,9 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
     if (opcode == 0x1f && o2 == 1) {                 /* FRECPX: reciprocal of the exponent */
         V128 r; r.d[0] = r.d[1] = 0;                 /* sign kept, mantissa zeroed, exp = ~exp */
         if (dbl) {
-            u64 x = c->v[Rn].d[0], sign = x & (1ULL << 63);
+            /* Flushing the operand only raises IDC: the exponent this reads
+             * is zero for a denormal and for the zero it becomes. */
+            u64 x = fz_in_bits_d(c->v[Rn].d[0]), sign = x & (1ULL << 63);
             unsigned exp = (x >> 52) & 0x7ff; u64 mant = x & 0xfffffffffffffULL;
             if (exp == 0x7ff && mant) {                                          /* NaN -> quiet */
                 if (!(mant & (1ULL << 51))) g_fpexc |= FPSR_IOC;
@@ -3187,7 +3446,7 @@ static void simd_scalar_cvt(CPU *c, u32 insn) {
             }
             else r.d[0] = sign | ((u64)((exp == 0) ? 0x7fe : (~exp & 0x7ff)) << 52);
         } else {
-            u32 x = c->v[Rn].s[0], sign = x & 0x80000000u;
+            u32 x = fz_in_bits_s(c->v[Rn].s[0]), sign = x & 0x80000000u;
             unsigned exp = (x >> 23) & 0xff, mant = x & 0x7fffffu;
             if (exp == 0xff && mant) {                                            /* NaN -> quiet */
                 if (!(mant & (1u << 22))) g_fpexc |= FPSR_IOC;
@@ -3291,7 +3550,8 @@ static void simd_shift_imm(CPU *c, u32 insn) {
                 if (dbl) vset_d(&r, i, (U ? d_from_u64(c->v[Rn].d[i]) : d_from_s64((s64)c->v[Rn].d[i])) / pw);
                 else     vset_s(&r, i, f_from_s64(U ? (s64)(u32)c->v[Rn].s[i] : (s64)(s32)c->v[Rn].s[i]) / (float)pw);
             } else {                                      /* FP -> fixed (trunc, saturating) */
-                double x = (dbl ? vget_d(&c->v[Rn], i) : (double)vget_s(&c->v[Rn], i)) * pw;
+                double x = (dbl ? fz_in_d(vget_d(&c->v[Rn], i))
+                                : (double)fz_in_s(vget_s(&c->v[Rn], i))) * pw;
                 u64 iv = fcvt_fixed(x, U == 0, dbl);
                 if (dbl) r.d[i] = iv; else r.s[i] = (u32)iv;
             }
@@ -3394,7 +3654,8 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
             if (dbl) vset_d(&r, 0, (U ? d_from_u64(c->v[Rn].d[0]) : d_from_s64((s64)c->v[Rn].d[0])) / pw);
             else     vset_s(&r, 0, f_from_s64(U ? (s64)(u32)c->v[Rn].s[0] : (s64)(s32)c->v[Rn].s[0]) / (float)pw);
         } else {                                      /* FP -> fixed (trunc, saturating) */
-            double x = (dbl ? vget_d(&c->v[Rn], 0) : (double)vget_s(&c->v[Rn], 0)) * pw;
+            double x = (dbl ? fz_in_d(vget_d(&c->v[Rn], 0))
+                            : (double)fz_in_s(vget_s(&c->v[Rn], 0))) * pw;
             u64 iv = fcvt_fixed(x, U == 0, dbl);
             if (dbl) r.d[0] = iv; else r.s[0] = (u32)iv;
         }
@@ -3837,11 +4098,11 @@ static void simd_scalar_three_same(CPU *c, u32 insn) {
         unsigned a = BIT(23), sz = BIT(22), key = (U << 6) | (a << 5) | opc;
         int cmp = (opc == 0x1c || opc == 0x1d);
         if (sz) {
-            double x = vget_d(&c->v[Rn], 0), y = vget_d(&c->v[Rm], 0);
+            double x = fz_in_d(vget_d(&c->v[Rn], 0)), y = fz_in_d(vget_d(&c->v[Rm], 0));
             if (cmp) r.d[0] = fp3_cmp_d(key, x, y) ? ~0ULL : 0;
             else vset_d(&r, 0, fop_d(fp3_key_op(key), x, y, vget_d(&c->v[Rd], 0)));
         } else {
-            float x = vget_s(&c->v[Rn], 0), y = vget_s(&c->v[Rm], 0);
+            float x = fz_in_s(vget_s(&c->v[Rn], 0)), y = fz_in_s(vget_s(&c->v[Rm], 0));
             if (cmp) r.s[0] = fp3_cmp_s(key, x, y) ? 0xffffffffu : 0;
             else vset_s(&r, 0, fop_s(fp3_key_op(key), x, y, vget_s(&c->v[Rd], 0)));
         }
@@ -4011,6 +4272,11 @@ static void simd_scalar_three_same_extra(CPU *c, u32 insn) {
 }
 
 void exec_fpsimd(CPU *c, u32 insn) {
+    /* Flush-to-zero for this instruction: latched here so the lane kernels
+     * need no CPU pointer (see the FPCR.FZ block above). */
+    g_fz   = (c->fpcr & FPCR_FZ)   != 0;
+    g_fz16 = (c->fpcr & FPCR_FZ16) != 0;
+
     /* Scalar floating-point (bit30=0 distinguishes from scalar AdvSIMD). */
     if ((insn & 0x7f000000) == 0x1e000000) { exec_fp_scalar(c, insn); return; }
     if ((insn & 0x7f000000) == 0x1f000000) { exec_fp_dp3(c, insn);    return; }

@@ -428,9 +428,17 @@ wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
 - `DCZID_EL0` advertises a 64-byte DC ZVA block (self-consistent with the
   implementation); it differs from QEMU's advertised value but libc memset works.
-- FPCR flush-to-zero (`FZ`) is not implemented — denormals compute at full
-  precision — and FPSR cumulative exception flags stay best-effort in denormal
-  corners; normal values and NaN generation/propagation match hardware.
+- FPCR flush-to-zero (`FZ`, `FZ16`) is implemented, with one boundary case:
+  a single- or double-precision result whose *exact* value fell inside the
+  last ULP below the smallest normal, and which rounding then carried up to
+  it, is kept where the architecture flushes it (the host reports tininess
+  after rounding, the architecture before). Reachable only through
+  FMUL/FDIV/the fused multiplies; the half-precision path and every narrowing
+  convert hold the exact value and flush exactly. FPSR cumulative exception
+  flags stay best-effort in the same corner; normal values and NaN
+  generation/propagation match hardware. `--jit` leaves floating point to the
+  interpreter for as long as either mode bit is set (see
+  [`docs/jit.md`](docs/jit.md)).
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
 - Big-endian hosts are not supported (the SIMD register union is little-endian).
 

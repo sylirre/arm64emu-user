@@ -322,6 +322,26 @@ FP core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which
 is why it is not on by default). CI builds with clang as well as gcc, which is
 what makes the gap visible instead of theoretical.
 
+Flush-to-zero adds a rule the lazy model does not naturally express. When
+`FPCR.FZ` replaces a tiny result with zero the architecture raises `UFC` and
+*nothing else* — in particular not the `Inexact` the host raised on its way to
+the value being thrown away. But the host's flags are a single sticky word
+shared by every lane of the instruction, so simply clearing `IXC` after a
+flush would also take away a *neighbouring* lane's legitimate one. Each
+rounding therefore banks the pending flags and starts from a clean host word
+(`fz_bank`/`fz_release` in `exec_fpsimd.c`); the cost is one `fetestexcept`
+per lane, and only for a guest that asked for the mode. The same rule is why
+the half-precision narrows raise their `UFC` by hand: they are pure integer
+code, so there is nothing to take back.
+
+Two asymmetries in that area are worth knowing because they read like bugs.
+`FZ16` flushes a half operand and raises **no** `IDC`, where `FZ` on a single
+or double raises one; and the precision-changing `FCVT` family ignores `FZ16`
+entirely on its half side (`FPUnpackCV`/`FPRoundCV` clear the bit before doing
+anything) while still honoring `FZ` on the single/double side. Both were found
+by differential test against `qemu-aarch64`, which implements the same
+carve-outs.
+
 FP→int has a second host trap, and this one is nobody's codegen quirk — it is
 the *libcall*, and it is why the rule above says "no cast" rather than "no cast
 to unsigned". No 32-bit host has a double→64-bit-int instruction, so the

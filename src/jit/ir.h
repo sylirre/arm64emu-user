@@ -269,6 +269,36 @@ enum {
                              * self-counting. */
 };
 
+/* Which classes stop being emittable once the guest sets FPCR.FZ or FZ16.
+ *
+ * The inline recipes are plain host FP: correct because the interpreter is
+ * plain host FP too (see IRO_VOP above), and that equivalence is exactly what
+ * flush-to-zero breaks -- exec_fpsimd.c then flushes denormal operands and
+ * denormal results in software, which no host instruction here does. So every
+ * class that unpacks or rounds a floating-point value goes back to the
+ * helper for as long as the mode is set.
+ *
+ * What stays: the bit moves and selects (FMOV, FCSEL, MOVI, INS/DUP), the
+ * integer vector and scalar classes, and VC_CVTIF -- an integer source is
+ * never a denormal, and a 64-bit integer scaled by at most 2^-64 is still a
+ * normal single or double, so neither end of it can flush. VC_F1 and VC_H1
+ * mix FMOV/FABS/FNEG (unaffected) with FSQRT (affected) and are declined
+ * whole: the mode is rare enough that splitting them buys nothing. */
+static inline int vop_fpcr_sensitive(unsigned vclass) {
+    switch (vclass) {
+        case VC_VF3S: case VC_VFCM: case VC_FX3: case VC_FS3: case VC_FPAIRS:
+        case VC_FELEM: case VC_FSELEM: case VC_FSMISC: case VC_VMISCF:
+        case VC_FRINTS: case VC_F1: case VC_F2: case VC_F3:
+        case VC_FCMP: case VC_FCCMP: case VC_CVTFI: case VC_FCVT:
+        case VC_FCVTH: case VC_H1: case VC_H2: case VC_H3:
+        case VC_VH3: case VC_VHCM: case VC_VH2M: case VC_VHMULX:
+        case VC_VHEST: case VC_VH3X:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* The NaN-gated vector classes follow a "self-counting" discipline: the
  * frontend keeps them out of IRBlock.ninsns and the backend's fast path bumps
  * c->icount inline instead. That is what stops a gated instruction being
@@ -352,6 +382,11 @@ typedef struct IRBlock {
     u32  ninsns;            /* NATIVE-retired guest insn count (icount delta
                              * added by exit stubs; CALL1 insns not included
                              * — jit_exec1 counts those itself) */
+    /* Set by the caller before translating: the guest has asked for a
+     * non-default FP mode (FPCR.FZ or FZ16), so the inline FP recipes below
+     * -- which are plain host arithmetic, and know nothing of flush-to-zero
+     * -- must not be emitted. See vop_fpcr_sensitive(). */
+    u8   fpnondef;
     /* Per-op vreg liveness (bit v set = vreg v live after this op). Computed
      * by fe_liveness for a free-after-last-use allocator; NO backend reads it
      * yet — both allocate LRU-style and spill on demand. Kept because the

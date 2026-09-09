@@ -144,6 +144,20 @@ the equivalence robust against toolchain changes; `tests/run_consist.sh`
 (random bit patterns through every inline FP class, jit vs. interpreter on
 the same host) enforces it on both backends.
 
+**Flush-to-zero has no inline form at all.** The equivalence above is
+"host FP == interpreter FP", and `FPCR.FZ`/`FZ16` break it: `exec_fpsimd.c`
+then flushes denormal operands and denormal results in software, which no host
+instruction the backends emit does. So the first time a thread's guest sets
+either bit, the code cache is dropped and every class that unpacks or rounds
+an FP value (`vop_fpcr_sensitive()` in `ir.h` — everything but the bit moves,
+the integer classes and int→FP conversion) goes back to the `exec_a64` helper.
+`jit_exec1` ends the block when it sees the write, so no already-translated
+inline FP runs after it; the flag is sticky, so a guest that toggles the mode
+pays the flush once rather than on every toggle. The cost lands on exactly the
+programs that asked for speed — `-ffast-math` startup code sets `FZ` — and the
+way out on an AArch64 host would be to mirror the guest's FPCR into the host's
+(same architecture, same rules), which is not done today.
+
 Being NaN-gated and being in `IRBlock.ninsns` are mutually exclusive. The
 slow arm re-runs the instruction through `jit_exec1`, which counts what it
 executes, so a gated class that is *also* in `ninsns` has the exit stub count
