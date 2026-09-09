@@ -625,8 +625,25 @@ const Region *as_next_region(AddrSpace *as, u64 va) {
  * either way: retired backing is quarantined until as_destroy (execve/exit). */
 static long g_host_pagesz;
 
+/* A guest length the host cannot even name. The guest address space is 47 bits
+ * wide whatever the host is, so an ILP32 host can be asked for a mapping no
+ * size_t of its own can express: mmap(2) and mremap(2) take a size_t, the high
+ * half of the request is dropped on the way in, and what comes back is a
+ * fraction of what was asked for -- while the region record and the page table
+ * go on describing the whole of it, pointing gigabytes of guest VA into a few
+ * pages of host memory. (A 4 GiB + 4 KiB anonymous mapping became one page,
+ * and the guest's write at 4 GiB then landed on its own first byte.)
+ *
+ * ENOMEM is both the honest answer and one every caller here is allowed to
+ * give: the host has no such mapping, and mmap/mremap report exactly that when
+ * the address space cannot hold what was asked. On an LP64 host the test is
+ * free -- no guest length can reach SIZE_MAX -- and the guard is compiled in
+ * everywhere rather than #ifdef'd, so the same code runs on both. */
+static int host_len_ok(u64 len) { return len <= (u64)SIZE_MAX; }
+
 static u8 *host_alloc(u64 len, int prot) {
-    void *p = mmap(NULL, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!host_len_ok(len)) return NULL;
+    void *p = mmap(NULL, (size_t)len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return (p == MAP_FAILED) ? NULL : p;
 }
 
@@ -818,11 +835,12 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
         return -EINVAL;
     /* Host backing stays RW: guest protection is enforced in software, and the
      * emulator itself must always be able to read/write the backing. */
-    u8 *host = host_alloc(len, PROT_READ | PROT_WRITE);
+    u8 *host = host_alloc(len, PROT_READ | PROT_WRITE);   /* host_len_ok inside */
     if (!host) return -ENOMEM;
     region_punch(as, addr, addr + len);
     Region r = { .start = addr, .end = addr + len, .prot = prot,
-                 .shared = 0, .wr_ok = 1, .host = host, .hmap = hmap_new(host, len),
+                 .shared = 0, .wr_ok = 1, .host = host,
+                 .hmap = hmap_new(host, (size_t)len),
                  .path = NULL, .file_off = 0 };
     region_insert(as, r);
     pte_set_range(as, addr, len, host, prot);
@@ -834,6 +852,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
     if ((addr | len | off) & GUEST_PAGE_MASK || !range_ok(addr, len) || !len)
         return -EINVAL;
+    if (!host_len_ok(len)) return -ENOMEM;      /* wider than a host size_t */
     u8 *host;
     u64 pad = 0;
     if (shared) {
@@ -841,7 +860,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
          * Host prot mirrors guest write permission (host write to a read-only
          * mapping of an O_RDONLY fd is refused by the kernel). */
         int hprot = PROT_READ | ((prot & PTE_W) ? PROT_WRITE : 0);
-        void *p = mmap(NULL, len, hprot, MAP_SHARED, host_fd, (off_t)off);
+        void *p = mmap(NULL, (size_t)len, hprot, MAP_SHARED, host_fd, (off_t)off);
         if (p == MAP_FAILED) {
             /* Host page > 4 KB (e.g. Android 16 KB kernels): mmap requires the file
              * offset to be host-page aligned, but guest offsets are only 4 KB
@@ -852,15 +871,16 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                 return -errno;
             u64 aligned = off & ~(u64)(g_host_pagesz - 1);
             pad = off - aligned;
-            p = mmap(NULL, len + pad, hprot, MAP_SHARED, host_fd, (off_t)aligned);
+            if (!host_len_ok(len + pad)) return -ENOMEM;   /* pad included */
+            p = mmap(NULL, (size_t)(len + pad), hprot, MAP_SHARED, host_fd, (off_t)aligned);
             if (p == MAP_FAILED) return -errno;
             host = (u8 *)p + pad;
         } else host = p;
     } else {
         /* MAP_PRIVATE file mapping: private copy-on-write host mapping, RW so
          * software-protected guest pages stay reachable by the emulator. */
-        void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, host_fd,
-                       (off_t)off);
+        void *p = mmap(NULL, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                       host_fd, (off_t)off);
         if (p == MAP_FAILED) {
             /* Host page > 4 KB (Android 16 KB kernels): the guest's offsets are
              * only 4 KB aligned and mmap wants host-page alignment, exactly as
@@ -886,8 +906,9 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                 return -errno;
             u64 aligned = off & ~(u64)(g_host_pagesz - 1);
             pad = off - aligned;
-            p = mmap(NULL, len + pad, PROT_READ | PROT_WRITE, MAP_PRIVATE,
-                     host_fd, (off_t)aligned);
+            if (!host_len_ok(len + pad)) return -ENOMEM;   /* pad included */
+            p = mmap(NULL, (size_t)(len + pad), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE, host_fd, (off_t)aligned);
             if (p == MAP_FAILED) return -errno;
             host = (u8 *)p + pad;
         } else host = p;
@@ -917,7 +938,7 @@ int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
     u64 eof = have_st ? PG_UP((u64)fst.st_size) : 0;
     Region r = { .start = addr, .end = addr + len, .prot = prot,
                  .shared = (u32)shared, .file = 1, .wr_ok = (u32)wr_ok, .host = host,
-                 .hmap = hmap_new(host - pad, len + pad),
+                 .hmap = hmap_new(host - pad, (size_t)(len + pad)),
                  .path = as_path_dup(path), .file_off = off,
                  .dev = have_st ? (u64)fst.st_dev : 0,
                  .ino = have_st ? (u64)fst.st_ino : 0,
@@ -964,14 +985,20 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
     HostMap *hm = r->hmap;
     u64 rlen = r->end - r->start;
 
+    /* Neither the grown slice nor the allocation behind it may pass what a
+     * host size_t can hold: every route below hands one of the two to
+     * mremap(2) or to host_alloc (see host_len_ok). */
+    if (!host_len_ok(rlen + extra) || !host_len_ok((u64)hm->len + extra))
+        return -ENOMEM;
+
     /* (1) The slice runs to the end of its own host allocation: extend the
      *     allocation where it stands. Nothing moves, so a host pointer another
      *     guest thread has already translated stays valid, and the pages that
      *     appear continue the same object -- the file's next pages for a file
      *     mapping, fresh zeroes for anonymous memory. */
     if (r->host + rlen == hm->base + hm->len &&
-        mremap(hm->base, hm->len, hm->len + extra, 0) != MAP_FAILED) {
-        hm->len += extra;
+        mremap(hm->base, hm->len, hm->len + (size_t)extra, 0) != MAP_FAILED) {
+        hm->len += (size_t)extra;
         return 0;
     }
 
@@ -986,14 +1013,15 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
         /* (2) Move the slice itself and grow it in one step. mremap carries
          *     the mapping's identity across, so a file stays that file at the
          *     same offsets and a shared segment stays shared. */
-        void *p = mremap(r->host, rlen, rlen + extra, MREMAP_MAYMOVE);
-        if (p == (void *)r->host) { hm->len += extra; return 0; }   /* in place */
+        void *p = mremap(r->host, (size_t)rlen, (size_t)(rlen + extra),
+                         MREMAP_MAYMOVE);
+        if (p == (void *)r->host) { hm->len += (size_t)extra; return 0; } /* in place */
         if (p != MAP_FAILED) {
             /* The move left a hole in the middle of an allocation whose munmap
              * is still described by hm->base/hm->len. Fill it, so the
              * allocation stays whole and a stale translation into it lands on
              * memory rather than faulting the emulator. */
-            mmap(r->host, rlen, PROT_READ | PROT_WRITE,
+            mmap(r->host, (size_t)rlen, PROT_READ | PROT_WRITE,
                  MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             nb = p;
         }
@@ -1002,7 +1030,7 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
          *     mapping rather than move it -- mremap with an old length of zero
          *     makes a second mapping of the same shared object -- so a stale
          *     translation still reaches the very pages the new one does. */
-        void *p = mremap(r->host, 0, rlen + extra, MREMAP_MAYMOVE);
+        void *p = mremap(r->host, 0, (size_t)(rlen + extra), MREMAP_MAYMOVE);
         if (p != MAP_FAILED) nb = p;
     } else if (!r->file) {
         /* (4) Private anonymous memory: no one else can observe these pages,
@@ -1011,7 +1039,7 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
          *     until the quarantine releases it, which keeps a racing thread's
          *     stale pointer benign. */
         u8 *p = host_alloc(rlen + extra, PROT_READ | PROT_WRITE);
-        if (p) { memcpy(p, r->host, rlen); nb = p; }
+        if (p) { memcpy(p, r->host, (size_t)rlen); nb = p; }
     }
     /* Left over: a private file mapping in a multi-threaded address space that
      * could not be extended in place. Copying it into anonymous memory would
@@ -1019,7 +1047,7 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
      * report and let the guest fall back to mmap+copy itself. */
     if (!nb) return -ENOMEM;
 
-    HostMap *nh = hmap_new(nb, rlen + extra);
+    HostMap *nh = hmap_new(nb, (size_t)(rlen + extra));
     pte_repoint_range(as, r->start, rlen, nb);
     r->host = nb;
     r->hmap = nh;

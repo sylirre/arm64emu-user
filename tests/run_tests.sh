@@ -2356,6 +2356,15 @@ check_fixture sockoptlen $'plain=0\nhi32=0\nhi32_zero=-22\nneg=-22\nneg_min=-22\
 # where a kernel answers EINVAL, and dies outright on the past-INT_MAX rows.
 check_fixture cmsgvalid $'short15 snd=-1 err=22 peer=-1 perr=11\nzerolen snd=-1 err=22 peer=-1 perr=11\nonelen  snd=-1 err=22 peer=-1 perr=11\nover17  snd=-1 err=22 peer=-1 perr=11\nover25  snd=-1 err=22 peer=-1 perr=11\nempty16 snd=1 err=0 peer=1 perr=0\nfd20/24 snd=1 err=0 peer=1 perr=0\nfd20/23 snd=1 err=0 peer=1 perr=0\nlvl16   snd=1 err=0 peer=1 perr=0\nnohdr8  snd=1 err=0 peer=1 perr=0\n2nd_bad snd=-1 err=22 peer=-1 perr=11\n2nd_ok  snd=1 err=0 peer=1 perr=0\nnullsnd=-1 err=14\nnullbig=-1 err=105\nnullrcv=1 err=0 ctrunc=1 ctl=0\nhugesnd=-1 err=105\nhugercv=1 err=0 ctl=0\npassfd snd=1 rcv=1 fd=1 ok=1\ndone'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+# A guest mapping wider than a host size_t (4 GiB + 64 KiB). The guest address
+# space is 47 bits wide whatever the host is, so an ILP32 host is asked for
+# mappings it cannot name; mmap/mremap would take the truncated low half and
+# the page table would then point gigabytes of guest VA into a few host pages.
+# Self-checking and host-independent: mapped-and-coherent and ENOMEM are both
+# correct answers, and each row asserts only that what came back behaves like
+# the mapping it claims to be. (qemu-user is a 64-bit process here and would
+# only ever take the mapped branch, so it is no oracle for the other one.)
+check_fixture hugemap $'anon_priv ok\nanon_shared ok\nfile_priv ok\nfile_shared ok\ngrow ok\ndone'
 # The guest's own memory footprint, as its own /proc reports it -- and as
 # another guest process's /proc reports that one. Self-checking:
 # status/statm/stat are host-passthrough unless synthesized, and the host

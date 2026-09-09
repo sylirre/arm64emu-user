@@ -13,6 +13,14 @@ all four targets.
   seam; only `mem.c` turns a translated PTE into a host pointer. This is what lets
   a 47-bit guest space run on a 32-bit host (where a page-table leaf is a 4-byte
   `uintptr_t`).
+- **A guest length can be wider than a host `size_t`.** The guest address space
+  is 47 bits whatever the host is, so an ILP32 host can be asked for a mapping
+  it cannot name. `mmap`/`mremap` take a `size_t` and silently receive the
+  truncated low half, so the host backs a fraction of what was asked while the
+  region record and page table describe all of it. Every host-backing path
+  goes through `host_len_ok` (`mem.c`) and answers `ENOMEM` instead. The same
+  applies to any guest count or offset handed to a host call: check it against
+  the *host's* width, not only against the guest's own address space.
 - **No `__int128` in the hot paths.** The 64×64→128 multiply (`SMULH`/`UMULH`) and
   the saturating-SIMD helpers use pure 64-bit arithmetic (`umulh64`/`smulh64`,
   range-checked saturation). `__int128` is used only where it is available and

@@ -101,6 +101,20 @@ flag bits. `MAP_SHARED` file mappings are the exception — they use a real host
 `mmap` so stores reach the file, and the host protection mirrors the guest write
 bit.
 
+**A guest length can be wider than a host `size_t`.** The guest address space is
+47 bits whatever the host is, so an ILP32 host can be asked for a mapping it
+cannot even name. `mmap(2)` and `mremap(2)` take a `size_t`: the high half of
+such a request is dropped on the way in, the host backs a fraction of what was
+asked for, and the region record and page table go on describing the whole of
+it — a 4 GiB + 4 KiB anonymous mapping became one page, and the guest's write at
+4 GiB landed on its own first byte. `host_len_ok` (`mem.c`) refuses what the
+host cannot name with `ENOMEM`, which is both the honest answer and one every
+caller is allowed to give; on an LP64 host the test can never fire, and it is
+compiled in on both so the same code runs everywhere.
+`tests/fixtures/hugemap.c` covers it, and is deliberately host-independent:
+mapped-and-coherent and `ENOMEM` are both correct answers, so each row asserts
+only that what came back behaves like the mapping it claims to be.
+
 Host pages larger than 4 KB (16 K Android, 64 K arm64 kernels) are detected at
 startup: anonymous maps over-allocate and slice; a file mapping — `MAP_SHARED`
 or `MAP_PRIVATE` — whose offset is not host-page-aligned is mapped from the
