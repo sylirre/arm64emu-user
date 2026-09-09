@@ -692,6 +692,27 @@ requests about itself**, the same way it already mediates every other syscall:
   processes with private copy-on-write address spaces; any other target is
   `-ESRCH`. A partial transfer stops at the first unmapped remote page and
   returns the byte count, matching the kernel.
+- The two iovecs are imported **in `process_vm_rw`'s order, and not the same
+  way**, which is observable. The local one reaches `import_iovec`'s `unsigned
+  nr_segs`, so the guest's 64-bit count is truncated there — `1<<32` segments
+  is none and `(1<<32)+1` is one — and its elements are bound like any
+  read/write vector's: a length that is negative as an `ssize_t` is `EINVAL`,
+  and the total is *clamped* to `MAX_RW_COUNT` rather than refused. If that
+  total is zero the call returns 0 without looking at the remote vector at all,
+  however malformed it is. The remote count keeps its full width
+  (`iovec_from_user` takes an `unsigned long`), so a huge one there **is**
+  `EINVAL` — except zero, which returns before even that check. Reading the
+  lengths as unsigned instead made `iov_len = 1<<63` a request to copy eight
+  exabytes, which the walk serviced a chunk at a time over the guest's own
+  memory and reported as a partial success. What is deliberately *not*
+  reproduced is the kernel's `access_ok` asymmetry — a single-segment local
+  vector is clamped to `MAX_RW_COUNT` before its range is checked
+  (`import_ubuf`) while a multi-segment one is checked at full length first
+  (`__import_iovec`), so the same segment passes alone and is `EFAULT` beside
+  another; that is an artifact of the current import path (older kernels
+  checked every segment) and the walk reports `EFAULT` for a range it cannot
+  reach anyway. `tests/fixtures/pvriov.c` covers all of it, self-checking:
+  qemu-user answers `ENOSYS` for both syscalls.
 
 **Stop points** (only active when the thread is traced — a near-always-zero
 thread-local `g_ptrace_*` int gates the hot paths):

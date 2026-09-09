@@ -2356,6 +2356,13 @@ check_fixture sockoptlen $'plain=0\nhi32=0\nhi32_zero=-22\nneg=-22\nneg_min=-22\
 # where a kernel answers EINVAL, and dies outright on the past-INT_MAX rows.
 check_fixture cmsgvalid $'short15 snd=-1 err=22 peer=-1 perr=11\nzerolen snd=-1 err=22 peer=-1 perr=11\nonelen  snd=-1 err=22 peer=-1 perr=11\nover17  snd=-1 err=22 peer=-1 perr=11\nover25  snd=-1 err=22 peer=-1 perr=11\nempty16 snd=1 err=0 peer=1 perr=0\nfd20/24 snd=1 err=0 peer=1 perr=0\nfd20/23 snd=1 err=0 peer=1 perr=0\nlvl16   snd=1 err=0 peer=1 perr=0\nnohdr8  snd=1 err=0 peer=1 perr=0\n2nd_bad snd=-1 err=22 peer=-1 perr=11\n2nd_ok  snd=1 err=0 peer=1 perr=0\nnullsnd=-1 err=14\nnullbig=-1 err=105\nnullrcv=1 err=0 ctrunc=1 ctl=0\nhugesnd=-1 err=105\nhugercv=1 err=0 ctl=0\npassfd snd=1 rcv=1 fd=1 ok=1\ndone'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+# process_vm_readv/writev iovec validation and the order the two vectors are
+# imported in. Self-checking: qemu-user answers ENOSYS for both syscalls. A
+# length that is negative as an ssize_t is EINVAL before anything is copied --
+# read as unsigned it was a request to copy 8 exabytes, which the walk serviced
+# a chunk at a time over the guest's own memory -- and `touched` is the column
+# that says a refused call deposited nothing.
+check_fixture pvriov $'plain      8 touched=1\nplaindata ABCDEFGH\nlneg       -22 touched=0\nrneg       -22 touched=0\nbothneg    -22 touched=0\nlzero_rneg 0 touched=0\nlneg_rzero -22 touched=0\nlcnt0_rbig 0 touched=0\nlcnt1_rbig -22 touched=0\nlbig_rcnt1 -22 touched=0\ncnt0_cnt0  0 touched=0\nrcnt0      0 touched=0\nl_2p32p1   8 touched=1\nl_2p32     0 touched=0\nr_2p32     -22 touched=0\nsplit 8 ABCDEFGH\nw_lneg     -22 touched=0\nw_rneg     -22 touched=0\nw_ok 8 ABCDEFGH\nflags -22\ndone'
 # A guest mapping wider than a host size_t (4 GiB + 64 KiB). The guest address
 # space is 47 bits wide whatever the host is, so an ILP32 host is asked for
 # mappings it cannot name; mmap/mremap would take the truncated low half and

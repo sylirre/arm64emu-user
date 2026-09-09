@@ -2566,23 +2566,71 @@ SYSDEF(times) {
  * argv/paths in bulk instead of word-by-word PTRACE_PEEKDATA. flags must be 0. */
 static u64 do_process_vm(CPU *c, int is_write, u64 pid, u64 liov, u64 liovcnt,
                          u64 riov, u64 riovcnt) {
-    if (liovcnt > 1024 || riovcnt > 1024) return (u64)(s64)-EINVAL;
-    if (liovcnt == 0 || riovcnt == 0) return 0;
-    int is_self = ((s32)pid == (s32)getpid());
+    /* The two vectors are imported the way process_vm_rw imports them, in that
+     * order -- which is not the same way, and the difference is visible.
+     *
+     * The local one goes through import_iovec, whose nr_segs is an `unsigned`:
+     * the guest's 64-bit register is truncated there, so liovcnt = 1<<32 names
+     * no segments at all and (1<<32)+1 names one. Its elements are then bound
+     * like any read/write vector's -- a length that is negative as an ssize_t
+     * is EINVAL, and the running total is clamped to MAX_RW_COUNT rather than
+     * refused (sys_file.c's iov_import follows the same rule for readv). If
+     * what is left is zero bytes, the call is over: it returns 0 without ever
+     * looking at the remote vector, however malformed that one is.
+     *
+     * The remote one is read by iovec_from_user, which takes an unsigned long
+     * and keeps the full width, so a huge count there is EINVAL where the same
+     * count on the local side would have been truncated to something small. A
+     * count of zero returns before even that check, and copies nothing.
+     *
+     * All of it measured against a kernel: qemu-user answers ENOSYS for this
+     * syscall and is no oracle for any of it. What is deliberately NOT
+     * reproduced is the kernel's access_ok inconsistency -- a single-segment
+     * local vector is clamped to MAX_RW_COUNT before its range is checked and
+     * a multi-segment one is checked at its full length first, so the same
+     * segment passes alone and is EFAULT beside another. That asymmetry is an
+     * artifact of import_ubuf vs. __import_iovec on current kernels (older
+     * ones checked every segment), and the walk below reports EFAULT for a
+     * range it cannot reach anyway. */
+    unsigned lcnt = (unsigned)liovcnt;              /* import_iovec's nr_segs */
+    if (lcnt > 1024) return (u64)(s64)-EINVAL;      /* UIO_MAXIOV */
 
-    GIovec *lv = malloc(sizeof(GIovec) * (size_t)liovcnt);
-    GIovec *rv = malloc(sizeof(GIovec) * (size_t)riovcnt);
-    if (!lv || !rv) { free(lv); free(rv); return (u64)(s64)-ENOMEM; }
-    if (copy_from_guest(c, lv, liov, sizeof(GIovec) * (size_t)liovcnt) < 0 ||
-        copy_from_guest(c, rv, riov, sizeof(GIovec) * (size_t)riovcnt) < 0) {
+    GIovec *lv = NULL, *rv = NULL;
+    u64 asked = 0;
+    if (lcnt) {
+        if (!(lv = malloc(sizeof(GIovec) * (size_t)lcnt)))
+            return (u64)(s64)-ENOMEM;
+        if (copy_from_guest(c, lv, liov, sizeof(GIovec) * (size_t)lcnt) < 0) {
+            free(lv); return (u64)(s64)-EFAULT;
+        }
+        for (unsigned i = 0; i < lcnt; i++) {
+            if ((s64)lv[i].iov_len < 0) { free(lv); return (u64)(s64)-EINVAL; }
+            if (lv[i].iov_len > A64_MAX_RW_COUNT - asked)
+                lv[i].iov_len = A64_MAX_RW_COUNT - asked;
+            asked += lv[i].iov_len;
+        }
+    }
+    if (!asked) { free(lv); return 0; }             /* nothing to copy into */
+
+    if (riovcnt == 0) { free(lv); return 0; }
+    if (riovcnt > 1024) { free(lv); return (u64)(s64)-EINVAL; }
+    if (!(rv = malloc(sizeof(GIovec) * (size_t)riovcnt))) {
+        free(lv); return (u64)(s64)-ENOMEM;
+    }
+    if (copy_from_guest(c, rv, riov, sizeof(GIovec) * (size_t)riovcnt) < 0) {
         free(lv); free(rv); return (u64)(s64)-EFAULT;
     }
+    for (u64 i = 0; i < riovcnt; i++)
+        if ((s64)rv[i].iov_len < 0) {
+            free(lv); free(rv); return (u64)(s64)-EINVAL;
+        }
 
+    int is_self = ((s32)pid == (s32)getpid());
     u8 bounce[1024];
     size_t li = 0, ri = 0, total = 0;
     u64 loff = 0, roff = 0;
     int err = 0;
-    while (li < liovcnt && ri < riovcnt) {
+    while (li < lcnt && ri < riovcnt) {
         u64 lrem = lv[li].iov_len - loff;
         u64 rrem = rv[ri].iov_len - roff;
         if (lrem == 0) { li++; loff = 0; continue; }
