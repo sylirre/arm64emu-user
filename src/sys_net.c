@@ -523,7 +523,14 @@ SYSDEF(setsockopt) {
         buf = malloc(len);
         if (!buf) return (u64)(s64)-ENOMEM;
     }
-    if (len && copy_from_guest(c, buf, a3, len) < 0) {
+    /* A zero-length option value stages nothing, and nothing can be read back
+     * out of the staging either -- the optlen handed to the host is what makes
+     * that true, not the pointer. Leave it in a defined state all the same:
+     * what setsockopt(2) is given is an address the host is entitled to read
+     * `len` bytes through, and untouched stack is not that. (The 32-bit build
+     * is where gcc notices, and it is right to.) */
+    if (!len) sbuf[0] = 0;
+    else if (copy_from_guest(c, buf, a3, len) < 0) {
         if (buf != sbuf) free(buf);
         return (u64)(s64)-EFAULT;
     }
