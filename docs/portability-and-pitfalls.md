@@ -28,6 +28,18 @@ all four targets.
 - **Little-endian host assumed.** The `V128` SIMD register is a byte/half/word/
   dword union; all four targets are little-endian. Big-endian hosts are out of
   scope.
+- **`>>` on a signed type is assumed arithmetic.** Right-shifting a negative
+  value is implementation-defined C, not undefined, and GCC and Clang both
+  document the arithmetic shift on every target here. The SIMD lane kernels
+  lean on it deliberately — `vreg_shift`, `narrow_shr` and the SQDMULH/SQRDMULH
+  family *are* modelling `ASR`, and the saturation bounds are compared after
+  shifting a negative `min` — and spelling that out longhand would hide the
+  arithmetic the instruction performs behind the workaround, per lane, in the
+  hot path. What is not written that way is a shift used as a *sign-extension
+  idiom*: `sqrdmlah_op`'s 128-bit pair takes its high word from `base < 0`, and
+  `clockid_allowed` (`sys_time.c`) decodes `CPUCLOCK_PID` through `~id`, which
+  is never negative. Both read better for it, which is the test — a shift that
+  says "all ones if negative" should say so.
 - **`_FILE_OFFSET_BITS=64` and `_TIME_BITS=64`** are set so a 32-bit host's libc
   presents 64-bit `off_t`/`time_t`, matching the guest's LP64 widths.
 - **`make m32`** builds the i386 binary natively on the x86-64 dev host, so ILP32

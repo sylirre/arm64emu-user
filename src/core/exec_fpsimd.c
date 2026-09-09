@@ -1581,12 +1581,19 @@ static u64 usat_sub(u64 a, u64 b, unsigned e) {
  * 2*a*b alone overflows s64 at the INT32_MIN^2 corner, so the sum is formed in
  * two 64-bit words (no __int128: the 32-bit-host build lacks it). esize is 16
  * or 32, so d<<esize + rounding and a*b each fit in s64 on their own; only the
- * doubling of the product can carry into the high word. */
+ * doubling of the product can carry into the high word.
+ *
+ * The high word of each pair is the operand's sign extension, written as such
+ * rather than as a `>> 63`: right-shifting a negative signed value is only
+ * implementation-defined C, and the shift was never arithmetic here -- it was
+ * spelling "all ones if negative". (The lane kernels below do rely on the
+ * arithmetic shift, where it is the arithmetic the instruction performs; see
+ * docs/portability-and-pitfalls.md.) */
 static u64 sqrdmlah_op(s64 d, s64 a, s64 b, unsigned esize, int sub) {
     s64 base = (s64)((u64)d << esize) + ((s64)1 << (esize - 1));
     s64 p = a * b;
-    u64 lo = (u64)base, hi = (u64)(base >> 63);
-    u64 plo = (u64)p << 1, phi = (u64)(p >> 63);   /* 2*p as a 128-bit pair */
+    u64 lo = (u64)base, hi = base < 0 ? ~(u64)0 : 0;
+    u64 plo = (u64)p << 1, phi = p < 0 ? ~(u64)0 : 0;   /* 2*p as a 128-bit pair */
     if (sub) {
         hi -= phi + (lo < plo);
         lo -= plo;
