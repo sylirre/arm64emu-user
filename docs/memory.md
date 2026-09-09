@@ -92,6 +92,33 @@ private instead of refusing it. (Linux 6.11 added `MAP_DROPPABLE`, `0x08`, as a
 third anonymous type; it is refused here as it is on every kernel before it,
 and as the 6.1 `uname` claims does.)
 
+`madvise`'s validation runs in the same spirit, and in `do_madvise`'s order:
+the *advice* is judged first, before anything about the range, so a value this
+kernel does not know is `EINVAL` even where the range alone would have been an
+empty-length success or a hole's `ENOMEM`. The accepted set is a 6.1 kernel's
+(`madv_valid`, `sys_mm.c`) — `MADV_DONTNEED`, `MADV_FREE` and
+`MADV_DONTNEED_LOCKED` discard the range, and the rest are hints about paging,
+fork inheritance and dumping that a kernel is free to ignore and that are
+ignored here. Two groups are deliberately absent: `MADV_HWPOISON` /
+`MADV_SOFT_OFFLINE` need `CONFIG_MEMORY_FAILURE`, which this kernel does not
+offer, and `MADV_GUARD_INSTALL` / `MADV_GUARD_REMOVE` are 6.13. Neither pair is
+a hint — one poisons a page, the other installs a faulting guard PTE — so
+accepting either would leave a guest waiting for a fault that cannot arrive,
+where `EINVAL` tells it plainly that this kernel has no such thing. Answering
+`0` to *every* unknown advice, which is what this did before, turned every
+guest feature probe into a false "supported". The third argument is an `int`,
+so the high half of the register carries no advice: `0x1_0000_0004` is
+`MADV_DONTNEED`. `tests/fixtures/madvadvice.c` covers the lot.
+
+The discard itself has to match the kernel's zero-on-reuse guarantee, not
+merely free memory: Go's page allocator treats a scavenged span as
+already-zero on reuse, so emulating `MADV_DONTNEED` as a no-op left stale heap
+data where the GC expected zeroes. Anonymous ranges are zeroed in their
+backing (which a kernel does whatever protection the mapping carries —
+discarding is not writing); a private file mapping hands the discard to the
+host so the re-fault comes from the file, and only where host pages are guest
+sized, since a bigger one would take neighbouring guest pages with it.
+
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**
 regardless of the guest's requested protection: the interpreter itself must

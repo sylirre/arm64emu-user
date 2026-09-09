@@ -51,6 +51,7 @@ enum {
     AT_UMOUNTFLAGS,/* umount2(2) flags */
     AT_SIG,        /* signal number → name */
     AT_WHENCE,     /* lseek whence */
+    AT_MADVICE,    /* madvise advice (MADV_*) */
     AT_SIGHOW,     /* rt_sigprocmask how */
     AT_CLONEFLAGS, /* clone/unshare flags (CLONE_*) */
     AT_SIGMASK,    /* pointer to a 64-bit sigset: [SIGUSR1 SIGCHLD] */
@@ -179,7 +180,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_mprotect,  { AT_PTR, AT_UINT, AT_PROT }, 0 },
     { G_NR_mremap,    { AT_PTR, AT_UINT, AT_UINT, AT_HEX, AT_PTR }, AT_HEX },
     { G_NR_brk,       { AT_PTR }, AT_HEX },
-    { G_NR_madvise,   { AT_PTR, AT_UINT, AT_INT }, 0 },
+    { G_NR_madvise,   { AT_PTR, AT_UINT, AT_MADVICE }, 0 },
     { G_NR_mlock,     { AT_PTR, AT_UINT }, 0 },
     { G_NR_munlock,   { AT_PTR, AT_UINT }, 0 },
     { G_NR_msync,     { AT_PTR, AT_UINT, AT_HEX }, 0 },
@@ -463,6 +464,20 @@ static const struct flagname sfd_tab[] = {
 static const struct enumname whence_tab[] = {
     { 0, "SEEK_SET" }, { 1, "SEEK_CUR" }, { 2, "SEEK_END" },
     { 3, "SEEK_DATA" }, { 4, "SEEK_HOLE" }, { 0, NULL }
+};
+static const struct enumname madv_tab[] = {
+    { 0, "MADV_NORMAL" }, { 1, "MADV_RANDOM" }, { 2, "MADV_SEQUENTIAL" },
+    { 3, "MADV_WILLNEED" }, { 4, "MADV_DONTNEED" }, { 8, "MADV_FREE" },
+    { 9, "MADV_REMOVE" }, { 10, "MADV_DONTFORK" }, { 11, "MADV_DOFORK" },
+    { 12, "MADV_MERGEABLE" }, { 13, "MADV_UNMERGEABLE" },
+    { 14, "MADV_HUGEPAGE" }, { 15, "MADV_NOHUGEPAGE" },
+    { 16, "MADV_DONTDUMP" }, { 17, "MADV_DODUMP" },
+    { 18, "MADV_WIPEONFORK" }, { 19, "MADV_KEEPONFORK" },
+    { 20, "MADV_COLD" }, { 21, "MADV_PAGEOUT" },
+    { 22, "MADV_POPULATE_READ" }, { 23, "MADV_POPULATE_WRITE" },
+    { 24, "MADV_DONTNEED_LOCKED" }, { 25, "MADV_COLLAPSE" },
+    { 100, "MADV_HWPOISON" }, { 101, "MADV_SOFT_OFFLINE" },
+    { 102, "MADV_GUARD_INSTALL" }, { 103, "MADV_GUARD_REMOVE" }, { 0, NULL }
 };
 static const struct enumname sighow_tab[] = {
     { 0, "SIG_BLOCK" }, { 1, "SIG_UNBLOCK" }, { 2, "SIG_SETMASK" }, { 0, NULL }
@@ -840,6 +855,7 @@ static void fmt_arg(SB *s, struct CPU *c, u8 ty, const u64 *args, int idx,
     case AT_UMOUNTFLAGS: fmt_flags(s, v, umount_tab, NULL); break;
     case AT_SIG:         fmt_enum(s, v, sig_tab); break;
     case AT_WHENCE:      fmt_enum(s, v, whence_tab); break;
+    case AT_MADVICE:     fmt_enum(s, v, madv_tab); break;
     case AT_SIGHOW:      fmt_enum(s, v, sighow_tab); break;
     case AT_CLONEFLAGS:  fmt_flags(s, v, clone_tab, "0"); break;
     case AT_SIGMASK:     fmt_sigmask(s, c, v); break;

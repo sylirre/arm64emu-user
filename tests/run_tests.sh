@@ -2401,6 +2401,15 @@ check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
 check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nhole_normal=-12\nunmapped=-12\ndiscarded=00\nwhole_space=-12\ndone'
+# Which madvise advice values the kernel takes, and the order it judges them
+# in: an unknown advice is EINVAL before the range is looked at, so it beats
+# both the empty-length success and the hole's ENOMEM. MADV_HWPOISON and
+# MADV_SOFT_OFFLINE are refused as a kernel without CONFIG_MEMORY_FAILURE
+# refuses them (nothing here can poison a page, and saying 0 would leave the
+# guest waiting for a SIGBUS), and the two guard-region values are 6.13, later
+# than the 6.1 uname advertises. Self-checking because qemu-user takes every
+# advice it does not know and refuses the two ...ONFORK ones it does.
+check_fixture madvadvice $'normal=0\nrandom=0\nsequential=0\nwillneed=0\ndontfork=0\ndofork=0\nmergeable=0\nunmergeable=0\nhugepage=0\nnohugepage=0\ndontdump=0\ndodump=0\nwipeonfork=0\nkeeponfork=0\ncold=0\npageout=0\npopulate_read=0\npopulate_write=0\ndontneed=0\nfree=0\ndontneed_locked=0\ngap5=-22\ngap6=-22\ngap7=-22\npast=-22\nfar=-22\nhwpoison=-22\nsoft_offline=-22\nguard_install=-22\nguard_remove=-22\nneg=-22\nintmax=-22\nok_zerolen=0\nbad_zerolen=-22\nok_hole=-12\nbad_hole=-22\nhi32_dontneed=0\nhi32_discarded=1\nhi32_bad=-22\ndone'
 # Ranges that wrap past the top of the address space, and lengths whose page
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;

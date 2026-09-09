@@ -389,16 +389,85 @@ SYSDEF(mprotect) {
     return r < 0 ? (u64)(s64)r : 0;
 }
 
-/* Guest madvise advice values (asm-generic). */
-#define G_MADV_DONTNEED 4
-#define G_MADV_FREE     8
+/* Guest madvise advice values (asm-generic/mman-common.h). */
+#define G_MADV_NORMAL           0
+#define G_MADV_RANDOM           1
+#define G_MADV_SEQUENTIAL       2
+#define G_MADV_WILLNEED         3
+#define G_MADV_DONTNEED         4
+#define G_MADV_FREE             8
+#define G_MADV_REMOVE           9
+#define G_MADV_DONTFORK         10
+#define G_MADV_DOFORK           11
+#define G_MADV_MERGEABLE        12
+#define G_MADV_UNMERGEABLE      13
+#define G_MADV_HUGEPAGE         14
+#define G_MADV_NOHUGEPAGE       15
+#define G_MADV_DONTDUMP         16
+#define G_MADV_DODUMP           17
+#define G_MADV_WIPEONFORK       18
+#define G_MADV_KEEPONFORK       19
+#define G_MADV_COLD             20
+#define G_MADV_PAGEOUT          21
+#define G_MADV_POPULATE_READ    22
+#define G_MADV_POPULATE_WRITE   23
+#define G_MADV_DONTNEED_LOCKED  24
+#define G_MADV_COLLAPSE         25
+
+/* madvise_behavior_valid's job: which advice values this kernel takes at all.
+ * Everything else is EINVAL -- a guest probing for an advice it might not have
+ * (or passing a garbage one) has to be told, and answering 0 to all of them
+ * made every such probe succeed.
+ *
+ * The set is the one a 6.1 kernel has, which is what uname advertises
+ * (GUEST_KREL), minus two groups that are deliberately absent:
+ *
+ *   MADV_HWPOISON (100) / MADV_SOFT_OFFLINE (101) need CONFIG_MEMORY_FAILURE,
+ *   and this kernel has no memory-failure machinery to offer. They are not
+ *   hints either: a guest asking for a page to be poisoned and told "0" would
+ *   wait for a SIGBUS that can never arrive, so the honest answer is the one a
+ *   kernel built without the option gives.
+ *
+ *   MADV_GUARD_INSTALL (102) / MADV_GUARD_REMOVE (103) are 6.13, later than
+ *   this kernel claims to be -- and they install state (a guard PTE that
+ *   faults) rather than offering a hint, so the same reasoning applies.
+ *
+ * What is left divides in two: MADV_DONTNEED / MADV_FREE / MADV_DONTNEED_LOCKED
+ * are carried out below, and the rest are hints about paging, fork inheritance
+ * and dumping that a kernel is itself free to ignore -- accepted and ignored,
+ * which is what they mean here. */
+static int madv_valid(int adv) {
+    switch (adv) {
+        case G_MADV_NORMAL:     case G_MADV_RANDOM:
+        case G_MADV_SEQUENTIAL: case G_MADV_WILLNEED:
+        case G_MADV_DONTNEED:   case G_MADV_FREE:
+        case G_MADV_REMOVE:     case G_MADV_DONTFORK:
+        case G_MADV_DOFORK:     case G_MADV_MERGEABLE:
+        case G_MADV_UNMERGEABLE: case G_MADV_HUGEPAGE:
+        case G_MADV_NOHUGEPAGE: case G_MADV_DONTDUMP:
+        case G_MADV_DODUMP:     case G_MADV_WIPEONFORK:
+        case G_MADV_KEEPONFORK: case G_MADV_COLD:
+        case G_MADV_PAGEOUT:    case G_MADV_POPULATE_READ:
+        case G_MADV_POPULATE_WRITE: case G_MADV_DONTNEED_LOCKED:
+        case G_MADV_COLLAPSE:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
 SYSDEF(madvise) {
     (void)a3; (void)a4; (void)a5;
-    /* The range checks a kernel makes for every advice value, in its order
-     * (do_madvise): an unaligned start is EINVAL, a length whose page round-up
-     * wrapped to zero is EINVAL ("rounded up from small -ve"), an end that
-     * wraps is EINVAL, and an empty range is success without a walk. */
+    /* The kernel's third argument is an `int`, so the high half of the
+     * register is no part of the advice: 0x1_0000_0004 is MADV_DONTNEED. */
+    int adv = (int)(s32)a2;
+    /* The order do_madvise makes its checks in: the behaviour is judged first,
+     * before anything about the range -- an unknown advice is EINVAL even for
+     * a misaligned start, a wrapped length or an empty range. Then an
+     * unaligned start is EINVAL, a length whose page round-up wrapped to zero
+     * is EINVAL ("rounded up from small -ve"), an end that wraps is EINVAL,
+     * and an empty range is success without a walk. */
+    if (!madv_valid(adv)) return (u64)(s64)-EINVAL;
     if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
     u64 len = PG_UP(a1);
     if (a1 && !len) return (u64)(s64)-EINVAL;
@@ -415,8 +484,13 @@ SYSDEF(madvise) {
      * span kept a live pointer in its inline-mark region and the GC read it as a
      * mark -> "sweep increased allocation count" / "marked free object". Discard
      * the range by zeroing its backing to match the kernel's zero-on-reuse
-     * guarantee. Only whole guest pages inside the range are cleared. */
-    int discard = (a2 == G_MADV_DONTNEED || a2 == G_MADV_FREE);
+     * guarantee. Only whole guest pages inside the range are cleared.
+     *
+     * MADV_DONTNEED_LOCKED is MADV_DONTNEED for a range that is mlocked, which
+     * a kernel refuses the plain advice on; nothing is ever locked here (the
+     * mlock family is accept-and-ignore below), so it discards. */
+    int discard = (adv == G_MADV_DONTNEED || adv == G_MADV_FREE ||
+                   adv == G_MADV_DONTNEED_LOCKED);
     long hps = sysconf(_SC_PAGESIZE);
     AddrSpace *as = &c->m->as;
     int hole = 0;
@@ -471,8 +545,8 @@ SYSDEF(madvise) {
         va = stop;
     }
     as_unlock();
-    /* Other advice: accepted and ignored, but not before the range it names
-     * has been judged. */
+    /* The hint advice values: accepted and ignored, but not before the range
+     * they name has been judged. */
     return hole ? (u64)(s64)-ENOMEM : 0;
 }
 
