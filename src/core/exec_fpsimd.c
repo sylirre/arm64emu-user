@@ -1586,9 +1586,9 @@ static u64 usat_sub(u64 a, u64 b, unsigned e) {
  * The high word of each pair is the operand's sign extension, written as such
  * rather than as a `>> 63`: right-shifting a negative signed value is only
  * implementation-defined C, and the shift was never arithmetic here -- it was
- * spelling "all ones if negative". (The lane kernels below do rely on the
- * arithmetic shift, where it is the arithmetic the instruction performs; see
- * docs/portability-and-pitfalls.md.) */
+ * spelling "all ones if negative". The lane kernels below do lean on the
+ * arithmetic shift deliberately, where it is the arithmetic the instruction
+ * itself performs; this one only looked like it. */
 static u64 sqrdmlah_op(s64 d, s64 a, s64 b, unsigned esize, int sub) {
     s64 base = (s64)((u64)d << esize) + ((s64)1 << (esize - 1));
     s64 p = a * b;
