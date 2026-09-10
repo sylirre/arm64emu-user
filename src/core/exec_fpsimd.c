@@ -251,18 +251,25 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
  * Known corners vs the architecture, deliberate. All were measured against
  * qemu by sweeping random FP/SIMD words; the counts are per 30000 words with
  * NaN and Inf excluded from every lane width:
- *   - tininess is detected after rounding on x86 (ARM: before) — one boundary
- *     ULP of difference in UFC for float/double;
  *   - f64-input fixed-point converts with 2^1000-scale overflow leak host OFC;
  *   - the FP16 widen-compute-narrow pipeline can miss UFC/IXC on a result
  *     that is inexact in half but exact in double (6/30000, FCMLA).
  * These are values a guest only sees if it inspects the sticky flags after an
- * exceptional operation. NaN *results* used to be a third such corner and are
- * no longer: both which NaN an operation returns and what a generated one
- * looks like are decided here rather than inherited from the host — see the
- * FPProcessNaNs / DefaultNaN block below. FPCR.DN (Default-NaN mode, which
- * would make even a propagated NaN come back as the default) is still not
- * modelled; Linux userspace leaves it clear. */
+ * exceptional operation. Two entries have left this list. NaN *results* were
+ * one, and are no longer: both which NaN an operation returns and what a
+ * generated one looks like are decided here rather than inherited from the
+ * host -- see the
+ * FPProcessNaNs / DefaultNaN block below. The other was the claim that x86
+ * detects tininess after rounding where ARM detects it before, costing one
+ * boundary ULP of UFC: it does not hold for the SSE math this builds with,
+ * and the i386 build forces -mfpmath=sse for its own reasons, so x87 never
+ * sees guest FP. 1.6M operations biased into the tiny range, over
+ * FMUL/FDIV/FADD/FSUB/FMADD in both precisions, agree with qemu flag for flag
+ * -- on the boundary and on either side of it. FPCR.FZ's before-rounding test
+ * relies on that being true; fz_op_tiny below says how.
+ *
+ * FPCR.DN (Default-NaN mode, which would make even a propagated NaN come back
+ * as the default) is still not modelled; Linux userspace leaves it clear. */
 #define FPSR_IOC 0x01u
 #define FPSR_DZC 0x02u
 #define FPSR_OFC 0x04u
@@ -334,16 +341,16 @@ void fpsr_sync(CPU *c) {
  * them once per dispatch instead of threading a CPU pointer through every
  * lane kernel.
  *
- * One deviation, and it is the tininess-detection difference already listed
- * above wearing a different hat: for the single- and double-precision paths
- * the host hands back a result that is already rounded, so a value whose
- * exact magnitude sat just below the smallest normal but rounded up to it is
- * kept here where the architecture (which tests the exponent before rounding)
- * would flush it. It needs an exact FMUL/FDIV/fused-multiply result inside
- * the last ULP below 2^-126 or 2^-1022 -- FADD and FSUB cannot reach it at
- * all, since a subnormal difference of two normals is exact. The half
- * pipeline computes in double and every narrowing convert below is
- * pure-integer, so both have the exact value in hand and flush exactly. */
+ * The architecture tests the exponent BEFORE rounding, and a rounded result
+ * cannot always report that: an exact value inside the last ULP below the
+ * smallest normal is carried up to it and comes back looking normal. The
+ * Underflow flag supplies the missing bit (see fz_op_tiny below), so this is
+ * exact rather than approximate -- which matters because the case is
+ * reachable, by any FMUL/FDIV/fused multiply whose exact result lands there.
+ * FADD and FSUB cannot reach it at all: a subnormal difference of two normals
+ * is exact, so it rounds to itself. The half pipeline computes in double and
+ * every narrowing convert below is pure-integer, so both hold the exact value
+ * and test it directly. */
 #define FPCR_FZ16 (1u << 19)
 #define FPCR_FZ   (1u << 24)
 static __thread int g_fz, g_fz16;
@@ -447,20 +454,40 @@ static u16 fz_out_h(u16 v) {
     return (u16)(v & 0x8000u);
 }
 
-/* FPRoundBase's flush of a denormal result. *flushed tells fz_release() to
- * take back the Inexact the host raised reaching a value now discarded. */
+/* Did THIS operation produce a tiny result? The architecture asks the
+ * question of the value *before* rounding, and a rounded result cannot always
+ * answer it: an exact value inside the last ULP below the smallest normal is
+ * carried up to it by round-to-nearest and comes back looking perfectly
+ * normal. The Underflow flag is the missing bit. It is raised for a result
+ * that is tiny and inexact -- tininess judged before rounding on every host
+ * this builds for, SSE and VFP alike -- so a result that is exactly the
+ * smallest normal is tiny precisely when it is set, and a result that merely
+ * rounded DOWN to the boundary from above leaves it clear. fz_bank() has
+ * emptied the flag word for this operation alone, which is what makes the
+ * reading trustworthy; where the fused multiply-add is derived in software
+ * (armv7) the same answer arrives in the pending set instead of the host's. */
+static int fz_op_tiny(void) {
+    return fetestexcept(FE_UNDERFLOW) != 0 || (g_fpexc & FPSR_UFC) != 0;
+}
+
+/* FPRoundBase's flush of a tiny result. *flushed tells fz_release() to take
+ * back the Inexact the host raised reaching a value now discarded. */
 static double fz_out_d(double x, int *flushed) {
     u64 b; memcpy(&b, &x, 8);
+    u64 mag = b & 0x7fffffffffffffffULL;
     *flushed = 0;
-    if (!g_fz || (b & 0x7ff0000000000000ULL) || !(b & 0x000fffffffffffffULL)) return x;
+    if (!g_fz || !mag || mag > 0x0010000000000000ULL) return x;
+    if (mag == 0x0010000000000000ULL && !fz_op_tiny()) return x;  /* rounded down to it */
     g_fpexc |= FPSR_UFC; *flushed = 1;
     b &= 0x8000000000000000ULL; memcpy(&x, &b, 8);
     return x;
 }
 static float fz_out_s(float x, int *flushed) {
     u32 b; memcpy(&b, &x, 4);
+    u32 mag = b & 0x7fffffffu;
     *flushed = 0;
-    if (!g_fz || (b & 0x7f800000u) || !(b & 0x007fffffu)) return x;
+    if (!g_fz || !mag || mag > 0x00800000u) return x;
+    if (mag == 0x00800000u && !fz_op_tiny()) return x;
     g_fpexc |= FPSR_UFC; *flushed = 1;
     b &= 0x80000000u; memcpy(&x, &b, 4);
     return x;

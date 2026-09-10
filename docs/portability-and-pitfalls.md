@@ -348,6 +348,24 @@ direction. `mrs fpsr` also has to be read by hand for IDC: `<fenv.h>` names
 the five IEEE exceptions and the Input Denormal is ARM's own, so
 `fetestexcept` cannot see the flag the hardware raises.
 
+The same flag answers a question the lazy model is otherwise the wrong shape
+for. Flush-to-zero asks whether a result is below the smallest normal, and the
+architecture asks that of the value *before* rounding — which a rounded result
+cannot always report, since an exact value inside the last ULP below the
+boundary is carried up onto it by round-to-nearest and comes back looking
+normal, while one just above can round down onto it and must be kept. The two
+are indistinguishable in the result. What separates them is whether the
+operation underflowed: `FE_UNDERFLOW` is raised for a result that is tiny and
+inexact, and — contrary to the folklore this file used to repeat — SSE judges
+that tininess before rounding too, exactly as VFP does. Measured against
+`qemu-aarch64`, the three cases (below, on, above the boundary) agree flag for
+flag on an x86-64 host. So the test is "result is exactly the smallest normal
+AND this operation raised Underflow", and it needs no recomputation — only the
+per-operation isolation `fz_bank` already provides. `tests/c/fpcr_ftz_tiny.c`
+pins all three cases for every operation that can reach the corner (FMUL,
+FDIV and the fused multiplies; FADD and FSUB cannot, because a subnormal
+difference of two normals is exact and rounds to itself).
+
 Flush-to-zero adds a rule the lazy model does not naturally express. When
 `FPCR.FZ` replaces a tiny result with zero the architecture raises `UFC` and
 *nothing else* — in particular not the `Inexact` the host raised on its way to

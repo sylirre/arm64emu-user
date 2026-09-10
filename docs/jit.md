@@ -151,9 +151,7 @@ be made to flush too.
 On an **AArch64 host** it can: the host's own FPCR implements the same two
 modes, so `exec_fpsimd.c` mirrors the guest's bits into it and every native
 instruction the backends emit flushes exactly as the guest asked. Nothing is
-withdrawn, and the boundary case the software path cannot see disappears with
-it — the hardware tests the exponent before rounding, which is what the
-architecture says. The single exception is `VC_H3` (scalar half FMADD), the
+withdrawn. The single exception is `VC_H3` (scalar half FMADD), the
 one recipe that does not replay the guest instruction: it widens to double,
 does a double FMA and narrows, and `FCVT` ignores `FZ16` by architecture, so
 it goes back to the helper while `FZ16` is set.

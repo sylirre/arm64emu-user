@@ -428,19 +428,17 @@ wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
 - `DCZID_EL0` advertises a 64-byte DC ZVA block (self-consistent with the
   implementation); it differs from QEMU's advertised value but libc memset works.
-- FPCR flush-to-zero (`FZ`, `FZ16`) is implemented. On an AArch64 host the
-  two bits are mirrored into the host's own FPCR — the same architecture,
-  so the hardware does the flushing and `--jit` goes on inlining floating
-  point. Elsewhere it is done in software, `--jit` leaves floating point to
-  the interpreter for as long as either bit is set (see
-  [`docs/jit.md`](docs/jit.md)), and one boundary case remains: a single- or
-  double-precision result whose *exact* value fell inside the last ULP below
-  the smallest normal, and which rounding then carried up to it, is kept
-  where the architecture flushes it (those hosts report tininess after
-  rounding, the architecture before). Reachable only through FMUL/FDIV/the
-  fused multiplies; the half-precision path and every narrowing convert hold
-  the exact value and flush exactly. FPSR cumulative exception flags stay
-  best-effort in the same corner; normal values and NaN
+- FPCR flush-to-zero (`FZ`, `FZ16`) is implemented, including the boundary:
+  the architecture judges tininess *before* rounding, so an exact result
+  inside the last ULP below the smallest normal is flushed even though
+  round-to-nearest carries it up onto the boundary, and one that rounds
+  *down* onto the boundary from above is kept. On an AArch64 host the two
+  bits are mirrored into the host's own FPCR — the same architecture, so the
+  hardware does the flushing and `--jit` goes on inlining floating point;
+  elsewhere it is done in software and `--jit` leaves floating point to the
+  interpreter for as long as either bit is set (see
+  [`docs/jit.md`](docs/jit.md)). FPSR cumulative exception flags stay
+  best-effort in denormal corners; normal values and NaN
   generation/propagation match hardware.
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
 - Big-endian hosts are not supported (the SIMD register union is little-endian).
