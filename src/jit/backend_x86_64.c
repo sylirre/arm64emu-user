@@ -2524,17 +2524,13 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                     sse_rr(e, 0x66, 0x76, 1, 1);
                     sse_shift_i(e, sz ? 0x73 : 0x72, 2, 1, 1);
                     sse_rr(e, 0x66, 0xDB, 0, 1);
-                    /* the single form is NOT a pure bit op in the
-                     * interpreter: its widen-through-double quiets SNaN
-                     * lanes (and raises IOC) — keep the gate there. The
-                     * double form reads the lane directly and is pure. */
-                    gated = !sz;
+                    gated = 0;                   /* exact, and raises nothing */
                     break;
                 case 0x6f:                       /* FNEG: flip sign bits */
                     sse_rr(e, 0x66, 0x76, 1, 1);
                     sse_shift_i(e, sz ? 0x73 : 0x72, 6, 1, sz ? 63 : 31);
                     sse_rr(e, 0x66, 0xEF, 0, 1);
-                    gated = !sz;                 /* same SNaN-quiet rule */
+                    gated = 0;
                     break;
                 case 0x7f:                       /* FSQRT */
                     sse_rr(e, pfx, 0x51, 0, 0);
@@ -2776,6 +2772,23 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                            ((insn >> 12) & 0x1f);
             int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
                           key == 0x6d || key == 0x2e);
+            if (key == 0x2f || key == 0x6f) {
+                /* FABS/FNEG: the sign bit of each half lane and nothing else.
+                 * Widening first would signal Invalid on a signaling NaN
+                 * lane, and these unpack nothing. pcmpeqd gives all-ones;
+                 * psrlw 1 makes 0x7fff per lane, psllw 15 makes 0x8000. */
+                sse_mem(e, 0xF3, 0x6F, 0, OFF_V(rn));    /* movdqu xmm0, Vn */
+                sse_rr(e, 0x66, 0x76, 2, 2);             /* pcmpeqd: ones */
+                if (key == 0x2f) { sse_shift_i(e, 0x71, 2, 2, 1);
+                                   sse_rr(e, 0x66, 0xDB, 0, 2); }   /* pand */
+                else             { sse_shift_i(e, 0x71, 6, 2, 15);
+                                   sse_rr(e, 0x66, 0xEF, 0, 2); }   /* pxor */
+                icount_add(be, 1);
+                if (Q) sse_mem(e, 0, 0x11, 0, OFF_V(rd));
+                else { movq_rax_x(e, 1, 0); st64(e, RAX, R14, OFF_V(rd));
+                       st_imm_r14(e, OFF_V(rd) + 8, 0); }
+                break;
+            }
             vcvtph2ps_m(e, 0, OFF_V(rn));
             if (Q) vcvtph2ps_m(e, 1, OFF_V(rn) + 8);
             if (is_cmp) {                            /* compare vs 0 -> mask */
@@ -2803,13 +2816,7 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                 break;
             }
             materialize_flags(be);
-            if (key == 0x2f) {                       /* FABS */
-                sse_rr(e, 0x66, 0x76, 2, 2); sse_shift_i(e, 0x72, 2, 2, 1);
-                sse_rr(e, 0, 0x54, 0, 2); if (Q) sse_rr(e, 0, 0x54, 1, 2);
-            } else if (key == 0x6f) {                /* FNEG */
-                sse_rr(e, 0x66, 0x76, 2, 2); sse_shift_i(e, 0x72, 6, 2, 31);
-                sse_rr(e, 0, 0x57, 0, 2); if (Q) sse_rr(e, 0, 0x57, 1, 2);
-            } else {                                 /* FSQRT (0x7f) */
+            if (key == 0x7f) {                       /* FSQRT */
                 sse_rr(e, 0, 0x51, 0, 0); if (Q) sse_rr(e, 0, 0x51, 1, 1);
             }
             sse_rr(e, 0x66, 0x6F, 4, 0); sse_rr(e, 0, 0xC2, 4, 4); e8(e, 3);
@@ -2831,9 +2838,12 @@ static void emit_vop(BE *be, const IRBlock *ir, int i, const IROp *o) {
                          * (the interpreter's f64_to_f16 canonicalizes NaN),
                          * FMOV is a plain 16-bit copy. */
             unsigned opc = (insn >> 15) & 0x3f;
-            if (opc == 0x0) {                        /* FMOV: 16-bit copy */
+            if (opc <= 0x2) {   /* FMOV/FABS/FNEG: 16 bits, sign bit only.
+                                 * No widen -- vcvtph2ps signals Invalid on a
+                                 * signaling NaN, and these unpack nothing. */
                 ld32(e, RAX, R14, OFF_V(rn));
-                alu_ri32(e, 0, 4, RAX, 0xffff);
+                alu_ri32(e, 0, 4, RAX, opc == 0x1 ? 0x7fffu : 0xffffu);
+                if (opc == 0x2) alu_ri32(e, 0, 6, RAX, 0x8000);   /* FNEG */
                 icount_add(be, 1);
                 st64(e, RAX, R14, OFF_V(rd));
                 st_imm_r14(e, OFF_V(rd) + 8, 0);

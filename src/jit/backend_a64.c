@@ -1236,12 +1236,15 @@ static void emit_vop(BE *be, const IROp *o) {
             break;
         }
         case VC_H1: {   /* scalar half 1-source (self-counting). FMOV is a bit
-                         * copy (native fmov h matches, no gate); FABS/FNEG/
-                         * FSQRT replay native + NaN gate (interp canonicalizes). */
+                         * copy, and FABS/FNEG are the sign bit -- exact, and
+                         * they raise nothing, so gating them would hand a
+                         * signaling NaN operand an IOC from the gate's own
+                         * compare. FSQRT replays native + NaN gate (interp
+                         * canonicalizes). */
             unsigned opc = (insn >> 15) & 0x3f;
             vop_src(be, 0, rn);                          /* v0 = Vn */
             u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
-            if (opc == 0x0) {                            /* FMOV: no gate */
+            if (opc <= 0x2) {                            /* FMOV/FABS/FNEG */
                 ei(e, w);                                /* fmov h2, h0 */
                 icount_add(be, 1);
                 vop_dst(be, 2, rd);
@@ -1325,10 +1328,13 @@ static void emit_vop(BE *be, const IROp *o) {
                            ((insn >> 12) & 0x1f);
             int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
                           key == 0x6d || key == 0x2e);
+            /* FABS/FNEG are the sign bit: exact, and they raise nothing, so
+             * the gate's own compare must not run on them either. */
+            int ungated = is_cmp || key == 0x2f || key == 0x6f;
             u8 *slow2 = NULL;
             vop_src(be, 0, rn);
             u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
-            if (is_cmp) {                                /* FCMxx#0: no gate */
+            if (ungated) {                               /* mask / sign bit */
                 ei(e, w);                                /* v2 = fcmxx v0,#0 */
                 icount_add(be, 1);
                 vop_dst(be, 2, rd);
@@ -1363,11 +1369,13 @@ static void emit_vop(BE *be, const IROp *o) {
                            ((insn >> 12) & 0x1f);
             int is_cmp = (key == 0x2c || key == 0x6c || key == 0x2d ||
                           key == 0x6d || key == 0x2e);
+            /* ... and FABS/FNEG, which are the sign bit and raise nothing. */
+            int ungated = is_cmp || key == 0x2f || key == 0x6f;
             u8 *slow2 = NULL;
             vop_src(be, 0, rn);
             u32 w = (insn & ~((0x1Fu << 5) | 0x1Fu)) | (0u << 5) | 2;
-            if (is_cmp) {
-                ei(e, w);                                /* v2 = fcmxx v0,#0 */
+            if (ungated) {
+                ei(e, w);                                /* v2 = fcmxx / fabs / fneg */
                 icount_add(be, 1);
                 vop_dst(be, 2, rd);
                 break;

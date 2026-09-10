@@ -1275,18 +1275,16 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
             fp_set_flags(c, fp_compare_d(a, b, BIT(4))); return;
         }
         if (o2 == 0 && BIT(14) == 1) {                    /* FP data-processing (1 source) */
-            unsigned opc = BITS(20, 15); double r;
+            unsigned opc = BITS(20, 15); double r, x;
             u16 hn = fp_rd_h(c, Rn);
-            /* FMOV/FABS/FNEG rewrite a sign bit and unpack nothing, so they
-             * take the raw widen and the raw narrow: FPCR.FZ16 must not turn
-             * a denormal operand -- or a denormal result -- into zero here.
-             * Every other form is an FPUnpack and takes the flushing one. */
-            double x = f16_to_f64_raw(hn);
-            int raw = (opc == 0x1 || opc == 0x2);
             switch (opc) {
+                /* FMOV/FABS/FNEG rewrite a sign bit. They unpack nothing, so
+                 * they do not round, do not flush to zero, and leave a
+                 * signaling NaN signaling -- which is why they cannot go
+                 * through the widen-compute-narrow pipeline the rest use. */
                 case 0x0: fp_wr_h(c, Rd, hn); return;                 /* FMOV  */
-                case 0x1: r = __builtin_fabs(x); break;               /* FABS  */
-                case 0x2: r = -x; break;                              /* FNEG  */
+                case 0x1: fp_wr_h(c, Rd, (u16)(hn & 0x7fffu)); return; /* FABS */
+                case 0x2: fp_wr_h(c, Rd, (u16)(hn ^ 0x8000u)); return; /* FNEG */
                 case 0x3: x = f16_to_f64(hn); fsqrt_raise_d(x);
                           r = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT */
                 case 0x8: r = frint_d(f16_to_f64(hn), 0, 0); break;   /* FRINTN */
@@ -1298,7 +1296,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                     r = frint_d(f16_to_f64(hn), (int)((c->fpcr >> 22) & 3), opc == 0xe); break;
                 default: fpsimd_undef(c, insn); return;
             }
-            fp_wr_h(c, Rd, raw ? f64_to_f16_raw(r) : f64_to_f16(r)); return;
+            fp_wr_h(c, Rd, f64_to_f16(r)); return;
         }
         if (o2 == 2) {                                    /* FP data-processing (2 source) */
             unsigned Rm = BITS(20, 16), opc = BITS(15, 12); double r;
@@ -3122,21 +3120,31 @@ static void simd_two_misc_fp(CPU *c, u32 insn) {
     unsigned key = (U << 6) | (hsz << 5) | opc;
     int dbl = sz, x64 = sz;
     unsigned n = dbl ? (Q ? 2 : 1) : (Q ? 4 : 2);
-    /* FPUnpack's flush-to-zero, for the forms that unpack: FABS/FNEG (0x0f)
-     * rewrite a sign bit, SCVTF/UCVTF and URECPE/URSQRTE read the lane as an
-     * integer, and FRECPE/FRSQRTE unpack the raw bits themselves. Nothing
-     * here can round a *result* into the denormal range, so there is no
-     * matching flush on the way out. */
+    /* Which forms unpack the lane as a number. Not FABS/FNEG (0x0f), which
+     * rewrite a sign bit; not SCVTF/UCVTF or URECPE/URSQRTE, which read it as
+     * an integer; not FRECPE/FRSQRTE, which unpack the raw bits themselves.
+     * The operand is only converted for the forms that do, so the ones that
+     * do not cannot be handed a conversion's flush-to-zero or its NaN
+     * quieting. Nothing here can round a *result* into the denormal range, so
+     * there is no matching flush on the way out. */
     int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x18 || opc == 0x19 ||
                  opc == 0x1a || opc == 0x1b || (opc == 0x1c && !hsz) || opc == 0x1f;
     for (unsigned i = 0; i < n; i++) {
-        double x;
-        if (dbl) { double t = vget_d(&vn, i); x = unpack ? fz_in_d(t) : t; }
-        else     { float  t = vget_s(&vn, i); x = unpack ? (double)fz_in_s(t) : (double)t; }
+        /* FABS/FNEG: FPAbs/FPNeg are the sign bit and nothing else. Routing
+         * the single form through double quieted a signaling NaN (and raised
+         * IOC for it) where the architecture keeps the operand as it is. */
+        if (key == 0x2f || key == 0x6f) {
+            u64 sign = dbl ? (1ULL << 63) : 0x80000000ULL;
+            u64 v = dbl ? vn.d[i] : vn.s[i];
+            v = (key == 0x2f) ? (v & ~sign) : (v ^ sign);
+            if (dbl) r.d[i] = v; else r.s[i] = (u32)v;
+            continue;
+        }
+        double x = 0.0;
+        if (unpack) x = dbl ? fz_in_d(vget_d(&vn, i))
+                            : (double)fz_in_s(vget_s(&vn, i));
         u64 ires; int is_int = 0, is_mask = 0; double res = 0; u64 mask = 0;
         switch (key) {
-            case 0x2f: res = __builtin_fabs(x); break;                 /* FABS  */
-            case 0x6f: res = -x; break;                                /* FNEG  */
             case 0x7f: fsqrt_raise_d(x);
                        res = fpnan_d(dbl ? __builtin_sqrt(x) : (double)__builtin_sqrtf((float)x), x, x); break; /* FSQRT */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
@@ -3196,17 +3204,18 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
     unsigned key = (U << 6) | (hsz << 5) | opc;
     V128 vn = c->v[Rn], r; r.d[0] = r.d[1] = 0;
     unsigned n = Q ? 8 : 4;
-    /* Same split as the single/double page: FABS/FNEG unpack nothing (and so
-     * round nothing on the way back), SCVTF/UCVTF read the lane as an integer
-     * and the estimates take the raw bits. */
+    /* Same split as the single/double page. */
     int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x18 || opc == 0x19 ||
                  opc == 0x1a || opc == 0x1b || (opc == 0x1c && !hsz) || opc == 0x1f;
     for (unsigned i = 0; i < n; i++) {
-        double x = unpack ? f16_to_f64(vn.h[i]) : f16_to_f64_raw(vn.h[i]);
+        if (key == 0x2f || key == 0x6f) {              /* FABS/FNEG: sign bit */
+            r.h[i] = (u16)((key == 0x2f) ? (vn.h[i] & 0x7fffu)
+                                         : (vn.h[i] ^ 0x8000u));
+            continue;
+        }
+        double x = unpack ? f16_to_f64(vn.h[i]) : 0.0;
         double res = 0; int done = 0;
         switch (key) {
-            case 0x2f: res = __builtin_fabs(x); break;                 /* FABS   */
-            case 0x6f: res = -x; break;                                /* FNEG   */
             case 0x7f: fsqrt_raise_d(x);
                        res = fpnan_d(__builtin_sqrt(x), x, x); break; /* FSQRT  */
             case 0x18: res = frint_d(x, 0, 0); break;                  /* FRINTN */
@@ -3232,7 +3241,7 @@ static void simd_two_misc_fp16(CPU *c, u32 insn) {
             case 0x7d: r.h[i] = rsqrte_f16(vn.h[i]); done = 1; break;   /* FRSQRTE */
             default: fpsimd_undef(c, insn); return;
         }
-        if (!done) r.h[i] = unpack ? f64_to_f16(res) : f64_to_f16_raw(res);
+        if (!done) r.h[i] = f64_to_f16(res);
     }
     c->v[Rd] = r;
 }
@@ -3368,7 +3377,7 @@ static void simd_scalar_cvt_fp16(CPU *c, u32 insn) {
     int unpack = (opc >= 0x0c && opc <= 0x0e) || opc == 0x1a || opc == 0x1b ||
                  (opc == 0x1c && !hsz);
     u16 h = c->v[Rn].h[0];
-    double x = unpack ? f16_to_f64(h) : f16_to_f64_raw(h);
+    double x = unpack ? f16_to_f64(h) : 0.0;
     V128 r; r.d[0] = r.d[1] = 0;
     switch (key) {
         case 0x1d: r.h[0] = f64_to_f16((double)(s16)h); break;     /* SCVTF */

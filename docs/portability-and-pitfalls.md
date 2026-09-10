@@ -348,6 +348,18 @@ per lane, and only for a guest that asked for the mode. The same rule is why
 the half-precision narrows raise their `UFC` by hand: they are pure integer
 code, so there is nothing to take back.
 
+**FABS and FNEG are not arithmetic**, and an emulator that treats them as
+such gets caught twice. They are defined on the bits, with no unpack: a
+signaling NaN stays signaling, a denormal stays a denormal even under
+flush-to-zero, and FPSR stays clear. But the half and single *vector* forms
+are convenient to compute by widening to double — and the widen quiets a
+signaling NaN (raising IOC for it) and, once the host is doing the flushing,
+turns a denormal operand into zero. Both engines had it: the interpreter
+widened, and the JIT's NaN gate then raised IOC from its own compare on the
+way to deferring to that wrong answer. `tests/c/fp_absneg.c` runs every form
+over operands that can tell the difference. The rule generalizes — a form that
+does not unpack must not be handed a conversion.
+
 Two asymmetries in that area are worth knowing because they read like bugs.
 `FZ16` flushes a half operand and raises **no** `IDC`, where `FZ` on a single
 or double raises one; and the precision-changing `FCVT` family ignores `FZ16`
