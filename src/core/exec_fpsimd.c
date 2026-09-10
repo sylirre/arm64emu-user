@@ -282,6 +282,19 @@ static __thread u32 g_fpexc;
 /* Fold the host's sticky flags into g_fpexc and clear them: fpsr_sync's
  * host half. */
 static void fold_host_fpexc(void) {
+#if defined(__aarch64__)
+    /* IDC has no C99 spelling -- <fenv.h> names the five IEEE exceptions and
+     * the Input Denormal is ARM's own -- so fetestexcept cannot see it, and
+     * with flush-to-zero mirrored into the host's FPCR the hardware is
+     * exactly where it comes from. Read and clear that one bit directly,
+     * leaving the five (and QC) to the portable calls below. */
+    u64 hf;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(hf));
+    if (hf & 0x80u) {
+        g_fpexc |= FPSR_IDC;
+        __asm__ volatile("msr fpsr, %0" :: "r"(hf & ~(u64)0x80u));
+    }
+#endif
     int e = fetestexcept(FE_ALL_EXCEPT);
     if (!e) return;
     if (e & FE_INVALID)   g_fpexc |= FPSR_IOC;
@@ -334,6 +347,51 @@ void fpsr_sync(CPU *c) {
 #define FPCR_FZ16 (1u << 19)
 #define FPCR_FZ   (1u << 24)
 static __thread int g_fz, g_fz16;
+
+/* ---- and the host's own FPCR, where it has one ----
+ * An AArch64 host implements FZ and FZ16 to the very architecture the guest
+ * is asking for, so mirroring the two bits into its FPCR hands the work to
+ * the hardware and the software flush below becomes a backstop that finds
+ * every value already flushed. Two things follow, and the second is the
+ * reason to bother:
+ *
+ *   - the boundary the software path cannot see stops existing. It decides
+ *     from a result the host has already rounded, so an exact value inside
+ *     the last ULP below the smallest normal, carried up to it by rounding,
+ *     is kept where the architecture flushes it. The hardware IS the
+ *     architecture and tests the exponent before rounding.
+ *   - the JIT can go on inlining floating point. Its recipes are native
+ *     instructions, and native instructions now flush exactly as the guest
+ *     asked -- which is the whole reason the inline surface has to be
+ *     withdrawn on a host without this (see jit/ir.h).
+ *
+ * The mirror is maintained by the places that read c->fpcr before running
+ * guest FP -- the latch below, and the JIT's helper and dispatch loop --
+ * rather than by hooking every write to the register: nothing between an MSR
+ * FPCR and the next FP operation can tell the difference, and a check against
+ * a cached value costs a compare. The cache starts at a value no FPCR field
+ * can hold, so the first sync on a thread always writes: a thread inherits
+ * its creator's FPCR, which need not be the default.
+ *
+ * Only these two bits are touched, read-modify-write, so the host's rounding
+ * mode and its (disabled) exception traps stay as the emulator set them. */
+#if defined(__aarch64__)
+static __thread u32 g_host_fzmode = ~0u;
+static void __attribute__((noinline)) fpcr_host_set(u32 want) {
+    u64 h;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(h));
+    h = (h & ~(u64)(FPCR_FZ | FPCR_FZ16)) | want;
+    __asm__ volatile("msr fpcr, %0" :: "r"(h));
+    g_host_fzmode = want;
+}
+void fpcr_host_sync(u32 fpcr) {
+    u32 want = fpcr & (FPCR_FZ | FPCR_FZ16);
+    if (want != g_host_fzmode) fpcr_host_set(want);
+}
+#else
+/* No host equivalent: the software flush is the whole implementation. */
+void fpcr_host_sync(u32 fpcr) { (void)fpcr; }
+#endif
 
 /* FPProcessDenorm: a denormal operand reads as zero of its own sign. */
 static double fz_in_d(double x) {
@@ -4289,9 +4347,11 @@ static void simd_scalar_three_same_extra(CPU *c, u32 insn) {
 
 void exec_fpsimd(CPU *c, u32 insn) {
     /* Flush-to-zero for this instruction: latched here so the lane kernels
-     * need no CPU pointer (see the FPCR.FZ block above). */
+     * need no CPU pointer (see the FPCR.FZ block above), and mirrored into
+     * the host's FPCR where the host has the same modes. */
     g_fz   = (c->fpcr & FPCR_FZ)   != 0;
     g_fz16 = (c->fpcr & FPCR_FZ16) != 0;
+    fpcr_host_sync(c->fpcr);
 
     /* Scalar floating-point (bit30=0 distinguishes from scalar AdvSIMD). */
     if ((insn & 0x7f000000) == 0x1e000000) { exec_fp_scalar(c, insn); return; }

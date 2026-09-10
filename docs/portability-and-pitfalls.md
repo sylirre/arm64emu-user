@@ -336,6 +336,18 @@ pending outlived the write. `feholdexcept`/`fesetenv` are exactly how a guest
 asks for that. The rule is on the declaration in `machine.h`;
 `tests/c/fpsr_sigframe.c` and `tests/ptrace/fpregs.c` pin both ends.
 
+Where the host has the same modes — an AArch64 host — the guest's FZ/FZ16 are
+mirrored into the host's own FPCR and the hardware does the flushing, which is
+what lets the JIT go on inlining floating point (`docs/jit.md`). That puts a
+standing obligation on this file: **the interpreter must not perform a host FP
+operation on a value it has deliberately not flushed**, because the host will
+flush it. Every widen from single to double here is applied to an operand that
+has already been through `fz_in_s`, and the forms that unpack nothing convert
+nothing — which is exactly the FABS/FNEG rule above, arrived at from the other
+direction. `mrs fpsr` also has to be read by hand for IDC: `<fenv.h>` names
+the five IEEE exceptions and the Input Denormal is ARM's own, so
+`fetestexcept` cannot see the flag the hardware raises.
+
 Flush-to-zero adds a rule the lazy model does not naturally express. When
 `FPCR.FZ` replaces a tiny result with zero the architecture raises `UFC` and
 *nothing else* — in particular not the `Inexact` the host raised on its way to

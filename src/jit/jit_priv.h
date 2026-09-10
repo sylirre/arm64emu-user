@@ -117,14 +117,14 @@ typedef struct JitEnv {
                                  * byte-shift masks; no RIP-relative pools) */
     u32 slowmem;                /* A64_JIT_SLOWMEM: every mem op takes the
                                  * helper path (fast-path codegen bisection) */
-    /* Sticky: this thread's guest has asked for a non-default FP mode
-     * (FPCR.FZ or FZ16) at least once, so no block translated from here on
-     * inlines floating point (ir.h's vop_fpcr_sensitive). Sticky rather than
-     * tracking the live bit because clearing it back would have to discard
-     * the cache again, and a guest that toggles the mode would then flush on
-     * every toggle; a program that sets flush-to-zero at startup and leaves
-     * it -- which is what -ffast-math startup code does -- pays one flush. */
-    u8 fpnondef;
+    /* Sticky union of the FP modes (FPMODE_*) this thread's guest has asked
+     * for; what it costs the inline FP surface is ir.h's vop_fpcr_blocked.
+     * Sticky rather than tracking the live bits because clearing them back
+     * would have to discard the cache again, and a guest that toggles the
+     * mode would then flush on every toggle; one that sets flush-to-zero at
+     * startup and leaves it -- which is what -ffast-math startup code does --
+     * pays a single flush. */
+    u8 fpmode_seen;
 
     /* Indirect-branch target cache, probed inline by generated code for
      * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */
@@ -215,6 +215,11 @@ void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
 void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off);
 
 /* ---- helpers called from generated code (jit.c) ---- */
+
+/* exec_fpsimd.c: mirror the guest's FZ/FZ16 into the host's own FPCR where
+ * the host has them, so generated code flushes to zero as the guest asked.
+ * A no-op on every other host. See the block comment there. */
+void fpcr_host_sync(u32 fpcr);
 
 u32 jit_exec1(CPU *c, u64 pc, u32 insn);
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn);

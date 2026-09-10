@@ -144,19 +144,36 @@ the equivalence robust against toolchain changes; `tests/run_consist.sh`
 (random bit patterns through every inline FP class, jit vs. interpreter on
 the same host) enforces it on both backends.
 
-**Flush-to-zero has no inline form at all.** The equivalence above is
-"host FP == interpreter FP", and `FPCR.FZ`/`FZ16` break it: `exec_fpsimd.c`
-then flushes denormal operands and denormal results in software, which no host
-instruction the backends emit does. So the first time a thread's guest sets
-either bit, the code cache is dropped and every class that unpacks or rounds
-an FP value (`vop_fpcr_sensitive()` in `ir.h` — everything but the bit moves,
-the integer classes and int→FP conversion) goes back to the `exec_a64` helper.
-`jit_exec1` ends the block when it sees the write, so no already-translated
-inline FP runs after it; the flag is sticky, so a guest that toggles the mode
-pays the flush once rather than on every toggle. The cost lands on exactly the
-programs that asked for speed — `-ffast-math` startup code sets `FZ` — and the
-way out on an AArch64 host would be to mirror the guest's FPCR into the host's
-(same architecture, same rules), which is not done today.
+**Flush-to-zero depends on whether the host has it.** The equivalence above is
+"host FP == interpreter FP", and `FPCR.FZ`/`FZ16` break it unless the host can
+be made to flush too.
+
+On an **AArch64 host** it can: the host's own FPCR implements the same two
+modes, so `exec_fpsimd.c` mirrors the guest's bits into it and every native
+instruction the backends emit flushes exactly as the guest asked. Nothing is
+withdrawn, and the boundary case the software path cannot see disappears with
+it — the hardware tests the exponent before rounding, which is what the
+architecture says. The single exception is `VC_H3` (scalar half FMADD), the
+one recipe that does not replay the guest instruction: it widens to double,
+does a double FMA and narrows, and `FCVT` ignores `FZ16` by architecture, so
+it goes back to the helper while `FZ16` is set.
+
+**Everywhere else** there is nothing to lean on. The first time a thread's
+guest sets either bit the code cache is dropped and every class that unpacks
+or rounds an FP value (`vop_fpcr_sensitive()` in `ir.h` — everything but the
+bit moves, the integer classes and int→FP conversion) goes back to the
+`exec_a64` helper. `jit_exec1` ends the block when it sees the write, so no
+already-translated inline FP runs after it; the decision is sticky, so a guest
+that toggles the mode pays the flush once rather than on every toggle. The
+cost lands on exactly the programs that asked for speed — `-ffast-math`
+startup code sets `FZ`. Measured on the `fpcr_ftz` workload: 12% of retired
+instructions take the helper on x86-64, 0.00% on an AArch64 host.
+
+`vop_fpcr_blocked()` (`ir.h`) is the single predicate, and it is compiled per
+host; the mirror itself is maintained by the three places that read `c->fpcr`
+before running guest FP — the interpreter's per-instruction latch, `jit_exec1`
+and `jit_run`'s dispatch loop — rather than by hooking every write to the
+register.
 
 Being NaN-gated and being in `IRBlock.ninsns` are mutually exclusive. The
 slow arm re-runs the instruction through `jit_exec1`, which counts what it
