@@ -322,6 +322,20 @@ FP core with `-ffp-exception-behavior=strict` (clang; ~7% on the FP path, which
 is why it is not on by default). CI builds with clang as well as gcc, which is
 what makes the gap visible instead of theoretical.
 
+Two ownership rules come with the lazy model, and both were learned the hard
+way. The pending set is **per thread** — `fpsr_sync` clears what it folds, so
+a set shared between guest threads does not merely show one thread flags it
+never raised, it takes them away from the thread that did (`tests/c/
+fpsr_threads.c`; the host's own status word is per host thread already and
+needs no help). And **anything that reads or writes `c->fpsr` behind the
+guest's back has to fold first** — a signal frame and a ptrace `NT_PRFPREG`
+regset both do, and both were working with a value as of the guest's last
+`MRS`: the frame showed a stale FPSR to the handler, and a handler that
+cleared FPSR in the frame had it come back at `sigreturn` because what was
+pending outlived the write. `feholdexcept`/`fesetenv` are exactly how a guest
+asks for that. The rule is on the declaration in `machine.h`;
+`tests/c/fpsr_sigframe.c` and `tests/ptrace/fpregs.c` pin both ends.
+
 Flush-to-zero adds a rule the lazy model does not naturally express. When
 `FPCR.FZ` replaces a tiny result with zero the architecture raises `UFC` and
 *nothing else* — in particular not the `Inexact` the host raised on its way to

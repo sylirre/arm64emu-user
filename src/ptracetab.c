@@ -306,6 +306,7 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
     case G_NT_PRFPREG: {
         GUserFpsimd f;
         memset(&f, 0, sizeof f);
+        fpsr_sync(c);           /* c->fpsr is lazy: fold before marshalling */
         for (int i = 0; i < 32; i++) f.vregs[i] = c->v[i];
         f.fpsr = c->fpsr;
         f.fpcr = c->fpcr;
@@ -357,6 +358,7 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
         if (len < sizeof f) return -EINVAL;
         memcpy(&f, in, sizeof f);
         for (int i = 0; i < 32; i++) c->v[i] = f.vregs[i];
+        fpsr_sync(c);           /* drop pending, or it resurrects after this */
         c->fpsr = f.fpsr;
         c->fpcr = f.fpcr;
         return 0;

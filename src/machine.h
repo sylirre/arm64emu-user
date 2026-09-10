@@ -603,6 +603,14 @@ void sig_reset_for_exec(struct Machine *m);
 /* Mirror the calling thread's guest block-state of terminal job-control
  * signals to the host process mask. */
 void sig_sync_host_mask(struct Machine *m);
+/* exec_fpsimd.c: fold this thread's lazily-accumulated FP exception flags --
+ * the host's sticky status word and the set raised in software -- into
+ * c->fpsr, and clear them. sysreg.c calls it for the guest's own MRS/MSR;
+ * anything else that reads or writes c->fpsr behind the guest's back (a
+ * signal frame, a ptrace regset) has to call it too, or it marshals a stale
+ * value out and leaves pending flags behind to resurrect after the guest has
+ * cleared them. Runs on the CPU's own thread; the pending set is per-thread. */
+void fpsr_sync(CPU *c);
 /* Touch every handler-reachable __thread variable from ordinary context: on
  * Bionic (emulated TLS) the first access mallocs, and a signal handler must
  * never be the one doing it. Run by main() before handlers install and by

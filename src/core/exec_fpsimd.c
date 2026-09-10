@@ -270,7 +270,14 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
 #define FPSR_IXC 0x10u
 #define FPSR_IDC 0x80u
 #define FPSR_QC  (1u << 27)
-static u32 g_fpexc;                  /* software-raised pending FPSR bits */
+/* Software-raised pending FPSR bits. Per thread, and it has to be: fpsr_sync
+ * CLEARS what it folds, so a guest thread reading FPSR out of a set shared
+ * with its siblings would not merely see flags it never raised -- it would
+ * take them away from the thread that did, which is how a saturating SIMD
+ * kernel's QC and a NaN compare's IOC ended up on whichever thread happened
+ * to read FPSR first. The host's own status word, the other half of this
+ * model, is per host thread already and needs no help. */
+static __thread u32 g_fpexc;
 
 /* Fold the host's sticky flags into g_fpexc and clear them: fpsr_sync's
  * host half. */

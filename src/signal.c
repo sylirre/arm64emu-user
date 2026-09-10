@@ -1148,7 +1148,11 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     wr64(fr, MC_PC, saved_pc);
     wr64(fr, MC_PSTATE, cpu_pack_spsr(c));
 
-    /* fpsimd_context + terminator */
+    /* fpsimd_context + terminator. The flags are accumulated lazily, so
+     * c->fpsr is only current once fpsr_sync has folded what is pending --
+     * a handler that inspects uc_mcontext would otherwise be shown the FPSR
+     * as of the guest's last MRS rather than as of the signal. */
+    fpsr_sync(c);
     wr32(fr, MC_RESERVED + 0, FPSIMD_MAGIC);
     wr32(fr, MC_RESERVED + 4, 528);
     wr32(fr, MC_RESERVED + 8, c->fpsr);
@@ -1238,6 +1242,10 @@ void sig_return(CPU *c) {
                 goto bad;
         /* Committed only once all of it is in hand, so a frame that faults
          * part way through leaves no half-restored FP state behind. */
+        /* Discard what is pending before taking the frame's value, exactly
+         * as a guest MSR does: a handler that cleared FPSR in the frame must
+         * not have flags raised before the signal come back after it. */
+        fpsr_sync(c);
         c->fpsr = fpsr;
         c->fpcr = fpcr;
         memcpy(c->v, v128, sizeof v128);
