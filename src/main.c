@@ -914,6 +914,7 @@ int main(int argc, char **argv)
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:
      * the ELF loader below already forwards host syscalls. */
     sig_install_sigsys_net();
+    sig_install_sync_nets();
     /* Which RT signals this host will let us reserve, before anything installs
      * a handler on one or sends one. A number the host accepts but never
      * delivers would turn the kick below -- and every other wake-up riding it

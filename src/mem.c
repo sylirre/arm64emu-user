@@ -2029,6 +2029,14 @@ static void bus_catcher(int sig, siginfo_t *si, void *uc) {
         sigprocmask(SIG_UNBLOCK, &only, NULL);
         bus_longjmp(mode == BUS_ARM_COPY ? &g_bus_copy_jb : &g_bus_jb, 1);
     }
+    /* Sent, not raised (kill -BUS, a guest raise()): a signal for the guest,
+     * queued like any other (signal.c sig_install_sync_nets has the story).
+     * Returning with the default restored, as below, would have consumed it
+     * -- nothing is retried for a sent signal, so the process lived on. */
+    if (si && si->si_code <= 0) {
+        sig_host_catch(sig, si, uc);
+        return;
+    }
     /* Not ours, or not recoverable from here: restore the default so the
      * retried access kills us exactly as it did before. */
     struct sigaction dfl;

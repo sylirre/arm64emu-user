@@ -627,6 +627,8 @@ int  sig_on_altstack(u64 sp);   /* the kernel's on_sig_stack(): SP-range test */
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
 void sig_install_kick_net(void);
+void sig_install_sync_nets(void);   /* SIGSEGV/ILL/FPE/TRAP: sent ones are the guest's */
+void sig_host_catch(int sig, siginfo_t *si, void *uctx);   /* the capture handler */
 /* Pick the three host signal numbers the emulator reserves for itself (the
  * control-channel kick and the two guest-32/33 carriers) by asking the host
  * which of them it can actually deliver. Run by main() before the nets install

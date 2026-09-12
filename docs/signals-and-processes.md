@@ -14,13 +14,29 @@ For each guest signal whose disposition is a real handler, one host catcher
 (`SA_SIGINFO`, no `SA_RESTART`, everything masked while it runs) is installed by
 `sig_host_update`. It does the minimum an async-signal-safe context allows: push
 `{signo, translated siginfo}` onto a small ring queue and set a
-`volatile sig_atomic_t g_sig_npend`. `SIG_DFL`/`SIG_IGN` guest dispositions are
-mirrored straight to the host disposition.
+`volatile sig_atomic_t g_sig_npend`. `SIG_IGN` is mirrored straight to the host
+disposition. `SIG_DFL` is, for the default-ignore and default-continue signals;
+a **default-terminate** one at `SIG_DFL` is caught too, and the death performed
+by the run loop (`guest_terminate_by_signal`): a bare host kill runs no guest
+code, so the process's registry slot, `SEM_UNDO` adjustments and tmpfs backing
+were left to later reclaim, and a tracee reported nothing. The exit status is the same — the run
+loop restores the default and re-raises — and this used to be done only under
+`ptrace` or while the signal was blocked.
 
 Synchronous guest faults (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`) never
 come through the host catcher — they arrive from the interpreter as pending
 exceptions and are delivered directly by `sig_deliver_fault`, which has precise
-`si_addr`/`si_code` from `mem.c`.
+`si_addr`/`si_code` from `mem.c`. A host signal of one of those numbers is
+therefore either the emulator's own fault (a bug, and it must kill the emulator
+as it always did) or a signal a process *sent* — `kill -SEGV`, `raise(SIGBUS)`,
+a `pthread_kill` — and the sent kind is the guest's like any other: `si_code`
+tells them apart (`SI_USER`/`SI_TKILL`/`SI_QUEUE` are all `<= 0`, a fault's
+reason positive), so the nets that own these numbers for the process lifetime
+(`sig_install_sync_nets`, and the bus-error net in `mem.c` for `SIGBUS`) queue a
+sent one for the guest's disposition and restore the default for a fault.
+Before that a guest with a `SIGSEGV` handler died of `kill(SIGSEGV)` at the
+host's default, and a sent `SIGBUS` was swallowed by the bus-error net — the
+process lived on (`tests/fixtures/sentsync.c`).
 
 ### The pending queue
 
@@ -1057,19 +1073,20 @@ report a `WIFSIGNALED` status to its tracer, but a bare host `SIG_DFL` kill runs
 guest code, so nothing would update the registry and a sibling tracer's `wait4`
 poll (above) would hang. Two mechanisms close this:
 
-- *catchable signals* — when a thread becomes a tracee, `sig_trace_update_all`
-  installs a host catcher for the default-terminate signals that were `SIG_DFL`
-  (`sig_host_update` picks this while *any* thread of the process is traced —
-  `ptrace_traced()`, a process-level count, since dispositions are process-wide).
-  The signal is then mediated: the tracee reports the signal-delivery-stop, the
-  tracer injects it, and the tracee terminates through
+- *catchable signals* — every default-terminate signal at `SIG_DFL` has a host
+  catcher, traced or not (`sig_host_update`; it used to be installed only for a
+  tracee, by `sig_trace_update_all`, and while any thread of the process is
+  traced — `ptrace_traced()`, a process-level count, since dispositions are
+  process-wide). The signal is then mediated: the tracee reports the
+  signal-delivery-stop, the tracer injects it, and the tracee terminates through
   `guest_terminate_by_signal` (`src/signal.c`) — which publishes the
   `WIFSIGNALED` status to the tracer for **every** traced thread of the group
   (`ptrace_report_exit_group`; the signal kills them all), then restores the
   host default and re-raises so the *real* parent sees the identical status
   (the same shared exit path the synchronous fatal-fault `force_sig_fault`
-  uses). The five interpreter-delivered synchronous fault signals are excluded
-  (they still arrive from `pend_exc`).
+  uses). The five synchronous fault numbers take the same path when *sent*
+  (their nets forward a sent instance to the catcher); raised by the guest's
+  own faulting instruction they still arrive from `pend_exc`.
 - *`SIGKILL`* — uncatchable, so it cannot be mediated: the tracee is host-killed
   directly and, if the tracer is a sibling, becomes a zombie its real parent has not
   reaped (so `kill(pid,0)` still succeeds). The tracer's `wait4`/`waitid` poll backs

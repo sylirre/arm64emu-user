@@ -568,6 +568,12 @@ void sig_tls_prewarm(void) {
     jit_tls_prewarm();   /* jit.c: g_jit_env, jit_signal_interrupt's target */
 }
 
+static void host_catcher(int sig, siginfo_t *si, void *uctx);
+
+/* The capture handler, for the nets that own a number and forward what is a
+ * signal rather than a fault (mem.c's SIGBUS net). */
+void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, uctx); }
+
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     PendSig ps, *p = &ps;
     p->signo = sig_remap_to_guest(sig);
@@ -805,6 +811,47 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
     host_catcher(sig, si, uctx);    /* a guest-directed signal of this number */
 }
 
+/* ---- the synchronous-fault numbers ----
+ *
+ * SIGSEGV, SIGILL, SIGFPE and SIGTRAP reach the guest from the interpreter
+ * (pend_exc), never through a host signal -- a fault the host raises with one
+ * of these numbers is the emulator's own, a bug, and must kill it as it
+ * always did. But the numbers are also ordinary signals a process can be SENT
+ * (kill -SEGV, abort()'s siblings, a test raising one), and those used to go
+ * to the host's default disposition: a guest with a SIGSEGV handler died of a
+ * kill(SIGSEGV) instead of running it, and a guest without one died on the
+ * spot, with none of what its death owes -- its registry slot and SEM_UNDO
+ * adjustments given back -- since no emulator code ran. si_code tells the two
+ * apart: a sent signal carries SI_USER, SI_TKILL or SI_QUEUE (all <= 0), a
+ * fault a positive reason. The nets own these four numbers for the process
+ * lifetime (sig_host_update skips them), as the SIGSYS and kick nets own
+ * theirs; SIGBUS is the bus-error net's (mem.c), which forwards its sent
+ * instances the same way. */
+static void sync_net(int sig, siginfo_t *si, void *uctx) {
+    if (si->si_code <= 0) {   /* a signal, not a fault: the guest's business */
+        host_catcher(sig, si, uctx);
+        return;
+    }
+    /* A fault of our own. Restore the default and return: the instruction
+     * re-executes, faults again and kills us, exactly as before. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+}
+
+void sig_install_sync_nets(void) {
+    static const int sigs[] = { SIGSEGV, SIGILL, SIGFPE, SIGTRAP };
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = sync_net;
+        sa.sa_flags = SA_SIGINFO;                 /* deliberately no SA_RESTART */
+        sigfillset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+
 void sig_install_kick_net(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -909,6 +956,9 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
                                                     own abort; the guest disposition
                                                     is applied by the run loop from
                                                     pend_exc, like every sync fault */
+    if (is_sync_sig(sig)) return;                /* owned by the sync nets above:
+                                                    a sent one is queued for the
+                                                    guest, a fault is ours */
     if (sig == PTRACE_KICKSIG) return;           /* owned by the ptrace kick net;
                                                     guest dispositions honored via
                                                     the capture queue (sig_kick_net) */
@@ -922,30 +972,28 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;
     if (h == GSIG_DFL) {
-        /* A ptrace tracee must *catch* its default-terminate signals rather than
-         * let the host default (kill) apply: a bare host SIG_DFL kill runs no
-         * guest code, so the tracee never reports the signal-delivery-stop nor the
-         * WIFSIGNALED death, and a sibling tracer's wait4 poll would hang forever.
-         * Caught, the signal is queued and mediated at the run-loop boundary (the
-         * sync fault signals still arrive from the interpreter, so skip those).
-         * Dispositions are process-wide, so the catcher stays while *any* thread
-         * of this process is traced (ptrace_traced), not just the calling one. */
-        /* Likewise when the guest has this signal BLOCKED, or a signalfd
-         * covers it. A blocked signal is pending, not delivered: the kernel
-         * holds it until the guest unblocks it, and the run loop applies the
-         * disposition then (terminating on a default-terminate signal, exactly
-         * as the kernel would). Left at the host default it would instead act
-         * immediately -- killing us for most signals, and silently discarding
-         * the SIGCHLD a signalfd was waiting for, so the fd never became
-         * readable. */
+        /* A default-terminate signal is CAUGHT and the death performed by the
+         * run loop (guest_terminate_by_signal), never left to the host
+         * default: a bare host kill runs no guest code, so the process's
+         * registry slot, SEM_UNDO adjustments and tmpfs backing are left to
+         * be reclaimed later, and a tracee never reports the signal-delivery
+         * stop nor the WIFSIGNALED death its tracer's wait4 is polling for.
+         * The exit status is the same either way (the run loop re-raises
+         * with the default restored). It used to be caught only under ptrace
+         * or while blocked.
+         *
+         * A default-ignore or default-continue signal is caught only while
+         * the guest has it BLOCKED, or a signalfd covers it: blocked, it is
+         * pending rather than delivered -- the kernel holds it until the
+         * guest unblocks it, and the run loop applies the disposition then --
+         * and left at the host default it would be discarded on arrival,
+         * with the SIGCHLD a signalfd was waiting for never making the fd
+         * readable. Dispositions are process-wide, so "blocked" is asked of
+         * every thread (sig_blocked_any). */
         u64 blocked = g_tls.sigmask |
                       __atomic_load_n(&m->sig_blocked_any, __ATOMIC_ACQUIRE);
-        if (((blocked | m->sfd_mask) & (1ULL << (sig - 1))) &&
-            !is_sync_sig(sig)) {
-            sa.sa_sigaction = host_catcher;
-            sa.sa_flags = SA_SIGINFO;
-            sigfillset(&sa.sa_mask);
-        } else if (ptrace_traced() && !is_sync_sig(sig) && sig_default_terminates(sig)) {
+        if (sig_default_terminates(sig) ||
+            ((blocked | m->sfd_mask) & (1ULL << (sig - 1)))) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -954,8 +1002,6 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
         }
     } else if (h == GSIG_IGN) {
         sa.sa_handler = SIG_IGN;
-    } else if (is_sync_sig(sig)) {
-        return;                                   /* delivered from pend_exc */
     } else {
         sa.sa_sigaction = host_catcher;
         sa.sa_flags = SA_SIGINFO;                 /* deliberately no SA_RESTART */
@@ -1513,11 +1559,11 @@ void sig_deliver_pending(CPU *c) {
         u64 h = sig_action_handler(m, sig);
         if (h == GSIG_IGN) continue;
         if (h == GSIG_DFL) {
-            /* A default-terminate signal: kill the process and report the
-             * WIFSIGNALED death to our tracer first (does not return). A tracee
-             * reaches here after the tracer let the signal through the delivery
-             * stop above; an untraced process reaches it only in a rare race (a
-             * handler dropped to SIG_DFL after the signal was queued). */
+            /* A default-terminate signal: the process's death, performed here
+             * -- registry slot and SEM_UNDO given back, the WIFSIGNALED
+             * status reported to a tracer -- and then
+             * the same death by the same signal, re-raised with the default
+             * restored (does not return). */
             if (sig_default_terminates(sig))
                 guest_terminate_by_signal(c, sig);
             /* Default-ignore/continue disposition: let the host default apply. */

@@ -2600,6 +2600,12 @@ check_fixture prctlset $'dumpable=1\nset_dump0=0 get=0\nset_dump2=-22 set_dump1=
 # and ignored. Self-checking: qemu-user passes neither through; the expected
 # block is a real kernel's, taken natively.
 check_fixture madvremove $'remove_priv=-22\nremove_shm=0 punched=1 neighbours=ss\nchild_punch=1 seen_here=1 rest=t\nremove_shm_ro=0 punched=1\nremove_fpriv=-13\nremove_fsro=-13\nremove_fshw=0 punched=1 file_hole=1 file_kept=1\nremove_hole=-12 before=1 after=1\npopr_hole=-12 popw_hole=-12 popr_holestart=-12\nremove_mixed=-22 shared_punched=1 private_kept=y\nremove_unaligned=-22 remove_zerolen=0\npopw_ro=-22 popr_ro=0\npopr_none=-22 popw_none=-22\npopw_rw=0 popr_rw=0\npopw_fsro=-22 popr_fsro=0\npopr_in=0 popr_past_eof=-14 popw_past_eof=-14\ndone'
+# A SENT SIGSEGV/BUS/ILL/FPE/TRAP is a signal, not a fault: a handler runs,
+# SIG_IGN drops it, SIG_DFL dies by it, a blocked one waits in sigwait. The
+# emulator left sent ones to the host's default disposition (a guest with a
+# SIGSEGV handler died of kill(SIGSEGV); a sent SIGBUS was swallowed).
+# Self-checking: qemu-user hangs on a raise() into its own SIGSEGV handler.
+check_fixture sentsync $'kill_segv: handler=1 si_user=1\nraise_segv: handler=1 si_tkill=1\npthread_kill_segv: handler=1\nkill_bus: handler=1 si_user=1\nraise_bus: handler=1 si_tkill=1\npthread_kill_bus: handler=1\nkill_ill: handler=1 si_user=1\nraise_ill: handler=1 si_tkill=1\npthread_kill_ill: handler=1\nkill_fpe: handler=1 si_user=1\nraise_fpe: handler=1 si_tkill=1\npthread_kill_fpe: handler=1\nkill_trap: handler=1 si_user=1\nraise_trap: handler=1 si_tkill=1\npthread_kill_trap: handler=1\nsigwait_segv=1\ndfl_bus: signaled 7\ndfl_segv: signaled 11\ndfl_ill: signaled 4\ndfl_fpe: signaled 8\ndfl_trap: signaled 5\ndfl_abrt: signaled 6\ndfl_term: signaled 15\nign_segv_bus: exited 5\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
