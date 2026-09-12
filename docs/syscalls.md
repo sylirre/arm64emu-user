@@ -352,6 +352,17 @@ trims them, keeping the ones that fit and raising `MSG_CTRUNC`. Two calls let
 the guest *name* the number, and there the limit is a plain argument check with
 its own errno: `dup3` above the limit is `EBADF`, `fcntl(F_DUPFD)` is `EINVAL`.
 
+`dup3` is also the one call that *replaces* a descriptor the emulator may be
+tracking by number (a signalfd served from the capture ring, a written-through
+`/proc` id-map file, a substituted netlink socket, a tier memfd), and it
+forgets newfd's old entry only **after** the host has really replaced it.
+Everything `ksys_dup3` refuses is refused first, in its order — a flag other
+than `O_CLOEXEC` and `oldfd == newfd` are `EINVAL`, newfd at the soft limit and
+an oldfd that is not open are `EBADF` — so a refused call leaves newfd exactly
+what it was, bookkeeping included. It used to unmark newfd before the host had
+judged anything, and `dup3(-1, sfd, 0)` then left the signalfd open but reading
+as the bare eventfd underneath it (`tests/c/dup3fail.c`).
+
 `openat` refuses *before* it opens anything rather than after: the kernel takes
 its descriptor first (`get_unused_fd_flags`, ahead of the lookup), so an open
 with none to return creates no file, and the pin — this emulator's own first

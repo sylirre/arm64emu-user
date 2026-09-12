@@ -2213,21 +2213,38 @@ SYSDEF(dup) {
 }
 
 SYSDEF(dup3) {
-    /* The guest NAMES the descriptor here, and the kernel refuses one at or
-     * above the soft limit outright -- EBADF, decided in ksys_dup3 after only
-     * the flags and the oldfd == newfd EINVAL, and before oldfd is looked at.
-     * Asked before the unmarking below, which must not run for a call that
-     * never replaces anything. */
-    if ((s32)a0 != (s32)a1 && (s32)a1 >= fd_nofile_cap(c->m))
-        return (u64)(s64)-EBADF;
-    /* dup2/dup3 also *replace* newfd, so whatever it named is gone. */
-    sigfd_unmark_fd(c->m, (int)a1);
-    procfs_unmark_fd(c->m, (int)a1);
-    nl_unmark_fd(c->m, (int)a1);
-    mfd_track_close((int)a1);
-    int r = dup3((int)a0, (int)a1, oflags_g2h((int)a2));
-    if (r >= 0) { sigfd_track_dup(c->m, (int)a0, r); mfd_track_dup((int)a0, r); }
-    return r < 0 ? host_err() : (u64)r;
+    int oldfd = (int)a0, newfd = (int)a1, flags = (int)a2;
+    /* Everything the kernel refuses is refused here BEFORE any bookkeeping is
+     * touched, in ksys_dup3's own order: a flag other than O_CLOEXEC and
+     * oldfd == newfd are EINVAL, a newfd at or above the soft limit is EBADF
+     * (the guest NAMES the descriptor, so the limit is asked of the name), and
+     * an oldfd that is not open is EBADF. The unmarking below used to run
+     * before the host had judged any of this, so a call that replaced nothing
+     * -- dup3(-1, sfd, 0), dup3(fd, fd, 0), a bad flag -- left newfd open and
+     * exactly what it was, but no longer tracked: a signalfd read reached the
+     * bare eventfd, a uid_map write landed in the backing memfd, a fake netlink
+     * request went to the AF_UNIX stand-in. */
+    if (flags & ~O_CLOEXEC) return (u64)(s64)-EINVAL;
+    if ((u32)a0 == (u32)a1) return (u64)(s64)-EINVAL;
+    if ((u32)a1 >= (u32)fd_nofile_cap(c->m)) return (u64)(s64)-EBADF;
+    if (fcntl(oldfd, F_GETFD) < 0) return (u64)(s64)-EBADF;
+    int r = dup3(oldfd, newfd, flags);
+    if (r < 0) return host_err();   /* nothing replaced, nothing to unmark */
+    /* dup2/dup3 *replace* newfd, so whatever it named is gone -- dropped only
+     * now, once the host has really replaced it, so that no failure can leave
+     * a live descriptor untracked. Another thread using newfd in the instant
+     * between the two steps is served as if it had got in before the
+     * replacement, which is one of the two answers the kernel itself gives
+     * that race; the signalfd, /proc and memfd classes re-check the
+     * descriptor's identity on use besides. Then the new name is tracked as a
+     * second name for whatever oldfd is, as dup(2) does. */
+    sigfd_unmark_fd(c->m, newfd);
+    procfs_unmark_fd(c->m, newfd);
+    nl_unmark_fd(c->m, newfd);
+    mfd_track_close(newfd);
+    sigfd_track_dup(c->m, oldfd, newfd);
+    mfd_track_dup(oldfd, newfd);
+    return (u64)r;
 }
 
 SYSDEF(pipe2) {
