@@ -790,6 +790,51 @@ static void region_split_at(AddrSpace *as, u64 va) {
     }
 }
 
+/* Can `a` and `b` (a immediately before b in the list) be one region again?
+ * The same test vma_merge applies -- same flags, same file, contiguous
+ * offsets -- plus the one this design adds: the same host allocation,
+ * contiguous in it. Two separate mmaps therefore never merge here even when
+ * a kernel would show them as one vma (each has backing of its own); what
+ * merges is what a split made -- mprotect's and madvise's boundaries, and
+ * the ELF loader's per-segment protection -- once the pieces agree again. */
+static int region_mergeable(const Region *a, const Region *b) {
+    if (a->end != b->start || a->hmap != b->hmap) return 0;
+    if (a->host + (a->end - a->start) != b->host) return 0;
+    if (a->prot != b->prot || a->shared != b->shared || a->file != b->file ||
+        a->wr_ok != b->wr_ok || a->hostmap != b->hostmap ||
+        a->anon_shm != b->anon_shm || a->mfdcnt != b->mfdcnt ||
+        a->forkflags != b->forkflags)
+        return 0;
+    if (a->file && (a->file_off + (a->end - a->start) != b->file_off ||
+                    a->dev != b->dev || a->ino != b->ino))
+        return 0;
+    if (!a->path != !b->path) return 0;
+    if (a->path && strcmp(a->path, b->path)) return 0;
+    return 1;
+}
+
+/* Coalesce the regions touching [lo, hi] with their neighbours wherever
+ * region_mergeable allows. Every split is otherwise a row the region table
+ * keeps for good: the loader used to protect an image page by page and
+ * nothing ever merged the pieces, so every ELF image was one region PER PAGE
+ * -- node's /proc/self/maps ran to ten thousand lines where a kernel shows a
+ * hundred -- and every mmap, munmap and brk walked that list several times
+ * over (as_mapped_bytes, as_account, region_punch, as_find_free, the per-page
+ * as_find_region loops): twenty thousand mmap/munmap pairs took thirty times
+ * longer in a 40 MB image than in a small one. */
+static void region_merge_range(AddrSpace *as, u64 lo, u64 hi) {
+    for (int i = 0; i + 1 < as->nregions; i++) {
+        Region *a = &as->regions[i], *b = &as->regions[i + 1];
+        if (a->end < lo) continue;   /* the boundary a->end is the one judged */
+        if (a->end > hi) break;      /* sorted, non-overlapping: ends ascend */
+        if (!region_mergeable(a, b)) continue;
+        a->end = b->end;
+        hmap_unref(as, b->hmap);   /* a's own reference keeps the allocation */
+        region_delete(as, i + 1);  /* ...and its mfdcnt census entry goes with it */
+        i--;                       /* a may now merge with its next neighbour */
+    }
+}
+
 /* Remove the guest range [addr, addr+len) from every overlapping region,
  * splitting as needed. Backing is never released here slice-wise: fragments
  * keep a reference to their HostMap, and the last one to go retires the whole
@@ -1296,6 +1341,7 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
         r->prot = prot;   /* fully covered after the splits above */
     }
     pte_prot_range(as, addr, len, prot);
+    region_merge_range(as, addr, addr + len);
     return 0;
 }
 
@@ -1429,11 +1475,12 @@ int guest_fork_advise(AddrSpace *as, u64 addr, u64 len, u32 set, u32 clear,
         /* MADV_WIPEONFORK is for private anonymous memory alone, and the
          * kernel says so vma by vma: the refusal lands on the first mapping
          * that is not, with the ones before it already advised. */
-        if (anon_only && (r->file || r->shared)) return -EINVAL;
+        if (anon_only && (r->file || r->shared)) { region_merge_range(as, addr, end); return -EINVAL; }
         r->forkflags = (r->forkflags | set) & ~clear;
         next = r->end;
     }
     if (next < end) hole = 1;
+    region_merge_range(as, addr, end);   /* advice that undid an earlier split */
     return hole ? -ENOMEM : 0;
 }
 

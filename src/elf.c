@@ -178,8 +178,16 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
             pageprot[(pg - lo) >> 12] |= (u8)prot;
     }
 
-    for (u64 i = 0; i < span_pages; i++)
-        guest_protect(&m->as, base + lo + (i << 12), GUEST_PAGE_SIZE, pageprot[i]);
+    /* One guest_protect per run of equal protection, not one per page: each
+     * call splits the span's region at its ends and flushes every thread's
+     * D-TLB, and a run is what a kernel's vma is here -- page by page, an
+     * image ended up as one region per page (mem.c region_merge_range). */
+    for (u64 i = 0; i < span_pages; ) {
+        u64 j = i + 1;
+        while (j < span_pages && pageprot[j] == pageprot[i]) j++;
+        guest_protect(&m->as, base + lo + (i << 12), (j - i) << 12, pageprot[i]);
+        i = j;
+    }
     free(pageprot);
     as_set_region_path(&m->as, base + lo, base + hi, gpath);
 

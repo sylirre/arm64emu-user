@@ -33,7 +33,19 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
   backs `munmap`/`mremap` splitting, `mprotect` bookkeeping,
   `/proc/self/maps` synthesis, and address-space teardown at `execve`/exit.
   The page table is the fast lookup; the region list is the authoritative
-  record. Its bookkeeping fails **loudly**: the region array's `realloc`, an
+  record. It stays **coalesced**: a split that `mprotect` or `madvise` made is
+  merged back (`region_merge_range`) as soon as the pieces agree again, under
+  the test `vma_merge` applies — same flags, same file, contiguous offsets —
+  plus the one this design adds, the same host allocation and contiguous in
+  it. (Two separate `mmap`s therefore never merge even where a kernel shows
+  one vma; what merges is what a split made.) The ELF loader protects an image
+  per run of equal protection, not per page: it used to do the latter, and
+  nothing ever merged the pieces, so every image was one region *per page* —
+  node's `/proc/self/maps` ran to ten thousand lines where a kernel shows a
+  hundred — and every `mmap`/`munmap`/`brk` walked that list several times over
+  (twenty thousand `mmap`/`munmap` pairs took thirty times longer in a 40 MB
+  image than in a small one; `tests/fixtures/regionmerge.c`). Its bookkeeping
+  fails **loudly**: the region array's `realloc`, an
   L2 table's `calloc`, the `HostMap` record and a region's path label all end
   the process rather than continue with a hole in the address space's own
   account of itself. The label was once the exception, taking `strdup`'s answer

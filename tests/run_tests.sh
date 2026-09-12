@@ -2521,6 +2521,12 @@ check_fixture shebang $'  argv: [<self>] [<dir>/s1] [extra]\nplain: ran\n  argv:
 # of its own). Self-checking: qemu-user has a restart list of its own; the
 # expected block is a real kernel's, taken natively with this same program.
 check_fixture sarestart $'read/plain: errno=4 alarm=1\nwrite/plain: errno=4 alarm=1\nsplice/plain: errno=4 alarm=1\naccept4/plain: errno=4 alarm=1\nconnect/plain: errno=4 alarm=1\nflock/plain: errno=4 alarm=1\nofd_setlkw/plain: errno=4 alarm=1\nsetlkw/plain: errno=4 alarm=1\nopen_fifo/plain: errno=4 alarm=1\nfutex/plain: errno=4 alarm=1\nfutex_timed/plain: errno=4 alarm=1\nfutex_abs/plain: errno=4 alarm=1\nlock_pi/plain: done alarm=1\nrecv/plain: errno=4 alarm=1\nread_sock/plain: errno=4 alarm=1\nrecv_timeo/plain: errno=4 alarm=1\nnanosleep/plain: errno=4 alarm=1\npoll/plain: errno=4 alarm=1\nwaitpid/plain: errno=4 alarm=1\nread/restart: done alarm=1\nwrite/restart: done alarm=1\nsplice/restart: done alarm=1\naccept4/restart: done alarm=1\nconnect/restart: done alarm=1\nflock/restart: done alarm=1\nofd_setlkw/restart: done alarm=1\nsetlkw/restart: done alarm=1\nopen_fifo/restart: done alarm=1\nfutex/restart: done alarm=1\nfutex_timed/restart: errno=4 alarm=1\nfutex_abs/restart: errno=4 alarm=1\nlock_pi/restart: done alarm=1\nrecv/restart: done alarm=1\nread_sock/restart: done alarm=1\nrecv_timeo/restart: errno=4 alarm=1\nnanosleep/restart: errno=4 alarm=1\npoll/restart: errno=4 alarm=1\nwaitpid/restart: done alarm=1\ndone'
+# The mapping table stays coalesced: an mprotect/madvise that changes part
+# of a mapping splits it, one that makes the parts agree again merges them
+# back, and an ELF image is laid out as a handful of segments rather than a
+# mapping per page. Self-checking: qemu-user's synthesized maps never merge
+# (split=3 stays 3 there); the numbers are a real kernel's.
+check_fixture regionmerge $'image_lines_few=1\none=1\nsplit=3\nmerged=1\nwhole=1\nends=3\nremerged=1 val=1\nadvised=3\nunadvised=1\nstill_split=3\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
