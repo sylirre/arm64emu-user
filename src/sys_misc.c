@@ -382,9 +382,16 @@ SYSDEF(membarrier) {
 }
 
 SYSDEF(getcpu) {
-    u32 zero = 0;
-    if (a0 && copy_to_guest(c, a0, &zero, 4) < 0) return (u64)(s64)-EFAULT;
-    if (a1 && copy_to_guest(c, a1, &zero, 4) < 0) return (u64)(s64)-EFAULT;
+    /* (cpu*, node*, tcache): the CPU this thread is on right now -- the host
+     * one, since a guest thread is a host thread and its affinity is real
+     * (sched_getaffinity, sys_proc.c). Answering 0 for every thread made a
+     * program that pins itself to CPU 3 and asks where it landed read 0. The
+     * NUMA node is the host's too; tcache has been ignored since 2.6.24. */
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    unsigned cpu = 0, node = 0;
+    if (syscall(SYS_getcpu, &cpu, &node, NULL) < 0) return host_err();
+    if (a0 && copy_to_guest(c, a0, &cpu, 4) < 0) return (u64)(s64)-EFAULT;
+    if (a1 && copy_to_guest(c, a1, &node, 4) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 

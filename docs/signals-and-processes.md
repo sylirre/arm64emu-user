@@ -459,6 +459,13 @@ and stopped on the resulting SIGTTOU.
 
 Guest pid **is** host pid, so `kill`/`wait4`/`setpgid`/`tcsetpgrp` pass through
 unchanged and job control works (the guest's children are real host processes).
+Guest tid is host tid the same way, so a thread's CPU affinity is real:
+`sched_getaffinity`, `sched_setaffinity` and `getcpu` are the host task's own
+(`sys_proc.c`, `sys_misc.c`) — what `nproc`, `getconf`, Go's `GOMAXPROCS`,
+Rust's `available_parallelism`, libuv and the JVM size their pools from. They
+used to answer one CPU for every task and ignore every `setaffinity`, from
+before `CLONE_THREAD` threads existed, so all of those ran on one core while
+`/proc/cpuinfo` listed the machine (`tests/fixtures/affinity.c`).
 
 ### Target containment
 

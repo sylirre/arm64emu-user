@@ -2571,6 +2571,13 @@ check_fixture forkfds $'openers: bad=0/200\nfifo_open: bad=0/50\nsemop: bad=0/50
 # answer EPERM and rounds a shmat address away instead of down to zero; the
 # expected block is a real kernel's, taken natively with this same program.
 check_fixture mmapminaddr $'fixed0: errno=1\nfixed4k: errno=1\nfixed_span: errno=1\nfixed_none0: errno=1\nfixed_notype: errno=1\nnoreplace4k: errno=1\nhint4k: high\nhint4k_odd: high\nhint0: high\nfixed64k: high\nmremap_fixed_low: errno=1\ntail_gone=1\nhead_kept=1\nshmat_low: errno=1\nshmat_round0: errno=1\nshmat_round0_remap: errno=22\nshmat_exact_low: errno=1\nzero_unmapped=1\ndone'
+# sched_getaffinity / sched_setaffinity / getcpu are the host thread's own: a
+# guest thread is a host thread. They used to answer one CPU for everyone and
+# ignore every setaffinity (nproc 1 while /proc/cpuinfo listed the machine).
+# Self-checking: qemu-user passes them through but adds a length check of
+# its own and answers for a thread that has exited; the rows are relations and
+# round-trips, never raw masks.
+check_fixture affinity $'get: bytes_positive=1 bytes_mult8=1 cpus_positive=1 cpus_le_online=1\nlen0=-22 len4=-22 len12=-22\nset_one=0\nget_one: cpus=1 is_first=1\nsched_getcpu_is_first=1\nset_short=0\nset_empty=-22\nset_far=-22\nrestore=0\nrestored=1\nthread_set=0\nthread_get: cpus=1 is_first=1\nself_unmoved=1\ngone=-3\nneg=-3\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

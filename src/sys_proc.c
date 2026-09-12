@@ -2544,28 +2544,47 @@ SYSDEF(sched_getscheduler) {
     return r < 0 ? host_err() : (u64)r;
 }
 
+/* A guest thread IS a host thread, so its CPU affinity is real and the
+ * host's answer is the guest's: what nproc, getconf, Go's GOMAXPROCS, Rust's
+ * available_parallelism, libuv and the JVM size their pools from. This used
+ * to report a single CPU ("we interpret on one thread anyway"), from before
+ * CLONE_THREAD threads existed, so every one of those ran on one core while
+ * /proc/cpuinfo listed eight -- node's os.cpus().length said 8 and its
+ * availableParallelism() said 1 -- and sched_setaffinity was accepted and
+ * ignored. Both pass through to the host task now; the mask is a bitmap of
+ * bytes, the same on every host width. The upper bound on the copy is what
+ * a cpumask can ever be (NR_CPUS caps at 8192 bits); the kernel itself
+ * copies at most cpumask_size() and answers in that unit. */
+#define SCHED_MASK_MAX 4096
+
 SYSDEF(sched_getaffinity) {
-    /* Report a single CPU (we interpret on one thread anyway). The target is
-     * still a tid the guest supplies, and its neighbours in this family all
-     * refuse one that is not a guest task -- answering for it regardless said
-     * "that task exists" about every host task on the machine. */
+    /* (pid, len, mask). The tid is one the guest supplies, and its neighbours
+     * in this family all refuse one that is not a guest task -- answering for
+     * it regardless said "that task exists" about every host task on the
+     * machine. The kernel's own checks on len: a whole number of the guest's
+     * 8-byte longs (an aarch64 kernel's, whatever the host's word is), and at
+     * least nr_cpu_ids bits, which the host judges. */
     if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
-    if (a1 < 8) return (u64)(s64)-EINVAL;
-    u64 mask = 1;
-    if (copy_to_guest(c, a2, &mask, 8) < 0) return (u64)(s64)-EFAULT;
-    return 8;
+    if (a1 & 7) return (u64)(s64)-EINVAL;
+    size_t len = a1 > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)a1;
+    u8 mask[SCHED_MASK_MAX];
+    long r = syscall(SYS_sched_getaffinity, (pid_t)(s32)a0, len, mask);
+    if (r < 0) return host_err();
+    if (r > 0 && copy_to_guest(c, a2, mask, (size_t)r) < 0) return (u64)(s64)-EFAULT;
+    return (u64)r;
 }
 
 SYSDEF(sched_setaffinity) {
-    /* Single-CPU interpreter (see sched_getaffinity): validate that the mask
-     * is readable and names at least one CPU in the first 64 -- more than we
-     * ever report -- then accept and ignore it. An empty set is EINVAL, as
-     * from the kernel. */
+    /* (pid, len, mask): the host task the tid names moves, and no other. The
+     * kernel takes the first cpumask_size() bytes and no more, so a long
+     * mask is cut, never refused; an empty intersection with the allowed
+     * set is its EINVAL. */
     if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
-    size_t len = (size_t)a1 < 8 ? (size_t)a1 : 8;
-    u64 mask = 0;
-    if (len && copy_from_guest(c, &mask, a2, len) < 0) return (u64)(s64)-EFAULT;
-    return mask ? 0 : (u64)(s64)-EINVAL;
+    size_t len = a1 > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)a1;
+    u8 mask[SCHED_MASK_MAX];
+    if (len && copy_from_guest(c, mask, a2, len) < 0) return (u64)(s64)-EFAULT;
+    long r = syscall(SYS_sched_setaffinity, (pid_t)(s32)a0, len, mask);
+    return r < 0 ? host_err() : 0;
 }
 
 SYSDEF(sched_get_priority_max) {
