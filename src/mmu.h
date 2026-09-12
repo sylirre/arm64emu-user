@@ -335,6 +335,11 @@ int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
  * backing that maps something else. */
 int  guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst);
 int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len);
+/* mremap(addr, 0, len, MREMAP_MAYMOVE): a second mapping, at `dst` (free
+ * ground), of the shareable object mapped at addr -- len bytes of it from
+ * the offset addr names. -EFAULT with nothing under addr, -EINVAL for a
+ * private mapping (the kernel refuses to "duplicate" one of those). */
+int  guest_remap_dup(AddrSpace *as, u64 addr, u64 len, u64 dst);
 /* madvise's fork-inheritance advice over [addr, addr+len): every region inside
  * gets `set` added to and `clear` taken from its forkflags, in address order,
  * the regions at the edges being split first so nothing outside the range is

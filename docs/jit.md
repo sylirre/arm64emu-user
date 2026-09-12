@@ -719,16 +719,20 @@ few lines that never touch the emulator:
 | `getsockopt(SO_RCVTIMEO)` | reports `optlen=4`, writes nothing | returns the full `struct timeval` |
 | `waitid(2)`'s fifth rusage argument | ignored; the buffer comes back untouched | filled |
 
-`tests/c/mremapsem.c`, `tests/c/socktimeo.c` and `tests/ptrace/wait_rusage.c`
+`tests/c/mremapsem.c`, `tests/fixtures/mremapdup.c` (the guest's own
+`mremap(old_size=0)`, which the emulator serves by duplicating the host
+mapping the same way), `tests/c/socktimeo.c` and `tests/ptrace/wait_rusage.c`
 declare what they need with a `NEEDS-HOST-SYSCALL:` marker, and `hostenv.sh`
 answers it by **building and running a probe the way the emulator itself was
 built** — same compiler, same ABI flags, so the same interpreter picks it up.
 The question is what the emulator's own process can do, not what this machine
 can do, and only a probe built that way asks it (`test32`/`test32-jit` pass
 `M32CC` down for exactly this). On an ordinary host, and on real armv7 silicon,
-every probe passes and all three rows run in full; under `qemu-arm` they skip
-naming the missing capability, so the zero-failure gate keeps its meaning
-instead of being read against a baseline again.
+every probe passes and every gated row runs in full; under `qemu-arm` they
+skip naming the missing capability, so the zero-failure gate keeps its meaning
+instead of being read against a baseline again. (`check_fixture` in
+`run_tests.sh` honours the marker in a fixture's source the way the C loop
+does in a test's.)
 
 The `SO_RCVTIMEO` one paid for itself before it was skipped. Chasing it found
 that the emulator's own conversion for that option used an uninitialized

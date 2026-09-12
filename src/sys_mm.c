@@ -644,11 +644,12 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     int flags = (int)a3;
     if (old_addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
     if (flags & ~(G_MREMAP_MAYMOVE | G_MREMAP_FIXED)) return (u64)(s64)-EINVAL;
-    /* Neither length may be zero. A zero new length is not a request to unmap
-     * everything -- the kernel rejects it outright -- and a zero old length
-     * only means anything for the shared-mapping duplication this does not
-     * implement; both are EINVAL on a native run. */
-    if (!new_len || !old_len) return (u64)(s64)-EINVAL;
+    /* A zero new length is not a request to unmap everything -- the kernel
+     * rejects it outright. A zero OLD length is the kernel's own special case
+     * and is taken below: a second mapping of the shareable object under
+     * old_addr ("mremap(0, 0, 0, 0) is legal", kept for DOS-emu, and the
+     * documented way to duplicate a mapping since). */
+    if (!new_len) return (u64)(s64)-EINVAL;
     if ((flags & G_MREMAP_FIXED) && !(flags & G_MREMAP_MAYMOVE))
         return (u64)(s64)-EINVAL;
     /* The old range has to lie inside the address space, its end included. An
@@ -662,16 +663,25 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * is not. musl's pthread_getattr_np probes for the main-thread stack
      * bottom with growing mremaps and relies on this non-ENOMEM failure to
      * stop -- succeeding here would hand it a bogus stack size and leak a
-     * stray mapping below the stack. */
+     * stray mapping below the stack. An empty old range still has to NAME a
+     * mapping (vma_lookup, before anything else is judged). */
+    if (!old_len && !as_find_region(as, old_addr)) return (u64)(s64)-EFAULT;
     for (u64 va = old_addr; va < old_addr + old_len; va += GUEST_PAGE_SIZE)
         if (!as_find_region(as, va)) return (u64)(s64)-EFAULT;
     /* What the growth paths need to know about the mapping being grown: its
      * protection, whether it is shared, and whether it is anonymous shared
      * memory (which mem.c cannot extend). Read before anything moves. */
-    const Region *tail = as_find_region(as, old_addr + old_len - 1);
+    const Region *tail = as_find_region(as, old_len ? old_addr + old_len - 1
+                                                    : old_addr);
     u32 prot = tail ? tail->prot : (PTE_R | PTE_W);
     int shared = tail && tail->shared;
     int shm = tail && tail->anon_shm;
+    /* Duplication is for a shareable mapping alone: a "duplicate" of a
+     * private one would be a fresh mapping unrelated to the original, which
+     * vma_to_resize refuses (before the destination is looked at -- the
+     * order a 6.12+ kernel judges it in; 6.1 unmapped an MREMAP_FIXED
+     * destination first and refused after). */
+    if (!old_len && !shared) return (u64)(s64)-EINVAL;
 
     /* Every path below that grows the mapping -- in place, or by allocating
      * elsewhere and releasing the old -- settles new_len - old_len bytes above
@@ -683,6 +693,32 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
         if (!as_fits(c->m, add)) return (u64)(s64)-ENOMEM;
         if ((prot & PTE_W) && !shared && !data_fits(c->m, add))
             return (u64)(s64)-ENOMEM;
+    }
+
+    if (!old_len) {
+        /* The duplicate goes where MREMAP_FIXED says -- replacing whatever
+         * was there, the source itself included if the two ranges touch
+         * (they may not overlap: old_addr strictly inside the destination is
+         * EINVAL, old_addr AT it is not, and then the source is gone by the
+         * time it is looked up again, which is EFAULT) -- or on free ground,
+         * which takes MREMAP_MAYMOVE: without it there is nothing to expand
+         * in place and the answer is ENOMEM. */
+        u64 dst;
+        if (flags & G_MREMAP_FIXED) {
+            dst = a4;
+            if (dst & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+            if (dst > GUEST_TASK_SIZE || new_len > GUEST_TASK_SIZE - dst)
+                return (u64)(s64)-EINVAL;
+            if (dst < old_addr && old_addr < dst + new_len)
+                return (u64)(s64)-EINVAL;   /* the source inside the destination */
+            guest_unmap(as, dst, new_len);
+        } else {
+            if (!(flags & G_MREMAP_MAYMOVE)) return (u64)(s64)-ENOMEM;
+            dst = as_find_free(as, new_len);
+            if (!dst) return (u64)(s64)-ENOMEM;
+        }
+        int r = guest_remap_dup(as, old_addr, new_len, dst);
+        return r < 0 ? (u64)(s64)r : dst;
     }
 
     if (!(flags & G_MREMAP_FIXED)) {

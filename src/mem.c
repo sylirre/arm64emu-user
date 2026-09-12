@@ -1102,6 +1102,60 @@ int guest_remap_move_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     return 0;
 }
 
+/* mremap with an old length of zero: a SECOND mapping of the shareable object
+ * under `addr` -- the kernel's own special case ("mremap(0, 0, 0, 0) is
+ * legal", kept for DOS-emu), which copy_vma turns into a new vma covering
+ * `len` bytes from the offset `addr` names, the old one left as it is. The
+ * pages are the same pages, so a store through either mapping shows through
+ * the other and a fork child shares both; and a private mapping cannot be
+ * duplicated -- vma_to_resize refuses with EINVAL, since a fresh private
+ * mapping would be unrelated to the original. The host mapping is duplicated
+ * the same way (guest_remap_grow's tier 3 already relies on it), so the
+ * identity travels: an anonymous shared segment stays that segment, a file
+ * stays that file at that offset, and the protection and the memfd census
+ * come along in the region record.
+ *
+ * The copy may run past the end of the source mapping -- copy_vma covers
+ * new_len from the source's offset regardless -- and there the pages are past
+ * end-of-file, the bus error they are in any file mapping (a shared anonymous
+ * segment is a memfd sized when the mapping was made, so the same holds).
+ * Those get no page-table entry, and the fault path probes and fills the ones
+ * the file has grown into; the pages the source has present are present in
+ * the copy from the start. */
+int guest_remap_dup_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    if ((addr | len | dst) & GUEST_PAGE_MASK || !len) return -EINVAL;
+    if (!range_ok(dst, len)) return -ENOMEM;
+    const Region *r = as_find_region(as, addr);
+    if (!r) return -EFAULT;
+    if (!r->shared) return -EINVAL;
+    for (u64 va = dst; va < dst + len; va += GUEST_PAGE_SIZE)
+        if (as_find_region(as, va)) return -ENOMEM;
+    /* mremap wants a host-page-aligned source, and the region's host slice
+     * is only guest-page aligned on a host with bigger pages (a trim, or the
+     * pad of an unaligned file offset): duplicate from the host page the
+     * slice starts in and keep the pad in front, as guest_map_file does. */
+    u8 *src = r->host + (addr - r->start);
+    u64 pad = (u64)((uintptr_t)src & (uintptr_t)(g_host_pagesz - 1));
+    if (!host_len_ok(len + pad)) return -ENOMEM;
+    void *p = mremap(src - pad, 0, (size_t)(len + pad), MREMAP_MAYMOVE);
+    if (p == MAP_FAILED) return -ENOMEM;
+    Region n = *r;
+    u64 src_end = r->end, prot = r->prot;
+    n.start = dst;
+    n.end = dst + len;
+    n.host = (u8 *)p + pad;
+    n.hmap = hmap_new((u8 *)p, (size_t)(len + pad));
+    n.path = as_path_dup(r->path);
+    n.file_off = r->file_off + (addr - r->start);
+    region_insert(as, n);          /* r is stale from here: the table moved */
+    for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
+        if (addr + off < src_end && pte_get(as, addr + off))
+            pte_put_one(as, dst + off, n.host + off, (u32)prot);
+    pte_sync_range(as, dst, len);
+    return 0;
+}
+
 /* Grow the mapping that ends at addr + old_len so that it covers new_len bytes
  * from addr. The guest VA of what is already there does not change; the ground
  * the growth needs must be free. Returns 0 or -errno. */
@@ -2298,6 +2352,14 @@ int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
 int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
     as_lock();
     int r = guest_remap_grow_impl(as, addr, old_len, new_len);
+    if (r == 0) as_account(as);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
+}
+int guest_remap_dup(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    as_lock();
+    int r = guest_remap_dup_impl(as, addr, len, dst);
     if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();

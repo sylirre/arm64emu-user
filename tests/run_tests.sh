@@ -2320,6 +2320,20 @@ fixture_verdict() {   # fixture_verdict <label> <expected> <got>
 # returns ENOSYS for set/get_robust_list and mlock2) ----
 check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label>]...
     local name="$1" expect="$2"; shift 2
+    # What the EMULATOR's own process has to be able to do, as in the C loop:
+    # a fixture whose emulation leans on a host syscall qemu-user gets wrong
+    # (the ARM32 tier) says so with a NEEDS-HOST-SYSCALL marker and is skipped
+    # by name where the probe fails.
+    local need_sys lacks= ns
+    need_sys=$(grep -m1 -o 'NEEDS-HOST-SYSCALL:[^*]*' "tests/fixtures/$name.c" |
+               sed 's/^NEEDS-HOST-SYSCALL: *//')
+    for ns in $need_sys; do
+        a64_emu_syscall_ok "$ns" || lacks="$lacks $ns"
+    done
+    if [ -n "$lacks" ]; then
+        skip=$((skip+1))
+        echo "SKIP fixture: $name (the emulator's host cannot:$lacks)"; return
+    fi
     "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
         skip_build "fixtures/$name"; return; }
     local got
@@ -2426,6 +2440,14 @@ check_fixture madvcode $'anon=42,42\nanon_dontneed=0 word=00000000 call=-4\nanon
 # byte-for-byte what this same fixture prints built for the host and run on a
 # real kernel, the refusals (a file or shared mapping, a hole) included.
 check_fixture madvfork $'dontfork=0 errno=0\ndontfork_child=aS\ndontfork_parent=ab\ndofork=0 errno=0\ndofork_child=ab\nwipeonfork=0 errno=0\nwipe_child=0b\nwipe_parent=ab\nwipe_grandchild=0b\nkeeponfork=0 errno=0\nkeep_child=ab\ndontfork_mid=0 errno=0\nmid_child_lo=aS\nmid_child_hi=Sb\nwipe_file=-1 errno=22\nwipe_shm=-1 errno=22\nkeep_file=0 errno=0\ndontfork_file=0 errno=0\ndofork_file=0 errno=0\nwipe_mixed=-1 errno=22\nmixed_child=0b\nwipe_hole=-1 errno=12\nhole_child=0S\ndontfork_hole=-1 errno=12\nhole_child2=SS\ndontfork_unmapped=-1 errno=12\nwipe_w=0 errno=0\ndontfork_w=0 errno=0\nvfork_child=aa\ndone'
+# mremap with an old length of zero duplicates a shareable mapping (man 2
+# mremap): a second mapping of the same object, on free ground or where
+# MREMAP_FIXED says, with a private source refused. Self-checking because
+# qemu-user range-checks mremap itself and answers ENOMEM for every row; the
+# values are a real kernel's (6.12+, which refuses the private source before
+# unmapping an MREMAP_FIXED destination). Gated on the emulator's own host
+# being able to duplicate a mapping, which qemu-arm cannot (hostenv.sh).
+check_fixture mremapdup $'dup=1\nshared=zyy\ndup_off=1 y\ndup_long=1 head=z tail=-7\nsrc=zy\nchild=k\nprivate=-1 errno=22\nprivate_nomove=-1 errno=22\nnomove=-1 errno=12\nunmapped=-1 errno=14\nnewlen0=-1 errno=22\nfixed=1 zk beyond=T\nfixed_overlap=-1 errno=22\nfixed_unaligned=-1 errno=22\nfixed_private=-1 errno=22\nvictim=118\nfile_ro=1 F write=-11\nfile_rw=1 G\norphan=G\ndone'
 # Ranges that wrap past the top of the address space, and lengths whose page
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;

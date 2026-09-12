@@ -590,6 +590,32 @@ shmem object. The mapping is rebuilt on a fresh, larger memfd and the old
 contents copied in; what a kernel keeps and this cannot is a sharer from
 *before* the grow — a child forked earlier goes on seeing the old pages.
 
+An **old length of zero** is the kernel's own special case ("`mremap(0, 0, 0,
+0)` is legal", kept for DOS-emu) and the documented way to *duplicate* a
+mapping: `copy_vma` makes a second vma covering `new_len` from the offset
+`addr` names, and the old mapping is left as it is. It is for a shareable
+object only — a "duplicate" of a private mapping would be a fresh mapping
+unrelated to the original, and `vma_to_resize` refuses it with `EINVAL` (before
+an `MREMAP_FIXED` destination is unmapped, the order 6.12 and later judge it
+in; 6.1 unmapped first). `guest_remap_dup` duplicates the host mapping the same
+way — the very `mremap` tier 3 above relies on — so the identity travels: an
+anonymous shared segment stays that segment, a file stays that file at that
+offset, and the protection and the memfd census come along in the region
+record. The copy may run past the end of the source mapping, and there the
+pages are past end-of-file — the bus error they are in any file mapping, since
+a shared anonymous segment is a memfd sized when the mapping was made — so they
+get no page-table entry and the fault path fills the ones the file has grown
+into, while the pages the source has present are present in the copy from the
+start. Without `MREMAP_MAYMOVE` there is nothing to expand in place and the
+answer is `ENOMEM`; with `MREMAP_FIXED` the destination is cleared first, the
+source itself included if the two touch (a source *strictly inside* the
+destination is `EINVAL`; one *at* it is not, and is then gone by the time it is
+looked up again, which is `EFAULT` — a kernel does the same). It used to be
+refused outright as `EINVAL`; `tests/fixtures/mremapdup.c` holds every row to a
+real kernel's answers, gated on the emulator's own host being able to
+duplicate a mapping (`NEEDS-HOST-SYSCALL: mremap-dup`, which `qemu-arm` cannot
+— `docs/jit.md`).
+
 `MREMAP_FIXED` is honored — the destination comes from the fifth argument,
 replaces whatever was mapped there (all of it, not just the part the move
 covers), and is refused when it overlaps the source — because a caller that
