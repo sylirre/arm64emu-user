@@ -69,13 +69,21 @@ SYSDEF(shmat) {
     s64 err = 0;
     if (shmaddr) {
         addr = shmaddr;
+        /* SHM_RND rounds down to SHMLBA. An address that rounds to zero stays
+         * a FIXED request -- do_shmat decided that on the address as given --
+         * so it lands on page zero's EPERM below, and SHM_REMAP with it is
+         * refused outright (nothing to replace). */
         if (shmflg & G_SHM_RND) addr &= ~(u64)(G_SHMLBA - 1);
         if (addr & GUEST_PAGE_MASK)              err = -EINVAL;
+        else if (!addr && (shmflg & G_SHM_REMAP)) err = -EINVAL;
         else if (addr + len > GUEST_TASK_SIZE)   err = -EINVAL;
-        else if (!(shmflg & G_SHM_REMAP)) {      /* target range must be free */
+        else if (addr && !(shmflg & G_SHM_REMAP)) {   /* target range must be free */
             for (u64 va = addr; va < addr + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) { err = -EINVAL; break; }
         }
+        /* Below vm.mmap_min_addr: the do_mmap underneath answers EPERM, after
+         * the intersection check above. */
+        if (!err && addr < mmap_min_addr()) err = -EPERM;
     } else {
         addr = as_find_free(as, len);
         if (!addr) err = -ENOMEM;

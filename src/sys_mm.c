@@ -31,6 +31,33 @@ static int anon_memfd(void) {
 }
 static void anon_memfd_close(int fd) { fdheld_close(fd); }
 
+/* vm.mmap_min_addr, the host's: the lowest address a fixed mapping may name
+ * (security_mmap_addr answers EPERM below it) and what a lower hint is raised
+ * to (round_hint_to_min). Read once; the kernel's compiled-in default where
+ * the file cannot be read, and what the guest reads from the passthrough
+ * /proc/sys/vm/mmap_min_addr agrees with it. */
+u64 mmap_min_addr(void) {
+    static u64 cached;
+    u64 v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (v) return v;
+    v = 65536;
+    char buf[32];
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open("/proc/sys/vm/mmap_min_addr", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            u64 p = strtoull(buf, NULL, 10);
+            if (p) v = PG_UP(p);
+        }
+    }
+    fdwin_leave();
+    __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+    return v;
+}
+
 /* Guest mmap flag values (asm-generic == x86 for these). */
 #define G_MAP_SHARED    0x01
 #define G_MAP_PRIVATE   0x02
@@ -172,6 +199,13 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     if (flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) {
         if (addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
         if (addr > GUEST_TASK_SIZE - len) return (u64)(s64)-ENOMEM;
+        /* vm.mmap_min_addr: the pages a NULL dereference must keep faulting
+         * on. security_mmap_addr refuses a fixed mapping below it with EPERM,
+         * from get_unmapped_area -- ahead of MAP_FIXED_NOREPLACE's EEXIST and
+         * of the MAP_TYPE check below, both of which a native probe confirms
+         * it wins over. Left unenforced, mmap(0, ..., MAP_FIXED) mapped page
+         * zero and a null pointer stopped being one. */
+        if (addr < mmap_min_addr()) return (u64)(s64)-EPERM;
         if (flags & G_MAP_FIXED_NOREPLACE)
             for (u64 va = addr; va < addr + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) return (u64)(s64)-EEXIST;
@@ -180,10 +214,13 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
          * advisory-hint behavior). Go's arena reservation depends on this: it
          * requests specific high addresses and discards (munmap) any mapping
          * placed elsewhere, so ignoring the hint causes an unbounded map/unmap
-         * churn against a smaller-than-expected guest address space. */
-        u64 hint = addr;
+         * churn against a smaller-than-expected guest address space. A hint
+         * below mmap_min_addr is raised to it (round_hint_to_min), not
+         * dropped. */
+        u64 hint = addr & ~(u64)GUEST_PAGE_MASK;
+        if (hint && hint < mmap_min_addr()) hint = mmap_min_addr();
         addr = 0;
-        if (hint && !(hint & GUEST_PAGE_MASK) && hint <= GUEST_TASK_SIZE - len) {
+        if (hint && hint <= GUEST_TASK_SIZE - len) {
             int busy = 0;
             for (u64 va = hint; va < hint + len; va += GUEST_PAGE_SIZE)
                 if (as_find_region(as, va)) { busy = 1; break; }
@@ -774,6 +811,10 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
          * range is gone in full whatever the new length is. */
         if (new_len < old_len)
             guest_unmap(as, old_addr + new_len, old_len - new_len);
+        /* A destination below vm.mmap_min_addr is EPERM (mremap_to asks
+         * get_unmapped_area only now, after both unmaps -- so the source's
+         * tail is gone even though the call fails, exactly as on a kernel). */
+        if (new_addr < mmap_min_addr()) return (u64)(s64)-EPERM;
     } else {
         new_addr = as_find_free(as, new_len);
         if (!new_addr) return (u64)(s64)-ENOMEM;

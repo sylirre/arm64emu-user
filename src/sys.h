@@ -138,6 +138,10 @@ static inline int fd_pair_within_limit(CPU *c, int a, int b) {
     return 0;
 }
 
+/* vm.mmap_min_addr (sys_mm.c): no fixed mapping below it, a hint below it
+ * raised to it. */
+u64 mmap_min_addr(void);
+
 /* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
  * the host kernel predates it (< 3.17 — Android 7 devices). */
 int a64_anonfd(const char *name);
