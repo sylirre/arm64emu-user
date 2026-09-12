@@ -509,6 +509,76 @@ static int madv_valid(int adv) {
     }
 }
 
+/* madvise_remove, over the guest's regions (see the call site). */
+static u64 madv_remove(CPU *c, u64 start, u64 end) {
+    AddrSpace *as = &c->m->as;
+    long hps = sysconf(_SC_PAGESIZE);
+    if (hps < (long)GUEST_PAGE_SIZE) hps = GUEST_PAGE_SIZE;
+    s64 err = 0;
+    int hole = 0;
+    as_lock();
+    for (u64 va = start; va < end; ) {
+        const Region *r = as_find_region(as, va);
+        if (!r) {
+            hole = 1;
+            const Region *nx = as_next_region(as, va);
+            if (!nx || nx->start >= end) break;
+            va = nx->start;
+            continue;
+        }
+        if (!r->file && !r->shared) { err = -EINVAL; break; }   /* no object */
+        if (!r->shared || !r->wr_ok)  { err = -EACCES; break; }   /* not maywrite */
+        u64 stop = r->end < end ? r->end : end;
+        u8 *lo = r->host + (va - r->start), *hi = r->host + (stop - r->start);
+        uintptr_t hmask = (uintptr_t)hps - 1;
+        u8 *alo = (u8 *)(((uintptr_t)lo + hmask) & ~hmask);
+        u8 *ahi = (u8 *)((uintptr_t)hi & ~hmask);
+        if (ahi > alo && madvise(alo, (size_t)(ahi - alo), MADV_REMOVE) != 0) {
+            err = -errno;
+            break;
+        }
+        /* The partial host pages (a host with pages bigger than 4 KB only):
+         * zeroed through the mapping, which reaches the object the same way. */
+        if (alo > ahi) alo = ahi = lo;   /* the range lies inside one host page */
+        u8 *parts[2][2] = { { lo, alo < hi ? alo : hi }, { ahi > lo ? ahi : lo, hi } };
+        for (int i = 0; i < 2; i++) {
+            if (parts[i][1] <= parts[i][0]) continue;
+            int writable = (r->prot & PTE_W) != 0;
+            u8 *pg = (u8 *)((uintptr_t)parts[i][0] & ~hmask);
+            if (!writable) mprotect(pg, (size_t)hps, PROT_READ | PROT_WRITE);
+            memset(parts[i][0], 0, (size_t)(parts[i][1] - parts[i][0]));
+            if (!writable) mprotect(pg, (size_t)hps, PROT_READ);
+        }
+        va = stop;
+    }
+    as_unlock();
+    /* Zeroes where there was code: the translations over it are stale. */
+    jit_invalidate_range(start, end - start);
+    if (err) return (u64)err;
+    return hole ? (u64)(s64)-ENOMEM : 0;
+}
+
+/* madvise_populate, over the guest's regions (see the call site). */
+static u64 madv_populate(CPU *c, u64 start, u64 end, int write) {
+    AddrSpace *as = &c->m->as;
+    s64 err = 0;
+    as_lock();
+    for (u64 va = start; va < end && !err; ) {
+        const Region *r = as_find_region(as, va);
+        if (!r) { err = -ENOMEM; break; }
+        if (!(r->prot & (write ? PTE_W : PTE_R))) { err = -EINVAL; break; }
+        u64 stop = r->end < end ? r->end : end;
+        for (u64 p = va; p < stop; p += GUEST_PAGE_SIZE)
+            if (!mem_host_ptr(c, p, GUEST_PAGE_SIZE, write ? ACC_WRITE : ACC_READ)) {
+                err = -EFAULT;   /* a file mapping's page past end-of-file */
+                break;
+            }
+        va = stop;
+    }
+    as_unlock();
+    return (u64)err;
+}
+
 SYSDEF(madvise) {
     (void)a3; (void)a4; (void)a5;
     /* The kernel's third argument is an `int`, so the high half of the
@@ -546,6 +616,29 @@ SYSDEF(madvise) {
         as_unlock();
         return (u64)(s64)r;
     }
+
+    /* MADV_REMOVE punches a hole in the object behind a shared mapping --
+     * shmem or a file -- so the range reads back as zeroes to every sharer;
+     * madvise_remove refuses anything else: a private anonymous mapping has
+     * no object (EINVAL), and a private file mapping or a shared one of a
+     * file not opened for writing may not punch it (EACCES). Region by
+     * region in address order, the first refusal ending the call with the
+     * regions before it done, and a hole ENOMEM at the end -- the walk every
+     * advice takes. The host mapping IS a mapping of that object, so the
+     * host's own MADV_REMOVE does the punching; where the host's pages are
+     * larger than the guest's, the interior is punched and the partial host
+     * pages at either end are zeroed through the mapping instead, made
+     * writable for the moment if the guest had taken that away (the object
+     * allows it: wr_ok). It used to be accepted and ignored. */
+    if (adv == G_MADV_REMOVE) return madv_remove(c, a0, end);
+    /* MADV_POPULATE_READ / _WRITE prefault the range: nothing a guest can see
+     * afterwards, but the refusals are its business -- a mapping without the
+     * permission asked for (a PROT_NONE one for a read, a read-only one for a
+     * write) is EINVAL, a page that cannot be faulted in (a file mapping past
+     * end-of-file) is EFAULT, and a hole is ENOMEM, each ending the call
+     * where it is met. They used to answer 0 to all of it. */
+    if (adv == G_MADV_POPULATE_READ || adv == G_MADV_POPULATE_WRITE)
+        return madv_populate(c, a0, end, adv == G_MADV_POPULATE_WRITE);
 
     /* MADV_DONTNEED / MADV_FREE return the pages to the kernel; on Linux the
      * next access to an anonymous page then faults in a fresh zero page. Go's

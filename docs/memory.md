@@ -111,8 +111,19 @@ empty-length success or a hole's `ENOMEM`. The accepted set is a 6.1 kernel's
 (`madv_valid`, `sys_mm.c`) — `MADV_DONTNEED`, `MADV_FREE` and
 `MADV_DONTNEED_LOCKED` discard the range, `MADV_DONTFORK` / `MADV_DOFORK` and
 `MADV_WIPEONFORK` / `MADV_KEEPONFORK` decide what a fork child inherits
-(below), and the rest are hints about paging and dumping that a kernel is free
-to ignore and that are ignored here. Two groups are deliberately absent: `MADV_HWPOISON` /
+(below), `MADV_REMOVE` punches a hole in the object behind a shared mapping
+(`madv_remove`: the host mapping *is* a mapping of that object, so the host's
+own `MADV_REMOVE` punches it for every sharer — with the partial host pages of
+a >4 KB host zeroed through the mapping instead — and `madvise_remove`'s
+refusals are kept: `EINVAL` for private anonymous memory, which has no object,
+`EACCES` for a private file mapping or a shared one of a file not opened for
+writing, the walk done up to the first refusal and a hole `ENOMEM` at the end),
+`MADV_POPULATE_READ` / `_WRITE` prefault (`madv_populate`: nothing to see
+afterwards, but the refusals are the guest's — `EINVAL` for a mapping without
+the permission asked, `EFAULT` for a file page past end-of-file, `ENOMEM` for a
+hole), and the rest are hints about paging and dumping that a kernel is free
+to ignore and that are ignored here. `MADV_REMOVE` and the two populates used
+to be among the ignored (`tests/fixtures/madvremove.c`). Two groups are deliberately absent: `MADV_HWPOISON` /
 `MADV_SOFT_OFFLINE` need `CONFIG_MEMORY_FAILURE`, which this kernel does not
 offer, and `MADV_GUARD_INSTALL` / `MADV_GUARD_REMOVE` are 6.13. Neither pair is
 a hint — one poisons a page, the other installs a faulting guard PTE — so

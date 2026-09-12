@@ -2592,6 +2592,14 @@ check_fixture cpuinfo $'blocks_eq_online=1\none_features_per_block=1\nfeatures_a
 # the guest set it. Self-checking: qemu-user answers EINVAL for several of
 # these; the expected block is a real kernel's, taken natively.
 check_fixture prctlset $'dumpable=1\nset_dump0=0 get=0\nset_dump2=-22 set_dump1=0\npdeath_set=0\npdeath_get=0 v=10\npdeath_set33=0\npdeath_get33=0 v=33\npdeath_bad=-22\npdeath_clear=0\npdeath_cleared=0 v=0\nsubreaper_get0=0 v=0\nsubreaper_set=0\nsubreaper_get1=0 v=1\norphan_parent_is_me=1\nreaped_grandchild=1\nsubreaper_off=0\nslack_default_positive=1\nslack_set=0 get=123456\nslack_reset=0 get_default=1\nthp_get=0\nthp_set=0 get=1\nthp_clear=0 get=0\nthp_badargs=-22\ntid_addr=0 nonzero=1\ntiming=0 set_timing=0\nmce_get=2\nsecurebits=0\nspec_answered=1\nspec_badargs=-22\nbogus=-22\ndone'
+# MADV_REMOVE punches a hole in the object behind a shared mapping (zeroes
+# for every sharer, a hole in the file), EINVAL on private anonymous memory,
+# EACCES on a private or read-only shared file mapping, done up to the first
+# refusal; MADV_POPULATE_READ/WRITE are EINVAL without the permission asked,
+# EFAULT past a file's end, ENOMEM across a hole. Both used to be accepted
+# and ignored. Self-checking: qemu-user passes neither through; the expected
+# block is a real kernel's, taken natively.
+check_fixture madvremove $'remove_priv=-22\nremove_shm=0 punched=1 neighbours=ss\nchild_punch=1 seen_here=1 rest=t\nremove_shm_ro=0 punched=1\nremove_fpriv=-13\nremove_fsro=-13\nremove_fshw=0 punched=1 file_hole=1 file_kept=1\nremove_hole=-12 before=1 after=1\npopr_hole=-12 popw_hole=-12 popr_holestart=-12\nremove_mixed=-22 shared_punched=1 private_kept=y\nremove_unaligned=-22 remove_zerolen=0\npopw_ro=-22 popr_ro=0\npopr_none=-22 popw_none=-22\npopw_rw=0 popr_rw=0\npopw_fsro=-22 popr_fsro=0\npopr_in=0 popr_past_eof=-14 popw_past_eof=-14\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
