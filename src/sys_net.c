@@ -577,8 +577,8 @@ SYSDEF(getsockopt) {
         u8 g[16];
         memset(g, 0, sizeof g);
         s64 v;
-        if (tl >= sizeof tv.tv_sec) { v = (s64)tv.tv_sec; memcpy(g, &v, 8); }
-        if (tl >= sizeof tv) { v = (s64)tv.tv_usec; memcpy(g + 8, &v, 8); }
+        if ((size_t)tl >= sizeof tv.tv_sec) { v = (s64)tv.tv_sec; memcpy(g, &v, 8); }
+        if ((size_t)tl >= sizeof tv) { v = (s64)tv.tv_usec; memcpy(g + 8, &v, 8); }
         u32 outl = (u32)glen < 16 ? (u32)glen : 16;   /* kernel: len = min(len, lv) */
         if (outl && copy_to_guest(c, a3, g, outl) < 0) return (u64)(s64)-EFAULT;
         if (copy_to_guest(c, a4, &outl, 4) < 0) return (u64)(s64)-EFAULT;
