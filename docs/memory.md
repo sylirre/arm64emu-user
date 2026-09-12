@@ -117,7 +117,11 @@ data where the GC expected zeroes. Anonymous ranges are zeroed in their
 backing (which a kernel does whatever protection the mapping carries —
 discarding is not writing); a private file mapping hands the discard to the
 host so the re-fault comes from the file, and only where host pages are guest
-sized, since a bigger one would take neighbouring guest pages with it.
+sized, since a bigger one would take neighbouring guest pages with it. Either
+way the discard is then published to the JIT like a mapping change
+(`jit_invalidate_range`): the bytes under a translated block may just have
+become zeroes, or the file's own code again, and a kernel owes the guest that
+without any cache maintenance on its part (`docs/jit.md`).
 
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**

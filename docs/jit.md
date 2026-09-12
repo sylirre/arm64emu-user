@@ -293,8 +293,14 @@ is stripped (a tagged code pointer must still flush the page it really names),
 and an address outside the guest address space — which can hold no translation —
 is ignored instead of indexing the code-page bitmap past its end. Mapping changes
 (`munmap`/`mprotect`/`mremap`/map-over) call `jit_invalidate_range` from
-`mem.c`; a global sticky "this page ever held code" bitmap decides whether
-other threads must be interrupted. Each thread drops its own affected blocks at
+`mem.c`, and so does a `madvise` discard (`MADV_DONTNEED`/`MADV_FREE`, in
+`sys_mm.c`): it changes what the bytes *are* — zeroes for anonymous memory,
+the file's own code for a patched private file mapping — and a kernel owes
+the guest coherence for that with no `IC IVAU` on its part, the pages being
+faulted in afresh. Left out, a block translated from the discarded code went
+on running it where the interpreter took the zeroed page's SIGILL
+(`tests/fixtures/madvcode.c`). A global sticky "this page ever held code"
+bitmap decides whether other threads must be interrupted. Each thread drops its own affected blocks at
 a safepoint and re-syncs its D-TLB (generated fast paths skip the interpreter's
 per-access generation check — the retired-backing quarantine in `mem.c` keeps a
 stale hit benign, exactly as for the interpreter). Dropping a page purges only

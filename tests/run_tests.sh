@@ -2410,6 +2410,13 @@ check_fixture madvhole $'hole_dontneed=-12\nhole_free=-12\nhole_willneed=-12\nho
 # than the 6.1 uname advertises. Self-checking because qemu-user takes every
 # advice it does not know and refuses the two ...ONFORK ones it does.
 check_fixture madvadvice $'normal=0\nrandom=0\nsequential=0\nwillneed=0\ndontfork=0\ndofork=0\nmergeable=0\nunmergeable=0\nhugepage=0\nnohugepage=0\ndontdump=0\ndodump=0\nwipeonfork=0\nkeeponfork=0\ncold=0\npageout=0\npopulate_read=0\npopulate_write=0\ndontneed=0\nfree=0\ndontneed_locked=0\ngap5=-22\ngap6=-22\ngap7=-22\npast=-22\nfar=-22\nhwpoison=-22\nsoft_offline=-22\nguard_install=-22\nguard_remove=-22\nneg=-22\nintmax=-22\nok_zerolen=0\nbad_zerolen=-22\nok_hole=-12\nbad_hole=-22\nhi32_dontneed=0\nhi32_discarded=1\nhi32_bad=-22\ndone'
+# A discard over EXECUTABLE memory changes what the bytes are, and the JIT
+# keeps translations by guest PC: they have to go, the way they go for a
+# mapping change, or a block translated from the discarded code runs on where
+# a jump there must now take the zeroed page's SIGILL. Self-checking because
+# qemu-user has the very defect (its TBs survive the discard); the values are
+# a real kernel's, and both engines must print them.
+check_fixture madvcode $'anon=42,42\nanon_dontneed=0 word=00000000 call=-4\nanon_rewritten=43\nfile=7\nfile_patched=42,42\nfile_dontneed=0 word=528000e0 call=7\nhole=44,45\nhole_dontneed=-1 errno=12 call=-4,-4\ndone'
 # Ranges that wrap past the top of the address space, and lengths whose page
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;

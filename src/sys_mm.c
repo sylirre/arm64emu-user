@@ -8,6 +8,7 @@
 #include <sys/syscall.h>
 
 #include "sys.h"
+#include "jit.h"
 
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK)
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
@@ -545,6 +546,17 @@ SYSDEF(madvise) {
         va = stop;
     }
     as_unlock();
+    /* A discard changes what the bytes ARE, and the JIT keeps translations
+     * by guest PC: a block translated from code the guest has just discarded
+     * would go on running it -- for anonymous memory, in place of the zeroes
+     * a jump there must now fault on; for a patched private file mapping, in
+     * place of the file's own code the discard restored. The kernel owes the
+     * guest coherence here without any IC IVAU on its part (the pages are
+     * faulted in afresh), exactly as for a mapping change, so the discard is
+     * published the way a mapping change is (mem.c pte_sync_range). Over the
+     * whole range, holes included: a hole holds no translation, and the
+     * codemap makes a page that was never code free to ask about. */
+    if (discard) jit_invalidate_range(a0, len);
     /* The hint advice values: accepted and ignored, but not before the range
      * they name has been judged. */
     return hole ? (u64)(s64)-ENOMEM : 0;
