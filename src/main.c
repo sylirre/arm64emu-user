@@ -672,6 +672,20 @@ static void set_fake_id(struct Machine *m, const char *attached,
 #ifdef ANDROID_JNI
 int arm64chroot_main(int argc, char **argv)
 #else
+/* chdir the host into the guest directory `canon` (namespace-absolute): the
+ * host cwd is the guest's from then on (path.c). 0, or 126 after a message. */
+static int enter_guest_cwd(struct Machine *m, const char *canon) {
+    char host[PATH_MAX];
+    int r = path_resolve(m, G_AT_FDCWD, canon, 0, host, NULL);
+    if (r == 0 && chdir(host) != 0) r = -errno;
+    if (r < 0) {
+        fprintf(stderr, "arm64chroot: cannot enter the working directory '%s': %s\n",
+                canon, strerror(-r));
+        return 126;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 #endif
 {
@@ -798,7 +812,12 @@ int main(int argc, char **argv)
     /* Not chrooted initially: the guest root is the rootfs root. */
     strcpy(m->chroot_base, "/");
 
-    /* Guest cwd: the host cwd when it lies inside the rootfs, else "/". */
+    /* Guest cwd: the host cwd when it lies inside the rootfs, else "/" -- and
+     * the host process moves there, because from here on the host cwd IS the
+     * guest's (path.c, "the working directory is the host's"). Every host
+     * path the emulator uses is absolute by now (the rootfs and the bind
+     * sources are realpath'd above), so nothing of its own depends on where
+     * it was launched from. */
     strcpy(m->cwd, "/");
     char hcwd[PATH_MAX];
     if (getcwd(hcwd, sizeof hcwd)) {
@@ -806,11 +825,13 @@ int main(int argc, char **argv)
         if (!strncmp(hcwd, m->rootfs, rl) && (hcwd[rl] == '/' || hcwd[rl] == 0))
             strcpy(m->cwd, hcwd[rl] ? hcwd + rl : "/");
     }
+    if (enter_guest_cwd(m, m->cwd) != 0) return 126;
 
     /* -w/--work-dir overrides the initial cwd with a guest path (resolved inside
      * the rootfs, honoring -bind and symlinks). An absolute DIR resolves from
-     * guest "/", a relative one against the default cwd above. Must land before
-     * do_execve, which resolves <program> against m->cwd. Fatal on a bad path. */
+     * guest "/", a relative one against the default cwd above -- which the host
+     * is standing in by now. Must land before do_execve, which resolves
+     * <program> against the cwd. Fatal on a bad path. */
     if (work_dir) {
         char host[PATH_MAX], canon[PATH_MAX];
         struct stat st;
@@ -823,6 +844,7 @@ int main(int argc, char **argv)
             return 126;
         }
         strcpy(m->cwd, canon);
+        if (enter_guest_cwd(m, m->cwd) != 0) return 126;
     }
 
     /* Guest argv: program args as given; argv[0] overridable. */

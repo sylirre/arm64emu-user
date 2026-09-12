@@ -100,6 +100,96 @@ int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
     return host_fd_guest_path(m, buf, out, NULL);
 }
 
+/* ---- the working directory is the host's -------------------------------
+ *
+ * A kernel's cwd is an inode, not a name: rename the directory a process
+ * sits in and its relative paths keep resolving and getcwd() reports the new
+ * name; unlink it and getcwd() is ENOENT, the names in it are gone, and ".."
+ * still climbs out. The emulator kept the cwd as a canonical guest STRING
+ * (m->cwd), so a directory renamed or removed by another process left the
+ * guest resolving against a name that meant nothing any more -- or, worse,
+ * something else -- and getcwd() lied.
+ *
+ * So the host process's own cwd IS the guest's now: chdir and fchdir move it
+ * (the guest's descriptor is the host's, and the pinned target of a chdir is
+ * opened O_PATH and fchdir'd), fork and execve carry it as they carry the
+ * kernel's, and every relative resolution starts from what the kernel says
+ * it is -- the /proc/self/cwd link, mapped to the guest view through the same
+ * bind and rootfs tables a dirfd's path is (dirfd_guest_path) -- rather than
+ * from the string -- the getcwd syscall, half a microsecond, mapped to the
+ * guest view through the same bind and rootfs tables a dirfd's path is
+ * (dirfd_guest_path). m->cwd remains as the published copy (proctab, the
+ * /proc/<pid>/cwd links), refreshed whenever the answer changes. A cwd that
+ * has been unlinked keeps its last basename under its parent's current path
+ * for the walk (".." climbs out of it, and a kernel's /proc link names it
+ * "(deleted)" too), and is flagged: the names in it answer ENOENT whatever
+ * the old path holds by now, "." names the inode itself (the pin is the
+ * host's AT_FDCWD then), and getcwd is ENOENT. */
+int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
+    char buf[PATH_MAX];
+    int gone = 0;
+    /* The raw syscall: half a microsecond, against the two of a readlink of
+     * /proc/self/cwd, and this runs once per relative path a guest names. It
+     * answers ENOENT for an unlinked cwd, where the link would have said
+     * "(deleted)". */
+    long n = syscall(SYS_getcwd, buf, sizeof buf);
+    if (n < 0 && errno == ENOENT) {
+        gone = 1;
+        /* Unlinked: the directory has no name, but its parent has, and ".."
+         * from inside it has to reach that parent -- wherever the directory
+         * had been moved to before it went. The parent's own path is read
+         * off an O_PATH descriptor of "..", the last known basename stays. */
+        char link[64], parent[PATH_MAX], pguest[PATH_MAX];
+        ssize_t pl = -1;
+        fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+        int pfd = open("..", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (pfd >= 0) {
+            snprintf(link, sizeof link, "/proc/self/fd/%d", pfd);
+            pl = readlink(link, parent, sizeof parent - 1);
+            close(pfd);
+        }
+        fdwin_leave();
+        const char *base = strrchr(m->cwd, '/');
+        base = base ? base + 1 : m->cwd;
+        if (pl > 0) {
+            parent[pl] = 0;
+            if (host_fd_guest_path(m, parent, pguest, NULL) == 0 &&
+                strlen(pguest) + 1 + strlen(base) + 1 <= sizeof buf) {
+                strcpy(buf, pguest);
+                if (strcmp(pguest, "/")) strcat(buf, "/");
+                strcat(buf, base);
+                if (strcmp(buf, m->cwd)) {
+                    strcpy(m->cwd, buf);
+                    proctab_set_cwd((s32)getpid(), m->cwd);
+                }
+            }
+        }
+        strcpy(canon_out, m->cwd[0] ? m->cwd : "/");
+        if (deleted) *deleted = 1;
+        return 0;
+    }
+    if (n < 0) {
+        /* Not askable (the host refused the call): the published copy is the
+         * best answer there is. */
+        strcpy(canon_out, m->cwd[0] ? m->cwd : "/");
+        if (deleted) *deleted = 0;
+        return 0;
+    }
+    char guest[PATH_MAX];
+    if (host_fd_guest_path(m, buf, guest, NULL) < 0) {
+        strcpy(canon_out, m->cwd[0] ? m->cwd : "/");
+        if (deleted) *deleted = 0;
+        return 0;
+    }
+    if (strcmp(guest, m->cwd)) {   /* renamed under us, or moved by a mount */
+        strcpy(m->cwd, guest);
+        proctab_set_cwd((s32)getpid(), m->cwd);
+    }
+    strcpy(canon_out, guest);
+    if (deleted) *deleted = gone;
+    return 0;
+}
+
 /* Is this a path in the host /proc zone? Such a path doubles as the canonical
  * guest spelling of the same file -- the zone passes through verbatim -- which
  * is what lets /proc keep working when a mount gives it another name. */
@@ -266,7 +356,12 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
     const char *tail = proc_self_tail(canon);
     if (tail) {
         if (!strcmp(tail, "exe"))  { strcpy(tgt, m->exec_path); return 1; }
-        if (!strcmp(tail, "cwd"))  { strcpy(tgt, m->cwd[0] ? m->cwd : "/"); return 1; }
+        if (!strcmp(tail, "cwd"))  {
+            int gone = 0;
+            cwd_current(m, tgt, &gone);   /* the kernel's own link, guest view */
+            if (gone) strcat(tgt, " (deleted)");
+            return 1;
+        }
         if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
         if (proc_map_files_link(tail)) return -EACCES;
         return 0;
@@ -1202,6 +1297,16 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
     const char *slash = strrchr(canon, '/');
     if (!slash || !slash[1]) return 0;          /* the root itself: nothing to pin */
     if (strlen(slash + 1) + 1 > sizeof p->base) return -ENAMETOOLONG;
+    /* The unlinked cwd itself ("." from inside it, path_walk): the one
+     * directory whose name reaches nothing, and whose inode the host's own
+     * cwd still is -- so the host's AT_FDCWD is the pin. */
+    if (!strcmp(host, ".")) {
+        p->dfd = AT_FDCWD;
+        strcpy(p->base, ".");
+        p->name = p->base;
+        p->pinned = 1;
+        return 0;
+    }
 
     char parent[PATH_MAX], parhost[PATH_MAX], joined[PATH_MAX];
     size_t pl = (size_t)(slash - canon);
@@ -1431,11 +1536,11 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
 
     if (!gpath[0]) return -ENOENT;   /* AT_EMPTY_PATH handled by callers */
 
+    int cwd_gone = 0;
     if (gpath[0] == '/') {
         strcpy(canon, croot);        /* absolute path is relative to the chroot */
     } else if (dirfd == G_AT_FDCWD) {
-        if (strlen(m->cwd) + 1 > sizeof canon) return -ENAMETOOLONG;
-        strcpy(canon, m->cwd[0] ? m->cwd : "/");
+        cwd_current(m, canon, &cwd_gone);   /* the host's cwd, as the kernel has it */
     } else {
         int r = dirfd_guest_path(m, dirfd, canon);
         if (r < 0) return r;
@@ -1472,6 +1577,11 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
         int r;
 
         if (!strcmp(comp, ".")) continue;
+        /* A name inside an unlinked cwd: there are none, whatever a directory
+         * created at the old path since may hold. ".." leaves it and "." is
+         * it, and both are answered. */
+        if (cwd_gone && strcmp(comp, "..")) return -ENOENT;
+        cwd_gone = 0;   /* ".." has left it */
         if (!strcmp(comp, "..")) {
             /* The optimistic route cannot fold a ".." that actually removes a
              * component. Its whole warrant is that the PIN certifies the fold,
@@ -1576,6 +1686,16 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
         if (tgt[0] == '/') { strcpy(canon, croot); depth = trusted = 0; }   /* absolute link: re-root at chroot */
     }
 
+    if (cwd_gone) {
+        /* "." (or nothing) from inside an unlinked cwd: the inode itself,
+         * which only the host's own cwd still reaches. path_pin reads the
+         * spelling; an unpinned user of it asks the host relative to its cwd,
+         * which is the same inode. */
+        strcpy(host_out, ".");
+        if (canon_out) strcpy(canon_out, canon);
+        if (fast) { *fast = 0; return 0; }   /* nothing to certify: the walk owns it */
+        return 0;
+    }
     int plain = 0;
     int r = canon_to_host(m, canon, host_out, NULL, &plain);   /* -bind > /dev,/proc > rootfs */
     if (r < 0) return r;

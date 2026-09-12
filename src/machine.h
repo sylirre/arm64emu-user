@@ -965,6 +965,10 @@ void path_strip_rootfs(const struct Machine *m, char *path);
  * bind-reverse / rootfs-strip). Writes to `out` (>= PATH_MAX) and returns 0, or
  * a negative errno. Used by getdents64 to identify the directory being listed. */
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out);
+/* The guest's cwd as the kernel has it -- the host cwd, mapped to the guest
+ * view -- refreshing m->cwd; *deleted says the directory has been unlinked
+ * (path.c, "the working directory is the host's"). */
+int cwd_current(struct Machine *m, char *canon_out, int *deleted);
 
 /* Map an fd's host path (as read from /proc/self/fd) to its guest path via the
  * same bind-reverse / rootfs-strip dirfd_guest_path uses, but without the

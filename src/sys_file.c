@@ -2314,13 +2314,19 @@ SYSDEF(pipe2) {
     return 0;
 }
 
+/* The cwd is the host process's own (path.c, "the working directory is the
+ * host's"): getcwd asks the kernel, and chdir/fchdir move the host. */
 SYSDEF(getcwd) {
     struct Machine *m = c->m;
+    char cur[PATH_MAX], view[PATH_MAX];
+    int gone = 0;
+    cwd_current(m, cur, &gone);
+    if (gone) return (u64)(s64)-ENOENT;   /* unlinked: what sys_getcwd answers */
     /* Report the cwd as the guest sees it: inside a chroot, subtract the chroot
-     * base (m->cwd is namespace-absolute). If cwd lies outside the chroot — only
-     * possible right after chroot(2), before the guest chdir("/")s — report "/". */
-    char view[PATH_MAX];
-    path_chroot_view(m, m->cwd, view);
+     * base (the canonical path is namespace-absolute). If cwd lies outside the
+     * chroot -- only possible right after chroot(2), before the guest
+     * chdir("/")s -- report "/". */
+    path_chroot_view(m, cur, view);
     size_t l = strlen(view) + 1;
     if (a1 < l) return (u64)(s64)-ERANGE;
     if (copy_to_guest(c, a0, view, l) < 0) return (u64)(s64)-EFAULT;
@@ -2332,38 +2338,40 @@ SYSDEF(chdir) {
     char canon[PATH_MAX];
     int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
     if (r < 0) return (u64)(s64)r;
-    /* The cwd is tracked as a guest string, so nothing is opened for it -- but
-     * the "is it a directory" check must still be about the pinned target and
-     * not about whatever the name means by now. */
-    struct stat st;
-    int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
-    u64 e = sr < 0 ? host_err() : 0;
+    /* The pinned target is opened and the host moved there: the inode the
+     * walk found, whatever the name means by now. The open carries the
+     * kernel's own refusals -- ENOTDIR, and EACCES for a directory this
+     * process may not search, which the old string tracking never noticed.
+     * The descriptor is ours for the moment (machine.h). */
+    fdwin_enter();
+    int dfd = openat(pin.dfd, pin.name,
+                     O_PATH | O_DIRECTORY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
+    int e = errno;
+    if (dfd >= 0 && fchdir(dfd) < 0) { e = errno; close(dfd); dfd = -1; }
+    else if (dfd >= 0) close(dfd);
+    fdwin_leave();
     path_unpin(&pin);
-    if (sr < 0) return e;
-    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    if (dfd < 0) return (u64)(s64)-e;
     strcpy(c->m->cwd, canon);
     proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
     return 0;
 }
 
 SYSDEF(fchdir) {
-    /* Track cwd as the fd's guest path (guest fd == host fd). The mapping goes
-     * through the bind table (dirfd_guest_path), not a bare rootfs-prefix
-     * strip: a directory reached through a mount -- an emulated tmpfs, or the
-     * root a pivot_root moved -- has a host path outside the rootfs entirely,
-     * and used to land the guest on "/". bubblewrap fchdir()s a root fd it kept
-     * across its pivot_root, so it noticed immediately. */
-    char link[64], buf[PATH_MAX], guest[PATH_MAX];
-    snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
-    ssize_t n = readlink(link, buf, sizeof buf - 1);
-    if (n < 0) return (u64)(s64)-EBADF;
-    buf[n] = 0;
-    struct stat st;
-    if (stat(buf, &st) < 0) return host_err();
-    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
-    if (host_fd_guest_path(c->m, buf, guest, NULL) < 0) return (u64)(s64)-EBADF;
-    strcpy(c->m->cwd, guest);
-    proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
+    /* Guest fd == host fd: the host's own fchdir, with its own refusals. The
+     * guest view of where that leaves us goes through the bind table
+     * (dirfd_guest_path), not a bare rootfs-prefix strip: a directory reached
+     * through a mount -- an emulated tmpfs, or the root a pivot_root moved --
+     * has a host path outside the rootfs entirely, and used to land the guest
+     * on "/". bubblewrap fchdir()s a root fd it kept across its pivot_root, so
+     * it noticed immediately. */
+    if (fchdir((int)(s32)a0) < 0) return host_err();
+    char guest[PATH_MAX];
+    if (dirfd_guest_path(c->m, (int)(s32)a0, guest) == 0) {
+        strcpy(c->m->cwd, guest);
+        proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
+    }
+    cwd_current(c->m, guest, NULL);   /* ...and the kernel's word on it */
     return 0;
 }
 

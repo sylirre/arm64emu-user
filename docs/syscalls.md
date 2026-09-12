@@ -464,11 +464,31 @@ component followed on exactly the hosts that can least afford it.
 Following it let a guest be redirected into creating the link's target — the
 race `O_EXCL` exists to prevent — and a dangling link made the open succeed.
 
-`*at` syscalls resolve `dirfd` via the fd's recorded guest path (`AT_FDCWD` → the
-task's canonical cwd string, which is tracked independently of the host cwd). That
-string starts at `/` — or, via `-w/--work-dir dir`, at any existing guest directory
-(resolved with `path_resolve`, so `--bind` and symlinks apply); `chdir`/`fchdir`
-update it thereafter.
+`*at` syscalls resolve `dirfd` via the fd's recorded guest path — the kernel's
+own `/proc/self/fd/N` link, mapped to the guest view through the bind and
+rootfs tables (`dirfd_guest_path`). `AT_FDCWD` is answered the same way: **the
+host process's cwd is the guest's** (`cwd_current`, `path.c`). A kernel's cwd
+is an inode, not a name — rename the directory a process sits in and its
+relative paths keep resolving while `getcwd()` reports the new name; unlink it
+and `getcwd()` is `ENOENT`, the names in it are gone, `.` is still the inode and
+`..` still climbs out — and the canonical cwd *string* this used to keep
+(`m->cwd`) lied about all of that once another process renamed or removed the
+directory. So `chdir` opens its pinned target `O_PATH` and `fchdir`s the host,
+`fchdir` is the host's, fork and `execve` carry the cwd as the kernel carries
+it, and every relative resolution starts from the `getcwd` syscall's answer
+(half a microsecond, which is why it is not the `/proc/self/cwd` link) mapped
+to the guest view. `m->cwd` survives as the published copy (the PID registry,
+the `/proc/<pid>/cwd` links), refreshed whenever the answer changes. An
+unlinked cwd is `ENOENT` from `getcwd`, flagged for the walk — the names in it
+answer `ENOENT` whatever a directory created at the old path holds by now, `.`
+pins as the host's own `AT_FDCWD` (the inode the name no longer reaches), `..`
+climbs to the parent's *current* path, read off an `O_PATH` descriptor of it —
+and named `(deleted)` by the `/proc/self/cwd` link (`tests/c/cwdinode.c`, with
+qemu doing real `chdir`s as the oracle). The guest starts at `/`, or where the
+host was launched if that lies inside the rootfs, or at `-w/--work-dir dir`
+(resolved with `path_resolve`, so `--bind` and symlinks apply), and the host
+moves there at startup: nothing of the emulator's own depends on where it was
+launched from, every host path it uses being absolute by then.
 
 **`--bind src:dst[:ro]` mounts** are matched first, before the special zones and
 the rootfs prefix: a resolved guest path at or under `dst` maps to `src +
