@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <linux/netlink.h>
@@ -78,6 +79,21 @@ void netlink_locks_reinit(void) { pthread_mutex_init(&nl_lock, NULL); }
 
 /* --- fake-fd table (call with nl_lock held) --- */
 
+/* The state of one substituted socket. Every fd that names the socket -- the
+ * one socket() handed out and any dup of it -- points at the same NlSock,
+ * because the reply pending on a socket, and its readiness, belong to the
+ * socket and not to one of its names: a request sent through one name is
+ * read back through another exactly as on a real netlink socket. Freed with
+ * its last name. A fork child gets its own copy along with the heap. */
+struct NlSock {
+    int refs;             /* entries of m->nl_fds naming this socket */
+    uint8_t *reply;       /* pending reply buffer (malloc'd), or NULL */
+    size_t reply_len;     /* valid bytes in reply awaiting recv */
+    size_t reply_off;     /* how much of it the guest has taken */
+    uint8_t ready;        /* socket is self-connected: readiness works */
+    uint8_t armed;        /* datagrams of ours sit in its queue right now */
+};
+
 static int nl_slot(struct Machine *m, int fd)
 {
     if (fd < 0)
@@ -86,6 +102,12 @@ static int nl_slot(struct Machine *m, int fd)
         if (m->nl_fds[i].fd == fd)
             return i;
     return -1;
+}
+
+/* The socket behind slot @i, or NULL for no slot. */
+static struct NlSock *nl_sock(struct Machine *m, int i)
+{
+    return i < 0 ? NULL : m->nl_fds[i].sock;
 }
 
 bool nl_is_fd(struct Machine *m, int fd)
@@ -145,20 +167,24 @@ static size_t nl_datagram_len(const uint8_t *reply, size_t len)
  * length, or 0 when that socket has nothing pending. Caller holds nl_lock. */
 static size_t nl_pending_datagram(struct Machine *m, int i, const uint8_t **reply)
 {
-    if (i < 0 || m->nl_fds[i].reply_len == 0)
+    struct NlSock *sk = nl_sock(m, i);
+
+    if (!sk || sk->reply_len == 0)
         return 0;
-    *reply = m->nl_fds[i].reply + m->nl_fds[i].reply_off;
-    return nl_datagram_len(*reply, m->nl_fds[i].reply_len - m->nl_fds[i].reply_off);
+    *reply = sk->reply + sk->reply_off;
+    return nl_datagram_len(*reply, sk->reply_len - sk->reply_off);
 }
 
 /* Drop the datagram just delivered; a datagram socket discards whatever didn't
  * fit in the caller's buffer, so it is consumed whole. Caller holds nl_lock. */
 static void nl_consume_datagram(struct Machine *m, int i, size_t datagram)
 {
-    m->nl_fds[i].reply_off += datagram;
-    if (m->nl_fds[i].reply_off >= m->nl_fds[i].reply_len) {
-        m->nl_fds[i].reply_len = 0;
-        m->nl_fds[i].reply_off = 0;
+    struct NlSock *sk = m->nl_fds[i].sock;
+
+    sk->reply_off += datagram;
+    if (sk->reply_off >= sk->reply_len) {
+        sk->reply_len = 0;
+        sk->reply_off = 0;
     }
 }
 
@@ -172,8 +198,7 @@ static void nl_consume_datagram(struct Machine *m, int i, size_t datagram)
  *
  * What is posted is the reply itself, split into the same datagrams the guest
  * will be handed, rather than a readiness token: it stays harmless -- correct,
- * even -- if a receive ever reaches the socket instead of the emulation,
- * through a dup of the fd say, which nothing tracks. */
+ * even -- if a receive ever reaches the socket instead of the emulation. */
 
 /* Connect @fd to itself so a send on it is a send to itself: autobind for a
  * name (an abstract one, invisible in the filesystem), then connect to it. The
@@ -203,43 +228,79 @@ static bool nl_selfconnect(int fd)
  * not go through the queue either way. Caller holds nl_lock. */
 static void nl_sync_ready(struct Machine *m, int i)
 {
+    struct NlSock *sk = m->nl_fds[i].sock;
+    int fd = m->nl_fds[i].fd;   /* any name of the socket reaches its queue */
     uint8_t drop[64];
     size_t off;
 
-    if (!m->nl_fds[i].ready)
+    if (!sk->ready)
         return;
-    if (m->nl_fds[i].armed) {
-        while (recv(m->nl_fds[i].fd, drop, sizeof drop, MSG_DONTWAIT) >= 0)
+    if (sk->armed) {
+        while (recv(fd, drop, sizeof drop, MSG_DONTWAIT) >= 0)
             ;
-        m->nl_fds[i].armed = 0;
+        sk->armed = 0;
     }
-    off = m->nl_fds[i].reply_off;
-    while (off < m->nl_fds[i].reply_len) {
-        const uint8_t *at = m->nl_fds[i].reply + off;
-        size_t dg = nl_datagram_len(at, m->nl_fds[i].reply_len - off);
+    off = sk->reply_off;
+    while (off < sk->reply_len) {
+        const uint8_t *at = sk->reply + off;
+        size_t dg = nl_datagram_len(at, sk->reply_len - off);
 
-        if (send(m->nl_fds[i].fd, at, dg, MSG_DONTWAIT | MSG_NOSIGNAL) != (ssize_t) dg)
+        if (send(fd, at, dg, MSG_DONTWAIT | MSG_NOSIGNAL) != (ssize_t) dg)
             break;
-        m->nl_fds[i].armed = 1;
+        sk->armed = 1;
         off += dg;
     }
 }
 
-void nl_mark_fd(struct Machine *m, int fd)
+/* Add a name for @sk to the table. Caller holds nl_lock. 0 or -ENOMEM. */
+static int nl_add_name(struct Machine *m, int fd, struct NlSock *sk)
 {
-    bool ready = fd >= 0 && nl_selfconnect(fd);
+    struct NlFd *t = fd_table_room(m->nl_fds, m->nl_fds_count, &m->nl_fds_cap,
+                                   sizeof *t);
+    if (!t)
+        return -ENOMEM;
+    m->nl_fds = t;
+    t[m->nl_fds_count].fd = fd;
+    t[m->nl_fds_count].sock = sk;
+    m->nl_fds_count++;
+    sk->refs++;
+    return 0;
+}
 
-    EMU_LOCK(&nl_lock, EMU_LK_NL);
-    if (fd >= 0 && nl_slot(m, fd) < 0 && m->nl_fds_count < NL_MAX_FDS) {
-        m->nl_fds[m->nl_fds_count].fd = fd;
-        m->nl_fds[m->nl_fds_count].reply = NULL;
-        m->nl_fds[m->nl_fds_count].reply_len = 0;
-        m->nl_fds[m->nl_fds_count].reply_off = 0;
-        m->nl_fds[m->nl_fds_count].ready = ready;
-        m->nl_fds[m->nl_fds_count].armed = 0;
-        m->nl_fds_count++;
+/* Drop the name in slot @i; the socket's state goes with its last name (a
+ * dup still holds it). Caller holds nl_lock. */
+static void nl_drop_name(struct Machine *m, int i)
+{
+    struct NlSock *sk = m->nl_fds[i].sock;
+
+    m->nl_fds[i] = m->nl_fds[--m->nl_fds_count];
+    if (--sk->refs == 0) {
+        free(sk->reply);
+        free(sk);
     }
+}
+
+int nl_mark_fd(struct Machine *m, int fd)
+{
+    struct NlSock *sk;
+    int r;
+
+    if (fd < 0)
+        return -EBADF;
+    sk = calloc(1, sizeof *sk);
+    if (!sk)
+        return -ENOMEM;
+    sk->ready = nl_selfconnect(fd);
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
+    /* The number is fresh from socket(2), so an entry under it is stale. */
+    int i = nl_slot(m, fd);
+    if (i >= 0)
+        nl_drop_name(m, i);
+    r = nl_add_name(m, fd, sk);
     EMU_UNLOCK(&nl_lock, EMU_LK_NL);
+    if (r < 0)
+        free(sk);
+    return r;
 }
 
 /* A fork child keeps its parent's substituted sockets -- they are its fds too --
@@ -252,9 +313,66 @@ void nl_mark_fd(struct Machine *m, int fd)
 void nl_fork_child(struct Machine *m)
 {
     for (int i = 0; i < m->nl_fds_count; i++) {
-        m->nl_fds[i].reply_len = 0;
-        m->nl_fds[i].reply_off = 0;
+        m->nl_fds[i].sock->reply_len = 0;
+        m->nl_fds[i].sock->reply_off = 0;
     }
+}
+
+/* Is @fd in the real-NETLINK_ROUTE table? Caller holds nl_lock. */
+static int nlr_slot(struct Machine *m, int fd)
+{
+    for (int j = 0; j < m->nlr_fds_count; j++)
+        if (m->nlr_fds[j] == fd)
+            return j;
+    return -1;
+}
+
+/* Add @fd to the real-NETLINK_ROUTE table. Caller holds nl_lock. 0 or -ENOMEM. */
+static int nlr_add(struct Machine *m, int fd)
+{
+    int *t = fd_table_room(m->nlr_fds, m->nlr_fds_count, &m->nlr_fds_cap,
+                           sizeof *t);
+    if (!t)
+        return -ENOMEM;
+    m->nlr_fds = t;
+    t[m->nlr_fds_count++] = fd;
+    return 0;
+}
+
+/* Do two names name the same socket? A socket's inode is its own (sockfs
+ * gives every socket one), so two descriptors reporting it are dups of each
+ * other. Cold: asked only about an fd a noted ack is pending on. */
+static bool nl_same_socket(int a, int b)
+{
+    struct stat sa, sb;
+
+    if (a == b)
+        return true;
+    if (a < 0 || b < 0 || fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
+        return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* A second name for whatever @oldfd is (dup, F_DUPFD, dup3). A substituted
+ * socket's new name shares its NlSock; a real NETLINK_ROUTE socket's joins the
+ * table the ack rewrite consults. 0, or -ENOMEM when a table could not grow
+ * -- the caller then withholds the name (sys.h, fd_track_dup). */
+int nl_track_dup(struct Machine *m, int oldfd, int newfd)
+{
+    int r = 0;
+
+    /* Unlocked fast path (see nl_is_fd): every dup passes here. */
+    if ((!m->nl_fds_count && !m->nlr_fds_count) || oldfd < 0 || newfd < 0 ||
+        oldfd == newfd)
+        return 0;
+    EMU_LOCK(&nl_lock, EMU_LK_NL);
+    int i = nl_slot(m, oldfd);
+    if (i >= 0 && nl_slot(m, newfd) < 0)
+        r = nl_add_name(m, newfd, m->nl_fds[i].sock);
+    if (r == 0 && nlr_slot(m, oldfd) >= 0 && nlr_slot(m, newfd) < 0)
+        r = nlr_add(m, newfd);
+    EMU_UNLOCK(&nl_lock, EMU_LK_NL);
+    return r;
 }
 
 void nl_unmark_fd(struct Machine *m, int fd)
@@ -264,20 +382,27 @@ void nl_unmark_fd(struct Machine *m, int fd)
         return;
     EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(m, fd);
-    if (i >= 0) {
-        free(m->nl_fds[i].reply);
-        m->nl_fds[i] = m->nl_fds[--m->nl_fds_count];
-    }
+    if (i >= 0)
+        nl_drop_name(m, i);
     /* Same for the real-NETLINK_ROUTE table: an fd number outliving its socket
      * there would make us inspect an unrelated file's traffic. */
-    for (int j = 0; j < m->nlr_fds_count; j++) {
-        if (m->nlr_fds[j] == fd) {
-            m->nlr_fds[j] = m->nlr_fds[--m->nlr_fds_count];
-            break;
-        }
-    }
-    if (m->nl_ack_pending && m->nl_ack_fd == fd)
+    int j = nlr_slot(m, fd);
+    if (j >= 0)
+        m->nlr_fds[j] = m->nlr_fds[--m->nlr_fds_count];
+    /* A noted ack belongs to the socket: when the name it was noted under
+     * closes, another name of the same socket -- a dup -- inherits the note,
+     * and only the socket's last name takes it away. The closing descriptor
+     * is still open here (close(2) unmarks first), so it can still be
+     * compared. */
+    if (m->nl_ack_pending && m->nl_ack_fd == fd) {
         m->nl_ack_pending = 0;
+        for (int k = 0; k < m->nlr_fds_count; k++)
+            if (nl_same_socket(m->nlr_fds[k], fd)) {
+                m->nl_ack_fd = m->nlr_fds[k];
+                m->nl_ack_pending = 1;
+                break;
+            }
+    }
     EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
@@ -311,17 +436,17 @@ static bool nlr_is_netns_fd(struct Machine *m, int fd)
     return false;
 }
 
-void nlr_mark_fd(struct Machine *m, int fd)
+int nlr_mark_fd(struct Machine *m, int fd)
 {
+    int r = 0;
+
+    if (fd < 0)
+        return -EBADF;
     EMU_LOCK(&nl_lock, EMU_LK_NL);
-    if (fd >= 0 && m->nlr_fds_count < NLR_MAX_FDS) {
-        bool present = false;
-        for (int i = 0; i < m->nlr_fds_count; i++)
-            if (m->nlr_fds[i] == fd) { present = true; break; }
-        if (!present)
-            m->nlr_fds[m->nlr_fds_count++] = fd;
-    }
+    if (nlr_slot(m, fd) < 0)
+        r = nlr_add(m, fd);
     EMU_UNLOCK(&nl_lock, EMU_LK_NL);
+    return r;
 }
 
 void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
@@ -358,7 +483,9 @@ int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
     if (!m->nl_ack_pending)
         return 0;
     EMU_LOCK(&nl_lock, EMU_LK_NL);
-    if (!m->nl_ack_pending || m->nl_ack_fd != fd) {
+    /* The note is the socket's, so a reply read through a dup of the noted
+     * name is the reply it awaits too (nl_same_socket: cold, an fstat each). */
+    if (!m->nl_ack_pending || !nl_same_socket(fd, m->nl_ack_fd)) {
         EMU_UNLOCK(&nl_lock, EMU_LK_NL);
         return 0;
     }
@@ -1299,17 +1426,17 @@ static u64 nl_take_request(CPU *c, int fd, const GIovec *gi, unsigned cnt,
     EMU_LOCK(&nl_lock, EMU_LK_NL);
     int i = nl_slot(c->m, fd);
     if (i < 0) { EMU_UNLOCK(&nl_lock, EMU_LK_NL); return (u64)(s64)-EBADF; }
-    if (!c->m->nl_fds[i].reply)
-        c->m->nl_fds[i].reply = malloc(NL_REPLY_MAX);
-    if (!c->m->nl_fds[i].reply) {
+    struct NlSock *sk = c->m->nl_fds[i].sock;
+    if (!sk->reply)
+        sk->reply = malloc(NL_REPLY_MAX);
+    if (!sk->reply) {
         /* Refuse the send rather than swallow it: a request with no reply
          * behind it leaves the read that follows waiting forever. */
         EMU_UNLOCK(&nl_lock, EMU_LK_NL);
         return (u64)(s64)-ENOBUFS;
     }
-    c->m->nl_fds[i].reply_off = 0;
-    c->m->nl_fds[i].reply_len =
-        build_reply_into(c->m->nl_fds[i].reply, NL_REPLY_MAX, head, headlen);
+    sk->reply_off = 0;
+    sk->reply_len = build_reply_into(sk->reply, NL_REPLY_MAX, head, headlen);
     /* The reply is ready now, so the socket must read as readable now: a caller
      * that waits for POLLIN before receiving is the common shape. */
     nl_sync_ready(c->m, i);

@@ -234,27 +234,27 @@ struct Machine {
      * A reply belongs to the socket, not to the process: a guest walking a
      * route dump on one netlink socket answers the interface lookups it makes
      * along the way on a second. It is handed back one datagram at a time
-     * (`reply_off` is how far the guest has read), because that is how the
-     * kernel delivers a dump — and a caller that stops walking a datagram early
-     * then reads on for the NLMSG_DONE would never reach it otherwise.
+     * (the socket's `reply_off` is how far the guest has read), because that
+     * is how the kernel delivers a dump — and a caller that stops walking a
+     * datagram early then reads on for the NLMSG_DONE would never reach it
+     * otherwise.
      *
      * The stand-in also carries *readiness*: a synthesised reply lives in the
      * emulator, where poll/select/epoll cannot see it, so the datagrams still
      * pending are posted into the socket's own queue and drained again as the
      * guest consumes them. That needs the socket connected to itself, which an
-     * AF_UNIX datagram socket permits; `ready` records whether that succeeded
-     * (it is the whole mechanism, and a host that refuses it just loses
-     * readiness reporting). */
-#define NL_MAX_FDS 32
-    struct {
-        int fd;
-        u8 *reply;            /* pending reply buffer (malloc'd), or NULL */
-        size_t reply_len;     /* valid bytes in reply awaiting recv */
-        size_t reply_off;     /* how much of it the guest has taken */
-        u8 ready;             /* socket is self-connected: readiness works */
-        u8 armed;             /* datagrams of ours sit in its queue right now */
-    } nl_fds[NL_MAX_FDS];
-    int nl_fds_count;
+     * AF_UNIX datagram socket permits; the socket's `ready` records whether
+     * that succeeded (it is the whole mechanism, and a host that refuses it
+     * just loses readiness reporting).
+     *
+     * One entry per *fd*, naming the socket's state: dup(2) gives a socket a
+     * second name, and the reply pending on it -- like its readiness -- is the
+     * socket's, so both names must reach the same NlSock (refcounted, freed
+     * with its last name). The table is malloc'd and grows as needed, so a
+     * name is never left untracked for want of a slot -- an untracked name
+     * would send a request to the AF_UNIX stand-in itself. */
+    struct NlFd { int fd; struct NlSock *sock; } *nl_fds;
+    int nl_fds_count, nl_fds_cap;
 
     /* Faked network namespace. A guest that asked for one (clone/unshare with
      * CLONE_NEWNET) keeps talking to the host's namespace, where it has no
@@ -268,9 +268,9 @@ struct Machine {
      * error field of the matching reply is zeroed as it is received
      * (sys_netlink.c). Inherited by fork children like the fds themselves. */
     u8 fake_netns;            /* this process asked for a net namespace */
-#define NLR_MAX_FDS 8
-    int nlr_fds[NLR_MAX_FDS]; /* real NETLINK_ROUTE fds held by this process */
-    int nlr_fds_count;
+    int *nlr_fds;             /* real NETLINK_ROUTE fds held by this process
+                               * (dup names included), malloc'd and grown */
+    int nlr_fds_count, nlr_fds_cap;
     u8 nl_ack_pending;        /* a noted request awaits its reply */
     int nl_ack_fd;            /* the socket it was sent on */
     u32 nl_ack_seq;           /* its nlmsg_seq, matched in the reply */
@@ -324,10 +324,12 @@ struct Machine {
      * kernel gives every anon_inode file the same inode, so an eventfd, a
      * second eventfd and a timerfd all report the identical st_ino. `ino` is
      * kept only as a weak "this fd number was reused behind our back" check
-     * (it still catches reuse by a regular file, socket or pipe). */
-#define SFD_MAX_FDS 8
-    struct { int fd; u64 mask; u64 ino; u64 id; u8 armed; } sfd_fds[SFD_MAX_FDS];
-    int sfd_fds_count;
+     * (it still catches reuse by a regular file, socket or pipe).
+     *
+     * Malloc'd and grown as needed (fork copies it with the heap): a name that
+     * found no slot would be a signalfd read as the bare eventfd under it. */
+    struct SfdFd { int fd; u64 mask; u64 ino; u64 id; u8 armed; } *sfd_fds;
+    int sfd_fds_count, sfd_fds_cap;
     u64 sfd_mask;             /* union of the masks above: sig_host_update
                                * forces the capture handler on for these, or a
                                * SIG_DFL signal would never be queued at all
@@ -341,9 +343,11 @@ struct Machine {
      * too, so a re-read shows what was written, and so is per-process status,
      * whose rewritten lines (TracerPid, Seccomp, the signal masks) change over
      * a process's life. Shared across guest threads, copied on fork — like the
-     * host fds. */
-#define PF_MAX_FDS 8
-    struct {
+     * host fds. One entry per *fd*: dup(2) adds a second name for the same
+     * memfd, and a write through it must reach the namespace state exactly as
+     * one through the original does. Malloc'd and grown as needed, so no name
+     * is left untracked for want of a slot. */
+    struct PfFd {
         int fd;
         u8 kind;              /* PF_* kind (sys_procfs.c) */
         u8 self;              /* PF_STATUS: the file describes this Machine */
@@ -354,8 +358,8 @@ struct Machine {
                                * repeats across filesystems, and a match on a
                                * recycled number would aim the refresh's
                                * ftruncate at whatever file opened next. */
-    } pf_fds[PF_MAX_FDS];
-    int pf_fds_count;
+    } *pf_fds;
+    int pf_fds_count, pf_fds_cap;
 
     /* System V shared-memory attachments held by this process (shmat). The
      * segments themselves live in the IPC broker daemon (proctab.c); this is

@@ -919,11 +919,35 @@ SYSDEF(openat) {
     return fd < 0 ? host_err() : (u64)fd;
 }
 
+/* The two routes by which a descriptor NUMBER starts or stops naming a
+ * description, for the classes tracked by number (sys.h). Every dup site
+ * goes through the first, every close site through the second: a class left
+ * out of one of them is an untracked name, which is the bug both exist to
+ * make impossible. The name is withheld from the guest when a table could not
+ * take it (dup and F_DUPFD close it and answer -ENOMEM; dup3 has already
+ * replaced newfd by then and closes it too -- an honest failure, where the
+ * alternative was a descriptor the emulator would silently misserve). */
+int fd_track_dup(struct Machine *m, int oldfd, int newfd) {
+    int r;
+    if ((r = sigfd_track_dup(m, oldfd, newfd)) < 0 ||
+        (r = procfs_track_dup(m, oldfd, newfd)) < 0 ||
+        (r = nl_track_dup(m, oldfd, newfd)) < 0) {
+        fd_track_close(m, newfd);   /* whatever a class before it recorded */
+        return r;
+    }
+    mfd_track_dup(oldfd, newfd);
+    return 0;
+}
+
+void fd_track_close(struct Machine *m, int fd) {
+    nl_unmark_fd(m, fd);
+    procfs_unmark_fd(m, fd);
+    sigfd_unmark_fd(m, fd);
+    mfd_track_close(fd);
+}
+
 SYSDEF(close) {
-    nl_unmark_fd(c->m, (int)a0);   /* drop any fake-netlink bookkeeping for this fd */
-    procfs_unmark_fd(c->m, (int)a0);
-    sigfd_unmark_fd(c->m, (int)a0);
-    mfd_track_close((int)a0);
+    fd_track_close(c->m, (int)a0);   /* whatever bookkeeping this number carried */
     return close((int)a0) < 0 ? host_err() : 0;
 }
 
@@ -2054,8 +2078,10 @@ SYSDEF(fcntl) {
                 return (u64)(s64)-EINVAL;
             int r = fcntl(fd, cmd, (int)a2);
             if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
-            if (r >= 0) { sigfd_track_dup(c->m, fd, r); mfd_track_dup(fd, r); }
-            return r < 0 ? host_err() : (u64)r;         /* as dup(2) above */
+            if (r < 0) return host_err();
+            int t = fd_track_dup(c->m, fd, r);          /* as dup(2) above */
+            if (t < 0) { close(r); return (u64)(s64)t; }
+            return (u64)r;
         }
         case 1033: case 1034: {   /* F_ADD_SEALS / F_GET_SEALS: a tier memfd's
                                    * seals live in the broker registry, not on
@@ -2208,8 +2234,10 @@ SYSDEF(fcntl) {
 SYSDEF(dup) {
     int r = dup((int)a0);
     if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
-    if (r >= 0) { sigfd_track_dup(c->m, (int)a0, r); mfd_track_dup((int)a0, r); }
-    return r < 0 ? host_err() : (u64)r;             /* a signalfd's second name */
+    if (r < 0) return host_err();
+    int t = fd_track_dup(c->m, (int)a0, r);   /* a second name for what a0 is */
+    if (t < 0) { close(r); return (u64)(s64)t; }
+    return (u64)r;
 }
 
 SYSDEF(dup3) {
@@ -2238,12 +2266,9 @@ SYSDEF(dup3) {
      * that race; the signalfd, /proc and memfd classes re-check the
      * descriptor's identity on use besides. Then the new name is tracked as a
      * second name for whatever oldfd is, as dup(2) does. */
-    sigfd_unmark_fd(c->m, newfd);
-    procfs_unmark_fd(c->m, newfd);
-    nl_unmark_fd(c->m, newfd);
-    mfd_track_close(newfd);
-    sigfd_track_dup(c->m, oldfd, newfd);
-    mfd_track_dup(oldfd, newfd);
+    fd_track_close(c->m, newfd);
+    int t = fd_track_dup(c->m, oldfd, newfd);
+    if (t < 0) { close(newfd); return (u64)(s64)t; }
     return (u64)r;
 }
 

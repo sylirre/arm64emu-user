@@ -943,11 +943,26 @@ go wrong:
   tracked incrementally, so it cannot drift. What gets posted is the reply
   itself, in the same datagrams the guest will be handed, rather than a
   readiness token: it stays harmless — correct, even — should a receive ever
-  reach the socket instead of the emulation, through a `dup` of the fd say. The self-connection is set up once
+  reach the socket instead of the emulation. The self-connection is set up once
   in `socket()` and is best-effort: a host that refuses it loses only readiness
   reporting, never delivery. It also means the guest's own `bind`/`connect` on
   such a socket are answered without touching it — they would otherwise fail on
   a `sockaddr_nl`, and `connect` would re-point the self-connection.
+
+  A second name for the socket — `dup`, `fcntl(F_DUPFD)`, `dup3` — is the
+  socket: the table is one entry per *fd*, and every entry naming the same
+  socket points at one refcounted `NlSock` (the pending reply, its offset,
+  the readiness state), freed with its last name. A request sent through one
+  name is read back through another, readiness reaches both, and closing the
+  original leaves the copy whole. The real-`NETLINK_ROUTE` table the ack
+  rewrite consults learns the copy too, and the noted ack follows the socket
+  rather than the name it was asked through (compared by socket inode, cold).
+  An untracked copy sent its request to the AF_UNIX stand-in itself — which
+  refused the `sockaddr_nl` — and on a real socket went unnoted, so the
+  kernel's refusal came back where the faked namespace was owed its ack
+  (`tests/fixtures/netns_ack.c`, `dup=`). Both tables grow as needed; a
+  stand-in that could not be tracked is closed and the `socket()` refused
+  with `ENOMEM`, since an untracked stand-in is a bare AF_UNIX socket.
 - **The host grants netlink, but the guest has no `CAP_NET_ADMIN` in it.**
   Namespace creation is impossible here, so `clone(CLONE_NEW*)` silently drops
   the flags and `unshare`/`setns` return 0 without doing anything — sandbox
@@ -1098,15 +1113,22 @@ then make the consequences the caller depends on true:
   if it cannot. The time-varying files (`loadavg`/`uptime`/`stat`) are
   regenerated when a read starts at offset 0: procps opens them once and
   `lseek(0)`+rereads every refresh cycle, so an open-time snapshot would
-  freeze `top`. That needs the descriptor in a small per-process table
-  (`PF_MAX_FDS`), whose rows are dropped when the guest closes or `dup2`s over
-  the fd — and by an identity check, on **device and inode**, for the closes
-  the table cannot see (`execve`'s CLOEXEC sweep). An open the guest's
+  freeze `top`. That needs the descriptor in a per-process table keyed by fd
+  number (`pf_fds`, grown as needed), whose rows are dropped when the guest
+  closes or `dup2`s over the fd — and by an identity check, on **device and
+  inode**, for the closes the table cannot see (`execve`'s CLOEXEC sweep) —
+  and *copied* when the guest `dup`s the fd (`procfs_track_dup`, reached from
+  `fd_track_dup` like every other class tracked by number): the two names
+  share one open file, so a rewind through either refreshes for both, and a
+  write of an id map through the copy reaches the namespace state exactly as
+  one through the original does rather than the backing memfd, which is what
+  an untracked copy did (`tests/fixtures/sandbox_probe.c` writes `uid_map`
+  through an `F_DUPFD` copy with the original closed). An open the guest's
   `RLIMIT_NOFILE` refuses *after* the view was built drops its row before
   closing the descriptor, in that order: once the number is closed it is
   anyone's, and a row left behind would aim the next refresh's `ftruncate` at
-  whatever opened next — while eight of them fill the table, after which no
-  view is tracked at all and every one of them freezes
+  whatever opened next — and when the table held eight rows, that many of
+  them stopped every later view from being tracked at all
   (`tests/c/procfsrefresh.c`). The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
   for every guest process. `status` is rebuilt line by line instead

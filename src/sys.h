@@ -133,6 +133,38 @@ static inline int fd_pair_within_limit(CPU *c, int a, int b) {
 int a64_anonfd(const char *name);
 int a64_mfdfile(int cloexec);
 
+/* ---- descriptors the emulator tracks by NUMBER ---------------------------
+ * Four classes of fd are served, in whole or in part, from emulator state
+ * rather than from the host object under them: a signalfd (sys_sig.c), a
+ * written-through or time-varying synthesized /proc file (sys_procfs.c), a
+ * substituted netlink socket (sys_netlink.c), and a fallback-tier memfd
+ * (sys_misc.c). Each keeps a per-process table keyed by fd number, and every
+ * route by which a NUMBER comes to name a description, or stops naming one,
+ * has to tell all four: an untracked second name reaches the bare host object
+ * (a signalfd's eventfd, an id map's backing memfd, the AF_UNIX stand-in). The
+ * two helpers below (sys_file.c) are those routes' single point of contact.
+ *
+ * fd_track_dup: newfd is now a second name for oldfd's description (dup,
+ * fcntl F_DUPFD, a successful dup3). Returns 0, or -ENOMEM when a table could
+ * not grow to hold the name -- in which case the caller must not hand newfd
+ * to the guest, since it would be one of the untracked names above.
+ * fd_track_close: fd no longer names what it did (close, dup3's replacement,
+ * execve's close-on-exec walk). */
+int  fd_track_dup(struct Machine *m, int oldfd, int newfd);
+void fd_track_close(struct Machine *m, int fd);
+
+/* Room for one more entry in one of those tables -- malloc'd arrays of `esz`-
+ * byte entries that fork copies with the heap -- doubling it when full.
+ * Returns the (possibly moved) table, or NULL with the old one intact when
+ * the host is out of memory. Caller holds the table's lock. */
+static inline void *fd_table_room(void *tab, int count, int *cap, size_t esz) {
+    if (count < *cap) return tab;
+    int ncap = *cap ? *cap * 2 : 8;
+    void *n = realloc(tab, (size_t)ncap * esz);
+    if (n) *cap = ncap;
+    return n;
+}
+
 /* ---- memfd_create fallback tier (sys_misc.c) ----------------------------
  * Client side of the broker seal registry: a per-process fd classification
  * cache plus the seal policy the host kernel cannot apply. The cache's only
@@ -374,6 +406,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
 void procfs_pre_read(CPU *c, int fd, s64 off);
 /* Drop refresh tracking for a closing fd. */
 void procfs_unmark_fd(struct Machine *m, int fd);
+/* newfd is a second name for oldfd's file (fd_track_dup): a written-through
+ * id-map file has to be recognised under it too. 0 or -ENOMEM. */
+int  procfs_track_dup(struct Machine *m, int oldfd, int newfd);
 /* A write to a synthesized /proc file that accepts one (the id maps of a faked
  * user namespace). Returns 1 with *ret set to the guest return value when it
  * consumed the write, 0 for an ordinary fd. */
@@ -395,7 +430,7 @@ int sigfd_tracked(struct Machine *m, int fd);
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
 void sigfd_sync(struct Machine *m);
 void sigfd_unmark_fd(struct Machine *m, int fd);
-void sigfd_track_dup(struct Machine *m, int oldfd, int newfd);
+int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM */
 
 /* sys_seccomp.c: guest seccomp-BPF. seccomp_gate runs the installed filters
  * for one guest syscall; it returns 1 when the call must not run (with *ret as

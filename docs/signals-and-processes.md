@@ -207,7 +207,12 @@ Two consequences worth knowing:
   register the copy too, so the counter is armed once no matter how many names
   it has. Without that a read on the duplicate reached the bare eventfd, which
   carries readiness rather than signals and is not even armed — the guest simply
-  blocked forever.
+  blocked forever. Every class the emulator tracks by fd number has the same
+  need, so the dup sites go through one hook, `fd_track_dup` (`sys.h`), and the
+  close sites — `close`, `dup3`'s replacement, `execve`'s close-on-exec walk —
+  through `fd_track_close`. The table grows as needed; a copy that could not
+  be recorded is withheld from the guest with `ENOMEM` rather than handed out
+  as the bare eventfd.
 
   Which entries name the *same* description is decided by an id handed out at
   creation, **not** by the eventfd's inode: the kernel gives every `anon_inode`

@@ -458,16 +458,24 @@ void sigfd_sync(struct Machine *m) {
  * copy has to be tracked too, or read(2) on it would reach the bare eventfd --
  * which carries readiness, not signals, and is not even armed unless something
  * synced it, so the guest simply blocked forever. */
-void sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
-    if (!m->sfd_fds_count || oldfd == newfd) return;   /* unlocked fast path */
+int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
+    if (!m->sfd_fds_count || oldfd == newfd) return 0;   /* unlocked fast path */
+    int r = 0;
     EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     int i = sfd_slot(m, oldfd);
-    if (i >= 0 && m->sfd_fds_count < SFD_MAX_FDS) {
-        m->sfd_fds[m->sfd_fds_count] = m->sfd_fds[i];
-        m->sfd_fds[m->sfd_fds_count].fd = newfd;
-        m->sfd_fds_count++;
+    if (i >= 0) {
+        struct SfdFd *t = fd_table_room(m->sfd_fds, m->sfd_fds_count,
+                                        &m->sfd_fds_cap, sizeof *t);
+        if (!t) r = -ENOMEM;   /* the caller withholds the name (sys.h) */
+        else {
+            m->sfd_fds = t;
+            t[m->sfd_fds_count] = t[i];
+            t[m->sfd_fds_count].fd = newfd;
+            m->sfd_fds_count++;
+        }
     }
     EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
+    return r;
 }
 
 /* read(2) on a signalfd: fill `out` with as many signalfd_siginfo records as
@@ -535,11 +543,14 @@ SYSDEF(signalfd4) {
     struct stat st;
     if (fstat(nfd, &st) != 0) { u64 e = host_err(); close(nfd); return e; }
     EMU_LOCK(&sfd_lock, EMU_LK_SFD);
-    if (m->sfd_fds_count >= SFD_MAX_FDS) {
+    struct SfdFd *t = fd_table_room(m->sfd_fds, m->sfd_fds_count,
+                                    &m->sfd_fds_cap, sizeof *t);
+    if (!t) {
         EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
         close(nfd);
-        return (u64)(s64)-EMFILE;   /* table full: better than a silent lie */
+        return (u64)(s64)-ENOMEM;   /* no room to track it: better than a silent lie */
     }
+    m->sfd_fds = t;
     m->sfd_fds[m->sfd_fds_count].fd = nfd;
     m->sfd_fds[m->sfd_fds_count].mask = mask;
     m->sfd_fds[m->sfd_fds_count].armed = 0;

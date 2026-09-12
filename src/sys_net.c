@@ -44,7 +44,8 @@ SYSDEF(socket) {
         int fd = socket(AF_UNIX, SOCK_DGRAM | (type & (SOCK_CLOEXEC | SOCK_NONBLOCK)), 0);
         if (fd < 0) return host_err();
         if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
-        nl_mark_fd(c->m, fd);
+        int r = nl_mark_fd(c->m, fd);
+        if (r < 0) { close(fd); return (u64)(s64)r; }   /* untracked = a bare AF_UNIX socket */
         return (u64)fd;
     }
     int fd = socket(domain, type, protocol);
@@ -61,8 +62,10 @@ SYSDEF(socket) {
     if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     /* A real NETLINK_ROUTE socket still needs the ack emulation when the guest
      * believes it configures a network namespace of its own (sys_netlink.c). */
-    if (domain == AF_NETLINK && protocol == NETLINK_ROUTE)
-        nlr_mark_fd(c->m, fd);
+    if (domain == AF_NETLINK && protocol == NETLINK_ROUTE) {
+        int r = nlr_mark_fd(c->m, fd);
+        if (r < 0) { close(fd); return (u64)(s64)r; }
+    }
     return (u64)fd;
 }
 

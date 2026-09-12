@@ -747,23 +747,30 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
 
 /* Track an open fd of a time-varying file for refresh-on-rewind. The memfd
  * inode is recorded so a stale entry (fd number reused after a close this
- * table missed: dup2-onto, execve's CLOEXEC sweep) is detected and dropped
- * instead of clobbering an innocent file. Table full: the fd just keeps its
- * open-time snapshot. */
-static void pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
+ * table missed: execve's CLOEXEC sweep) is detected and dropped instead of
+ * clobbering an innocent file. Returns 0, or -ENOMEM when the table could not
+ * grow -- the caller then withholds the descriptor, since an untracked
+ * written-through file is a silent lie (its writes land in the memfd). */
+static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
     struct stat st;
-    if (fstat(fd, &st) != 0) return;
+    if (fstat(fd, &st) != 0) return -errno;
+    int r = 0;
     EMU_LOCK(&pf_lock, EMU_LK_PF);
-    if (m->pf_fds_count < PF_MAX_FDS) {
-        m->pf_fds[m->pf_fds_count].fd = fd;
-        m->pf_fds[m->pf_fds_count].kind = (u8)kind;
-        m->pf_fds[m->pf_fds_count].self = (u8)self;
-        m->pf_fds[m->pf_fds_count].pid = pid;
-        m->pf_fds[m->pf_fds_count].dev = (u64)st.st_dev;
-        m->pf_fds[m->pf_fds_count].ino = (u64)st.st_ino;
+    struct PfFd *t = fd_table_room(m->pf_fds, m->pf_fds_count, &m->pf_fds_cap,
+                                   sizeof *t);
+    if (!t) r = -ENOMEM;
+    else {
+        m->pf_fds = t;
+        t[m->pf_fds_count].fd = fd;
+        t[m->pf_fds_count].kind = (u8)kind;
+        t[m->pf_fds_count].self = (u8)self;
+        t[m->pf_fds_count].pid = pid;
+        t[m->pf_fds_count].dev = (u64)st.st_dev;
+        t[m->pf_fds_count].ino = (u64)st.st_ino;
         m->pf_fds_count++;
     }
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return r;
 }
 
 void procfs_unmark_fd(struct Machine *m, int fd) {
@@ -775,6 +782,40 @@ void procfs_unmark_fd(struct Machine *m, int fd) {
             break;
         }
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+}
+
+/* A second name for a tracked file (dup, F_DUPFD, dup3). The entry is copied
+ * whole: the two names share one open file description, so its identity, its
+ * kind and whose file it is are the same -- and so is its offset, which is
+ * what makes a rewind through either name refresh for both. A write of an id
+ * map through the copy then reaches the namespace state exactly as one
+ * through the original does, rather than the backing memfd. */
+int procfs_track_dup(struct Machine *m, int oldfd, int newfd) {
+    if (!m->pf_fds_count || oldfd == newfd) return 0;   /* unlocked fast path */
+    int r = 0;
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
+    int i;
+    for (i = 0; i < m->pf_fds_count; i++)
+        if (m->pf_fds[i].fd == oldfd) break;
+    if (i < m->pf_fds_count) {
+        struct stat st;   /* stale (the number was reused): drop, track nothing */
+        if (fstat(oldfd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
+            (u64)st.st_dev != m->pf_fds[i].dev) {
+            m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
+        } else {
+            struct PfFd *t = fd_table_room(m->pf_fds, m->pf_fds_count,
+                                           &m->pf_fds_cap, sizeof *t);
+            if (!t) r = -ENOMEM;
+            else {
+                m->pf_fds = t;
+                t[m->pf_fds_count] = t[i];
+                t[m->pf_fds_count].fd = newfd;
+                m->pf_fds_count++;
+            }
+        }
+    }
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return r;
 }
 
 void procfs_pre_read(CPU *c, int fd, s64 off) {
@@ -1594,7 +1635,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             put_idmap(fd, m, k, upid);
             lseek(fd, 0, SEEK_SET);
             if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-            pf_track(m, fd, k, upid, 0);   /* written through, and re-read after */
+            /* Written through, and re-read after: a descriptor this cannot
+             * track would take the write into the memfd and call it done. */
+            if (pf_track(m, fd, k, upid, 0) < 0) { close(fd); *ret = -ENOMEM; return 1; }
             *ret = fd;
             return 1;
         }
@@ -1778,9 +1821,16 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
-    if (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT ||
-        kind == PF_LIMITS || writable)
-        pf_track(m, fd, kind, 0, 1);   /* time-varying, or written through */
+    /* Time-varying, or written through. An untracked time-varying file just
+     * keeps its open-time snapshot; an untracked written-through one would
+     * take the write into the memfd and call it done, so that one is refused. */
+    if ((kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT ||
+         kind == PF_LIMITS || writable) &&
+        pf_track(m, fd, kind, 0, 1) < 0 && writable) {
+        close(fd);
+        *ret = -ENOMEM;
+        return 1;
+    }
     *ret = fd;
     return 1;
 }

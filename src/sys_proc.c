@@ -869,10 +869,7 @@ static void exec_close_cloexec(struct Machine *m) {
     }
     if (d) closedir(d);
     for (size_t i = 0; i < n; i++) {
-        nl_unmark_fd(m, cl[i]);
-        procfs_unmark_fd(m, cl[i]);
-        sigfd_unmark_fd(m, cl[i]);
-        mfd_track_close(cl[i]);
+        fd_track_close(m, cl[i]);
         close(cl[i]);
     }
     if (cl != stack) free(cl);

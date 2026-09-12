@@ -23,6 +23,7 @@
 #define _GNU_SOURCE   /* unshare(2), CLONE_NEWNET */
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sched.h>
@@ -668,6 +669,62 @@ static const char *plain_ack(int fd, unsigned seq, int vectored) {
     return ack_reply(fd, seq);
 }
 
+/* A second name for the socket IS the socket. dup(2), fcntl(F_DUPFD) and
+ * dup3(2) hand out one, and everything the socket carries -- the reply a
+ * request drew, the readiness that says so, the ack a faked namespace is owed
+ * -- belongs to the socket, not to the name it was asked through: a request
+ * sent through one name is read back through another, and closing the
+ * original leaves the copy whole. The emulator tracks both tiers by fd
+ * number, so each name has to be registered; an untracked one sent its
+ * request to the AF_UNIX stand-in itself (which refused a sockaddr_nl), and
+ * on a real socket went unnoted, so the kernel's refusal came back where the
+ * ack was owed. Every stage names itself on failure. */
+static const char *dup_names(int fd) {
+    static char out[64];
+    const char *r;
+    int d = dup(fd), ep;
+
+    if (d < 0) return "nodup";
+    /* Asked through the copy, answered through the original. */
+    if (!ask_ack(d, 1016)) { close(d); return "dup:sendfail"; }
+    r = ack_reply(fd, 1016);
+    if (strcmp(r, "ack") != 0) { snprintf(out, sizeof out, "dup:%s", r); close(d); return out; }
+    /* A dump asked through the original is readiness on the copy. */
+    ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0) { close(d); return "noepoll"; }
+    struct epoll_event add = { .events = EPOLLIN, .data.fd = d };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, d, &add) < 0) { close(ep); close(d); return "noctl"; }
+    if (!ask_dump(fd, 1017)) { close(ep); close(d); return "dump:sendfail"; }
+    int bits = readable(d, ep);
+    drain(d);
+    int after = readable(d, ep);
+    close(ep);
+    if (bits != 7 || after != 0) {
+        snprintf(out, sizeof out, "ready%d/after%d", bits, after);
+        close(d);
+        return out;
+    }
+    /* The original closed: the copy still holds the socket, and still owes
+     * the ack. Then the other two faces a second name comes through. */
+    close(fd);
+    if (!ask_ack(d, 1018)) { close(d); return "orphan:sendfail"; }
+    r = ack_reply(d, 1018);
+    if (strcmp(r, "ack") != 0) { snprintf(out, sizeof out, "orphan:%s", r); close(d); return out; }
+    int f = fcntl(d, F_DUPFD_CLOEXEC, 50);
+    if (f < 0) { close(d); return "nofdupfd"; }
+    if (!ask_ack(f, 1019)) { close(f); close(d); return "fdupfd:sendfail"; }
+    r = ack_reply(d, 1019);
+    close(f);
+    if (strcmp(r, "ack") != 0) { snprintf(out, sizeof out, "fdupfd:%s", r); close(d); return out; }
+    if (dup3(d, 60, 0) != 60) { close(d); return "nodup3"; }
+    close(d);
+    if (!ask_ack(60, 1020)) { close(60); return "dup3:sendfail"; }
+    r = ack_reply(60, 1020);
+    close(60);
+    if (strcmp(r, "ack") != 0) { snprintf(out, sizeof out, "dup3:%s", r); return out; }
+    return "ok";
+}
+
 int main(void) {
     unsigned src_pid;
     int fd = nl_open();
@@ -675,7 +732,7 @@ int main(void) {
         printf("empty=skip\nself=skip\npeer=skip\nno_netns=skip\nunshare=1\n"
                "after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
 
@@ -699,7 +756,7 @@ int main(void) {
     if (fd < 0) {
         printf("after_netns=skip\nsrc=skip\nquery=skip\nwrdump=skip\nready=skip\n"
                "frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
     const char *after = newaddr_roundtrip(fd, 1002, &src_pid);
@@ -742,7 +799,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("wrdump=skip\nready=skip\nframe=skip\nmmsg=skip\nfault=skip\n"
-               "sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+               "sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
     struct { struct nlmsghdr n; struct rtgenmsg g; } d;
@@ -767,7 +824,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("ready=skip\nframe=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
     printf("ready=%s\n", readiness_cycle(fd));
@@ -778,7 +835,7 @@ int main(void) {
     fd = nl_open();
     if (fd < 0) {
         printf("frame=skip\nmmsg=skip\nfault=skip\nsendfault=skip\n"
-               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+               "addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
     printf("frame=%s\n", dump_walk(fd));
@@ -800,7 +857,7 @@ int main(void) {
     /* A destination the guest cannot write: EFAULT, not a silent short read. */
     fd = nl_open();
     if (fd < 0) {
-        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n");
+        printf("fault=skip\nsendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n");
         return 0;
     }
     printf("fault=%s\n", fault_recv(fd));
@@ -810,19 +867,19 @@ int main(void) {
      * a bad one must fail the call rather than become a successful empty
      * operation. */
     fd = nl_open();
-    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
+    if (fd < 0) { printf("sendfault=skip\naddrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n"); return 0; }
     printf("sendfault=%s\n", fault_send(fd));
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
+    if (fd < 0) { printf("addrfault=skip\nzerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n"); return 0; }
     printf("addrfault=%s\n", fault_addr(fd));
     close(fd);
 
     /* Calls that carry no bytes: what they answer, and that none of them
      * disturbs the reply the socket is holding. */
     fd = nl_open();
-    if (fd < 0) { printf("zerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
+    if (fd < 0) { printf("zerolen=skip\nsplit=skip\nsplitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n"); return 0; }
     printf("zerolen=%s\n", zero_len(fd));
     close(fd);
 
@@ -834,19 +891,24 @@ int main(void) {
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("splitack=skip\nwrack=skip\nwvack=skip\n"); return 0; }
+    if (fd < 0) { printf("splitack=skip\nwrack=skip\nwvack=skip\ndup=skip\n"); return 0; }
     printf("splitack=%s\n", split_ack(fd, 1013));
     close(fd);
 
     /* The same request through the faces that carry no address of their own. */
     fd = nl_open();
-    if (fd < 0) { printf("wrack=skip\nwvack=skip\n"); return 0; }
+    if (fd < 0) { printf("wrack=skip\nwvack=skip\ndup=skip\n"); return 0; }
     printf("wrack=%s\n", plain_ack(fd, 1014, 0));
     close(fd);
 
     fd = nl_open();
-    if (fd < 0) { printf("wvack=skip\n"); return 0; }
+    if (fd < 0) { printf("wvack=skip\ndup=skip\n"); return 0; }
     printf("wvack=%s\n", plain_ack(fd, 1015, 1));
     close(fd);
+
+    /* The socket under any of its names. */
+    fd = nl_open();
+    if (fd < 0) { printf("dup=skip\n"); return 0; }
+    printf("dup=%s\n", dup_names(fd));
     return 0;
 }

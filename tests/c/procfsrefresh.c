@@ -4,12 +4,14 @@
  * A synthesized /proc view is a memfd the emulator fills at open time and
  * refills when the guest rewinds and reads again -- that is what makes
  * /proc/uptime, /proc/loadavg and /proc/stat time-varying rather than frozen at
- * their open. The refill needs the descriptor to be in a small per-process
- * table (PF_MAX_FDS entries), and an open that is refused AFTER the view was
- * built -- the guest's RLIMIT_NOFILE says the number it landed on is one it may
- * not have -- used to close the descriptor and leave its table entry behind.
- * Enough refused opens and the table is full of dead rows, at which point the
- * next real open is not tracked at all and its file never refreshes again.
+ * their open. The refill needs the descriptor to be in a per-process table
+ * keyed by fd number, and an open that is refused AFTER the view was built --
+ * the guest's RLIMIT_NOFILE says the number it landed on is one it may not
+ * have -- used to close the descriptor and leave its table entry behind. The
+ * table was eight rows then, so enough refused opens filled it with dead ones,
+ * at which point the next real open was not tracked at all and its file never
+ * refreshed again (it grows now, but a dead row is still a row that would aim
+ * a later refresh's ftruncate at whatever reused the number).
  *
  * A kernel has no such table and no such failure mode, so both sides answer the
  * same two things: the refused opens are EMFILE, and a rewound re-read of
@@ -24,7 +26,7 @@
 #include <unistd.h>
 #include <sys/resource.h>
 
-#define ROUNDS 16      /* comfortably more than PF_MAX_FDS */
+#define ROUNDS 16      /* comfortably more than the table's original eight rows */
 
 static double uptime_of(int fd) {
     char buf[128];

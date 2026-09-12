@@ -67,6 +67,24 @@ static int write_str(const char *path, const char *s) {
     return e;
 }
 
+/* The same write through a SECOND NAME of the descriptor, the original closed
+ * before it: a dup shares the open file, so the kernel takes the map from it
+ * exactly as from the original. The emulator serves these files from a memfd
+ * and recognises a write to them by fd number, so the copy has to be
+ * registered too -- an unregistered one took the write into the memfd, and
+ * the map read back empty. */
+static int write_str_dup(const char *path, const char *s) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -errno;
+    int d = fcntl(fd, F_DUPFD, 40);
+    close(fd);
+    if (d < 0) return -errno;
+    ssize_t r = write(d, s, strlen(s));
+    int e = r < 0 ? -errno : (int)r;
+    close(d);
+    return e;
+}
+
 /* One-byte handshakes, so parent and child prints stay strictly ordered. */
 static void wake(int fd)  { char c = 'x'; if (write(fd, &c, 1) != 1) _exit(90); }
 static void wait1(int fd) { char c;       if (read(fd, &c, 1) != 1)  _exit(91); }
@@ -121,7 +139,7 @@ static void id_maps_from_parent(void) {
     snprintf(path, sizeof path, "/proc/%d/setgroups", (int)kid);
     printf("umap_sg_late=%d\n", write_str(path, "deny") == -EPERM);
     snprintf(path, sizeof path, "/proc/%d/uid_map", (int)kid);
-    printf("umap_uid=%d\n", write_str(path, "0 1000 1"));
+    printf("umap_uid=%d\n", write_str_dup(path, "0 1000 1"));
     /* Written once: a second write is EPERM whatever it holds, which is the
      * kernel's order -- the one-shot rule is tested before the parse. */
     printf("umap_junk=%d\n", write_str(path, "junk") == -EPERM);

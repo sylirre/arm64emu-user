@@ -13,10 +13,16 @@
  * (probed once via socket()+bind(), then cached process-wide). */
 bool nl_host_blocks(void);
 
-/* Fake-netlink fd table. */
+/* Fake-netlink fd table. nl_mark_fd registers the stand-in socket() just
+ * made: 0, or -ENOMEM when it could not be tracked -- and then the caller must
+ * not hand the fd out, since an untracked stand-in is a bare AF_UNIX socket
+ * to the guest. nl_track_dup adds a second name for a tracked socket (a real
+ * NETLINK_ROUTE one included, for the ack rewrite below), same contract. */
 bool nl_is_fd(struct Machine *m, int fd);
-void nl_mark_fd(struct Machine *m, int fd);
-void nl_unmark_fd(struct Machine *m, int fd);   /* frees any pending reply */
+int  nl_mark_fd(struct Machine *m, int fd);
+int  nl_track_dup(struct Machine *m, int oldfd, int newfd);
+void nl_unmark_fd(struct Machine *m, int fd);   /* drops a name; the socket's
+                                                 * state goes with its last */
 /* Fork child: keeps the sockets, drops the replies pending on them (they belong
  * to whoever sent the request). Child side of fork, single-threaded, unlocked. */
 void nl_fork_child(struct Machine *m);
@@ -31,7 +37,7 @@ void nl_fork_child(struct Machine *m);
  *   nlr_note_request -- a sendto/sendmsg on such an fd may need the rewrite.
  *   nlr_fix_reply -- rewrite the noted refusal in a just-received buffer.
  * nl_unmark_fd drops an fd from both tables (close). */
-void nlr_mark_fd(struct Machine *m, int fd);
+int  nlr_mark_fd(struct Machine *m, int fd);     /* 0 or -ENOMEM */
 void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len);
 /* `buf` holds `len` received bytes from `fd`; rewrites in place. `peek` (a
  * MSG_PEEK receive) keeps the note pending for the read that consumes the
