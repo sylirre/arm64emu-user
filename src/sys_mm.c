@@ -797,9 +797,86 @@ SYSDEF(mremap) {
     return r;
 }
 
+#define G_MS_ASYNC      1
+#define G_MS_INVALIDATE 2
+#define G_MS_SYNC       4
+
+/* msync(2). This used to answer 0 to every call: no flag or range check, and
+ * no write-back, so a guest that asked for MS_SYNC durability was told it
+ * had it. The validation is the kernel's, in the kernel's order
+ * (mm/msync.c): a flag outside the three, an unaligned start and MS_ASYNC
+ * together with MS_SYNC are EINVAL; a range that wraps is ENOMEM and an empty
+ * one -- a length whose page round-up wraps to zero included -- succeeds
+ * before anything is looked at; and an unmapped page anywhere in the range is
+ * ENOMEM, after the mapped parts have been synced (the walk carries on past a
+ * hole, as msync_walk does, and reports it at the end).
+ *
+ * The sync itself is asked of the host for every MAP_SHARED region in the
+ * range, since its host backing IS the file mapping: a host msync(MS_SYNC)
+ * there is the vfs_fsync_range the kernel would issue for the vma. MS_ASYNC
+ * has done nothing but the walk since 2.6.19 (dirty pages are written back on
+ * the usual schedule), and MS_INVALIDATE only refuses a locked mapping with
+ * EBUSY, of which there are none here (mlock is accept-and-ignore) -- so
+ * neither reaches the host. The host calls are made with the address-space
+ * lock dropped, like the kernel's mmap_lock during the fsync: a sync can take
+ * as long as the storage takes, and the other threads' translations must not
+ * wait on it. A region unmapped meanwhile makes its host call fail with
+ * ENOMEM, which is the answer the guest's own race deserves. */
 SYSDEF(msync) {
-    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    return 0;
+    (void)a3; (void)a4; (void)a5;
+    int flags = (int)a2;
+    if (flags & ~(G_MS_ASYNC | G_MS_INVALIDATE | G_MS_SYNC)) return (u64)(s64)-EINVAL;
+    if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
+    if ((flags & G_MS_ASYNC) && (flags & G_MS_SYNC)) return (u64)(s64)-EINVAL;
+    u64 len = PG_UP(a1), end = a0 + len;
+    if (end < a0) return (u64)(s64)-ENOMEM;
+    if (end == a0) return 0;
+
+    struct sync_span { u8 *p; size_t n; } stack[16], *v = stack;
+    int nv = 0, cap = (int)(sizeof stack / sizeof stack[0]);
+    int hole = 0, err = 0;
+    long hps = sysconf(_SC_PAGESIZE);
+    AddrSpace *as = &c->m->as;
+    as_lock();
+    u64 va = a0;
+    while (va < end) {
+        const Region *r = as_find_region(as, va);
+        if (!r) {
+            hole = 1;
+            const Region *nx = as_next_region(as, va);
+            if (!nx || nx->start >= end) break;
+            va = nx->start;
+            continue;
+        }
+        u64 stop = r->end < end ? r->end : end;
+        if ((flags & G_MS_SYNC) && r->shared) {
+            if (nv == cap) {
+                int ncap = cap * 2;
+                struct sync_span *nvv = malloc((size_t)ncap * sizeof *nvv);
+                if (!nvv) { err = -ENOMEM; break; }
+                memcpy(nvv, v, (size_t)nv * sizeof *nvv);
+                if (v != stack) free(v);
+                v = nvv;
+                cap = ncap;
+            }
+            /* msync wants a host-page-aligned start, and the slice is only
+             * guest-page aligned on a host with bigger pages: round down
+             * (the host mapping begins at a host page, so this stays inside
+             * it), and let the host round the length up as the kernel does. */
+            u8 *hp = r->host + (va - r->start);
+            uintptr_t lo = (uintptr_t)hp & ~((uintptr_t)hps - 1);
+            v[nv].p = (u8 *)lo;
+            v[nv].n = (size_t)(stop - va) + ((uintptr_t)hp - lo);
+            nv++;
+        }
+        va = stop;
+    }
+    as_unlock();
+    for (int i = 0; i < nv && !err; i++)
+        if (msync(v[i].p, v[i].n, MS_SYNC) < 0) err = -errno;
+    if (v != stack) free(v);
+    if (err) return (u64)(s64)err;
+    return hole ? (u64)(s64)-ENOMEM : 0;
 }
 
 /* mincore(2). The kernel's validation, in the kernel's order (mm/mincore.c):

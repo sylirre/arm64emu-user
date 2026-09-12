@@ -143,6 +143,21 @@ copy-on-write broken now) and writing only the partial host pages at either end
 space and gets neither, here as there. `tests/fixtures/madvfork.c` holds every
 row to a real kernel's answers.
 
+`msync` used to answer 0 to every call — no flag or range check, and no
+write-back, so a guest that asked for `MS_SYNC` durability was told it had it.
+Its validation is the kernel's now, in the kernel's order (`mm/msync.c`): a
+flag outside `MS_ASYNC|MS_INVALIDATE|MS_SYNC`, an unaligned start and
+`MS_ASYNC` together with `MS_SYNC` are `EINVAL`; a range that wraps is
+`ENOMEM`, an empty one succeeds before anything is looked at; and an unmapped
+page anywhere in the range is `ENOMEM`, after the mapped parts have been
+synced. The sync itself is asked of the host for every `MAP_SHARED` region in
+the range, whose host backing *is* the file mapping — a host `msync(MS_SYNC)`
+there is the `vfs_fsync_range` the kernel would issue for the vma — with the
+address-space lock dropped for the duration, as the kernel drops `mmap_lock`
+during the fsync. `MS_ASYNC` has been nothing but the walk since 2.6.19 and
+`MS_INVALIDATE` only refuses a locked mapping, of which there are none here, so
+neither reaches the host (`tests/c/msync.c`).
+
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**
 regardless of the guest's requested protection: the interpreter itself must
