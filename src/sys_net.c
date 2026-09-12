@@ -729,7 +729,32 @@ typedef struct {
  * message whose ancillary data is malformed is never sent at all. Stopping
  * instead used to send the message with the offending element and everything
  * after it silently dropped, and report success. */
-static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
+/* --fake-id and SCM_CREDENTIALS. The guest sends its own identity as it
+ * knows it -- {getpid(), getuid(), getgid()} is what dbus authentication,
+ * sd_notify and polkit put in the element -- and the kernel judges the uid and
+ * gid against the sender's REAL credentials (scm_check_creds): a fake root
+ * sending uid 0 was refused EPERM by a host whose task is uid 1000. So a uid
+ * or gid that is one of the guest's own fake credentials goes out as the host
+ * identity it stands for, and comes back in (cmsg_h2g, and SO_PEERCRED above)
+ * as the fake one again, through the same remap every stat uses. An id that
+ * is neither is left alone: a fake root has CAP_SETUID in its own eyes and
+ * may send any id, and the host will refuse one that is not its own -- the
+ * one refusal the mapping cannot lift. */
+static void cred_g2h(const struct Machine *m, u8 *ucred /* {pid,uid,gid} */) {
+    u32 uid, gid;
+    memcpy(&uid, ucred + 4, 4);
+    memcpy(&gid, ucred + 8, 4);
+    const Cred *cr = &m->cred;
+    if (uid == cr->ruid || uid == cr->euid || uid == cr->suid || uid == m->fake_uid)
+        uid = m->host_uid;
+    if (gid == cr->rgid || gid == cr->egid || gid == cr->sgid || gid == m->fake_gid)
+        gid = m->host_gid;
+    memcpy(ucred + 4, &uid, 4);
+    memcpy(ucred + 8, &gid, 4);
+}
+
+static ssize_t cmsg_g2h(const struct Machine *m, const u8 *gb, size_t glen,
+                        u8 *hb, size_t hcap) {
     size_t goff = 0, hoff = 0;
     while (goff + GCMSG_HDRLEN <= glen) {
         u64 clen;
@@ -751,6 +776,8 @@ static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
         memset(hb + hoff, 0, hstep);
         memcpy(hb + hoff, &ch, sizeof ch);
         memcpy(hb + hoff + CMSG_ALIGN(sizeof ch), gb + goff + GCMSG_HDRLEN, dlen);
+        if (m->fake_id && level == SOL_SOCKET && type == SCM_CREDENTIALS && dlen >= 12)
+            cred_g2h(m, hb + hoff + CMSG_ALIGN(sizeof ch));
         hoff += hstep;
         goff += (size_t)GCMSG_ALIGN(clen);
     }
@@ -759,8 +786,8 @@ static ssize_t cmsg_g2h(const u8 *gb, size_t glen, u8 *hb, size_t hcap) {
 
 /* Host control buffer -> guest, in the guest's layout and bounded by the
  * guest's buffer. Sets *ctrunc when anything had to be dropped or cut short. */
-static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
-                       int *ctrunc, int fdcap) {
+static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
+                       u8 *gb, size_t gcap, int *ctrunc, int fdcap) {
     size_t hoff = 0, goff = 0;
     while (hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) <= hlen) {
         struct cmsghdr ch;
@@ -833,6 +860,16 @@ static size_t cmsg_h2g(const u8 *hb, size_t hlen, u8 *gb, size_t gcap,
         memcpy(gb + goff + 12, &type, 4);
         memcpy(gb + goff + GCMSG_HDRLEN,
                hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)), dlen);
+        /* The peer's credentials as the guest knows them (cred_g2h above). */
+        if (m->fake_id && level == SOL_SOCKET && type == SCM_CREDENTIALS && dlen >= 12) {
+            u32 uid, gid;
+            memcpy(&uid, gb + goff + GCMSG_HDRLEN + 4, 4);
+            memcpy(&gid, gb + goff + GCMSG_HDRLEN + 8, 4);
+            uid = remap_uid(m, uid);
+            gid = remap_gid(m, gid);
+            memcpy(gb + goff + GCMSG_HDRLEN + 4, &uid, 4);
+            memcpy(gb + goff + GCMSG_HDRLEN + 8, &gid, 4);
+        }
         goff += gstep;
         hoff += hstep;
     }
@@ -1010,7 +1047,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
                 free(gctrl); free(hctrl);
                 free(bounce); free(iov); free(gbase); return -EFAULT;
             }
-            ssize_t hl = cmsg_g2h(gctrl, cl, hctrl, hcap);
+            ssize_t hl = cmsg_g2h(c->m, gctrl, cl, hctrl, hcap);
             free(gctrl);
             if (hl < 0) {
                 free(hctrl);
@@ -1128,8 +1165,8 @@ static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
         u8 *gctrl = calloc(1, ctrl_cap ? ctrl_cap : 1);
         if (!gctrl) return -ENOMEM;
         int ctrunc = 0;
-        size_t gl = cmsg_h2g(ctrl, h->msg_controllen, gctrl, ctrl_cap, &ctrunc,
-                             fd_nofile_cap(c->m));
+        size_t gl = cmsg_h2g(c->m, ctrl, h->msg_controllen, gctrl, ctrl_cap,
+                             &ctrunc, fd_nofile_cap(c->m));
         int bad = gl && copy_to_guest(c, g->msg_control, gctrl, gl) < 0;
         free(gctrl);
         if (bad) return -EFAULT;

@@ -1813,7 +1813,16 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   `gstat_from_host`, `statx`, and the setuid-exec owner lookup. The same remap
   covers **`SO_PEERCRED`** (`getsockopt` in `sys_net.c`): the peer `ucred`
   uid/gid the host reports for a Unix socket is remapped to the fake identity so
-  peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()`.
+  peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()` — and
+  **`SCM_CREDENTIALS`** both ways (`cmsg_g2h`/`cmsg_h2g`): a guest sends the
+  identity it knows, `{getpid(), getuid(), getgid()}` (dbus authentication,
+  `sd_notify`, polkit), and `scm_check_creds` judges the ids against the
+  sender's *real* ones, so a fake root sending uid 0 was refused `EPERM`. An id
+  that is one of the guest's own fake credentials goes out as the host identity
+  it stands for, and any credentials received (including the ones `SO_PASSCRED`
+  makes the kernel attach) come back through the remap. A third party's ids
+  stay the host's refusal — a fake root has `CAP_SETUID` in its own eyes and
+  the host has not (`tests/fixtures/fakecred.c`).
 - **`/proc/<pid>/status`** (`sys_procfs.c`): the `Uid:`/`Gid:`/`Groups:` lines
   of the host file carry the real invoking uid, but `ps`/`top` read them (not
   `getuid()`) to name the USER/GROUP. Under fake-id those lines are rewritten

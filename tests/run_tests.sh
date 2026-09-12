@@ -491,6 +491,35 @@ euid1000 real_r600=1 eff_r600=0
 uid1000 r600=0 r640=1 w640=0 x755=1" --fake-id "$ALPINE" /tmp/ci_fakeidacc
     rm -f "$ALPINE/tmp/ci_fakeidacc" "$ALPINE"/tmp/ci_fa[0-9][0-9][0-9]
     fx_rm tests/fixtures/fakeidacc.bin
+    # SCM_CREDENTIALS: the guest sends the identity it knows ({pid, getuid(),
+    # getgid()}) and the kernel judges the ids against the sender's REAL ones,
+    # so a fake root sending uid 0 was refused EPERM; the peer must read back
+    # the fake identity, as it does from SO_PEERCRED. A third party's ids stay
+    # the host's refusal.
+    "$AGCC" -O1 -static -o tests/fixtures/fakecred.bin tests/fixtures/fakecred.c 2>/dev/null &&
+        cp tests/fixtures/fakecred.bin "$ALPINE/tmp/ci_fakecred" && {
+        check_fakeid "SCM_CREDENTIALS as fake root" "me uid=0 gid=0
+send_own=0
+recv_own pid_ok=1 uid=0 gid=0
+send_eff=0
+recv_eff uid=0 gid=0
+passcred pid_ok=1 uid=0 gid=0
+peercred uid=0 gid=0
+send_other=-1
+send_pid1=-1
+done" --fake-id "$ALPINE" /tmp/ci_fakecred
+        check_fakeid "SCM_CREDENTIALS as fake 7:7" "me uid=7 gid=7
+send_own=0
+recv_own pid_ok=1 uid=7 gid=7
+send_eff=0
+recv_eff uid=7 gid=7
+passcred pid_ok=1 uid=7 gid=7
+peercred uid=7 gid=7
+send_other=-1
+send_pid1=-1
+done" --fake-id 7 "$ALPINE" /tmp/ci_fakecred
+    }
+    rm -f "$ALPINE/tmp/ci_fakecred"; fx_rm tests/fixtures/fakecred.bin
     # adduser exercises vfork+exec of helpers under fake-root.
     check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
         --fake-id "$ALPINE" /bin/sh -c \
