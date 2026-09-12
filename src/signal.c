@@ -820,13 +820,13 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
  * (kill -SEGV, abort()'s siblings, a test raising one), and those used to go
  * to the host's default disposition: a guest with a SIGSEGV handler died of a
  * kill(SIGSEGV) instead of running it, and a guest without one died on the
- * spot, with none of what its death owes -- its registry slot and SEM_UNDO
- * adjustments given back -- since no emulator code ran. si_code tells the two
- * apart: a sent signal carries SI_USER, SI_TKILL or SI_QUEUE (all <= 0), a
- * fault a positive reason. The nets own these four numbers for the process
- * lifetime (sig_host_update skips them), as the SIGSYS and kick nets own
- * theirs; SIGBUS is the bus-error net's (mem.c), which forwards its sent
- * instances the same way. */
+ * spot, with none of what its death owes -- the robust futexes it held marked,
+ * its registry slot and SEM_UNDO adjustments given back -- since no emulator
+ * code ran. si_code tells the two apart: a sent signal carries SI_USER,
+ * SI_TKILL or SI_QUEUE (all <= 0), a fault a positive reason. The nets own
+ * these four numbers for the process lifetime (sig_host_update skips them),
+ * as the SIGSYS and kick nets own theirs; SIGBUS is the bus-error net's
+ * (mem.c), which forwards its sent instances the same way. */
 static void sync_net(int sig, siginfo_t *si, void *uctx) {
     if (si->si_code <= 0) {   /* a signal, not a fault: the guest's business */
         host_catcher(sig, si, uctx);
@@ -974,7 +974,8 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
     if (h == GSIG_DFL) {
         /* A default-terminate signal is CAUGHT and the death performed by the
          * run loop (guest_terminate_by_signal), never left to the host
-         * default: a bare host kill runs no guest code, so the process's
+         * default: a bare host kill runs no guest code, so the robust futexes
+         * the process holds stay locked forever for their waiters, its
          * registry slot, SEM_UNDO adjustments and tmpfs backing are left to
          * be reclaimed later, and a tracee never reports the signal-delivery
          * stop nor the WIFSIGNALED death its tracer's wait4 is polling for.
@@ -1495,6 +1496,8 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
 }
 
 void guest_terminate_by_signal(CPU *c, int sig) {
+    robust_list_exit_group(c);           /* every thread's robust futexes:
+                                          * OWNER_DIED, as at any death */
     /* Report the WIFSIGNALED death to the tracer(s) (a no-op when untraced):
      * the pre-exit PTRACE_EVENT_EXIT under TRACEEXIT, then the terminal status
      * word -- for every traced thread of this process, since the signal kills
@@ -1560,8 +1563,8 @@ void sig_deliver_pending(CPU *c) {
         if (h == GSIG_IGN) continue;
         if (h == GSIG_DFL) {
             /* A default-terminate signal: the process's death, performed here
-             * -- registry slot and SEM_UNDO given back, the WIFSIGNALED
-             * status reported to a tracer -- and then
+             * -- robust futexes marked, registry slot and SEM_UNDO given
+             * back, the WIFSIGNALED status reported to a tracer -- and then
              * the same death by the same signal, re-raised with the default
              * restored (does not return). */
             if (sig_default_terminates(sig))

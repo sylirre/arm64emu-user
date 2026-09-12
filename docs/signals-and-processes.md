@@ -18,8 +18,9 @@ For each guest signal whose disposition is a real handler, one host catcher
 disposition. `SIG_DFL` is, for the default-ignore and default-continue signals;
 a **default-terminate** one at `SIG_DFL` is caught too, and the death performed
 by the run loop (`guest_terminate_by_signal`): a bare host kill runs no guest
-code, so the process's registry slot, `SEM_UNDO` adjustments and tmpfs backing
-were left to later reclaim, and a tracee reported nothing. The exit status is the same — the run
+code, so the robust futexes the process held stayed locked for their waiters,
+its registry slot, `SEM_UNDO` adjustments and tmpfs backing were left to later
+reclaim, and a tracee reported nothing. The exit status is the same — the run
 loop restores the default and re-raises — and this used to be done only under
 `ptrace` or while the signal was blocked.
 
@@ -598,8 +599,8 @@ lock hierarchy, and `emu_atfork_prepare` in `main.c` is the one place it is
 written down:
 
 ```
-jit stats → pf_lock → est_lock → nl_lock → sfd_lock → sigact_lock → casp16 → as_lock
-outermost                                                                  innermost
+jit stats → pf_lock → est_lock → nl_lock → sfd_lock → sigact_lock → robust_lock → casp16 → as_lock
+outermost                                                                                 innermost
 ```
 
 `as_lock` is innermost because **any** critical section that touches guest memory
@@ -610,7 +611,8 @@ the address-space generation, which invalidates that thread's D-TLB and
 *guarantees* the miss. `casp16` sits just above it (a CASP retry can miss the
 D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`),
 and `sigact_lock` under `sfd_lock` because `sfd_remask` re-mirrors dispositions
-with the signalfd table locked.
+with the signalfd table locked; `robust_lock` (the robust-futex list registry,
+`sys_proc.c`) sits above `as_lock` because walking a list copies guest memory.
 
 This began as five separate triples, one per module. That worked, but it encoded
 the hierarchy in the *reverse* order of five adjacent `*_atfork_init()` calls —
@@ -654,8 +656,8 @@ handler if a future `EMU_LOCK` site ever is.
 
 ##### No code path may fork while holding one of these locks
 
-`prepare` takes all eight, so the forking thread must hold none of them. Seven
-are non-recursive and `prepare` would block on them forever; the eighth,
+`prepare` takes all nine, so the forking thread must hold none of them. Eight
+are non-recursive and `prepare` would block on them forever; the ninth,
 `as_lock`, is recursive and fails *quietly* instead — `prepare` succeeds, and the child's
 handler re-initializes the mutex under the surviving thread, which goes on
 believing it holds it.
@@ -675,7 +677,7 @@ sent to kill it, which is why the harness needs `timeout -k`. The atfork handler
 themselves keep the raw `pthread` calls — they run *inside* `fork()`, where the
 mask describes the state already vetted and must not move.
 
-One cost worth keeping in mind: a fork pays seven uncontended lock round-trips,
+One cost worth keeping in mind: a fork pays eight uncontended lock round-trips,
 small but not free on fork-heavy guests.
 
 #### A child inherits no descriptor of the emulator's own
@@ -773,7 +775,31 @@ One host thread per guest thread over the shared `Machine`/address space:
   and lock-free code correct even on weakly-ordered ARM hosts;
 - `futex` passes through to the host futex on `mem_host_ptr(uaddr)`, valid because
   guest threads share the host address space;
-- thread exit performs the `CLONE_CHILD_CLEARTID` futex wake.
+- thread exit walks the thread's **robust futex list** first and then performs
+  the `CLONE_CHILD_CLEARTID` futex wake, in `mm_release`'s order. The list
+  (`set_robust_list`) names the `PTHREAD_MUTEX_ROBUST` mutexes the thread
+  holds, and a kernel marks each `FUTEX_OWNER_DIED` at the owner's death so
+  the next locker gets `EOWNERDEAD`. It cannot be handed to the host kernel —
+  its links are guest addresses, host addresses only through the page table
+  (and an ILP32 host would read the LP64 layout wrong) — so `sys_proc.c` keeps
+  every live thread's head in a registry and walks it itself wherever a kernel
+  walks it: the thread's own list at its exit and at its `execve`
+  (`robust_list_exit_self`), and every thread's when the group dies at once
+  (`robust_list_exit_group`, from `exit_group`, a lone main thread's `exit`,
+  and `guest_terminate_by_signal`), since the siblings die without an exit
+  path of their own. The walk is `exit_robust_list`'s (2048 entries at most,
+  the next link fetched before the current node is handled, `list_op_pending`
+  last and only with waiters, a fault ending the walk) and `handle_futex_death`
+  is a CAS to `OWNER_DIED | WAITERS` on a word whose TID field is the dying
+  thread's, plus a wake; a PI word's waiters the host kernel already handles,
+  the host thread that owned it dying for real. It used to be recorded and
+  never walked ("without `CLONE_VM` threads it is inert"), so a dying owner
+  never produced `EOWNERDEAD` and its waiters hung. Two things stay outside
+  the emulator's reach: a process killed by `SIGKILL` runs no code of its own,
+  so its non-PI robust mutexes are left locked (a kernel walks them), and in
+  the group walk a sibling that locks a robust mutex in the microseconds
+  between its list being walked and `_exit` goes unmarked
+  (`tests/fixtures/robustdeath.c`).
 
 ### exit
 
@@ -1079,7 +1105,8 @@ poll (above) would hang. Two mechanisms close this:
   traced — `ptrace_traced()`, a process-level count, since dispositions are
   process-wide). The signal is then mediated: the tracee reports the
   signal-delivery-stop, the tracer injects it, and the tracee terminates through
-  `guest_terminate_by_signal` (`src/signal.c`) — which publishes the
+  `guest_terminate_by_signal` (`src/signal.c`) — which marks the robust
+  futexes every thread held (`robust_list_exit_group`), publishes the
   `WIFSIGNALED` status to the tracer for **every** traced thread of the group
   (`ptrace_report_exit_group`; the signal kills them all), then restores the
   host default and re-raises so the *real* parent sees the identical status

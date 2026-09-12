@@ -662,6 +662,9 @@ void sig_locks_reinit(void);
 void sigact_locks_take(void);    /* sigact_lock — signal.c */
 void sigact_locks_drop(void);
 void sigact_locks_reinit(void);
+void robust_locks_take(void);    /* robust_lock — sys_proc.c */
+void robust_locks_drop(void);
+void robust_locks_reinit(void);
 void netlink_locks_take(void);   /* nl_lock */
 void netlink_locks_drop(void);
 void netlink_locks_reinit(void);
@@ -700,8 +703,10 @@ enum {
     EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
     EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (sfd_remask
                                 * re-mirrors dispositions) */
-    EMU_LK_CASP16 = 1u << 6,   /* mem.c          */
-    EMU_LK_AS     = 1u << 7,   /* mem.c as_lock  — innermost; counted, not
+    EMU_LK_ROBUST = 1u << 6,   /* sys_proc.c     — the robust-list registry;
+                                * its walk copies guest memory (as_lock) */
+    EMU_LK_CASP16 = 1u << 7,   /* mem.c          */
+    EMU_LK_AS     = 1u << 8,   /* mem.c as_lock  — innermost; counted, not
                                 * flagged, because it legitimately re-enters */
 };
 extern __thread unsigned g_emu_lk_held;   /* the six non-recursive locks */
@@ -739,8 +744,8 @@ void emu_fdwin_lock_warn(unsigned taking);
  * them into anything else silently turns the check into noise. */
 _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
                EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
-               EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_CASP16 &&
-               EMU_LK_CASP16 < EMU_LK_AS,
+               EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_ROBUST &&
+               EMU_LK_ROBUST < EMU_LK_CASP16 && EMU_LK_CASP16 < EMU_LK_AS,
                "EMU_LK_* bits are ranks: keep them in the order "
                "emu_atfork_prepare (main.c) takes the locks");
 
@@ -1270,5 +1275,11 @@ s64  msgbroker_rcv(struct Machine *m, s32 msqid, s64 msgtyp, void *buf, u64 sz,
 s32  msgbroker_ctl(struct Machine *m, s32 msqid, s32 cmd, struct MsgStat *st);
 /* Fork child: reset sem_undo_used (a fresh pid holds no adjustments). */
 void ipc_fork_child(struct Machine *m);
+
+/* Robust futexes (sys_proc.c): the dying thread's list, or every thread's
+ * when the group dies at once (exit_group, a fatal signal). */
+void robust_list_exit_self(CPU *c);
+void robust_list_exit_group(CPU *c);
+void robust_fork_child(void);
 
 #endif /* A64_MACHINE_H */

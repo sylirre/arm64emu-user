@@ -63,8 +63,10 @@ static u32 stop_gen_bump(struct Machine *m) {
  * agreed on. Shared by exit_group, by a lone main thread's exit(2), and by
  * whichever thread turns out to be the last one alive when the main thread has
  * already parked. */
-static __attribute__((noreturn)) void process_exit(struct Machine *m) {
+static __attribute__((noreturn)) void process_exit(CPU *c) {
+    struct Machine *m = c->m;
     int code = __atomic_load_n(&m->group_exit_code, __ATOMIC_ACQUIRE);
+    robust_list_exit_group(c);  /* every thread's robust futexes: OWNER_DIED */
     /* The whole thread group dies without its remaining threads running their
      * own exit paths: publish the WIFEXITED status on every traced thread's
      * link (a parked sibling dies inside its service loop; its tracer would
@@ -151,6 +153,7 @@ SYSDEF(exit) {
          * end here. Report only this thread's own death and release anything
          * pthread_join'ing it, then park (leader_park). */
         ptrace_report_exit(c, ws);
+        robust_list_exit_self(c);   /* before the tid clear, as mm_release */
         if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
         g_tls.clear_child_tid = 0;
         /* Announce the parked leader *before* dropping out of the live count.
@@ -163,19 +166,19 @@ SYSDEF(exit) {
          * the process down. (thread_entry makes the same test for the opposite
          * order; exactly one decrement can reach zero, so exactly one fires.) */
         if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0)
-            process_exit(m);
+            process_exit(c);
         leader_park(c);
         return 0;   /* revived: de_thread handed this thread a new image */
     }
 
-    process_exit(m);   /* the last thread of the group */
+    process_exit(c);   /* the last thread of the group */
 }
 
 SYSDEF(exit_group) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     __atomic_store_n(&c->m->group_exit_code, (int)a0 & 0xff, __ATOMIC_RELEASE);
     ptrace_report_exit_stop(c, ((int)a0 & 0xff) << 8);   /* PTRACE_EVENT_EXIT */
-    process_exit(c->m);
+    process_exit(c);
 }
 
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
@@ -206,14 +209,156 @@ SYSDEF(set_tid_address) {
     return (u64)g_tls.tid;
 }
 
+/* ---- robust futexes ------------------------------------------------------
+ *
+ * A thread's robust list names the PTHREAD_MUTEX_ROBUST mutexes it holds, so
+ * that when it dies the kernel can mark each of them FUTEX_OWNER_DIED and wake
+ * a waiter, which then takes the lock as EOWNERDEAD (exit_robust_list). The
+ * list cannot be handed to the host kernel: its links are guest addresses,
+ * which are host addresses only through the page table -- and an ILP32 host
+ * would read the LP64 layout wrong besides. So the head is recorded per thread
+ * (get_robust_list echoes it; that call is on Android's seccomp deny-list and
+ * must never be forwarded) and walked HERE at every point a kernel walks it:
+ * when the thread exits, when it execs (exec_mm_release), and, for every
+ * thread of the group at once, when the process ends -- exit_group, or a
+ * fatal signal -- since the siblings die without running an exit path of
+ * their own. "Without CLONE_VM threads it is inert" was true once; a dying
+ * owner then never produced EOWNERDEAD and its waiters hung.
+ *
+ * The walk is exit_robust_list's: at most ROBUST_LIST_LIMIT entries, the next
+ * link fetched before the current one is handled (a handler may free the
+ * node), the pending entry (list_op_pending) done last and only if it has
+ * waiters or is PI, a fault anywhere ending the walk. handle_futex_death: a
+ * word whose TID field is the dying thread's is CAS'd to OWNER_DIED plus its
+ * WAITERS bit, and a waiter is woken; a PI word's waiters the host kernel
+ * already handles itself (the host thread that owned the word dies for real,
+ * and exit_pi_state_list runs from the pi_state a waiter attached), so only
+ * the marking is done here. A word the guest cannot back is skipped as a
+ * kernel skips a faulting one.
+ *
+ * The group walk reads siblings' lists while they may still be running --
+ * the process is about to be ended out from under them -- which is what the
+ * CAS is for: a mutex released concurrently is left alone (the TID no longer
+ * matches), one held is marked. A mutex a sibling takes in the microseconds
+ * between its list being walked and _exit is the one thing this cannot
+ * catch; a kernel walks each list after the thread stopped for good. */
+#define ROBUST_LIST_LIMIT 2048
+#define G_FUTEX_WAITERS    0x80000000u
+#define G_FUTEX_OWNER_DIED 0x40000000u
+#define G_FUTEX_TID_MASK   0x3fffffffu
+
+/* Every live thread's head, for the group walk. */
+static pthread_mutex_t robust_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { s32 tid; u64 head; } *robust_tab;
+static int robust_n, robust_cap;
+
+void robust_locks_take(void)   { pthread_mutex_lock(&robust_lock); }
+void robust_locks_drop(void)   { pthread_mutex_unlock(&robust_lock); }
+void robust_locks_reinit(void) { pthread_mutex_init(&robust_lock, NULL); }
+
+static void robust_tab_set(s32 tid, u64 head) {
+    EMU_LOCK(&robust_lock, EMU_LK_ROBUST);
+    int i;
+    for (i = 0; i < robust_n; i++) if (robust_tab[i].tid == tid) break;
+    if (!head) {
+        if (i < robust_n) robust_tab[i] = robust_tab[--robust_n];
+    } else {
+        if (i == robust_n) {
+            if (robust_n == robust_cap) {
+                int nc = robust_cap ? robust_cap * 2 : 16;
+                void *nb = realloc(robust_tab, (size_t)nc * sizeof *robust_tab);
+                if (!nb) { perror("arm64chroot: realloc"); exit(127); }
+                robust_tab = nb;
+                robust_cap = nc;
+            }
+            robust_n++;
+        }
+        robust_tab[i].tid = tid;
+        robust_tab[i].head = head;
+    }
+    EMU_UNLOCK(&robust_lock, EMU_LK_ROBUST);
+}
+
+/* handle_futex_death. 0 to go on, -1 on a fault (the walk ends). */
+static int robust_futex_death(CPU *c, u64 uaddr, s32 tid, int pi, int pending) {
+    if (uaddr & 3) return -1;
+    void *hp = mem_host_ptr(c, uaddr, 4, ACC_WRITE);
+    if (!hp) return -1;
+    u32 uval = __atomic_load_n((u32 *)hp, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (pending && !pi && !(uval & G_FUTEX_WAITERS)) return 0;
+        if ((uval & G_FUTEX_TID_MASK) != (u32)tid) return 0;
+        u32 mval = (uval & G_FUTEX_WAITERS) | G_FUTEX_OWNER_DIED;
+        if (__atomic_compare_exchange_n((u32 *)hp, &uval, mval, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            break;
+        /* uval now holds the current word: judge it again */
+    }
+    if (!pi && (uval & G_FUTEX_WAITERS))
+        syscall(SYS_futex, hp, 1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0);
+    return 0;
+}
+
+/* exit_robust_list for the thread `tid` whose head is `head`. Only guest
+ * memory is read (copy_from_guest), so a sibling's list can be walked from
+ * any thread of the process. */
+static void robust_list_walk(CPU *c, s32 tid, u64 head) {
+    if (!head) return;
+    u64 entry, pending, offset;
+    if (copy_from_guest(c, &entry, head, 8) < 0) return;         /* list.next */
+    if (copy_from_guest(c, &offset, head + 8, 8) < 0) return;    /* futex_offset */
+    if (copy_from_guest(c, &pending, head + 16, 8) < 0) return;  /* list_op_pending */
+    int pi = (int)(entry & 1), pip = (int)(pending & 1);
+    entry &= ~1ULL;
+    pending &= ~1ULL;
+    int limit = ROBUST_LIST_LIMIT;
+    while (entry != head) {
+        u64 next = 0;
+        int rc = copy_from_guest(c, &next, entry, 8) < 0;
+        if (entry != pending &&
+            robust_futex_death(c, entry + offset, tid, pi, 0) < 0) return;
+        if (rc) return;
+        pi = (int)(next & 1);
+        entry = next & ~1ULL;
+        if (!--limit) break;
+    }
+    if (pending) robust_futex_death(c, pending + offset, tid, pip, 1);
+}
+
+/* The calling thread's own list, at its exit or its exec (futex_exit_release):
+ * walked, then forgotten. */
+void robust_list_exit_self(CPU *c) {
+    u64 head = g_tls.robust_head;
+    g_tls.robust_head = 0;
+    if (!head) return;
+    robust_tab_set(g_tls.tid, 0);
+    robust_list_walk(c, g_tls.tid, head);
+}
+
+/* Every thread's list, when the whole group dies at once. */
+void robust_list_exit_group(CPU *c) {
+    EMU_LOCK(&robust_lock, EMU_LK_ROBUST);
+    for (int i = 0; i < robust_n; i++)
+        robust_list_walk(c, robust_tab[i].tid, robust_tab[i].head);
+    robust_n = 0;
+    EMU_UNLOCK(&robust_lock, EMU_LK_ROBUST);
+    g_tls.robust_head = 0;
+}
+
+/* A fork child has one thread and inherits its registration alone. */
+void robust_fork_child(void) {
+    pthread_mutex_init(&robust_lock, NULL);
+    robust_n = 0;
+    if (g_tls.robust_head) robust_tab_set(g_tls.tid, g_tls.robust_head);
+}
+
 SYSDEF(set_robust_list) {
-    /* The guest robust-list layout is LP64; registering it with an ILP32 host
-     * kernel would be wrong, and without CLONE_VM threads it is inert anyway.
-     * Record the head per thread so get_robust_list can echo it -- that one
-     * must never be forwarded (blocked by the Android seccomp filter). */
+    /* (head, len): len must be sizeof(struct robust_list_head), the guest's
+     * LP64 one. Recorded, never forwarded (see above). */
     (void)c; (void)a2; (void)a3; (void)a4; (void)a5;
     if (a1 != 24) return (u64)(s64)-EINVAL;   /* sizeof(struct robust_list_head) */
     g_tls.robust_head = a0;
+    robust_tab_set(g_tls.tid, a0);
     return 0;
 }
 
@@ -362,6 +507,7 @@ static void *thread_entry(void *arg) {
      * joiner has not been woken yet, so it cannot have freed the stack that
      * word lives in. */
     struct Machine *m = t->m;
+    robust_list_exit_self(c);   /* its robust futexes, before the tid clear */
     as_thread_exit(&m->as);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     free(t);
@@ -373,7 +519,7 @@ static void *thread_entry(void *arg) {
      * zero (an execve reload transient did, before as_reinit_live), the wrong
      * outcome is a leaked zombie, not a live process torn down. */
     if (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE) &&
-        __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(m);
+        __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(c);
     return NULL;
 }
 
@@ -554,6 +700,7 @@ SYSDEF(clone) {
         if (!(flags & G_CLONE_VM)) as_fork_child(&m->as);
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         sig_fork_child();                 /* nor is the pending-signal set */
+        robust_fork_child();              /* one thread's robust list, its own */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */
@@ -1132,6 +1279,7 @@ static void dethread_join(CPU *c) {
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
     g_tls.robust_head = 0;
+    robust_tab_set(g_tls.tid, 0);
     g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
     g_tls.sig_altstack_flags = 0;
     g_tls.saved_sigmask = 0;
@@ -1596,6 +1744,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     }
 
     /* Point of no return: tear down and reload. */
+    robust_list_exit_self(c);   /* exec_mm_release: this thread's robust futexes */
     if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
     if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
     shm_detach_all(m);       /* System V shm attaches do not survive execve;
