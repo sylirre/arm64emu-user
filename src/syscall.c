@@ -164,7 +164,7 @@ static const struct {
     { G_NR_readahead, sys_readahead, "readahead" },
     { G_NR_utimensat, sys_utimensat, "utimensat" },
     { G_NR_statx, sys_statx, "statx" },
-    { 32 /* flock */, sys_flock, "flock" },
+    { G_NR_flock, sys_flock, "flock" },
     { G_NR_sync_file_range, sys_sync_file_range, "sync_file_range" },
     { G_NR_eventfd2, sys_eventfd2, "eventfd2" },
     { G_NR_inotify_init1, sys_inotify_init1, "inotify_init1" },

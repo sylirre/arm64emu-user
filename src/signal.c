@@ -23,6 +23,7 @@
 #include <time.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -1052,6 +1053,78 @@ void sig_reset_for_exec(struct Machine *m) {
 static void wr64(u8 *fr, u64 off, u64 v) { memcpy(fr + off, &v, 8); }
 static void wr32(u8 *fr, u64 off, u32 v) { memcpy(fr + off, &v, 4); }
 
+/* Does the socket behind `fd` have a timeout of its own in this direction?
+ * Not a socket, or no timeout: 0. */
+static int sock_timeo_set(int fd, int opt) {
+    struct timeval tv;
+    socklen_t len = sizeof tv;
+    if (getsockopt(fd, SOL_SOCKET, opt, &tv, &len) != 0) return 0;
+    return tv.tv_sec != 0 || tv.tv_usec != 0;
+}
+
+/* Is the syscall a handler is about to interrupt one the kernel would restart
+ * once the handler returns? Decided by the syscall, as the kernel decides it
+ * by the errno the syscall came back with:
+ *
+ *   ERESTARTSYS          -- restarted if the handler has SA_RESTART, else EINTR.
+ *                           The blocking file and socket calls, the waits, the
+ *                           locks, an untimed FUTEX_WAIT.
+ *   ERESTARTNOINTR       -- restarted whatever the handler's flags: the PI
+ *                           futex ops, whose callers (pthread_mutex_lock) are
+ *                           never shown EINTR.
+ *   ERESTART_RESTARTBLOCK, ERESTARTNOHAND, EINTR
+ *                        -- EINTR to a handler, always: every sleep and poll
+ *                           (nanosleep, ppoll, pselect6, epoll_pwait,
+ *                           rt_sigtimedwait), a timed FUTEX_WAIT, the SysV
+ *                           IPC waits.
+ *
+ * The socket calls carry one more rule (sock_intr_errno): a socket with a
+ * timeout of its own (SO_RCVTIMEO for the receive side, SO_SNDTIMEO for the
+ * send side) answers EINTR and is never restarted, and read/write on a socket
+ * are socket calls. The list used to be sixteen numbers with no rule at all:
+ * accept4, flock, fcntl(F_SETLKW) and the open of a FIFO came back EINTR
+ * under an SA_RESTART handler where a kernel resumes them (the FIFO open
+ * then left a writer blocked forever), and a timed futex wait was restarted
+ * where a kernel reports it. */
+static int sc_restart_wanted(CPU *c, unsigned saflags) {
+    if (!g_tls.sc_ret_eintr) return 0;
+    int sa_restart = (saflags & G_SA_RESTART) != 0;
+    int fd = (int)(s32)g_tls.sc_orig_x0;   /* the descriptor, where there is one */
+    switch (g_tls.sc_nr) {
+    case G_NR_futex: {
+        int op = (int)c->x[1] & 127;   /* x1..x5 still hold the call's args */
+        switch (op) {
+        case 6: case 13: case 11:   /* LOCK_PI, LOCK_PI2, WAIT_REQUEUE_PI */
+            return 1;               /* ERESTARTNOINTR */
+        case 0: case 9:             /* WAIT, WAIT_BITSET */
+            return c->x[3] == 0 && sa_restart;   /* timed: RESTARTBLOCK */
+        default:
+            return 0;
+        }
+    }
+    case G_NR_read: case G_NR_readv: case G_NR_pread64:
+    case G_NR_preadv: case G_NR_preadv2:
+    case G_NR_accept: case G_NR_accept4: case G_NR_recvfrom:
+    case G_NR_recvmsg: case G_NR_recvmmsg:
+        return sa_restart && !sock_timeo_set(fd, SO_RCVTIMEO);
+    case G_NR_write: case G_NR_writev: case G_NR_pwrite64:
+    case G_NR_pwritev: case G_NR_pwritev2:
+    case G_NR_connect: case G_NR_sendto: case G_NR_sendmsg: case G_NR_sendmmsg:
+    case G_NR_sendfile:   /* out_fd is x0 */
+        return sa_restart && !sock_timeo_set(fd, SO_SNDTIMEO);
+    case G_NR_splice:     /* a socket may sit on either side */
+        return sa_restart && !sock_timeo_set(fd, SO_RCVTIMEO) &&
+               !sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO);
+    case G_NR_openat: case G_NR_openat2:   /* a FIFO's wait for its partner */
+    case G_NR_wait4: case G_NR_waitid:
+    case G_NR_ioctl: case G_NR_fcntl: case G_NR_flock:
+    case G_NR_tee: case G_NR_vmsplice: case G_NR_getrandom:
+        return sa_restart;
+    default:
+        return 0;
+    }
+}
+
 /* Deliver `sig` to the guest handler in m->sigact[sig] (caller checked it is
  * a real handler). Builds the frame and redirects the CPU. */
 static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
@@ -1064,19 +1137,8 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     sig_action_snapshot(m, sig, &snap);
     const GSigAction *act = &snap;
 
-    int restart = 0;
+    int restart = sc_restart_wanted(c, (unsigned)act->flags);
     u64 saved_pc = c->pc, saved_x0 = c->x[0];
-    if (g_tls.sc_ret_eintr && (act->flags & G_SA_RESTART)) {
-        switch (g_tls.sc_nr) {   /* restartable subset (kernel: ERESTARTSYS) */
-            case G_NR_read: case G_NR_write: case G_NR_readv: case G_NR_writev:
-            case G_NR_pread64: case G_NR_pwrite64: case G_NR_wait4:
-            case G_NR_waitid: case G_NR_ioctl: case G_NR_futex:
-            case G_NR_accept: case G_NR_connect: case G_NR_recvfrom:
-            case G_NR_sendto: case G_NR_recvmsg: case G_NR_sendmsg:
-                restart = 1;
-                break;
-        }
-    }
     if (restart) { saved_pc = g_tls.sc_svc_pc; saved_x0 = g_tls.sc_orig_x0; }
 
     /* Pick the stack: guest sigaltstack if requested and configured. */

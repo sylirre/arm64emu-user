@@ -115,7 +115,24 @@ frame that cannot be read is a bad frame, and the guest dies of `SIGSEGV` --
 what `parse_user_sigframe` does with a failed `__get_user`.
 
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
-interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`).
+interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`) — for the
+syscalls a kernel restarts, which it decides by the errno the call came back
+with (`sc_restart_wanted`, `signal.c`): `ERESTARTSYS` (the blocking file and
+socket calls, `openat` of a FIFO, `wait4`/`waitid`, `ioctl`, `fcntl`'s
+`F_SETLKW`/`F_OFD_SETLKW`, `flock`, the `splice` family, an *untimed*
+`FUTEX_WAIT`) is restarted under `SA_RESTART`; `ERESTART_RESTARTBLOCK` and
+`ERESTARTNOHAND` (every sleep and poll, `rt_sigtimedwait`, a *timed*
+`FUTEX_WAIT`) and the SysV IPC waits are `EINTR` to a handler whatever the
+flag; and a socket with a timeout of its own (`SO_RCVTIMEO` on the receive
+side, `SO_SNDTIMEO` on the send side — `read`/`write` on a socket included)
+answers `EINTR` and is never restarted, which is `sock_intr_errno`. The PI
+futex ops are `ERESTARTNOINTR`, restarted whatever the flags; the host kernel
+does that one itself, before the emulator ever sees an `EINTR`. The list used
+to be sixteen syscall numbers with no rule at all: `accept4`, `flock`,
+`F_SETLKW` and the open of a FIFO came back `EINTR` under an `SA_RESTART`
+handler where a kernel resumes them (the FIFO open then left a writer blocked
+forever), and a timed futex wait was restarted where a kernel reports it
+(`tests/fixtures/sarestart.c`; qemu-user has a restart list of its own).
 
 #### The emulator's own interruptions are invisible to the guest
 
