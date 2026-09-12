@@ -1321,11 +1321,13 @@ int ptrace_have_tracee(s32 wpid) {
 static char pt_task_state(s32 t) {
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/stat", (int)t);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
+    if (fd < 0) { fdwin_leave(); return 0; }
     char buf[256];
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
+    fdwin_leave();
     if (n <= 0) return '?';
     buf[n] = 0;
     char *rp = strrchr(buf, ')');               /* comm may hold spaces/parens */

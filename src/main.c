@@ -567,8 +567,12 @@ static void emu_atfork_prepare(void) {
     sig_locks_take();        /* sfd_lock */
     sigact_locks_take();     /* sigact_lock — sfd_remask re-mirrors under sfd_lock */
     mem_locks_take();        /* casp16, then as_lock — innermost */
+    fdheld_fork_prepare();   /* the fd-window barrier: last, so that a window
+                              * is never waiting on a lock this already holds
+                              * (machine.h, "the emulator's own descriptors") */
 }
 static void emu_atfork_parent(void) {
+    fdheld_fork_parent();
     mem_locks_drop();        /* innermost first, mirroring prepare */
     sigact_locks_drop();
     sig_locks_drop();
@@ -582,6 +586,7 @@ static void emu_atfork_child(void) {
      * parent's. Cleared here rather than where the child adopts its own slot,
      * because a fork that found no free slot never gets there. */
     proctab_fork_child();
+    fdheld_fork_child();     /* close what sibling threads held (machine.h) */
     mem_locks_reinit();
     sigact_locks_reinit();
     sig_locks_reinit();

@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -647,12 +648,14 @@ int tmpfs_dir_new(struct Machine *m, char *host_out) {
      * directory of ours before creating anything inside. Every leaf is then
      * made relative to that fd, so the session name cannot be swapped for a
      * symlink between the check and the mkdir. */
+    fdwin_enter();   /* the session directory's fd: ours, briefly (machine.h) */
     int sfd = open(sess, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (sfd < 0) return -errno;
+    if (sfd < 0) { r = -errno; fdwin_leave(); return r; }
     struct stat st;
-    if (fstat(sfd, &st) != 0) { r = -errno; close(sfd); return r; }
+    if (fstat(sfd, &st) != 0) { r = -errno; close(sfd); fdwin_leave(); return r; }
     if (st.st_uid != getuid() || (st.st_mode & (S_IRWXG | S_IRWXO))) {
         close(sfd);
+        fdwin_leave();
         return -EACCES;
     }
     /* The counter only has to be unique within this process; mkdirat resolves
@@ -666,11 +669,12 @@ int tmpfs_dir_new(struct Machine *m, char *host_out) {
         snprintf(leaf, sizeof leaf, "%d.%d", (int)getpid(),
                  __atomic_fetch_add(&seq, 1, __ATOMIC_RELAXED));
         int n = snprintf(host_out, PATH_MAX, "%s/%s", sess, leaf);
-        if (n <= 0 || n >= PATH_MAX) { close(sfd); return -ENAMETOOLONG; }
-        if (mkdirat(sfd, leaf, 0755) == 0) { close(sfd); return 0; }
-        if (errno != EEXIST) { r = -errno; close(sfd); return r; }
+        if (n <= 0 || n >= PATH_MAX) { close(sfd); fdwin_leave(); return -ENAMETOOLONG; }
+        if (mkdirat(sfd, leaf, 0755) == 0) { close(sfd); fdwin_leave(); return 0; }
+        if (errno != EEXIST) { r = -errno; close(sfd); fdwin_leave(); return r; }
     }
     close(sfd);
+    fdwin_leave();
     return -ENOSPC;
 }
 
@@ -683,10 +687,13 @@ void tmpfs_session_cleanup(struct Machine *m) {
     if (!base) return;
     char name[64];
     if (tmpfs_session_name(m, name, sizeof name) < 0) return;
+    fdwin_enter();   /* the walk's descriptors are ours, and it is short (machine.h) */
     int bfd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (bfd < 0) return;
-    rm_rf_at(bfd, name, 0);
-    close(bfd);
+    if (bfd >= 0) {
+        rm_rf_at(bfd, name, 0);
+        close(bfd);
+    }
+    fdwin_leave();
 }
 
 /* Sweep session directories left behind by invocations that died without
@@ -1217,7 +1224,11 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
     strcat(joined, slash + 1);
     if (strcmp(joined, p->host)) return 0;
 
+    fdwin_enter();   /* the walk's descriptors, and the registration of the
+                      * one it keeps, in one window (machine.h) */
     int dfd = pin_walk(parhost, rootlen, &p->lowfd);
+    if (dfd >= 0) fdheld_add(dfd);
+    fdwin_leave();
     if (dfd < 0) return dfd;
     p->dfd = dfd;
     strcpy(p->base, slash + 1);
@@ -1227,11 +1238,125 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
 }
 
 void path_unpin(PathPin *p) {
-    if (p->dfd >= 0) close(p->dfd);
+    if (p->dfd >= 0) fdheld_close(p->dfd);
     p->dfd = AT_FDCWD;
     p->pinned = 0;
     p->lowfd = -1;
     p->name = p->host;
+}
+
+/* ---- the emulator's own descriptors, and fork (machine.h has the story) ---- */
+
+static pthread_rwlock_t fdwin_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t  fdheld_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { int fd; s32 tid; } *fdheld;
+static int fdheld_n, fdheld_cap;
+static s32 fdheld_forker;           /* the thread inside fork(), for the child */
+__thread int g_fdwin_depth;
+
+void fdwin_enter(void) {
+    pthread_rwlock_rdlock(&fdwin_lock);
+    g_fdwin_depth++;
+}
+
+void fdwin_leave(void) {
+    g_fdwin_depth--;
+    pthread_rwlock_unlock(&fdwin_lock);
+}
+
+int fdheld_add(int fd) {
+    if (fd < 0) return fd;
+    pthread_mutex_lock(&fdheld_lock);
+    /* A number can be held once. One already here is an entry whose closer
+     * did not go through fdheld_close, and a fork child would close whatever
+     * the guest has since put at that number: drop it, and say so once. */
+    for (int i = 0; i < fdheld_n; i++)
+        if (fdheld[i].fd == fd) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                static const char msg[] = "arm64chroot: internal error: a held "
+                    "descriptor was closed behind the registry's back (machine.h, "
+                    "\"the emulator's own descriptors\")\n";
+                (void)!write(2, msg, sizeof msg - 1);
+            }
+            fdheld[i] = fdheld[--fdheld_n];
+            break;
+        }
+    if (fdheld_n == fdheld_cap) {
+        int nc = fdheld_cap ? fdheld_cap * 2 : 64;
+        void *nb = realloc(fdheld, (size_t)nc * sizeof *fdheld);
+        if (!nb) { perror("arm64chroot: realloc"); exit(127); }   /* as the region table */
+        fdheld = nb;
+        fdheld_cap = nc;
+    }
+    fdheld[fdheld_n].fd = fd;
+    fdheld[fdheld_n].tid = g_tls.tid;
+    fdheld_n++;
+    pthread_mutex_unlock(&fdheld_lock);
+    return fd;
+}
+
+void fdheld_close(int fd) {
+    if (fd < 0) return;
+    fdwin_enter();
+    /* Forget first, close second: the moment the number is free another
+     * thread's open may take it and register it, and it must not find this
+     * entry still there. The window keeps fork out of both steps. */
+    pthread_mutex_lock(&fdheld_lock);
+    for (int i = 0; i < fdheld_n; i++)
+        if (fdheld[i].fd == fd) { fdheld[i] = fdheld[--fdheld_n]; break; }
+    pthread_mutex_unlock(&fdheld_lock);
+    close(fd);
+    fdwin_leave();
+}
+
+/* Forget a held descriptor WITHOUT closing it: it is about to become the
+ * guest's (a synthesized /proc file, a re-opened memfd). Returns fd. */
+int fdheld_forget(int fd) {
+    if (fd < 0) return fd;
+    fdwin_enter();
+    pthread_mutex_lock(&fdheld_lock);
+    for (int i = 0; i < fdheld_n; i++)
+        if (fdheld[i].fd == fd) { fdheld[i] = fdheld[--fdheld_n]; break; }
+    pthread_mutex_unlock(&fdheld_lock);
+    fdwin_leave();
+    return fd;
+}
+
+void fdheld_exec_clear(void) {
+    fdwin_enter();
+    pthread_mutex_lock(&fdheld_lock);
+    int keep = 0;
+    for (int i = 0; i < fdheld_n; i++)
+        if (fdheld[i].tid == g_tls.tid) fdheld[keep++] = fdheld[i];
+    fdheld_n = keep;
+    pthread_mutex_unlock(&fdheld_lock);
+    fdwin_leave();
+}
+
+/* Raw pthread calls, like every other atfork handler: they run inside fork(). */
+void fdheld_fork_prepare(void) {
+    pthread_rwlock_wrlock(&fdwin_lock);   /* waits for every open window */
+    pthread_mutex_lock(&fdheld_lock);
+    fdheld_forker = g_tls.tid;
+}
+void fdheld_fork_parent(void) {
+    pthread_mutex_unlock(&fdheld_lock);
+    pthread_rwlock_unlock(&fdwin_lock);
+}
+void fdheld_fork_child(void) {
+    /* Only the forking thread came across: what every other thread held is a
+     * descriptor nobody here will ever close or use. The forker's own stay --
+     * a broker spawn from inside a syscall that holds a pin, say. */
+    int keep = 0;
+    for (int i = 0; i < fdheld_n; i++) {
+        if (fdheld[i].tid == fdheld_forker) fdheld[keep++] = fdheld[i];
+        else close(fdheld[i].fd);
+    }
+    fdheld_n = keep;
+    pthread_mutex_init(&fdheld_lock, NULL);
+    pthread_rwlock_init(&fdwin_lock, NULL);
 }
 
 /* A path spelling of a pinned target, for the syscalls with no *at form at all
@@ -1254,11 +1379,17 @@ int path_pin_spell(const PathPin *p, char *out) {
  * that file however the tree changes afterwards; path_fd_spell writes it.
  * Returns the fd or -errno. */
 int path_pin_final(const PathPin *p) {
+    fdwin_enter();
     int fd = p->pinned
         ? openat(p->dfd, p->base, O_PATH | O_NOFOLLOW | O_CLOEXEC)
         : open(p->host, O_PATH | O_CLOEXEC);
-    return fd < 0 ? -errno : fd;
+    int e = errno;
+    fdheld_add(fd);
+    fdwin_leave();
+    return fd < 0 ? -e : fd;
 }
+
+void path_unpin_final(int fd) { fdheld_close(fd); }
 
 void path_fd_spell(int fd, char *out) {
     snprintf(out, PATH_MAX, "/proc/self/fd/%d", fd);

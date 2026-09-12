@@ -90,7 +90,7 @@ SYSDEF(shmat) {
         else       shm_att_add_local(c->m, shmid, addr, len);
     }
     as_unlock();
-    close(fd);                       /* mapping now backs it; drop the host fd */
+    broker_fd_close(fd);             /* mapping now backs it; drop the host fd */
     if (err) { shmbroker_dt(c->m, shmid); return (u64)(s64)err; }
     return addr;
 }

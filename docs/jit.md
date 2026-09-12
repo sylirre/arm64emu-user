@@ -329,7 +329,9 @@ added behind a flag.
 The code cache is first allocated as anonymous `PROT_READ|WRITE|EXEC`. Where a
 host forbids that (SELinux `execmem`, common on Android app processes), it falls
 back to a `memfd_create` dual mapping (a writable view + an executable view of
-the same pages). If neither works — `memfd_create` may itself be seccomp-blocked
+the same pages; the descriptor is closed as soon as both are mapped — guest fd
+== host fd, so one the emulator kept would be a number the guest sees). If
+neither works — `memfd_create` may itself be seccomp-blocked
 on old Android, which the process-lifetime SIGSYS net turns into `-ENOSYS` —
 `--jit` warns once and the interpreter runs. Any new raw syscall here is subject
 to the same Android Oreo allow-list audit as the rest of the tree; `make

@@ -361,6 +361,15 @@ trims them, keeping the ones that fit and raising `MSG_CTRUNC`. Two calls let
 the guest *name* the number, and there the limit is a plain argument check with
 its own errno: `dup3` above the limit is `EBADF`, `fcntl(F_DUPFD)` is `EINVAL`.
 
+What the pin must *not* cost is a descriptor in a fork child: the parent's
+whole table is duplicated, and a pin a sibling thread held at that instant
+used to cross into the child for good (a kernel's path walk holds dentries,
+not descriptors, so its children carry none). Every pin is held against fork
+now, and so is every other descriptor the emulator opens for itself on a guest
+thread — see "A child inherits no descriptor of the emulator's own" in
+`docs/signals-and-processes.md` and `machine.h`, "the emulator's own
+descriptors".
+
 `dup3` is also the one call that *replaces* a descriptor the emulator may be
 tracking by number (a signalfd served from the capture ring, a written-through
 `/proc` id-map file, a substituted netlink socket, a tier memfd), and it

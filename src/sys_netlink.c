@@ -555,13 +555,17 @@ bool nl_host_blocks(void)
      * nl_groups == 0. Some hosts permit socket creation but reject bind()
      * under a separate SELinux/seccomp check, so probing socket() alone would
      * wrongly classify them as "AF_NETLINK works". */
+    fdwin_enter();   /* the probe socket is ours, briefly (machine.h) */
     fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-    if (fd < 0)
+    if (fd < 0) {
+        fdwin_leave();
         goto blocked;
+    }
     memset(&snl, 0, sizeof(snl));
     snl.nl_family = AF_NETLINK;
     if (bind(fd, (struct sockaddr *) &snl, sizeof(snl)) < 0) {
         close(fd);
+        fdwin_leave();
         goto blocked;
     }
 
@@ -593,10 +597,12 @@ bool nl_host_blocks(void)
                (struct sockaddr *) &snl, sizeof(snl)) < 0
         && (errno == EACCES || errno == EPERM)) {
         close(fd);
+        fdwin_leave();
         goto blocked;
     }
 
     close(fd);
+    fdwin_leave();
     __atomic_store_n(&cached, PROBE_ALLOWED, __ATOMIC_RELAXED);
     return false;
 
@@ -1436,7 +1442,13 @@ static u64 nl_take_request(CPU *c, int fd, const GIovec *gi, unsigned cnt,
         return (u64)(s64)-ENOBUFS;
     }
     sk->reply_off = 0;
+    /* The builders open sockets of their own -- a netlink dump relay, an
+     * ioctl socket, getifaddrs' internal one -- into a buffer of ours, with
+     * no guest memory and no lock touched: one fd window covers them all
+     * (machine.h, "the emulator's own descriptors"). */
+    fdwin_enter();
     sk->reply_len = build_reply_into(sk->reply, NL_REPLY_MAX, head, headlen);
+    fdwin_leave();
     /* The reply is ready now, so the socket must read as readable now: a caller
      * that waits for POLLIN before receiving is the common shape. */
     nl_sync_ready(c->m, i);
@@ -1866,7 +1878,12 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
         if (copy_from_guest(c, &idx, arg + IFNAMSIZ, sizeof idx) < 0)
             return 0;
         memset(nm, 0, sizeof nm);
-        if (idx > 0 && if_indextoname((unsigned) idx, nm) == NULL) {
+        fdwin_enter();   /* if_indextoname opens a socket (machine.h) */
+        char *found_nm = idx > 0 ? if_indextoname((unsigned) idx, nm) : NULL;
+        int ie = errno;
+        fdwin_leave();
+        errno = ie;
+        if (idx > 0 && found_nm == NULL) {
             if (idx != 1) { *ret = (u64)(s64) -ENODEV; return 1; }
             strcpy(nm, "lo");                        /* loopback is index 1 */
         }
@@ -1894,7 +1911,10 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
         return 0;
     name[IFNAMSIZ - 1] = '\0';
 
-    if (!gather_ifq(name, &q)) {
+    fdwin_enter();   /* getifaddrs and the ioctl socket (machine.h) */
+    int found = gather_ifq(name, &q);
+    fdwin_leave();
+    if (!found) {
         *ret = (u64)(s64) -ENODEV;                   /* real kernel's errno */
         return 1;
     }
@@ -1963,7 +1983,10 @@ int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
         return 0;
 
     /* SIOCGIFCONF is IPv4-only: one ifreq per AF_INET address (aliases too). */
-    if (getifaddrs(&ifaddr) == 0) {
+    fdwin_enter();   /* getifaddrs' own socket (machine.h) */
+    int gia = getifaddrs(&ifaddr);
+    fdwin_leave();
+    if (gia == 0) {
         for (ifa = ifaddr; ifa != NULL && n < 64; ifa = ifa->ifa_next) {
             struct sockaddr_in *si;
             if (ifa->ifa_name == NULL || ifa->ifa_addr == NULL)

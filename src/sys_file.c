@@ -314,8 +314,10 @@ static int l2s_marker_name(char *out, unsigned long long ino, unsigned long coun
 }
 
 static void l2s_touch(int dfd, const char *name) {
+    fdwin_enter();   /* ours, briefly (machine.h) */
     int fd = openat(dfd, name, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd >= 0) close(fd);
+    fdwin_leave();
 }
 
 /* Are these two descriptors the same directory? Two pins of one directory are
@@ -330,10 +332,11 @@ static int l2s_same_dir(int a, int b) {
 /* Live link count for inode `ino`: scan the pinned directory for its
  * ".l2s.<ino>.<count>" marker. 0 (found, fills *count) or -1 (no marker). */
 static int l2s_find_marker(int dfd, unsigned long long ino, unsigned long *count) {
+    fdwin_enter();   /* the scan's own descriptor (machine.h) */
     int d2 = openat(dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (d2 < 0) return -1;
+    if (d2 < 0) { fdwin_leave(); return -1; }
     DIR *d = fdopendir(d2);
-    if (!d) { close(d2); return -1; }
+    if (!d) { close(d2); fdwin_leave(); return -1; }
     struct dirent *de;
     int found = -1;
     while ((de = readdir(d)) != NULL) {
@@ -343,6 +346,7 @@ static int l2s_find_marker(int dfd, unsigned long long ino, unsigned long *count
         }
     }
     closedir(d);                                  /* closes d2 */
+    fdwin_leave();
     return found;
 }
 
@@ -397,15 +401,18 @@ static int l2s_target(const PathPin *p, char *data, unsigned long *count) {
 static int l2s_materialize(struct Machine *m, int sdfd, const char *sname,
                            int ddfd, const char *dname) {
 #define L2SLOG(...) do { if (m->strace) fprintf(stderr, "l2s: " __VA_ARGS__); } while (0)
+    /* Both descriptors are ours for the length of the copy: one window over
+     * all of it (machine.h, "the emulator's own descriptors"). */
+    fdwin_enter();
     int in = openat(sdfd, sname, O_RDONLY | O_CLOEXEC);  /* follows /proc/self/fd/N */
-    if (in < 0) { L2SLOG("materialize open('%s'): %s\n", sname, strerror(errno)); return -errno; }
+    if (in < 0) { int e = errno; fdwin_leave(); L2SLOG("materialize open('%s'): %s\n", sname, strerror(e)); return -e; }
     struct stat sst;
-    if (fstat(in, &sst) < 0) { int e = errno; close(in); return -e; }
-    if (!S_ISREG(sst.st_mode)) { close(in); return -EPERM; }   /* only regular content */
+    if (fstat(in, &sst) < 0) { int e = errno; close(in); fdwin_leave(); return -e; }
+    if (!S_ISREG(sst.st_mode)) { close(in); fdwin_leave(); return -EPERM; }   /* only regular content */
 
     int out = openat(ddfd, dname, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
                      sst.st_mode & 0777);
-    if (out < 0) { int e = errno; close(in); L2SLOG("materialize creat('%s'): %s\n", dname, strerror(e)); return -e; }
+    if (out < 0) { int e = errno; close(in); fdwin_leave(); L2SLOG("materialize creat('%s'): %s\n", dname, strerror(e)); return -e; }
 
     char buf[65536];
     ssize_t n;
@@ -422,6 +429,7 @@ static int l2s_materialize(struct Machine *m, int sdfd, const char *sname,
     if (rc == 0) fchmod(out, sst.st_mode & 0777);    /* best-effort metadata */
     close(in);
     if (close(out) < 0 && rc == 0) rc = -errno;
+    fdwin_leave();
     if (rc != 0) { unlinkat(ddfd, dname, 0); L2SLOG("materialize copy '%s'->'%s': %s\n", sname, dname, strerror(-rc)); }
     return rc;
 #undef L2SLOG
@@ -675,12 +683,15 @@ static void l2s_fix_fd(int fd, struct stat *st) {
     if (!dl) dl = 1;                          /* a root child: the root itself */
     memcpy(dir, path, dl);
     dir[dl] = 0;
+    fdwin_enter();   /* the directory's fd is ours, briefly (machine.h) */
     int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd < 0) return;
-    unsigned long count;
-    if (l2s_find_marker(dfd, ino, &count) == 0)
-        st->st_nlink = count ? count : 1;
-    close(dfd);
+    if (dfd >= 0) {
+        unsigned long count;
+        if (l2s_find_marker(dfd, ino, &count) == 0)   /* nests a window: fine */
+            st->st_nlink = count ? count : 1;
+        close(dfd);
+    }
+    fdwin_leave();
 }
 #endif /* L2S_ENABLED */
 
@@ -761,6 +772,10 @@ static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
     }
     struct stat st;
     if (fstat(own, &st) < 0 || !S_ISREG(st.st_mode)) { errno = EACCES; return -1; }
+    /* Held while the copy is made -- the guest gets the number only once
+     * the snapshot is complete (machine.h, "the emulator's own
+     * descriptors"); forgotten, not closed, on the way out. */
+    fdwin_enter();
 #if defined(__BIONIC__) && defined(SYS_memfd_create)
     int nfd = (int)syscall(SYS_memfd_create, "fdreopen", 2 /* MFD_ALLOW_SEALING */);
 #else
@@ -768,16 +783,18 @@ static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
 #endif
     if (nfd < 0) {
         nfd = a64_mfdfile(0);                    /* the tier's own backing */
-        if (nfd < 0) { errno = EACCES; return -1; }
+        if (nfd < 0) { fdwin_leave(); errno = EACCES; return -1; }
         *tiered = 1;
     }
+    fdheld_add(nfd);
+    fdwin_leave();
     char buf[65536];
     off_t off = 0;
     for (;;) {
         ssize_t rd = pread(own, buf, sizeof buf, off);
         if (rd == 0) break;
         if (rd < 0 || pwrite(nfd, buf, (size_t)rd, off) != rd) {
-            close(nfd);
+            fdheld_close(nfd);
             errno = EACCES;
             return -1;
         }
@@ -789,7 +806,7 @@ static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
          * snapshot of a sealed original would be worse than refusing. */
         if (mfdbroker_reg(c->m, nfd, 0xf /* SEAL|SHRINK|GROW|WRITE */,
                           "fdreopen") < 0) {
-            close(nfd);
+            fdheld_close(nfd);
             errno = EACCES;
             return -1;
         }
@@ -799,7 +816,7 @@ static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
         fcntl(nfd, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
     }
     if (gflags & O_CLOEXEC) fcntl(nfd, F_SETFD, FD_CLOEXEC);
-    return nfd;   /* offset 0, like the re-open the host denied */
+    return fdheld_forget(nfd);   /* offset 0, like the re-open the host denied */
 }
 
 /* open(2) promises the LOWEST free descriptor, and here the guest's numbers are
@@ -2806,7 +2823,7 @@ SYSDEF(truncate) {
         if (fstat(ffd, &st) == 0)
             as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)(s64)a1);
     }
-    close(ffd);
+    path_unpin_final(ffd);
     return e;
 }
 
@@ -2855,7 +2872,7 @@ SYSDEF(fchmodat) {
     char spell[PATH_MAX];
     path_fd_spell(ffd, spell);
     u64 ret = chattr_result(c->m, chmod(spell, (mode_t)a2));
-    close(ffd);
+    path_unpin_final(ffd);
     return ret;
 }
 
@@ -3086,7 +3103,7 @@ SYSDEF(statfs) {
         sr = statfs(spell, &h);
     }
     u64 e = sr < 0 ? host_err() : 0;
-    close(ffd);
+    path_unpin_final(ffd);
     return sr < 0 ? e : statfs_out(c, a1, &h);
 }
 
@@ -3416,6 +3433,7 @@ SYSDEF(ppoll) {
  * have outgrown, if the host's /proc is not there to ask. */
 static int host_fdtable_size(void) {
     int size = -1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     FILE *f = fopen("/proc/self/status", "re");
     if (f) {
         char line[128];
@@ -3423,6 +3441,7 @@ static int host_fdtable_size(void) {
             if (!strncmp(line, "FDSize:", 7)) { size = atoi(line + 7); break; }
         fclose(f);
     }
+    fdwin_leave();
     if (size <= 0) {
         struct rlimit rl;
         size = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max <= (rlim_t)INT_MAX

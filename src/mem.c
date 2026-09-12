@@ -340,7 +340,41 @@ void emu_lock_order_warn(unsigned taking, unsigned held) {
     (void)!write(2, buf, n);
 }
 
+void emu_fdwin_lock_warn(unsigned taking) {
+    static unsigned reported;
+    int ti = 0;
+    for (unsigned b = taking; b > 1u; b >>= 1) ti++;
+    if (ti >= EMU_LK_COUNT) return;
+    if (__atomic_fetch_or(&reported, taking, __ATOMIC_RELAXED) & taking) return;
+    char buf[256];
+    size_t n = 0;
+    const char *parts[] = {
+        "arm64chroot: lock taken inside an fd window: ",
+        emu_lk_names[ti],
+        ".\n  A window (machine.h, \"the emulator's own descriptors\") may take no\n"
+        "  emulator lock: fork's prepare handler holds them all while it waits\n"
+        "  for open windows, so this one would hold fork up for good.\n",
+    };
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        size_t l = strlen(parts[i]);
+        if (n + l >= sizeof buf) break;
+        memcpy(buf + n, parts[i], l);
+        n += l;
+    }
+    (void)!write(2, buf, n);
+}
+
 void emu_fork_check(const char *site) {
+    if (UNLIKELY(g_fdwin_depth)) {
+        /* The prepare handler takes the fd-window barrier exclusively, and a
+         * thread inside a window holds it shared: this fork would wait for
+         * itself. */
+        fprintf(stderr,
+                "arm64chroot: internal error: %s forks from inside an fd window\n"
+                "  (machine.h, \"the emulator's own descriptors\"); aborting.\n", site);
+        fflush(stderr);
+        abort();
+    }
     if (LIKELY(!g_emu_lk_held && !g_emu_as_depth)) return;
     fprintf(stderr,
             "arm64chroot: internal error: %s forks while holding %s.\n"
@@ -1752,11 +1786,13 @@ static int __attribute__((cold)) host_page_readable(const u8 *hp) {
         __atomic_store_n(&no_pvr, 1, __ATOMIC_RELAXED);
     }
     int pf[2];
-    if (pipe2(pf, O_CLOEXEC) < 0) return 0;
+    fdwin_enter();   /* a descriptor of our own, however briefly (machine.h) */
+    if (pipe2(pf, O_CLOEXEC) < 0) { fdwin_leave(); return 0; }
     ssize_t n;
     do { n = write(pf[1], hp, 1); } while (n < 0 && errno == EINTR);
     close(pf[0]);
     close(pf[1]);
+    fdwin_leave();
     return n == 1;
 }
 

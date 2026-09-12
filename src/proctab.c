@@ -147,10 +147,12 @@ static int g_tab_n;              /* PROCTAB_MAX, or 0 */
  * whitespace-delimited field. 0 if the process is gone or unreadable. */
 static u64 starttime_read(const char *path) {
     char buf[512];
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
+    if (fd < 0) { fdwin_leave(); return 0; }
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
+    fdwin_leave();
     if (n <= 0) return 0;
     buf[n] = 0;
     char *p = strrchr(buf, ')');
@@ -375,12 +377,23 @@ static int broker_recv(int sock, void *data, size_t len, int *fd_out) {
     msg.msg_control = cm.b;
     msg.msg_controllen = sizeof cm.b;
     ssize_t r;
+    /* A descriptor that arrives here (a segment for shmat) is the emulator's
+     * own until its caller has mapped it: registered as held in the same
+     * window that receives it (machine.h, "the emulator's own descriptors"),
+     * and closed with broker_fd_close. Only a receive that can carry one takes
+     * the window; the daemon's side takes it too, harmlessly. */
+    if (fd_out) fdwin_enter();
     do { r = recvmsg(sock, &msg, 0); } while (r < 0 && errno == EINTR);
+    if (r > 0 && fd_out) {
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
+            c->cmsg_len == CMSG_LEN(sizeof(int))) {
+            memcpy(fd_out, CMSG_DATA(c), sizeof(int));
+            fdheld_add(*fd_out);
+        }
+    }
+    if (fd_out) fdwin_leave();
     if (r <= 0) return -1;
-    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-    if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
-        c->cmsg_len == CMSG_LEN(sizeof(int)) && fd_out)
-        memcpy(fd_out, CMSG_DATA(c), sizeof(int));
     /* A stream socket may hand back less than asked. Only the first read has
      * to be a recvmsg (the ancillary data rides with the first byte), so
      * finish the payload plainly rather than letting a caller act on a
@@ -2109,7 +2122,7 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
             if (memfd >= 0) {
                 void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                                MAP_SHARED, memfd, 0);
-                close(memfd);
+                broker_fd_close(memfd);   /* broker_recv registered it */
                 if (p != MAP_FAILED) {
                     g_tab = p;
                     g_tab_n = PROCTAB_MAX;
@@ -2813,18 +2826,28 @@ static int shm_connect(struct Machine *m) {
                                   : broker_addr(&a, 0, m->shm_session);
     int spawns = 0;
     for (int attempt = 0; attempt < 100; attempt++) {
+        /* The socket is the emulator's own for as long as the exchange lasts
+         * -- a parked semop wait, for one -- so it is HELD against a sibling's
+         * fork from the moment it exists (machine.h, "the emulator's own
+         * descriptors"); the caller closes it with shm_disconnect. The spawn
+         * below happens outside the window: it forks. */
+        fdwin_enter();
         int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (s < 0) return -1;
+        if (s < 0) { fdwin_leave(); return -1; }
         struct timeval tv = { 2, 0 };   /* never block forever on a wedged daemon */
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         if (connect(s, (struct sockaddr *)&a, al) == 0) {
-            if (peer_is_ours(s)) return s;      /* see peer_is_ours */
-            close(s);
-            return -1;                          /* squatted: no broker for us */
+            int ours = peer_is_ours(s);         /* see peer_is_ours */
+            if (ours) fdheld_add(s);
+            else close(s);
+            fdwin_leave();
+            return ours ? s : -1;               /* squatted: no broker for us */
         }
+        int e = errno;
         close(s);
-        if (errno != ECONNREFUSED && errno != ENOENT) return -1;
+        fdwin_leave();
+        if (e != ECONNREFUSED && e != ENOENT) return -1;
         /* Spawn a shm-only daemon on the first miss (a --shared-proc proctab
          * daemon, if any, already owns this rendezvous and answers shm too). */
         if (spawns == 0 || attempt % 16 == 0) {
@@ -2835,6 +2858,12 @@ static int shm_connect(struct Machine *m) {
     }
     return -1;
 }
+
+/* Close a socket shm_connect returned. */
+static void shm_disconnect(int s) { fdheld_close(s); }
+
+/* Close a descriptor broker_recv handed out. */
+void broker_fd_close(int fd) { fdheld_close(fd); }
 
 /* Stamp the caller's pid and effective guest creds into a request (the
  * daemon's advisory permission checks run against these). */
@@ -2855,7 +2884,7 @@ static int shm_rpc(struct Machine *m, struct BReq *q, struct BResp *r, int *fd_o
     if (broker_send(s, q, sizeof *q, -1) == 0 &&
         broker_recv(s, r, sizeof *r, fd_out) == 0)
         ok = 0;
-    close(s);
+    shm_disconnect(s);
     return ok;
 }
 
@@ -2872,7 +2901,7 @@ int shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out) {
     q.op = REQ_SHMAT; q.id = shmid; q.arg = readonly ? 1 : 0;
     struct BResp r; int fd = -1;
     if (shm_rpc(m, &q, &r, &fd) < 0) return -EINVAL;
-    if (r.ret < 0) { if (fd >= 0) close(fd); return r.ret; }
+    if (r.ret < 0) { broker_fd_close(fd); return r.ret; }
     if (fd < 0) return -EINVAL;              /* success but no fd: treat as bad id */
     if (size_out) *size_out = r.size;
     return fd;
@@ -2937,7 +2966,7 @@ static int mfd_rpc(struct Machine *m, struct BReq *q, struct BResp *r,
                 name_out[n] = 0;
         }
     }
-    close(s);
+    shm_disconnect(s);
     return ok;
 }
 
@@ -2993,39 +3022,12 @@ void mfdbroker_mapadj(struct Machine *m, u64 dev, u64 ino, int delta) {
 
 /* ---- System V sem/msg broker: client side --------------------------------- */
 
-/* Register/release an in-flight blocking-IPC socket in the per-process stray
- * table (see machine.h: fork-duplicate cleanup). Value fd+1, 0 = free. */
-static int ipc_fd_reg(struct Machine *m, int fd) {
-    for (int i = 0; i < IPC_WAIT_FDS; i++) {
-        s32 expect = 0;
-        if (__atomic_compare_exchange_n(&m->ipc_wait_fd[i], &expect, fd + 1,
-                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return i;
-    }
-    return -1;   /* full: unregistered — only the fork-stray cleanup degrades */
-}
-static void ipc_fd_unreg(struct Machine *m, int slot) {
-    if (slot >= 0)
-        __atomic_store_n(&m->ipc_wait_fd[slot], 0, __ATOMIC_RELEASE);
-}
-
-/* Fork child (only the forking thread exists): close every stray blocking-IPC
- * socket inherited from a parked sibling thread of the parent, and reset the
- * undo marker — a fresh pid holds no SEM_UNDO adjustments yet. */
+/* Fork child (only the forking thread exists): reset the undo marker -- a
+ * fresh pid holds no SEM_UNDO adjustments yet. The blocking-IPC socket a
+ * parked sibling held is closed by the general mechanism now (fdheld,
+ * machine.h), which this used to have a registry of its own for. */
 void ipc_fork_child(struct Machine *m) {
-    for (int i = 0; i < IPC_WAIT_FDS; i++) {
-        s32 v = m->ipc_wait_fd[i];
-        if (v > 0) close(v - 1);
-        m->ipc_wait_fd[i] = 0;
-    }
     m->sem_undo_used = 0;
-}
-
-/* execve (in-process reload): sibling threads are gone and the CLOEXEC walk
- * already closed their parked sockets — only forget the numbers. The undo
- * marker survives: undo lists persist across exec. */
-void ipc_exec_clear(struct Machine *m) {
-    for (int i = 0; i < IPC_WAIT_FDS; i++) m->ipc_wait_fd[i] = 0;
 }
 
 /* One blocking-capable broker exchange (semop / msgsnd / msgrcv). Sends the
@@ -3053,7 +3055,6 @@ static s32 ipc_wait_rpc(struct Machine *m, struct BReq *q,
     if (s < 0) return -EIDRM;
     struct timeval tv0 = { 0, 0 };   /* unbounded sleep: drop the 2 s RCVTIMEO */
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof tv0);
-    int slot = ipc_fd_reg(m, s);
     s32 ret;
     /* Two stream writes (the daemon loop-reads); a signal mid-send cannot
      * cancel — finish the send, the wait below takes the interruption. */
@@ -3089,8 +3090,7 @@ static s32 ipc_wait_rpc(struct Machine *m, struct BReq *q,
         if (n > rmax || read_full(s, rbuf, n) != 0) ret = -EIDRM;
     }
 out:
-    ipc_fd_unreg(m, slot);
-    close(s);
+    shm_disconnect(s);
     return ret;
 }
 
@@ -3160,7 +3160,7 @@ s32 sembroker_getall(struct Machine *m, s32 semid, u16 *vals, u32 cap) {
                 ret = (s32)n;
         }
     }
-    close(s);
+    shm_disconnect(s);
     return ret;
 }
 
@@ -3176,7 +3176,7 @@ s32 sembroker_setall(struct Machine *m, s32 semid, const u16 *vals, u32 nsems) {
         send_full(s, vals, nsems * sizeof *vals) == 0 &&
         read_full(s, &r, sizeof r) == 0)
         ret = r.ret;
-    close(s);
+    shm_disconnect(s);
     return ret;
 }
 

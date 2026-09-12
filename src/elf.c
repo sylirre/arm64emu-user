@@ -237,11 +237,16 @@ int exec_open_pinned(const PathPin *p) {
     int nf = p->pinned ? AT_SYMLINK_NOFOLLOW : 0;
     if (!denied && fstatat(p->dfd, p->name, &gst, nf) == 0 && !S_ISREG(gst.st_mode))
         return -EACCES;
+    /* The descriptor is the emulator's own and lives until the load or the
+     * refusal: held, so a sibling's fork meanwhile does not hand its child a
+     * copy (machine.h, "the emulator's own descriptors"); the caller closes
+     * it with exec_close_image. */
     int fd;
+    fdwin_enter();
     if (denied) { fd = -1; errno = EACCES; }
     else fd = openat(p->dfd, p->name, O_RDONLY | O_CLOEXEC | O_NONBLOCK |
                                           O_NOCTTY | (p->pinned ? O_NOFOLLOW : 0));
-    if (fd >= 0) return fd;
+    if (fd >= 0) { fdheld_add(fd); fdwin_leave(); return fd; }
     /* An image that lives on one of our own fds (execve of /proc/self/fd/N,
      * execveat AT_EMPTY_PATH) on a host that refuses the path re-open --
      * Android denies it for memfds. Every reader here uses pread, which
@@ -250,8 +255,13 @@ int exec_open_pinned(const PathPin *p) {
     int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
     int ownfd = proc_own_fd_path(host_path);
     if (ownfd >= 0) fd = fcntl(ownfd, F_DUPFD_CLOEXEC, 0);
-    return fd >= 0 ? fd : (ownfd >= 0 ? -errno : -e);
+    int e2 = errno;
+    fdheld_add(fd);
+    fdwin_leave();
+    return fd >= 0 ? fd : (ownfd >= 0 ? -e2 : -e);
 }
+
+void exec_close_image(int fd) { fdheld_close(fd); }
 
 /* Resolve a guest path and open it for loading. `canon` may be NULL. Only the
  * interpreter comes through here now -- the executable itself is opened once
@@ -292,7 +302,7 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
     int ifd = exec_open(m, interp, NULL);
     if (ifd < 0) return ifd;
     r = elf_header_check(ifd, NULL);
-    if (r < 0) { close(ifd); return r; }
+    if (r < 0) { exec_close_image(ifd); return r; }
     *interp_fd = ifd;
     return 0;
 }
@@ -417,7 +427,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
             own = 1;
         }
         r = load_one(m, ifd, (u64)-1, &interp, exe.interp);
-        if (own) close(ifd);
+        if (own) exec_close_image(ifd);
         if (r < 0) return r;
         entry = interp.entry;
         at_base = interp.base;

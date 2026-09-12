@@ -142,7 +142,6 @@ typedef struct JitEnv {
     u8 *ptr, *end;              /* bump cursor / limit, in the RW view */
     u8 *blocks_start_rw;        /* flush resets ptr here (thunks precede it) */
     size_t cache_size;
-    int memfd;                  /* backing fd for the dual-map case, else -1 */
 
     JBlock **hash;              /* [JIT_HASH_SIZE] */
     JBlock **pages;             /* [JIT_PAGE_TBL], chained via page_next */

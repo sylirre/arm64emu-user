@@ -425,17 +425,6 @@ struct Machine {
      * See shmbroker_* in proctab.c. */
     u64 shm_session;
 
-    /* In-flight blocking-IPC sockets (a semop/msgsnd/msgrcv sleeping in the
-     * broker holds its CLOEXEC connection open for the wait). A fork by a
-     * sibling thread duplicates such an fd into the child, where it is a
-     * stray: guest-visible, and muting the broker's waiter-death POLLHUP.
-     * ipc_fork_child closes every registered fd right after fork; execve only
-     * clears the table (its CLOEXEC walk already closed the fds). Slots hold
-     * fd+1 (0 = free) and are claimed/released with atomics — a lock here
-     * could be fork-inherited in a held state. */
-#define IPC_WAIT_FDS 64
-    s32 ipc_wait_fd[IPC_WAIT_FDS];
-
     u8 sem_undo_used;         /* this process may hold SEM_UNDO adjustments:
                                * apply them (REQ_SEMEXIT) at process exit.
                                * Survives execve (undo lists do too); cleared
@@ -736,6 +725,11 @@ extern __thread int g_emu_as_depth;       /* as_lock, which nests: a count */
  * is one test of two thread-locals. */
 #define EMU_LK_INNER(bit) (~((unsigned)(bit) - 1u))
 void emu_lock_order_warn(unsigned taking, unsigned held);
+/* A lock taken inside an fd window (below): the fork barrier is taken last
+ * by the prepare handler, with every lock already held, so a window that
+ * waits for one holds fork up for good. Warned once per lock, like the
+ * inversions above. */
+void emu_fdwin_lock_warn(unsigned taking);
 
 /* The whole scheme is the bit positions being in hierarchy order; renumbering
  * them into anything else silently turns the check into noise. */
@@ -752,6 +746,7 @@ _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
                              (g_emu_as_depth ? (unsigned)EMU_LK_AS : 0u); \
         if (emu_held_ & EMU_LK_INNER(bit)) \
             emu_lock_order_warn((unsigned)(bit), emu_held_); \
+        if (g_fdwin_depth) emu_fdwin_lock_warn((unsigned)(bit)); \
         pthread_mutex_lock(mtx); \
         g_emu_lk_held |= (unsigned)(bit); \
     } while (0)
@@ -784,6 +779,9 @@ u64 exec_arg_budget(struct Machine *m);
  * a static image) for load_elf, so nothing is re-opened by name in between.
  * Returns 0 or -errno. */
 int elf_probe(struct Machine *m, int fd, int *interp_fd);
+/* Close a descriptor exec_open_pinned or elf_probe handed out (they are held
+ * against fork -- fdheld_close). */
+void exec_close_image(int fd);
 
 /* path.c: resolve a guest path against the rootfs.
  * dirfd: guest fd for *at syscalls, or AT_FDCWD.
@@ -853,6 +851,58 @@ int  path_pin_spell(const PathPin *p, char *out);
  * /proc/self/fd/<fd> then names that exact inode. Returns the fd or -errno;
  * path_fd_spell writes the spelling (out >= PATH_MAX). */
 int  path_pin_final(const PathPin *p);
+/* Close a path_pin_final descriptor (it is one of the emulator's own: see
+ * fdheld_close below). */
+void path_unpin_final(int fd);
+
+/* ---- the emulator's own descriptors, and fork -----------------------------
+ *
+ * Guest fd == host fd, so every descriptor the emulator opens for itself on a
+ * guest thread -- a pin's O_PATH parent (path.c), the image an execve is
+ * loading, a /proc file it is reading for a synthesized view, a probe pipe --
+ * sits in the guest's own table while it is open. That is contained (every
+ * path operation goes through the resolver) and invisible, EXCEPT to fork: a
+ * child duplicates the whole table, so one that a sibling thread held at that
+ * instant crossed into the child and stayed there for good -- 222 of 300
+ * children of a four-thread opener loop carried an extra directory fd, where
+ * a kernel's carry none (the kernel's path walk holds dentries, not
+ * descriptors). Guest-visible: the next open() returned a higher number and
+ * /proc/self/fd listed it.
+ *
+ * Two mechanisms close that, and every internal descriptor uses one or both:
+ *
+ *   - A WINDOW (fdwin_enter/fdwin_leave) brackets the whole life of a
+ *     short-lived one -- open, use, close -- and fork waits for open windows
+ *     to close before it duplicates the table (a read-write lock: windows take
+ *     it shared, the atfork prepare handler takes it exclusive, last in the
+ *     hierarchy). Nothing inside a window may take an emulator lock or touch
+ *     guest memory (as_lock): prepare holds every lock by then, and a window
+ *     that waited for one would hold the fork up forever. Windows are for a
+ *     few host syscalls into a local buffer.
+ *
+ *   - A HELD entry (fdheld_add, inside a window) records a descriptor that
+ *     outlives its window -- a pin held across the syscall it serves, the
+ *     execve image held across the shebang loop -- with the thread holding it.
+ *     A fork child closes every entry that belongs to a thread other than the
+ *     one that forked (only that thread exists in the child) and forgets them;
+ *     fdheld_close closes and forgets one atomically against fork, so a number
+ *     cannot be closed, reused by the guest, and then found in the table by a
+ *     child that closes it a second time.
+ *
+ * The blocking IPC socket a parked broker wait holds used to have a registry
+ * of its own of this shape (ipc_wait_fd); it is held here now like the rest,
+ * and every entry goes at execve (fdheld_exec_clear), once de_thread has
+ * ended the threads that held them. */
+void fdwin_enter(void);
+void fdwin_leave(void);
+int  fdheld_add(int fd);            /* inside a window; returns fd */
+void fdheld_close(int fd);          /* -1 is a no-op */
+int  fdheld_forget(int fd);         /* handed to the guest: not ours any more */
+void fdheld_fork_prepare(void);     /* the atfork triple (main.c) */
+void fdheld_fork_parent(void);
+void fdheld_fork_child(void);
+void fdheld_exec_clear(void);       /* past de_thread: nobody else's entries */
+extern __thread int g_fdwin_depth;  /* windows this thread is inside */
 
 /* -link2symlink (sys_file.c): if `p` names one of the emulated-hardlink
  * scheme's members, rewrite the pin to name the group's backing file instead,
@@ -1118,9 +1168,11 @@ struct ShmStat {              /* shmctl STAT/INFO payload, host-native fields */
 };
 /* shmget: find-or-create the segment for key/size/shmflg; shmid (>0) or -errno. */
 s32  shmbroker_get(struct Machine *m, s32 key, u64 size, s32 shmflg);
-/* shmat: hand back a mappable host fd for shmid (caller mmaps then closes it)
- * and increment nattch; fills *size_out. Returns the fd (>=0) or -errno. */
+/* shmat: hand back a mappable host fd for shmid (caller mmaps then closes it
+ * with broker_fd_close: it is held against fork until then) and increment
+ * nattch; fills *size_out. Returns the fd (>=0) or -errno. */
 int  shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out);
+void broker_fd_close(int fd);
 /* Decrement nattch for one attachment of shmid (shmdt / detach on exec+exit). */
 void shmbroker_dt(struct Machine *m, s32 shmid);
 /* Increment nattch for one inherited attachment of shmid (fork child). */
@@ -1206,9 +1258,7 @@ s64  msgbroker_rcv(struct Machine *m, s32 msqid, s64 msgtyp, void *buf, u64 sz,
 /* msgctl: STAT cmds fill *st; IPC_SET reads mode/uid/gid/qbytes from *st;
  * MSG_INFO/IPC_INFO fill the info fields and return the max index. */
 s32  msgbroker_ctl(struct Machine *m, s32 msqid, s32 cmd, struct MsgStat *st);
-/* Fork child: close stray in-flight IPC sockets, reset sem_undo_used. */
+/* Fork child: reset sem_undo_used (a fresh pid holds no adjustments). */
 void ipc_fork_child(struct Machine *m);
-/* execve: forget the (already-closed) in-flight sockets. */
-void ipc_exec_clear(struct Machine *m);
 
 #endif /* A64_MACHINE_H */

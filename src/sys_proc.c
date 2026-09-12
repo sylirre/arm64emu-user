@@ -946,12 +946,14 @@ static void dethread_kick(s32 tid) {
 /* What /proc/self/task lists, verbatim. Returns -1 without /proc, which the
  * callers treat as "cannot tell". */
 static int host_task_count_raw(void) {
+    fdwin_enter();   /* the directory's fd is ours, briefly (machine.h) */
     DIR *d = opendir("/proc/self/task");
-    if (!d) return -1;
+    if (!d) { fdwin_leave(); return -1; }
     int n = 0;
     struct dirent *e;
     while ((e = readdir(d))) if (e->d_name[0] != '.') n++;
     closedir(d);
+    fdwin_leave();
     return n;
 }
 
@@ -979,6 +981,7 @@ static int g_nforeign;
 void proc_foreign_sample(void) {
     g_nforeign = 0;
     s32 self = (s32)getpid();
+    fdwin_enter();   /* the directory's fd is ours, briefly (machine.h) */
     DIR *d = opendir("/proc/self/task");
     if (d) {
         struct dirent *e;
@@ -989,6 +992,7 @@ void proc_foreign_sample(void) {
         }
         closedir(d);
     }
+    fdwin_leave();
     /* Into the registry for everyone else. A no-op from main(), where this
      * process has no entry yet -- proctab_register_at publishes it there. */
     proctab_foreign_publish(g_foreign, g_nforeign);
@@ -1038,8 +1042,9 @@ static int host_task_count(void) {
  * running guest code never leaves the interpreter/JIT fast path on its own and
  * de_thread falls back on timing out -- correctly, if unhelpfully. */
 static void dethread_kick_all(s32 self) {
+    fdwin_enter();   /* the directory's fd is ours, briefly (machine.h) */
     DIR *d = opendir("/proc/self/task");
-    if (!d) return;
+    if (!d) { fdwin_leave(); return; }
     struct dirent *de;
     while ((de = readdir(d))) {
         s32 tid = (s32)atoi(de->d_name);
@@ -1048,6 +1053,7 @@ static void dethread_kick_all(s32 self) {
         dethread_kick(tid);
     }
     closedir(d);
+    fdwin_leave();
 }
 
 /* A cancelled de_thread must be invisible to the guest, so the syscall the
@@ -1434,7 +1440,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * which is why this sits inside the loop. */
         r = exec_perm_check(m, &pin, imgfd, &img_st);
         path_unpin(&pin);        /* nothing below names the image by path */
-        if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
+        if (r < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
 
         /* The argument vectors are taken here: the image is open and judged,
          * and nothing of its contents has been read. That is the window a
@@ -1446,7 +1452,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * EFAULT of an argv the guest cannot back did the same. */
         if (!argv) {
             r = exec_vecs_take(c, argv_in, envp_in, &argv, &envp);
-            if (r < 0) { close(imgfd); return (u64)(s64)r; }
+            if (r < 0) { exec_close_image(imgfd); return (u64)(s64)r; }
         }
         /* ...and measured, which is bprm_stack_limits' place in that same
          * window: ahead of the ENOEXEC of a file that is no executable format
@@ -1454,14 +1460,14 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * there. Measured again on each turn of the loop, since the shebang
          * rewrite below adds to the list. */
         r = exec_arg_limit(m, canon, argv, envp);
-        if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
+        if (r < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
         /* The kernel's binprm buffer: BINPRM_BUF_SIZE bytes, zero-padded
          * when the file is shorter, and never NUL-terminated by itself. */
         unsigned char hdr[256];
         size_t n;
         memset(hdr, 0, sizeof hdr);
         ssize_t hn = pread(imgfd, hdr, sizeof hdr, 0);  /* leaves the offset alone */
-        if (hn < 0) { close(imgfd); free_execvecs(argv, envp); return host_err(); }
+        if (hn < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return host_err(); }
         n = (size_t)hn;
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
             /* shebang: rebuild argv = [interp, (arg), script, argv[1..]],
@@ -1481,7 +1487,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
             if (!i_end) {
                 i_end = shebang_next_non_blank(buf + 2, buf_end);
                 if (!i_end || !shebang_next_terminator(i_end, buf_end)) {
-                    close(imgfd); free_execvecs(argv, envp);
+                    exec_close_image(imgfd); free_execvecs(argv, envp);
                     return (u64)(s64)-ENOEXEC;   /* all blank, or a cut name */
                 }
                 i_end = buf_end;
@@ -1489,7 +1495,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
             while (i_end[-1] == ' ' || i_end[-1] == '\t') i_end--;
             char *interp = shebang_next_non_blank(buf + 2, i_end), *arg = NULL;
             if (!interp || interp == i_end) {
-                close(imgfd); free_execvecs(argv, envp);
+                exec_close_image(imgfd); free_execvecs(argv, envp);
                 return (u64)(s64)-ENOEXEC;   /* no interpreter name */
             }
             char *sep = shebang_next_terminator(interp, i_end);
@@ -1501,11 +1507,11 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
              * NUL -- passes load_script's checks and goes to open_exec as "",
              * which a kernel-side lookup takes as the working directory: a
              * directory is not a regular file, so EACCES, never ENOENT. */
-            if (!*interp) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-EACCES; }
+            if (!*interp) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)-EACCES; }
             int oldc = 0;
             while (argv[oldc]) oldc++;
             char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));
-            if (!nv) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOMEM; }
+            if (!nv) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOMEM; }
             int k = 0;
             nv[k++] = strdup(interp);
             if (arg) nv[k++] = strdup(arg);
@@ -1516,7 +1522,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
                 if (!nv[i]) {   /* a NULL hole would silently truncate argv */
                     for (int j = 0; j < k; j++) free(nv[j]);
                     free(nv);
-                    close(imgfd);
+                    exec_close_image(imgfd);
                     free_execvecs(argv, envp);
                     return (u64)(s64)-ENOMEM;
                 }
@@ -1531,13 +1537,13 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
              * script's, which is the execfn a kernel measures here too: the
              * rewrite changes bprm->interp, never bprm->filename. */
             r = exec_arg_limit(m, canon, argv, envp);
-            if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
+            if (r < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
-            close(imgfd);
+            exec_close_image(imgfd);
             continue;
         }
         if (n >= 4 && !memcmp(hdr, "\177ELF", 4)) break;   /* imgfd held past here */
-        close(imgfd);
+        exec_close_image(imgfd);
         free_execvecs(argv, envp);
         return (u64)(s64)-ENOEXEC;
     }
@@ -1551,7 +1557,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * -- load_elf_binary keeps its interpreter's struct file the same way. */
     int ifd = -1;
     int pr = elf_probe(m, imgfd, &ifd);
-    if (pr < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)pr; }
+    if (pr < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)pr; }
 
     /* setuid/setgid bit on the final ELF, read off the same stat the
      * permission check judged -- the image's own descriptor, not its name.
@@ -1583,8 +1589,8 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     int carrier_is_me = 1;
     int dt = dethread_begin(c, pathbuf, &carrier_is_me);
     if (dt < 0) {
-        close(imgfd);
-        if (ifd >= 0) close(ifd);
+        exec_close_image(imgfd);
+        if (ifd >= 0) exec_close_image(ifd);
         free_execvecs(argv, envp);
         return (u64)(s64)dt;
     }
@@ -1592,10 +1598,12 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     /* Point of no return: tear down and reload. */
     if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
     if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
-    shm_detach_all(m);       /* System V shm attaches do not survive execve */
-    ipc_exec_clear(m);       /* forget parked-IPC sockets (the CLOEXEC walk
-                              * below closes the fds); SEM_UNDO lists and
-                              * m->sem_undo_used survive exec */
+    shm_detach_all(m);       /* System V shm attaches do not survive execve;
+                              * SEM_UNDO lists and m->sem_undo_used do */
+    fdheld_exec_clear();     /* the descriptors de_thread's dead siblings held
+                              * go to the CLOEXEC walk below; forget them, or
+                              * a fork child of the new image would close
+                              * whatever reused their numbers */
     ptimers_exec_clear();    /* POSIX timers do not survive execve */
     /* Reload the address space in place, leaving as.nthreads untouched: the
      * threads de_thread left alive go on sharing this one (as_init's fresh
@@ -1613,8 +1621,8 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
 
     int r = load_elf(m, imgfd, ifd, canon, argv, envp);
-    close(imgfd);
-    if (ifd >= 0) close(ifd);
+    exec_close_image(imgfd);
+    if (ifd >= 0) exec_close_image(ifd);
     free_execvecs(argv, envp);
     if (r < 0) {
         /* Nothing can be returned any more: the caller's image is gone. A

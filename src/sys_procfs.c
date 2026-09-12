@@ -308,10 +308,11 @@ static void put_loadavg(int fd) {
  * tests; probed once per process, netlink-style. */
 static int stat_probe_blocked(void) {
     if (getenv("A64_PROCSTAT_FORCE_SYNTH")) return 1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 1;
-    close(fd);
-    return 0;
+    if (fd >= 0) close(fd);
+    fdwin_leave();
+    return fd < 0;
 }
 static int stat_blocked(void) {
     static int blocked = -1;
@@ -337,12 +338,13 @@ static int procfs_old_host(void) {
  * file per process; A64_OVERFLOWID_FORCE_SYNTH forces the fallback in tests. */
 static int overflowid_probe_blocked(int is_gid) {
     if (getenv("A64_OVERFLOWID_FORCE_SYNTH")) return 1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open(is_gid ? "/proc/sys/kernel/overflowgid"
                          : "/proc/sys/kernel/overflowuid",
                   O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 1;
-    close(fd);
-    return 0;
+    if (fd >= 0) close(fd);
+    fdwin_leave();
+    return fd < 0;
 }
 static int overflowid_blocked(int is_gid) {
     static int blocked[2] = { -1, -1 };
@@ -480,11 +482,13 @@ static void stat_estimate(struct Machine *m, u64 ncpu, u64 *busy_j, u64 *idle_j)
  * report the same idle time. */
 static int host_stat_idle(u64 *idle_j) {
     if (stat_blocked()) return 0;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
+    if (fd < 0) { fdwin_leave(); return 0; }
     char buf[256];
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
+    fdwin_leave();
     if (n <= 0) return 0;
     buf[n] = '\0';
     unsigned long long u, ni, sy, id;
@@ -906,7 +910,15 @@ static int synth_memfd(void) {
         errno = ENOSYS;
         return -1;
     }
-    return a64_anonfd("proc-synth");
+    /* Held from birth: the view is built over several writes, some under
+     * the emulator's locks, before the guest gets the number -- a sibling's
+     * fork meanwhile must not hand its child the half-built file (machine.h,
+     * "the emulator's own descriptors"). procfs_open lets go of it with
+     * fdheld_forget as it hands it over, and closes it with fdheld_close. */
+    fdwin_enter();
+    int fd = fdheld_add(a64_anonfd("proc-synth"));
+    fdwin_leave();
+    return fd;
 }
 
 /* What to answer when there is no anonymous backing for a synthesized view.
@@ -1088,10 +1100,12 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
         resident = shared + (mi->rss_anon >> 12);
     } else {
         char buf[256];
+        fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
         int hfd = open(canon, O_RDONLY | O_CLOEXEC);
-        if (hfd < 0) return -1;
+        if (hfd < 0) { fdwin_leave(); return -1; }
         ssize_t n = read(hfd, buf, sizeof buf - 1);
         close(hfd);
+        fdwin_leave();
         if (n <= 0) return -1;
         buf[n] = 0;
         unsigned long long ign;
@@ -1166,12 +1180,14 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
  * to plain passthrough). */
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out) {
+    fdwin_enter();   /* the host file's fd is ours, briefly (machine.h) */
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
-    if (hfd < 0) return -1;              /* no host file: the caller's open
-                                            fails the same way, nothing leaks */
+    if (hfd < 0) { fdwin_leave(); return -1; }   /* no host file: the caller's
+                                                  * open fails the same way,
+                                                  * nothing leaks */
     size_t cap = STATUS_MAX, n = 0;
     char *buf = malloc(cap);
-    if (!buf) { close(hfd); return -2; }
+    if (!buf) { close(hfd); fdwin_leave(); return -2; }
     for (;;) {
         ssize_t r = read(hfd, buf + n, cap - 1 - n);
         if (r <= 0) break;
@@ -1182,13 +1198,14 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
          * than give up, and stop only at an absurdity. Handing back the raw
          * host file is not an option: its Uid, Seccomp and Sig* lines describe
          * the emulator, which is exactly what the rewrite exists to hide. */
-        if (cap >= STATUS_CAP) { free(buf); close(hfd); return -2; }
+        if (cap >= STATUS_CAP) { free(buf); close(hfd); fdwin_leave(); return -2; }
         char *nb = realloc(buf, cap * 2);
-        if (!nb) { free(buf); close(hfd); return -2; }
+        if (!nb) { free(buf); close(hfd); fdwin_leave(); return -2; }
         buf = nb;
         cap *= 2;
     }
     close(hfd);
+    fdwin_leave();
     if (!n) { free(buf); return -2; }    /* readable but empty: not rewritable */
     buf[n] = 0;
 
@@ -1457,11 +1474,13 @@ static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
 static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
                        const AsMem *mi, int self, const char *canon,
                        s32 *tid_out) {
+    fdwin_enter();   /* the host file's fd is ours, briefly (machine.h) */
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
-    if (hfd < 0) return -1;
+    if (hfd < 0) { fdwin_leave(); return -1; }
     char buf[4096];
     ssize_t n = read(hfd, buf, sizeof buf - 1);
     close(hfd);
+    fdwin_leave();
     if (n <= 0) return -2;
     buf[n] = 0;
     char *rp = strrchr(buf, ')');
@@ -1540,7 +1559,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fd;
+        *ret = fdheld_forget(fd);
         return 1;
     }
 
@@ -1564,7 +1583,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         put_mounts(fd, m, fmt);
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fd;
+        *ret = fdheld_forget(fd);
         return 1;
     }
 
@@ -1595,7 +1614,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if (blen) { ssize_t w = write(fd, buf, blen); (void)w; }
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fd;
+        *ret = fdheld_forget(fd);
         return 1;
     }
 
@@ -1637,8 +1656,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
             /* Written through, and re-read after: a descriptor this cannot
              * track would take the write into the memfd and call it done. */
-            if (pf_track(m, fd, k, upid, 0) < 0) { close(fd); *ret = -ENOMEM; return 1; }
-            *ret = fd;
+            if (pf_track(m, fd, k, upid, 0) < 0) { fdheld_close(fd); *ret = -ENOMEM; return 1; }
+            *ret = fdheld_forget(fd);
             return 1;
         }
     }
@@ -1658,7 +1677,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         s32 tid = 0;
         int st = put_status(fd, m, canon, self, &tid);
         if (st < 0) {
-            close(fd);
+            fdheld_close(fd);
             /* -1 is "there is no host file to rewrite": the caller's own open
              * reports that, and reports it exactly. -2 is "there is one but it
              * cannot be rewritten", and the raw file describes the emulator. */
@@ -1669,7 +1688,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         if (tid > 0) pf_track(m, fd, PF_STATUS, tid, self);
-        *ret = fd;
+        *ret = fdheld_forget(fd);
         return 1;
     }
 
@@ -1714,7 +1733,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int st = is_statm ? put_statm(fd, m, &pm, mi, canon)
                           : put_pidstat(fd, m, &pm, mi, !szpid, canon, &sttid);
         if (st < 0) {
-            close(fd);
+            fdheld_close(fd);
             if (st == -1) return 0;   /* no host file: report that exactly */
             *ret = -ENOMEM;
             return 1;
@@ -1722,7 +1741,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         lseek(fd, 0, SEEK_SET);
         if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
         pf_track(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, !szpid);
-        *ret = fd;
+        *ret = fdheld_forget(fd);
         return 1;
     }
 
@@ -1827,10 +1846,10 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if ((kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT ||
          kind == PF_LIMITS || writable) &&
         pf_track(m, fd, kind, 0, 1) < 0 && writable) {
-        close(fd);
+        fdheld_close(fd);
         *ret = -ENOMEM;
         return 1;
     }
-    *ret = fd;
+    *ret = fdheld_forget(fd);
     return 1;
 }

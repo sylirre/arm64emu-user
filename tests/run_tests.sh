@@ -2527,6 +2527,13 @@ check_fixture sarestart $'read/plain: errno=4 alarm=1\nwrite/plain: errno=4 alar
 # mapping per page. Self-checking: qemu-user's synthesized maps never merge
 # (split=3 stays 3 there); the numbers are a real kernel's.
 check_fixture regionmerge $'image_lines_few=1\none=1\nsplit=3\nmerged=1\nwhole=1\nends=3\nremerged=1 val=1\nadvised=3\nunadvised=1\nstill_split=3\ndone'
+# A fork child's table is its parent's and nothing more: a descriptor the
+# emulator holds for itself on a sibling thread at that instant -- a path
+# pin, the socket of a parked semop, an execve image -- used to cross into
+# the child for good (126/200 children of the pinner row, 50/50 of the FIFO
+# row). Self-checking: qemu-user has no pins and nothing to leak; a kernel's
+# children carry none.
+check_fixture forkfds $'openers: bad=0/200\nfifo_open: bad=0/50\nsemop: bad=0/50\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

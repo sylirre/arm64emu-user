@@ -43,8 +43,14 @@ int host_random_bytes(void *buf, size_t len) {
         }
         if (got == len) return 0;
     }
+    /* Called at execve, on a guest thread whose siblings may fork: the
+     * device is held (machine.h, "the emulator's own descriptors"). urandom
+     * never blocks, but /dev/random may, so a window would not do. */
+    fdwin_enter();
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) fd = open("/dev/random", O_RDONLY | O_CLOEXEC);
+    fdheld_add(fd);
+    fdwin_leave();
     if (fd < 0) return -1;
     while (got < len) {
         ssize_t n = read(fd, p + got, len - got);
@@ -52,7 +58,7 @@ int host_random_bytes(void *buf, size_t len) {
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    close(fd);
+    fdheld_close(fd);
     return got == len ? 0 : -1;
 }
 
@@ -123,10 +129,14 @@ SYSDEF(getrandom) {
      * pre-4.8 host never blocks urandom reads anyway, so both flavors read
      * urandom. GRND_RANDOM keeps its own device and its blocking rules. */
     int rnd = (flags & G_GRND_RANDOM) != 0;
+    fdwin_enter();   /* held, not windowed: /dev/random blocks (machine.h) */
     int fd = open(rnd ? "/dev/random" : "/dev/urandom",
                   O_RDONLY | O_CLOEXEC |
                       ((flags & G_GRND_NONBLOCK) ? O_NONBLOCK : 0));
-    if (fd < 0) return host_err();
+    int e = errno;
+    fdheld_add(fd);
+    fdwin_leave();
+    if (fd < 0) return (u64)(s64)-e;
     size_t got = 0;
     for (;;) {
         ssize_t r = read(fd, buf + got, len - got);
@@ -140,13 +150,13 @@ SYSDEF(getrandom) {
         } else {
             if (!got) {
                 u64 e = r < 0 ? host_err() : 0;   /* len==0 lands here as 0 */
-                close(fd);
+                fdheld_close(fd);
                 return e;
             }
             break;
         }
     }
-    close(fd);
+    fdheld_close(fd);
     if (copy_to_guest(c, a0, buf, got) < 0) return (u64)(s64)-EFAULT;
     return (u64)got;
 }
@@ -606,6 +616,7 @@ int mfd_chmod_blocked(void) {
     return PROBE_ONCE(on, ({
         int v = getenv("A64_MEMFD_CHMOD_FORCE_DENY") != NULL;
         if (!v) {
+            fdwin_enter();   /* the probe memfd: ours, briefly (machine.h) */
 #if defined(__BIONIC__) && defined(SYS_memfd_create)
             int p = (int)syscall(SYS_memfd_create, "a64-chmod-probe", 1 /*CLOEXEC*/);
 #else
@@ -618,6 +629,7 @@ int mfd_chmod_blocked(void) {
                     v = 1;
                 close(p);
             }
+            fdwin_leave();
         }
         v; }));
 }

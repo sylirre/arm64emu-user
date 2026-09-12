@@ -408,26 +408,33 @@ static int cache_alloc(JitEnv *env) {
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p != MAP_FAILED) {
         env->cache_rw = env->cache_rx = p;
-        env->memfd = -1;
         env->cache_size = size;
         return 0;
     }
 #ifdef SYS_memfd_create
+    /* The descriptor lives only until both views are mapped: the mappings
+     * keep the pages, and guest fd == host fd makes a descriptor the emulator
+     * keeps for itself a number the guest can see -- in /proc/self/fd, and in
+     * what its next open() returns. One fd window covers its whole life, so
+     * a sibling's fork cannot hand its child a copy either (machine.h, "the
+     * emulator's own descriptors"). */
+    fdwin_enter();
     int fd = (int)syscall(SYS_memfd_create, "arm64chroot-jit", 1 /*MFD_CLOEXEC*/);
+    void *rw = MAP_FAILED, *rx = MAP_FAILED;
     if (fd >= 0 && ftruncate(fd, (off_t)size) == 0) {
-        void *rw = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        void *rx = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
-        if (rw != MAP_FAILED && rx != MAP_FAILED) {
-            env->cache_rw = rw;
-            env->cache_rx = rx;
-            env->memfd = fd;
-            env->cache_size = size;
-            return 0;
-        }
-        if (rw != MAP_FAILED) munmap(rw, size);
-        if (rx != MAP_FAILED) munmap(rx, size);
+        rw = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        rx = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
     }
     if (fd >= 0) close(fd);
+    fdwin_leave();
+    if (rw != MAP_FAILED && rx != MAP_FAILED) {
+        env->cache_rw = rw;
+        env->cache_rx = rx;
+        env->cache_size = size;
+        return 0;
+    }
+    if (rw != MAP_FAILED) munmap(rw, size);
+    if (rx != MAP_FAILED) munmap(rx, size);
 #endif
     return -1;
 }
@@ -451,21 +458,18 @@ static void jit_env_destroy(JitEnv *env) {
     if (env->cache_rw) munmap(env->cache_rw, env->cache_size);
     if (env->cache_rx && env->cache_rx != env->cache_rw)
         munmap((void *)env->cache_rx, env->cache_size);
-    if (env->memfd >= 0) close(env->memfd);
     free(env->hash);
     free(env->pages);
     free(env->arena);
     free(env->edges);
     free(env->fixups);
     memset(env, 0, sizeof *env);
-    env->memfd = -1;
 }
 
 static int jit_env_init(JitEnv *env, CPU *c) {
     if (!be_available()) return -1;
     memset(env, 0, sizeof *env);
     env->c = c;
-    env->memfd = -1;
     env->helper_exec1 = (void *)jit_exec1;
     env->helper_exec1_ic = (void *)jit_exec1_ic;
     env->helper_ld = (void *)jit_ld;

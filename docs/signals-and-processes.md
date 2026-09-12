@@ -638,6 +638,56 @@ mask describes the state already vetted and must not move.
 One cost worth keeping in mind: a fork pays seven uncontended lock round-trips,
 small but not free on fork-heavy guests.
 
+#### A child inherits no descriptor of the emulator's own
+
+Guest fd == host fd, so every descriptor the emulator opens for itself on a
+guest thread — a pin's `O_PATH` parent (`path.c`), the image an `execve` is
+loading through its shebang loop, the socket a parked `semop` holds to the IPC
+broker, a `/proc` file being read for a synthesized view, the probe pipe of
+`host_page_readable` — sits in the guest's own table while it is open. That is
+contained and invisible, *except to fork*: the child duplicates the whole
+table, so one that a **sibling** thread held at that instant crossed into the
+child and stayed there for good. 222 of 300 children of a four-thread opener
+loop carried a directory fd they never opened, where a kernel's carry none (its
+path walk holds dentries, not descriptors); the child's next `open()` returned
+a higher number than a kernel gives, and `/proc/self/fd` listed the stray.
+
+Two mechanisms close that, both in `path.c` and both stated in `machine.h`
+("the emulator's own descriptors"):
+
+* an **fd window** (`fdwin_enter`/`fdwin_leave`) brackets the whole life of a
+  short-lived descriptor — open, use, close — and fork waits for open windows
+  to close before it duplicates the table. It is a read-write lock: windows
+  take it shared, the atfork prepare handler takes it exclusive, **after every
+  lock above** (`fdheld_fork_prepare` is the last call in
+  `emu_atfork_prepare`). That order is what makes the rule for a window simple:
+  nothing inside one may take an emulator lock or touch guest memory
+  (`as_lock`), because prepare holds them all by then and a window that waited
+  for one would hold the fork up for good. `EMU_LOCK` warns once per lock if a
+  window ever does, and `emu_fork_check` refuses to fork from inside one (the
+  writer would wait for its own reader). A window may be *entered* while
+  holding a lock — the synthesized `/proc` reads are — since prepare cannot
+  reach the barrier before that lock is released;
+* a **held** entry (`fdheld_add`, made inside a window) records a descriptor
+  that outlives its window — a pin held across the syscall it serves, the
+  `execve` image, a broker socket, a synthesized `/proc` file while it is being
+  written — with the thread that holds it. The child's handler closes every
+  entry of a thread other than the one that forked (only that one exists
+  there) and forgets them; `fdheld_close` closes and forgets one atomically
+  against fork, so a number cannot be closed, reused by the guest and then
+  found in the table by a child that closes it a second time; `fdheld_forget`
+  lets go of one that is about to become the guest's; and `fdheld_exec_clear`
+  drops the entries of the threads `de_thread` ended, whose descriptors the
+  CLOEXEC walk closes.
+
+The blocking-IPC socket had a registry of its own of the same shape before
+(`ipc_wait_fd`, closed by `ipc_fork_child`); it is held like the rest now. The
+JIT's W^X code-cache `memfd` is closed the moment both views are mapped, for
+the same reason. `tests/fixtures/forkfds.c` forks under three kinds of sibling
+activity — path pinners, a thread blocked in the open of a FIFO with its pin
+held, a thread parked in `semop` — and counts the strangers in each child: zero
+in every row, where the old code showed 126/200 and 50/50 for the first two.
+
 ### vfork vs threads — the distinguishing flag is `CLONE_THREAD`
 
 A guest thread and a vfork both set `CLONE_VM`, so `CLONE_VM` alone cannot decide

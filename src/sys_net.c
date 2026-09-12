@@ -199,7 +199,9 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
     if (n < 0 || (size_t)n >= sizeof proc) { path_unpin(&pin); return -ENAMETOOLONG; }
     memcpy(un->sun_path, proc, (size_t)n + 1);
     *sl = (socklen_t)(poff + (size_t)n + 1);
-    *dirfd_out = pin.dfd;                      /* handed to the caller to close */
+    *dirfd_out = pin.dfd;                      /* handed to the caller to close --
+                                                * with fdheld_close: it is a held
+                                                * descriptor (machine.h) */
     return 0;
 }
 
@@ -241,7 +243,7 @@ SYSDEF(bind) {
     if (r < 0) return (u64)(s64)r;
     if ((r = unix_path_in(c, &ss, &sl, 0, &dfd)) < 0) return (u64)(s64)r;
     u64 ret = bind((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
-    if (dfd >= 0) close(dfd);
+    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return ret;
 }
 
@@ -256,7 +258,7 @@ SYSDEF(connect) {
     if (r < 0) return (u64)(s64)r;
     if ((r = unix_path_in(c, &ss, &sl, 1, &dfd)) < 0) return (u64)(s64)r;
     u64 ret = connect((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
-    if (dfd >= 0) close(dfd);
+    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return ret;
 }
 
@@ -381,7 +383,7 @@ SYSDEF(sendto) {
     ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
     u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
     free(buf);
-    if (dfd >= 0) close(dfd);
+    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return e;
 }
 
@@ -1084,7 +1086,7 @@ SYSDEF(sendmsg) {
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
     u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
     free(iov); free(gbase); free(bounce); free(ctrl);
-    if (dfd >= 0) close(dfd);
+    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return e;
 }
 
@@ -1211,7 +1213,7 @@ SYSDEF(sendmmsg) {
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
         u64 e = n < 0 ? host_err() : 0;    /* before the close(2) below */
         free(iov); free(gbase); free(bounce); free(ctrl);
-        if (dfd >= 0) close(dfd);
+        fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
         if (n < 0) return sent ? (u64)sent : e;
         u32 mlen = (u32)n;
         if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)

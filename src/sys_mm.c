@@ -17,7 +17,19 @@
  * back to an unlinked temp file on hosts whose kernel predates memfd_create
  * (< 3.17 — Android 7): a nameless shared region must still stay shared
  * across fork() there. */
-static int anon_memfd(void) { return a64_anonfd("a64shared"); }
+static int anon_memfd(void) {
+    /* Held while it is sized and mapped: the number is the emulator's own,
+     * closed again before the syscall returns, and a sibling's fork in
+     * between must not hand its child a copy (machine.h, "the emulator's own
+     * descriptors"). Closed with anon_memfd_close. */
+    fdwin_enter();
+    int fd = fdheld_add(a64_anonfd("a64shared"));
+    int e = errno;
+    fdwin_leave();
+    errno = e;
+    return fd;
+}
+static void anon_memfd_close(int fd) { fdheld_close(fd); }
 
 /* Guest mmap flag values (asm-generic == x86 for these). */
 #define G_MAP_SHARED    0x01
@@ -243,11 +255,11 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
             u64 back = (len + (u64)ps - 1) & ~((u64)ps - 1);
             if (ftruncate(fd, (off_t)back) != 0) {
                 u64 e = host_err();   /* before close(2) overwrites errno */
-                close(fd);
+                anon_memfd_close(fd);
                 return e;
             }
             r = guest_map_file(as, addr, len, pte, fd, 0, 1, NULL);
-            close(fd);
+            anon_memfd_close(fd);
             if (r == 0) {
                 /* Mark it as the emulator's own backing: its end-of-file is an
                  * artifact of how this is built, not something the guest can
@@ -620,13 +632,13 @@ static int anon_shm_regrow(CPU *c, u64 old_addr, u64 old_len, u64 new_len,
     long ps = sysconf(_SC_PAGESIZE);
     if (ps < (long)GUEST_PAGE_SIZE) ps = (long)GUEST_PAGE_SIZE;
     u64 back = (new_len + (u64)ps - 1) & ~((u64)ps - 1);
-    if (ftruncate(fd, (off_t)back) != 0) { close(fd); return -ENOMEM; }
+    if (ftruncate(fd, (off_t)back) != 0) { anon_memfd_close(fd); return -ENOMEM; }
     /* Staged at a free VA: `dst` may be the old mapping's own address, whose
      * contents are still needed for the copy. */
     u64 tmp = as_find_free(as, new_len);
-    if (!tmp) { close(fd); return -ENOMEM; }
+    if (!tmp) { anon_memfd_close(fd); return -ENOMEM; }
     int r = guest_map_file(as, tmp, new_len, prot, fd, 0, 1, NULL);
-    close(fd);
+    anon_memfd_close(fd);
     if (r < 0) return r;
     Region *nr = (Region *)as_find_region(as, tmp);
     if (nr) nr->anon_shm = 1;
