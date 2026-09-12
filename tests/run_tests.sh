@@ -2492,6 +2492,12 @@ check_fixture stackrlimit $'tiny=1\nsmall=1\ndefault=1\nlarge=1\nscales=1\ndone'
 # real kernel.
 check_fixture execarglimit $'fits=ok\nmany=ok\nmany_over=e2big\nstrings_only=1\nptrtab=e2big\nstrings=e2big\nfloor=ok\nstackfit=e2big\nstackfit_ok=ok\ncap_ok=ok\ncap_over=e2big\ndone'
 check_fixture mmwrap $'mmap_zerolen=22\nmmap_len_align0=12\nmmap_len_huge=12\nmmap_fixed_wrap=12\nmmap_hint_wrap=0\nmmap_notype=22\nmmap_anon_validate=22\nmmap_type15=22\nmmap_file_notype=22\nmmap_file_validate=0\nmremap_old_wrap=14\nmremap_old_wrap_grow=14\nmremap_newlen_align0=22\nmremap_oldlen_align0=22\nmremap_zero_oldlen=22\nmunmap_zerolen=22\nmunmap_len_align0=22\nmunmap_wrap=22\nmprotect_zerolen=0\nmprotect_len_align0=12\nmprotect_wrap=12\nkeep=1\ndone'
+# readlinkat's bufsiz is an int, judged before the path: zero and every
+# negative value are EINVAL, with the register's high half dropped first.
+# Self-checking because qemu-user answers EFAULT for the negative rows (its
+# user-memory lock fails on the enormous length); the values are a real
+# kernel's, taken natively with this same program.
+check_fixture readlinksz $'neg=-22 guard=1\nzero=-22 guard=1\nintmin=-22\nhi32_zero=-22\nhi32_one=1 /\nneg_missing=-22\nneg_null=-22\nzero_missing=-22\nempty_neg=-22\nempty_zero=-22\nempty_four=4 /tar\nseven=7 /target\nfull=15 /target/of/link\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

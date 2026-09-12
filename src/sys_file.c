@@ -1423,6 +1423,13 @@ SYSDEF(faccessat2) {
 }
 
 SYSDEF(readlinkat) {
+    /* bufsiz is an int to the kernel and judged before the path is even
+     * fetched: zero or negative is EINVAL. Read as a u64 count, -5 was a
+     * 16-exabyte buffer, the whole target was copied over a 16-byte one and
+     * the guest died of its own stack protector. */
+    int bufsiz = (int)(s32)a3;
+    if (bufsiz <= 0) return (u64)(s64)-EINVAL;
+    size_t cap = (size_t)bufsiz;
     char gpath[PATH_MAX];
     long gn = copy_str_from_guest(c, gpath, a1, sizeof gpath);
     if (gn < 0) return (u64)(s64)gn;
@@ -1430,7 +1437,7 @@ SYSDEF(readlinkat) {
         char lbuf[PATH_MAX];
         ssize_t ln = readlinkat((int)(s32)a0, "", lbuf, sizeof lbuf - 1);
         if (ln < 0) return host_err();
-        size_t out = (size_t)ln < a3 ? (size_t)ln : a3;
+        size_t out = (size_t)ln < cap ? (size_t)ln : cap;
         if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
         return out;
     }
@@ -1488,7 +1495,7 @@ SYSDEF(readlinkat) {
         strcpy(buf, view);
         rn = (ssize_t)strlen(buf);
     }
-    size_t out = (size_t)rn < a3 ? (size_t)rn : a3;
+    size_t out = (size_t)rn < cap ? (size_t)rn : cap;
     if (copy_to_guest(c, a2, buf, out) < 0) return (u64)(s64)-EFAULT;
     return out;
 }
