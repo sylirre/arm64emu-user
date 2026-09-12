@@ -2142,11 +2142,100 @@ SYSDEF(prctl) {
             name[15] = 0;
             return prctl(PR_SET_NAME, name) < 0 ? host_err() : 0;
         }
+        /* The dumpable flag is recorded, not applied: clearing it on the host
+         * turns the host's /proc/self entries root-owned, and the emulator reads its
+         * own /proc/self/fd links to reopen descriptors (Android's memfds
+         * among them). A guest reads back what it set, as it would, and starts
+         * at 1 as a process does; the values are the kernel's (SUID_DUMP_USER,
+         * SUID_DUMP_DISABLE), and anything else is its EINVAL. */
         case PR_GET_DUMPABLE:
+            return c->m->dumpable;
         case PR_SET_DUMPABLE:
+            if (a1 != 0 && a1 != 1) return (u64)(s64)-EINVAL;
+            c->m->dumpable = (u8)a1;
             return 0;
+        /* The parent-death signal is a host signal: the guest's number rides
+         * the carrier that guest 32/33 need (sig_send_host_nr), and comes
+         * back through the inverse. valid_signal() is the kernel's own check,
+         * 0 clearing it. */
         case PR_SET_PDEATHSIG:
-            return prctl(PR_SET_PDEATHSIG, (unsigned long)a1) < 0 ? host_err() : 0;
+            if (a1 > 64) return (u64)(s64)-EINVAL;
+            return prctl(PR_SET_PDEATHSIG,
+                         (unsigned long)(a1 ? sig_send_host_nr((int)a1) : 0)) < 0
+                       ? host_err() : 0;
+        case PR_GET_PDEATHSIG: {
+            int hs = 0;
+            if (prctl(PR_GET_PDEATHSIG, &hs) < 0) return host_err();
+            s32 gs = hs ? sig_guest_nr(hs) : 0;
+            return copy_to_guest(c, a1, &gs, 4) < 0 ? (u64)(s64)-EFAULT : 0;
+        }
+        /* Process-level kernel state that is the guest's because the guest
+         * process IS the host process: a subreaper collects the orphans of
+         * its own descendants, which are host processes (tini, dumb-init, s6
+         * all set it and used to be told EINVAL); the timer slack is per
+         * thread and a guest thread is a host thread; THP, MCE, the timing
+         * mode, the speculation controls and the securebits are the task's. */
+        case PR_SET_CHILD_SUBREAPER:
+            return prctl(PR_SET_CHILD_SUBREAPER, (unsigned long)a1) < 0 ? host_err() : 0;
+        case PR_GET_CHILD_SUBREAPER: {
+            int v = 0;
+            if (prctl(PR_GET_CHILD_SUBREAPER, &v) < 0) return host_err();
+            s32 gv = v;
+            return copy_to_guest(c, a1, &gv, 4) < 0 ? (u64)(s64)-EFAULT : 0;
+        }
+        case PR_SET_TIMERSLACK:
+            return prctl(PR_SET_TIMERSLACK, (unsigned long)a1) < 0 ? host_err() : 0;
+        case PR_GET_TIMERSLACK: {
+            long r = prctl(PR_GET_TIMERSLACK);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_SET_THP_DISABLE:
+            if (a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            return prctl(PR_SET_THP_DISABLE, (unsigned long)a1, 0, 0, 0) < 0 ? host_err() : 0;
+        case PR_GET_THP_DISABLE: {
+            if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            long r = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_MCE_KILL: {
+            long r = prctl(PR_MCE_KILL, (unsigned long)a1, (unsigned long)a2,
+                           (unsigned long)a3, (unsigned long)a4);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_MCE_KILL_GET: {
+            if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            long r = prctl(PR_MCE_KILL_GET, 0, 0, 0, 0);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_GET_TIMING: {
+            long r = prctl(PR_GET_TIMING);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_SET_TIMING:
+            return prctl(PR_SET_TIMING, (unsigned long)a1) < 0 ? host_err() : 0;
+        case PR_GET_SPECULATION_CTRL: {
+            if (a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            long r = prctl(PR_GET_SPECULATION_CTRL, (unsigned long)a1, 0, 0, 0);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_SET_SPECULATION_CTRL:
+            if (a3 || a4) return (u64)(s64)-EINVAL;
+            return prctl(PR_SET_SPECULATION_CTRL, (unsigned long)a1,
+                         (unsigned long)a2, 0, 0) < 0 ? host_err() : 0;
+        case PR_GET_SECUREBITS: {
+            long r = prctl(PR_GET_SECUREBITS);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case PR_SET_SECUREBITS:
+            return prctl(PR_SET_SECUREBITS, (unsigned long)a1) < 0 ? host_err() : 0;
+        /* The address set_tid_address recorded for this thread -- the guest's
+         * own, which the emulator keeps (CLONE_CHILD_CLEARTID is served from
+         * it at thread exit), so it is answered from there. */
+        case PR_GET_TID_ADDRESS: {
+            if (a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            u64 ta = g_tls.clear_child_tid;
+            return copy_to_guest(c, a1, &ta, 8) < 0 ? (u64)(s64)-EFAULT : 0;
+        }
         /* Capability bounding set and keepcaps are real host-process kernel
          * state, unrelated to the -fake-id credential illusion (unlike
          * capget/capset in sys_misc.c) -- pass straight through. */

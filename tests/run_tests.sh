@@ -2585,6 +2585,13 @@ check_fixture affinity $'get: bytes_positive=1 bytes_mult8=1 cpus_positive=1 cpu
 # file of its own; every row is a relation between the file, getauxval and
 # the machine.
 check_fixture cpuinfo $'blocks_eq_online=1\none_features_per_block=1\nfeatures_are_hwcap=1\nhas_atomics=1 has_fphp=1 has_mops=1\nno_x86=1\nno_model_name=1\nmidr_ok=1\nids_ascending=1\ndone'
+# The prctl operations a guest process owns because it is a host process
+# (subreaper, timer slack, THP, MCE, timing, speculation, securebits), the
+# parent-death signal translated both ways (32/33 ride a carrier), the tid
+# address the guest's own set_tid_address recorded, and the dumpable flag as
+# the guest set it. Self-checking: qemu-user answers EINVAL for several of
+# these; the expected block is a real kernel's, taken natively.
+check_fixture prctlset $'dumpable=1\nset_dump0=0 get=0\nset_dump2=-22 set_dump1=0\npdeath_set=0\npdeath_get=0 v=10\npdeath_set33=0\npdeath_get33=0 v=33\npdeath_bad=-22\npdeath_clear=0\npdeath_cleared=0 v=0\nsubreaper_get0=0 v=0\nsubreaper_set=0\nsubreaper_get1=0 v=1\norphan_parent_is_me=1\nreaped_grandchild=1\nsubreaper_off=0\nslack_default_positive=1\nslack_set=0 get=123456\nslack_reset=0 get_default=1\nthp_get=0\nthp_set=0 get=1\nthp_clear=0 get=0\nthp_badargs=-22\ntid_addr=0 nonzero=1\ntiming=0 set_timing=0\nmce_get=2\nsecurebits=0\nspec_answered=1\nspec_badargs=-22\nbogus=-22\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

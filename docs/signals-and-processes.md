@@ -467,6 +467,23 @@ used to answer one CPU for every task and ignore every `setaffinity`, from
 before `CLONE_THREAD` threads existed, so all of those ran on one core while
 `/proc/cpuinfo` listed the machine (`tests/fixtures/affinity.c`).
 
+The same identity decides `prctl(2)` (`sys_proc.c`): what is a property of the
+host task is the guest's, and passes through — `PR_SET/GET_CHILD_SUBREAPER`
+(tini, dumb-init and s6 collect the orphans of their descendants with it, and
+those are host processes; it used to be `EINVAL`), `PR_SET/GET_TIMERSLACK`
+(per thread), `PR_SET/GET_THP_DISABLE`, `PR_MCE_KILL`, `PR_GET/SET_TIMING`,
+the speculation controls, the securebits, the capability bounding set and
+keepcaps. Three are translated rather than forwarded: `PR_SET_PDEATHSIG`
+carries a *guest* signal number, which rides the host carrier that guest 32
+and 33 need (`sig_send_host_nr`), and `PR_GET_PDEATHSIG` — missing before —
+translates it back; `PR_GET_TID_ADDRESS` answers from the address the guest's
+own `set_tid_address` recorded, which the emulator keeps to serve
+`CLONE_CHILD_CLEARTID`; and the dumpable flag is *recorded*
+(`PR_SET/GET_DUMPABLE`, reset to 1 by an exec and to 0 by a secure one, as
+`setup_new_exec` does) but never applied to the host, whose `/proc/self` the
+emulator has to keep reading to reopen its own descriptors
+(`tests/fixtures/prctlset.c`).
+
 ### Target containment
 
 That identity cuts both ways: an id the guest supplies addresses **any** host

@@ -530,6 +530,9 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     u32 at_gid = m->fake_id ? m->cred.rgid : (u32)getgid();
     u32 at_egid = m->fake_id ? m->cred.egid : (u32)getegid();
     u64 at_secure = (at_uid != at_euid || at_gid != at_egid) ? 1 : 0;
+    /* setup_new_exec: a new image is dumpable again, unless it is a secure
+     * one, which gets fs.suid_dumpable -- 0, the compiled-in default. */
+    m->dumpable = at_secure ? 0 : 1;
     u64 auxv[][2] = {
         { G_AT_PHDR,    exe.phdr_va },
         { G_AT_PHENT,   sizeof(Elf64_Phdr) },

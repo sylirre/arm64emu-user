@@ -876,6 +876,7 @@ int main(int argc, char **argv)
             genv[ge++] = (char *)guest_default[k];
     genv[ge] = NULL;
 
+    m->dumpable = 1;  /* SUID_DUMP_USER, as a process starts (sys_proc.c prctl) */
     rlim_init(m);     /* seed the guest's resource limits from the host's,
                        * before anything can consult or change them */
     as_init(&m->as);

@@ -219,6 +219,8 @@ struct Machine {
      * leaving a signal at the host default because the *calling* thread does
      * not block it kills the whole process for a sibling that does. */
     u64 sig_blocked_any;
+    u8  dumpable;             /* PR_SET_DUMPABLE as the guest set it (recorded,
+                               * never applied to the host: sys_proc.c) */
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
 
     /* Thread bookkeeping (CLONE_VM) needs no tid table: the guest tid of a
