@@ -3268,13 +3268,26 @@ static void pwait_mask_leave(CPU *c) {
     errno = e;
 }
 
+/* The temporary mask's SIZE, which the three waits below take beside the
+ * mask: set_user_sigmask refuses any but the kernel's own (8 bytes) with
+ * EINVAL, exactly as rt_sigprocmask and its family do (sys_sig.c), and only
+ * when a mask was given at all. It is what lets a libc built against another
+ * sigset layout fail loudly instead of installing a mask read from the wrong
+ * bytes; the size used to be ignored here, and every such refusal came back
+ * as a successful wait. Judged before the mask is read -- a bad size beats an
+ * unreadable mask -- and after the timespec, which ppoll and pselect6 read
+ * first (tests/c/pwait_sigsetsize.c). */
+static int pwait_mask_read(CPU *c, u64 mask_va, u64 sigsetsize, u64 *gmask) {
+    if (sigsetsize != 8) return -EINVAL;
+    if (copy_from_guest(c, gmask, mask_va, 8) < 0) return -EFAULT;
+    return 0;
+}
+
 SYSDEF(ppoll) {
+    /* (fds, nfds, timespec, sigmask, sigsetsize), judged in the kernel's
+     * order: the timespec, then the mask and its size (set_user_sigmask),
+     * then nfds against the soft RLIMIT_NOFILE (do_sys_poll). */
     unsigned nfds = (unsigned)a1;
-    if (nfds > 4096) return (u64)(s64)-EINVAL;
-    struct pollfd pf[4096];
-    /* guest struct pollfd == host (int, short, short) on all targets */
-    if (nfds && copy_from_guest(c, pf, a0, sizeof(struct pollfd) * nfds) < 0)
-        return (u64)(s64)-EFAULT;
     struct timespec ts, *tsp = NULL;
     if (a2) {
         GTimespec g;
@@ -3282,22 +3295,43 @@ SYSDEF(ppoll) {
         ts.tv_sec = (time_t)g.tv_sec; ts.tv_nsec = (long)g.tv_nsec;
         tsp = &ts;
     }
+    u64 gmask = 0;
+    if (a3) {
+        int e = pwait_mask_read(c, a3, a4, &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    /* do_sys_poll's bound is the guest's own descriptor limit, not a size of
+     * ours: a server polling five thousand descriptors is within its rights
+     * wherever RLIMIT_NOFILE allows it. The array is on the stack for the
+     * common count and on the heap past it. */
+    if (nfds > (unsigned)fd_nofile_cap(c->m)) return (u64)(s64)-EINVAL;
+    struct pollfd pfs[256], *pf = pfs;
+    if (nfds > sizeof pfs / sizeof pfs[0]) {
+        pf = malloc(sizeof *pf * nfds);
+        if (!pf) return (u64)(s64)-ENOMEM;
+    }
+    /* guest struct pollfd == host (int, short, short) on all targets */
+    if (nfds && copy_from_guest(c, pf, a0, sizeof(struct pollfd) * nfds) < 0) {
+        if (pf != pfs) free(pf);
+        return (u64)(s64)-EFAULT;
+    }
     sigset_t ss, *ssp = NULL;
     if (a3) {
-        u64 gmask;
-        if (copy_from_guest(c, &gmask, a3, 8) < 0) return (u64)(s64)-EFAULT;
         pwait_host_mask(&ss, gmask);
         ssp = &ss;
-        if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
+        if (pwait_mask_enter(c, gmask)) { if (pf != pfs) free(pf); return (u64)(s64)-EINTR; }
     }
     sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
     syscall_wait_begin(tsp);   /* see syscall.c: a restart keeps the deadline */
     int r = ppoll(pf, nfds, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
-    if (r < 0) return host_err();
-    if (nfds && copy_to_guest(c, a0, pf, sizeof(struct pollfd) * nfds) < 0)
-        return (u64)(s64)-EFAULT;
-    return (u64)r;
+    u64 ret;
+    if (r < 0) ret = host_err();
+    else if (nfds && copy_to_guest(c, a0, pf, sizeof(struct pollfd) * nfds) < 0)
+        ret = (u64)(s64)-EFAULT;
+    else ret = (u64)r;
+    if (pf != pfs) free(pf);
+    return ret;
 }
 
 SYSDEF(pselect6) {
@@ -3323,7 +3357,8 @@ SYSDEF(pselect6) {
         if (copy_from_guest(c, pair, a5, 16) < 0) return (u64)(s64)-EFAULT;
         if (pair[0]) {
             u64 gmask;
-            if (copy_from_guest(c, &gmask, pair[0], 8) < 0) return (u64)(s64)-EFAULT;
+            int e = pwait_mask_read(c, pair[0], pair[1], &gmask);
+            if (e < 0) return (u64)(s64)e;
             pwait_host_mask(&ss, gmask);
             ssp = &ss;
             if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
@@ -3474,13 +3509,26 @@ SYSDEF(epoll_ctl) {
 }
 
 SYSDEF(epoll_pwait) {
-    /* (epfd, events, maxevents, timeout, sigmask, sigsetsize). */
+    /* (epfd, events, maxevents, timeout, sigmask, sigsetsize). The mask and
+     * its size are judged first (set_user_sigmask runs before do_epoll_wait
+     * looks at anything else), then maxevents. */
+    u64 gmask = 0;
+    if (a4) {
+        int e = pwait_mask_read(c, a4, a5, &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    /* ep_check_params's bound is EP_MAX_EVENTS, INT_MAX over the size of an
+     * event -- not a size of ours. The bounce buffer IS bounded: the kernel
+     * hands back what is ready up to maxevents, and a call answered with
+     * fewer events than that is indistinguishable from one on a quieter
+     * queue (whatever was not delivered stays on the ready list for the next
+     * call), so the cap goes on the buffer, never on the argument. */
     int maxevents = (int)a2;
-    if (maxevents <= 0 || maxevents > 4096) return (u64)(s64)-EINVAL;
+    if (maxevents <= 0 || maxevents > INT_MAX / (int)sizeof(GEpollEvent))
+        return (u64)(s64)-EINVAL;
+    if (maxevents > 4096) maxevents = 4096;
     sigset_t ss, *ssp = NULL;
     if (a4) {
-        u64 gmask;
-        if (copy_from_guest(c, &gmask, a4, 8) < 0) return (u64)(s64)-EFAULT;
         pwait_host_mask(&ss, gmask);
         ssp = &ss;
         if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;

@@ -260,6 +260,21 @@ tests for an already-deliverable signal before sleeping, as the kernel does —
 without it the queued-before-the-wait case, the one the idiom exists for, was
 not noticed until some later signal happened to wake the wait.
 
+The mask comes with its *size*, and `set_user_sigmask` refuses any but the
+kernel's own (8 bytes) with `EINVAL`, exactly as `rt_sigprocmask` and its
+family do — that is what lets a libc built against another sigset layout fail
+loudly instead of installing a mask read from the wrong bytes. The size used to
+be ignored here (`pwait_mask_read`, `sys_file.c`, judges it now), so every such
+refusal came back as a successful wait. It is judged only when a mask was given,
+in the kernel's order: after the timespec, which `ppoll` and `pselect6` read
+first; before the mask itself, so a bad size beats an unreadable mask; and, for
+`epoll_pwait`, before `maxevents` — whose own bound is `EP_MAX_EVENTS`
+(`INT_MAX` over the 16-byte guest event), not a size of the emulator's, the
+bounce buffer being capped instead since a call answered with fewer events than
+asked is indistinguishable from one on a quieter queue. `ppoll`'s `nfds` is
+likewise bounded by the guest's own `RLIMIT_NOFILE`, as `do_sys_poll` bounds
+it, and not by an array of ours (`tests/c/pwait_sigsetsize.c`).
+
 ### POSIX interval timers and the guest-32/33 carrier remap
 
 The `timer_create` family (`sys_time.c`) wraps host libc timers behind a
