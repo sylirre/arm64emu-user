@@ -2498,6 +2498,14 @@ check_fixture mmwrap $'mmap_zerolen=22\nmmap_len_align0=12\nmmap_len_huge=12\nmm
 # user-memory lock fails on the enormous length); the values are a real
 # kernel's, taken natively with this same program.
 check_fixture readlinksz $'neg=-22 guard=1\nzero=-22 guard=1\nintmin=-22\nhi32_zero=-22\nhi32_one=1 /\nneg_missing=-22\nneg_null=-22\nzero_missing=-22\nempty_neg=-22\nempty_zero=-22\nempty_four=4 /tar\nseven=7 /target\nfull=15 /target/of/link\ndone'
+# The time a ppoll/pselect6 timeout has left is written back to the caller's
+# timespec whatever the call returned (poll_select_finish): ready, timed out,
+# EINTR, even the EINVAL/EFAULT that do_sys_poll and core_sys_select answer.
+# Only the refusals judged before the wait leave it alone. Self-checking:
+# qemu-user updates the timespec only on a successful return and never on
+# EINTR, which is the case a caller looping with the time it has left needs.
+# Also the clamp of a select nfds past the fd table's size, never a refusal.
+check_fixture pwaittmo $'ppoll_eintr r=-4 band=1\npselect_eintr r=-4 band=1\nppoll_timeout r=0 zero=1\npselect_timeout r=0 zero=1\nppoll_ready r=1 updated=1\npselect_ready r=1 updated=1 isset=1\nppoll_nfds r=-22 updated=1\nppoll_fault r=-14 updated=1\npselect_nfds r=-22 updated=1\npselect_fault r=-14 updated=1\nppoll_badts r=-22 kept=1\nppoll_badsize r=-22 kept=1\nppoll_badmask r=-14 kept=1\nppoll_badts_badmask r=-22\npselect_badsize r=-22 kept=1\npselect_badts_badnfds r=-22 kept=1\npselect_badmask_badnfds r=-14 kept=1\npselect_badpair r=-14\nppoll_zero r=1 zero=1\npselect_intmax r=1 isset=1\npselect_wide r=1 isset=1 updated=1\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

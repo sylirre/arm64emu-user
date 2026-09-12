@@ -12,6 +12,7 @@
 #include <sys/socket.h>   /* socklen_t (sock_addr_out) */
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "machine.h"
@@ -38,6 +39,15 @@ typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
  * hands the guest an errno from the cleanup instead of from its syscall, which
  * is both wrong and untraceable. */
 static inline u64 host_err(void) { return (u64)(s64)(-errno); }
+
+/* CLOCK_MONOTONIC now, in nanoseconds -- the clock the kernel's own timeouts
+ * run on (poll_select_set_timeout uses ktime_get_ts64): recvmmsg's deadline,
+ * the remainder ppoll/pselect6 write back, the restart accounting. */
+static inline u64 mono_ns(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
 
 /* ---- one transfer's byte count ------------------------------------------
  * A read/write count is a guest u64 and this emulator has to turn it into a

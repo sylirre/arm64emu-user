@@ -1221,14 +1221,6 @@ SYSDEF(sendmmsg) {
     return (u64)sent;
 }
 
-/* CLOCK_MONOTONIC now, in nanoseconds -- the clock recvmmsg's timeout runs on
- * (poll_select_set_timeout uses ktime_get_ts64). */
-static u64 mono_ns(void) {
-    struct timespec t;
-    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
-    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
-}
-
 /* Wait for `fd` to become readable, but never past `deadline` (monotonic ns).
  * 1 readable, 0 the deadline arrived first, -1 error/interrupted (errno set). */
 static int wait_readable(int fd, u64 deadline) {

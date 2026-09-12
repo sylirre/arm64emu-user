@@ -165,6 +165,23 @@ reporting a bare `EINTR` left a caller that loops on `EINTR` re-sleeping from a
 `TIMER_ABSTIME` has no remainder to write and never touches the pointer
 (`tests/c/remfault.c` covers both, qemu agreeing with the host kernel).
 
+`ppoll` and `pselect6` write their remainder back too, and not only when
+interrupted: `poll_select_finish` updates the caller's timespec on *every*
+return — descriptors ready, the timeout itself, `EINTR`, even the `EINVAL` and
+`EFAULT` that `do_sys_poll` and `core_sys_select` answer for a bad `nfds` or an
+unreadable set — leaving alone only a zero timeout and the refusals judged
+before the wait (an invalid timespec, a bad mask or mask size). The host libc
+hides the kernel's own update (glibc hands the kernel a private copy of the
+timespec on purpose), so `pwait_tmo_finish` (`sys_file.c`) reconstructs it from
+the deadline the wait was given. That is also how these two keep their deadline
+across the internal restart above: the re-run reads the guest's timespec again,
+which now holds the time left, exactly as a kernel's restart re-reads it — so a
+wait whose remainder was written back charges nothing to `sc_waited_ns`, and
+one whose write-back faulted keeps the stopwatch and the subtraction. A caller
+that loops on `EINTR` with the time it has left relied on the update; given the
+whole timeout each time it never finished (`tests/fixtures/pwaittmo.c`; qemu
+updates the timespec only on success).
+
 ### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
 
 `sig_timedwait` consumes one pending signal from the calling thread's capture
@@ -273,7 +290,12 @@ first; before the mask itself, so a bad size beats an unreadable mask; and, for
 bounce buffer being capped instead since a call answered with fewer events than
 asked is indistinguishable from one on a quieter queue. `ppoll`'s `nfds` is
 likewise bounded by the guest's own `RLIMIT_NOFILE`, as `do_sys_poll` bounds
-it, and not by an array of ours (`tests/c/pwait_sigsetsize.c`).
+it, and not by an array of ours (`tests/c/pwait_sigsetsize.c`); `pselect6`'s is
+not bounded at all but *clamped* to the fd table's size, as `core_sys_select`
+clamps it — the table is the host process's own (guest fd == host fd), and its
+size is the `FDSize` line of its status, consulted only for an `nfds` past what
+a libc `fd_set` holds (`host_fdtable_size`). A negative `nfds` is `EINVAL`,
+answered inside the timeout bracket like `ppoll`'s.
 
 ### POSIX interval timers and the guest-32/33 carrier remap
 

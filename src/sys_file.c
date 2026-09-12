@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@
 #include <sys/uio.h>
 #include <sys/xattr.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sys.h"
@@ -3290,6 +3292,61 @@ static int pwait_mask_read(CPU *c, u64 mask_va, u64 sigsetsize, u64 *gmask) {
     return 0;
 }
 
+/* The time a ppoll/pselect6 timeout has left goes back to the caller's
+ * timespec (poll_select_finish) -- and it goes back whatever the call
+ * returned: descriptors ready, the timeout itself, EINTR, even do_sys_poll's
+ * own EINVAL for too many descriptors. Only a zero timeout is left alone, and
+ * only a timespec that cannot be written stays as it was. The host libc's
+ * wrappers hide the kernel's own update (glibc hands the kernel a private
+ * copy of the timespec on purpose), so it is reconstructed here from the
+ * deadline the wait was given: what a caller does with the value is loop on
+ * EINTR with the time it has left, and given the whole timeout each time it
+ * never finished.
+ *
+ * It is also how a restarted call keeps its deadline. The emulator's own
+ * control signal rewinds an interrupted SVC (syscall_restart_internal), and
+ * the re-run reads the guest's timespec again -- which now holds the time
+ * left, exactly as a kernel's restart re-reads it. So a wait whose remainder
+ * was written back charges nothing to sc_waited_ns (the timespec carries the
+ * accounting); one whose write-back failed keeps the stopwatch running and
+ * the accounting subtracts what was spent from the unchanged timespec. */
+typedef struct { u64 va; u64 deadline; } PwaitTmo;
+
+/* Arm after syscall_wait_begin has shrunk `ts`: the deadline is what THIS
+ * attempt was given, and the remainder written back is measured from it. */
+static void pwait_tmo_arm(PwaitTmo *t, u64 va, const struct timespec *ts) {
+    t->va = 0;
+    if (!va || !ts || (ts->tv_sec == 0 && ts->tv_nsec == 0)) return;
+    u64 now = mono_ns();
+    u64 want = (u64)ts->tv_sec > UINT64_MAX / 1000000000ULL
+                   ? UINT64_MAX
+                   : (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
+    t->va = va;
+    t->deadline = want > UINT64_MAX - now ? UINT64_MAX : now + want;
+}
+
+static u64 pwait_tmo_finish(CPU *c, const PwaitTmo *t, u64 ret) {
+    if (!t->va) return ret;
+    int e = errno;
+    u64 now = mono_ns();
+    u64 rem = t->deadline > now ? t->deadline - now : 0;
+    GTimespec g = { (s64)(rem / 1000000000ULL), (s64)(rem % 1000000000ULL) };
+    if (copy_to_guest(c, t->va, &g, sizeof g) == 0) g_tls.sc_wait_t0 = 0;
+    errno = e;
+    return ret;
+}
+
+/* The guest's timespec as the host's: EFAULT if unreadable, EINVAL if not a
+ * valid duration (poll_select_set_timeout) -- both judged before the sigmask
+ * is looked at, which is the kernel's order. */
+static int pwait_tmo_read(CPU *c, u64 va, struct timespec *ts) {
+    GTimespec g;
+    if (copy_from_guest(c, &g, va, sizeof g) < 0) return -EFAULT;
+    if (g.tv_sec < 0 || g.tv_nsec < 0 || g.tv_nsec >= 1000000000) return -EINVAL;
+    ts->tv_sec = (time_t)g.tv_sec; ts->tv_nsec = (long)g.tv_nsec;
+    return 0;
+}
+
 SYSDEF(ppoll) {
     /* (fds, nfds, timespec, sigmask, sigsetsize), judged in the kernel's
      * order: the timespec, then the mask and its size (set_user_sigmask),
@@ -3297,9 +3354,8 @@ SYSDEF(ppoll) {
     unsigned nfds = (unsigned)a1;
     struct timespec ts, *tsp = NULL;
     if (a2) {
-        GTimespec g;
-        if (copy_from_guest(c, &g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        ts.tv_sec = (time_t)g.tv_sec; ts.tv_nsec = (long)g.tv_nsec;
+        int e = pwait_tmo_read(c, a2, &ts);
+        if (e < 0) return (u64)(s64)e;
         tsp = &ts;
     }
     u64 gmask = 0;
@@ -3307,29 +3363,38 @@ SYSDEF(ppoll) {
         int e = pwait_mask_read(c, a3, a4, &gmask);
         if (e < 0) return (u64)(s64)e;
     }
+    /* From here on the timeout is written back whatever happens: the
+     * refusals below are do_sys_poll's own, inside poll_select_finish's
+     * bracket. Nothing has waited yet, so the remainder is the whole. */
+    PwaitTmo tmo;
+    syscall_wait_begin(tsp);   /* see syscall.c: a restart keeps the deadline */
+    pwait_tmo_arm(&tmo, a2, tsp);
     /* do_sys_poll's bound is the guest's own descriptor limit, not a size of
      * ours: a server polling five thousand descriptors is within its rights
      * wherever RLIMIT_NOFILE allows it. The array is on the stack for the
      * common count and on the heap past it. */
-    if (nfds > (unsigned)fd_nofile_cap(c->m)) return (u64)(s64)-EINVAL;
+    if (nfds > (unsigned)fd_nofile_cap(c->m))
+        return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINVAL);
     struct pollfd pfs[256], *pf = pfs;
     if (nfds > sizeof pfs / sizeof pfs[0]) {
         pf = malloc(sizeof *pf * nfds);
-        if (!pf) return (u64)(s64)-ENOMEM;
+        if (!pf) return pwait_tmo_finish(c, &tmo, (u64)(s64)-ENOMEM);
     }
     /* guest struct pollfd == host (int, short, short) on all targets */
     if (nfds && copy_from_guest(c, pf, a0, sizeof(struct pollfd) * nfds) < 0) {
         if (pf != pfs) free(pf);
-        return (u64)(s64)-EFAULT;
+        return pwait_tmo_finish(c, &tmo, (u64)(s64)-EFAULT);
     }
     sigset_t ss, *ssp = NULL;
     if (a3) {
         pwait_host_mask(&ss, gmask);
         ssp = &ss;
-        if (pwait_mask_enter(c, gmask)) { if (pf != pfs) free(pf); return (u64)(s64)-EINTR; }
+        if (pwait_mask_enter(c, gmask)) {
+            if (pf != pfs) free(pf);
+            return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINTR);
+        }
     }
     sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
-    syscall_wait_begin(tsp);   /* see syscall.c: a restart keeps the deadline */
     int r = ppoll(pf, nfds, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     u64 ret;
@@ -3338,54 +3403,110 @@ SYSDEF(ppoll) {
         ret = (u64)(s64)-EFAULT;
     else ret = (u64)r;
     if (pf != pfs) free(pf);
-    return ret;
+    return pwait_tmo_finish(c, &tmo, ret);
+}
+
+/* How many descriptors the kernel's fd table has room for right now: what
+ * core_sys_select clamps a select's nfds to. The guest's table IS the host's
+ * (guest fd == host fd), and its size is the FDSize line of the host process's
+ * own status -- the one place the kernel publishes it. Consulted only for an
+ * nfds past what a libc fd_set can hold, where the clamp decides how much of
+ * the caller's memory is read at all; below that the sets are copied whole,
+ * as they were. Falls back to the hard RLIMIT_NOFILE, which the table cannot
+ * have outgrown, if the host's /proc is not there to ask. */
+static int host_fdtable_size(void) {
+    int size = -1;
+    FILE *f = fopen("/proc/self/status", "re");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "FDSize:", 7)) { size = atoi(line + 7); break; }
+        fclose(f);
+    }
+    if (size <= 0) {
+        struct rlimit rl;
+        size = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max <= (rlim_t)INT_MAX
+                   ? (int)rl.rlim_max : INT_MAX;
+    }
+    return size;
 }
 
 SYSDEF(pselect6) {
-    int nfds = (int)a0;
-    if (nfds < 0 || nfds > 1024) return (u64)(s64)-EINVAL;
-    fd_set r, w, e, *rp = NULL, *wp = NULL, *ep = NULL;
-    size_t setb = (size_t)(nfds + 7) / 8;
-    FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
-    if (a1) { if (copy_from_guest(c, &r, a1, setb) < 0) return (u64)(s64)-EFAULT; rp = &r; }
-    if (a2) { if (copy_from_guest(c, &w, a2, setb) < 0) return (u64)(s64)-EFAULT; wp = &w; }
-    if (a3) { if (copy_from_guest(c, &e, a3, setb) < 0) return (u64)(s64)-EFAULT; ep = &e; }
+    /* (nfds, in, out, ex, timespec, {sigmask, sigsetsize}*), in the kernel's
+     * order: the mask pair is fetched first, then the timespec, then the mask
+     * itself (set_user_sigmask), and only then does core_sys_select judge
+     * nfds and read the sets -- inside poll_select_finish's bracket, so the
+     * timeout is written back even when it refuses. */
+    u64 pair[2] = { 0, 0 };
+    if (a5 && copy_from_guest(c, pair, a5, 16) < 0) return (u64)(s64)-EFAULT;
     struct timespec ts, *tsp = NULL;
     if (a4) {
-        GTimespec g;
-        if (copy_from_guest(c, &g, a4, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        ts.tv_sec = (time_t)g.tv_sec; ts.tv_nsec = (long)g.tv_nsec;
+        int e = pwait_tmo_read(c, a4, &ts);
+        if (e < 0) return (u64)(s64)e;
         tsp = &ts;
     }
+    u64 gmask = 0;
+    if (pair[0]) {
+        int e = pwait_mask_read(c, pair[0], pair[1], &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    PwaitTmo tmo;
+    syscall_wait_begin(tsp);
+    pwait_tmo_arm(&tmo, a4, tsp);
+    int nfds = (int)a0;
+    if (nfds < 0) return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINVAL);
+    /* A count past the fd table's size is clamped to it, not refused: the
+     * kernel reads and writes only as much of each set as the table can name.
+     * A libc fd_set holds 1024, and that is what every set in practice is;
+     * past it the clamp is what bounds the copies, and the buffers move to
+     * the heap. The sets are copied in whole longs (FDS_BYTES). */
+    if (nfds > FD_SETSIZE) {
+        int cap = host_fdtable_size();
+        if (nfds > cap) nfds = cap;
+    }
+    size_t setb = ((size_t)nfds + 63) / 64 * 8;
+    unsigned long sets[3][FD_SETSIZE / (8 * sizeof(unsigned long))];
+    unsigned long *r = sets[0], *w = sets[1], *e = sets[2], *heap = NULL;
+    if (setb > sizeof sets[0]) {
+        heap = calloc(3, setb);
+        if (!heap) return pwait_tmo_finish(c, &tmo, (u64)(s64)-ENOMEM);
+        r = heap; w = heap + setb / sizeof *heap; e = w + setb / sizeof *heap;
+    } else {
+        memset(sets, 0, sizeof sets);
+    }
+    u64 ret;
+    fd_set *rp = a1 ? (fd_set *)r : NULL, *wp = a2 ? (fd_set *)w : NULL,
+           *ep = a3 ? (fd_set *)e : NULL;
+    if ((a1 && copy_from_guest(c, r, a1, setb) < 0) ||
+        (a2 && copy_from_guest(c, w, a2, setb) < 0) ||
+        (a3 && copy_from_guest(c, e, a3, setb) < 0)) {
+        ret = (u64)(s64)-EFAULT;
+        goto out;
+    }
     sigset_t ss, *ssp = NULL;
-    if (a5) {
-        /* arm64 passes {const sigset_t *ss; size_t ss_len} */
-        u64 pair[2];
-        if (copy_from_guest(c, pair, a5, 16) < 0) return (u64)(s64)-EFAULT;
-        if (pair[0]) {
-            u64 gmask;
-            int e = pwait_mask_read(c, pair[0], pair[1], &gmask);
-            if (e < 0) return (u64)(s64)e;
-            pwait_host_mask(&ss, gmask);
-            ssp = &ss;
-            if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
-        }
+    if (pair[0]) {
+        pwait_host_mask(&ss, gmask);
+        ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) { ret = (u64)(s64)-EINTR; goto out; }
     }
     sigfd_sync(c->m);
-    syscall_wait_begin(tsp);
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
-    if (rr < 0) return host_err();
+    if (rr < 0) { ret = host_err(); goto out; }
     /* A set that cannot be written back is EFAULT, whatever the call found:
      * core_sys_select overwrites its own return with it (the input sets were
      * readable at entry, but nothing says the memory is still writable when
      * the sleep ends). Reporting the ready count instead tells the guest to
      * read descriptor bits that were never stored. */
-    if ((a1 && copy_to_guest(c, a1, &r, setb) < 0) ||
-        (a2 && copy_to_guest(c, a2, &w, setb) < 0) ||
-        (a3 && copy_to_guest(c, a3, &e, setb) < 0))
-        return (u64)(s64)-EFAULT;
-    return (u64)rr;
+    if ((a1 && copy_to_guest(c, a1, r, setb) < 0) ||
+        (a2 && copy_to_guest(c, a2, w, setb) < 0) ||
+        (a3 && copy_to_guest(c, a3, e, setb) < 0))
+        ret = (u64)(s64)-EFAULT;
+    else
+        ret = (u64)rr;
+out:
+    free(heap);
+    return pwait_tmo_finish(c, &tmo, ret);
 }
 
 SYSDEF(splice) {
