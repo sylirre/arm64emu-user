@@ -3,7 +3,10 @@
  * against the raw-syscall path; run_tests.sh re-runs it with
  * A64_GETRANDOM_FORCE_DEV=1 so the /dev-backed fallback tier -- what a host
  * kernel without getrandom (Android 7's 3.x) is served by -- must answer
- * with identical semantics. */
+ * with identical semantics, and with A64_GETRANDOM_FORCE_OLD=1 for a host
+ * that has the call but not GRND_INSECURE (3.17-5.5), where the flag has to
+ * be served from /dev/urandom rather than refused with the host's EINVAL
+ * (the insecure= row). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>

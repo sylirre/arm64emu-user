@@ -64,6 +64,16 @@ SYSDEF(getrandom) {
      * syscall's own contract above 256 bytes (its callers loop), and the
      * kernel bounds it too: import_ubuf caps the iterator at MAX_RW_COUNT. */
     unsigned flags = (unsigned)a2;
+    /* The kernel's flag rules, applied here before the host sees the call:
+     * a bit outside the three, or GRND_RANDOM together with GRND_INSECURE, is
+     * EINVAL (both paths below used to enforce them, one through the host
+     * and one itself). Judging them first is what makes an EINVAL from the
+     * host below mean exactly one thing. */
+    if (flags & ~(G_GRND_NONBLOCK | G_GRND_RANDOM | G_GRND_INSECURE))
+        return (u64)(s64)-EINVAL;
+    if ((flags & (G_GRND_RANDOM | G_GRND_INSECURE)) ==
+        (G_GRND_RANDOM | G_GRND_INSECURE))
+        return (u64)(s64)-EINVAL;
     u8 buf[65536];
     size_t len = a1 > sizeof buf ? sizeof buf : (size_t)a1;
     /* Then by the guest's own buffer, the way the kernel's iterator is bounded
@@ -73,30 +83,43 @@ SYSDEF(getrandom) {
      * that names more than it mapped -- which a clamped huge count makes easy
      * -- got EFAULT where a kernel hands it a bufferful. */
     if (len && !(len = rw_room(c, a0, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
-    if (!getenv("A64_GETRANDOM_FORCE_DEV")) {
+    /* GRND_INSECURE is 5.6. A host that has getrandom(2) but predates the
+     * flag -- 3.17 through 5.5, which is every Android 10 and 11 kernel and
+     * an Ubuntu 20.04 -- answers EINVAL for a flag the guest's 6.1 ABI
+     * promises, and a guest that asked for insecure bytes was refused them
+     * where a kernel hands them over. The refusal is remembered once seen
+     * (the flags have already been judged above, so nothing else the host
+     * could call EINVAL is left), and the flag then goes straight to the
+     * urandom tier below, which is what it asks for: the urandom pool
+     * without the seeded wait. A64_GETRANDOM_FORCE_OLD is such a host on any
+     * kernel, and is how the suite runs the tier where the real thing has
+     * the flag. */
+    static int host_no_insecure = -1;
+    int old = (flags & G_GRND_INSECURE) &&
+              PROBE_ONCE(host_no_insecure, getenv("A64_GETRANDOM_FORCE_OLD") != NULL);
+    if (!old && !getenv("A64_GETRANDOM_FORCE_DEV")) {
         ssize_t n = syscall(SYS_getrandom, buf, len, flags);
         if (n >= 0) {
             if (copy_to_guest(c, a0, buf, (size_t)n) < 0)
                 return (u64)(s64)-EFAULT;
             return (u64)n;
         }
-        if (errno != ENOSYS) return host_err();
+        if (errno == EINVAL && (flags & G_GRND_INSECURE))
+            __atomic_store_n(&host_no_insecure, 1, __ATOMIC_RELAXED);
+        else if (errno != ENOSYS) return host_err();
     }
     /* The host kernel predates getrandom(2) (< 3.17 -- Android 7 devices run
-     * 3.x), or a seccomp filter blocked it (the SIGSYS net answers ENOSYS).
-     * The guest ABI still has the syscall: uname presents a modern kernel,
-     * and OpenSSL's seeding *skips* its /dev/urandom fallback on anything
-     * >= 4.8 precisely because getrandom must exist there -- so forwarding
-     * the host's ENOSYS leaves TLS software with no entropy source at all
-     * (apk update died dereferencing the NULL SSL object that came of it).
-     * Serve the call from the host's random devices, with the kernel's own
-     * flag rules. */
-    if (flags & ~(G_GRND_NONBLOCK | G_GRND_RANDOM | G_GRND_INSECURE))
-        return (u64)(s64)-EINVAL;
-    if ((flags & (G_GRND_RANDOM | G_GRND_INSECURE)) ==
-        (G_GRND_RANDOM | G_GRND_INSECURE))
-        return (u64)(s64)-EINVAL;
-    /* GRND_INSECURE asks for the urandom source without the seeded wait; a
+     * 3.x), or a seccomp filter blocked it (the SIGSYS net answers ENOSYS),
+     * or it predates GRND_INSECURE alone (above). The guest ABI still has the
+     * syscall: uname presents a modern kernel, and OpenSSL's seeding *skips*
+     * its /dev/urandom fallback on anything >= 4.8 precisely because
+     * getrandom must exist there -- so forwarding the host's ENOSYS leaves
+     * TLS software with no entropy source at all (apk update died
+     * dereferencing the NULL SSL object that came of it). Serve the call
+     * from the host's random devices, with the kernel's own flag rules
+     * (judged above).
+     *
+     * GRND_INSECURE asks for the urandom source without the seeded wait; a
      * pre-4.8 host never blocks urandom reads anyway, so both flavors read
      * urandom. GRND_RANDOM keeps its own device and its blocking rules. */
     int rnd = (flags & G_GRND_RANDOM) != 0;

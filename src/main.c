@@ -339,6 +339,10 @@ static void help(void) {
                         "AT_RANDOM seed, onto the /dev/urandom / /dev/random "
                         "fallback (the tier a host kernel without getrandom "
                         "is served by)."},
+        {"A64_GETRANDOM_FORCE_OLD", "Refuse GRND_INSECURE on the host "
+                        "getrandom(2) path the way a 3.17-5.5 kernel does "
+                        "(the tier such a host is served by: the flag is "
+                        "then answered from /dev/urandom)."},
         {"A64_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
                         "with a pipe instead of process_vm_readv (the tier a "
                         "host kernel older than 3.2 is served by)."},

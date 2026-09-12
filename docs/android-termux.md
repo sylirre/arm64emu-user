@@ -50,7 +50,14 @@ unfiltered:
   object). `A64_GETRANDOM_FORCE_DEV` forces this tier for testing. The same
   two tiers seed the guest's `AT_RANDOM` (the sixteen bytes libc turns into
   a stack canary and pointer guard), which used to fall back to a fixed
-  pattern instead — the same canary in every guest on such a host.
+  pattern instead — the same canary in every guest on such a host. A host
+  that has `getrandom(2)` but predates `GRND_INSECURE` (5.6 — so every
+  Android 10 and 11 kernel) is a third case: it answers `EINVAL` for a flag
+  the guest's 6.1 ABI promises, and the emulator, having judged the flags
+  itself first so that nothing else the host could call `EINVAL` is left,
+  remembers the refusal and serves the flag from `/dev/urandom` from then on
+  — which is what it asks for, the urandom pool without the seeded wait.
+  `A64_GETRANDOM_FORCE_OLD` is such a host on any kernel.
 * **Never-forwarded set**: the keyring family returns `-ENOSYS` everywhere now
   (`--host-keyring` opts a glibc host back into the passthrough; on Bionic the
   option cannot be honoured, since the Oreo filter kills a forwarded call);

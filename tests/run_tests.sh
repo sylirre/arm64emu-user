@@ -386,6 +386,17 @@ elif [ -x "$GRBIN" ]; then
         fail=$((fail+1)); echo "FAIL c/getrandom(dev-tier) (qemu rc=$rc_q, ours rc=$rc_e)"
         diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
     fi
+    # And once more as a host that has getrandom(2) but predates GRND_INSECURE
+    # (3.17-5.5: every Android 10/11 kernel), which answers EINVAL for the
+    # flag; the emulator must serve it from /dev/urandom there, and the rest
+    # of the calls still from the host.
+    out_e=$(A64_GETRANDOM_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
+    if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
+        pass=$((pass+1)); echo "PASS c/getrandom(old-getrandom tier)"
+    else
+        fail=$((fail+1)); echo "FAIL c/getrandom(old-getrandom tier) (qemu rc=$rc_q, ours rc=$rc_e)"
+        diff <(echo "$out_q") <(echo "$out_e") | head -6 | sed 's/^/     /'
+    fi
 fi
 
 # ---- Alpine rootfs shell tests (if present) ----
