@@ -17,10 +17,16 @@
  *
  * The tree is built one level below the temp directory so that every ".."
  * lands somewhere this test owns; a `..` that climbed out would be reading
- * whatever the host has there. Not included: `lfile/..`, `dangling/..` and
- * `nodir/..`, where the kernel refuses (ENOTDIR/ENOENT) a component this
- * resolver cancels without looking at -- a divergence that predates the
- * optimistic route and belongs to the walk itself. */
+ * whatever the host has there.
+ *
+ * The `xx_` rows are the other thing ".." is not: a lexical erasure. The
+ * kernel steps INTO the component before it climbs back out, so `nodir/..`
+ * and `dangling/..` are ENOENT, `lfile/..` is ENOTDIR, and a ".." past a
+ * file never reaches the file it names next -- the walk used to cancel the
+ * component without looking at it and answer 0 for all of them. The
+ * exception is the directory the walk starts in: a kernel climbs out of the
+ * cwd through its dentry's parent whether or not it still exists, so `../x`
+ * from a directory since removed is still x (rows cwd_*). */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -131,6 +137,51 @@ int main(void)
     ask("nd_through", "a/b/x");
     ask("nd_plain",   "a/x");
     ask("nd_root",    "x");
+
+    /* A ".." that cancels something the kernel has to walk into first. */
+    ln("nowhere", "r/dangling");
+    ask("xx_nodir",    "nodir/../x");
+    ask("xx_nodir2",   "a/nodir/../x");
+    ask("xx_file",     "x/../x");
+    ask("xx_file2",    "a/x/../x");
+    ask("xx_dangling", "dangling/../x");
+    ask("xx_lfile",    "a/b/x/../x");          /* through the link: c/x/.. */
+    ask("xx_dir",      "a/e/../x");            /* a real directory: fine */
+    ask("xx_twice",    "nodir/../nodir2/../x");
+    ask("xx_after",    "a/../nodir/../x");
+    ask("xx_dot",      "nodir/./../x");
+    ask("xx_tail",     "a/x/..");              /* the file, then up: ENOTDIR */
+    ask("xx_tail2",    "nodir/..");
+    rm("r/dangling");
+
+    /* From a working directory that no longer exists: ".." climbs out of it
+     * all the same, and a name in it is gone. */
+    {
+        char cwd[512], gone[512];
+        if (getcwd(cwd, sizeof cwd)) {
+            snprintf(gone, sizeof gone, "%s/r/gone", base);
+            mkdir(gone, 0755);
+            if (chdir(gone) == 0) {
+                rmdir(gone);
+                char buf[64];
+                int fd = open("../x", O_RDONLY);
+                if (fd < 0) printf("cwd_up errno=%d\n", errno);
+                else { ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
+                       buf[n < 0 ? 0 : n] = 0; printf("cwd_up %s\n", buf); }
+                fd = open("../a/../x", O_RDONLY);
+                if (fd < 0) printf("cwd_up2 errno=%d\n", errno);
+                else { ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
+                       buf[n < 0 ? 0 : n] = 0; printf("cwd_up2 %s\n", buf); }
+                fd = open("x", O_RDONLY);
+                printf("cwd_in %s\n", fd < 0 ? "errno=2" : "open");
+                if (fd >= 0) close(fd);
+                fd = open("./../x", O_RDONLY);
+                printf("cwd_dot %s\n", fd < 0 ? "errno" : "open");
+                if (fd >= 0) close(fd);
+                if (chdir(cwd) != 0) printf("chdir back failed\n");
+            }
+        }
+    }
 
     rm("r/d/lup"); rm("r/a/b");
     rm("r/d/x"); rm("r/d");

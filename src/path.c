@@ -37,6 +37,16 @@ static void canon_pop(char *canon) {
     *s = 0;
 }
 
+/* How many components `canon` has below `root` (a prefix of it, or "/"). */
+static int canon_depth(const char *canon, const char *root) {
+    size_t rl = strlen(root);
+    if (rl > 1 && !strncmp(canon, root, rl)) canon += rl;
+    int n = 0;
+    for (; *canon; canon++)
+        if (*canon == '/' && canon[1] && canon[1] != '/') n++;
+    return n;
+}
+
 /* rootfs + canon -> host path. canon always starts with '/'. */
 static int to_host(const struct Machine *m, const char *canon, char *host_out) {
     size_t rl = strlen(m->rootfs), cl = strlen(canon);
@@ -1308,6 +1318,13 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
      * unlink("file/") deleted the file. */
     int want_dir = path_wants_dir(rest);
     int nlinks = 0;
+    /* Components below `trusted` came from the starting directory (the cwd,
+     * or the dirfd) and are a directory that exists by construction -- the
+     * kernel climbs out of one through its dentry's parent, even out of one
+     * since unlinked. Anything above it was named by the path or spliced in
+     * from a link, and a ".." that cancels one of those is a walk INTO it
+     * first (see below). */
+    int depth = canon_depth(canon, croot), trusted = depth;
     char *p = rest;
     while (*p) {
         while (*p == '/') p++;
@@ -1321,6 +1338,7 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
         memcpy(comp, p, cl);
         comp[cl] = 0;
         p = end;
+        int r;
 
         if (!strcmp(comp, ".")) continue;
         if (!strcmp(comp, "..")) {
@@ -1339,13 +1357,31 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
              * nothing (the clamp below) and stays on the fast route. */
             if (strcmp(canon, croot)) {
                 if (fast) { *fast = 0; return 0; }
+                /* ".." is not a lexical erasure: link_path_walk steps INTO the
+                 * component before it climbs back out, so the component has
+                 * to be there, and has to be a directory -- stat("/nope/..")
+                 * is ENOENT and stat("/etc/passwd/..") is ENOTDIR, where the
+                 * fold used to answer 0 for both and open("/nope/../etc/
+                 * passwd") succeeded. Asked of the component's own host path
+                 * (a symlink there has been spliced away by now, so this is
+                 * the thing itself); the trusted prefix is exempt, being the
+                 * directory the walk started in. */
+                if (depth > trusted) {
+                    r = canon_to_host(m, canon, hostbuf, NULL, NULL);
+                    if (r < 0) return r;
+                    struct stat dst;
+                    if (stat(hostbuf, &dst) != 0) return -errno;
+                    if (!S_ISDIR(dst.st_mode)) return -ENOTDIR;
+                }
                 canon_pop(canon);                        /* clamp at chroot root */
+                if (--depth < trusted) trusted = depth;
             }
             continue;
         }
 
-        int r = canon_push(canon, comp);
+        r = canon_push(canon, comp);
         if (r < 0) return r;
+        depth++;
 
         if (fast) {
             if (zone_prefix(m, canon)) { *fast = 0; return 0; }
@@ -1405,7 +1441,8 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
         want_dir = path_wants_dir(rest);   /* the link may end in a slash too */
         p = rest;
         canon_pop(canon);                 /* the link itself is replaced */
-        if (tgt[0] == '/') strcpy(canon, croot);   /* absolute link: re-root at chroot */
+        if (--depth < trusted) trusted = depth;
+        if (tgt[0] == '/') { strcpy(canon, croot); depth = trusted = 0; }   /* absolute link: re-root at chroot */
     }
 
     int plain = 0;

@@ -208,7 +208,16 @@ containment.) `path_resolve` walks the guest path
 **component by component**, resolving each against `rootfs + sofar`:
 
 - an absolute symlink target restarts the walk at the guest root;
-- `..` clamps at the guest root and cannot escape;
+- `..` clamps at the guest root and cannot escape — and it is not a lexical
+  erasure: `link_path_walk` steps *into* the component before it climbs back
+  out, so the component has to be there and has to be a directory.
+  `stat("/nope/..")` is `ENOENT`, `stat("/etc/passwd/..")` is `ENOTDIR`, and
+  `open("/nope/../etc/passwd")` fails, where the walk used to cancel the
+  component without looking at it and answer 0 for all three. The one exemption
+  is the directory the walk starts in (the cwd, or the dirfd's directory): a
+  kernel climbs out of it through its dentry's parent whether or not it still
+  exists, so `../x` from a directory since removed is still `x`
+  (`tests/c/pathdotdot.c`, rows `xx_*` and `cwd_*`);
 - `ELOOP` after 40 hops;
 - a **trailing slash** (or a final `.`/`..`) demands that the final component be
   a directory, and is checked after bind translation against the host path the
