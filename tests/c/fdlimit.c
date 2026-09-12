@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 
 #define LIM 64
 
@@ -95,6 +96,9 @@ int main(void)
     int sv[2];
     errno = 0; printf("spair_full=%d errno=%d\n",
                       ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sv)), errno);
+    /* memfd_create was the one creator that skipped the limit. */
+    errno = 0; printf("memfd_full=%d errno=%d\n",
+                      ok((int)syscall(SYS_memfd_create, "ci", 0)), errno);
 
     /* One back, and open(2) promises the lowest free number -- which is the one
      * just released, and must not have been taken by anything of the

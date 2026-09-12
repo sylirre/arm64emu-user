@@ -709,6 +709,11 @@ SYSDEF(memfd_create) {
         r = memfd_create(name, (unsigned)a1);
 #endif
         if (r >= 0) {
+            /* The guest's soft RLIMIT_NOFILE, enforced where the descriptor is
+             * handed over like every other fd creator's (sys.h): this was the
+             * one that skipped it, so a guest at its limit could still get a
+             * memfd where a kernel answers EMFILE. */
+            if (!fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
             struct stat st;                  /* class the native fd too: its */
             if (fstat(r, &st) == 0)          /* number may shadow a stale    */
                 mfd_track_native(r, (u64)st.st_dev, (u64)st.st_ino);
