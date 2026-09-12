@@ -2506,6 +2506,14 @@ check_fixture readlinksz $'neg=-22 guard=1\nzero=-22 guard=1\nintmin=-22\nhi32_z
 # EINTR, which is the case a caller looping with the time it has left needs.
 # Also the clamp of a select nfds past the fd table's size, never a refusal.
 check_fixture pwaittmo $'ppoll_eintr r=-4 band=1\npselect_eintr r=-4 band=1\nppoll_timeout r=0 zero=1\npselect_timeout r=0 zero=1\nppoll_ready r=1 updated=1\npselect_ready r=1 updated=1 isset=1\nppoll_nfds r=-22 updated=1\nppoll_fault r=-14 updated=1\npselect_nfds r=-22 updated=1\npselect_fault r=-14 updated=1\nppoll_badts r=-22 kept=1\nppoll_badsize r=-22 kept=1\nppoll_badmask r=-14 kept=1\nppoll_badts_badmask r=-22\npselect_badsize r=-22 kept=1\npselect_badts_badnfds r=-22 kept=1\npselect_badmask_badnfds r=-14 kept=1\npselect_badpair r=-14\nppoll_zero r=1 zero=1\npselect_intmax r=1 isset=1\npselect_wide r=1 isset=1 updated=1\ndone'
+# How a #! line is read (load_script): a newline anywhere in the 256-byte
+# buffer ends it, without one the line is cut at the buffer's end and refused
+# only where the cut could have truncated the interpreter -- so "#!/bin/sh"
+# with no newline runs, as does a newline past the buffer while the name fits.
+# Trailing blanks trimmed, the argument is the rest of the line blanks and
+# all, an empty name is EACCES. Self-checking: qemu-user parses the line with
+# a walk of its own; the expected block is a real kernel's, taken natively.
+check_fixture shebang $'  argv: [<self>] [<dir>/s1] [extra]\nplain: ran\n  argv: [<self>] [<dir>/s2] [extra]\nno_newline: ran\n  argv: [<self>] [-a -b] [<dir>/s3] [extra]\ntrailing_blanks: ran\n  argv: [<self>] [-x] [<dir>/s4] [extra]\nleading_blanks: ran\n  argv: [<self>] [-a] [<dir>/s5] [extra]\narg_no_newline: ran\n  argv: [<self>] [-a] [<dir>/s6] [extra]\nnul_in_arg: ran\n  argv: [<self>] [<dir>/s7] [extra]\nnul_after_name: ran\n  argv: [<self>] [cut ok] [<dir>/s8] [extra]\narg_cut: ran\n  argv: [<self>] [cut ok] [<dir>/s9] [extra]\narg_cut_late_newline: ran\n  argv: [<self>] [<dir>/s10] [extra]\nblank_run_past_buffer: ran\nname_cut: errno=8\nempty_line: errno=8\nblank_line: errno=8\nbare: errno=13\nblank_no_newline: errno=13\nmissing_interp: errno=2\n  argv: [<dir>/<long>/i] [<dir>/s17] [extra]\nname_253_newline: ran\n  argv: [<dir>/<long>/i] [<dir>/s18] [extra]\nname_253_padded: ran\nname_254_newline: errno=8\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

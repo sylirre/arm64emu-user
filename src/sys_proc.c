@@ -1373,6 +1373,20 @@ static int exec_perm_check(struct Machine *m, const PathPin *p, int fd,
                         remap_gid(m, (u32)st.st_gid), st.st_mode);
 }
 
+/* load_script's two scanners, both over the CLOSED range [first, last]: the
+ * first non-blank byte, and the first byte that ends a name (a blank or a
+ * NUL). NULL when there is none. */
+static char *shebang_next_non_blank(char *first, char *last) {
+    for (; first <= last; first++)
+        if (*first != ' ' && *first != '\t') return first;
+    return NULL;
+}
+static char *shebang_next_terminator(char *first, char *last) {
+    for (; first <= last; first++)
+        if (*first == ' ' || *first == '\t' || !*first) return first;
+    return NULL;
+}
+
 u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     struct Machine *m = c->m;
     PathPin pin;
@@ -1441,27 +1455,53 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * rewrite below adds to the list. */
         r = exec_arg_limit(m, canon, argv, envp);
         if (r < 0) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
+        /* The kernel's binprm buffer: BINPRM_BUF_SIZE bytes, zero-padded
+         * when the file is shorter, and never NUL-terminated by itself. */
         unsigned char hdr[256];
         size_t n;
+        memset(hdr, 0, sizeof hdr);
         ssize_t hn = pread(imgfd, hdr, sizeof hdr, 0);  /* leaves the offset alone */
         if (hn < 0) { close(imgfd); free_execvecs(argv, envp); return host_err(); }
         n = (size_t)hn;
         if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
-            /* shebang: rebuild argv = [interp, (arg), script, argv[1..]] */
-            hdr[n < sizeof hdr ? n : sizeof hdr - 1] = 0;
-            char *line = (char *)hdr + 2;
-            char *nl = strchr(line, '\n');
-            if (!nl) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOEXEC; }
-            *nl = 0;
-            while (*line == ' ' || *line == '\t') line++;
-            char *interp = line, *arg = NULL;
-            char *sp = strpbrk(line, " \t");
-            if (sp) {
-                *sp++ = 0;
-                while (*sp == ' ' || *sp == '\t') sp++;
-                if (*sp) arg = sp;
+            /* shebang: rebuild argv = [interp, (arg), script, argv[1..]],
+             * parsed as load_script parses it (binfmt_script.c, 5.1+). A
+             * newline anywhere in the buffer ends the line; without one the
+             * line is cut at the buffer's end, and that is refused only when
+             * the cut could have truncated the INTERPRETER -- no space, tab or
+             * NUL after its first byte. So a file that is exactly "#!/bin/sh"
+             * runs (the zero padding terminates the name), and so does a line
+             * whose newline lies past the buffer while the interpreter fits;
+             * both used to be ENOEXEC for want of a newline. Trailing blanks
+             * are trimmed off the line, the argument is everything after the
+             * first blank run, blanks and all, and an embedded NUL ends the
+             * argument (or, before it, the name) as it ends any C string. */
+            char *buf = (char *)hdr, *buf_end = buf + sizeof hdr - 1;
+            char *i_end = memchr(buf, '\n', sizeof hdr);
+            if (!i_end) {
+                i_end = shebang_next_non_blank(buf + 2, buf_end);
+                if (!i_end || !shebang_next_terminator(i_end, buf_end)) {
+                    close(imgfd); free_execvecs(argv, envp);
+                    return (u64)(s64)-ENOEXEC;   /* all blank, or a cut name */
+                }
+                i_end = buf_end;
             }
-            if (!*interp) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOEXEC; }
+            while (i_end[-1] == ' ' || i_end[-1] == '\t') i_end--;
+            char *interp = shebang_next_non_blank(buf + 2, i_end), *arg = NULL;
+            if (!interp || interp == i_end) {
+                close(imgfd); free_execvecs(argv, envp);
+                return (u64)(s64)-ENOEXEC;   /* no interpreter name */
+            }
+            char *sep = shebang_next_terminator(interp, i_end);
+            if (sep && *sep) arg = shebang_next_non_blank(sep, i_end);
+            *i_end = 0;
+            if (arg) *sep = 0;
+            /* A name that is empty -- the file is "#!" and nothing else, or
+             * "#!" and blanks, so the first non-blank byte is the padding's
+             * NUL -- passes load_script's checks and goes to open_exec as "",
+             * which a kernel-side lookup takes as the working directory: a
+             * directory is not a regular file, so EACCES, never ENOENT. */
+            if (!*interp) { close(imgfd); free_execvecs(argv, envp); return (u64)(s64)-EACCES; }
             int oldc = 0;
             while (argv[oldc]) oldc++;
             char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));

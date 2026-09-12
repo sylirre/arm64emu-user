@@ -1483,6 +1483,20 @@ the guest may **execute** it, handles a `#!` shebang loop (depth 4, rebuilding
 argv), and for an ELF64/AArch64 file performs an **in-process reload**: tear down
 the address space, close CLOEXEC fds, reset signal handlers, and `load_elf`.
 
+The `#!` line is read the way `load_script` (binfmt_script.c, 5.1+) reads it,
+out of a 256-byte zero-padded buffer that is never NUL-terminated by itself. A
+newline anywhere in it ends the line; without one the line is cut at the
+buffer's end, and the cut is `ENOEXEC` only where it could have truncated the
+*interpreter* — no blank or NUL after its first byte. So a file that is exactly
+`#!/bin/sh` runs (the padding terminates the name), a newline lying past the
+buffer is fine while the name fits, and an over-long argument is simply cut;
+all three used to be refused for want of a newline within what was read.
+Trailing blanks come off the line, the argument is everything after the first
+blank run (blanks included), an embedded NUL ends it as it ends any C string,
+and a name that comes out empty (`#!` alone, or with blanks) is `EACCES`, not
+`ENOENT` — a kernel-side lookup of `""` lands on the working directory, and a
+directory is no executable (`tests/fixtures/shebang.c`).
+
 **The image is opened once** (`exec_open_pinned`, `elf.c`), in the resolution
 loop, and every question after that is asked of *that descriptor*: the file
 type and mode, the permission, the header, the setuid bits, and the load
