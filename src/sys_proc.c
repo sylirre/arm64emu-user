@@ -543,6 +543,15 @@ SYSDEF(clone) {
         m->leader_parked = 0;
         m->group_exit_code = 0;
         jit_fork_child();                 /* fork discipline for the JIT state */
+        /* What the parent asked fork to leave out of this child, or to hand it
+         * empty (madvise MADV_DONTFORK / MADV_WIPEONFORK): the host fork copied
+         * every mapping, so the regions are dropped and wiped here. Not for
+         * vfork, whose child shares the parent's address space -- the copy
+         * this one runs on is discarded at its imminent exec. After the JIT
+         * reset above: the unmap drops translations, and the inherited code
+         * cache may be a memfd the parent still runs from (W^X hosts), which
+         * an unpatch written through the inherited view would reach. */
+        if (!(flags & G_CLONE_VM)) as_fork_child(&m->as);
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         sig_fork_child();                 /* nor is the pending-signal set */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */

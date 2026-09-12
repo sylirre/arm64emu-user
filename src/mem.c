@@ -1335,6 +1335,97 @@ static void as_account(AddrSpace *as) {
     proctab_mem_publish(&pm);
 }
 
+/* ---- what a fork child inherits: madvise MADV_DONTFORK / MADV_WIPEONFORK ----
+ *
+ * These are not hints. A kernel copies an address space vma by vma, and a vma
+ * marked VM_DONTCOPY is left out of the child while one marked VM_WIPEONFORK
+ * is given to it empty -- an RDMA library keeps the registered buffers of a
+ * parent out of its children that way, and a PRNG's state page is wiped so
+ * that parent and child never draw the same stream. The host fork underneath
+ * this emulator copies every host mapping regardless, so the two are carried
+ * as region flags and applied on the child side of fork (as_fork_child). */
+
+/* Split the region straddling `va`, but only if the advice would change it:
+ * a straddling region whose flags already read as asked needs no boundary,
+ * and every split is a row the region table keeps for good. */
+static void region_split_for_advice(AddrSpace *as, u64 va, u32 set, u32 clear) {
+    const Region *r = as_find_region(as, va);
+    if (!r || r->start == va) return;
+    if (((r->forkflags | set) & ~clear) == r->forkflags) return;
+    region_split_at(as, va);
+}
+
+int guest_fork_advise(AddrSpace *as, u64 addr, u64 len, u32 set, u32 clear,
+                      int anon_only) {
+    if ((addr | len) & GUEST_PAGE_MASK || !len) return -EINVAL;
+    if (!range_ok(addr, len)) return -ENOMEM;
+    u64 end = addr + len;
+    region_split_for_advice(as, addr, set, clear);
+    region_split_for_advice(as, end, set, clear);
+    /* In address order, as madvise_walk_vmas goes: the list is sorted by
+     * start, and the splits above put every region either wholly inside the
+     * range or wholly outside it. */
+    int hole = 0;
+    u64 next = addr;   /* where the next region ought to start for no hole */
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if (r->end <= addr) continue;
+        if (r->start >= end) break;
+        if (r->start > next) hole = 1;
+        /* MADV_WIPEONFORK is for private anonymous memory alone, and the
+         * kernel says so vma by vma: the refusal lands on the first mapping
+         * that is not, with the ones before it already advised. */
+        if (anon_only && (r->file || r->shared)) return -EINVAL;
+        r->forkflags = (r->forkflags | set) & ~clear;
+        next = r->end;
+    }
+    if (next < end) hole = 1;
+    return hole ? -ENOMEM : 0;
+}
+
+/* Zero `len` bytes of anonymous private host backing at `p`, cheaply: the
+ * host-page-aligned interior is discarded (MADV_DONTNEED on a private
+ * anonymous mapping makes the next touch a fresh zero page, and touches
+ * nothing now), and only the partial host pages at either end -- there are
+ * none unless the host's pages are bigger than the guest's -- are written. A
+ * memset of the whole range would break copy-on-write on every page of it in
+ * the child, which for a large wiped region is the copy fork is meant to
+ * avoid. */
+static void host_zero_backing(u8 *p, size_t len) {
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    uintptr_t hp = (uintptr_t)g_host_pagesz;
+    uintptr_t lo = ((uintptr_t)p + hp - 1) & ~(hp - 1);
+    uintptr_t hi = ((uintptr_t)p + len) & ~(hp - 1);
+    if (hi > lo && madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0) {
+        memset(p, 0, lo - (uintptr_t)p);
+        memset((void *)hi, 0, (uintptr_t)p + len - hi);
+    } else {
+        memset(p, 0, len);
+    }
+}
+
+void as_fork_child(AddrSpace *as) {
+    as_lock();
+    /* Wipe first, drop second: an unmap moves the table under a walk. */
+    for (int i = 0; i < as->nregions; i++) {
+        Region *r = &as->regions[i];
+        if ((r->forkflags & RF_WIPEONFORK) && !(r->forkflags & RF_DONTFORK))
+            host_zero_backing(r->host, (size_t)(r->end - r->start));
+    }
+    for (int i = 0; i < as->nregions; ) {
+        Region *r = &as->regions[i];
+        if (r->forkflags & RF_DONTFORK) {
+            u64 start = r->start, rlen = r->end - r->start;
+            guest_unmap_impl(as, start, rlen);   /* the table shifts down */
+            continue;
+        }
+        i++;
+    }
+    as_account(as);
+    as_drain_retired(as);
+    as_unlock();
+}
+
 /* The same, for the callers outside this file: the ELF loader, which records
  * the image spans only after the mappings that carried them are already in
  * place, and the fork path, which seeds its child's slot. */

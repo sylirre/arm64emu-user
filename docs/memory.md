@@ -97,9 +97,10 @@ the *advice* is judged first, before anything about the range, so a value this
 kernel does not know is `EINVAL` even where the range alone would have been an
 empty-length success or a hole's `ENOMEM`. The accepted set is a 6.1 kernel's
 (`madv_valid`, `sys_mm.c`) — `MADV_DONTNEED`, `MADV_FREE` and
-`MADV_DONTNEED_LOCKED` discard the range, and the rest are hints about paging,
-fork inheritance and dumping that a kernel is free to ignore and that are
-ignored here. Two groups are deliberately absent: `MADV_HWPOISON` /
+`MADV_DONTNEED_LOCKED` discard the range, `MADV_DONTFORK` / `MADV_DOFORK` and
+`MADV_WIPEONFORK` / `MADV_KEEPONFORK` decide what a fork child inherits
+(below), and the rest are hints about paging and dumping that a kernel is free
+to ignore and that are ignored here. Two groups are deliberately absent: `MADV_HWPOISON` /
 `MADV_SOFT_OFFLINE` need `CONFIG_MEMORY_FAILURE`, which this kernel does not
 offer, and `MADV_GUARD_INSTALL` / `MADV_GUARD_REMOVE` are 6.13. Neither pair is
 a hint — one poisons a page, the other installs a faulting guard PTE — so
@@ -122,6 +123,25 @@ way the discard is then published to the JIT like a mapping change
 (`jit_invalidate_range`): the bytes under a translated block may just have
 become zeroes, or the file's own code again, and a kernel owes the guest that
 without any cache maintenance on its part (`docs/jit.md`).
+
+The fork-inheritance advice is not a hint either: a kernel copies an address
+space vma by vma, leaving out one marked `VM_DONTCOPY` and handing the child an
+empty one marked `VM_WIPEONFORK` — an RDMA library keeps a parent's registered
+buffers out of its children that way, and a PRNG wipes its state page so parent
+and child never draw the same stream. The host fork underneath this emulator
+copies every host mapping regardless, so the four values are carried as region
+flags (`Region.forkflags`, set by `guest_fork_advise`, which splits the regions
+at the range's edges like `mprotect` does and walks them in address order like
+`madvise_walk_vmas` — `MADV_WIPEONFORK` is refused on the first file-backed or
+shared region it meets, with the ones before it advised, and a hole is `ENOMEM`
+after the mapped parts were) and applied on the child side of fork
+(`as_fork_child`): a `RF_DONTFORK` region is unmapped there, a `RF_WIPEONFORK`
+one is zeroed — by discarding the host-page-aligned interior of its anonymous
+backing (`MADV_DONTNEED` on the host: a fresh zero page on the next touch, no
+copy-on-write broken now) and writing only the partial host pages at either end
+— and keeps its flag, as the kernel's does. A vfork child shares the parent's
+space and gets neither, here as there. `tests/fixtures/madvfork.c` holds every
+row to a real kernel's answers.
 
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**

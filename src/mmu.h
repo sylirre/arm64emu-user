@@ -226,7 +226,19 @@ typedef struct Region {
                                * mapping census (F_SEAL_WRITE's EBUSY check):
                                * region_insert/-delete keep the broker's count
                                * in step as splits copy and unmaps retire it */
+    u32  forkflags;           /* RF_*: what a fork child gets of this region
+                               * (madvise MADV_DONTFORK / MADV_WIPEONFORK).
+                               * Travels with the region through splits, trims
+                               * and moves, the way vm_flags travel with a vma */
 } Region;
+
+/* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
+ * space altogether (the kernel's VM_DONTCOPY); RF_WIPEONFORK hands the child
+ * zeroes there and stays set in the child (VM_WIPEONFORK, private anonymous
+ * memory only). Neither means anything to vfork, whose child shares the
+ * space. Applied on the child side of fork by as_fork_child. */
+#define RF_DONTFORK   1u
+#define RF_WIPEONFORK 2u
 
 /* Host backing whose guest mapping is gone but whose munmap is deferred:
  * another guest thread may still hold a translated host pointer or a stale
@@ -323,6 +335,18 @@ int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
  * backing that maps something else. */
 int  guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst);
 int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len);
+/* madvise's fork-inheritance advice over [addr, addr+len): every region inside
+ * gets `set` added to and `clear` taken from its forkflags, in address order,
+ * the regions at the edges being split first so nothing outside the range is
+ * touched. `anon_only` refuses a file-backed or shared region with -EINVAL
+ * and stops there, leaving the regions before it changed -- which is what
+ * the kernel's walk does. -ENOMEM when the range has a hole in it, after the
+ * mapped parts have been advised (madvise_walk_vmas). Caller holds as_lock. */
+int  guest_fork_advise(AddrSpace *as, u64 addr, u64 len, u32 set, u32 clear,
+                       int anon_only);
+/* The child side of fork (not vfork): drop every RF_DONTFORK region and zero
+ * every RF_WIPEONFORK one. The forking thread is the only one here. */
+void as_fork_child(AddrSpace *as);
 /* Empty and publish this thread's D-TLB epoch, releasing its hold on the
  * retired-backing quarantine. Called at the run-loop safepoint. */
 void as_tlb_quiesce_self(void);

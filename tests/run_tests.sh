@@ -2417,6 +2417,15 @@ check_fixture madvadvice $'normal=0\nrandom=0\nsequential=0\nwillneed=0\ndontfor
 # qemu-user has the very defect (its TBs survive the discard); the values are
 # a real kernel's, and both engines must print them.
 check_fixture madvcode $'anon=42,42\nanon_dontneed=0 word=00000000 call=-4\nanon_rewritten=43\nfile=7\nfile_patched=42,42\nfile_dontneed=0 word=528000e0 call=7\nhole=44,45\nhole_dontneed=-1 errno=12 call=-4,-4\ndone'
+# The madvise advice that changes what a fork child inherits: MADV_DONTFORK
+# leaves the range out of the child, MADV_WIPEONFORK hands it zeroes (and
+# stays set in the child), and MADV_DOFORK / MADV_KEEPONFORK undo them.
+# Self-checking: qemu-user refuses the two ...ONFORK values and passes the
+# other two through to the host, where a guest fork is a host fork -- so it
+# can be neither the oracle nor the thing under test. The expected output is
+# byte-for-byte what this same fixture prints built for the host and run on a
+# real kernel, the refusals (a file or shared mapping, a hole) included.
+check_fixture madvfork $'dontfork=0 errno=0\ndontfork_child=aS\ndontfork_parent=ab\ndofork=0 errno=0\ndofork_child=ab\nwipeonfork=0 errno=0\nwipe_child=0b\nwipe_parent=ab\nwipe_grandchild=0b\nkeeponfork=0 errno=0\nkeep_child=ab\ndontfork_mid=0 errno=0\nmid_child_lo=aS\nmid_child_hi=Sb\nwipe_file=-1 errno=22\nwipe_shm=-1 errno=22\nkeep_file=0 errno=0\ndontfork_file=0 errno=0\ndofork_file=0 errno=0\nwipe_mixed=-1 errno=22\nmixed_child=0b\nwipe_hole=-1 errno=12\nhole_child=0S\ndontfork_hole=-1 errno=12\nhole_child2=SS\ndontfork_unmapped=-1 errno=12\nwipe_w=0 errno=0\ndontfork_w=0 errno=0\nvfork_child=aa\ndone'
 # Ranges that wrap past the top of the address space, and lengths whose page
 # round-up wraps to zero. Self-checking because qemu-user range-checks mremap
 # itself, wrongly -- ENOMEM for every case where a kernel says EFAULT or EINVAL;

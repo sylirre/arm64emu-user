@@ -433,10 +433,13 @@ SYSDEF(mprotect) {
  *   this kernel claims to be -- and they install state (a guard PTE that
  *   faults) rather than offering a hint, so the same reasoning applies.
  *
- * What is left divides in two: MADV_DONTNEED / MADV_FREE / MADV_DONTNEED_LOCKED
- * are carried out below, and the rest are hints about paging, fork inheritance
- * and dumping that a kernel is itself free to ignore -- accepted and ignored,
- * which is what they mean here. */
+ * What is left divides in three: MADV_DONTNEED / MADV_FREE /
+ * MADV_DONTNEED_LOCKED are carried out below; MADV_DONTFORK / MADV_DOFORK and
+ * MADV_WIPEONFORK / MADV_KEEPONFORK are recorded on the regions and carried
+ * out on the child side of fork (mem.c as_fork_child) -- they change what a
+ * child's address space holds, which no hint does; and the rest are hints
+ * about paging and dumping that a kernel is itself free to ignore -- accepted
+ * and ignored, which is what they mean here. */
 static int madv_valid(int adv) {
     switch (adv) {
         case G_MADV_NORMAL:     case G_MADV_RANDOM:
@@ -475,6 +478,25 @@ SYSDEF(madvise) {
     u64 end = a0 + len;
     if (end < a0) return (u64)(s64)-EINVAL;
     if (end == a0) return 0;
+
+    /* The fork-inheritance advice: a flag on the regions, honoured when the
+     * process forks. MADV_WIPEONFORK takes private anonymous memory only and
+     * is refused on anything else -- region by region, in the kernel's walk
+     * order, so the regions before the offending one are advised regardless.
+     * The other three take any mapping. A hole in the range is ENOMEM, with
+     * the mapped parts advised, as for every other advice. */
+    if (adv == G_MADV_DONTFORK || adv == G_MADV_DOFORK ||
+        adv == G_MADV_WIPEONFORK || adv == G_MADV_KEEPONFORK) {
+        u32 set = adv == G_MADV_DONTFORK ? RF_DONTFORK :
+                  adv == G_MADV_WIPEONFORK ? RF_WIPEONFORK : 0;
+        u32 clear = adv == G_MADV_DOFORK ? RF_DONTFORK :
+                    adv == G_MADV_KEEPONFORK ? RF_WIPEONFORK : 0;
+        as_lock();
+        int r = guest_fork_advise(&c->m->as, a0, len, set, clear,
+                                  adv == G_MADV_WIPEONFORK);
+        as_unlock();
+        return (u64)(s64)r;
+    }
 
     /* MADV_DONTNEED / MADV_FREE return the pages to the kernel; on Linux the
      * next access to an anonymous page then faults in a fresh zero page. Go's
