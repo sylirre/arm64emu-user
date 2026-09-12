@@ -214,6 +214,22 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     return 0;
 }
 
+/* What this emulator implements, as the two AT_HWCAP words a kernel would
+ * report for such a CPU. One place for it: the auxv below and the Features
+ * line of the synthesized /proc/cpuinfo (sys_procfs.c) must not disagree, or
+ * a program that reads the one runs instructions the other never promised. */
+void elf_hwcaps(u64 *hwcap, u64 *hwcap2) {
+    *hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
+             G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
+             G_HWCAP_SHA512 | G_HWCAP_ATOMICS |  /* LSE implemented (decode.c) */
+             G_HWCAP_FPHP | G_HWCAP_ASIMDHP |    /* FEAT_FP16 (exec_fpsimd.c) */
+             G_HWCAP_ASIMDRDM | G_HWCAP_JSCVT | G_HWCAP_FCMA |
+             G_HWCAP_LRCPC | G_HWCAP_ILRCPC |    /* LDAPR + LDAPUR/STLUR */
+             G_HWCAP_ASIMDDP | G_HWCAP_ASIMDFHM | G_HWCAP_FLAGM;
+    *hwcap2 = G_HWCAP2_FLAGM2 |
+              G_HWCAP2_MOPS;                     /* CPYx/SETx (decode.c) */
+}
+
 /* Push a block onto the guest stack (grows down), 8-byte aligned. */
 static u64 stack_push(struct Machine *m, u64 *sp, const void *data, size_t len) {
     *sp = (*sp - len) & ~7ULL;
@@ -504,15 +520,8 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     u64 rnd_va = stack_push(m, &sp, rnd, sizeof rnd);
     u64 plat_va = stack_push(m, &sp, "aarch64", 8);
 
-    u64 hwcap = G_HWCAP_FP | G_HWCAP_ASIMD | G_HWCAP_AES | G_HWCAP_PMULL |
-                G_HWCAP_SHA1 | G_HWCAP_SHA2 | G_HWCAP_CRC32 | G_HWCAP_SHA3 |
-                G_HWCAP_SHA512 | G_HWCAP_ATOMICS |  /* LSE implemented (decode.c) */
-                G_HWCAP_FPHP | G_HWCAP_ASIMDHP |    /* FEAT_FP16 (exec_fpsimd.c) */
-                G_HWCAP_ASIMDRDM | G_HWCAP_JSCVT | G_HWCAP_FCMA |
-                G_HWCAP_LRCPC | G_HWCAP_ILRCPC |    /* LDAPR + LDAPUR/STLUR */
-                G_HWCAP_ASIMDDP | G_HWCAP_ASIMDFHM | G_HWCAP_FLAGM;
-    u64 hwcap2 = G_HWCAP2_FLAGM2 |
-                 G_HWCAP2_MOPS;                     /* CPYx/SETx (decode.c) */
+    u64 hwcap, hwcap2;
+    elf_hwcaps(&hwcap, &hwcap2);
     /* Credentials (fake identity when -fake-id, else the real host ids).
      * AT_SECURE reflects a setuid/setgid transition (do_execve set euid/egid
      * from the file's bits before this reload), telling libc to run guarded. */

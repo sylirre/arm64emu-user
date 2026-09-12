@@ -2578,6 +2578,13 @@ check_fixture mmapminaddr $'fixed0: errno=1\nfixed4k: errno=1\nfixed_span: errno
 # its own and answers for a thread that has exited; the rows are relations and
 # round-trips, never raw masks.
 check_fixture affinity $'get: bytes_positive=1 bytes_mult8=1 cpus_positive=1 cpus_le_online=1\nlen0=-22 len4=-22 len12=-22\nset_one=0\nget_one: cpus=1 is_first=1\nsched_getcpu_is_first=1\nset_short=0\nset_empty=-22\nset_far=-22\nrestore=0\nrestored=1\nthread_set=0\nthread_get: cpus=1 is_first=1\nself_unmoved=1\ngone=-3\nneg=-3\ndone'
+# /proc/cpuinfo is an arm64 kernel's for the CPU this emulator is -- one
+# block per online host CPU, Features spelled from the auxv's own HWCAP words,
+# the MIDR_EL1 fields, no model name line -- not the host's file (which showed
+# an aarch64 guest "GenuineIntel"). Self-checking: qemu-user synthesizes a
+# file of its own; every row is a relation between the file, getauxval and
+# the machine.
+check_fixture cpuinfo $'blocks_eq_online=1\none_features_per_block=1\nfeatures_are_hwcap=1\nhas_atomics=1 has_fphp=1 has_mops=1\nno_x86=1\nno_model_name=1\nmidr_ok=1\nids_ascending=1\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

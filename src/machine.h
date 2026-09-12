@@ -764,6 +764,8 @@ void emu_fork_check(const char *site);
  * Returns 0 or -errno. */
 int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
              char **argv, char **envp);
+/* The AT_HWCAP / AT_HWCAP2 words this emulator advertises (elf.c). */
+void elf_hwcaps(u64 *hwcap, u64 *hwcap2);
 /* Does this argument list fit the budget a new image gets for argv+envp
  * (bprm_stack_limits: a share of RLIMIT_STACK, minus the pointer table)?
  * 0 or -E2BIG. Asked by execve while it can still refuse; load_elf asks it

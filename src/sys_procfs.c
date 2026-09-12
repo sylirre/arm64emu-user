@@ -61,7 +61,7 @@ enum {
     PF_LOADAVG, PF_UPTIME, PF_VERSION, PF_STAT,
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
-    PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT,
+    PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT, PF_CPUINFO,
 };
 
 /* put_mounts format selector. */
@@ -520,6 +520,81 @@ static void put_uptime(int fd, struct Machine *m) {
 static void put_version(int fd) {
     dprintf(fd, "Linux version %s (arm64chroot) (arm64chroot) %s\n",
             GUEST_KREL, GUEST_KVER);
+}
+
+/* /proc/cpuinfo: an arm64 kernel's, for the CPU this emulator is. The host's
+ * file used to pass through -- an x86 host showed an aarch64 guest
+ * "GenuineIntel" and x86 flags, and an AArch64 host would advertise Features
+ * (sve, sme, ...) the emulator does not implement, so a detector reading the
+ * line executes instructions that SIGILL. One block per online host CPU, as
+ * c_show walks for_each_online_cpu (a cpuset or an affinity mask hides
+ * nothing here, on a kernel either), the Features line spelled from the same
+ * HWCAP words the auxv carries (elf_hwcaps), in the kernel's own order and
+ * names (arch/arm64/kernel/cpuinfo.c hwcap_str), and the MIDR fields of the
+ * part MIDR_EL1 reads as (core/sysreg.c: 0x411fd070, a Cortex-A57). A real
+ * arm64 kernel prints no "model name" line, and neither does this. */
+static const char *const cpuinfo_hwcap_str[] = {
+    "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32",
+    "atomics", "fphp", "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc",
+    "dcpop", "sha3", "sm3", "sm4", "asimddp", "sha512", "sve", "asimdfhm",
+    "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb", "paca", "pacg",
+};
+static const char *const cpuinfo_hwcap2_str[] = {
+    "dcpodp", "sve2", "sveaes", "svepmull", "svebitperm", "svesha3", "svesm4",
+    "flagm2", "frint", "svei8mm", "svef32mm", "svef64mm", "svebf16", "i8mm",
+    "bf16", "dgh", "rng", "bti", "mte", "ecv", "afp", "rpres", "mte3", "sme",
+    "smei16i64", "smef64f64", "smei8i32", "smef16f32", "smeb16f32",
+    "smef32f32", "smefa64", "wfxt", "ebf16", "sveebf16", "cssc", "rprfm",
+    "sve2p1", "sme2", "sme2p1", "smei16i32", "smebi32i32", "smeb16b16",
+    "smef16f16", "mops", "hbc",
+};
+
+/* The host's online CPU ids, as /sys/devices/system/cpu/online lists them
+ * ("0-3,6"); every id below the online count when the file is not there. */
+static int cpuinfo_online(int *ids, int max) {
+    int n = 0;
+    char buf[4096];
+    ssize_t len = -1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open("/sys/devices/system/cpu/online", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { len = read(fd, buf, sizeof buf - 1); close(fd); }
+    fdwin_leave();
+    if (len > 0) {
+        buf[len] = 0;
+        for (char *p = buf; *p && n < max; ) {
+            char *e;
+            long a = strtol(p, &e, 10), b = a;
+            if (e == p) break;
+            if (*e == '-') { b = strtol(e + 1, &e, 10); }
+            for (long i = a; i <= b && n < max; i++) ids[n++] = (int)i;
+            if (*e != ',') break;
+            p = e + 1;
+        }
+    }
+    if (!n) {
+        long onln = sysconf(_SC_NPROCESSORS_ONLN);
+        if (onln < 1) onln = 1;
+        for (long i = 0; i < onln && n < max; i++) ids[n++] = (int)i;
+    }
+    return n;
+}
+
+static void put_cpuinfo(int fd) {
+    u64 hwcap, hwcap2;
+    elf_hwcaps(&hwcap, &hwcap2);
+    int ids[4096];
+    int n = cpuinfo_online(ids, (int)(sizeof ids / sizeof ids[0]));
+    const u32 midr = 0x411fd070u;   /* as MRS MIDR_EL1 answers (core/sysreg.c) */
+    for (int i = 0; i < n; i++) {
+        dprintf(fd, "processor\t: %d\nBogoMIPS\t: 100.00\nFeatures\t:", ids[i]);
+        for (unsigned b = 0; b < sizeof cpuinfo_hwcap_str / sizeof *cpuinfo_hwcap_str; b++)
+            if (hwcap & (1ULL << b)) dprintf(fd, " %s", cpuinfo_hwcap_str[b]);
+        for (unsigned b = 0; b < sizeof cpuinfo_hwcap2_str / sizeof *cpuinfo_hwcap2_str; b++)
+            if (hwcap2 & (1ULL << b)) dprintf(fd, " %s", cpuinfo_hwcap2_str[b]);
+        dprintf(fd, "\nCPU implementer\t: 0x%02x\nCPU architecture: 8\n"
+                    "CPU variant\t: 0x%x\nCPU part\t: 0x%03x\nCPU revision\t: %d\n\n",
+                (midr >> 24) & 0xff, (midr >> 20) & 0xf, (midr >> 4) & 0xfff, midr & 0xf);
+    }
 }
 
 /* The guest /proc/stat where the host's is unreadable (see stat_blocked).
@@ -1782,6 +1857,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         kind = PF_UPTIME;
     } else if (!strcmp(canon, "/proc/version")) {
         kind = PF_VERSION;
+    } else if (!strcmp(canon, "/proc/cpuinfo")) {
+        kind = PF_CPUINFO;
     } else if (!strcmp(canon, "/proc/stat")) {
         if (!stat_blocked()) return 0;   /* readable host file is richer */
         kind = PF_STAT;
@@ -1831,6 +1908,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_LOADAVG:    put_loadavg(fd); break;
     case PF_UPTIME:     put_uptime(fd, m); break;
     case PF_VERSION:    put_version(fd); break;
+    case PF_CPUINFO:    put_cpuinfo(fd); break;
     case PF_STAT:       put_stat(fd, m); break;
     case PF_OVERFLOWID: put_overflowid(fd); break;
     case PF_LIMITS:     put_limits(fd, m); break;

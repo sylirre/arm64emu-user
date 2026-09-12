@@ -1110,7 +1110,18 @@ then make the consequences the caller depends on true:
   SELinux denies apps the real ones, so they are rebuilt from `sysinfo()`/
   `CLOCK_BOOTTIME` — the same sources guest `sysinfo` marshals, so the views
   agree; `version` is built from the fixed kernel identity `sys_uname`
-  presents, which the host file would contradict on *any* host). `/proc/stat`
+  presents, which the host file would contradict on *any* host). `cpuinfo` is
+  an arm64 kernel's for the CPU this emulator is (`put_cpuinfo`): one block per
+  online host CPU (`c_show` walks `for_each_online_cpu`, so a cpuset or an
+  affinity mask hides nothing there either), a `Features` line spelled from the
+  very HWCAP words the auxv carries (`elf_hwcaps`), in the kernel's order and
+  names, the MIDR fields `MIDR_EL1` reads as, and no `model name` line — the
+  host's file used to pass through, showing an aarch64 guest `GenuineIntel` and
+  x86 flags, and an AArch64 host would have advertised `sve`/`sme` Features
+  the emulator does not implement, which a feature detector reading the line
+  would then execute. Being host-global but the wrong ISA's, it is denied
+  rather than passed through where no anonymous backing exists
+  (`tests/fixtures/cpuinfo.c`). `/proc/stat`
   is try-host-first: the readable real file is strictly richer (per-CPU
   jiffies, intr, ctxt) and passes through; where the host denies it (Android
   again) a fallback is synthesized — CPU time estimated by integrating the
@@ -1174,7 +1185,8 @@ then make the consequences the caller depends on true:
   per-process views are **denied** instead (`ENOENT`, or the guest's own
   `EMFILE`/`ENFILE` where it ran the process out of descriptors), while only the
   host-global ones (`loadavg`, `uptime`, `version`, and the try-host-first
-  `stat`/`overflow{u,g}id`) still fall through, carrying no guest state to leak.
+  `stat`/`overflow{u,g}id`) still fall through, carrying no guest state to leak
+  — `cpuinfo` excepted, whose host file is the wrong CPU's.
   `status` is the same: a host file it can read but not rewrite — bigger than
   the 1 MiB cap, or no memory to hold it — is refused rather than passed
   through, and only "there is no host file at all" falls through, since the
