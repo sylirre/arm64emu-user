@@ -466,6 +466,8 @@ static void *thread_entry(void *arg) {
     g_tls.image_gen = t->image_gen;
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
+    g_tls.sig_altstack_flags = 2 /*SS_DISABLE*/;   /* sas_ss_reset: a CLONE_VM
+                                                    * child starts with none */
     CPU *c = &t->cpu;
     c->m = t->m;
     sig_sync_host_mask(c->m);   /* the creator's mask, as clone gives it -- the
@@ -1463,8 +1465,8 @@ static void dethread_join(CPU *c) {
     g_tls.clear_child_tid = 0;
     g_tls.robust_head = 0;
     robust_tab_set(g_tls.tid, 0);
-    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
-    g_tls.sig_altstack_flags = 0;
+    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;   /* execve: the
+                                                            * flags word stays */
     g_tls.saved_sigmask = 0;
     g_tls.have_saved_sigmask = 0;
     g_tls.sc_ret_eintr = 0;

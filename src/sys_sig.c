@@ -180,11 +180,12 @@ SYSDEF(sigaltstack) {
      * stack pointer, not a flag (sig_on_altstack) -- see signal.c. */
     int on = sig_on_altstack(*cpu_cur_sp(c));
     if (a1) {
+        /* sas_ss_flags(sp) -- SS_DISABLE when there is none, else whether sp
+         * is on it -- plus the SS_AUTODISARM bit of the stored word. */
         struct { u64 sp; s32 flags; s32 pad; u64 size; } old = {
             g_tls.sig_altstack_sp,
-            (s32)(!g_tls.sig_altstack_size ? 2 /*SS_DISABLE*/
-                                           : (on ? 1 /*SS_ONSTACK*/ : 0) |
-                                                 (s32)g_tls.sig_altstack_flags),
+            (s32)((!g_tls.sig_altstack_size ? 2u /*SS_DISABLE*/ : (on ? 1u /*SS_ONSTACK*/ : 0u)) |
+                  (g_tls.sig_altstack_flags & 0x80000000u /*SS_AUTODISARM*/)),
             0,
             g_tls.sig_altstack_size,
         };
@@ -193,17 +194,8 @@ SYSDEF(sigaltstack) {
     if (a0) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } ss;
         if (copy_from_guest(c, &ss, a0, sizeof ss) < 0) return (u64)(s64)-EFAULT;
-        /* The kernel refuses to move the alternate stack out from under a
-         * handler that is running on it -- disabling it included. */
-        if (on) return (u64)(s64)-EPERM;
-        if (ss.flags & 2 /*SS_DISABLE*/) {
-            g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
-        } else {
-            if (ss.size < 2048) return (u64)(s64)-ENOMEM;
-            g_tls.sig_altstack_sp = ss.sp;
-            g_tls.sig_altstack_size = ss.size;
-            g_tls.sig_altstack_flags = (u32)ss.flags;
-        }
+        int r = sig_altstack_set(ss.sp, (u32)ss.flags, ss.size, on, 2048 /*MINSIGSTKSZ*/);
+        if (r < 0) return (u64)(s64)r;
     }
     return 0;
 }

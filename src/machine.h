@@ -610,6 +610,8 @@ void sig_fork_child(void);
 void sig_gate_forget(void);
 void bus_tls_prewarm(void);
 int  sig_on_altstack(u64 sp);   /* the kernel's on_sig_stack(): SP-range test */
+/* do_sigaltstack's install: 0 or -EPERM/-EINVAL/-ENOMEM (signal.c). */
+int  sig_altstack_set(u64 sp, u32 flags, u64 size, int on, u64 min_size);
 /* Arm the process-lifetime SIGSYS net: seccomp traps become -ENOSYS. */
 void sig_install_sigsys_net(void);
 void sig_install_kick_net(void);

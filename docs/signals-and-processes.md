@@ -295,9 +295,29 @@ current stack pointer against the stack's range (`sig_on_altstack`, the kernel's
 A handler that leaves by `siglongjmp` never reaches `sigreturn`, and that is the
 normal way to recover from a stack-overflow `SIGSEGV` — with a flag it stayed
 set for the life of the thread, so every later `SA_ONSTACK` signal was delivered
-onto the stack that had just overflowed. The same test drives `uc_stack`'s
-`ss_flags`, `sigaltstack`'s `SS_ONSTACK` reporting, and its `EPERM` refusal to
-move the stack out from under a handler standing on it.
+onto the stack that had just overflowed. The same test drives `sigaltstack`'s
+`SS_ONSTACK` reporting and its `EPERM` refusal to move the stack out from under
+a handler standing on it.
+
+The state kept is the kernel's three words (`sas_ss_sp`, `sas_ss_size`,
+`sas_ss_flags`), and the flags word is kept *as given* — `SS_AUTODISARM`, or a
+`SS_ONSTACK`/`SS_DISABLE` the caller passed — because that is what a frame's
+`uc_stack.ss_flags` carries (`__save_altstack` writes it raw; `sigaltstack`'s
+own report is `sas_ss_flags(sp)` plus the `SS_AUTODISARM` bit). The modes are
+`SS_DISABLE`, `SS_ONSTACK` and 0, anything else `EINVAL` (it used to be
+installed and read back); `execve` drops the stack and keeps the flags word; a
+`CLONE_VM` thread starts with none (`sas_ss_reset`, flags `SS_DISABLE`).
+**`SS_AUTODISARM`** does what it is for: the alternate stack is disabled for the
+handler's run (`signal_delivered`'s `sas_ss_reset`, whether or not the frame
+went onto it) and comes back at `rt_sigreturn`, restored from the frame's
+`uc_stack` — `restore_altstack`, judged against the *restored* stack pointer and
+with every refusal but an unreadable frame ignored, so a handler that edited
+`uc_stack` changes its stack that way, and one that ran on the (non-disarming)
+alternate stack changes nothing (`EPERM`). It used to stay armed, so a nested
+delivery from a handler that had switched off it — a coroutine library's whole
+reason for the flag — landed on top of the frame in use.
+`tests/fixtures/altstackflags.c` holds the frame words and the disarm rows;
+qemu-user knows no `SS_AUTODISARM`.
 
 ### The temporary mask of `ppoll` / `pselect6` / `epoll_pwait`
 

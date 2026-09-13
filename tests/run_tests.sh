@@ -2621,6 +2621,11 @@ check_fixture sentsync $'kill_segv: handler=1 si_user=1\nraise_segv: handler=1 s
 # its ENOENT. The child used to run free on a fork copy. Self-checking:
 # qemu-user's vfork is a fork too.
 check_fixture vforkback $'spawn_missing: r=ENOENT waited=0\nspawn_ok: r=0 exited0=1\nexit_child: flag=1 heap=h stack=7 waited=yes\nexit_child_status: 3\nexec_child: flag=2\nexec_child_status: 0\nsignal_child: flag=3\nsignal_child_status: signaled=1 sig=15\nnested: flag=5 flag2=6\nforked_grandchild: flag=0 flag2=9\nmany_pages: big=1 arr=xyz untouched=a\nafter: flag=11 heap=p\nvfork_no_vm: flag=0 waited=yes\ndone'
+# sigaltstack: the flags word kept as given and written raw into the frame's
+# uc_stack, the modes judged, SS_AUTODISARM disarming the stack for the
+# handler's run and rt_sigreturn restoring it. Self-checking: qemu-user knows
+# no SS_AUTODISARM.
+check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsigaltstack_disable_small: 0\nalt_none: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_plain: frame_flags=0 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_onstack_bit: frame_flags=0x1 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_autodisarm: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_autodisarm_offstack: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_disabled: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_disabled_autodisarm: frame_flags=0x80000002 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000002 after_size=0\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

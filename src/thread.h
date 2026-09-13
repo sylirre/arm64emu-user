@@ -49,7 +49,12 @@ typedef struct {
      * multithreading -- each Go M registers its own gsignal stack, so a shared
      * field routes one thread's signal frame onto another thread's stack. */
     u64 sig_altstack_sp, sig_altstack_size;
-    u32 sig_altstack_flags;
+    u32 sig_altstack_flags;   /* the kernel's sas_ss_flags: the ss_flags word
+                               * as sigaltstack was given it (SS_AUTODISARM,
+                               * or a SS_ONSTACK/SS_DISABLE the caller passed),
+                               * SS_DISABLE after a reset; written raw into a
+                               * frame's uc_stack, and only its SS_AUTODISARM
+                               * bit reported back by sigaltstack */
 } ThreadState;
 
 extern __thread ThreadState g_tls;

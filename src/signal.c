@@ -1184,7 +1184,29 @@ void sig_reset_for_exec(struct Machine *m) {
     }
     EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
     sigq_reset();   /* this thread's queue; post-exec is single-threaded */
-    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
+    g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;   /* execve drops the
+                                                            * stack, keeps the
+                                                            * flags word */
+}
+
+/* do_sigaltstack's install half, shared by the syscall and by rt_sigreturn's
+ * restore_altstack (which ignores what it returns). `on` says the caller's
+ * stack pointer is on the current alternate stack, which no change may pull
+ * out from under it. The mode is the flags word less SS_AUTODISARM, and only
+ * SS_DISABLE, SS_ONSTACK and 0 are modes -- SS_ONSTACK is accepted and means
+ * nothing on the way in; the flags word is kept as given, since that is what
+ * a frame's uc_stack carries. Anything else used to be installed and read
+ * back as whatever bits were passed. */
+int sig_altstack_set(u64 sp, u32 flags, u64 size, int on, u64 min_size) {
+    if (on) return -EPERM;
+    u32 mode = flags & ~0x80000000u /*SS_AUTODISARM*/;
+    if (mode != 2 /*SS_DISABLE*/ && mode != 1 /*SS_ONSTACK*/ && mode != 0) return -EINVAL;
+    if (mode == 2) { sp = 0; size = 0; }
+    else if (size < min_size) return -ENOMEM;
+    g_tls.sig_altstack_sp = sp;
+    g_tls.sig_altstack_size = size;
+    g_tls.sig_altstack_flags = flags;
+    return 0;
 }
 
 /* ---- guest frame layout (arm64 kernel ABI) ---- */
@@ -1335,11 +1357,8 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
 
     /* Pick the stack: guest sigaltstack if requested and configured. */
     u64 sp = *cpu_cur_sp(c);
-    int used_altstack = 0;
-    if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !sig_on_altstack(sp)) {
+    if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !sig_on_altstack(sp))
         sp = g_tls.sig_altstack_sp + g_tls.sig_altstack_size;
-        used_altstack = 1;
-    }
     u64 frame = (sp - FRAME_SIZE) & ~15ULL;
 
     /* Build the frame in an image of our own and write it out once.
@@ -1365,10 +1384,10 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     /* ucontext */
     u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
                                                 : g_tls.sigmask;
+    /* uc_stack is __save_altstack's: the stored words as they are, the flags
+     * word raw (sas_ss_flags), not the on-stack answer sigaltstack computes. */
     wr64(fr, UC_STACK + 0, g_tls.sig_altstack_sp);
-    wr32(fr, UC_STACK + 8,
-         !g_tls.sig_altstack_size ? 2 /*SS_DISABLE*/
-                                  : (used_altstack ? 0 : 1 /*SS_ONSTACK*/));
+    wr32(fr, UC_STACK + 8, g_tls.sig_altstack_flags);
     wr64(fr, UC_STACK + 16, g_tls.sig_altstack_size);
     wr64(fr, UC_SIGMASK, mask_to_save);
 
@@ -1414,6 +1433,16 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     c->x[30] = m->sigtramp_va;
     *cpu_cur_sp(c) = frame;
     c->pc = act->handler;
+    /* SS_AUTODISARM: the alternate stack is disabled for the handler's run
+     * (signal_delivered's sas_ss_reset, whether or not the frame went onto
+     * it) and comes back at rt_sigreturn, restored from the frame's uc_stack
+     * (sig_return). It used to stay armed, so a nested delivery from a
+     * handler that had switched off it -- a coroutine library's whole reason
+     * for the flag -- landed on top of the frame in use. */
+    if (g_tls.sig_altstack_flags & 0x80000000u) {
+        g_tls.sig_altstack_sp = g_tls.sig_altstack_size = 0;
+        g_tls.sig_altstack_flags = 2 /*SS_DISABLE*/;
+    }
 
     /* New blocked set while the handler runs -- and the host's with it, or
      * the kernel would go on delivering to a thread whose handler is
@@ -1484,6 +1513,21 @@ void sig_return(CPU *c) {
         c->fpsr = fpsr;
         c->fpcr = fpcr;
         memcpy(c->v, v128, sizeof v128);
+    }
+    /* restore_altstack: the alternate stack comes back from the frame's
+     * uc_stack -- what SS_AUTODISARM took away at delivery, or whatever the
+     * handler wrote there -- judged against the restored stack pointer
+     * (do_sigaltstack refuses a change from under a stack in use) and with
+     * every refusal but an unreadable frame ignored, as the kernel's is. */
+    {
+        u64 ss_sp, ss_size;
+        u32 ss_flags;
+        if (copy_from_guest(c, &ss_sp, frame + UC_STACK, 8) < 0 ||
+            copy_from_guest(c, &ss_flags, frame + UC_STACK + 8, 4) < 0 ||
+            copy_from_guest(c, &ss_size, frame + UC_STACK + 16, 8) < 0)
+            goto bad;
+        sig_altstack_set(ss_sp, ss_flags, ss_size, sig_on_altstack(*cpu_cur_sp(c)),
+                         2048 /*MINSIGSTKSZ*/);
     }
     c->excl_valid = false;
     return;
