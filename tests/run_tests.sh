@@ -2626,6 +2626,11 @@ check_fixture vforkback $'spawn_missing: r=ENOENT waited=0\nspawn_ok: r=0 exited
 # handler's run and rt_sigreturn restoring it. Self-checking: qemu-user knows
 # no SS_AUTODISARM.
 check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsigaltstack_disable_small: 0\nalt_none: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_plain: frame_flags=0 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_onstack_bit: frame_flags=0x1 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_autodisarm: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_autodisarm_offstack: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_disabled: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_disabled_autodisarm: frame_flags=0x80000002 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000002 after_size=0\ndone'
+# mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
+# afresh -- zeroes behind private anonymous memory, the file again behind a
+# private file mapping, the same pages behind a shared one. Self-checking:
+# qemu fails the call; the private file row needs a 5.13+ host (marker).
+check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_maymove: Invalid argument\nanon_written: ok moved=1 new=7 old=0\nanon_untouched: ok moved=1 new=0 old=0\nunrounded: ok moved=1 new=8 old=0\nfixed: ok at_dst=1 new=9 old=0\nshared_memfd: ok moved=1 new=5 old=5\nprivate_memfd_written: ok moved=1 new=6 old=5\nprivate_memfd_clean: ok moved=1 new=5 old=5\nprivate_file: ok moved=1 new=0 old=0\nshared_file: ok moved=1 new=0 old=0\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

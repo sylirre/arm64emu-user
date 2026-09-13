@@ -530,6 +530,16 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #   waitid-rusage   waitid(2)'s fifth argument, the rusage no libc exposes, is
 #                   ignored outright; the buffer comes back untouched.
 #
+# A fourth names not an interposer's defect but a host kernel's vintage, since
+# the emulator answers the guest by asking the host to do the same thing:
+#
+#   mremap-dontunmap-file   mremap(MREMAP_MAYMOVE|MREMAP_DONTUNMAP) of a
+#                   private FILE mapping, a 5.13 kernel's (5.7 took anonymous
+#                   memory only). The emulator serves a guest's request on a
+#                   private file mapping with the host's own, since a fresh
+#                   private mapping of the file for the range left behind
+#                   would need a descriptor nothing keeps.
+#
 # A test that needs one says so with a marker line
 #
 #     NEEDS-HOST-SYSCALL: <name> [<name> ...]
@@ -576,6 +586,23 @@ int main(void) {
      * asked is whether the option came back at all: the host being gated
      * against reports optlen 4 and writes nothing, leaving these zeroed. */
     return !(l == sizeof got && got.tv_sec == 1);
+}
+EOF
+        ;;
+    mremap-dontunmap-file) cat <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+int main(void) {
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return 1;
+    char *a = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (a == MAP_FAILED) return 1;
+    return mremap(a, 4096, 4096, MREMAP_MAYMOVE | MREMAP_DONTUNMAP) == MAP_FAILED;
 }
 EOF
         ;;

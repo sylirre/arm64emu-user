@@ -726,8 +726,9 @@ SYSDEF(madvise) {
     return hole ? (u64)(s64)-ENOMEM : 0;
 }
 
-#define G_MREMAP_MAYMOVE 1
-#define G_MREMAP_FIXED   2
+#define G_MREMAP_MAYMOVE   1
+#define G_MREMAP_FIXED     2
+#define G_MREMAP_DONTUNMAP 4
 
 /* Copy `len` bytes of guest memory between two mapped ranges. Only used to
  * rebuild anonymous shared memory below, where every page of both ranges is
@@ -785,7 +786,8 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     u64 old_addr = a0, old_len = PG_UP(a1), new_len = PG_UP(a2);
     int flags = (int)a3;
     if (old_addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-    if (flags & ~(G_MREMAP_MAYMOVE | G_MREMAP_FIXED)) return (u64)(s64)-EINVAL;
+    if (flags & ~(G_MREMAP_MAYMOVE | G_MREMAP_FIXED | G_MREMAP_DONTUNMAP))
+        return (u64)(s64)-EINVAL;
     /* A zero new length is not a request to unmap everything -- the kernel
      * rejects it outright. A zero OLD length is the kernel's own special case
      * and is taken below: a second mapping of the shareable object under
@@ -793,6 +795,11 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * documented way to duplicate a mapping since). */
     if (!new_len) return (u64)(s64)-EINVAL;
     if ((flags & G_MREMAP_FIXED) && !(flags & G_MREMAP_MAYMOVE))
+        return (u64)(s64)-EINVAL;
+    /* MREMAP_DONTUNMAP is always a move and never a resize -- the lengths
+     * compared page-rounded, as a 6.13+ kernel's check_mremap_flags sees them
+     * (5.7 compared them as given). */
+    if ((flags & G_MREMAP_DONTUNMAP) && (!(flags & G_MREMAP_MAYMOVE) || old_len != new_len))
         return (u64)(s64)-EINVAL;
     /* The old range has to lie inside the address space, its end included. An
      * old_addr + old_len that wraps past the top of it makes the walk below run
@@ -863,8 +870,10 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
         return r < 0 ? (u64)(s64)r : dst;
     }
 
-    if (!(flags & G_MREMAP_FIXED)) {
-        /* Staying put: shrink in place, or grow in place when allowed. */
+    if (!(flags & (G_MREMAP_FIXED | G_MREMAP_DONTUNMAP))) {
+        /* Staying put: shrink in place, or grow in place when allowed.
+         * (MREMAP_DONTUNMAP always moves: do_mremap sends it down mremap_to
+         * with FIXED, to a fresh address of the kernel's choosing.) */
         if (new_len <= old_len) {
             if (new_len < old_len) guest_unmap(as, old_addr + new_len, old_len - new_len);
             return old_addr;
@@ -911,6 +920,16 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     } else {
         new_addr = as_find_free(as, new_len);
         if (!new_addr) return (u64)(s64)-ENOMEM;
+    }
+    if (flags & G_MREMAP_DONTUNMAP) {
+        /* The old range stays mapped, so the space grows by its length:
+         * vma_to_resize charges that to RLIMIT_AS (and RLIMIT_DATA for a
+         * private writable mapping) here, after the destination was cleared. */
+        if (!as_fits(c->m, old_len)) return (u64)(s64)-ENOMEM;
+        if ((prot & PTE_W) && !shared && !data_fits(c->m, old_len))
+            return (u64)(s64)-ENOMEM;
+        int r = guest_remap_dontunmap(as, old_addr, old_len, new_addr);
+        return r < 0 ? (u64)(s64)r : new_addr;
     }
     if (shm && new_len > old_len) {
         /* Rebuilt rather than moved: the copy reads the old mapping, so it has

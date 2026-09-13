@@ -1385,6 +1385,104 @@ int guest_remap_dup_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     return 0;
 }
 
+/* mremap(MREMAP_MAYMOVE|MREMAP_DONTUNMAP): the pages of [addr, addr+len)
+ * move to `dst` and the old range STAYS MAPPED, as a fresh mapping of the same
+ * thing -- move_page_tables with the old vma kept, so a private anonymous
+ * range reads as zeroes afterwards (its pages went), a private file range
+ * reads the file again (the COW'd pages went, clean pages fault back in), and
+ * a shared range reads what it did (the same pages, through either). The
+ * caller has the destination free and the lengths equal. The old range is
+ * left to whatever its regions are, region by region:
+ *
+ * - shared: a second host mapping of the object, as guest_remap_dup makes one
+ *   (mremap of length 0), so both ranges are the same pages;
+ * - private anonymous: fresh backing for the destination, the bytes copied
+ *   over, the old backing discarded to zeroes (host_zero_backing) -- what the
+ *   kernel's page-table move amounts to, and portable to any host;
+ * - private file: the host's own MREMAP_DONTUNMAP on the slice, which does
+ *   for the host mapping exactly what the guest asked -- and only a host
+ *   kernel of 5.13 or later does it for a file mapping, only on whole host
+ *   pages. Where the host refuses, so does this, with the EINVAL a kernel
+ *   before 5.13 answers: a fresh private mapping of the file for the old range
+ *   would need its descriptor, which nothing keeps (guest fd == host fd).
+ *
+ * The guest used to be told EINVAL for the flag itself, as a kernel before
+ * 5.7 was. */
+static void host_zero_backing(u8 *p, size_t len);
+int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    if ((addr | len | dst) & GUEST_PAGE_MASK || !len) return -EINVAL;
+    if (!range_ok(addr, len) || !range_ok(dst, len)) return -EINVAL;
+    if (dst < addr + len && addr < dst + len) return -EINVAL;
+    for (u64 va = dst; va < dst + len; va += GUEST_PAGE_SIZE)
+        if (as_find_region(as, va)) return -ENOMEM;
+    /* Every slice is judged before any is moved, so a refusal leaves the
+     * guest exactly as it was: the file slices are the only ones that can be
+     * refused, and only for what the host will not do. */
+    u64 pos = addr;
+    while (pos < addr + len) {
+        const Region *src = as_find_region(as, pos);
+        if (!src) return -EFAULT;
+        u64 hi = src->end < addr + len ? src->end : addr + len;
+        if (src->hostmap && !src->shared) {
+            u8 *h = src->host + (pos - src->start);
+            if (((uintptr_t)h & (uintptr_t)(g_host_pagesz - 1)) ||
+                ((hi - pos) & (u64)(g_host_pagesz - 1)))
+                return -EINVAL;          /* not whole host pages (>4 KB host) */
+        }
+        pos = hi;
+    }
+    pos = addr;
+    while (pos < addr + len) {
+        Region *src = NULL;
+        for (int i = 0; i < as->nregions; i++)
+            if (pos >= as->regions[i].start && pos < as->regions[i].end) {
+                src = &as->regions[i]; break;
+            }
+        u64 hi = src->end < addr + len ? src->end : addr + len;
+        u64 slen = hi - pos, ndst = dst + (pos - addr);
+        u8 *shost = src->host + (pos - src->start);
+        Region n = *src;
+        n.start = ndst;
+        n.end = ndst + slen;
+        n.file_off = src->file_off + (pos - src->start);
+        n.path = as_path_dup(src->path);
+        u32 prot = src->prot;
+        if (src->shared) {
+            u64 pad = (u64)((uintptr_t)shost & (uintptr_t)(g_host_pagesz - 1));
+            if (!host_len_ok(slen + pad)) { free(n.path); return -ENOMEM; }
+            void *p = mremap(shost - pad, 0, (size_t)(slen + pad), MREMAP_MAYMOVE);
+            if (p == MAP_FAILED) { free(n.path); return -ENOMEM; }
+            n.host = (u8 *)p + pad;
+            n.hmap = hmap_new((u8 *)p, (size_t)(slen + pad));
+        } else if (!src->hostmap) {
+            u8 *host = host_alloc(slen, PROT_READ | PROT_WRITE);
+            if (!host) { free(n.path); return -ENOMEM; }
+            memcpy(host, shost, (size_t)slen);
+            host_zero_backing(shost, (size_t)slen);
+            n.host = host;
+            n.hmap = hmap_new(host, (size_t)slen);
+            n.mfdcnt = 0;
+        } else {
+            void *p = mremap(shost, (size_t)slen, (size_t)slen,
+                             MREMAP_MAYMOVE | 4 /*MREMAP_DONTUNMAP*/);
+            if (p == MAP_FAILED) { free(n.path); return -EINVAL; }
+            n.host = p;
+            n.hmap = hmap_new((u8 *)p, (size_t)slen);
+        }
+        region_insert(as, n);             /* src is stale from here */
+        for (u64 off = 0; off < slen; off += GUEST_PAGE_SIZE)
+            if (pte_get(as, pos + off))
+                pte_put_one(as, ndst + off, n.host + off, prot);
+        pos = hi;
+    }
+    pte_sync_range(as, dst, len);
+    /* The old range's own translations may be cached with their old content
+     * in every thread's D-TLB; the sync above bumped the generation, and
+     * nothing else about them changed. */
+    return 0;
+}
+
 /* Grow the mapping that ends at addr + old_len so that it covers new_len bytes
  * from addr. The guest VA of what is already there does not change; the ground
  * the growth needs must be free. Returns 0 or -errno. */
@@ -2633,6 +2731,13 @@ int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
     int r = guest_remap_grow_impl(as, addr, old_len, new_len);
     if (r == 0) as_account(as);
     as_drain_retired(as);
+    as_unlock();
+    return r;
+}
+int guest_remap_dontunmap(AddrSpace *as, u64 addr, u64 len, u64 dst) {
+    as_lock();
+    int r = guest_remap_dontunmap_impl(as, addr, len, dst);
+    if (r == 0) as_account(as);
     as_unlock();
     return r;
 }

@@ -340,6 +340,9 @@ int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len);
  * the offset addr names. -EFAULT with nothing under addr, -EINVAL for a
  * private mapping (the kernel refuses to "duplicate" one of those). */
 int  guest_remap_dup(AddrSpace *as, u64 addr, u64 len, u64 dst);
+/* mremap(MREMAP_DONTUNMAP): [addr, addr+len) moves to dst and stays mapped
+ * afresh behind (mem.c has the per-kind story). 0 or -errno. */
+int  guest_remap_dontunmap(AddrSpace *as, u64 addr, u64 len, u64 dst);
 /* madvise's fork-inheritance advice over [addr, addr+len): every region inside
  * gets `set` added to and `clear` taken from its forkflags, in address order,
  * the regions at the edges being split first so nothing outside the range is

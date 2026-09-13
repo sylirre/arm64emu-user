@@ -309,6 +309,34 @@ charge passed RAM+swap. `tests/fixtures/forklock.c` is the regression test —
 it churns from a sibling thread while forking, and used to need 15 GB where it
 now peaks under 500 MB.
 
+### `mremap(MREMAP_DONTUNMAP)`
+
+The pages of the old range move to the new one and the old range **stays
+mapped**, as a fresh mapping of the same thing: `move_page_tables` with the old
+vma kept. Behind a private anonymous range that is zeroes (its pages went);
+behind a private file range, the file again (the COW'd pages went, clean pages
+fault back in); behind a shared range, the same pages through either. Always a
+move — `do_mremap` sends it down `mremap_to` to a fresh address, or to the
+`MREMAP_FIXED` one — never a resize (the lengths compared page-rounded, as a
+6.13+ kernel's `check_mremap_flags` sees them), refused without
+`MREMAP_MAYMOVE`, and the old range is charged to `RLIMIT_AS`/`RLIMIT_DATA` as
+new space. `guest_remap_dontunmap` does it region by region: a shared region
+gets a second host mapping of the object (the `mremap(old_size=0)` duplicate
+`guest_remap_dup` makes); a private anonymous one gets fresh backing for the
+destination, the bytes copied and the old backing discarded to zeroes, which is
+what the kernel's page-table move amounts to and works on any host; a private
+file one gets the host's own `MREMAP_DONTUNMAP` on its slice, which does for the
+host mapping exactly what the guest asked — and only a host kernel of 5.13 or
+later does that for a file mapping, only on whole host pages. Where the host
+refuses, so does this, with the `EINVAL` a kernel before 5.13 answers: a fresh
+private mapping of the file for the range left behind would need its
+descriptor, which nothing keeps (guest fd == host fd). The guest used to be told
+`EINVAL` for the flag itself, as a kernel before 5.7 was.
+`tests/fixtures/dontunmap.c` (qemu passes the call to its host with its own
+address bookkeeping and fails it) carries `NEEDS-HOST-SYSCALL:
+mremap-dontunmap-file` for the file row, so a host older than 5.13 skips it by
+name (`tests/hostenv.sh`).
+
 ### The page table gives its second level back
 
 Guest VA is handed out by a bump allocator that walks forward and only wraps at
