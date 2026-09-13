@@ -784,8 +784,59 @@ between them. **Only `CLONE_THREAD` marks a real (pthread) thread.**
   process that immediately `execve`s or `_exit`s. It must be a **`fork`**, not a
   thread — running it as a thread breaks `wait4` (`ECHILD`) and lets the child
   `execve` tear down the *shared* address space under the parent (a crash that
-  presents as a jump to `pc=0`). The child's forked copy is discarded at its
-  imminent exec, so fork semantics are correct here.
+  presents as a jump to `pc=0`). A fork alone is not vfork, though, and the
+  difference is what vfork is *used* for — see the next section.
+
+### vfork: the parent waits, and the child's writes come back
+
+Two things make `vfork` more than a cheap `fork`: the parent is suspended until
+the child execs or exits, and the child writes into the parent's memory in the
+meantime. `posix_spawn`'s child writes the errno of a failed `execve` into the
+parent's frame; busybox's applets set flags the parent reads; `system(3)` in
+several libcs, Go's `os/exec` and every "spawn without paying for a copy"
+caller lean on one half or both. The child used to run free on its fork copy —
+`posix_spawn` of a program that does not exist returned 0, with a child dead of
+`ENOENT` for the caller to find in `wait()` later, and a flag the child set was
+never seen.
+
+Both halves are kept now (`sys_proc.c`, *vfork*). The parent sleeps inside the
+`clone` until the child has execed, exited or died — where a kernel's
+`wait_for_vfork_done` sleeps — and what the child wrote is carried back byte for
+byte: the child's stores were tracked page by page from its first instruction
+(`docs/memory.md`, *A vfork child's writes are tracked*), and at its exec
+(`do_execve`'s point of no return, where `exec_mmap` releases the parent), its
+exit (`process_exit`) or its death by a signal (`guest_terminate_by_signal`) it
+compares each page it touched with the copy it took and sends the bytes that
+changed. They travel through one `MAP_SHARED` anonymous page made before the
+fork — no descriptor, so nothing for the guest's fd table or the CLOEXEC walk to
+see — with a futex word at its head; the child waits for each run to be
+acknowledged, the parent applies it with the ptrace-poke path
+(`copy_to_guest_code`: past the software write bit, since the child may have
+`mprotect`ed what it wrote to, and dropping any JIT block over the bytes), then
+reports `PTRACE_EVENT_VFORK_DONE` when `PTRACE_O_TRACEVFORKDONE` asks and
+returns the pid. Both sides wake on a timer to ask whether the other still
+exists — the parent with `waitid(WNOHANG|WNOWAIT)`, which reaps nothing (the
+zombie stays for the guest's own `wait4`), the child with `getppid` — so a child
+killed outright (`SIGKILL`, an emulator abort) leaves a parent that wakes to
+find it gone, with the diff it would have sent lost as its robust futexes are.
+The parent's wait is killable and nothing more, like the kernel's: a fatal
+signal for it (`sig_pending_fatal`) or an execve dismantling its thread group
+abandons the wait, and every other signal waits in the ring until the `clone`
+returns. `CLONE_VFORK` without `CLONE_VM` gets the wait alone; the child's copy
+is its own there, as on a kernel.
+
+What is not carried, and is documented as such: a mapping the child makes or
+changes itself (`mmap`, `munmap`, `mremap`, `brk`, `mprotect`) is its own — the
+fork copy is gone at its exec, and a kernel's vfork child changing the shared
+map is a program that is already broken by the standard's terms; and a sibling
+thread of the parent writing the very bytes the child writes loses to the child,
+as it would in any race. A nested vfork works (the grandchild's bytes reach the
+child, which forwards them with its own), and a plain `fork` from a vfork child
+gives the grandchild a space of its own. `tests/fixtures/vforkback.c` covers
+`posix_spawn` of a missing program, writes to a global, the heap and the
+parent's frame, the exec / exit / signal endings, both kinds of grandchild, 300
+KB of pages, and the wait itself; self-checking, since qemu-user's vfork is a
+fork.
 
 ### threads (`CLONE_THREAD`)
 

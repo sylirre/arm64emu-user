@@ -593,17 +593,167 @@ static void pte_set_range(AddrSpace *as, u64 addr, u64 len, u8 *host, u32 prot) 
     pte_sync_range(as, addr, len);
 }
 
-static void pte_prot_range(AddrSpace *as, u64 addr, u64 len, u32 prot) {
+/* Rewrite the protection bits of the live PTEs in a range. The caller
+ * publishes (jit_invalidate_range, as_gen_bump, tlb_flush_all) once it has
+ * done every range of the same mutation. */
+static void pte_prot_raw(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE) {
         u64 va = addr + off;
         struct L2Table *l2 = as->l1[L1_IDX(va)];
         if (l2 && l2->e[L2_IDX(va)])
             l2->e[L2_IDX(va)] = (l2->e[L2_IDX(va)] & ~(uintptr_t)PTE_FLAGS) | prot;
     }
-    jit_invalidate_range(addr, len);   /* e.g. mprotect over translated code */
+}
+/* ---- vfork: the child's writes, tracked for the parent -------------------
+ *
+ * A vfork child shares its parent's address space until it execs or exits,
+ * and the parent is suspended until then; here the child runs on a fork copy
+ * (sys_proc.c has why a host thread cannot stand in). What the child writes
+ * before its exec therefore has to be carried back to the parent, or the one
+ * thing vfork is USED for is lost: posix_spawn's child writes the errno of a
+ * failed execve into the parent's frame, and busybox's noexec applets set
+ * flags the parent reads -- posix_spawn of a program that does not exist
+ * returned 0 here, and the parent went on to wait for a child that had
+ * already died of ENOENT.
+ *
+ * The child's PTEs have PTE_W taken away over every private mapping when it
+ * starts (as_vfork_track_begin; a MAP_SHARED mapping is the same file for
+ * both, nothing to carry). The first store to a page then reaches translate's
+ * permission fault, where as_write_heal finds a page whose region is writable
+ * and whose PTE is not -- a combination nothing but this tracking produces --
+ * snapshots the page as it was, gives the PTE its bit back and lets the store
+ * through. At the child's exec, exit or death by signal the snapshots are
+ * compared byte for byte with the pages as they are, and the bytes that
+ * changed go to the parent (as_vfork_flush, over the box sys_proc.c keeps
+ * between the two). Byte diffs rather than pages because the parent's other
+ * threads keep running, and a stale page from the child must not wipe out
+ * what a sibling wrote beside the child's bytes meanwhile. Two things stay
+ * out of reach, and are documented: a mapping the child makes or changes
+ * itself (mmap, munmap, mremap, brk, mprotect) is its own and not carried,
+ * and a sibling thread of the parent writing the very bytes the child writes
+ * loses to the child, as in any race. A grandchild forked from a tracked
+ * child starts clean (as_vfork_fork_child): the heal path still mends the
+ * PTEs it inherited, recording nothing. */
+typedef struct { u64 va; u8 *was; } VforkPage;
+static int g_vf_track;                  /* this process's stores are tracked */
+static VforkPage *g_vf_pages;           /* sorted by va; under as_lock */
+static int g_vf_n, g_vf_cap;
+
+static int vf_find(u64 va) {            /* index of va, or -(insertion+1) */
+    int lo = 0, hi = g_vf_n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_vf_pages[mid].va == va) return mid;
+        if (g_vf_pages[mid].va < va) lo = mid + 1; else hi = mid - 1;
+    }
+    return -(lo + 1);
+}
+
+/* Snapshot `page` (host backing `host`) unless it already is. 0, or -1 when
+ * there is no memory for the copy -- the store is then refused, which the
+ * guest sees as a fault: a lie the parent would otherwise read is worse. */
+static int vf_record(u64 page, const u8 *host) {
+    int i = vf_find(page);
+    if (i >= 0) return 0;
+    i = -i - 1;
+    if (g_vf_n == g_vf_cap) {
+        int cap = g_vf_cap ? g_vf_cap * 2 : 64;
+        VforkPage *t = realloc(g_vf_pages, (size_t)cap * sizeof *t);
+        if (!t) return -1;
+        g_vf_pages = t;
+        g_vf_cap = cap;
+    }
+    u8 *was = malloc(GUEST_PAGE_SIZE);
+    if (!was) return -1;
+    memcpy(was, host, GUEST_PAGE_SIZE);
+    memmove(&g_vf_pages[i + 1], &g_vf_pages[i], (size_t)(g_vf_n - i) * sizeof *g_vf_pages);
+    g_vf_pages[i].va = page;
+    g_vf_pages[i].was = was;
+    g_vf_n++;
+    return 0;
+}
+
+static void vf_drop(void) {
+    for (int i = 0; i < g_vf_n; i++) free(g_vf_pages[i].was);
+    free(g_vf_pages);
+    g_vf_pages = NULL;
+    g_vf_n = g_vf_cap = 0;
+    g_vf_track = 0;
+}
+
+/* The prot a private region's PTEs carry while tracking: writable pages wait
+ * for their first store. */
+static inline u32 vf_pte_prot(const Region *r, u32 prot) {
+    return (g_vf_track && !r->shared) ? prot & ~PTE_W : prot;
+}
+
+void as_vfork_track_begin(AddrSpace *as) {
+    as_lock();
+    vf_drop();
+    g_vf_track = 1;
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        if (r->shared || !(r->prot & PTE_W)) continue;
+        pte_prot_raw(as, r->start, r->end - r->start, r->prot & ~PTE_W);
+    }
     as_gen_bump();
     tlb_flush_all();
+    as_unlock();
 }
+
+int as_vfork_tracking(void) { return g_vf_track; }
+
+/* A write about to land through the host backing rather than through a guest
+ * store (the vfork parent applying its own child's bytes -- which, in a vfork
+ * child that vforked in turn, must reach the grandparent too). Snapshot the
+ * pages first, as the heal path would have for a store. */
+void as_vfork_note_write(AddrSpace *as, u64 va, size_t len) {
+    if (!g_vf_track) return;
+    as_lock();
+    for (u64 page = va & ~(u64)GUEST_PAGE_MASK; page < va + len; page += GUEST_PAGE_SIZE) {
+        uintptr_t pte = pte_get(as, page);
+        if (!pte) continue;
+        const Region *r = as_find_region(as, page);
+        if (!r || r->shared) continue;
+        vf_record(page, (const u8 *)(pte & ~(uintptr_t)PTE_FLAGS));
+    }
+    as_unlock();
+}
+
+void as_vfork_fork_child(void) {
+    vf_drop();   /* the copies came along with the fork; the PTEs heal */
+}
+
+int as_vfork_flush(AddrSpace *as, int (*emit)(void *ctx, u64 va, const u8 *data, u32 len),
+                   void *ctx) {
+    int rc = 0;
+    as_lock();
+    g_vf_track = 0;
+    for (int i = 0; i < g_vf_n && rc == 0; i++) {
+        u64 va = g_vf_pages[i].va;
+        uintptr_t pte = pte_get(as, va);
+        if (!pte) continue;                       /* unmapped since: its own */
+        const u8 *now = (const u8 *)(pte & ~(uintptr_t)PTE_FLAGS);
+        const u8 *was = g_vf_pages[i].was;
+        /* Runs of changed bytes, with gaps of up to 16 unchanged bytes
+         * folded in so a struct written field by field goes as one piece. */
+        u32 off = 0;
+        while (off < GUEST_PAGE_SIZE && rc == 0) {
+            if (now[off] == was[off]) { off++; continue; }
+            u32 last = off, j = off + 1;
+            while (j < GUEST_PAGE_SIZE && j - last <= 16) {
+                if (now[j] != was[j]) last = j;
+                j++;
+            }
+            rc = emit(ctx, va + off, now + off, last - off + 1);
+            off = last + 1;
+        }
+    }
+    vf_drop();
+    as_unlock();
+    return rc;
+}
+
 
 /* ---- region list (sorted by start) ---- */
 
@@ -1373,8 +1523,13 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
             }
         }
         r->prot = prot;   /* fully covered after the splits above */
+        /* Per region rather than over the whole range: under vfork tracking
+         * a private region's pages wait for their first store (vf_pte_prot). */
+        pte_prot_raw(as, r->start, r->end - r->start, vf_pte_prot(r, prot));
     }
-    pte_prot_range(as, addr, len, prot);
+    jit_invalidate_range(addr, len);   /* mprotect over translated code */
+    as_gen_bump();
+    tlb_flush_all();
     region_merge_range(as, addr, addr + len);
     return 0;
 }
@@ -1742,6 +1897,29 @@ void as_destroy(AddrSpace *as) {
 
 static AddrSpace *cpu_as(CPU *c) { return &c->m->as; }
 
+/* A store to a page whose PTE lacks PTE_W while its region has it: the vfork
+ * tracking above took the bit (in this process, or in the parent a fork
+ * copied it from). Snapshot if tracking, give the bit back, and return the
+ * mended PTE; 0 for a genuine permission fault. Cold: once per page. */
+static uintptr_t __attribute__((cold)) as_write_heal(CPU *c, u64 va) {
+    AddrSpace *as = cpu_as(c);
+    u64 page = va & ~(u64)GUEST_PAGE_MASK;
+    uintptr_t out = 0;
+    as_lock();
+    struct L2Table *l2 = as->l1[L1_IDX(page)];
+    uintptr_t pte = l2 ? l2->e[L2_IDX(page)] : 0;
+    if (pte && !(pte & PTE_W)) {
+        const Region *r = as_find_region(as, page);
+        if (r && !r->shared && (r->prot & PTE_W) &&
+            (!g_vf_track || vf_record(page, (const u8 *)(pte & ~(uintptr_t)PTE_FLAGS)) == 0)) {
+            l2->e[L2_IDX(page)] = pte | PTE_W;
+            out = pte | PTE_W;
+        }
+    }
+    as_unlock();
+    return out;
+}
+
 /* Is `va` a page of a file mapping that lies past end-of-file? Such a page is
  * deliberately left out of the page table (guest_map_file_impl), so it looks
  * unmapped to the walk -- but the kernel answers it with a bus error, not a
@@ -1811,8 +1989,9 @@ static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
         u64 page = va & ~(u64)GUEST_PAGE_MASK;
         u8 *hp = r->host + (page - r->start);
         if (host_page_readable(hp)) {
-            pte_set_range(as, page, GUEST_PAGE_SIZE, hp, r->prot);
-            pte = (uintptr_t)hp | r->prot;
+            u32 prot = vf_pte_prot(r, r->prot);
+            pte_set_range(as, page, GUEST_PAGE_SIZE, hp, prot);
+            pte = (uintptr_t)hp | prot;
         }
     }
     as_unlock();
@@ -2094,7 +2273,16 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
         e->page = page;
         e->pte = pte;
     }
-    if (UNLIKELY((pte & need) != need)) { *perm_fault = true; return NULL; }
+    if (UNLIKELY((pte & need) != need)) {
+        /* A write refused by a PTE whose region allows it: the vfork write
+         * tracking took the bit (as_write_heal gives it back, snapshotting
+         * the page first); anything else is the guest's fault to take. */
+        uintptr_t h = (need == PTE_W) ? as_write_heal(c, va) : 0;
+        if (!h) { *perm_fault = true; return NULL; }
+        pte = h;
+        e->page = page;
+        e->pte = pte;
+    }
     return (u8 *)(pte & ~(uintptr_t)PTE_FLAGS) + (va & GUEST_PAGE_MASK);
 }
 

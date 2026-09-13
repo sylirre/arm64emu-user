@@ -187,7 +187,9 @@ high half of a 64-bit `tv_sec` still looks like a plausible number.
 `CLONE_VM` alone does not mean "thread"; only `CLONE_THREAD` does. Spawning a
 host thread for a vfork breaks `wait4` (`ECHILD`) and lets the child `execve`
 tear down the shared address space (crash → jump to `pc=0`). Gate the thread
-path on `CLONE_THREAD`; treat vfork as `fork`.
+path on `CLONE_THREAD`; run vfork as a `fork` — with the parent's wait and the
+child's writes put back on top (`docs/signals-and-processes.md`, *vfork*), since
+a plain fork makes `posix_spawn` of a missing program return 0.
 
 *Visible on:* all hosts, when running busybox `adduser`/`passwd` and similar.
 

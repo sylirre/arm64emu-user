@@ -14,6 +14,7 @@
 #include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/times.h>
@@ -67,6 +68,8 @@ static __attribute__((noreturn)) void process_exit(CPU *c) {
     struct Machine *m = c->m;
     int code = __atomic_load_n(&m->group_exit_code, __ATOMIC_ACQUIRE);
     robust_list_exit_group(c);  /* every thread's robust futexes: OWNER_DIED */
+    vfork_child_flush(c);       /* a vfork child's writes, to its parent; the
+                                 * OWNER_DIED marks above among them */
     /* The whole thread group dies without its remaining threads running their
      * own exit paths: publish the WIFEXITED status on every traced thread's
      * link (a parked sibling dies inside its service loop; its tracer would
@@ -526,6 +529,152 @@ static void *thread_entry(void *arg) {
     return NULL;
 }
 
+/* ---- vfork ----------------------------------------------------------------
+ *
+ * A vfork child shares the parent's address space and the parent sleeps until
+ * the child execs or exits: that is the whole contract, and posix_spawn,
+ * system(3) in several libcs, busybox's applets and every "spawn without
+ * paying for a copy" caller lean on both halves -- the child writes into the
+ * parent's frame (the errno of an execve that failed, a flag that says the
+ * child got as far as exec) and the parent reads it the moment it wakes.
+ *
+ * The child cannot be a host thread here (a thread's execve would replace the
+ * space the parent runs on; sys_proc.c, "vfork vs threads") and so runs on a
+ * fork copy, as it always did -- and used to run free: the parent returned
+ * at once and read nothing the child wrote, so posix_spawn of a program that
+ * does not exist returned 0, with a child dead of ENOENT for the caller to
+ * find in wait() later. Both halves are kept now. The parent waits in the
+ * clone for the child's exec, exit or death, exactly where a kernel's
+ * wait_for_vfork_done sleeps; and what the child wrote in the meantime is
+ * carried back, byte for byte, through a page the two share -- the child's
+ * stores were tracked page by page from its first instruction (mem.c,
+ * "the child's writes, tracked for the parent"), and at its exec / exit /
+ * death it compares each page it touched with the copy it took and sends the
+ * bytes that changed. The parent applies them to its own space with the
+ * ptrace-poke path (copy_to_guest_code: past the software write bit, since
+ * the child may have mprotected what it wrote to, and dropping any JIT block
+ * over them), then reports PTRACE_EVENT_VFORK_DONE if asked to and returns
+ * the pid.
+ *
+ * The box is one MAP_SHARED anonymous mapping made before the fork (no
+ * descriptor: nothing for the guest's fd table or the CLOEXEC walk to see)
+ * with a futex word at its head. Each message is one run of bytes; the child
+ * waits for the parent's acknowledgement before the next, and both sides
+ * wake on a timer to ask whether the other still exists: the parent asks the
+ * kernel (waitid WNOHANG|WNOWAIT, which reaps nothing -- the zombie stays for
+ * the guest's own wait4), the child asks getppid. A child killed outright
+ * (SIGKILL, an emulator abort) sends nothing, and the parent wakes to find it
+ * gone; the diff it would have sent is lost, as its robust futexes are. The
+ * parent's wait is killable and nothing more, like the kernel's: a fatal
+ * signal for it, or an execve dismantling its thread group, abandons the
+ * wait (VF_GONE tells the child to stop sending), and every other signal
+ * waits in the ring until the clone returns. What is not carried: a mapping
+ * the child makes or changes itself (mmap, munmap, mremap, brk, mprotect --
+ * its own, with the fork copy gone at its exec), and a race a sibling thread
+ * of the parent writes into the very bytes the child writes, where the child
+ * wins as it would on a kernel. */
+#define VF_BOX_SIZE (64u << 10)
+#define VF_DATA_MAX (VF_BOX_SIZE - 16)
+enum { VF_IDLE = 0, VF_DATA, VF_ACK, VF_DONE, VF_GONE };
+struct VforkBox {
+    u32 state;              /* the futex word: who moves next */
+    u32 len;                /* VF_DATA: bytes in data[] */
+    u64 va;                 /* VF_DATA: where they go */
+    u8  data[VF_DATA_MAX];
+};
+static struct VforkBox *g_vf_box;   /* the child's end; NULL in any other process */
+static pid_t g_vf_parent;
+
+static void vf_wake(u32 *w) { syscall(SYS_futex, w, 1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0); }
+static void vf_wait(u32 *w, u32 val, long ms) {
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    syscall(SYS_futex, w, 0 /*FUTEX_WAIT*/, val, &ts, NULL, 0);
+}
+
+/* Child: one run of changed bytes to the parent, in box-sized pieces. -1 once
+ * the parent is gone or has given up, which ends the flush. */
+static int vf_emit(void *ctx, u64 va, const u8 *data, u32 len) {
+    struct VforkBox *b = ctx;
+    while (len) {
+        u32 n = len > VF_DATA_MAX ? VF_DATA_MAX : len;
+        memcpy(b->data, data, n);
+        b->va = va;
+        b->len = n;
+        __atomic_store_n(&b->state, VF_DATA, __ATOMIC_RELEASE);
+        vf_wake(&b->state);
+        for (;;) {
+            u32 st = __atomic_load_n(&b->state, __ATOMIC_ACQUIRE);
+            if (st == VF_ACK) break;
+            if (st != VF_DATA) return -1;             /* VF_GONE: the parent left */
+            vf_wait(&b->state, VF_DATA, 100);
+            if (getppid() != g_vf_parent) return -1;   /* the parent died */
+        }
+        va += n; data += n; len -= n;
+    }
+    return 0;
+}
+
+void vfork_child_flush(CPU *c) {
+    struct VforkBox *b = g_vf_box;
+    if (!b) return;
+    g_vf_box = NULL;
+    if (as_vfork_tracking()) as_vfork_flush(&c->m->as, vf_emit, b);
+    __atomic_store_n(&b->state, VF_DONE, __ATOMIC_RELEASE);   /* release the parent */
+    vf_wake(&b->state);
+    munmap(b, VF_BOX_SIZE);
+}
+
+/* A fork child of a vfork child: not a vfork child itself. The inherited box
+ * belongs to its parent's exchange, and the tracked pages to its parent. */
+void vfork_fork_child(void) {
+    if (g_vf_box) { munmap(g_vf_box, VF_BOX_SIZE); g_vf_box = NULL; }
+    as_vfork_fork_child();
+}
+
+/* Parent: sleep until the child has execed, exited or died, applying what it
+ * sends on the way. */
+static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
+    struct Machine *m = c->m;
+    for (;;) {
+        u32 st = __atomic_load_n(&b->state, __ATOMIC_ACQUIRE);
+        if (st == VF_DATA) {
+            u32 len = b->len > VF_DATA_MAX ? VF_DATA_MAX : b->len;
+            /* Into our own tracking first if we are a vfork child ourselves
+             * (the grandchild's bytes are ours to forward), then past the
+             * software write bit. -EFAULT / -EIO: a sibling thread unmapped
+             * or remapped the bytes' home since the fork; the child's write
+             * has nowhere to go. */
+            as_vfork_note_write(&m->as, b->va, len);
+            copy_to_guest_code(c, b->va, b->data, len);
+            __atomic_store_n(&b->state, VF_ACK, __ATOMIC_RELEASE);
+            vf_wake(&b->state);
+            continue;
+        }
+        if (st == VF_DONE) return;
+        vf_wait(&b->state, st, 100);
+        if (__atomic_load_n(&b->state, __ATOMIC_ACQUIRE) != st) continue;
+        /* Quiet: is there still a child to wait for? */
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        int r = waitid(P_PID, child, &si, WEXITED | WNOHANG | WNOWAIT);
+        if ((r == 0 && si.si_pid == child) || (r < 0 && errno == ECHILD)) {
+            /* Dead (killed before it could send), or reaped already by a
+             * sibling thread's wait. A DONE that landed between the load
+             * above and the waitid is taken first. */
+            if (__atomic_load_n(&b->state, __ATOMIC_ACQUIRE) != st) continue;
+            return;
+        }
+        /* Killable, and nothing else: a fatal signal for this process, or the
+         * de_thread of an execve in a sibling thread (a kernel's de_thread
+         * kills the waiting thread outright). */
+        if ((g_sig_npend && sig_pending_fatal(m)) || guest_stop_pending(m)) {
+            __atomic_store_n(&b->state, VF_GONE, __ATOMIC_RELEASE);
+            vf_wake(&b->state);
+            return;
+        }
+    }
+}
+
 SYSDEF(clone) {
     u64 flags = a0, child_stack = a1, ptid = a2, ctid = a4, tls = a3;
     struct Machine *m = c->m;
@@ -534,8 +683,9 @@ SYSDEF(clone) {
      * CLONE_VM without CLONE_THREAD is vfork(): the child shares the address
      * space but is a distinct process that immediately execve()s or _exit()s —
      * running it as a thread would tear down the shared address space under the
-     * parent and make wait4() fail with ECHILD. Treat vfork as a fork (the
-     * child's copy is discarded at its imminent exec). */
+     * parent and make wait4() fail with ECHILD. It is a fork instead, with the
+     * two halves of vfork put back on top (the block above): the parent waits
+     * for the child's exec or exit, and the child's writes are carried back. */
     if ((flags & G_CLONE_VM) && (flags & G_CLONE_THREAD)) {
         /* Real thread: one host thread per guest thread, shared address space. */
         GThread *t = calloc(1, sizeof *t);
@@ -652,9 +802,21 @@ SYSDEF(clone) {
         if (proctab_mem_get((s32)getpid(), &pm)) proctab_mem_seed(rsv, &pm);
     }
 
+    /* vfork's exchange page, before there are two of us to share it. */
+    struct VforkBox *box = NULL;
+    if (flags & G_CLONE_VFORK) {
+        box = mmap(NULL, VF_BOX_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (box == MAP_FAILED) { proctab_release(rsv); return (u64)(s64)-ENOMEM; }
+    }
+
     emu_fork_check("the guest fork/clone syscall");
     pid_t pid = fork();
-    if (pid < 0) { proctab_release(rsv); return host_err(); }
+    if (pid < 0) {
+        if (box) munmap(box, VF_BOX_SIZE);
+        proctab_release(rsv);
+        return host_err();
+    }
     if (pid == 0) {
         proctab_slot_adopt(rsv);          /* the slot our parent reserved */
         /* seccomp survives fork, but the reservation was zeroed before it, so
@@ -701,6 +863,16 @@ SYSDEF(clone) {
          * cache may be a memfd the parent still runs from (W^X hosts), which
          * an unpatch written through the inherited view would reach. */
         if (!(flags & G_CLONE_VM)) as_fork_child(&m->as);
+        /* Whatever vfork exchange our parent was party to is not ours; and
+         * if this IS a vfork, ours starts here -- the write tracking before
+         * the first store into guest memory below (CLONE_CHILD_SETTID is one
+         * a real vfork child makes in the shared space). */
+        vfork_fork_child();
+        if (box) {
+            g_vf_box = box;
+            g_vf_parent = getppid();
+            if (flags & G_CLONE_VM) as_vfork_track_begin(&m->as);
+        }
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         sig_fork_child();                 /* nor is the pending-signal set */
         robust_fork_child();              /* one thread's robust list, its own */
@@ -770,6 +942,14 @@ SYSDEF(clone) {
     /* Parent's fork/clone event stop (before "returning" the child pid), so the
      * tracer learns the new pid via PTRACE_GETEVENTMSG. */
     if (pt_ev) ptrace_report_event(c, pt_ev, (u64)pid);
+    if (box) {
+        /* vfork: sleep until the child has execed or exited, taking its writes
+         * (kernel_clone's wait_for_vfork_done, event stop and all). */
+        vfork_parent_wait(c, box, pid);
+        munmap(box, VF_BOX_SIZE);
+        if (ptrace_self_active() && (ptrace_self_options() & G_PTRACE_O_TRACEVFORKDONE))
+            ptrace_report_event(c, G_PTRACE_EVENT_VFORK_DONE, (u64)pid);
+    }
     return (u64)pid;
 }
 
@@ -1749,6 +1929,8 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
 
     /* Point of no return: tear down and reload. */
     robust_list_exit_self(c);   /* exec_mm_release: this thread's robust futexes */
+    vfork_child_flush(c);       /* ...and a vfork child's writes to its parent,
+                                 * released here as exec_mmap releases it */
     if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
     if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
     shm_detach_all(m);       /* System V shm attaches do not survive execve;

@@ -1266,5 +1266,13 @@ void ipc_fork_child(struct Machine *m);
 void robust_list_exit_self(CPU *c);
 void robust_list_exit_group(CPU *c);
 void robust_fork_child(void);
+/* vfork (sys_proc.c): a vfork child hands its parent the bytes it wrote and
+ * releases it -- at its exec, its exit, its death by a signal. A no-op in any
+ * other process. */
+void vfork_child_flush(CPU *c);
+void vfork_fork_child(void);
+/* signal.c: an unblocked default-terminate signal at SIG_DFL is queued -- the
+ * one kind of signal a killable wait (the vfork parent's) ends for. */
+int  sig_pending_fatal(struct Machine *m);
 
 #endif /* A64_MACHINE_H */

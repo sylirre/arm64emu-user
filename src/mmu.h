@@ -352,6 +352,17 @@ int  guest_fork_advise(AddrSpace *as, u64 addr, u64 len, u32 set, u32 clear,
 /* The child side of fork (not vfork): drop every RF_DONTFORK region and zero
  * every RF_WIPEONFORK one. The forking thread is the only one here. */
 void as_fork_child(AddrSpace *as);
+/* vfork write tracking (mem.c, "the child's writes, tracked for the parent"):
+ * a vfork child calls _begin before its first instruction, _flush at its exec
+ * / exit / death -- `emit` is handed each run of changed bytes and stops the
+ * walk by returning nonzero -- and a fork child of a tracked process calls
+ * _fork_child to start clean. _tracking says whether this process is one. */
+void as_vfork_track_begin(AddrSpace *as);
+int  as_vfork_flush(AddrSpace *as, int (*emit)(void *ctx, u64 va, const u8 *data, u32 len),
+                    void *ctx);
+void as_vfork_fork_child(void);
+int  as_vfork_tracking(void);
+void as_vfork_note_write(AddrSpace *as, u64 va, size_t len);   /* before a host-side write */
 /* Empty and publish this thread's D-TLB epoch, releasing its hold on the
  * retired-backing quarantine. Called at the run-loop safepoint. */
 void as_tlb_quiesce_self(void);

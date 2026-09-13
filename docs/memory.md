@@ -166,6 +166,32 @@ copy-on-write broken now) and writing only the partial host pages at either end
 space and gets neither, here as there. `tests/fixtures/madvfork.c` holds every
 row to a real kernel's answers.
 
+### A vfork child's writes are tracked, and carried back
+
+A vfork child shares its parent's address space until it execs or exits, but
+here it runs on a fork copy (`docs/signals-and-processes.md`, *vfork*, has why
+a host thread cannot stand in), so what it writes has to be carried back. The
+child's PTEs lose `PTE_W` over every private mapping before its first
+instruction (`as_vfork_track_begin`; a `MAP_SHARED` mapping is the same file
+for both and needs nothing). Its first store to a page then reaches
+`translate`'s permission fault, where `as_write_heal` finds a page whose
+*region* is writable and whose PTE is not — a combination nothing but this
+tracking produces — snapshots the page as it stands, gives the PTE its bit
+back and lets the store through; the JIT's inline stores take the same route,
+since their D-TLB probe sees the missing bit and falls to the helper. At the
+child's exec, exit or death by signal `as_vfork_flush` compares each touched
+page with its snapshot and hands the runs of changed bytes (gaps of up to 16
+unchanged bytes folded in) to `sys_proc.c`, which ships them to the parent.
+Bytes rather than pages, because the parent's other threads keep running and
+a stale page from the child must not undo what a sibling wrote beside the
+child's bytes. `mprotect` and the end-of-file fill keep the bit withheld on a
+private region while tracking (`vf_pte_prot`); a mapping the child makes
+itself is untracked and its own. A fork child of a tracked process starts
+clean (`as_vfork_fork_child`) — the heal path still mends the PTEs it
+inherited, recording nothing — and a process applying its own vfork child's
+bytes while itself tracked records them first (`as_vfork_note_write`), so a
+grandchild's writes reach the grandparent. `tests/fixtures/vforkback.c`.
+
 `msync` used to answer 0 to every call — no flag or range check, and no
 write-back, so a guest that asked for `MS_SYNC` durability was told it had it.
 Its validation is the kernel's now, in the kernel's order (`mm/msync.c`): a

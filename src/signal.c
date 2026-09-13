@@ -1517,6 +1517,21 @@ int sig_pending_deliverable(struct Machine *m) {
     return 0;
 }
 
+/* Is a signal that will KILL this process waiting: unblocked, at SIG_DFL, and
+ * default-terminate. What a killable wait -- the vfork parent's, whose
+ * kernel counterpart wait_for_completion_killable ends for a fatal signal and
+ * nothing else -- looks at (sys_proc.c). */
+int sig_pending_fatal(struct Machine *m) {
+    sigq_sync();
+    for (int sig = 1; sig <= 64; sig++) {
+        if (!sigq_pend(sig)) continue;
+        if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
+        if (sig_action_handler(m, sig) == GSIG_DFL && sig_default_terminates(sig))
+            return 1;
+    }
+    return 0;
+}
+
 /* One PendSig as the 128-byte guest siginfo rt_sigtimedwait hands back. */
 static int pendsig_to_guest(CPU *c, const PendSig *p, u64 info_va) {
     u8 si[128];
@@ -1609,6 +1624,8 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
 void guest_terminate_by_signal(CPU *c, int sig) {
     robust_list_exit_group(c);           /* every thread's robust futexes:
                                           * OWNER_DIED, as at any death */
+    vfork_child_flush(c);                /* a vfork child's writes reach its
+                                          * parent at its death too (exit_mm) */
     /* Report the WIFSIGNALED death to the tracer(s) (a no-op when untraced):
      * the pre-exit PTRACE_EVENT_EXIT under TRACEEXIT, then the terminal status
      * word -- for every traced thread of this process, since the signal kills

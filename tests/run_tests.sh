@@ -2615,6 +2615,12 @@ check_fixture robustdeath $'thread_exit: ownerdead ownerdead\nthread_clean: lock
 # qemu-user hangs on a raise() into its own SIGSEGV handler, and hands that
 # read an EINTR.
 check_fixture sentsync $'kill_segv: handler=1 si_user=1\nraise_segv: handler=1 si_tkill=1\npthread_kill_segv: handler=1\nkill_bus: handler=1 si_user=1\nraise_bus: handler=1 si_tkill=1\npthread_kill_bus: handler=1\nkill_ill: handler=1 si_user=1\nraise_ill: handler=1 si_tkill=1\npthread_kill_ill: handler=1\nkill_fpe: handler=1 si_user=1\nraise_fpe: handler=1 si_tkill=1\npthread_kill_fpe: handler=1\nkill_trap: handler=1 si_user=1\nraise_trap: handler=1 si_tkill=1\npthread_kill_trap: handler=1\nsigwait_segv=1\nblocked_segv_read: r=1 handler=0 pending=1\nafter_unblock: handler=1\ndfl_bus: signaled 7\ndfl_segv: signaled 11\ndfl_ill: signaled 4\ndfl_fpe: signaled 8\ndfl_trap: signaled 5\ndfl_abrt: signaled 6\ndfl_term: signaled 15\nign_segv_bus: exited 5\ndone'
+# vfork: the parent is suspended until the child execs or exits, and the
+# child's writes -- a global, the heap, the parent's frame, 300 KB of pages --
+# are there when the clone returns: posix_spawn of a missing program returns
+# its ENOENT. The child used to run free on a fork copy. Self-checking:
+# qemu-user's vfork is a fork too.
+check_fixture vforkback $'spawn_missing: r=ENOENT waited=0\nspawn_ok: r=0 exited0=1\nexit_child: flag=1 heap=h stack=7 waited=yes\nexit_child_status: 3\nexec_child: flag=2\nexec_child_status: 0\nsignal_child: flag=3\nsignal_child_status: signaled=1 sig=15\nnested: flag=5 flag2=6\nforked_grandchild: flag=0 flag2=9\nmany_pages: big=1 arr=xyz untouched=a\nafter: flag=11 heap=p\nvfork_no_vm: flag=0 waited=yes\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
