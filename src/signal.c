@@ -283,16 +283,14 @@ static void host_unblock_mask(u64 mask) {
  * delivers the unblocked signals inside this call, so a caller that runs it
  * first sees a queue that is up to date -- and if the flood is still coming,
  * the gate simply shuts again a few entries later. */
+static u64 sig_host_blockmask(void);
 static void sigq_ungate_now(void) {
     u64 host = __atomic_exchange_n(&sigq_gated, 0, __ATOMIC_RELAXED);
     if (!host) return;
-    /* SIGTTOU/SIGTTIN/SIGTSTP may since have been blocked because the guest
-     * asked for it (sig_sync_host_mask). That mirroring outranks the gate and
-     * undoes itself when the guest unblocks them, so hand those over rather
-     * than unblock them here. */
-    u64 keep = g_tls.sigmask & ((1ULL << (SIGTTOU - 1)) | (1ULL << (SIGTTIN - 1)) |
-                                (1ULL << (SIGTSTP - 1)));
-    host &= ~keep;
+    /* Whatever the guest has since blocked stays blocked: its mask is
+     * mirrored onto the host's (sig_sync_host_mask), and that mirroring
+     * outranks the gate and undoes itself when the guest unblocks. */
+    host &= ~sig_host_blockmask();
     host_unblock_mask(host);
 }
 
@@ -574,8 +572,11 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx);
  * signal rather than a fault (mem.c's SIGBUS net). */
 void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, uctx); }
 
-static void host_catcher(int sig, siginfo_t *si, void *uctx) {
-    PendSig ps, *p = &ps;
+/* A host siginfo as the guest's PendSig: the number translated back from a
+ * carrier, the fields the frame writer wants. Async-signal-safe (plain
+ * loads): host_catcher runs it, and so does a sigtimedwait that dequeued
+ * from the kernel. */
+static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     p->err = si->si_errno;
@@ -588,16 +589,63 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
         /* A POSIX-timer signal: the host sigval carries only the emulator's
          * timer-slot index (the guest's 8-byte sigval cannot ride a 32-bit
          * host kernel's 4-byte sigval); swap in the slot's stored guest value
-         * and make si_timerid the guest timer id (async-signal-safe: plain
-         * loads). Every SI_TIMER in this process is one of ours. */
+         * and make si_timerid the guest timer id. Every SI_TIMER in this
+         * process is one of ours. */
         u64 gv;
         if (ptimer_siginfo(si->si_value.sival_int, &gv)) {
             p->value = (s64)gv;
             p->pid = si->si_value.sival_int;   /* si_timerid slot */
         }
     }
+}
+
+static void host_catcher(int sig, siginfo_t *si, void *uctx) {
+    PendSig ps, *p = &ps;
+    pendsig_from_host(p, sig, si);
+    /* A signal the guest has BLOCKED, caught all the same because its number
+     * is held out of the mirrored mask (a sent SIGSEGV, a kill(SIGSYS) --
+     * sig_set_to_host): it waits in the ring until the unblock, and the
+     * EINTR it just inflicted on a host syscall is one a kernel would not
+     * have -- ours to undo, like the kick's (syscall_restart_internal). */
+    if (g_tls.sigmask & (1ULL << (p->signo - 1))) g_sig_selfintr = 1;
     if (!sigq_push(p, uctx)) return;
     jit_signal_interrupt();   /* make generated code exit at its next entry */
+}
+
+/* A guest signal set as the host numbers that stand for it: what the kernel
+ * can be asked to wait for or hold, which is the set sig_host_blockmask
+ * mirrors. The numbers the emulator's own nets own are left out (a sent
+ * instance of those reaches the ring instead), and the three reserved host
+ * numbers stand for nothing of the guest's here: the kick is never blocked,
+ * and each carrier's bit follows guest 32/33 -- ARMED OR NOT. Arming is lazy
+ * and per-process while a mask is per-thread: a thread whose mask was
+ * mirrored before a sibling armed a carrier would otherwise be holding that
+ * carrier because it blocks the guest number the carrier's host number
+ * spells (a sigfillset does), with guest 32 itself unblocked -- and the
+ * pthread_cancel aimed at it, or the timer signal its sigwait was entered
+ * for, would wait in the kernel until its next mask change. A guest 62/63/64
+ * of its own (the numbers the host uses for those three, when nothing is
+ * armed) is caught unblocked and held in the ring instead, as every signal
+ * used to be. */
+static u64 sig_set_to_host(u64 gset) {
+    u64 hs = gset & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)) |
+                      (1ULL << (SIGSEGV - 1)) | (1ULL << (SIGBUS - 1)) |
+                      (1ULL << (SIGILL - 1)) | (1ULL << (SIGFPE - 1)) |
+                      (1ULL << (SIGTRAP - 1)) | (1ULL << (SIGSYS - 1)) |
+                      (1ULL << 31) | (1ULL << 32));
+    hs &= ~((1ULL << (g_sig_kicksig - 1)) | (1ULL << (SIG_REMAP32_HOST - 1)) |
+            (1ULL << (SIG_REMAP33_HOST - 1)));
+    if (gset & (1ULL << 31)) hs |= 1ULL << (SIG_REMAP32_HOST - 1);
+    if (gset & (1ULL << 32)) hs |= 1ULL << (SIG_REMAP33_HOST - 1);
+    return hs;
+}
+u64 sig_guest_set_to_host(u64 gset) { return sig_set_to_host(gset); }
+/* The host mask a wait sleeps under for a guest blocked set `gset`: the set's
+ * host numbers plus whatever the gate is holding (sigq_gate), which no
+ * temporary mask may let go -- the pwait trio's sigmask argument (sys_file.c)
+ * and rt_sigsuspend's. */
+u64 sig_host_wait_mask(u64 gset) {
+    return sig_set_to_host(gset) | __atomic_load_n(&sigq_gated, __ATOMIC_RELAXED);
 }
 
 /* Arm the carrier for guest signal 32 or 33 and return the host signal number
@@ -617,22 +665,35 @@ int sig_arm_rt_remap(int guest_sig) {
     return host;
 }
 
-/* The signals sitting in this thread's capture ring. That ring *is* the guest's
- * pending set: everything the host catches is queued here, and one the guest has
- * blocked stays queued instead of being delivered (sig_deliver_pending). */
+/* The kernel's pending set for this thread -- the thread's own and the
+ * process's shared one, which is what sigpending(2) reports -- in guest
+ * numbering. That is where a blocked signal waits now that the guest's mask
+ * is the host's; the ring adds what was caught while deliverable and has not
+ * reached a boundary yet, or was blocked between capture and delivery. */
+static u64 sig_host_pending(void) {
+    u64 hp = 0;
+#ifdef SYS_rt_sigpending
+    if (syscall(SYS_rt_sigpending, &hp, (size_t)8) != 0) hp = 0;
+#else
+    sigset_t s;
+    if (sigpending(&s) == 0)
+        for (int i = 1; i <= 64; i++) if (sigismember(&s, i)) hp |= 1ULL << (i - 1);
+#endif
+    u64 m = 0;
+    for (int i = 1; i <= 64; i++)
+        if (hp & (1ULL << (i - 1))) {
+            if (i == g_sig_kicksig || i == 32 || i == 33) continue;   /* the host's own */
+            m |= 1ULL << (sig_remap_to_guest(i) - 1);
+        }
+    return m;
+}
+
+/* The signals pending for the guest: the kernel's set and the ring's. */
 u64 sig_pending_set(void) {
     sigq_sync();
-    u64 m = 0;
+    u64 m = sig_host_pending();
     for (int sig = 1; sig <= 64; sig++)
         if (sigq_pend(sig)) m |= 1ULL << (sig - 1);
-    /* Whatever the gate is holding is pending for the guest too, and the
-     * kernel is the one that knows which of the signals it blocked are. */
-    u64 held = __atomic_load_n(&sigq_gated, __ATOMIC_RELAXED);
-    sigset_t hp;
-    if (held && sigpending(&hp) == 0)
-        for (int i = 1; i <= 64; i++)
-            if ((held & (1ULL << (i - 1))) && sigismember(&hp, i))
-                m |= 1ULL << (sig_remap_to_guest(i) - 1);
     return m;
 }
 
@@ -717,8 +778,8 @@ static int sig_default_terminates(int sig) {
  *
  * The net owns the host SIGSYS disposition for the process lifetime:
  * sig_host_update skips SIGSYS so a guest sigaction can never replace it,
- * and it is never blocked host-side (sig_sync_host_mask touches only the
- * job-control trio) — a seccomp SIGSYS delivered while blocked force-kills
+ * and it is never blocked host-side (sig_set_to_host holds it out of the
+ * mirrored mask) — a seccomp SIGSYS delivered while blocked force-kills
  * regardless, so the net must stay armed. */
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
@@ -861,61 +922,94 @@ void sig_install_kick_net(void) {
     sigaction(PTRACE_KICKSIG, &sa, NULL);
 }
 
-/* Mirror the guest block-state to the host where it has to be observed.
+/* ---- the guest's blocked set IS the host thread's ---------------------------
  *
- * Two separate things happen here. First the terminal job-control signals are
- * mirrored onto the host process mask. SIGTTOU/SIGTTIN are generated *synchronously by the host
- * kernel* (tcsetpgrp, background terminal I/O) and would stop our process
- * before the run loop can mediate; SIGTSTP travels with them in bash's
- * give_terminal_to() critical section. When the guest blocks one of these
- * (as bash does around tcsetpgrp), we must block it on the host too — POSIX
- * then suppresses the signal entirely instead of stopping us. The guest
- * blocked set is per-thread (g_tls); the shells that need this mirroring are
- * single-threaded, so mirroring the calling thread's view suffices. */
+ * A signal the guest has blocked is not deliverable, and a kernel acts on
+ * that in three ways that the capture ring cannot: the syscall the thread is
+ * in is not interrupted (a read completes where it was returning EINTR here,
+ * with no handler to show for it); a process-directed signal is routed to a
+ * thread that has it UNBLOCKED (complete_signal picks by mask -- here the
+ * host chose among threads whose host masks were all open, so the signal
+ * landed in the ring of a thread whose guest mask blocked it and sat there,
+ * while the sibling in sigwait() for it never heard: "one thread sigwaits,
+ * the rest block", the JVM's and every signal-handling thread's design,
+ * could not work); and the blocked signal waits in the KERNEL's pending set,
+ * where sigpending, sigtimedwait and a signalfd find it.
+ *
+ * So the guest's mask is the host thread's mask, kept in step at every place
+ * the guest's changes: rt_sigprocmask, the temporary masks of rt_sigsuspend
+ * and the pwait trio, a handler's entry (sa_mask and the signal itself) and
+ * its sigreturn, thread start, the de_thread hand-over. The kernel then
+ * holds, routes and reports as it does for any process, and the ring is left
+ * with what is deliverable NOW. A few host numbers are held out of the
+ * mirror, because blocking them on the host would be fatal rather than
+ * faithful: the synchronous fault numbers (a blocked host fault is a forced
+ * kill; a guest that blocks SIGSEGV still has a sent one queued for it by the
+ * sync net, and the ring holds it until the unblock, as before), SIGSYS (a
+ * seccomp trap arriving blocked kills the process), the control-channel kick,
+ * and host 32/33, the host libc's own. Guest 32/33 block the carriers that
+ * stand in for them, whether armed yet or not, and the carriers' host numbers
+ * stand for nothing else in a mask (sig_set_to_host has the race that
+ * decides it). The gate (sigq_gate) may add bits of its own on top and takes
+ * them away again itself.
+ *
+ * Every acquisition goes out as one SIG_SETMASK of the kernel's 64-bit set,
+ * by the raw syscall: a libc sigset_t may be narrower (Bionic's 32-bit one),
+ * and the RT signals are exactly what has to be expressible. */
+static u64 sig_host_blockmask(void) { return sig_set_to_host(g_tls.sigmask); }
+
+static void host_set_mask(u64 mask) {
+#ifdef SYS_rt_sigprocmask
+    u64 k = mask;
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &k, (void *)0, (size_t)8) == 0)
+        return;
+#endif
+    sigset_t s;
+    sigemptyset(&s);
+    for (int i = 1; i <= 64; i++)
+        if (mask & (1ULL << (i - 1))) sigaddset(&s, i);
+    pthread_sigmask(SIG_SETMASK, &s, NULL);
+}
+
 void sig_sync_host_mask(struct Machine *m) {
-    static const int sigs[] = { SIGTTOU, SIGTTIN, SIGTSTP };
-    sigset_t block, unblock;
+    (void)m;
+    host_set_mask(sig_host_wait_mask(g_tls.sigmask));
+}
 
-    /* Publish this thread's blocked set into the process-wide union first, so
-     * the re-mirroring below sees it. A host disposition covers the whole
-     * process, so "is this signal blocked" has to be asked of the whole process:
-     * answering it from the calling thread alone let a SIG_DFL signal keep the
-     * host default while a sibling had it blocked, and the host default then
-     * killed everyone the moment it arrived.
-     *
-     * There is no thread registry to poll here, so the union accumulates while
-     * the process is multi-threaded -- catching a signal the guest will
-     * dispatch itself costs a queue entry and a run-loop check, while letting
-     * the host act on a blocked one is fatal, so erring high is the safe
-     * direction. A process down to one guest thread *is* that thread, so it
-     * puts the union back to its own mask and the over-approximation does not
-     * outlive the threads that caused it. */
-    if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= 1)
-        __atomic_store_n(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_RELEASE);
-    else
-        __atomic_or_fetch(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_ACQ_REL);
+/* rt_sigsuspend's sleep: the host's, under the mask the guest asked for
+ * (already mirrored), so nothing can slip between the swap and the sleep.
+ * Returns once a handler of ours has run. */
+void sig_host_suspend(void) {
+    u64 k = sig_host_wait_mask(g_tls.sigmask);
+#ifdef SYS_rt_sigsuspend
+    syscall(SYS_rt_sigsuspend, &k, (size_t)8);
+#else
+    sigset_t s;
+    sigemptyset(&s);
+    for (int i = 1; i <= 64; i++)
+        if (k & (1ULL << (i - 1))) sigaddset(&s, i);
+    sigsuspend(&s);
+#endif
+}
 
-    sigemptyset(&block);
-    sigemptyset(&unblock);
-    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
-        if (g_tls.sigmask & (1ULL << (sigs[i] - 1))) sigaddset(&block, sigs[i]);
-        else sigaddset(&unblock, sigs[i]);
-    }
-    sigprocmask(SIG_BLOCK, &block, NULL);
-    sigprocmask(SIG_UNBLOCK, &unblock, NULL);
-
-    /* Then the dispositions of whatever the guest just blocked or unblocked:
-     * at SIG_DFL a *blocked* signal has to be caught rather than left to the
-     * host default, which would act on it right now. Only the bits that
-     * changed are re-mirrored -- shells call sigprocmask constantly. */
-    static __thread u64 mirrored;
-    u64 changed = mirrored ^ g_tls.sigmask;
-    mirrored = g_tls.sigmask;
-    for (int s = 1; changed && s <= 64; s++)
-        if (changed & (1ULL << (s - 1))) {
-            changed &= ~(1ULL << (s - 1));
-            sig_host_update(m, s);
-        }
+/* The host's own mask at startup, as the guest's initial one: execve keeps
+ * the caller's blocked set, so a guest launched from a shell that blocks
+ * SIGINT starts with it blocked -- and so that the two are in step from the
+ * first instruction. */
+void sig_inherit_host_mask(struct Machine *m) {
+    u64 k = 0;
+#ifdef SYS_rt_sigprocmask
+    if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, (void *)0, &k, (size_t)8) != 0) k = 0;
+#else
+    sigset_t s;
+    if (sigprocmask(SIG_BLOCK, NULL, &s) == 0)
+        for (int i = 1; i <= 64; i++) if (sigismember(&s, i)) k |= 1ULL << (i - 1);
+#endif
+    k &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)) | (1ULL << 31) | (1ULL << 32));
+    k &= ~((1ULL << (g_sig_kicksig - 1)) | (1ULL << (SIG_REMAP32_HOST - 1)) |
+           (1ULL << (SIG_REMAP33_HOST - 1)));   /* the host's numbers, not the guest's */
+    g_tls.sigmask = k;
+    sig_sync_host_mask(m);
 }
 
 /* ---- the disposition lock ------------------------------------------------
@@ -929,10 +1023,10 @@ void sig_sync_host_mask(struct Machine *m) {
  * sighand->siglock: do_sigaction takes it to swap the entry, and get_signal
  * takes it to read one.
  *
- * Rank EMU_LK_SIGACT sits under sfd_lock (sfd_remask re-mirrors dispositions
- * while holding it) and above as_lock, which every guest-memory touch takes --
- * so the critical sections here stay short and no reader holds it across a
- * copy_to_guest. */
+ * Rank EMU_LK_SIGACT sits under sfd_lock (a leftover of the signalfd table
+ * once re-mirroring dispositions under it; the order is kept) and above
+ * as_lock, which every guest-memory touch takes -- so the critical sections
+ * here stay short and no reader holds it across a copy_to_guest. */
 static pthread_mutex_t sigact_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Raw pthread calls on purpose: main()'s atfork handlers call these from inside
@@ -983,18 +1077,13 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
          * with the default restored). It used to be caught only under ptrace
          * or while blocked.
          *
-         * A default-ignore or default-continue signal is caught only while
-         * the guest has it BLOCKED, or a signalfd covers it: blocked, it is
-         * pending rather than delivered -- the kernel holds it until the
-         * guest unblocks it, and the run loop applies the disposition then --
-         * and left at the host default it would be discarded on arrival,
-         * with the SIGCHLD a signalfd was waiting for never making the fd
-         * readable. Dispositions are process-wide, so "blocked" is asked of
-         * every thread (sig_blocked_any). */
-        u64 blocked = g_tls.sigmask |
-                      __atomic_load_n(&m->sig_blocked_any, __ATOMIC_ACQUIRE);
-        if (sig_default_terminates(sig) ||
-            ((blocked | m->sfd_mask) & (1ULL << (sig - 1)))) {
+         * A default-ignore, -continue or -stop signal keeps the host default:
+         * the kernel does with it exactly what the guest's disposition says,
+         * a BLOCKED one included -- the guest's mask is the host thread's
+         * (sig_sync_host_mask), so the kernel holds it pending, shows it to
+         * sigpending, hands it to sigwait or a signalfd, and discards it at
+         * the unblock if nobody took it, as it would for any process. */
+        if (sig_default_terminates(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -1060,10 +1149,6 @@ void sig_trace_update_all(struct Machine *m) {
 
 void sig_reset_for_exec(struct Machine *m) {
     EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
-    /* Post-exec the process is single-threaded again (de_thread), so this
-     * thread's mask is the whole process's -- drop the union back to it rather
-     * than carrying a dead sibling's bits into the new image. */
-    __atomic_store_n(&m->sig_blocked_any, g_tls.sigmask, __ATOMIC_RELEASE);
     for (int s = 1; s <= 64; s++) {
         if (m->sigact[s].handler > GSIG_IGN) {   /* handlers do not survive exec */
             m->sigact[s].handler = GSIG_DFL;
@@ -1172,6 +1257,40 @@ static int sc_restart_wanted(CPU *c, unsigned saflags) {
     }
 }
 
+/* One PendSig as the guest's 128-byte siginfo, into `si` (zeroed here). The
+ * layout is the one siginfo_layout picks: by the signal for a kernel-raised
+ * instance (si_code > 0 -- a fault's address, a child's status, a seccomp
+ * trap's call), and the _kill/_rt one, pid and uid and the payload, for
+ * anything a process sent (SI_USER, SI_TKILL, SI_QUEUE are all <= 0) -- a
+ * kill(SIGSEGV) carries the sender, not an address. The delivery frame and
+ * rt_sigtimedwait both hand out this. */
+static void siginfo_to_guest(u8 *si, int sig, const PendSig *info) {
+    memset(si, 0, 128);
+    wr32(si, 0, (u32)sig);
+    wr32(si, 4, (u32)info->err);
+    wr32(si, 8, (u32)info->code);
+    if (info->code > 0 && sig == SIGCHLD) {
+        wr32(si, 16, (u32)info->pid);
+        wr32(si, 20, (u32)info->uid);
+        wr32(si, 24, (u32)info->status);
+    } else if (info->code > 0 && is_sync_sig(sig)) {
+        wr64(si, 16, info->addr);
+    } else if (sig == SIGSYS && info->code == SIG_SECCOMP_CODE) {
+        /* _sigsys: the call address, the syscall number and the architecture
+         * -- what a seccomp trap handler reads to decide what was blocked. */
+        wr64(si, 16, info->addr);
+        wr32(si, 24, (u32)info->status);
+        wr32(si, 28, G_AUDIT_ARCH_AARCH64);
+    } else {
+        wr32(si, 16, (u32)info->pid);
+        wr32(si, 20, (u32)info->uid);
+        /* si_value: carries the rt_sigqueueinfo/sigqueue payload; the kernel
+         * zeroes this union region for plain kill (SI_USER), so the captured
+         * zero is faithful there too. */
+        wr64(si, 24, (u64)(s64)info->value);
+    }
+}
+
 /* Deliver `sig` to the guest handler in m->sigact[sig] (caller checked it is
  * a real handler). Builds the frame and redirects the CPU. */
 static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
@@ -1215,29 +1334,7 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     memset(fr, 0, sizeof fr);
 
     /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16) */
-    wr32(fr, SI_OFF + 0, (u32)sig);
-    wr32(fr, SI_OFF + 4, (u32)info->err);
-    wr32(fr, SI_OFF + 8, (u32)info->code);
-    if (sig == SIGCHLD) {
-        wr32(fr, SI_OFF + 16, (u32)info->pid);
-        wr32(fr, SI_OFF + 20, (u32)info->uid);
-        wr32(fr, SI_OFF + 24, (u32)info->status);
-    } else if (is_sync_sig(sig)) {
-        wr64(fr, SI_OFF + 16, info->addr);
-    } else if (sig == SIGSYS && info->code == SIG_SECCOMP_CODE) {
-        /* _sigsys: the call address, the syscall number and the architecture
-         * -- what a seccomp trap handler reads to decide what was blocked. */
-        wr64(fr, SI_OFF + 16, info->addr);
-        wr32(fr, SI_OFF + 24, (u32)info->status);
-        wr32(fr, SI_OFF + 28, G_AUDIT_ARCH_AARCH64);
-    } else {
-        wr32(fr, SI_OFF + 16, (u32)info->pid);
-        wr32(fr, SI_OFF + 20, (u32)info->uid);
-        /* si_value: carries the rt_sigqueueinfo/sigqueue payload; the kernel
-         * zeroes this union region for plain kill (SI_USER), so the captured
-         * zero is faithful there too. */
-        wr64(fr, SI_OFF + 24, (u64)(s64)info->value);
-    }
+    siginfo_to_guest(fr + SI_OFF, sig, info);
 
     /* ucontext */
     u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
@@ -1292,10 +1389,13 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     *cpu_cur_sp(c) = frame;
     c->pc = act->handler;
 
-    /* New blocked set while the handler runs. */
+    /* New blocked set while the handler runs -- and the host's with it, or
+     * the kernel would go on delivering to a thread whose handler is
+     * running with the signal blocked (sig_sync_host_mask). */
     g_tls.sigmask |= act->mask;
     if (!(act->flags & G_SA_NODEFER)) g_tls.sigmask |= 1ULL << (sig - 1);
     g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sig_sync_host_mask(m);
 
     if (act->flags & G_SA_RESETHAND) {
         /* Only if this is still the disposition we delivered: a sibling that
@@ -1391,57 +1491,33 @@ int sig_pending_deliverable(struct Machine *m) {
     return 0;
 }
 
-/* ---- signalfd(2) view of the capture ring (sys_sig.c drives these) ----
- *
- * A signalfd reports signals that are *pending*, i.e. queued and not yet
- * dispositioned -- exactly what the ring holds, since sig_deliver_pending
- * consumes everything the guest mask lets through (including the
- * default-ignore discards). So the ring restricted to the fd's mask is the
- * set a read(2) may return, and no separate bookkeeping is needed. */
-int sig_fd_pending(u64 mask) {
-    sigq_sync();
-    for (int sig = 1; sig <= 64; sig++)
-        if (sigq_pend(sig) && (mask & (1ULL << (sig - 1)))) return 1;
-    return 0;
+/* One PendSig as the 128-byte guest siginfo rt_sigtimedwait hands back. */
+static int pendsig_to_guest(CPU *c, const PendSig *p, u64 info_va) {
+    u8 si[128];
+    siginfo_to_guest(si, p->signo, p);
+    return copy_to_guest(c, info_va, si, sizeof si) < 0 ? -EFAULT : 0;
 }
 
-/* Pop the oldest queued signal covered by `mask` into a signalfd_siginfo.
- * Returns 0 when the ring holds no match. Only the fields the kernel fills for
- * the signal's si_code are set; the rest stay zero, as they do there. */
-int sig_fd_take(u64 mask, GSignalfdSiginfo *out) {
-    sigq_sync();
-    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
-        int sig = sigq[t].signo;
-        if (!(mask & (1ULL << (sig - 1)))) continue;
-        PendSig p = sigq[t];
-        sigq_take(t);
-        memset(out, 0, sizeof *out);
-        out->ssi_signo = (u32)p.signo;
-        out->ssi_code = p.code;
-        out->ssi_pid = (u32)p.pid;
-        out->ssi_uid = (u32)p.uid;
-        out->ssi_status = p.status;
-        out->ssi_addr = p.addr;
-        out->ssi_int = (s32)p.value;
-        out->ssi_ptr = (u64)p.value;
-        return 1;
-    }
-    return 0;
-}
-
-/* rt_sigtimedwait: synchronously consume one pending signal from `set` off
- * this thread's capture ring -- without invoking its handler -- as sigwait/
- * sigwaitinfo do. The caller keeps these signals *blocked* (the POSIX
- * contract), and blocked host-caught signals accumulate in the ring, so the
- * ring is exactly the pending set to take from; the guest block mask is
- * deliberately ignored (sigwait consumes blocked signals). Polls in short
- * naps like rt_sigsuspend: a matching signal can land on this thread at any
- * moment -- e.g. a SIGEV_THREAD_ID timer aimed at a libc timer helper thread
- * sigwaitinfo()ing its SIGTIMER. timeout_ns < 0 waits forever. Returns the
- * signal number, -EAGAIN on timeout, or -EINTR when a different deliverable
- * signal pends (the run loop delivers it once the syscall returns). */
+/* rt_sigtimedwait: consume one pending signal from `set` without running its
+ * handler, as sigwait/sigwaitinfo do. The guest keeps the waited signals
+ * blocked (the POSIX contract), and since the guest's mask is the host
+ * thread's they wait in the KERNEL's pending set -- so the kernel's own
+ * rt_sigtimedwait does the waiting, with everything that comes with it: the
+ * waited set is held blocked for the duration (do_sigtimedwait does that, so
+ * a signal the guest left unblocked is dequeued here rather than delivered),
+ * a process-directed signal is dequeued from the shared set whichever thread
+ * it was aimed at, and the wait sleeps rather than polls. The ring is asked
+ * first, for what was captured while deliverable and blocked since (or is a
+ * number the emulator's nets own, which never reaches the kernel's set): a
+ * set made only of those is polled in short naps, as everything used to be.
+ * -EAGAIN on timeout; -EINTR when a caught signal interrupted the wait (the
+ * run loop delivers it), or when a call-out to a run-loop safepoint did
+ * (execve's de_thread), which is invisible to the guest via the dispatcher's
+ * restart. timeout_ns < 0 waits forever. */
 s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
     struct Machine *m = c->m;
+    set &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    u64 hset = sig_set_to_host(set);
     struct timespec dl;
     if (timeout_ns > 0) {
         clock_gettime(CLOCK_MONOTONIC, &dl);
@@ -1456,25 +1532,10 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
             if (!(set & (1ULL << (sig - 1)))) continue;
             PendSig p = sigq[t];
             sigq_take(t);
-            if (info_va) {
-                u8 si[128];
-                memset(si, 0, sizeof si);
-                s32 *w = (s32 *)si;
-                w[0] = p.signo;
-                w[2] = p.code;
-                /* Union fields as the frame writer lays them out: pid/uid --
-                 * which SI_TIMER's timerid/overrun alias -- at +16/+20, the
-                 * sigval payload at +24. */
-                memcpy(si + 16, &p.pid, 4);
-                memcpy(si + 20, &p.uid, 4);
-                s64 v = (s64)p.value;
-                memcpy(si + 24, &v, 8);
-                if (copy_to_guest(c, info_va, si, sizeof si) < 0)
-                    return -EFAULT;
-            }
+            if (info_va && pendsig_to_guest(c, &p, info_va) < 0) return -EFAULT;
             return p.signo;
         }
-        /* Nothing from `set`: a caught signal arriving during the wait makes
+        /* Nothing from `set` in the ring: a caught signal that arrived makes
          * the kernel return EINTR -- mirror that when the ring holds another
          * deliverable signal, so the run loop can deliver it. */
         if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
@@ -1482,16 +1543,40 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
          * and go there. This is the loop that made a libc SIGEV_THREAD timer
          * helper look permanently parked. */
         if (guest_stop_pending(m)) return -EINTR;
-        if (timeout_ns == 0) return -EAGAIN;   /* pure poll */
-        if (timeout_ns > 0) {
+        /* What is left of the timeout. */
+        struct timespec rem, *remp = NULL;
+        if (timeout_ns == 0) { rem.tv_sec = 0; rem.tv_nsec = 0; remp = &rem; }
+        else if (timeout_ns > 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec > dl.tv_sec ||
-                (now.tv_sec == dl.tv_sec && now.tv_nsec >= dl.tv_nsec))
-                return -EAGAIN;
+            s64 left = ((s64)dl.tv_sec - now.tv_sec) * 1000000000LL + (dl.tv_nsec - now.tv_nsec);
+            if (left <= 0) return -EAGAIN;
+            rem.tv_sec = (time_t)(left / 1000000000LL);
+            rem.tv_nsec = (long)(left % 1000000000LL);
+            remp = &rem;
         }
-        struct timespec nap = { 0, 2 * 1000 * 1000 };
-        nanosleep(&nap, NULL);
+        if (!hset) {
+            /* Only numbers the ring serves: poll it. */
+            if (timeout_ns == 0) return -EAGAIN;
+            struct timespec nap = { 0, 2 * 1000 * 1000 };
+            nanosleep(&nap, NULL);
+            continue;
+        }
+        siginfo_t hsi;
+        memset(&hsi, 0, sizeof hsi);
+        long r = syscall(SYS_rt_sigtimedwait, &hset, &hsi, remp, (size_t)8);
+        if (r > 0) {
+            PendSig p;
+            pendsig_from_host(&p, (int)r, &hsi);
+            if (info_va && pendsig_to_guest(c, &p, info_va) < 0) return -EFAULT;
+            return p.signo;
+        }
+        if (errno == EAGAIN) return -EAGAIN;
+        if (errno != EINTR) return -errno;
+        /* A handler of ours ran (the capture handler, a net, the kick): back to
+         * the top, where the ring and the call-out are looked at. A caught
+         * signal the guest cannot take yet (blocked, or nothing to run) is
+         * not an interruption a kernel would report, so the wait goes on. */
     }
 }
 

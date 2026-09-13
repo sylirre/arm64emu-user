@@ -123,7 +123,7 @@ static void leader_park(CPU *c) {
                 (int)g_tls.stop_gen, NULL, NULL, 0);
     }
     pthread_sigmask(SIG_UNBLOCK, &all, NULL);
-    sig_sync_host_mask(m);   /* re-mirror the job-control trio for the new image */
+    sig_sync_host_mask(m);   /* the new image's mask (dethread_join set it) */
 }
 
 SYSDEF(exit) {
@@ -465,6 +465,9 @@ static void *thread_entry(void *arg) {
     g_tls.sigmask = t->sigmask;
     CPU *c = &t->cpu;
     c->m = t->m;
+    sig_sync_host_mask(c->m);   /* the creator's mask, as clone gives it -- the
+                                 * host thread inherited the creator's host
+                                 * mask, gate bits and all; make it this one's */
     if (t->flags & G_CLONE_SETTLS) c->tpidr[0] = t->tls;
     /* CLONE_CHILD_SETTID / CLONE_PARENT_SETTID: the kernel stores the new tid
      * before the child runs AND before clone returns in the creator; write
@@ -1286,6 +1289,7 @@ static void dethread_join(CPU *c) {
     g_tls.have_saved_sigmask = 0;
     g_tls.sc_ret_eintr = 0;
     g_tls.sigmask = m->dethread_sigmask;
+    sig_sync_host_mask(m);   /* the exec'ing thread's mask is the new image's */
     g_tls.image_gen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);
     g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
     __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);

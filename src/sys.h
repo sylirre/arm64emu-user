@@ -433,16 +433,11 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
  * shared registry, never to the Machine copy we inherit. */
 void procfs_idmap_inherit(struct Machine *m, s32 from);
 
-/* sys_sig.c: signalfd(2). The fd is a host eventfd carrying only readiness;
- * the signals themselves come from the emulator's capture ring, so read(2) on
- * one is answered here instead of by the host. sigfd_sync re-levels every
- * signalfd of this process against the ring and must run before any host sleep
- * that can wait on one (poll/ppoll/select/epoll). */
-int sig_fd_pending(u64 mask);                       /* signal.c: ring lookup */
-int sig_fd_take(u64 mask, GSignalfdSiginfo *out);   /* signal.c: ring pop */
+/* sys_sig.c: signalfd(2). The fd is a host signalfd; read(2) on one goes
+ * through sigfd_fill for the translation of the records it returned (a
+ * carrier back to guest 32/33, a timer's slot index back to its sigval). */
 int sigfd_tracked(struct Machine *m, int fd);
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
-void sigfd_sync(struct Machine *m);
 void sigfd_unmark_fd(struct Machine *m, int fd);
 int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM */
 

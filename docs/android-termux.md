@@ -99,8 +99,8 @@ unfiltered:
   bind of a fresh host directory (under `$TMPDIR` where Android has no
   ownerless tmpfs), `mount -t proc`/`-t devpts` bind the passthrough zones,
   `pivot_root(2)` re-roots like `chroot(2)`, the id maps of a faked user
-  namespace are writable, and `signalfd` is answered from the emulator's own
-  signal-capture ring. See [syscalls.md](syscalls.md).
+  namespace are writable, and `signalfd` is the host's own with its records
+  translated on the way out. See [syscalls.md](syscalls.md).
 * **System V IPC** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
   `shmdt`/`shmctl` run over an in-process broker backed by an anonymous `memfd`
   (on the Oreo allow-list) passed between processes over `SCM_RIGHTS` on an

@@ -42,11 +42,16 @@ process lived on (`tests/fixtures/sentsync.c`).
 ### The pending queue
 
 That per-thread queue is not a buffer between two ends of the same delivery —
-it **is** the guest's pending set. A guest that blocks a signal does not block
-it on the host (only the job-control trio is mirrored, below), so the host
-catches it anyway and it waits here until the guest unblocks it. `sigpending`,
-`signalfd`, `rt_sigtimedwait` and `sigsuspend` are all answered from it. So it
-has to hold what a kernel's pending queue holds, by the kernel's own two rules:
+together with the kernel's own pending set it **is** the guest's pending set.
+The guest's blocked set is the host thread's (below, "the guest's blocked set
+is the host thread's"), so a signal the guest has blocked never reaches the
+capture handler: it waits in the *kernel's* pending set, where `sigpending`,
+`rt_sigtimedwait` and a `signalfd` find it and the unblock delivers it. The
+ring holds what the kernel handed over because it was deliverable at that
+instant — and has not reached a run-loop boundary yet, or was blocked by the
+guest between capture and delivery (a handler's `sa_mask`, a `sigprocmask`
+that raced the arrival, the few numbers held out of the mirror). So it has to
+hold what a kernel's pending queue holds, by the kernel's own two rules:
 
 - **A standard signal (1..31) does not queue.** One instance is pending and
   further ones are dropped with their siginfo — the kernel's `legacy_queue()`.
@@ -182,10 +187,12 @@ achieved by having each timed wait declare its relative timeout
 (`syscall_wait_begin`, and `_ms` for the `poll`/`epoll` millisecond form), which
 shrinks it by however long earlier attempts already waited. Absolute deadlines —
 `clock_nanosleep(TIMER_ABSTIME)`, `FUTEX_WAIT_BITSET` and the PI futex ops — are
-exact under a plain restart and declare nothing. Handlers that instead wait in
-short naps and poll for themselves (`rt_sigsuspend`, `rt_sigtimedwait`,
-`sigfd_fill`, the IPC broker wait) never see the kick as an `EINTR` at all; the
-`de_thread` call-out they *do* report is restarted where it is cancelled
+exact under a plain restart and declare nothing. `rt_sigsuspend` and
+`rt_sigtimedwait` sleep in their host namesakes and loop over the kick's
+`EINTR` themselves (a handler of ours ran, nothing for the guest: sleep on);
+a `signalfd` read is the host's read and rewinds like any other call; the IPC
+broker wait polls and never sees the kick at all. The `de_thread` call-out
+they *do* report is restarted where it is cancelled
 (`dethread_restart_syscall`). Covered by `tests/ptrace/attach_no_eintr.c`, which
 asserts both halves: the sleep returns `0`, and it still ends when the guest
 asked rather than one interruption-point later.
@@ -218,70 +225,60 @@ updates the timespec only on success).
 
 ### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
 
-`sig_timedwait` consumes one pending signal from the calling thread's capture
-ring *without* running its handler. The caller keeps the waited signals blocked
-(the POSIX contract), and blocked host-caught signals accumulate in the ring, so
-the ring **is** the pending set to take from — the guest block mask is
-deliberately ignored, exactly as `sigwait` consumes blocked signals. It polls in
-short naps (like `rt_sigsuspend`), returns `-EAGAIN` on timeout, and mirrors the
-kernel's `EINTR` when a *different* deliverable signal pends (the run loop then
-delivers it). The libc timer helper thread lives in this call, so `SIGEV_THREAD`
-timers depend on it.
+`sig_timedwait` consumes one pending signal from `set` *without* running its
+handler. The caller keeps the waited signals blocked (the POSIX contract), and
+since the guest's blocked set is the host thread's they wait in the **kernel's**
+pending set — so the kernel's own `rt_sigtimedwait` does the waiting, with
+everything that comes with it: the waited set is held blocked for the duration
+(`do_sigtimedwait` does that, so a signal the guest left unblocked is dequeued
+here rather than delivered), a process-directed signal is dequeued from the
+shared set whichever thread it was aimed at, and the wait sleeps rather than
+polls. The ring is asked first, for what was captured while deliverable and
+blocked since, or is a number the emulator's nets own and never reaches the
+kernel's set; a set made only of those is polled in short naps, as everything
+used to be. `-EAGAIN` on timeout; `-EINTR` when a caught signal interrupted the
+wait (the run loop delivers it). The libc timer helper thread lives in this
+call, so `SIGEV_THREAD` timers depend on it. The 128-byte `siginfo` it hands
+back is the delivery frame's (`siginfo_to_guest`), laid out by `si_code` as
+`siginfo_layout` does — a kernel-raised instance by its signal, anything a
+process sent as sender pid/uid and payload, so a `kill(SIGSEGV)` carries the
+sender and not an address.
 
 ### `signalfd(2)`
 
-A host signalfd would never fire for the guest: the emulator catches signals
-itself and leaves none pending host-side, which is the whole point of the
-capture ring. So `signalfd4` hands out a host **eventfd** that carries nothing
-but readiness — armed (counter 1) exactly while the ring holds a signal the
-fd's mask covers — and `read(2)` on it is intercepted (`sys_file.c` →
-`sigfd_fill`) and answered from the ring as `struct signalfd_siginfo` records.
-Because readiness lives in a real fd, `poll`/`ppoll`/`select`/`epoll` need no
-special case; they only need the level re-computed before the host sleeps, which
-`sigfd_sync` does at each of those entry points.
+A host signalfd, and nothing else. The guest's blocked signals wait in the
+kernel's pending set now that the guest's blocked set is the host thread's,
+which is exactly what a signalfd reads from, so the kernel's own file does the
+whole job: readiness for `poll`/`select`/`epoll`, the blocking read,
+`O_NONBLOCK`'s `EAGAIN`, `EINVAL` for a write or a buffer shorter than one
+record, the dequeue of a process-directed signal from the shared set whichever
+thread it was aimed at, and a `SIG_DFL` signal — `SIGCHLD`, the usual subject —
+held pending while blocked because a blocked signal is never ignored
+(`sig_ignored`). It used to be a host **eventfd** carrying nothing but
+readiness, armed against the capture ring before every host sleep and read
+from it, with the ring per-thread while the fd is per-process — because the
+ring was the only place a blocked signal ever was.
 
-Two consequences worth knowing:
-
-- A signal at `SIG_DFL` is normally not caught at all (the host default applies,
-  and `SIGCHLD` — the usual signalfd subject — is default-ignore, so it would
-  simply vanish). `sig_host_update` therefore installs the capture handler for
-  every signal any signalfd covers, and drops it again when the last one goes.
-  A signal that was *already* pending before a signalfd covered it is not
-  visible to that fd for the same reason: the emulator only starts queueing a
-  signal once something asks for it.
-- The ring is per-thread while the fd is per-process, so a signal queued on one
-  thread arms the fd but only that thread's own `read` consumes it. Every real
-  signalfd user blocks the signal and reads it on one thread, which is exactly
-  this case.
-- The mask, the pending set and the readiness belong to the **file
-  description**, not to an fd number: `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)`
-  register the copy too, so the counter is armed once no matter how many names
-  it has. Without that a read on the duplicate reached the bare eventfd, which
-  carries readiness rather than signals and is not even armed — the guest simply
-  blocked forever. Every class the emulator tracks by fd number has the same
-  need, so the dup sites go through one hook, `fd_track_dup` (`sys.h`), and the
-  close sites — `close`, `dup3`'s replacement, `execve`'s close-on-exec walk —
-  through `fd_track_close`. The table grows as needed; a copy that could not
-  be recorded is withheld from the guest with `ENOMEM` rather than handed out
-  as the bare eventfd.
-
-  Which entries name the *same* description is decided by an id handed out at
-  creation, **not** by the eventfd's inode: the kernel gives every `anon_inode`
-  file one shared inode, so two eventfds and a timerfd all report the same
-  `st_ino`. Keying on it made every signalfd look like a duplicate of the first,
-  and a guest holding two never saw the second become readable. The recorded
-  inode survives only as a weak "this fd number was reused behind our back"
-  check — it still catches reuse by a regular file, socket or pipe, but not by
-  another `anon_inode` file, which is why every path that closes or replaces an
-  fd unmarks it explicitly (`close`, `dup2` over an fd, and **`execve`'s CLOEXEC
-  sweep**; a stale entry there let a timerfd inherit a dead signalfd's number
-  and have its `read` answered from the signal ring).
-- `readv` with **no bytes** in it (`iovcnt == 0`, or every segment empty) is 0,
-  not the `EINVAL` a buffer too small for one `signalfd_siginfo` earns: a vector
-  of no bytes never reaches the file, since `do_iter_read` returns as soon as
-  the imported total is zero. `read(fd, buf, 0)` really is `EINVAL` — `vfs_read`
-  has no such shortcut, so `signalfd_read` sees the zero itself — and the two
-  answers differing is the kernel's own asymmetry, not a rounding of ours.
+What is left of the emulator's own is the number translation on the way out:
+a guest 32/33 arrives as its carrier and a POSIX timer's `sigval` as a slot
+index (the capture handler undoes the same for a delivery), and the record is
+`struct signalfd_siginfo`, the kernel's arch-independent layout, so `read(2)`
+on one is intercepted (`sys_file.c` → `sigfd_fill`) for that alone. The mask
+goes to the host as the host numbers the guest's stand for
+(`sig_guest_set_to_host`), and the fds are tracked by number for the
+translation — registered on `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)` and dropped on
+`close`, `dup3`'s replacement and `execve`'s close-on-exec walk through the
+same `fd_track_dup`/`fd_track_close` hooks (`sys.h`) every class tracked by
+number uses. The recorded inode is only a weak "this fd number was reused
+behind our back" check: the kernel gives every `anon_inode` file one shared
+inode, so it catches reuse by a regular file, socket or pipe and not by an
+eventfd or a timerfd, which is why every path that closes or replaces an fd
+unmarks it explicitly. `readv` with **no bytes** in it (`iovcnt == 0`, or every
+segment empty) is 0, not the `EINVAL` a buffer too small for one record earns:
+a vector of no bytes never reaches the file, since `do_iter_read` returns as
+soon as the imported total is zero — the kernel's own asymmetry.
+`tests/c/sigmaskmirror.c` reads one from a worker while the main thread sits
+in a `read` with the signal blocked.
 
 ### `sigaltstack(2)` and `SA_ONSTACK`
 
@@ -299,14 +296,18 @@ move the stack out from under a handler standing on it.
 
 These install a signal mask for the duration of the wait, which is why they
 exist: block a signal, check whatever it would have changed, then sleep with it
-unblocked *only* while sleeping. Handing the mask to the host call alone does
-not implement that here — every signal but the job-control trio stays unblocked
-host-side so `host_catcher` can queue it, and `g_tls.sigmask` is what gates
-delivery. So the wait was interrupted and the run loop then declined to run the
-handler, leaving the guest with a bare `EINTR` and no signal. The guest mask is
-swapped too, and held across delivery exactly as `rt_sigsuspend` does (the frame
-records the caller's via `have_saved_sigmask`; `sigreturn` restores it); a wait
-that ends with nothing to deliver restores it directly. The enter path also
+unblocked *only* while sleeping. The host call is handed the guest's temporary
+mask translated exactly as the standing one is mirrored (`pwait_host_mask` →
+`sig_host_wait_mask`: guest 32/33 as their carriers, the gate's bits kept, the
+numbers the emulator's nets own held out — the control-channel kick among
+them, so a guest that `sigfillset`s cannot make a thread parked here
+unreachable to `de_thread`), and the guest mask is swapped too and held across
+delivery exactly as `rt_sigsuspend` does (the frame records the caller's via
+`have_saved_sigmask`; `sigreturn` restores it); a wait that ends with nothing
+to deliver restores it directly. Handing the mask to the host alone used to
+leave `g_tls.sigmask` gating delivery: the wait was interrupted and the run
+loop then declined to run the handler, leaving the guest with a bare `EINTR`
+and no signal. The enter path also
 tests for an already-deliverable signal before sleeping, as the kernel does —
 without it the queued-before-the-wait case, the one the idiom exists for, was
 not noticed until some later signal happened to wake the wait.
@@ -391,32 +392,67 @@ of a session reaches the same answer without sharing it, because the answer is a
 property of the host. `A64_SIGRT_MAX=N` caps the search, which is how the suite
 exercises the low-RT tier on a host that has no hole of its own.
 
-### Blocked signals are held, not applied
+### The guest's blocked set is the host thread's
 
-A blocked signal is *pending*, not delivered: the kernel holds it until the
-guest unblocks it. Only signals with a guest handler used to be caught here, so
-a signal the guest had blocked at `SIG_DFL` was left to the host default, which
-acted immediately — killing the process for most signals, and silently
-discarding `SIGCHLD`. `sig_host_update` therefore installs the capture handler
-for any signal the calling thread has blocked (as well as any a signalfd
-covers), and `sig_sync_host_mask` re-mirrors just the bits a `sigprocmask`
-changed, so the common case stays cheap. The signal then waits in the ring and
-the run loop applies the disposition at unblock time, terminating there if that
-is the default action — which is what the kernel does.
+A blocked signal is *pending*, not delivered, and a kernel acts on that in
+three ways a capture ring cannot: the syscall the thread is in is **not
+interrupted** (a `read` completes where the emulator returned `EINTR` with no
+handler to show for it — `wait`, `sleep`, `poll` loops in every shell and
+daemon saw that); a process-directed signal is **routed** to a thread that has
+it unblocked (`complete_signal` picks by mask — the host used to choose among
+threads whose host masks were all open, so the signal landed in the ring of a
+thread whose guest mask blocked it and sat there, while the sibling in
+`sigwait()` for it never heard: "one thread `sigwait`s, the rest block", the
+JVM's and every signal-handling thread's design, could not work); and the
+blocked signal waits in the **kernel's pending set**, where `sigpending`,
+`rt_sigtimedwait` and a `signalfd` find it.
 
-A host disposition is **process-wide**, so "is this signal blocked" has to be a
-process-wide question. Asked of the calling thread alone it had the wrong answer
-under `CLONE_VM`: a thread that unblocked `SIGTERM` put the host disposition back
-to `SIG_DFL` while a sibling still had it blocked, and the next `SIGTERM` killed
-everyone instead of waiting for that sibling to unblock it. There is no registry
-of guest threads to poll, so `m->sig_blocked_any` accumulates what any thread has
-blocked, and `sig_host_update` asks it rather than `g_tls.sigmask` alone. It errs
-high on purpose — catching a signal the guest will dispatch itself costs a ring
-entry and a run-loop check, where letting the host default act on a blocked one
-is fatal — and a process down to a single guest thread *is* that thread, so it
-puts the union back to its own mask (as does `execve`, which lands single-threaded
-by construction) and the over-approximation does not outlive the threads that
-caused it.
+So the guest's mask *is* the host thread's mask (`sig_sync_host_mask`, one
+`SIG_SETMASK` of the kernel's 64-bit set by the raw syscall — a libc
+`sigset_t` may be narrower, Bionic's 32-bit one is, and the RT signals are
+exactly what has to be expressible), kept in step at every place the guest's
+changes: `rt_sigprocmask`, the temporary masks of `rt_sigsuspend` and the
+`ppoll`/`pselect6`/`epoll_pwait` trio, a handler's entry (`sa_mask` and the
+signal itself) and its `sigreturn`, thread start, the `de_thread` hand-over,
+and the mask the emulator itself was started with (`sig_inherit_host_mask`:
+`execve` keeps the caller's blocked set, so a guest launched from a shell that
+blocks `SIGINT` starts with it blocked). The kernel then holds, routes and
+reports as it does for any process, and the ring is left with what is
+deliverable *now*. A `SIG_DFL` signal the guest has blocked needs no catcher
+for the kernel to hold it — a blocked signal is never ignored, and a
+default-terminate one is caught for its death's sake anyway (above) — which is
+what retired the process-wide "blocked by any thread" union
+(`m->sig_blocked_any`) and the signalfd mask union that used to force the
+capture handler on for every blocked or watched signal.
+
+A few host numbers are **held out** of the mirror (`sig_set_to_host`),
+because blocking them on the host would be fatal rather than faithful: the
+synchronous fault numbers (a blocked host fault is a forced kill; a guest that
+blocks `SIGSEGV` still has a *sent* one queued for it by the sync net, and the
+ring holds it until the unblock), `SIGSYS` (a seccomp trap arriving blocked
+kills the process), the control-channel kick, and host 32/33, the host libc's
+own. Guest 32/33 block the *carriers* that stand in for them — whether armed
+yet or not, and the carriers' host numbers stand for nothing else in a mask:
+arming is lazy and per-process while a mask is per-thread, so a thread whose
+mask was mirrored before a sibling armed a carrier would otherwise be holding
+the carrier because it blocks the guest number that host number spells (a
+`sigfillset` does) with guest 32 itself unblocked — the `pthread_cancel` aimed
+at it, or the timer signal its `sigwait` was entered for, waiting in the kernel
+until its next mask change (`c/timers` hung on the second, one run in six). A
+guest 62/63/64 of its own is caught unblocked and held in the ring instead, as
+every signal used to be. A
+held-out signal caught while the guest has it blocked interrupts nothing a
+kernel would have interrupted: the capture handler flags it as the emulator's
+own interruption and the syscall rewinds (`g_sig_selfintr`,
+`syscall_restart_internal`), the same way the kick is hidden. The gate
+(`sigq_gate`) may add bits of its own on top and takes them away again itself.
+
+`tests/c/sigmaskmirror.c` covers the read that completes, the death at the
+unblock of a blocked default-terminate signal, the routing to the unblocked
+worker, the `sigwait` and `signalfd` workers, `rt_sigtimedwait`,
+`rt_sigsuspend` and the `pthread_cancel` of a worker that blocked everything;
+`tests/fixtures/sentsync.c` the held-out `SIGSEGV`, which
+qemu-user gets wrong (it hands the read an `EINTR`).
 
 ### One disposition, four words
 
@@ -451,9 +487,10 @@ the bits the caller passed in. `tests/fixtures/sigactorder.c` covers all of it
 against the raw syscall; qemu-user is not the oracle there (it locks both user
 structs up front, and keeps the two unblockable signals in the mask).
 
-## Job control: mirroring the block mask to the host
+## Job control: where mirroring the block mask began
 
-This is the non-obvious part, and the source of a real bug.
+The mirror above started as a three-signal special case, and the bug that
+forced it is worth keeping.
 
 During job-control setup bash issues `tcsetpgrp` on a process group that is not
 yet the terminal's foreground group. POSIX makes the kernel send **`SIGTTOU`** to
@@ -461,12 +498,11 @@ the caller in that situation — so bash **blocks SIGTTOU** (via `sigprocmask`)
 around the call; blocked, POSIX suppresses the signal and the call just succeeds.
 
 `SIGTTOU`/`SIGTTIN` are generated **synchronously by the host kernel** against our
-process. If the guest blocks them but we only update the *guest* mask, the host
-still stops us before the run loop can mediate. So `sig_sync_host_mask` mirrors
-the guest block-state of the terminal job-control signals (`SIGTTOU`, `SIGTTIN`,
-`SIGTSTP`) to the **host** process mask on every guest mask change
-(`rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`). Blocked on the host, the
-kernel-generated SIGTTOU is suppressed, exactly as on real Linux.
+process. If the guest blocks them but only the *guest* mask is updated, the host
+still stops us before the run loop can mediate. Blocked on the host, the
+kernel-generated SIGTTOU is suppressed, exactly as on real Linux — which is what
+`sig_sync_host_mask` did for `SIGTTOU`, `SIGTTIN` and `SIGTSTP` alone, before
+the whole mask went to the host.
 
 Symptom before the fix: a fast external command (`id`) under interactive bash was
 immediately `Stopped`, because the child raced ahead of the parent's `tcsetpgrp`
@@ -610,8 +646,9 @@ request while holding `nl_lock` — a sibling mapping or unmapping anything bump
 the address-space generation, which invalidates that thread's D-TLB and
 *guarantees* the miss. `casp16` sits just above it (a CASP retry can miss the
 D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`),
-and `sigact_lock` under `sfd_lock` because `sfd_remask` re-mirrors dispositions
-with the signalfd table locked; `robust_lock` (the robust-futex list registry,
+and `sigact_lock` under `sfd_lock` (a leftover of the signalfd table once
+re-mirroring dispositions under it; the order is kept); `robust_lock` (the
+robust-futex list registry,
 `sys_proc.c`) sits above `as_lock` because walking a list copies guest memory.
 
 This began as five separate triples, one per module. That worked, but it encoded

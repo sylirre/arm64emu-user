@@ -66,6 +66,34 @@ int main(void) {
     int w = -1;
     printf("sigwait_segv=%d\n", sigwait(&set, &w) == 0 && w == SIGSEGV);
     sigprocmask(SIG_SETMASK, &old, NULL);
+    /* Blocked while the thread sits in a read: a blocked signal interrupts
+     * nothing, so the read completes, the signal shows pending, and the
+     * handler runs at the unblock -- for a SIGSEGV as for any other number,
+     * though this one the emulator catches host-side regardless of the
+     * guest's mask (its own faults must stay deliverable). qemu-user hands
+     * the read an EINTR here and shows nothing pending. */
+    sigprocmask(SIG_BLOCK, &set, &old);
+    int pp[2];
+    if (pipe(pp) < 0) return 1;
+    fflush(stdout);
+    pid_t k = fork();
+    if (k == 0) {
+        usleep(150000);
+        kill(getppid(), SIGSEGV);
+        usleep(250000);
+        if (write(pp[1], "x", 1) != 1) _exit(1);
+        _exit(0);
+    }
+    got_sig = 0;
+    char b;
+    int r = (int)read(pp[0], &b, 1);
+    sigset_t pend;
+    sigpending(&pend);
+    printf("blocked_segv_read: r=%d handler=%d pending=%d\n", r, got_sig, sigismember(&pend, SIGSEGV));
+    waitpid(k, NULL, 0);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    printf("after_unblock: handler=%d\n", got_sig == SIGSEGV);
+    close(pp[0]); close(pp[1]);
     /* The default: death by that signal. */
     child_status("dfl_bus", dfl_bus);
     child_status("dfl_segv", dfl_segv);

@@ -2609,9 +2609,11 @@ check_fixture robustdeath $'thread_exit: ownerdead ownerdead\nthread_clean: lock
 # A SENT SIGSEGV/BUS/ILL/FPE/TRAP is a signal, not a fault: a handler runs,
 # SIG_IGN drops it, SIG_DFL dies by it, a blocked one waits in sigwait. The
 # emulator left sent ones to the host's default disposition (a guest with a
-# SIGSEGV handler died of kill(SIGSEGV); a sent SIGBUS was swallowed).
-# Self-checking: qemu-user hangs on a raise() into its own SIGSEGV handler.
-check_fixture sentsync $'kill_segv: handler=1 si_user=1\nraise_segv: handler=1 si_tkill=1\npthread_kill_segv: handler=1\nkill_bus: handler=1 si_user=1\nraise_bus: handler=1 si_tkill=1\npthread_kill_bus: handler=1\nkill_ill: handler=1 si_user=1\nraise_ill: handler=1 si_tkill=1\npthread_kill_ill: handler=1\nkill_fpe: handler=1 si_user=1\nraise_fpe: handler=1 si_tkill=1\npthread_kill_fpe: handler=1\nkill_trap: handler=1 si_user=1\nraise_trap: handler=1 si_tkill=1\npthread_kill_trap: handler=1\nsigwait_segv=1\ndfl_bus: signaled 7\ndfl_segv: signaled 11\ndfl_ill: signaled 4\ndfl_fpe: signaled 8\ndfl_trap: signaled 5\ndfl_abrt: signaled 6\ndfl_term: signaled 15\nign_segv_bus: exited 5\ndone'
+# SIGSEGV handler died of kill(SIGSEGV); a sent SIGBUS was swallowed), and a
+# blocked one still interrupted the read the thread sat in. Self-checking:
+# qemu-user hangs on a raise() into its own SIGSEGV handler, and hands that
+# read an EINTR.
+check_fixture sentsync $'kill_segv: handler=1 si_user=1\nraise_segv: handler=1 si_tkill=1\npthread_kill_segv: handler=1\nkill_bus: handler=1 si_user=1\nraise_bus: handler=1 si_tkill=1\npthread_kill_bus: handler=1\nkill_ill: handler=1 si_user=1\nraise_ill: handler=1 si_tkill=1\npthread_kill_ill: handler=1\nkill_fpe: handler=1 si_user=1\nraise_fpe: handler=1 si_tkill=1\npthread_kill_fpe: handler=1\nkill_trap: handler=1 si_user=1\nraise_trap: handler=1 si_tkill=1\npthread_kill_trap: handler=1\nsigwait_segv=1\nblocked_segv_read: r=1 handler=0 pending=1\nafter_unblock: handler=1\ndfl_bus: signaled 7\ndfl_segv: signaled 11\ndfl_ill: signaled 4\ndfl_fpe: signaled 8\ndfl_trap: signaled 5\ndfl_abrt: signaled 6\ndfl_term: signaled 15\nign_segv_bus: exited 5\ndone'
 
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).

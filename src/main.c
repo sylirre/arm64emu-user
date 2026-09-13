@@ -565,7 +565,7 @@ static void emu_atfork_prepare(void) {
     procfs_locks_take();     /* pf_lock, then est_lock */
     netlink_locks_take();    /* nl_lock    — taken above as_lock by real code */
     sig_locks_take();        /* sfd_lock */
-    sigact_locks_take();     /* sigact_lock — sfd_remask re-mirrors under sfd_lock */
+    sigact_locks_take();     /* sigact_lock — inside sfd_lock by rank (signal.c) */
     robust_locks_take();     /* robust_lock — its walk copies guest memory */
     mem_locks_take();        /* casp16, then as_lock — innermost */
     fdheld_fork_prepare();   /* the fd-window barrier: last, so that a window
@@ -926,6 +926,10 @@ int main(int argc, char **argv)
     /* Arm the ptrace attach stop-kick net (reserved RT signal) so a later
      * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
     sig_install_kick_net();
+    sig_inherit_host_mask(m);   /* the guest starts with the mask it was given
+                                 * (execve keeps it), and the host's is the
+                                 * guest's from here on -- after the reserved
+                                 * numbers are known, which it holds out */
     /* Make every process-local mutex fork-safe before there is a second thread
      * to hold one (mem.c carries the full story and the hang it cost). */
     mem_locks_init();

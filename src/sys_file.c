@@ -990,8 +990,7 @@ SYSDEF(read) {
     if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
-    /* A signalfd carries no readable bytes of its own: the queued signals it
-     * reports live in the emulator's capture ring (sys_sig.c). */
+    /* A signalfd's records are translated on the way out (sys_sig.c). */
     ssize_t n;
     if (sigfd_tracked(c->m, (int)a0)) {
         s64 r = sigfd_fill(c, (int)a0, buf, len);
@@ -1048,7 +1047,7 @@ SYSDEF(readv) {
     if (cnt < 0) return (u64)(s64)cnt;
     if (efault == 1) { free(bounce); return (u64)(s64)-EFAULT; }
     ssize_t n;
-    if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: filled from the ring */
+    if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: records translated */
         size_t tot = 0;
         for (int i = 0; i < cnt; i++) tot += iov[i].iov_len;
         /* A vector of no bytes never reaches the file at all: do_iter_read
@@ -3269,28 +3268,31 @@ static int pwait_mask_enter(CPU *c, u64 gmask) {
     return sig_pending_deliverable(c->m);
 }
 
-/* The guest's blocked set as a host sigset -- the mask these calls install for
- * the duration of the wait -- with one signal held back.
+/* The guest's blocked set as the host sigset these calls install for the
+ * duration of the wait: the same translation the mirror uses for the
+ * thread's own mask (sig_host_wait_mask -- guest 32/33 as their carriers, the
+ * gate's bits kept, the numbers the emulator's nets own held out), so the
+ * kernel holds and routes under the temporary mask exactly as under the
+ * standing one.
  *
- * The emulator reserves a high RT signal for its own control channel
- * (PTRACE_KICKSIG: a tracer's attach kick, and execve's de_thread call-out),
- * and the guest must not be able to switch that off. It otherwise can, because
- * blocking everything is the usual way to reach one of these calls and
- * sigfillset covers that number too -- and then a thread parked here cannot be
- * reached at all, so de_thread times out and execve is refused on a program
- * that should have worked.
- *
- * The cost is confined to a guest-directed signal of that exact number arriving
- * while the guest has it blocked and is inside one of these three calls: it is
- * still queued in the capture ring (not lost, and delivered once the guest
- * unblocks it), but the wait returns EINTR where a kernel would have kept
- * waiting. Nothing sends the top of the RT range in practice; being unable to
- * reach our own threads is the worse failure of the two. */
+ * One of the held-out numbers matters here in particular. The emulator
+ * reserves a high RT signal for its own control channel (PTRACE_KICKSIG: a
+ * tracer's attach kick, and execve's de_thread call-out), and the guest must
+ * not be able to switch that off. It otherwise could, because blocking
+ * everything is the usual way to reach one of these calls and sigfillset
+ * covers that number too -- and then a thread parked here cannot be reached
+ * at all, so de_thread times out and execve is refused on a program that
+ * should have worked. The cost is confined to a guest-directed signal of that
+ * exact number arriving while the guest has it blocked and is inside one of
+ * these three calls: it is still queued in the capture ring (not lost, and
+ * delivered once the guest unblocks it), but the wait returns EINTR where a
+ * kernel would have kept waiting. Nothing sends the top of the RT range in
+ * practice; being unable to reach our own threads is the worse failure. */
 static void pwait_host_mask(sigset_t *ss, u64 gmask) {
+    u64 hm = sig_host_wait_mask(gmask);
     sigemptyset(ss);
     for (int i = 1; i <= 64; i++)
-        if (gmask & (1ULL << (i - 1))) sigaddset(ss, i);
-    sigdelset(ss, PTRACE_KICKSIG);
+        if (hm & (1ULL << (i - 1))) sigaddset(ss, i);
 }
 
 static void pwait_mask_leave(CPU *c) {
@@ -3419,7 +3421,6 @@ SYSDEF(ppoll) {
             return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINTR);
         }
     }
-    sigfd_sync(c->m);   /* level any signalfd against the ring before sleeping */
     int r = ppoll(pf, nfds, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     u64 ret;
@@ -3516,7 +3517,6 @@ SYSDEF(pselect6) {
         ssp = &ss;
         if (pwait_mask_enter(c, gmask)) { ret = (u64)(s64)-EINTR; goto out; }
     }
-    sigfd_sync(c->m);
     int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
     if (ssp) pwait_mask_leave(c);
     if (rr < 0) { ret = host_err(); goto out; }
@@ -3690,7 +3690,6 @@ SYSDEF(epoll_pwait) {
     }
     struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
     if (!evs) { if (ssp) pwait_mask_leave(c); return (u64)(s64)-ENOMEM; }
-    sigfd_sync(c->m);
     int tmo = (int)a3;
     syscall_wait_begin_ms(&tmo);
     int r = epoll_pwait((int)a0, evs, maxevents, tmo, ssp);

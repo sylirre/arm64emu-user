@@ -112,15 +112,16 @@ SYSDEF(rt_sigsuspend) {
     g_tls.have_saved_sigmask = 1;
     g_tls.sigmask = set;
     sig_sync_host_mask(c->m);
-    /* Sleep until the capture queue holds a deliverable signal. A bare
-     * pause() loses the race against a signal captured *before* it parks:
-     * the kernel's sigsuspend swaps the mask and sleeps atomically, but here
-     * a SIGCHLD that arrived while the guest still had it blocked sits in
-     * the queue already and pause() would wait for a second arrival that
-     * never comes (`sh -c 'sleep 0.2 & wait'` hung this way). The host
-     * catcher interrupts nanosleep (no SA_RESTART), so the tick only bounds
-     * the check-to-sleep window. On return the run loop delivers to the
-     * guest handler. */
+    /* Sleep until the capture queue holds a deliverable signal. The guest's
+     * temporary mask is the host thread's now, so the kernel's own
+     * rt_sigsuspend does the sleeping: it swaps the mask and sleeps
+     * atomically, delivering at once whatever the new mask lets through --
+     * the SIGCHLD that arrived while the guest still had it blocked included
+     * (`sh -c 'sleep 0.2 & wait'` hung on exactly that once, with a pause()
+     * that could not see it) -- and returns EINTR after any handler of ours,
+     * whereupon the queue is looked at. A signal already queued (captured
+     * while deliverable, blocked since) is seen before the first sleep. On
+     * return the run loop delivers to the guest handler. */
     while (!sig_pending_deliverable(c->m)) {
         /* Called out to a run-loop safepoint (execve's de_thread): stop waiting
          * and go there. Waiting only for a *guest-deliverable* signal is not
@@ -146,8 +147,7 @@ SYSDEF(rt_sigsuspend) {
             sig_sync_host_mask(c->m);
             return (u64)(s64)-EINTR;
         }
-        struct timespec ts = { 0, 20 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+        sig_host_suspend();
     }
     return (u64)(s64)-EINTR;
 }
@@ -344,22 +344,25 @@ SYSDEF(tgkill) {
 
 /* ---- signalfd(2) ----
  *
- * The host's own signalfd is useless to a guest here: a signalfd only ever
- * reports signals left *pending* on the host, and the emulator catches every
- * signal it cares about into its capture ring (signal.c) precisely so it can
- * decide delivery itself -- nothing stays pending, so a host signalfd would
- * never become readable. The fd handed to the guest is therefore an eventfd
- * carrying nothing but readiness: it is armed (counter 1) exactly while the
- * ring holds a signal the fd's mask covers, which is what makes poll/select/
- * epoll work with no special case anywhere. read(2) on it is intercepted and
- * answered from the ring.
+ * A host signalfd, and nothing else: the guest's blocked signals wait in the
+ * kernel's pending set now that the guest's mask is the host thread's
+ * (signal.c), which is exactly what a signalfd reads from, so the kernel's
+ * own file does the whole job -- readiness for poll/select/epoll, the
+ * blocking read, O_NONBLOCK's EAGAIN, the dequeue of a process-directed
+ * signal from the shared set whichever thread it was aimed at, EINVAL for a
+ * write. It used to be an eventfd carrying nothing but readiness, armed
+ * against the capture ring and read from it, because the ring was the only
+ * place a blocked signal ever was.
  *
- * The ring is per-thread, the fd is per-process: a signal queued on thread A
- * arms the fd, but only A's own read can consume it. Every real signalfd user
- * blocks the signal and reads it on one thread, which is exactly this case. */
+ * What is left of the emulator's own is the number translation on the way
+ * out: a guest 32/33 arrives as its carrier and a POSIX timer's sigval as a
+ * slot index (sig_host_catch does the same for a delivery), and the record
+ * is struct signalfd_siginfo, the kernel's own arch-independent layout, so
+ * the read is intercepted for that alone. The fds are tracked by number for
+ * it, and copied on dup / dropped on close with every other class
+ * (fd_track_dup / fd_track_close, sys.h). */
 
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
-static u64 sfd_next_id = 1;   /* under sfd_lock; identifies a description */
 
 /* Fork safety: a lock a sibling thread held when the guest forked crosses into
  * the child locked and ownerless. See the long note in mem.c -- prepare takes
@@ -375,8 +378,8 @@ void sig_locks_reinit(void) { pthread_mutex_init(&sfd_lock, NULL); }
 /* Slot of a live signalfd, or -1. A slot whose fd number was reused behind our
  * back is detected by the recorded inode and dropped, so an innocent fd is not
  * intercepted. This check is weaker than it looks -- every anon_inode file
- * shares one inode, so reuse by another eventfd or a timerfd slips through --
- * which is why each path that closes or replaces an fd unmarks it explicitly. */
+ * shares one inode, so reuse by an eventfd or a timerfd slips through -- which
+ * is why each path that closes or replaces an fd unmarks it explicitly. */
 static int sfd_slot(struct Machine *m, int fd) {
     for (int i = 0; i < m->sfd_fds_count; i++) {
         if (m->sfd_fds[i].fd != fd) continue;
@@ -388,28 +391,6 @@ static int sfd_slot(struct Machine *m, int fd) {
         return i;
     }
     return -1;
-}
-
-/* Every fd naming the same signalfd is one entry here, so mask changes and
- * readiness have to apply to the *file description* (`id`), not to one fd
- * number: dup(2) hands the guest a second name for the same signalfd, and the
- * kernel's mask and pending set are shared between them. */
-static void sfd_set_mask(struct Machine *m, u64 id, u64 mask) {
-    for (int i = 0; i < m->sfd_fds_count; i++)
-        if (m->sfd_fds[i].id == id) m->sfd_fds[i].mask = mask;
-}
-
-/* Recompute the union of the live masks and re-mirror every disposition it
- * newly covers: a signal nobody handles must still be caught and queued for a
- * signalfd to see it (sig_host_update reads m->sfd_mask). */
-static void sfd_remask(struct Machine *m) {
-    u64 u = 0;
-    for (int i = 0; i < m->sfd_fds_count; i++) u |= m->sfd_fds[i].mask;
-    u64 added = u & ~m->sfd_mask;
-    u64 dropped = m->sfd_mask & ~u;
-    m->sfd_mask = u;
-    for (int s = 1; s <= 64; s++)
-        if ((added | dropped) & (1ULL << (s - 1))) sig_host_update(m, s);
 }
 
 int sigfd_tracked(struct Machine *m, int fd) {
@@ -426,38 +407,13 @@ void sigfd_unmark_fd(struct Machine *m, int fd) {
     for (int i = 0; i < m->sfd_fds_count; i++)
         if (m->sfd_fds[i].fd == fd) {
             m->sfd_fds[i] = m->sfd_fds[--m->sfd_fds_count];
-            sfd_remask(m);
             break;
         }
     EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
 }
 
-/* Re-level every signalfd against the ring: arm the eventfd of one whose mask
- * now matches something queued, disarm one whose signals have been consumed.
- * The counter is only ever 0 or 1, so the writes and drains cannot block. */
-void sigfd_sync(struct Machine *m) {
-    if (!m->sfd_fds_count) return;   /* unlocked fast path */
-    EMU_LOCK(&sfd_lock, EMU_LK_SFD);
-    for (int i = 0; i < m->sfd_fds_count; i++) {
-        int dup_of = -1;   /* one eventfd counter per description, not per fd */
-        for (int j = 0; j < i; j++)
-            if (m->sfd_fds[j].id == m->sfd_fds[i].id) { dup_of = j; break; }
-        if (dup_of >= 0) { m->sfd_fds[i].armed = m->sfd_fds[dup_of].armed; continue; }
-        int want = sig_fd_pending(m->sfd_fds[i].mask);
-        u64 one = 1;
-        if (want && !m->sfd_fds[i].armed) {
-            if (write(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 1;
-        } else if (!want && m->sfd_fds[i].armed) {
-            if (read(m->sfd_fds[i].fd, &one, 8) == 8) m->sfd_fds[i].armed = 0;
-        }
-    }
-    EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
-}
-
 /* A second fd for an existing signalfd (dup/dup2/dup3, fcntl F_DUPFD): the
- * copy has to be tracked too, or read(2) on it would reach the bare eventfd --
- * which carries readiness, not signals, and is not even armed unless something
- * synced it, so the guest simply blocked forever. */
+ * copy is tracked too, so a read through it gets the same translation. */
 int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
     if (!m->sfd_fds_count || oldfd == newfd) return 0;   /* unlocked fast path */
     int r = 0;
@@ -478,88 +434,78 @@ int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
     return r;
 }
 
-/* read(2) on a signalfd: fill `out` with as many signalfd_siginfo records as
- * fit and are queued. Blocks (in short naps, like rt_sigtimedwait) unless the
- * fd is non-blocking, and gives up with EINTR when another signal becomes
- * deliverable, so the run loop can run its handler. */
+/* read(2) on a signalfd: the host's read, then the translation of what it
+ * returned -- whole struct signalfd_siginfo records, ssi_signo back from a
+ * carrier to the guest number, a timer's slot index back to its guest sigval
+ * and timer id. The blocking, O_NONBLOCK and EINTR behaviour are the file's
+ * own (a read interrupted by a signal the guest handles is restartable, as
+ * signalfd_read's ERESTARTSYS makes it). */
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
-    struct Machine *m = c->m;
-    if (len < sizeof(GSignalfdSiginfo)) return -EINVAL;
-    size_t want = len / sizeof(GSignalfdSiginfo);
-    int fl = fcntl(fd, F_GETFL);
-    int nonblock = fl >= 0 && (fl & O_NONBLOCK);
-    for (;;) {
-        EMU_LOCK(&sfd_lock, EMU_LK_SFD);
-        int i = sfd_slot(m, fd);
-        u64 mask = i >= 0 ? m->sfd_fds[i].mask : 0;
-        EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
-        if (i < 0) return -EBADF;   /* raced with a close: no longer ours */
-        size_t n = 0;
-        while (n < want &&
-               sig_fd_take(mask, (GSignalfdSiginfo *)(out + n * sizeof(GSignalfdSiginfo))))
-            n++;
-        if (n) {
-            sigfd_sync(m);   /* re-level: the ring may have run dry */
-            return (s64)(n * sizeof(GSignalfdSiginfo));
+    (void)c;
+    ssize_t n = read(fd, out, len);
+    if (n < 0) return -errno;
+    for (size_t off = 0; off + sizeof(GSignalfdSiginfo) <= (size_t)n;
+         off += sizeof(GSignalfdSiginfo)) {
+        GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
+        r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
+        if (r->ssi_code == SI_TIMER) {
+            u64 gv;
+            if (ptimer_siginfo((s32)r->ssi_int, &gv)) {
+                r->ssi_tid = (u32)r->ssi_int;    /* the guest timer id (slot) */
+                r->ssi_int = (s32)gv;
+                r->ssi_ptr = gv;
+            }
         }
-        sigfd_sync(m);
-        if (nonblock) return -EAGAIN;
-        if (g_sig_npend && sig_pending_deliverable(m)) return -EINTR;
-        /* Called out to a run-loop safepoint (execve's de_thread): stop waiting
-         * and go there, or the thread dismantling this group waits on us. */
-        if (guest_stop_pending(m)) return -EINTR;
-        struct timespec nap = { 0, 2 * 1000 * 1000 };
-        nanosleep(&nap, NULL);
     }
+    return (s64)n;
 }
 
 SYSDEF(signalfd4) {
-    /* (fd, mask, sigsetsize, flags): fd < 0 creates one, fd >= 0 replaces the
-     * mask of an existing signalfd. SIGKILL/SIGSTOP are silently dropped from
-     * the mask, as the kernel does. */
+    /* (fd, mask, sizemask, flags): fd < 0 creates one, fd >= 0 replaces the
+     * mask of an existing signalfd -- one of ours, or EINVAL as the kernel
+     * answers for any fd that is not a signalfd. SIGKILL/SIGSTOP are silently
+     * dropped from the mask, as the kernel does. The mask goes to the host as
+     * the host numbers the guest's stand for (sig_guest_set_to_host: 32/33
+     * through their carriers; the numbers the emulator's nets own are left
+     * out, a sent SIGSEGV never reaching the kernel's pending set here). The
+     * flag bits are the kernel's own on both sides. */
     (void)a4; (void)a5;
     struct Machine *m = c->m;
     if (a2 != 8) return (u64)(s64)-EINVAL;
     if (a3 & ~(u64)(G_SFD_CLOEXEC | G_SFD_NONBLOCK)) return (u64)(s64)-EINVAL;
     u64 mask;
     if (copy_from_guest(c, &mask, a1, 8) < 0) return (u64)(s64)-EFAULT;
+    if (a3 & ~(u64)(G_SFD_CLOEXEC | G_SFD_NONBLOCK))   /* do_signalfd4's order:
+                                                        * after the mask copy */
+        return (u64)(s64)-EINVAL;
     mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    u64 hmask = sig_guest_set_to_host(mask);
     int fd = (int)(s32)a0;
+    int hflags = ((a3 & G_SFD_CLOEXEC) ? O_CLOEXEC : 0) |
+                 ((a3 & G_SFD_NONBLOCK) ? O_NONBLOCK : 0);
     if (fd >= 0) {
-        EMU_LOCK(&sfd_lock, EMU_LK_SFD);
-        int i = sfd_slot(m, fd);
-        if (i >= 0) { sfd_set_mask(m, m->sfd_fds[i].id, mask); sfd_remask(m); }
-        EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
-        if (i < 0) return (u64)(s64)-EINVAL;
-        sigfd_sync(m);
-        return (u64)(s32)fd;
+        if (!sigfd_tracked(m, fd)) return (u64)(s64)-EINVAL;
+        long r = syscall(SYS_signalfd4, fd, &hmask, (size_t)8, hflags);
+        return r < 0 ? host_err() : (u64)(s32)fd;
     }
-    int eflags = EFD_CLOEXEC * 0;
-    if (a3 & G_SFD_CLOEXEC)  eflags |= EFD_CLOEXEC;
-    if (a3 & G_SFD_NONBLOCK) eflags |= EFD_NONBLOCK;
-    int nfd = eventfd(0, eflags);
+    long nfd = syscall(SYS_signalfd4, -1, &hmask, (size_t)8, hflags);
     if (nfd < 0) return host_err();
-    if (!fd_within_limit(c, nfd)) return (u64)(s64)-EMFILE;
+    if (!fd_within_limit(c, (int)nfd)) return (u64)(s64)-EMFILE;
     struct stat st;
-    if (fstat(nfd, &st) != 0) { u64 e = host_err(); close(nfd); return e; }
+    if (fstat((int)nfd, &st) != 0) { u64 e = host_err(); close((int)nfd); return e; }
     EMU_LOCK(&sfd_lock, EMU_LK_SFD);
     struct SfdFd *t = fd_table_room(m->sfd_fds, m->sfd_fds_count,
                                     &m->sfd_fds_cap, sizeof *t);
     if (!t) {
         EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
-        close(nfd);
+        close((int)nfd);
         return (u64)(s64)-ENOMEM;   /* no room to track it: better than a silent lie */
     }
     m->sfd_fds = t;
-    m->sfd_fds[m->sfd_fds_count].fd = nfd;
-    m->sfd_fds[m->sfd_fds_count].mask = mask;
-    m->sfd_fds[m->sfd_fds_count].armed = 0;
+    m->sfd_fds[m->sfd_fds_count].fd = (int)nfd;
     m->sfd_fds[m->sfd_fds_count].ino = (u64)st.st_ino;
-    m->sfd_fds[m->sfd_fds_count].id = sfd_next_id++;
     m->sfd_fds_count++;
-    sfd_remask(m);
     EMU_UNLOCK(&sfd_lock, EMU_LK_SFD);
-    sigfd_sync(m);   /* a matching signal may already be queued */
     return (u64)(s32)nfd;
 }
 

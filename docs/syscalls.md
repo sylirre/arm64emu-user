@@ -371,7 +371,7 @@ thread — see "A child inherits no descriptor of the emulator's own" in
 descriptors".
 
 `dup3` is also the one call that *replaces* a descriptor the emulator may be
-tracking by number (a signalfd served from the capture ring, a written-through
+tracking by number (a signalfd whose records are translated, a written-through
 `/proc` id-map file, a substituted netlink socket, a tier memfd), and it
 forgets newfd's old entry only **after** the host has really replaced it.
 Everything `ksys_dup3` refuses is refused first, in its order — a flag other
@@ -1778,8 +1778,9 @@ or parked at a ptrace stop its tracer never resumes. Two cases that *would* have
 hit it are handled instead. A guest blocking every signal across
 `ppoll`/`pselect6`/`epoll_pwait` used to block the kick too, so
 `pwait_host_mask` (`sys_file.c`) holds the reserved control signal out of the
-mask those calls install. And `rt_sigsuspend` waits *inside* the emulator rather
-than in a host call, so the kick had nothing to interrupt that mattered: it
+mask those calls install (the same translation now holds it out of every
+mirrored mask, `sig_set_to_host`). And `rt_sigsuspend` loops over the host
+sleep it does, so the kick's interruption alone changes nothing for it: it
 returns early on `guest_stop_pending`, putting its temporary mask back on the
 way out, since no delivery frame is going to. That one is easy to miss from a
 glibc host — `pause()` is not a single syscall, as aarch64 has no `SYS_pause`,

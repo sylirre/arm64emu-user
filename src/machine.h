@@ -213,12 +213,6 @@ struct Machine {
      * under a mask the installer never asked for, and on a 32-bit host a torn
      * 64-bit handler is not an address at all. */
     GSigAction sigact[65];    /* index 1..64 */
-    /* Union of the blocked sets of this process's guest threads, as far as they
-     * can be known here (see sig_sync_host_mask). A host disposition is
-     * process-wide, so sig_host_update has to ask a process-wide question:
-     * leaving a signal at the host default because the *calling* thread does
-     * not block it kills the whole process for a sibling that does. */
-    u64 sig_blocked_any;
     u8  dumpable;             /* PR_SET_DUMPABLE as the guest set it (recorded,
                                * never applied to the host: sys_proc.c) */
     u64 sigtramp_va;          /* guest VA of the rt_sigreturn trampoline page */
@@ -309,34 +303,20 @@ struct Machine {
     u8 seccomp_mode;          /* G_SECCOMP_MODE_* (0 = none: the hot path) */
     void *seccomp_filters;    /* struct SeccompProg *, newest first */
 
-    /* signalfd(2) descriptors held by this process. A host signalfd cannot
-     * serve the guest: the emulator catches signals itself, so none is ever
-     * left pending host-side and the fd would stay silent forever. Each guest
-     * signalfd is instead a host eventfd used purely as a readiness flag --
-     * armed while the capture ring holds a signal this fd's mask covers, so
-     * poll/select/epoll need no special case -- with read(2) intercepted and
-     * answered from the ring (sys_sig.c). Copied by fork like the fds are; a
-     * parent and child then share one eventfd but have separate rings, so each
-     * can briefly see the other's readiness -- a spurious poll wake followed by
-     * EAGAIN, which the next sync corrects.
-     *
-     * One entry per *fd*, so dup(2) adds a second entry naming the same
-     * description. `id` is what says two entries are the same description --
-     * a counter handed out at creation, because the inode cannot say it: the
-     * kernel gives every anon_inode file the same inode, so an eventfd, a
-     * second eventfd and a timerfd all report the identical st_ino. `ino` is
-     * kept only as a weak "this fd number was reused behind our back" check
-     * (it still catches reuse by a regular file, socket or pipe).
-     *
-     * Malloc'd and grown as needed (fork copies it with the heap): a name that
-     * found no slot would be a signalfd read as the bare eventfd under it. */
-    struct SfdFd { int fd; u64 mask; u64 ino; u64 id; u8 armed; } *sfd_fds;
+    /* signalfd(2) descriptors held by this process: real host signalfds
+     * (the guest's blocked signals wait in the kernel's pending set, which is
+     * what a signalfd reads -- signal.c, "the guest's blocked set IS the host
+     * thread's"), tracked by NUMBER only so that a read through one can have
+     * its records translated (a carrier back to guest 32/33, a timer's slot
+     * index back to its sigval; sys_sig.c). One entry per fd, so dup(2) adds
+     * an entry; `ino` is a weak "this fd number was reused behind our back"
+     * check (every anon_inode file shares one inode, so it catches reuse by a
+     * regular file, socket or pipe and not by another signalfd or an
+     * eventfd), which is why each path that closes or replaces an fd unmarks
+     * it explicitly. Malloc'd and grown as needed (fork copies it with the
+     * heap): a name that found no slot would be a signalfd read untranslated. */
+    struct SfdFd { int fd; u64 ino; } *sfd_fds;
     int sfd_fds_count, sfd_fds_cap;
-    u64 sfd_mask;             /* union of the masks above: sig_host_update
-                               * forces the capture handler on for these, or a
-                               * SIG_DFL signal would never be queued at all
-                               * (SIGCHLD, the usual signalfd subject, is
-                               * default-ignore and would just vanish) */
 
     /* Open fds of time-varying synthesized /proc files (loadavg, uptime,
      * stat — sys_procfs.c): a read starting at offset 0 regenerates the
@@ -565,13 +545,11 @@ int sig_pending_deliverable(struct Machine *m);
  * info_va when non-zero. timeout_ns < 0 = forever. Returns the signal number
  * or -EAGAIN (timeout) / -EINTR (another deliverable signal pends). */
 s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns);
-/* signalfd's view of the same ring (declared with the rest of the signalfd
- * plumbing in sys.h, which has the guest struct): sig_fd_pending / sig_fd_take. */
 /* Arm the host carrier signal for guest signal 32 or 33 (the guest libc's
  * internal SIGTIMER/SIGCANCEL, unraisable as host numbers -- the host libc
  * owns those) and return the host signal to raise instead; the capture
  * handler translates it back to the guest number (sys_time.c timer_create). */
-/* Signals queued in this thread's capture ring (the guest's pending set). */
+/* The guest's pending set: the kernel's for this thread plus the ring's. */
 u64  sig_pending_set(void);
 int  sig_arm_rt_remap(int guest_sig);
 /* Host signal number to raise for a guest signal (32/33 -> armed carrier). */
@@ -595,9 +573,14 @@ void sig_raise_local(int sig);
 void sig_return(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */
 void sig_reset_for_exec(struct Machine *m);
-/* Mirror the calling thread's guest block-state of terminal job-control
- * signals to the host process mask. */
+/* The calling thread's guest blocked set becomes its host mask (signal.c,
+ * "the guest's blocked set IS the host thread's"); and the host's mask at
+ * startup becomes the guest's initial one. */
 void sig_sync_host_mask(struct Machine *m);
+void sig_inherit_host_mask(struct Machine *m);
+void sig_host_suspend(void);            /* rt_sigsuspend's sleep, on the host */
+u64  sig_guest_set_to_host(u64 gset);   /* the host numbers a guest set names */
+u64  sig_host_wait_mask(u64 gset);      /* ... plus the gate's: a wait's mask */
 /* exec_fpsimd.c: fold this thread's lazily-accumulated FP exception flags --
  * the host's sticky status word and the set raised in software -- into
  * c->fpsr, and clear them. sysreg.c calls it for the guest's own MRS/MSR;
@@ -701,8 +684,7 @@ enum {
     EMU_LK_EST    = 1u << 2,   /* sys_procfs.c   — under pf_lock (put_stat) */
     EMU_LK_NL     = 1u << 3,   /* sys_netlink.c  */
     EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
-    EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (sfd_remask
-                                * re-mirrors dispositions) */
+    EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (by rank) */
     EMU_LK_ROBUST = 1u << 6,   /* sys_proc.c     — the robust-list registry;
                                 * its walk copies guest memory (as_lock) */
     EMU_LK_CASP16 = 1u << 7,   /* mem.c          */

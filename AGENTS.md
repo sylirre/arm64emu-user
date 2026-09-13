@@ -82,7 +82,7 @@ src/
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread); a main thread that exit(2)s while siblings run parks as the kernel's zombie leader instead of ending the process
-  sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions, signalfd over the capture ring)
+  sys_sig.c                          Signal syscalls (rt_sigaction / sigprocmask dispositions -- the guest's blocked set is the host thread's, signalfd is a host signalfd with translated records)
   sys_time.c                         Time / clock / timerfd syscalls
   sys_net.c                          Socket syscalls (rootfs-aware AF_UNIX paths, abstract-socket isolation)
   sys_netlink.c sys_netlink.h        AF_NETLINK / NETLINK_ROUTE emulation (proot-style): AF_UNIX fallback when the host denies netlink (probed incl. a write, per-message-type LSM policies), covering read/write and their vector forms as well as the socket calls, replies per-socket and delivered a datagram at a time (NLMSG_DONE on its own), with readiness carried by the self-connected stand-in so poll/select/epoll work, plus rtnetlink-refusal-to-ack rewriting for a guest whose CLONE_NEWNET was faked
