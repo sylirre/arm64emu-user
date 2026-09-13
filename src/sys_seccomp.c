@@ -181,8 +181,14 @@ static u32 bpf_run(const GSockFilter *f, u32 len, const GSeccompData *d) {
             case BPF_AND: A &= v; break;
             case BPF_OR:  A |= v; break;
             case BPF_XOR: A ^= v; break;
-            case BPF_LSH: if (v >= 32) return 0; A <<= v; break;
-            case BPF_RSH: if (v >= 32) return 0; A >>= v; break;
+            /* A shift by X of 32 or more is masked to five bits -- the eBPF
+             * interpreter's `DST << (SRC & 31)` since the undefined-behaviour
+             * fix, and what the x86/arm64 JITs' shift instructions do by
+             * themselves. (A shift by K of 32 or more never loads: the classic
+             * checker refuses it, above.) It used to end the program with 0,
+             * a kill. */
+            case BPF_LSH: A <<= (v & 31); break;
+            case BPF_RSH: A >>= (v & 31); break;
             /* Classic BPF is unsigned 32-bit throughout, and the kernel's
              * NEG is the wraparound (its eBPF form is DST = (u32) -DST): the
              * negation of 0x80000000 is 0x80000000. Negating it as a signed

@@ -2626,6 +2626,11 @@ check_fixture vforkback $'spawn_missing: r=ENOENT waited=0\nspawn_ok: r=0 exited
 # handler's run and rt_sigreturn restoring it. Self-checking: qemu-user knows
 # no SS_AUTODISARM.
 check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsigaltstack_disable_small: 0\nalt_none: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_plain: frame_flags=0 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_onstack_bit: frame_flags=0x1 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x1 in_size=65536 after_flags=0 after_size=65536\nalt_autodisarm: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=1 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_autodisarm_offstack: frame_flags=0x80000000 frame_sp=1 frame_size=65536 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000000 after_size=65536\nalt_disabled: frame_flags=0x2 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x2 after_size=0\nalt_disabled_autodisarm: frame_flags=0x80000002 frame_sp=0 frame_size=0 in_alt=0 in_flags=0x2 in_size=0 after_flags=0x80000002 after_size=0\ndone'
+# Small kernel-ABI facts, each against a real kernel: uname domainname,
+# F_GETFL's O_LARGEFILE, getdents64 into a half-mapped buffer, statx /
+# fchownat flag refusals, the SIOCGIF* ioctls on a non-socket and on a bad
+# pointer, a seccomp shift by X >= 32. Self-checking: qemu differs on most.
+check_fixture smallabi $'domainname=[(none)]\ngetfl_largefile=1\ngetdents_short: r=one errno=0\ngetdents_unmapped: r=-1 errno=14 pos_kept=1\ngetdents_rest: r=some errno=0\nstatx_badflag: 22\nstatx_synctype_both: 22\nstatx_reserved_mask: 22\nstatx_badflag_noent: 22\nstatx_ok: 0\nfchownat_badflag: 22\nfchownat_ok: 0\nifflags_devnull: 25\nifconf_devnull_fault: 25\nifname_devnull_null: 25\nifflags_sock: r=0 errno=0 up=1\nifflags_fault: 14\nifflags_null: 14\nifconf_fault: 14\nifname_fault: 14\nifflags_badfd: 9\nseccomp_shift_x: exited=1 code=0\ndone'
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
 # afresh -- zeroes behind private anonymous memory, the file again behind a
 # private file mapping, the same pages behind a shared one. Self-checking:

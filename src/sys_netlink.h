@@ -75,6 +75,7 @@ int nl_maybe_readv(CPU *c, int fd, u64 iov_va, u64 iov_cnt, u64 *ret);
  *   nl_maybe_ifreq_ioctl: SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,
  *                         DSTADDR,MTU,METRIC,HWADDR,TXQLEN,MAP} on a struct ifreq.
  *   nl_maybe_siocgifconf: SIOCGIFCONF enumeration into a struct ifconf. */
+int nl_ifreq_cmd(u32 cmd);   /* one of the commands the two below answer */
 int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret);
 int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret);
 

@@ -47,6 +47,38 @@ the raw pointer, since the buffer was not written); an output buffer's shown len
 is the call's return value. Any argument a syscall's descriptor does not cover falls
 back to hex, so coverage grows one table row at a time.
 
+### Small facts a kernel states and a guest may read
+
+A sweep against a real kernel turned up a handful of answers the emulator had
+invented, each now the kernel's (`tests/fixtures/smallabi.c` holds them; qemu
+is not the oracle for most, so the expected block is a native run's):
+
+- `uname`'s `domainname` is the host's, `"(none)"` where no NIS domain was set —
+  the field used to be left empty, which no kernel prints.
+- `F_GETFL` shows `O_LARGEFILE` (arm64's `0400000`) on every descriptor: a
+  64-bit task gets it on every open (`force_o_largefile`), whatever the host's
+  own bit — which on an ILP32 host is set only when the emulator asked.
+- `getdents64` writes the records that fit the *mapped* part of the buffer and
+  stops at the first that does not, returning what it wrote and leaving the
+  directory position at the record that did not fit (`filldir64`); only a first
+  record that does not fit is `EFAULT`. The host read is bounded by the room
+  (`rw_room`) for that, where it used to read `count` bytes and lose every entry
+  past the mapped part when the copy-out failed — and a buffer that was not
+  there at all read as an empty directory.
+- `statx` refuses both sync bits at once, a reserved mask bit and a flag it does
+  not take (`EINVAL`, after the name is read); `fchownat` refuses a flag other
+  than `AT_SYMLINK_NOFOLLOW`/`AT_EMPTY_PATH` before it reads the name; and
+  `sigaltstack`'s modes are `SS_DISABLE`, `SS_ONSTACK` and 0 with
+  `SS_AUTODISARM` on top, anything else `EINVAL` (`docs/signals-and-processes.md`
+  has the rest of `sigaltstack`, `SS_AUTODISARM` included;
+  `tests/fixtures/altstackflags.c`).
+- The `SIOCGIF*` interface ioctls are answered on a socket alone — they reach
+  `dev_ioctl` only through `sock_do_ioctl`, and a file's ioctl op answers them
+  `ENOTTY` — and a pointer they cannot copy through (null included) is
+  `EFAULT`; they used to be answered on any descriptor, and a fault fell into
+  the generic table's `ENOTTY`.
+- `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
+
 ## Struct marshalling: always convert
 
 Handlers **never** issue raw host syscall numbers and never pass guest structs to
@@ -637,7 +669,12 @@ What that buys: `bwrap --seccomp`, flatpak's syscall blacklists and any
 libseccomp-generated program behave as they would on a kernel. The accepted
 instruction set is the kernel's (`seccomp_check_filter`): 32-bit aligned
 absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset, jumps
-forward and in range, a `RET` last — anything else is `EINVAL` at install time.
+forward and in range, a `RET` last, a shift by an immediate below 32 — anything
+else is `EINVAL` at install time. What runs runs as the kernel's converted
+program does: a division by a zero `X` ends the program with 0 (a kill), and a
+shift by an `X` of 32 or more shifts by `X & 31` — the interpreter's own
+masking since its undefined-behaviour fix, and what the JITs' shift instructions
+do by themselves; it used to end the program here (`tests/fixtures/smallabi.c`).
 `SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
 `TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, plus the filter's
 own `SECCOMP_RET_DATA` in `si_errno` — that is how one filter tells its several
@@ -651,7 +688,10 @@ and the chain is inherited by fork and kept across execve.
 
 Two divergences worth knowing: threads share the chain (the kernel's `TSYNC`
 behavior rather than its per-thread default), so a filter installed by one
-thread applies to the process; and `SECCOMP_RET_USER_NOTIF` is declined at
+thread applies to the process — a deliberate choice, since every real installer
+either is single-threaded at the time or asks for `TSYNC`, and a per-thread
+chain would need the seccomp state moved out of the shared registry slot every
+reader of `/proc/<pid>/status` consults; and `SECCOMP_RET_USER_NOTIF` is declined at
 install (`SECCOMP_FILTER_FLAG_NEW_LISTENER` → `EOPNOTSUPP`), since servicing a
 notification fd would mean parking guest syscalls on an external agent. Note
 this is entirely separate from the emulator's *own* SIGSYS net, which absorbs

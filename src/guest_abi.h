@@ -570,6 +570,9 @@ typedef struct {
 #define G_AT_EACCESS           0x200   /* faccessat2 only: same bit, other meaning */
 #define G_AT_SYMLINK_FOLLOW    0x400
 #define G_AT_EMPTY_PATH        0x1000
+#define G_AT_NO_AUTOMOUNT      0x800
+#define G_AT_STATX_SYNC_TYPE   0x6000   /* AT_STATX_{SYNC_AS_STAT,FORCE_SYNC,DONT_SYNC} */
+#define G_STATX__RESERVED      0x80000000u
 
 /* mount(2) flags (arch-uniform) and umount2(2) flags, for the bind-mount
  * emulation in sys_file.c. MS_MGC_VAL is the legacy magic some tools still OR

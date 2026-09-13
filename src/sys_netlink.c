@@ -1862,6 +1862,29 @@ static int gather_ifq(const char *name, struct ifq *q)
     return q->found;
 }
 
+/* The interface ioctls answered here (and SIOCGIFCONF by the function below):
+ * sys_file.c asks before it asks whether the descriptor is a socket, since
+ * these reach dev_ioctl only through sock_do_ioctl -- a file's ioctl op
+ * answers them ENOTTY. */
+int nl_ifreq_cmd(u32 cmd)
+{
+    switch (cmd) {
+    case 0x8910: /*SIOCGIFNAME*/    case 0x8912: /*SIOCGIFCONF*/
+    case 0x8913: /*SIOCGIFFLAGS*/   case 0x8915: /*SIOCGIFADDR*/
+    case 0x8917: /*SIOCGIFDSTADDR*/ case 0x8919: /*SIOCGIFBRDADDR*/
+    case 0x891b: /*SIOCGIFNETMASK*/ case 0x891d: /*SIOCGIFMETRIC*/
+    case 0x8921: /*SIOCGIFMTU*/     case 0x8927: /*SIOCGIFHWADDR*/
+    case 0x8933: /*SIOCGIFINDEX*/   case 0x8942: /*SIOCGIFTXQLEN*/
+    case 0x8970: /*SIOCGIFMAP*/
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* A guest pointer the kernel's get_user_ifreq / put_user_ifreq could not
+ * copy through is EFAULT, for a null one as for an unmapped one: it used to
+ * drop the request into the generic table, which answered ENOTTY. */
 int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
 {
     char name[IFNAMSIZ];
@@ -1873,10 +1896,10 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
     if (cmd == 0x8910 /*SIOCGIFNAME*/) {
         int idx;
         char nm[IFNAMSIZ];
-        if (arg == 0)
-            return 0;
-        if (copy_from_guest(c, &idx, arg + IFNAMSIZ, sizeof idx) < 0)
-            return 0;
+        if (arg == 0 || copy_from_guest(c, &idx, arg + IFNAMSIZ, sizeof idx) < 0) {
+            *ret = (u64)(s64) -EFAULT;
+            return 1;
+        }
         memset(nm, 0, sizeof nm);
         fdwin_enter();   /* if_indextoname opens a socket (machine.h) */
         char *found_nm = idx > 0 ? if_indextoname((unsigned) idx, nm) : NULL;
@@ -1887,28 +1910,17 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
             if (idx != 1) { *ret = (u64)(s64) -ENODEV; return 1; }
             strcpy(nm, "lo");                        /* loopback is index 1 */
         }
-        if (copy_to_guest(c, arg, nm, sizeof nm) < 0)
-            return 0;
-        *ret = 0;
+        *ret = copy_to_guest(c, arg, nm, sizeof nm) < 0 ? (u64)(s64) -EFAULT : 0;
         return 1;
     }
 
-    switch (cmd) {
-    case 0x8913: /*SIOCGIFFLAGS*/   case 0x8915: /*SIOCGIFADDR*/
-    case 0x8917: /*SIOCGIFDSTADDR*/ case 0x8919: /*SIOCGIFBRDADDR*/
-    case 0x891b: /*SIOCGIFNETMASK*/ case 0x891d: /*SIOCGIFMETRIC*/
-    case 0x8921: /*SIOCGIFMTU*/     case 0x8927: /*SIOCGIFHWADDR*/
-    case 0x8933: /*SIOCGIFINDEX*/   case 0x8942: /*SIOCGIFTXQLEN*/
-    case 0x8970: /*SIOCGIFMAP*/
-        break;
-    default:
+    if (cmd == 0x8912 || !nl_ifreq_cmd(cmd))
         return 0;                                    /* not ours; fall through */
-    }
 
-    if (arg == 0)
-        return 0;
-    if (copy_from_guest(c, name, arg, sizeof name) < 0)
-        return 0;
+    if (arg == 0 || copy_from_guest(c, name, arg, sizeof name) < 0) {
+        *ret = (u64)(s64) -EFAULT;
+        return 1;
+    }
     name[IFNAMSIZ - 1] = '\0';
 
     fdwin_enter();   /* getifaddrs and the ioctl socket (machine.h) */
@@ -1959,9 +1971,7 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
         outlen = GUEST_IFREQ_SZ - IFNAMSIZ; break;
     }
 
-    if (copy_to_guest(c, arg + IFNAMSIZ, out, outlen) < 0)
-        return 0;
-    *ret = 0;
+    *ret = copy_to_guest(c, arg + IFNAMSIZ, out, outlen) < 0 ? (u64)(s64) -EFAULT : 0;
     return 1;
 }
 
@@ -1974,13 +1984,12 @@ int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
     struct ifaddrs *ifaddr, *ifa;
     uint32_t total, cap, produced, i;
 
-    if (arg == 0)
-        return 0;
     /* guest struct ifconf: int ifc_len @0, pad @4, ifc_buf/ifc_req ptr @8. */
-    if (copy_from_guest(c, &ifc_len, arg, sizeof ifc_len) < 0)
-        return 0;
-    if (copy_from_guest(c, &bufp, arg + 8, sizeof bufp) < 0)
-        return 0;
+    if (arg == 0 || copy_from_guest(c, &ifc_len, arg, sizeof ifc_len) < 0 ||
+        copy_from_guest(c, &bufp, arg + 8, sizeof bufp) < 0) {
+        *ret = (u64)(s64) -EFAULT;
+        return 1;
+    }
 
     /* SIOCGIFCONF is IPv4-only: one ifreq per AF_INET address (aliases too). */
     fdwin_enter();   /* getifaddrs' own socket (machine.h) */
@@ -2012,9 +2021,7 @@ int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
 
     /* NULL buffer => report the size needed to hold every entry (netdevice(7)). */
     if (bufp == 0) {
-        if (copy_to_guest(c, arg, &total, sizeof total) < 0)
-            return 0;
-        *ret = 0;
+        *ret = copy_to_guest(c, arg, &total, sizeof total) < 0 ? (u64)(s64) -EFAULT : 0;
         return 1;
     }
 
@@ -2030,12 +2037,12 @@ int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
         si.sin_addr.s_addr = ent[i].addr;
         memcpy(e + IFNAMSIZ, &si, sizeof si);        /* ifr_addr @ offset 16 */
         if (copy_to_guest(c, bufp + (uint64_t) i * GUEST_IFREQ_SZ,
-                          e, GUEST_IFREQ_SZ) < 0)
-            return 0;
+                          e, GUEST_IFREQ_SZ) < 0) {
+            *ret = (u64)(s64) -EFAULT;
+            return 1;
+        }
         produced += GUEST_IFREQ_SZ;
     }
-    if (copy_to_guest(c, arg, &produced, sizeof produced) < 0)
-        return 0;
-    *ret = 0;
+    *ret = copy_to_guest(c, arg, &produced, sizeof produced) < 0 ? (u64)(s64) -EFAULT : 0;
     return 1;
 }

@@ -388,6 +388,11 @@ SYSDEF(uname) {
     snprintf(g.release, sizeof g.release, GUEST_KREL);
     snprintf(g.version, sizeof g.version, GUEST_KVER);
     snprintf(g.machine, sizeof g.machine, "aarch64");
+    /* The NIS domain name is the host's, as the node name is; a kernel that
+     * was never given one answers "(none)", and so does the host's uname --
+     * the field used to be left empty, which no kernel ever prints. */
+    snprintf(g.domainname, sizeof g.domainname, "%s",
+             h.domainname[0] ? h.domainname : "(none)");
     return copy_to_guest(c, a0, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 

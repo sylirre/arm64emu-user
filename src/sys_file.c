@@ -57,6 +57,11 @@ int oflags_h2g(int h) {
 #ifdef O_DIRECT
     if (h & O_DIRECT)    g |= G_O_DIRECT;
 #endif
+    /* The guest is a 64-bit task, and build_open_flags puts O_LARGEFILE on
+     * every open a 64-bit task makes (force_o_largefile), so F_GETFL always
+     * shows it there -- whatever the host's own bit says, which on an ILP32
+     * host is set only when the emulator asked for it. */
+    g |= G_O_LARGEFILE;
     return g;
 }
 
@@ -1645,6 +1650,21 @@ SYSDEF(getdents64) {
      * buffer passes straight through. */
     size_t len = (size_t)a2;
     if (len > (1u << 20)) len = 1u << 20;
+    /* Only as far as the guest's buffer is mapped: filldir64 writes one
+     * record at a time and stops at the first that faults, returning what it
+     * wrote (EFAULT if that was nothing), and the directory position stays at
+     * the record that did not fit. Reading `count` bytes from the host and
+     * failing the copy-out afterwards consumed every entry past the mapped
+     * part, and a buffer that was not there at all read as an empty
+     * directory. Bounding the host read by the room does both the kernel's
+     * way -- except that a first record too long for the room comes back
+     * from the host as EINVAL, which is what a kernel answers for a count
+     * too small; when it was the mapping and not the count that was short,
+     * that is the fault the kernel would have taken (below). */
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    if (len && !room) return (u64)(s64)-EFAULT;
+    size_t asked = len;
+    len = room;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
 
@@ -1729,7 +1749,12 @@ SYSDEF(getdents64) {
     } else {
         n = syscall(SYS_getdents64, (int)a0, buf, len);
     }
-    if (n < 0) { u64 e = host_err(); free(buf); return e; }
+    if (n < 0) {
+        u64 e = host_err();
+        if (e == (u64)(s64)-EINVAL && len < asked) e = (u64)(s64)-EFAULT;
+        free(buf);
+        return e;
+    }
     if (want_inject && pos0 == 0 && n > 0) {
         if (inject_dev)
             n = (long)dev_inject_dents((int)a0, buf, (size_t)n, len);
@@ -2015,8 +2040,14 @@ SYSDEF(ioctl) {
      * from the host's own interface table so they work on Android, where the
      * socket ioctls are denied (EACCES), and on rootfs setups without a
      * /proc/net/dev to enumerate from. Ungated (like proot) so they work whether
-     * or not the host blocks netlink; non-network cmds fall through to ioctl_tab. */
-    {
+     * or not the host blocks netlink; non-network cmds fall through to ioctl_tab.
+     * Only on a socket, though: these reach dev_ioctl through sock_do_ioctl,
+     * and a file's ioctl op answers them ENOTTY -- they used to be answered on
+     * any descriptor, /dev/null included. */
+    if (nl_ifreq_cmd(cmd)) {
+        struct stat st;
+        if (fstat((int)a0, &st) != 0) return host_err();          /* EBADF */
+        if (!S_ISSOCK(st.st_mode)) return (u64)(s64)-ENOTTY;
         u64 ret;
         if (cmd == 0x8912 /*SIOCGIFCONF*/) {
             if (nl_maybe_siocgifconf(c, a2, &ret)) return ret;
@@ -2885,6 +2916,9 @@ SYSDEF(fchmodat) {
 
 SYSDEF(fchownat) {
     unsigned gf = (unsigned)a4;
+    /* do_fchownat judges the flags before it reads the name: a bit other than
+     * these two is EINVAL, ahead of any EFAULT or ENOENT the path would earn. */
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
     if (gf & G_AT_EMPTY_PATH) {   /* fchownat(fd, "", ..., AT_EMPTY_PATH): operate on the fd */
         char gpath[PATH_MAX];
         long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
@@ -3182,6 +3216,15 @@ SYSDEF(statx) {
     long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
     if (n < 0) return (u64)(s64)n;
     unsigned gf = (unsigned)a2;
+    /* do_statx's own refusals, after the name is read (getname comes first
+     * in the syscall) and before anything is looked up: both sync bits at
+     * once, a reserved mask bit, a flag statx does not take. None of them
+     * used to be judged, so statx(..., 0x8000, ...) answered the stat. */
+    if ((gf & G_AT_STATX_SYNC_TYPE) == G_AT_STATX_SYNC_TYPE) return (u64)(s64)-EINVAL;
+    if ((unsigned)a3 & G_STATX__RESERVED) return (u64)(s64)-EINVAL;
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_NO_AUTOMOUNT | G_AT_EMPTY_PATH |
+               G_AT_STATX_SYNC_TYPE))
+        return (u64)(s64)-EINVAL;
     char host[PATH_MAX];
     u8 buf[256];
     long r;
