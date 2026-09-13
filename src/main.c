@@ -930,6 +930,10 @@ int main(int argc, char **argv)
                                  * (execve keeps it), and the host's is the
                                  * guest's from here on -- after the reserved
                                  * numbers are known, which it holds out */
+    sig_inherit_host_dispositions(m);   /* likewise SIG_IGN; and every
+                                         * default-terminate signal caught
+                                         * from here on, not from the guest's
+                                         * first sigaction on it */
     /* Make every process-local mutex fork-safe before there is a second thread
      * to hold one (mem.c carries the full story and the hang it cost). */
     mem_locks_init();

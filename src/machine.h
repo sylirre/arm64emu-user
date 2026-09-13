@@ -578,6 +578,9 @@ void sig_reset_for_exec(struct Machine *m);
  * startup becomes the guest's initial one. */
 void sig_sync_host_mask(struct Machine *m);
 void sig_inherit_host_mask(struct Machine *m);
+/* ...and the dispositions it was started with, with the host's mirrored to
+ * every one of the guest's from the start (signal.c). */
+void sig_inherit_host_dispositions(struct Machine *m);
 void sig_host_suspend(void);            /* rt_sigsuspend's sleep, on the host */
 u64  sig_guest_set_to_host(u64 gset);   /* the host numbers a guest set names */
 u64  sig_host_wait_mask(u64 gset);      /* ... plus the gate's: a wait's mask */

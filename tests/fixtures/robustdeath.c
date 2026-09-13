@@ -92,6 +92,16 @@ int main(int argc, char **argv) {
     printf("child_sigsegv: %s signaled=%d\n", lockres(r), WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
     if (r == EOWNERDEAD) pthread_mutex_consistent(sm);
     pthread_mutex_unlock(sm);
+    /* ...one killed by a SIGTERM it never set a disposition for: the death
+     * has to go through the emulator's own exit path all the same, or the
+     * list is never walked (a host default kill runs no emulator code). */
+    k = fork();
+    if (k == 0) { pthread_mutex_lock(sm); kill(getpid(), SIGTERM); pause(); _exit(0); }
+    waitpid(k, &st, 0);
+    r = pthread_mutex_lock(sm);
+    printf("child_sigterm: %s signaled=%d\n", lockres(r), WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+    if (r == EOWNERDEAD) pthread_mutex_consistent(sm);
+    pthread_mutex_unlock(sm);
     /* ...one that exec()s while holding it: exec releases the list too. */
     k = fork();
     if (k == 0) { pthread_mutex_lock(sm); execl("/proc/self/exe", "robustdeath", "--true", (char *)NULL); _exit(3); }

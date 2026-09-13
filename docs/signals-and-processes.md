@@ -22,7 +22,14 @@ code, so the robust futexes the process held stayed locked for their waiters,
 its registry slot, `SEM_UNDO` adjustments and tmpfs backing were left to later
 reclaim, and a tracee reported nothing. The exit status is the same — the run
 loop restores the default and re-raises — and this used to be done only under
-`ptrace` or while the signal was blocked.
+`ptrace` or while the signal was blocked. Every disposition is mirrored at
+startup (`sig_inherit_host_dispositions`), not at the guest's first `sigaction`
+on it: a `SIGTERM` the guest never mentioned used to die at the host default
+with none of that performed (`tests/fixtures/robustdeath.c`, the `child_sigterm`
+row). The same pass takes the dispositions the emulator was started with —
+`execve` keeps `SIG_IGN` and resets the rest — so a guest launched under `nohup`
+reads `SIGHUP` back as `SIG_IGN`, as it would from a kernel, instead of `SIG_DFL`
+while the host went on ignoring it.
 
 Synchronous guest faults (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`) never
 come through the host catcher — they arrive from the interpreter as pending

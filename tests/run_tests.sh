@@ -2601,11 +2601,12 @@ check_fixture prctlset $'dumpable=1\nset_dump0=0 get=0\nset_dump2=-22 set_dump1=
 # block is a real kernel's, taken natively.
 check_fixture madvremove $'remove_priv=-22\nremove_shm=0 punched=1 neighbours=ss\nchild_punch=1 seen_here=1 rest=t\nremove_shm_ro=0 punched=1\nremove_fpriv=-13\nremove_fsro=-13\nremove_fshw=0 punched=1 file_hole=1 file_kept=1\nremove_hole=-12 before=1 after=1\npopr_hole=-12 popw_hole=-12 popr_holestart=-12\nremove_mixed=-22 shared_punched=1 private_kept=y\nremove_unaligned=-22 remove_zerolen=0\npopw_ro=-22 popr_ro=0\npopr_none=-22 popw_none=-22\npopw_rw=0 popr_rw=0\npopw_fsro=-22 popr_fsro=0\npopr_in=0 popr_past_eof=-14 popw_past_eof=-14\ndone'
 # Robust futexes: a PTHREAD_MUTEX_ROBUST owner that dies -- a thread exiting,
-# a process exiting, one killed by a fault, one exec'ing, a sibling thread of
-# a group that exit()s -- hands the mutex to the next locker as EOWNERDEAD,
+# a process exiting, one killed by a fault, one killed by a SIGTERM it never
+# set a disposition for, one exec'ing, a sibling thread of a group that
+# exit()s -- hands the mutex to the next locker as EOWNERDEAD,
 # and a waiter already blocked is woken. The list used to be recorded and
 # never walked. Self-checking: qemu-user answers ENOSYS to set_robust_list.
-check_fixture robustdeath $'thread_exit: ownerdead ownerdead\nthread_clean: locked\nchild_exit: ownerdead\nchild_sigsegv: ownerdead signaled=1\nchild_exec: ownerdead exited=1\nsibling_at_exit_group: ownerdead\nwoken_waiter: ownerdead\ndone'
+check_fixture robustdeath $'thread_exit: ownerdead ownerdead\nthread_clean: locked\nchild_exit: ownerdead\nchild_sigsegv: ownerdead signaled=1\nchild_sigterm: ownerdead signaled=1\nchild_exec: ownerdead exited=1\nsibling_at_exit_group: ownerdead\nwoken_waiter: ownerdead\ndone'
 # A SENT SIGSEGV/BUS/ILL/FPE/TRAP is a signal, not a fault: a handler runs,
 # SIG_IGN drops it, SIG_DFL dies by it, a blocked one waits in sigwait. The
 # emulator left sent ones to the host's default disposition (a guest with a

@@ -1147,6 +1147,32 @@ void sig_trace_update_all(struct Machine *m) {
         sig_host_update(m, s);
 }
 
+/* The dispositions the guest starts with, and the host's mirrored to match
+ * -- at startup, once the nets own their numbers. execve keeps SIG_IGN and
+ * resets everything else to SIG_DFL, so a signal the emulator was launched
+ * with ignored (nohup's SIGHUP, a shell's SIGINT for a background job) is
+ * ignored for the guest, and reads back as SIG_IGN; it used to read SIG_DFL
+ * while the host went on ignoring it. And every default-terminate signal gets
+ * its catcher NOW rather than at the guest's first sigaction on it (or never,
+ * for one it never touches): a SIGTERM the guest never mentioned killed the
+ * process at the host default, with none of what the death owes performed --
+ * a vfork child's writes never reached its parent, its robust futexes were
+ * left locked -- while a SIGTERM the guest had once set a handler for died
+ * through the run loop. */
+void sig_inherit_host_dispositions(struct Machine *m) {
+    for (int s = 1; s <= 64; s++) {
+        if (s == SIGKILL || s == SIGSTOP || s == 32 || s == 33 || s == SIGSYS ||
+            s == SIGBUS || is_sync_sig(s) || s == g_sig_kicksig ||
+            s == SIG_REMAP32_HOST || s == SIG_REMAP33_HOST)
+            continue;
+        struct sigaction old;
+        if (sigaction(s, NULL, &old) == 0 && old.sa_handler == SIG_IGN)
+            m->sigact[s].handler = GSIG_IGN;
+    }
+    for (int s = 1; s <= 64; s++)
+        sig_host_update(m, s);
+}
+
 void sig_reset_for_exec(struct Machine *m) {
     EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
     for (int s = 1; s <= 64; s++) {
