@@ -153,7 +153,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_syncfs,    { AT_FD }, 0 },
     { G_NR_readahead, { AT_FD, AT_INT, AT_UINT }, 0 },
     { G_NR_utimensat, { AT_DIRFD, AT_STR, AT_PTR, AT_ATFLAGS }, 0 },
-    { 32 /* flock */, { AT_FD, AT_HEX }, 0 },
+    { G_NR_flock,     { AT_FD, AT_HEX }, 0 },
     { G_NR_sync_file_range, { AT_FD, AT_INT, AT_INT, AT_HEX }, 0 },
     { G_NR_eventfd2,  { AT_UINT, AT_HEX }, 0 },
     { G_NR_inotify_init1, { AT_HEX }, 0 },

@@ -465,7 +465,7 @@ void mem_locks_init(void) {
 /* Every field except nthreads: shared with as_reinit_live, which must leave
  * that word alone (other threads sample it lock-free at any instant). */
 static void as_fields_init(AddrSpace *as) {
-    as->l1 = calloc(L1_SIZE, sizeof(uintptr_t *));
+    as->l1 = calloc(L1_SIZE, sizeof *as->l1);
     if (!as->l1) { perror("arm64chroot: calloc"); exit(127); }
     as->regions = NULL;
     as->nregions = as->cap_regions = 0;
