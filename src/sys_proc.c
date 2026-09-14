@@ -2812,13 +2812,18 @@ SYSDEF(getgroups) {
     gid_t sg[CHUNK], *g = sg;
     int n, got;
     u64 r;
+    /* gidsetsize is an int: the register's high half is not part of it (a
+     * count of 0 with high bits set used to be judged too small), and a
+     * negative one is EINVAL before the list is looked at. */
+    s32 size = (s32)a0;
+    if (size < 0) return (u64)(s64)-EINVAL;
 
     if (m->fake_id) {
         /* The faked list is already held in the guest's own u32 form, so it
          * goes out as it stands -- no host type is involved to convert. */
         n = m->cred.ngroups;
-        if (a0 == 0) return (u64)n;
-        if ((int)a0 < n) return (u64)(s64)-EINVAL;
+        if (size == 0) return (u64)n;
+        if (size < n) return (u64)(s64)-EINVAL;
         if (copy_to_guest(c, a1, m->cred.groups, sizeof(u32) * (size_t)n) < 0)
             return (u64)(s64)-EFAULT;
         return (u64)n;
@@ -2826,8 +2831,8 @@ SYSDEF(getgroups) {
 
     n = getgroups(0, NULL);
     if (n < 0) return host_err();
-    if (a0 == 0) return (u64)n;
-    if ((int)a0 < n) return (u64)(s64)-EINVAL;
+    if (size == 0) return (u64)n;
+    if (size < n) return (u64)(s64)-EINVAL;
     if (n > CHUNK) {
         g = malloc((size_t)n * sizeof *g);
         if (!g) return (u64)(s64)-ENOMEM;
@@ -3199,8 +3204,9 @@ SYSDEF(sched_getaffinity) {
      * 8-byte longs (an aarch64 kernel's, whatever the host's word is), and at
      * least nr_cpu_ids bits, which the host judges. */
     if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
-    if (a1 & 7) return (u64)(s64)-EINVAL;
-    size_t len = a1 > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)a1;
+    u32 glen = (u32)a1;   /* an unsigned int: the high half is not part of it */
+    if (glen & 7) return (u64)(s64)-EINVAL;
+    size_t len = glen > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)glen;
     u8 mask[SCHED_MASK_MAX];
     long r = syscall(SYS_sched_getaffinity, (pid_t)(s32)a0, len, mask);
     if (r < 0) return host_err();
@@ -3214,7 +3220,8 @@ SYSDEF(sched_setaffinity) {
      * mask is cut, never refused; an empty intersection with the allowed
      * set is its EINVAL. */
     if (!sched_target((s32)a0)) return (u64)(s64)-ESRCH;
-    size_t len = a1 > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)a1;
+    u32 glen = (u32)a1;   /* as above */
+    size_t len = glen > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)glen;
     u8 mask[SCHED_MASK_MAX];
     if (len && copy_from_guest(c, mask, a2, len) < 0) return (u64)(s64)-EFAULT;
     long r = syscall(SYS_sched_setaffinity, (pid_t)(s32)a0, len, mask);

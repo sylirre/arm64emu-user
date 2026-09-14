@@ -521,13 +521,16 @@ s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va) {
 }
 
 SYSDEF(seccomp) {
+    /* (op, flags, uargs): op and flags are unsigned ints, so the registers'
+     * high halves are not part of them; uargs is a pointer. */
     (void)a3; (void)a4; (void)a5;
-    switch (a0) {
+    u32 op = (u32)a0, flags = (u32)a1;
+    switch (op) {
     case G_SECCOMP_SET_MODE_STRICT:
-        if (a1 != 0 || a2 != 0) return (u64)(s64)-EINVAL;
+        if (flags != 0 || a2 != 0) return (u64)(s64)-EINVAL;
         return (u64)seccomp_set_strict(c->m);
     case G_SECCOMP_SET_MODE_FILTER:
-        return (u64)seccomp_install(c, a1, a2);
+        return (u64)seccomp_install(c, flags, a2);
     case G_SECCOMP_GET_ACTION_AVAIL: {
         /* "Is this action supported?" -- probed by libseccomp before it emits
          * a program using one. USER_NOTIF is the one this kernel has not got
@@ -535,7 +538,7 @@ SYSDEF(seccomp) {
          * compares it (seccomp_get_action_avail): an action with data bits
          * set is not an action it knows. */
         u32 act;
-        if (a1 != 0) return (u64)(s64)-EINVAL;
+        if (flags != 0) return (u64)(s64)-EINVAL;
         if (copy_from_guest(c, &act, a2, 4) < 0) return (u64)(s64)-EFAULT;
         switch (act) {
         case G_SECCOMP_RET_KILL_PROCESS:

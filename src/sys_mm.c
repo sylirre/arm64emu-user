@@ -1080,9 +1080,10 @@ SYSDEF(mincore) {
 SYSDEF(mlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
 SYSDEF(mlock2) {
     /* Accept-and-ignore like the rest of the mlock family, but keep the
-     * kernel's flag validation: only MLOCK_ONFAULT (1) is defined. */
+     * kernel's flag validation: only MLOCK_ONFAULT (1) is defined. The flags
+     * are an int, so the register's high half is not part of them. */
     (void)c; (void)a0; (void)a1; (void)a3; (void)a4; (void)a5;
-    return (a2 & ~1ULL) ? (u64)(s64)-EINVAL : 0;
+    return ((unsigned)a2 & ~1u) ? (u64)(s64)-EINVAL : 0;
 }
 SYSDEF(munlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
 SYSDEF(mlockall) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
