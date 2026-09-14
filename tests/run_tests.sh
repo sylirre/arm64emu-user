@@ -1114,6 +1114,31 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- clone(2) flag validation (src/sys_proc.c clone_flags_valid): the
+# combinations a kernel refuses before it creates anything. Self-checking:
+# qemu-user validates clone flags its own way (EINVAL for all but the exact
+# thread shape and a small fork subset), so the block below is what a real
+# 6.x kernel prints for the same program; the namespace flags are faked here,
+# but the rules about combining them are validation and hold regardless. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/cloneflags.bin \
+            tests/fixtures/cloneflags.c 2>/dev/null; then
+        expect=$'fork: ok\nthread: ok (thread)\nthread_no_sighand: EINVAL\nsighand_no_vm: EINVAL\nnewns_fs: EINVAL\nnewuser_fs: EINVAL\nthread_newuser: EINVAL\nthread_newpid: EINVAL\nnewuser_newipc_sysvsem: EINVAL\nnewuser_newpid: ok\nexit_signal_40: ok\nexit_signal_0: ok\nvfork_no_vm: ok\nhigh_bit: ok\ndone'
+        for eng in "" "--jit"; do
+            lbl="fixture: cloneflags${eng:+ (jit)}"
+            got=$(timeout -k 5 30 "$EMU" $eng / tests/fixtures/cloneflags.bin 2>/dev/null)
+            if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm tests/fixtures/cloneflags.bin
+    else
+        skip_build "fixtures/cloneflags"
+    fi
+fi
+
 # ---- the seccomp chain under concurrent installers (src/sys_seccomp.c): eight
 # threads pushing onto one chain must leave every filter on it, a filter one
 # thread installs binds the rest, and the chain budget (MAX_INSNS_PER_PATH,

@@ -461,10 +461,15 @@ SYSDEF(uname) {
     return copy_to_guest(c, a0, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
-/* clone flags (subset) */
+/* clone flags */
 #define G_CLONE_VM      0x00000100
+#define G_CLONE_FS      0x00000200
+#define G_CLONE_FILES   0x00000400
+#define G_CLONE_SIGHAND 0x00000800
 #define G_CLONE_VFORK   0x00004000
+#define G_CLONE_PARENT  0x00008000
 #define G_CLONE_THREAD  0x00010000
+#define G_CLONE_SYSVSEM 0x00040000
 #define G_CLONE_SETTLS  0x00080000
 #define G_CLONE_PARENT_SETTID  0x00100000
 #define G_CLONE_CHILD_CLEARTID 0x00200000
@@ -474,8 +479,79 @@ SYSDEF(uname) {
  * rather than failed (sandbox helpers only check the return value). Only
  * CLONE_NEWNET has a consequence — see m->fake_netns. */
 #define G_CLONE_NEWNS   0x00020000
+#define G_CLONE_NEWIPC  0x08000000
 #define G_CLONE_NEWUSER 0x10000000
+#define G_CLONE_NEWPID  0x20000000
 #define G_CLONE_NEWNET  0x40000000
+
+/* The combinations a kernel refuses before it creates anything
+ * (copy_process, copy_namespaces): a thread group shares its signal
+ * handlers, shared handlers imply a shared address space, a shared
+ * fs_struct cannot cross into a new mount or user namespace, a thread
+ * cannot sit in a pid or user namespace its group does not, and a new IPC
+ * namespace detaches the undo list CLONE_SYSVSEM would share. The namespace
+ * flags are otherwise faked here, but the rules about combining them are
+ * validation, not namespaces: a program that passes one of these got EINVAL
+ * from every kernel it ever ran on, and got a process from this one --
+ * clone(CLONE_THREAD|CLONE_VM) without CLONE_SIGHAND got a thread. Probed
+ * against a 6.x host, row by row (tests/fixtures/cloneflags.c). */
+static int clone_flags_valid(u64 flags) {
+    if ((flags & (G_CLONE_NEWNS | G_CLONE_FS)) == (G_CLONE_NEWNS | G_CLONE_FS))
+        return 0;
+    if ((flags & (G_CLONE_NEWUSER | G_CLONE_FS)) == (G_CLONE_NEWUSER | G_CLONE_FS))
+        return 0;
+    if ((flags & G_CLONE_THREAD) && !(flags & G_CLONE_SIGHAND)) return 0;
+    if ((flags & G_CLONE_SIGHAND) && !(flags & G_CLONE_VM)) return 0;
+    if ((flags & G_CLONE_THREAD) && (flags & (G_CLONE_NEWUSER | G_CLONE_NEWPID)))
+        return 0;
+    if ((flags & G_CLONE_NEWIPC) && (flags & G_CLONE_SYSVSEM)) return 0;
+    return 1;
+}
+
+/* What a process clone asks for that a fork-based child cannot be given, and
+ * is told about once, on stderr, the way an unimplemented syscall is. A
+ * guest thread is a host thread and shares everything; a guest process is a
+ * host process and shares nothing, so the sharing flags below make a copy
+ * where a kernel makes a share: the address space (CLONE_VM without
+ * CLONE_THREAD or CLONE_VFORK -- with CLONE_VFORK the parent waits and the
+ * child's writes are carried back, which is what vfork is used for), the
+ * descriptor table, the fs_struct (cwd, root, umask), the signal handlers.
+ * CLONE_PARENT would make the child a sibling; a host fork cannot. And the
+ * exit signal is always SIGCHLD: the host child signals SIGCHLD, and a wait4
+ * without __WCLONE finds it where a kernel would not. LinuxThreads is the
+ * program that wanted these; nothing current does, which is why the child
+ * proceeds as a fork rather than being refused (qemu-user's answer). */
+static void clone_unshareable_warn(u64 flags, u64 pc) {
+    static const struct { u64 bit; const char *name; } want[] = {
+        { G_CLONE_VM,      "CLONE_VM" },
+        { G_CLONE_FILES,   "CLONE_FILES" },
+        { G_CLONE_FS,      "CLONE_FS" },
+        { G_CLONE_SIGHAND, "CLONE_SIGHAND" },
+        { G_CLONE_PARENT,  "CLONE_PARENT" },
+    };
+    u64 lie = flags & (G_CLONE_FILES | G_CLONE_FS | G_CLONE_SIGHAND | G_CLONE_PARENT);
+    if ((flags & G_CLONE_VM) && !(flags & G_CLONE_VFORK)) lie |= G_CLONE_VM;
+    int exitsig = (int)(flags & G_CSIGNAL);
+    if (!lie && exitsig == SIGCHLD) return;
+    static char warned;   /* one line per process (a fork child inherits the mark) */
+    if (__atomic_test_and_set(&warned, __ATOMIC_RELAXED)) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof buf, "arm64chroot: clone flags 0x%llx at pc=0x%llx:",
+                     (unsigned long long)flags, (unsigned long long)pc);
+    int named = 0;
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
+        if (lie & want[i].bit)
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%s %s",
+                          named++ ? "," : "", want[i].name);
+    if (named)
+        n += snprintf(buf + n, sizeof buf - (size_t)n,
+                      " not shared with a forked child (it gets copies)%s",
+                      exitsig != SIGCHLD ? ";" : "");
+    if (exitsig != SIGCHLD)
+        n += snprintf(buf + n, sizeof buf - (size_t)n,
+                      " exit signal %d becomes SIGCHLD (the child is a fork)", exitsig);
+    fprintf(stderr, "%s\n", buf);
+}
 
 /* A spawned guest thread: its own CPU, sharing the Machine (address space,
  * fds, signal dispositions) with the rest of the process. The guest tid IS
@@ -753,6 +829,8 @@ SYSDEF(clone) {
     u64 flags = a0, child_stack = a1, ptid = a2, ctid = a4, tls = a3;
     struct Machine *m = c->m;
 
+    if (!clone_flags_valid(flags)) return (u64)(s64)-EINVAL;
+
     /* Spawn a host thread only for a real thread clone (CLONE_THREAD). A bare
      * CLONE_VM without CLONE_THREAD is vfork(): the child shares the address
      * space but is a distinct process that immediately execve()s or _exit()s —
@@ -817,6 +895,8 @@ SYSDEF(clone) {
         if (pt_ev) ptrace_report_event(c, pt_ev, (u64)tid);
         return (u64)tid;
     }
+
+    clone_unshareable_warn(flags, c->pc);
 
     /* Process clone (fork/vfork shape). ptrace: if this process is a tracee
      * following child creation (PTRACE_O_TRACE{FORK,VFORK,CLONE}), pick the

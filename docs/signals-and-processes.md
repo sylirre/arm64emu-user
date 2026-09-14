@@ -847,6 +847,31 @@ in every row, where the old code showed 126/200 and 50/50 for the first two.
 
 ### vfork vs threads — the distinguishing flag is `CLONE_THREAD`
 
+First the combinations a kernel refuses before it creates anything
+(`copy_process`, `copy_namespaces`), refused here the same way
+(`clone_flags_valid`, `sys_proc.c`): `CLONE_THREAD` without `CLONE_SIGHAND`,
+`CLONE_SIGHAND` without `CLONE_VM`, `CLONE_FS` with `CLONE_NEWNS` or
+`CLONE_NEWUSER`, `CLONE_THREAD` with `CLONE_NEWUSER` or `CLONE_NEWPID`,
+`CLONE_NEWIPC` with `CLONE_SYSVSEM` — all `EINVAL`. The namespace flags are
+otherwise faked (below), but the rules about combining them are validation, not
+namespaces; a `clone(CLONE_THREAD|CLONE_VM)` without `CLONE_SIGHAND` got a
+thread here where every kernel says `EINVAL` (`tests/fixtures/cloneflags.c`,
+against a 6.x host row by row).
+
+Then what a process clone may ask for that a fork-based child cannot be given.
+A guest thread is a host thread and shares everything; a guest process is a
+host process and shares nothing, so the sharing flags make a copy where a
+kernel makes a share: bare `CLONE_VM` (without `CLONE_THREAD` or
+`CLONE_VFORK` — with `CLONE_VFORK` the parent waits and the child's writes are
+carried back, below), `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND` and
+`CLONE_PARENT` without `CLONE_THREAD`, and an exit signal other than `SIGCHLD`
+(the host child signals `SIGCHLD`, and a `wait4` without `__WCLONE` finds it
+where a kernel would not). The child proceeds as a fork and the process is
+told once, on stderr, which flags it did not get — the way an unimplemented
+syscall is reported — rather than refused (qemu-user's answer, which would
+break the `CLONE_FILES` child that only execs). LinuxThreads is the program
+that wanted these; nothing current does.
+
 A guest thread and a vfork both set `CLONE_VM`, so `CLONE_VM` alone cannot decide
 between them. **Only `CLONE_THREAD` marks a real (pthread) thread.**
 
