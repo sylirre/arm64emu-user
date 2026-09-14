@@ -98,6 +98,10 @@ static int addr_in(CPU *c, u64 va, u32 len, struct sockaddr_storage *ss, socklen
      * cannot show it (the protocol refuses anything past sun_path either way),
      * an AF_INET one can: a kernel answers EINVAL where this answered 0. */
     if ((s32)len < 0 || len > sizeof *ss) return -EINVAL;
+    /* The bytes past the guest's length are never the address, but the host
+     * call takes the whole struct and the family check below reads the first
+     * two of them: defined either way, rather than whatever the stack held. */
+    memset(ss, 0, sizeof *ss);
     if (len && copy_from_guest(c, ss, va, len) < 0) return -EFAULT;
     *out = len;
     return 0;
@@ -159,6 +163,10 @@ static void abs_tag_out(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t po
 static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
                         int follow, int *dirfd_out) {
     if (dirfd_out) *dirfd_out = -1;
+    /* An address too short to hold a family has none to look at (the host
+     * refuses it by protocol); the field used to be read regardless, and a
+     * guest length of 0 or 1 left it uninitialized. */
+    if ((size_t)*sl < sizeof ss->ss_family) return 0;
     if (ss->ss_family != AF_UNIX) return 0;
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
@@ -210,6 +218,9 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
  * guest never sees a host path (pathname) or our rootfs tag (abstract). No-op
  * for non-AF_UNIX and unnamed addresses. Rewrites address and length in place. */
 static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
+    /* As on the way in: a length the kernel left at 0 (an unnamed datagram
+     * peer) wrote no family, so there is none to read. */
+    if ((size_t)*sl < sizeof ss->ss_family) return;
     if (ss->ss_family != AF_UNIX) return;
     struct sockaddr_un *un = (struct sockaddr_un *)ss;
     const size_t poff = offsetof(struct sockaddr_un, sun_path);
@@ -916,6 +927,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
     if (g->msg_name && g->msg_namelen) {
         if (for_send) {
             u32 nl = g->msg_namelen > sizeof *ss ? sizeof *ss : g->msg_namelen;
+            memset(ss, 0, sizeof *ss);   /* as addr_in: defined past the length */
             if (copy_from_guest(c, ss, g->msg_name, nl) < 0) return -EFAULT;
             h->msg_name = ss;
             h->msg_namelen = nl;
