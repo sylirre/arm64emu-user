@@ -61,7 +61,6 @@ struct SeccompProg {
 #define BPF_LSH   0x60
 #define BPF_RSH   0x70
 #define BPF_NEG   0x80
-#define BPF_MOD   0x90
 #define BPF_XOR   0xa0
 #define BPF_JA    0x00
 #define BPF_JEQ   0x10
@@ -105,11 +104,14 @@ static int bpf_validate(const GSockFilter *f, u32 len) {
         case BPF_STX:
             if (k >= BPF_MEMWORDS) return -EINVAL;
             break;
+        /* Every ALU form the kernel's list has -- which is not every form
+         * classic BPF has: BPF_MOD (a 3.7 addition to the packet filter) was
+         * never added to seccomp_check_filter, so a filter using it is EINVAL
+         * on every kernel, and was accepted here. */
         case BPF_ALU | BPF_ADD | BPF_K: case BPF_ALU | BPF_ADD | BPF_X:
         case BPF_ALU | BPF_SUB | BPF_K: case BPF_ALU | BPF_SUB | BPF_X:
         case BPF_ALU | BPF_MUL | BPF_K: case BPF_ALU | BPF_MUL | BPF_X:
         case BPF_ALU | BPF_DIV | BPF_K: case BPF_ALU | BPF_DIV | BPF_X:
-        case BPF_ALU | BPF_MOD | BPF_K: case BPF_ALU | BPF_MOD | BPF_X:
         case BPF_ALU | BPF_AND | BPF_K: case BPF_ALU | BPF_AND | BPF_X:
         case BPF_ALU | BPF_OR  | BPF_K: case BPF_ALU | BPF_OR  | BPF_X:
         case BPF_ALU | BPF_XOR | BPF_K: case BPF_ALU | BPF_XOR | BPF_X:
@@ -119,16 +121,15 @@ static int bpf_validate(const GSockFilter *f, u32 len) {
             /* A constant shift past the word width is rejected, as there. */
             if ((code == (BPF_ALU | BPF_LSH | BPF_K) ||
                  code == (BPF_ALU | BPF_RSH | BPF_K)) && k >= 32) return -EINVAL;
-            /* And so is a constant division or modulo by zero: it is knowable
-             * at load time, so bpf_check_classic refuses the program rather
-             * than let the interpreter meet it. Accepting it here installed a
-             * filter that looked valid and then killed the thread the first
-             * time that instruction was reached -- the guest heard about its
-             * own broken filter as a death rather than as an EINVAL from
-             * seccomp(2). The BPF_X forms stay runtime checks, as there:
-             * whether X is zero is not knowable until the filter runs. */
-            if ((code == (BPF_ALU | BPF_DIV | BPF_K) ||
-                 code == (BPF_ALU | BPF_MOD | BPF_K)) && k == 0) return -EINVAL;
+            /* And so is a constant division by zero: it is knowable at load
+             * time, so bpf_check_classic refuses the program rather than let
+             * the interpreter meet it. Accepting it here installed a filter
+             * that looked valid and then killed the thread the first time that
+             * instruction was reached -- the guest heard about its own broken
+             * filter as a death rather than as an EINVAL from seccomp(2). The
+             * BPF_X form stays a runtime check, as there: whether X is zero is
+             * not knowable until the filter runs. */
+            if (code == (BPF_ALU | BPF_DIV | BPF_K) && k == 0) return -EINVAL;
             break;
         case BPF_JMP | BPF_JA:
             if (k >= len - pc - 1) return -EINVAL;   /* forward, in range */
@@ -147,9 +148,9 @@ static int bpf_validate(const GSockFilter *f, u32 len) {
     return BPF_CLASS(f[len - 1].code) == BPF_RET ? 0 : -EINVAL;
 }
 
-/* Run one validated program. Division or modulo by zero aborts the program
- * with 0, matching the kernel's interpreter (0 is SECCOMP_RET_KILL_THREAD --
- * severe, but that is the kernel's answer to a broken filter too). */
+/* Run one validated program. Division by zero aborts the program with 0,
+ * matching the kernel's interpreter (0 is SECCOMP_RET_KILL_THREAD -- severe,
+ * but that is the kernel's answer to a broken filter too). */
 static u32 bpf_run(const GSockFilter *f, u32 len, const GSeccompData *d) {
     const u8 *data = (const u8 *)d;
     u32 A = 0, X = 0, mem[BPF_MEMWORDS] = { 0 };
@@ -177,7 +178,6 @@ static u32 bpf_run(const GSockFilter *f, u32 len, const GSeccompData *d) {
             case BPF_SUB: A -= v; break;
             case BPF_MUL: A *= v; break;
             case BPF_DIV: if (!v) return 0; A /= v; break;
-            case BPF_MOD: if (!v) return 0; A %= v; break;
             case BPF_AND: A &= v; break;
             case BPF_OR:  A |= v; break;
             case BPF_XOR: A ^= v; break;
@@ -328,25 +328,41 @@ void seccomp_publish(struct Machine *m) {
     proctab_seccomp_set(mode, n);
 }
 
-/* Install a filter: copy the program in, validate it, push it on the chain. */
+/* Install a filter: copy the program in, validate it, push it on the chain.
+ *
+ * The refusals come in the kernel's order (seccomp_set_mode_filter, then
+ * seccomp_prepare_user_filter): the flags first, then the program header
+ * (EFAULT), its length (EINVAL), the privilege check (EACCES), the
+ * instructions (EFAULT) and their validity (EINVAL), and the mode last. The
+ * order is observable, and observed: libseccomp asks whether a flag exists by
+ * passing it with a NULL program and expecting EFAULT -- before it has set
+ * no_new_privs -- so a check that put EACCES first told it that no flag
+ * exists, TSYNC included, and seccomp_attr_set(SCMP_FLTATR_CTL_TSYNC) failed
+ * with EOPNOTSUPP on every guest that was not fake root. */
 static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     struct Machine *m = c->m;
-    /* The kernel requires no_new_privs (or CAP_SYS_ADMIN) so a filtered
-     * process cannot gain privilege through a setuid exec it can no longer
-     * see. Our fake-root is that capability. */
-    if (!m->no_new_privs && !(m->fake_id && m->cred.euid == 0)) return -EACCES;
-    if (!may_assign_mode(m, G_SECCOMP_MODE_FILTER)) return -EINVAL;
     /* TSYNC is implicit here (one filter chain per process); LOG and
-     * SPEC_ALLOW are advisory. A listener fd is something we cannot service. */
+     * SPEC_ALLOW are advisory; TSYNC_ESRCH only changes how a TSYNC failure
+     * is reported, and TSYNC cannot fail here. NEW_LISTENER is not a flag this
+     * kernel has: a user-notification fd would park guest syscalls on an
+     * external agent, and a kernel without the feature -- any before 5.0 --
+     * answers the flag as it answers every bit it does not know, which is what
+     * libseccomp's probe wants to hear before it emits SECCOMP_RET_USER_NOTIF
+     * (WAIT_KILLABLE_RECV, which needs a listener, is unknown for the same
+     * reason). An unknown bit is EINVAL whatever it is combined with. */
     if (flags & ~(u64)(G_SECCOMP_FILTER_FLAG_TSYNC | G_SECCOMP_FILTER_FLAG_LOG |
                        G_SECCOMP_FILTER_FLAG_SPEC_ALLOW |
                        G_SECCOMP_FILTER_FLAG_TSYNC_ESRCH))
-        return (flags & G_SECCOMP_FILTER_FLAG_NEW_LISTENER) ? -EOPNOTSUPP : -EINVAL;
+        return -EINVAL;
 
     GSockFprog fprog;
     if (copy_from_guest(c, &fprog, prog_va, sizeof fprog) < 0) return -EFAULT;
     u32 len = fprog.len;
     if (len == 0 || len > G_BPF_MAXINSNS) return -EINVAL;
+    /* The kernel requires no_new_privs (or CAP_SYS_ADMIN) so a filtered
+     * process cannot gain privilege through a setuid exec it can no longer
+     * see. Our fake-root is that capability. */
+    if (!m->no_new_privs && !(m->fake_id && m->cred.euid == 0)) return -EACCES;
 
     struct SeccompProg *p = malloc(sizeof *p + (size_t)len * sizeof(GSockFilter));
     if (!p) return -ENOMEM;
@@ -357,6 +373,7 @@ static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     }
     int r = bpf_validate(p->insns, len);
     if (r < 0) { free(p); return r; }
+    if (!may_assign_mode(m, G_SECCOMP_MODE_FILTER)) { free(p); return -EINVAL; }
     p->len = len;
     p->prev = m->seccomp_filters;
     m->seccomp_filters = p;
@@ -394,11 +411,14 @@ SYSDEF(seccomp) {
         return (u64)seccomp_install(c, a1, a2);
     case G_SECCOMP_GET_ACTION_AVAIL: {
         /* "Is this action supported?" -- probed by libseccomp before it emits
-         * a program using one. USER_NOTIF is the one we have to decline. */
+         * a program using one. USER_NOTIF is the one this kernel has not got
+         * (seccomp_install). The whole word is compared, as the kernel
+         * compares it (seccomp_get_action_avail): an action with data bits
+         * set is not an action it knows. */
         u32 act;
         if (a1 != 0) return (u64)(s64)-EINVAL;
         if (copy_from_guest(c, &act, a2, 4) < 0) return (u64)(s64)-EFAULT;
-        switch (act & G_SECCOMP_RET_ACTION_FULL) {
+        switch (act) {
         case G_SECCOMP_RET_KILL_PROCESS:
         case G_SECCOMP_RET_KILL_THREAD:
         case G_SECCOMP_RET_TRAP:
@@ -411,8 +431,10 @@ SYSDEF(seccomp) {
             return (u64)(s64)-EOPNOTSUPP;
         }
     }
+    /* GET_NOTIF_SIZES is the user-notification operation, which this kernel
+     * does not have (seccomp_install): an operation it does not know is
+     * EINVAL, like every other. */
     case G_SECCOMP_GET_NOTIF_SIZES:
-        return (u64)(s64)-EOPNOTSUPP;   /* no user-notification listener here */
     default:
         return (u64)(s64)-EINVAL;
     }

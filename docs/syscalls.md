@@ -668,9 +668,11 @@ is meant to judge.
 What that buys: `bwrap --seccomp`, flatpak's syscall blacklists and any
 libseccomp-generated program behave as they would on a kernel. The accepted
 instruction set is the kernel's (`seccomp_check_filter`): 32-bit aligned
-absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset, jumps
-forward and in range, a `RET` last, a shift by an immediate below 32 — anything
-else is `EINVAL` at install time. What runs runs as the kernel's converted
+absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset (which has no
+`BPF_MOD`: a 3.7 addition to the packet filter that seccomp's list was never
+extended to), jumps forward and in range, a `RET` last, a shift by an immediate
+below 32, no constant division by zero — anything else is `EINVAL` at install
+time. What runs runs as the kernel's converted
 program does: a division by a zero `X` ends the program with 0 (a kill), and a
 shift by an `X` of 32 or more shifts by `X & 31` — the interpreter's own
 masking since its undefined-behaviour fix, and what the JITs' shift instructions
@@ -691,11 +693,27 @@ behavior rather than its per-thread default), so a filter installed by one
 thread applies to the process — a deliberate choice, since every real installer
 either is single-threaded at the time or asks for `TSYNC`, and a per-thread
 chain would need the seccomp state moved out of the shared registry slot every
-reader of `/proc/<pid>/status` consults; and `SECCOMP_RET_USER_NOTIF` is declined at
-install (`SECCOMP_FILTER_FLAG_NEW_LISTENER` → `EOPNOTSUPP`), since servicing a
-notification fd would mean parking guest syscalls on an external agent. Note
-this is entirely separate from the emulator's *own* SIGSYS net, which absorbs
-the **host** seccomp filter Android imposes on the emulator process.
+reader of `/proc/<pid>/status` consults; and user notification does not exist
+here — servicing a notification fd would mean parking guest syscalls on an
+external agent — so the emulator answers as a kernel without the feature (any
+before 5.0) does: `SECCOMP_FILTER_FLAG_NEW_LISTENER` is a flag it does not
+know (`EINVAL`, whatever it is combined with), `SECCOMP_GET_NOTIF_SIZES` an
+operation it does not know (`EINVAL`), and `SECCOMP_GET_ACTION_AVAIL` says
+`EOPNOTSUPP` to `SECCOMP_RET_USER_NOTIF` — which is what libseccomp asks before
+it emits the action, and the answer that makes it not.
+
+The refusals of an install come in the kernel's order, and the order is load-
+bearing: flags first (`EINVAL`), then the program header (`EFAULT`), its length
+(`EINVAL`), *then* the `no_new_privs` check (`EACCES`), the instructions
+(`EFAULT`) and their validity (`EINVAL`), the mode last. libseccomp probes for
+a flag by passing it with a NULL program and expecting `EFAULT` — before it
+has set `no_new_privs` — so a check that put `EACCES` first told it that no
+flag exists, `TSYNC` included, and `seccomp_attr_set(SCMP_FLTATR_CTL_TSYNC)`
+failed with `EOPNOTSUPP` in every guest that was not fake root. `GET_ACTION_AVAIL`
+compares the whole word as the kernel does: an action with data bits set is not
+one it knows. `tests/fixtures/seccomp_probe.c` holds the rows. Note this is
+entirely separate from the emulator's *own* SIGSYS net, which absorbs the
+**host** seccomp filter Android imposes on the emulator process.
 
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
 contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/

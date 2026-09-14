@@ -7,10 +7,14 @@
  * returns differs, which the man page calls architecture-specific (x86 leaves
  * the syscall number, arm64 leaves -ENOSYS).
  *
- * Covers: the no_new_privs precondition, ERRNO with and without argument
- * matching, stacked filters (most severe wins, newest wins a tie), TRAP with
- * the _sigsys siginfo a handler reads, KILL, strict mode, inheritance across
- * fork, PR_GET_SECCOMP, and the programs the kernel rejects.
+ * Covers: the no_new_privs precondition and what the kernel refuses BEFORE
+ * it (the order libseccomp's flag probe depends on), ERRNO with and without
+ * argument matching, stacked filters (most severe wins, newest wins a tie),
+ * TRAP with the _sigsys siginfo a handler reads, KILL, strict mode,
+ * inheritance across fork, PR_GET_SECCOMP, the programs and flags the kernel
+ * rejects, and the one flag this kernel has not got (NEW_LISTENER, refused
+ * as a kernel before 5.0 refuses it -- the row a real 5.0+ kernel answers
+ * differently, with a listener fd).
  *
  * Buffering: stdout is block-buffered when captured, so flush before fork(). */
 #ifndef _GNU_SOURCE
@@ -74,6 +78,29 @@ int main(void) {
     };
     int r = install(deny_chdir, sizeof deny_chdir / sizeof deny_chdir[0]);
     printf("nonnp=%d %d\n", r, r < 0 && errno == EACCES);
+    /* ...but it validates the flags and reads the program header BEFORE it
+     * asks about no_new_privs (seccomp_set_mode_filter, then
+     * seccomp_prepare_user_filter): an unknown flag is EINVAL, an unreadable
+     * program EFAULT and an empty one EINVAL, all from a process that could
+     * not install anything. libseccomp relies on the order -- it probes for a
+     * flag by passing it with a NULL program and expecting EFAULT, before it
+     * has set no_new_privs -- so an EACCES-first check told it no flag exists. */
+    struct sock_fprog empty = { 0, deny_chdir };
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, 0, NULL);
+    printf("nonnp_null=%d\n", r < 0 && errno == EFAULT);
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, 1 << 20, NULL);
+    printf("nonnp_badflag=%d\n", r < 0 && errno == EINVAL);
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, NULL);
+    printf("nonnp_tsync_null=%d\n", r < 0 && errno == EFAULT);
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, 0, &empty);
+    printf("nonnp_empty=%d\n", r < 0 && errno == EINVAL);
+    /* GET_ACTION_AVAIL compares the whole word: an action carrying data bits
+     * is not one the kernel knows. */
+    unsigned act = SECCOMP_RET_ERRNO | 5;
+    r = seccomp_(SECCOMP_GET_ACTION_AVAIL, 0, &act);
+    printf("avail_data=%d\n", r < 0 && errno == EOPNOTSUPP);
+    act = SECCOMP_RET_ERRNO;
+    printf("avail_errno=%d\n", seccomp_(SECCOMP_GET_ACTION_AVAIL, 0, &act));
 
     printf("nnp=%d\n", prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
 
@@ -93,7 +120,6 @@ int main(void) {
 
     /* Rejected programs: empty, and one with an opcode seccomp does not allow
      * (a packet-relative load — there is no packet). */
-    struct sock_fprog empty = { 0, deny_chdir };
     r = seccomp_(SECCOMP_SET_MODE_FILTER, 0, &empty);
     printf("empty=%d\n", r < 0 && errno == EINVAL);
     struct sock_filter bad[] = {
@@ -104,12 +130,31 @@ int main(void) {
     printf("badinsn=%d\n", r < 0 && errno == EINVAL);
     r = seccomp_(SECCOMP_SET_MODE_FILTER, 1 << 20, &empty);
     printf("badflag=%d\n", r < 0 && errno == EINVAL);
-    /* A constant division or modulo by zero is knowable when the program is
-     * loaded, so bpf_check_classic refuses the program rather than let the
-     * interpreter meet it. Accepted instead, the filter installs and then
-     * kills the thread the first time that instruction is reached -- the
-     * guest hears about its own broken filter as a death. The BPF_X forms
-     * stay legal: whether X is zero is not knowable until the filter runs. */
+    /* An unknown flag is EINVAL whatever it travels with. The listener flag
+     * is one this kernel does not have (a listener fd would park guest
+     * syscalls on an external agent; a kernel before 5.0 answers the bit as
+     * one it does not know), so it is refused the same way -- alone, with
+     * TSYNC (EINVAL on every kernel: the two return values collide), and with
+     * a flag nobody has. */
+    struct sock_fprog dprog = { sizeof deny_chdir / sizeof deny_chdir[0],
+                                deny_chdir };
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                 &dprog);
+    printf("listener=%d\n", r < 0 && errno == EINVAL);
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER |
+                 SECCOMP_FILTER_FLAG_TSYNC, &dprog);
+    printf("listener_tsync=%d\n", r < 0 && errno == EINVAL);
+    r = seccomp_(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER |
+                 (1 << 20), &dprog);
+    printf("listener_badflag=%d\n", r < 0 && errno == EINVAL);
+    r = seccomp_(SECCOMP_GET_NOTIF_SIZES, 0, NULL);
+    printf("notif_sizes=%d\n", r < 0 && errno == EINVAL);
+    /* A constant division by zero is knowable when the program is loaded, so
+     * bpf_check_classic refuses the program rather than let the interpreter
+     * meet it. Accepted instead, the filter installs and then kills the
+     * thread the first time that instruction is reached -- the guest hears
+     * about its own broken filter as a death. The BPF_X form stays legal:
+     * whether X is zero is not knowable until the filter runs. */
     struct sock_filter div0[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
         BPF_STMT(BPF_ALU | BPF_DIV | BPF_K, 0),
@@ -117,6 +162,9 @@ int main(void) {
     };
     r = install(div0, 3);
     printf("div0=%d\n", r < 0 && errno == EINVAL);
+    /* Modulo is not in seccomp's instruction set at all: BPF_MOD came to the
+     * packet filter in 3.7 and seccomp_check_filter's list was never extended
+     * to it, by a nonzero constant as much as by zero. */
     struct sock_filter mod0[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
         BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, 0),
@@ -124,10 +172,18 @@ int main(void) {
     };
     r = install(mod0, 3);
     printf("mod0=%d\n", r < 0 && errno == EINVAL);
+    struct sock_filter mod3[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, 3),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    r = install(mod3, 3);
+    printf("mod3=%d\n", r < 0 && errno == EINVAL);
 
-    /* ERRNO on one syscall; everything else still runs. */
-    printf("install=%d\n", install(deny_chdir,
-                                   sizeof deny_chdir / sizeof deny_chdir[0]));
+    /* ERRNO on one syscall; everything else still runs. TSYNC is accepted
+     * on the way (a single-threaded process has nothing to sync). */
+    printf("install=%d\n", (int)seccomp_(SECCOMP_SET_MODE_FILTER,
+                                         SECCOMP_FILTER_FLAG_TSYNC, &dprog));
     r = chdir("/");
     printf("chdir=%d %d\n", r, r < 0 && errno == EPERM);
     printf("getpid_ok=%d\n", getpid() > 0);
