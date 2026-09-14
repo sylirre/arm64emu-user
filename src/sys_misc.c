@@ -190,9 +190,22 @@ static void rlim_nofile_unbind(void) {
     setrlimit(RLIMIT_NOFILE, &n);
 }
 
-/* Seed the guest's table from the host's, once, at startup. Every later change
- * comes through set/prlimit, and fork copies the table with the rest of the
- * Machine while execve leaves it alone -- which is what a kernel does. */
+u64 rlim_cur(struct Machine *m, int res) {
+    return __atomic_load_n(&m->rlim[res].rlim_cur, __ATOMIC_RELAXED);
+}
+u64 rlim_max(struct Machine *m, int res) {
+    return __atomic_load_n(&m->rlim[res].rlim_max, __ATOMIC_RELAXED);
+}
+void rlim_get(struct Machine *m, int res, GRlimit *out) {
+    task_lock();
+    *out = m->rlim[res];
+    task_unlock();
+}
+
+/* Seed the guest's table from the host's, once, at startup -- before a second
+ * thread exists, so without the lock. Every later change comes through
+ * set/prlimit, and fork copies the table with the rest of the Machine while
+ * execve leaves it alone -- which is what a kernel does. */
 void rlim_init(struct Machine *m) {
     for (int r = 0; r < G_RLIM_NLIMITS; r++) {
         struct rlimit h;
@@ -210,37 +223,48 @@ void rlim_init(struct Machine *m) {
     rlim_nofile_unbind();
 }
 
-/* Apply one guest limit, table first and host after where the host is the one
- * enforcing it. Returns 0 or -errno; the table is left untouched on refusal. */
-static s64 rlim_set(struct Machine *m, int res, const GRlimit *g) {
+/* do_prlimit: read the old limit and apply the new one (either may be
+ * absent), as one step under the task lock -- the check against the hard
+ * limit, the write, and the old value a prlimit64 hands back all describe the
+ * same instant, so two of them racing cannot both be told the same "old".
+ * The host is told where the host is the one enforcing it, and the table is
+ * left untouched on refusal. Returns 0 or -errno. */
+static s64 rlim_set(struct Machine *m, int res, const GRlimit *g, GRlimit *old) {
     if (res < 0 || res >= G_RLIM_NLIMITS) return -EINVAL;
-    if (g->rlim_cur > g->rlim_max) return -EINVAL;
+    if (g && g->rlim_cur > g->rlim_max) return -EINVAL;
+    s64 r = 0;
+    task_lock();
     /* Only privilege can raise a hard limit, and the guest's fake root is not
      * privilege the host would honour -- so the ceiling is the one it has. */
-    if (g->rlim_max > m->rlim[res].rlim_max) return -EPERM;
-    if (!rlim_virtual(res)) {
+    if (g && g->rlim_max > m->rlim[res].rlim_max) r = -EPERM;
+    if (r == 0 && g && !rlim_virtual(res)) {
         struct rlimit h = {
             g->rlim_cur == G_RLIM_INFINITY ? RLIM_INFINITY : (rlim_t)g->rlim_cur,
             g->rlim_max == G_RLIM_INFINITY ? RLIM_INFINITY : (rlim_t)g->rlim_max,
         };
-        if (setrlimit(res, &h) < 0) return -errno;
+        if (setrlimit(res, &h) < 0) r = -errno;
     }
-    m->rlim[res] = *g;
-    return 0;
+    if (r == 0) {
+        if (old) *old = m->rlim[res];
+        if (g) m->rlim[res] = *g;
+    }
+    task_unlock();
+    return r;
 }
 
 SYSDEF(getrlimit) {
     int res = (int)a0;
     if (res < 0 || res >= G_RLIM_NLIMITS) return (u64)(s64)-EINVAL;
-    return copy_to_guest(c, a1, &c->m->rlim[res], sizeof(GRlimit)) < 0
-               ? (u64)(s64)-EFAULT : 0;
+    GRlimit g;
+    rlim_get(c->m, res, &g);
+    return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
 SYSDEF(setrlimit) {
     GRlimit g;
     if ((int)a0 < 0 || (int)a0 >= G_RLIM_NLIMITS) return (u64)(s64)-EINVAL;
     if (copy_from_guest(c, &g, a1, sizeof g) < 0) return (u64)(s64)-EFAULT;
-    s64 e = rlim_set(c->m, (int)a0, &g);
+    s64 e = rlim_set(c->m, (int)a0, &g, NULL);
     return e < 0 ? (u64)e : 0;
 }
 
@@ -255,13 +279,10 @@ SYSDEF(prlimit64) {
      * the change here, which is what handing this to the host used to do. */
     if (pid != 0 && pid != (pid_t)getpid())
         return (u64)(s64)(proctab_has((s32)pid) ? -EPERM : -ESRCH);
-    GRlimit old = m->rlim[res];
-    if (a2) {
-        GRlimit g;
-        if (copy_from_guest(c, &g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
-        s64 e = rlim_set(m, res, &g);
-        if (e < 0) return (u64)e;
-    }
+    GRlimit g, old;
+    if (a2 && copy_from_guest(c, &g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
+    s64 e = rlim_set(m, res, a2 ? &g : NULL, &old);
+    if (e < 0) return (u64)e;
     if (a3 && copy_to_guest(c, a3, &old, sizeof old) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
@@ -801,7 +822,7 @@ SYSDEF(syslog) {
     (void)a3; (void)a4; (void)a5;
     int type = (int)(s32)a0;
     s64 len = (s64)(s32)a2;
-    int priv = c->m->fake_id && c->m->cred.euid == 0;
+    int priv = fake_root(c->m);
     if (!priv && type != 3 && type != 10) return (u64)(s64)-EPERM;
     switch (type) {
     case 0: case 1: case 5: case 6: case 7:
@@ -871,7 +892,7 @@ SYSDEF(capget) {
 
     if (a1) {
         struct { u32 eff, perm, inh; } d[2];
-        u32 all = (c->m->fake_id && c->m->cred.euid == 0) ? 0xffffffffu : 0;
+        u32 all = fake_root(c->m) ? 0xffffffffu : 0;
         for (int i = 0; i < 2; i++) { d[i].eff = all; d[i].perm = all; d[i].inh = 0; }
         if (copy_to_guest(c, a1, d, sizeof(d[0]) * (size_t)nsets) < 0)
             return (u64)(s64)-EFAULT;
@@ -882,7 +903,7 @@ SYSDEF(capget) {
 SYSDEF(capset) {
     /* Accept capability changes under fake-root; otherwise deny like the host. */
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    if (c->m->fake_id && c->m->cred.euid == 0) return 0;
+    if (fake_root(c->m)) return 0;
     return (u64)(s64)-EPERM;
 }
 

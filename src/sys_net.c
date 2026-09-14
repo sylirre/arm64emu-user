@@ -53,7 +53,7 @@ SYSDEF(socket) {
         /* fake_id0-style shim: a would-be-root guest that the host denies a
          * NETLINK_AUDIT socket gets EPROTONOSUPPORT ("audit not built in")
          * rather than a hard permission error. */
-        if (c->m->fake_id && c->m->cred.euid == 0 &&
+        if (fake_root(c->m) &&
             domain == AF_NETLINK && protocol == NETLINK_AUDIT &&
             (errno == EPERM || errno == EACCES))
             return (u64)(s64)-EPROTONOSUPPORT;
@@ -744,7 +744,9 @@ static void cred_g2h(const struct Machine *m, u8 *ucred /* {pid,uid,gid} */) {
     u32 uid, gid;
     memcpy(&uid, ucred + 4, 4);
     memcpy(&gid, ucred + 8, 4);
-    const Cred *cr = &m->cred;
+    Cred cr_;
+    cred_get(m, &cr_);
+    const Cred *cr = &cr_;
     if (uid == cr->ruid || uid == cr->euid || uid == cr->suid || uid == m->fake_uid)
         uid = m->host_uid;
     if (gid == cr->rgid || gid == cr->egid || gid == cr->sgid || gid == m->fake_gid)

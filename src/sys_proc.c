@@ -216,23 +216,60 @@ SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
 SYSDEF(getppid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getppid(); }
 SYSDEF(gettid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)g_tls.tid; }
 
-/* ---- credential policy (-fake-id). "Privileged" == fake euid is root. ---- */
+/* ---- credential policy (-fake-id). "Privileged" == fake euid is root. ----
+ *
+ * The set is process-wide and shared by every thread, so it is read and
+ * written under the task lock: a setter takes a copy, decides against it and
+ * writes the whole set back in one step (a kernel's prepare_creds /
+ * commit_creds), and a reader copies the set out (cred_get) and judges the
+ * copy. Field by field it was neither -- setreuid wrote the whole struct back
+ * over a sibling's setfsgid, and a permission check could read an euid from
+ * one setter and a group list from another. */
 #define ID_KEEP ((u32)-1)          /* the -1 "leave unchanged" sentinel */
 
-static int cred_priv(struct Machine *m) { return m->cred.euid == 0; }
+void cred_get(const struct Machine *m, Cred *out) {
+    task_lock();
+    *out = m->cred;
+    task_unlock();
+}
+
+u32 cred_euid(const struct Machine *m) {
+    task_lock();
+    u32 e = m->cred.euid;
+    task_unlock();
+    return e;
+}
+
+static int cred_priv(const Cred *cr) { return cr->euid == 0; }
 
 /* Is `v` one of the current real/effective/saved ids? (unprivileged constraint) */
-static int in_uset(struct Machine *m, u32 v) {
-    return v == m->cred.ruid || v == m->cred.euid || v == m->cred.suid;
+static int in_uset(const Cred *cr, u32 v) {
+    return v == cr->ruid || v == cr->euid || v == cr->suid;
 }
-static int in_gset(struct Machine *m, u32 v) {
-    return v == m->cred.rgid || v == m->cred.egid || v == m->cred.sgid;
+static int in_gset(const Cred *cr, u32 v) {
+    return v == cr->rgid || v == cr->egid || v == cr->sgid;
 }
 
-SYSDEF(getuid)  { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.ruid : (u64)getuid(); }
-SYSDEF(geteuid) { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.euid : (u64)geteuid(); }
-SYSDEF(getgid)  { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.rgid : (u64)getgid(); }
-SYSDEF(getegid) { (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return c->m->fake_id ? c->m->cred.egid : (u64)getegid(); }
+SYSDEF(getuid) {
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    if (!c->m->fake_id) return (u64)getuid();
+    Cred cr; cred_get(c->m, &cr); return cr.ruid;
+}
+SYSDEF(geteuid) {
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    if (!c->m->fake_id) return (u64)geteuid();
+    return cred_euid(c->m);
+}
+SYSDEF(getgid) {
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    if (!c->m->fake_id) return (u64)getgid();
+    Cred cr; cred_get(c->m, &cr); return cr.rgid;
+}
+SYSDEF(getegid) {
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    if (!c->m->fake_id) return (u64)getegid();
+    Cred cr; cred_get(c->m, &cr); return cr.egid;
+}
 
 SYSDEF(set_tid_address) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -820,6 +857,14 @@ SYSDEF(clone) {
      * child that had just unshared the namespace it left. */
     if (flags & G_CLONE_NEWUSER) proctab_userns_seed(rsv, 1);
     else if (m->fake_userns)     proctab_userns_seed(rsv, 0);
+    /* The cwd the child inherits is this process's at the fork, and its
+     * published copy is read here, before the fork, under the lock every
+     * chdir takes: read afterwards, a sibling's chdir could be half-written
+     * into it. (A chdir between here and the fork leaves the child's copy one
+     * step behind, which its first relative path refreshes -- the kernel's
+     * cwd the child inherits is always the right one.) */
+    char cwd_at_fork[PATH_MAX];
+    cwd_get(m, cwd_at_fork);
     /* Seccomp is inherited across fork and the timing argument is the same:
      * the child republishes it below, but the parent can return from fork(2)
      * and read /proc/<child>/status before the child has run a single
@@ -970,7 +1015,7 @@ SYSDEF(clone) {
      * fork-inherited state, identical to what the child would have written, and
      * the single writer keeps the slot's seqlock uncontended. */
     proctab_register_at(rsv, (s32)pid, m->cmdline, m->cmdline_len,
-                        m->exec_path, m->cwd, m->environ, m->environ_len,
+                        m->exec_path, cwd_at_fork, m->environ, m->environ_len,
                         m->auxv, m->auxv_len);
     if (flags & G_CLONE_PARENT_SETTID) {
         s32 tid = (s32)pid;
@@ -1743,8 +1788,10 @@ static int exec_perm_check(struct Machine *m, const PathPin *p, int fd,
         return mode_exec_ok((u32)geteuid(), (u32)getegid(), gs, ng,
                             (u32)st.st_uid, (u32)st.st_gid, st.st_mode);
     }
-    return mode_exec_ok(m->cred.euid, m->cred.egid, m->cred.groups,
-                        m->cred.ngroups, remap_uid(m, (u32)st.st_uid),
+    Cred cr;
+    cred_get(m, &cr);
+    return mode_exec_ok(cr.euid, cr.egid, cr.groups, cr.ngroups,
+                        remap_uid(m, (u32)st.st_uid),
                         remap_gid(m, (u32)st.st_gid), st.st_mode);
 }
 
@@ -1968,8 +2015,14 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     robust_list_exit_self(c);   /* exec_mm_release: this thread's robust futexes */
     vfork_child_flush(c);       /* ...and a vfork child's writes to its parent,
                                  * released here as exec_mmap releases it */
-    if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
-    if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
+    if (raise_uid || raise_gid) {
+        /* Every sibling is gone by now (de_thread), but the set is written
+         * as every set is, under its lock. */
+        task_lock();
+        if (raise_uid) m->cred.euid = m->cred.suid = m->cred.fsuid = new_euid;
+        if (raise_gid) m->cred.egid = m->cred.sgid = m->cred.fsgid = new_egid;
+        task_unlock();
+    }
     shm_detach_all(m);       /* System V shm attaches do not survive execve;
                               * SEM_UNDO lists and m->sem_undo_used do */
     fdheld_exec_clear();     /* the descriptors de_thread's dead siblings held
@@ -2711,14 +2764,16 @@ SYSDEF(getgroups) {
 SYSDEF(setgroups) {
     struct Machine *m = c->m;
     if (m->fake_id) {
-        if (!cred_priv(m)) return (u64)(s64)-EPERM;
+        if (!fake_root(m)) return (u64)(s64)-EPERM;
         int n = (int)(s32)a0;
         if (n < 0 || n > 64) return (u64)(s64)-EINVAL;
         u32 g[64];
         if (n && copy_from_guest(c, g, a1, sizeof(u32) * (size_t)n) < 0)
             return (u64)(s64)-EFAULT;
+        task_lock();
         for (int i = 0; i < n; i++) m->cred.groups[i] = g[i];
         m->cred.ngroups = n;
+        task_unlock();
         return 0;
     }
     (void)a2; (void)a3; (void)a4; (void)a5;
@@ -2727,89 +2782,108 @@ SYSDEF(setgroups) {
 
 SYSDEF(umask) { (void)c;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)umask((mode_t)a0); }
 
+/* The setters: decide against a copy, write the copy back, all under the
+ * lock. `r` is what the guest is told. */
+#define CRED_UPDATE(m, body) \
+    do { \
+        task_lock(); \
+        Cred nc = (m)->cred; \
+        s64 r = 0; \
+        { body } \
+        if (r == 0) (m)->cred = nc; \
+        task_unlock(); \
+        return (u64)r; \
+    } while (0)
+
 SYSDEF(setuid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setuid((uid_t)a0) < 0 ? host_err() : 0;
     u32 u = (u32)a0;
-    if (cred_priv(m)) { m->cred.ruid = m->cred.euid = m->cred.suid = m->cred.fsuid = u; return 0; }
-    if (u == m->cred.ruid || u == m->cred.suid) { m->cred.euid = m->cred.fsuid = u; return 0; }
-    return (u64)(s64)-EPERM;
+    CRED_UPDATE(m, {
+        if (cred_priv(&nc)) nc.ruid = nc.euid = nc.suid = nc.fsuid = u;
+        else if (u == nc.ruid || u == nc.suid) nc.euid = nc.fsuid = u;
+        else r = -EPERM;
+    });
 }
 SYSDEF(setgid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setgid((gid_t)a0) < 0 ? host_err() : 0;
     u32 g = (u32)a0;
-    if (cred_priv(m)) { m->cred.rgid = m->cred.egid = m->cred.sgid = m->cred.fsgid = g; return 0; }
-    if (g == m->cred.rgid || g == m->cred.sgid) { m->cred.egid = m->cred.fsgid = g; return 0; }
-    return (u64)(s64)-EPERM;
+    CRED_UPDATE(m, {
+        if (cred_priv(&nc)) nc.rgid = nc.egid = nc.sgid = nc.fsgid = g;
+        else if (g == nc.rgid || g == nc.sgid) nc.egid = nc.fsgid = g;
+        else r = -EPERM;
+    });
 }
 
 SYSDEF(setreuid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setreuid((uid_t)a0, (uid_t)a1) < 0 ? host_err() : 0;
-    u32 r = (u32)a0, e = (u32)a1;
-    Cred nc = m->cred;
-    if (r != ID_KEEP) {
-        if (!cred_priv(m) && r != m->cred.ruid && r != m->cred.euid) return (u64)(s64)-EPERM;
-        nc.ruid = r;
-    }
-    if (e != ID_KEEP) {
-        if (!cred_priv(m) && e != m->cred.ruid && e != m->cred.euid && e != m->cred.suid) return (u64)(s64)-EPERM;
-        nc.euid = e;
-    }
-    if ((r != ID_KEEP) || (e != ID_KEEP && e != m->cred.ruid)) nc.suid = nc.euid;
-    nc.fsuid = nc.euid;
-    m->cred = nc;
-    return 0;
+    u32 ru = (u32)a0, eu = (u32)a1;
+    CRED_UPDATE(m, {
+        const Cred old = nc;   /* the checks judge the set being replaced */
+        if (ru != ID_KEEP) {
+            if (!cred_priv(&old) && ru != old.ruid && ru != old.euid) r = -EPERM;
+            nc.ruid = ru;
+        }
+        if (eu != ID_KEEP) {
+            if (!cred_priv(&old) && eu != old.ruid && eu != old.euid && eu != old.suid) r = -EPERM;
+            nc.euid = eu;
+        }
+        if ((ru != ID_KEEP) || (eu != ID_KEEP && eu != old.ruid)) nc.suid = nc.euid;
+        nc.fsuid = nc.euid;
+    });
 }
 SYSDEF(setregid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setregid((gid_t)a0, (gid_t)a1) < 0 ? host_err() : 0;
-    u32 r = (u32)a0, e = (u32)a1;
-    Cred nc = m->cred;
-    if (r != ID_KEEP) {
-        if (!cred_priv(m) && r != m->cred.rgid && r != m->cred.egid) return (u64)(s64)-EPERM;
-        nc.rgid = r;
-    }
-    if (e != ID_KEEP) {
-        if (!cred_priv(m) && e != m->cred.rgid && e != m->cred.egid && e != m->cred.sgid) return (u64)(s64)-EPERM;
-        nc.egid = e;
-    }
-    if ((r != ID_KEEP) || (e != ID_KEEP && e != m->cred.rgid)) nc.sgid = nc.egid;
-    nc.fsgid = nc.egid;
-    m->cred = nc;
-    return 0;
+    u32 rg = (u32)a0, eg = (u32)a1;
+    CRED_UPDATE(m, {
+        const Cred old = nc;
+        if (rg != ID_KEEP) {
+            if (!cred_priv(&old) && rg != old.rgid && rg != old.egid) r = -EPERM;
+            nc.rgid = rg;
+        }
+        if (eg != ID_KEEP) {
+            if (!cred_priv(&old) && eg != old.rgid && eg != old.egid && eg != old.sgid) r = -EPERM;
+            nc.egid = eg;
+        }
+        if ((rg != ID_KEEP) || (eg != ID_KEEP && eg != old.rgid)) nc.sgid = nc.egid;
+        nc.fsgid = nc.egid;
+    });
 }
 
 SYSDEF(setresuid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setresuid((uid_t)a0, (uid_t)a1, (uid_t)a2) < 0 ? host_err() : 0;
-    u32 r = (u32)a0, e = (u32)a1, s = (u32)a2;
-    if (!cred_priv(m)) {
-        if (r != ID_KEEP && !in_uset(m, r)) return (u64)(s64)-EPERM;
-        if (e != ID_KEEP && !in_uset(m, e)) return (u64)(s64)-EPERM;
-        if (s != ID_KEEP && !in_uset(m, s)) return (u64)(s64)-EPERM;
-    }
-    if (r != ID_KEEP) m->cred.ruid = r;
-    if (e != ID_KEEP) m->cred.euid = e;
-    if (s != ID_KEEP) m->cred.suid = s;
-    m->cred.fsuid = m->cred.euid;
-    return 0;
+    u32 ru = (u32)a0, eu = (u32)a1, su = (u32)a2;
+    CRED_UPDATE(m, {
+        if (!cred_priv(&nc) &&
+            ((ru != ID_KEEP && !in_uset(&nc, ru)) ||
+             (eu != ID_KEEP && !in_uset(&nc, eu)) ||
+             (su != ID_KEEP && !in_uset(&nc, su))))
+            r = -EPERM;
+        if (ru != ID_KEEP) nc.ruid = ru;
+        if (eu != ID_KEEP) nc.euid = eu;
+        if (su != ID_KEEP) nc.suid = su;
+        nc.fsuid = nc.euid;
+    });
 }
 SYSDEF(setresgid) {
     struct Machine *m = c->m;
     if (!m->fake_id) return setresgid((gid_t)a0, (gid_t)a1, (gid_t)a2) < 0 ? host_err() : 0;
-    u32 r = (u32)a0, e = (u32)a1, s = (u32)a2;
-    if (!cred_priv(m)) {
-        if (r != ID_KEEP && !in_gset(m, r)) return (u64)(s64)-EPERM;
-        if (e != ID_KEEP && !in_gset(m, e)) return (u64)(s64)-EPERM;
-        if (s != ID_KEEP && !in_gset(m, s)) return (u64)(s64)-EPERM;
-    }
-    if (r != ID_KEEP) m->cred.rgid = r;
-    if (e != ID_KEEP) m->cred.egid = e;
-    if (s != ID_KEEP) m->cred.sgid = s;
-    m->cred.fsgid = m->cred.egid;
-    return 0;
+    u32 rg = (u32)a0, eg = (u32)a1, sg = (u32)a2;
+    CRED_UPDATE(m, {
+        if (!cred_priv(&nc) &&
+            ((rg != ID_KEEP && !in_gset(&nc, rg)) ||
+             (eg != ID_KEEP && !in_gset(&nc, eg)) ||
+             (sg != ID_KEEP && !in_gset(&nc, sg))))
+            r = -EPERM;
+        if (rg != ID_KEEP) nc.rgid = rg;
+        if (eg != ID_KEEP) nc.egid = eg;
+        if (sg != ID_KEEP) nc.sgid = sg;
+        nc.fsgid = nc.egid;
+    });
 }
 
 /* setfsuid/setfsgid: return the previous fs id; never fail. */
@@ -2817,27 +2891,38 @@ SYSDEF(setfsuid) {
     struct Machine *m = c->m;
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (!m->fake_id) return (u64)(uid_t)syscall(SYS_setfsuid, (uid_t)a0);
-    u32 old = m->cred.fsuid, u = (u32)a0;
-    if (u != ID_KEEP && (cred_priv(m) || u == m->cred.ruid || u == m->cred.euid ||
-                         u == m->cred.suid || u == m->cred.fsuid))
+    u32 u = (u32)a0;
+    task_lock();
+    u32 old = m->cred.fsuid;
+    if (u != ID_KEEP && (cred_priv(&m->cred) || u == m->cred.ruid ||
+                         u == m->cred.euid || u == m->cred.suid ||
+                         u == m->cred.fsuid))
         m->cred.fsuid = u;
+    task_unlock();
     return old;
 }
 SYSDEF(setfsgid) {
     struct Machine *m = c->m;
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (!m->fake_id) return (u64)(gid_t)syscall(SYS_setfsgid, (gid_t)a0);
-    u32 old = m->cred.fsgid, g = (u32)a0;
-    if (g != ID_KEEP && (cred_priv(m) || g == m->cred.rgid || g == m->cred.egid ||
-                         g == m->cred.sgid || g == m->cred.fsgid))
+    u32 g = (u32)a0;
+    task_lock();
+    u32 old = m->cred.fsgid;
+    if (g != ID_KEEP && (cred_priv(&m->cred) || g == m->cred.rgid ||
+                         g == m->cred.egid || g == m->cred.sgid ||
+                         g == m->cred.fsgid))
         m->cred.fsgid = g;
+    task_unlock();
     return old;
 }
 
 SYSDEF(getresuid) {
     uid_t r, e, s;
-    if (c->m->fake_id) { r = c->m->cred.ruid; e = c->m->cred.euid; s = c->m->cred.suid; }
-    else getresuid(&r, &e, &s);
+    if (c->m->fake_id) {
+        Cred cr;
+        cred_get(c->m, &cr);
+        r = cr.ruid; e = cr.euid; s = cr.suid;
+    } else getresuid(&r, &e, &s);
     u32 v;
     v = r; if (copy_to_guest(c, a0, &v, 4) < 0) return (u64)(s64)-EFAULT;
     v = e; if (copy_to_guest(c, a1, &v, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2847,8 +2932,11 @@ SYSDEF(getresuid) {
 
 SYSDEF(getresgid) {
     gid_t r, e, s;
-    if (c->m->fake_id) { r = c->m->cred.rgid; e = c->m->cred.egid; s = c->m->cred.sgid; }
-    else getresgid(&r, &e, &s);
+    if (c->m->fake_id) {
+        Cred cr;
+        cred_get(c->m, &cr);
+        r = cr.rgid; e = cr.egid; s = cr.sgid;
+    } else getresgid(&r, &e, &s);
     u32 v;
     v = r; if (copy_to_guest(c, a0, &v, 4) < 0) return (u64)(s64)-EFAULT;
     v = e; if (copy_to_guest(c, a1, &v, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2879,7 +2967,7 @@ static int prio_target(CPU *c, int which, u32 who, s32 *one) {
     case G_PRIO_USER: {
         /* Only this guest's own user has processes here; any other id names a
          * user with none, which is the kernel's ESRCH. */
-        u32 self = c->m->fake_id ? c->m->cred.euid : (u32)geteuid();
+        u32 self = c->m->fake_id ? cred_euid(c->m) : (u32)geteuid();
         if (who && who != self) return -ESRCH;
         return 1;
     }

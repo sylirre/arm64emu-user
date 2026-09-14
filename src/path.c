@@ -125,7 +125,56 @@ int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
  * "(deleted)" too), and is flagged: the names in it answer ENOENT whatever
  * the old path holds by now, "." names the inode itself (the pin is the
  * host's AT_FDCWD then), and getcwd is ENOENT. */
-int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
+/* ---- the published copy and the root, under the task lock ---------------
+ *
+ * m->cwd and m->chroot_base are strings every thread reads and any thread's
+ * chdir, chroot or pivot_root rewrites, and a strcpy is readable half-done:
+ * a resolver on a sibling thread could start its walk from a root that was
+ * the first bytes of the new one and the tail of the old. A kernel keeps
+ * both behind fs->lock and reads them together (get_fs_root_and_pwd); here
+ * every reader copies what it needs out under the task lock (sys_proc.c) and
+ * every writer stores under it, and the kernel's own cwd is asked under it
+ * too (cwd_current_locked), so the published copy never lags the host's
+ * move by a sibling's refresh. */
+
+void croot_get(struct Machine *m, char *out) {
+    task_lock();
+    strcpy(out, m->chroot_base[0] ? m->chroot_base : "/");
+    task_unlock();
+}
+
+int croot_active(struct Machine *m) {
+    task_lock();
+    int a = m->chroot_base[0] && strcmp(m->chroot_base, "/");
+    task_unlock();
+    return a;
+}
+
+void croot_set(struct Machine *m, const char *canon) {
+    task_lock();
+    strcpy(m->chroot_base, canon);
+    task_unlock();
+}
+
+void cwd_get(struct Machine *m, char *out) {
+    task_lock();
+    strcpy(out, m->cwd);
+    task_unlock();
+}
+
+/* Store the published copy and keep the /proc/<pid>/cwd links live. Caller
+ * holds the task lock, which also serializes the registry slot's seqlock
+ * writes: two of this process's threads publishing at once used to
+ * interleave the odd/even steps a reader relies on. */
+void cwd_publish_locked(struct Machine *m, const char *canon) {
+    if (!strcmp(m->cwd, canon)) return;
+    strcpy(m->cwd, canon);
+    proctab_set_cwd((s32)getpid(), m->cwd);
+}
+
+/* Caller holds the task lock (path_walk takes it once for the root and the
+ * cwd together, as a kernel reads both under fs->lock). */
+int cwd_current_locked(struct Machine *m, char *canon_out, int *deleted) {
     char buf[PATH_MAX];
     int gone = 0;
     /* The raw syscall: half a microsecond, against the two of a readlink of
@@ -138,7 +187,9 @@ int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
         /* Unlinked: the directory has no name, but its parent has, and ".."
          * from inside it has to reach that parent -- wherever the directory
          * had been moved to before it went. The parent's own path is read
-         * off an O_PATH descriptor of "..", the last known basename stays. */
+         * off an O_PATH descriptor of "..", the last known basename stays.
+         * The fd window sits inside the lock, never the other way round
+         * (machine.h, the fork barrier). */
         char link[64], parent[PATH_MAX], pguest[PATH_MAX];
         ssize_t pl = -1;
         fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
@@ -158,10 +209,7 @@ int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
                 strcpy(buf, pguest);
                 if (strcmp(pguest, "/")) strcat(buf, "/");
                 strcat(buf, base);
-                if (strcmp(buf, m->cwd)) {
-                    strcpy(m->cwd, buf);
-                    proctab_set_cwd((s32)getpid(), m->cwd);
-                }
+                cwd_publish_locked(m, buf);
             }
         }
         strcpy(canon_out, m->cwd[0] ? m->cwd : "/");
@@ -181,13 +229,17 @@ int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
         if (deleted) *deleted = 0;
         return 0;
     }
-    if (strcmp(guest, m->cwd)) {   /* renamed under us, or moved by a mount */
-        strcpy(m->cwd, guest);
-        proctab_set_cwd((s32)getpid(), m->cwd);
-    }
+    cwd_publish_locked(m, guest);   /* renamed under us, or moved by a mount */
     strcpy(canon_out, guest);
     if (deleted) *deleted = gone;
     return 0;
+}
+
+int cwd_current(struct Machine *m, char *canon_out, int *deleted) {
+    task_lock();
+    int r = cwd_current_locked(m, canon_out, deleted);
+    task_unlock();
+    return r;
 }
 
 /* Is this a path in the host /proc zone? Such a path doubles as the canonical
@@ -413,8 +465,7 @@ void path_strip_rootfs(const struct Machine *m, char *path) {
  * handed back (getcwd, readlink targets, the mount table). A path outside the
  * base has no name in that view at all; "/" is the closest honest answer, and
  * the same one the kernel gives for an unreachable cwd. */
-void path_chroot_view(const struct Machine *m, const char *canon, char *out) {
-    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+void path_chroot_view_in(const char *croot, const char *canon, char *out) {
     const char *p = canon && canon[0] ? canon : "/";
     if (!strcmp(croot, "/")) { strcpy(out, p); return; }
     size_t cl = strlen(croot);
@@ -422,6 +473,12 @@ void path_chroot_view(const struct Machine *m, const char *canon, char *out) {
         strcpy(out, p[cl] ? p + cl : "/");
     else
         strcpy(out, "/");
+}
+
+void path_chroot_view(struct Machine *m, const char *canon, char *out) {
+    char croot[PATH_MAX];
+    croot_get(m, croot);
+    path_chroot_view_in(croot, canon, out);
 }
 
 /* Special path zones, applied to the *canonical* guest path:
@@ -1531,17 +1588,24 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
 
     /* chroot(2) root: an absolute path and an absolute symlink re-root here (not
      * at "/"), and ".." cannot climb above it. "/" (the un-chrooted default)
-     * makes every rule below a no-op, so the non-chrooted path is unchanged. */
-    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+     * makes every rule below a no-op, so the non-chrooted path is unchanged.
+     * Read together with the cwd under the task lock, as a kernel's path_init
+     * reads root and pwd under one fs->lock: a chroot or a chdir on a sibling
+     * thread lands before this walk or after it, never inside it. */
+    char croot[PATH_MAX];
 
     if (!gpath[0]) return -ENOENT;   /* AT_EMPTY_PATH handled by callers */
 
     int cwd_gone = 0;
+    task_lock();
+    strcpy(croot, m->chroot_base[0] ? m->chroot_base : "/");
     if (gpath[0] == '/') {
         strcpy(canon, croot);        /* absolute path is relative to the chroot */
     } else if (dirfd == G_AT_FDCWD) {
-        cwd_current(m, canon, &cwd_gone);   /* the host's cwd, as the kernel has it */
-    } else {
+        cwd_current_locked(m, canon, &cwd_gone);   /* the host's cwd, as the kernel has it */
+    }
+    task_unlock();
+    if (gpath[0] != '/' && dirfd != G_AT_FDCWD) {
         int r = dirfd_guest_path(m, dirfd, canon);
         if (r < 0) return r;
     }

@@ -88,7 +88,7 @@ static u32 prot_g2pte(int prot) {
  * sys_misc.c. Written to subtract rather than add so a guest naming a huge
  * length cannot overflow its way past the check. */
 static int as_fits(struct Machine *m, u64 add) {
-    u64 cap = m->rlim[G_RLIMIT_AS].rlim_cur;
+    u64 cap = rlim_cur(m, G_RLIMIT_AS);
     if (cap == G_RLIM_INFINITY) return 1;
     if (add > cap) return 0;
     return as_mapped_bytes(&m->as) <= cap - add;
@@ -104,9 +104,9 @@ static int as_fits(struct Machine *m, u64 add) {
  * program it exists for is exactly the sort of thing a guest here runs:
  * valgrind sets the limit to zero and expects the hard limit to govern. */
 static int data_fits(struct Machine *m, u64 add) {
-    u64 cap = m->rlim[G_RLIMIT_DATA].rlim_cur;
+    u64 cap = rlim_cur(m, G_RLIMIT_DATA);
     if (cap == G_RLIM_INFINITY) return 1;
-    if (!cap) cap = m->rlim[G_RLIMIT_DATA].rlim_max;
+    if (!cap) cap = rlim_max(m, G_RLIMIT_DATA);
     if (cap == G_RLIM_INFINITY) return 1;
     if (add > cap) return 0;
     return as_data_bytes(&m->as) <= cap - add;
@@ -150,7 +150,7 @@ static u64 brk_locked(CPU *c, u64 a0) {
         /* ...or if it would cross RLIMIT_AS, or take the heap past
          * RLIMIT_DATA. brk(2) reports a refusal as the unchanged break rather
          * than an errno, which is what malloc reads to fall back on mmap. */
-        u64 dcap = c->m->rlim[G_RLIMIT_DATA].rlim_cur;
+        u64 dcap = rlim_cur(c->m, G_RLIMIT_DATA);
         if (dcap != G_RLIM_INFINITY && new_end - as->brk_start > dcap)
             return as->brk;
         if (!as_fits(c->m, new_end - old_end)) return as->brk;

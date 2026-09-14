@@ -510,7 +510,13 @@ directory. So `chdir` opens its pinned target `O_PATH` and `fchdir`s the host,
 it, and every relative resolution starts from the `getcwd` syscall's answer
 (half a microsecond, which is why it is not the `/proc/self/cwd` link) mapped
 to the guest view. `m->cwd` survives as the published copy (the PID registry,
-the `/proc/<pid>/cwd` links), refreshed whenever the answer changes. An
+the `/proc/<pid>/cwd` links), refreshed whenever the answer changes — under the
+task lock, together with the chroot root (`m->chroot_base`), the way a kernel
+keeps both behind `fs->lock`: a walk copies the root and asks the kernel for
+the cwd in one critical section, `chdir`/`fchdir` move the host and publish in
+one, and `chroot`/`pivot_root` store under it, so a sibling thread's `chdir`
+lands before a walk or after it and never inside it, and no resolver starts
+from the first bytes of a new root with the tail of the old one. An
 unlinked cwd is `ENOENT` from `getcwd`, flagged for the walk — the names in it
 answer `ENOENT` whatever a directory created at the old path holds by now, `.`
 pins as the host's own `AT_FDCWD` (the inode the name no longer reaches), `..`
@@ -1905,7 +1911,14 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   shared across threads). The whole `get`/`set` family (`setuid`/`setgid`/
   `setre*`/`setres*`/`setfsuid`/`setfsgid`/`setgroups`) operates on it with real
   Linux privilege rules — "privileged" ⇔ fake `euid == 0`; a dropped identity
-  cannot regain root.
+  cannot regain root. Shared across threads means read and written under the
+  task lock (`sys_proc.c`): a setter decides against a copy and writes the copy
+  back as one step (a kernel's `prepare_creds`/`commit_creds`), and every reader
+  — `access(2)`, `execve`'s permission check, the `get*id` family, the auxv,
+  `/proc` — takes the set out whole (`cred_get`) and judges the copy. Field by
+  field it was neither: `setreuid` wrote the whole struct back over a sibling's
+  `setfsgid`, and a `getresuid` could return a triple no setter ever wrote
+  (`tests/fixtures/credrace.c`).
 - **setuid/setgid bit on exec**: `do_execve` reads the file's mode; `S_ISUID`
   sets `euid/suid/fsuid` to the file owner's *remapped* id, `S_ISGID` the group.
   `AT_SECURE` follows a real transition (`euid != ruid`). The raise is applied

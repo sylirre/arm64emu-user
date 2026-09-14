@@ -132,7 +132,8 @@ static const char *rootfs_fstype(const struct Machine *m) {
 /* A mount point in the guest's current view, or 0 when it is not reachable
  * from the current root (chroot / pivot_root) and so has no name there. */
 static int mnt_view(struct Machine *m, const char *guest, char *out) {
-    const char *croot = m->chroot_base[0] ? m->chroot_base : "/";
+    char croot[PATH_MAX];
+    croot_get(m, croot);
     if (!strcmp(croot, "/")) { strcpy(out, guest); return 1; }
     size_t cl = strlen(croot);
     if (strncmp(guest, croot, cl) || (guest[cl] != 0 && guest[cl] != '/')) return 0;
@@ -173,7 +174,7 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
      * readlink(/proc/self/fd/N) -- and mounts outside the current root are
      * dropped, as the kernel drops what is unreachable in the namespace. */
     size_t np = sizeof pseudo / sizeof pseudo[0];
-    int chrooted = m->chroot_base[0] && strcmp(m->chroot_base, "/");
+    int chrooted = croot_active(m);
     if (fmt == MNT_MOUNTINFO) {
         dprintf(fd, "1 1 %u:%u / / rw,relatime - %s /dev/root rw\n",
                 maj, min, fstype);
@@ -240,6 +241,8 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
  * segment protections that way — so emit runs of equal page protection,
  * kernel-style. */
 static void put_maps(int fd, struct Machine *m) {
+    char croot[PATH_MAX];
+    croot_get(m, croot);   /* before as_lock: the task lock ranks outside it */
     as_lock();
     AddrSpace *as = &m->as;
     for (int i = 0; i < as->nregions; i++) {
@@ -250,7 +253,7 @@ static void put_maps(int fd, struct Machine *m) {
         char nameview[PATH_MAX];
         const char *name = r->path;
         if (name && name[0] == '/') {
-            path_chroot_view(m, name, nameview);
+            path_chroot_view_in(croot, name, nameview);
             name = nameview;
         }
         if (!name) {
@@ -391,12 +394,14 @@ static void put_limits(int fd, struct Machine *m) {
             "Limit", "Soft Limit", "Hard Limit", "Units");
     for (int i = 0; i < G_RLIM_NLIMITS; i++) {
         char cur[24], max[24];
-        if (m->rlim[i].rlim_cur == G_RLIM_INFINITY) strcpy(cur, "unlimited");
+        GRlimit rl;
+        rlim_get(m, i, &rl);   /* the pair, as proc_pid_limits copies it */
+        if (rl.rlim_cur == G_RLIM_INFINITY) strcpy(cur, "unlimited");
         else snprintf(cur, sizeof cur, "%llu",
-                      (unsigned long long)m->rlim[i].rlim_cur);
-        if (m->rlim[i].rlim_max == G_RLIM_INFINITY) strcpy(max, "unlimited");
+                      (unsigned long long)rl.rlim_cur);
+        if (rl.rlim_max == G_RLIM_INFINITY) strcpy(max, "unlimited");
         else snprintf(max, sizeof max, "%llu",
-                      (unsigned long long)m->rlim[i].rlim_max);
+                      (unsigned long long)rl.rlim_max);
         dprintf(fd, "%-25s %-20s %-20s ", ln[i].name, cur, max);
         if (ln[i].unit) dprintf(fd, "%-10s\n", ln[i].unit);
         else            dprintf(fd, "\n");
@@ -1347,7 +1352,7 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     int scknown;
     if (self) { scmode = (u8)seccomp_status(m, &scfilters); scknown = 1; }
     else scknown = proctab_seccomp_get(tid, &scmode, &scfilters);
-    int fakeroot = self && m->fake_id && m->cred.euid == 0 && capfull[0];
+    int fakeroot = self && fake_root(m) && capfull[0];
     /* Threads: counts host tasks, and a host task in this process's thread
      * group need not be a guest thread -- an interposer between us and the
      * kernel can hold one (proc_foreign_sample). The guest is told what it has,
@@ -1522,7 +1527,7 @@ static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
          * could be measured. Another guest's limit table lives in its own
          * Machine and is not shared, so its host file's figure stands. */
         if (!self) return 0;
-        *out = m->rlim[G_RLIMIT_RSS].rlim_cur;
+        *out = rlim_cur(m, G_RLIMIT_RSS);
         if (*out == G_RLIM_INFINITY) *out = ~0ULL;
         return 1;
     case 26: *out = pm->start_code;  return 1;

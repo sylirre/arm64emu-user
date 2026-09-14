@@ -25,7 +25,9 @@ typedef struct {
     u64 mask;                 /* guest sigset (64 bits) */
 } GSigAction;
 
-/* Fake process credential set (-fake-id mode). Process-wide per POSIX. */
+/* Fake process credential set (-fake-id mode). Process-wide per POSIX, shared
+ * by every thread, read and written under the task lock (sys_proc.c: cred_get
+ * copies it out whole, the setters write it back whole). */
 typedef struct {
     u32 ruid, euid, suid, fsuid;
     u32 rgid, egid, sgid, fsgid;
@@ -127,7 +129,10 @@ struct Machine {
 
     /* Rootfs containment */
     char rootfs[PATH_MAX];    /* realpath'd host prefix, no trailing slash */
-    char cwd[PATH_MAX];       /* canonical guest cwd ("/" based, namespace-absolute) */
+    char cwd[PATH_MAX];       /* canonical guest cwd ("/" based, namespace-absolute):
+                               * the PUBLISHED copy of the host's (path.c), read
+                               * and written under the task lock (cwd_get,
+                               * cwd_publish_locked) */
     char exec_path[PATH_MAX]; /* canonical guest path of the running exe */
 
     /* Guest chroot(2) root: a canonical namespace-absolute guest path that
@@ -135,7 +140,9 @@ struct Machine {
      * absolute-symlink reset all use it). "" or "/" means "not chrooted", the
      * universal initial state — then resolution is unchanged. cwd stays
      * namespace-absolute (chroot(2) does not change it); getcwd subtracts this
-     * base for the guest view. Copied by fork, preserved across execve. */
+     * base for the guest view. Copied by fork, preserved across execve. Read
+     * and written under the task lock (croot_get / croot_set, path.c): the
+     * kernel's fs->lock, for the same pair of strings. */
     char chroot_base[PATH_MAX];
 
     /* The bind-mount table (--bind + runtime mount(2)/umount2(2)/pivot_root(2))
@@ -200,7 +207,13 @@ struct Machine {
      *
      * The rest are stored here too -- so the guest reads back one coherent set
      * -- and also applied to the host, where the host is the thing that
-     * enforces them. */
+     * enforces them.
+     *
+     * Written under the task lock (rlim_set, sys_misc.c), where do_prlimit
+     * writes under task_lock, and read as a pair under it; a single field is
+     * read atomically without it (rlim_cur / rlim_max), as task_rlimit reads
+     * one -- on an ILP32 host a u64 is two words, and a plain read could take
+     * one of each. */
     GRlimit rlim[G_RLIM_NLIMITS];
 
     /* Guest signal state (process-wide per POSIX; signal.c). The blocked
@@ -420,6 +433,39 @@ struct Machine {
 
 /* The singleton task of this process (fork copies it naturally). */
 extern struct Machine g_machine;
+
+/* sys_proc.c: the task lock (EMU_LK_TASK below) over the process-wide Machine
+ * fields that are written rarely and read from any thread -- credentials,
+ * resource limits, the published cwd and the chroot root, the seccomp chain.
+ * Writers take it; readers take it to copy out what they need and use the
+ * copy. Nothing that blocks or forks may run under it. */
+void task_lock(void);
+void task_unlock(void);
+
+/* The fake credentials (sys_proc.c), as one consistent set: a setter changes
+ * several fields as one step under the task lock, and a reader that took
+ * them one at a time could see a set no setter ever wrote -- an euid from
+ * after a setresuid with the groups from before a setgroups. cred_get copies
+ * the whole set out under the lock; cred_euid is the one field most callers
+ * want, read the same way. Meaningful only under --fake-id (m->fake_id);
+ * without it the host's own ids are the guest's. */
+void cred_get(const struct Machine *m, Cred *out);
+u32  cred_euid(const struct Machine *m);
+/* "Privileged" under --fake-id: the fake effective id is root. */
+static inline int fake_root(const struct Machine *m) {
+    return m->fake_id && cred_euid(m) == 0;
+}
+
+/* sys_misc.c: the guest's resource limits (rlim[] above). A single field is
+ * read the way a kernel's task_rlimit reads it -- the word alone, atomically,
+ * no lock, since the address-space checks ask under as_lock and a limit is
+ * one word either way (on an ILP32 host a plain u64 read is two words, and a
+ * setrlimit between them is a limit nobody set). The pair, for getrlimit and
+ * /proc/<pid>/limits, is copied out under the task lock, as do_prlimit reads
+ * it under task_lock. */
+u64  rlim_cur(struct Machine *m, int res);
+u64  rlim_max(struct Machine *m, int res);
+void rlim_get(struct Machine *m, int res, GRlimit *out);
 
 /* Ownership remap for -fake-id: a file the host reports as owned by the real
  * invoking user is presented to the guest as owned by the fake identity;
@@ -965,7 +1011,10 @@ int proc_own_fd_denied(const char *host);
 
 /* A namespace-absolute guest path as the guest sees it: subtract the chroot /
  * pivot_root base. out >= PATH_MAX. */
-void path_chroot_view(const struct Machine *m, const char *canon, char *out);
+void path_chroot_view(struct Machine *m, const char *canon, char *out);
+/* The same against a root already copied out (croot_get, below) -- for a
+ * caller that holds as_lock, which the task lock may not be taken under. */
+void path_chroot_view_in(const char *croot, const char *canon, char *out);
 
 /* Does this host path lie in the /proc zone? A path that resolves there is
  * also the canonical guest spelling of the same file, which is how the
@@ -983,8 +1032,19 @@ void path_strip_rootfs(const struct Machine *m, char *path);
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out);
 /* The guest's cwd as the kernel has it -- the host cwd, mapped to the guest
  * view -- refreshing m->cwd; *deleted says the directory has been unlinked
- * (path.c, "the working directory is the host's"). */
+ * (path.c, "the working directory is the host's"). The _locked form is for a
+ * caller already holding the task lock. */
 int cwd_current(struct Machine *m, char *canon_out, int *deleted);
+int cwd_current_locked(struct Machine *m, char *canon_out, int *deleted);
+/* The published copy of the cwd and the chroot root, under the task lock
+ * (path.c). croot_get writes "/" when there is no chroot; croot_active says
+ * whether there is one; cwd_publish_locked stores the copy and keeps the
+ * registry's /proc/<pid>/cwd live, for a caller holding the lock. */
+void cwd_get(struct Machine *m, char *out);
+void cwd_publish_locked(struct Machine *m, const char *canon);
+void croot_get(struct Machine *m, char *out);
+int  croot_active(struct Machine *m);
+void croot_set(struct Machine *m, const char *canon);
 
 /* Map an fd's host path (as read from /proc/self/fd) to its guest path via the
  * same bind-reverse / rootfs-strip dirfd_guest_path uses, but without the

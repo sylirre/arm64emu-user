@@ -520,6 +520,20 @@ send_pid1=-1
 done" --fake-id 7 "$ALPINE" /tmp/ci_fakecred
     }
     rm -f "$ALPINE/tmp/ci_fakecred"; fx_rm tests/fixtures/fakecred.bin
+    # The fake credential set is shared by every thread, so a setter has to
+    # change it as one step and a reader read it as one (the task lock,
+    # sys_proc.c): readers must never see a triple no setter wrote, and a
+    # whole-struct writeback on one thread must not undo a sibling's setfsgid.
+    "$AGCC" -O2 -static -o tests/fixtures/credrace.bin tests/fixtures/credrace.c $A64_TESTLIBS 2>/dev/null && {
+        for eng in "" "--jit"; do
+            check_fakeid "credentials under concurrent setters${eng:+ (jit)}" "start uid=0 euid=0
+gids=5 6 fs=6
+uids=0 0 1000
+writers_ok=1 torn=0 fsgid_chain=1
+done" $eng --fake-id / tests/fixtures/credrace.bin
+        done
+    }
+    fx_rm tests/fixtures/credrace.bin
     # adduser exercises vfork+exec of helpers under fake-root.
     check_fakeid "adduser (vfork+setuid path)" "ci_u:x:1234:1234:CI:/home/ci_u:/bin/sh" \
         --fake-id "$ALPINE" /bin/sh -c \

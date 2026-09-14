@@ -409,6 +409,17 @@ no-op; it still answers `getrlimit` from the host, so a guest there sees its own
 call succeed and read back `unlimited`. Enforcing them properly is what keeps
 the churn test above meaningful.)
 
+The table is written under the task lock (`rlim_set`, `sys_misc.c` — where
+`do_prlimit` writes under `task_lock`), and `prlimit64` reads the old pair and
+installs the new one in the same critical section, so two calls racing cannot
+both be told the same "old" (`tests/c/rlimchain.c`: across 3200 calls from
+eight threads every installed value is returned as the previous one exactly
+once). A single field is read without the lock, atomically, the way
+`task_rlimit` reads one — the address-space checks ask under `as_lock`, and on
+an ILP32 host a plain `u64` read is two words that a `setrlimit` between them
+turns into a limit nobody set; the pair (`getrlimit`, `/proc/<pid>/limits`)
+is copied out under the lock.
+
 `mmap`, `mremap` and `brk` check a growth against `as_mapped_bytes()`, which
 sums the region list. It is summed rather than carried in a counter on purpose:
 the list is the only definitionally correct record, and coverage changes in more

@@ -2866,11 +2866,18 @@ static void shm_disconnect(int s) { fdheld_close(s); }
 void broker_fd_close(int fd) { fdheld_close(fd); }
 
 /* Stamp the caller's pid and effective guest creds into a request (the
- * daemon's advisory permission checks run against these). */
+ * daemon's advisory permission checks run against these). The two ids are
+ * read one at a time, atomically, rather than copied out under the task
+ * lock: mmap resolves a tier memfd's seals through here while holding
+ * as_lock, inside which the task lock may not be taken (machine.h, the
+ * hierarchy), and a stamp that is an id or two behind a racing setter is
+ * the same stamp the request would have carried an instant earlier. */
 static void breq_stamp(struct Machine *m, struct BReq *q) {
     q->pid = (s32)getpid();
-    q->uid = m->fake_id ? m->cred.euid : (u32)geteuid();
-    q->gid = m->fake_id ? m->cred.egid : (u32)getegid();
+    q->uid = m->fake_id ? __atomic_load_n(&m->cred.euid, __ATOMIC_RELAXED)
+                        : (u32)geteuid();
+    q->gid = m->fake_id ? __atomic_load_n(&m->cred.egid, __ATOMIC_RELAXED)
+                        : (u32)getegid();
 }
 
 /* One request/response round-trip. Stamps the caller's pid and effective guest

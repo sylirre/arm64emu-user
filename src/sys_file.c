@@ -114,7 +114,6 @@ void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
 }
 
 /* True when -fake-id is active and the guest's effective uid is root. */
-static int fake_root(struct Machine *m) { return m->fake_id && m->cred.euid == 0; }
 
 /* Bounded guest-iovec import. Returns iov count or -errno.
  *
@@ -1388,9 +1387,11 @@ static u64 access_faked(struct Machine *m, const PathPin *p, int mode, int eff) 
     /* The same mode every other guest-visible stat of this file reports: a
      * memfd whose mode the host would not hold is the registry's (sys_misc.c). */
     mfd_stat_fixup(m, proc_own_fd_path(p->host), &st);
-    int r = mode_access_ok(eff ? m->cred.euid : m->cred.ruid,
-                           eff ? m->cred.egid : m->cred.rgid,
-                           m->cred.groups, m->cred.ngroups,
+    Cred cr;
+    cred_get(m, &cr);
+    int r = mode_access_ok(eff ? cr.euid : cr.ruid,
+                           eff ? cr.egid : cr.rgid,
+                           cr.groups, cr.ngroups,
                            remap_uid(m, (u32)st.st_uid),
                            remap_gid(m, (u32)st.st_gid),
                            (u32)st.st_mode, mode);
@@ -1511,7 +1512,7 @@ SYSDEF(readlinkat) {
      * guest path (a magic self-link, or a /proc/self/fd entry mapped back
      * through the mount table) is namespace-absolute here, and a guest that
      * pivot_root'd would not recognize its own paths. */
-    if (buf[0] == '/' && c->m->chroot_base[0] && strcmp(c->m->chroot_base, "/")) {
+    if (buf[0] == '/' && croot_active(c->m)) {
         buf[rn] = 0;
         char view[PATH_MAX];
         path_chroot_view(c->m, buf, view);
@@ -2372,7 +2373,13 @@ SYSDEF(chdir) {
      * walk found, whatever the name means by now. The open carries the
      * kernel's own refusals -- ENOTDIR, and EACCES for a directory this
      * process may not search, which the old string tracking never noticed.
-     * The descriptor is ours for the moment (machine.h). */
+     * The descriptor is ours for the moment (machine.h). The host's move and
+     * the published copy are one step under the task lock (a kernel's
+     * set_fs_pwd under fs->lock): a sibling refreshing the copy from the
+     * kernel's answer meanwhile would otherwise publish the old directory
+     * over the new one. The fd window sits inside the lock, never the other
+     * way round (machine.h, the fork barrier). */
+    task_lock();
     fdwin_enter();
     int dfd = openat(pin.dfd, pin.name,
                      O_PATH | O_DIRECTORY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
@@ -2380,11 +2387,10 @@ SYSDEF(chdir) {
     if (dfd >= 0 && fchdir(dfd) < 0) { e = errno; close(dfd); dfd = -1; }
     else if (dfd >= 0) close(dfd);
     fdwin_leave();
+    if (dfd >= 0) cwd_publish_locked(c->m, canon);   /* keep /proc/<pid>/cwd live */
+    task_unlock();
     path_unpin(&pin);
-    if (dfd < 0) return (u64)(s64)-e;
-    strcpy(c->m->cwd, canon);
-    proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
-    return 0;
+    return dfd < 0 ? (u64)(s64)-e : 0;
 }
 
 SYSDEF(fchdir) {
@@ -2395,13 +2401,17 @@ SYSDEF(fchdir) {
      * has a host path outside the rootfs entirely, and used to land the guest
      * on "/". bubblewrap fchdir()s a root fd it kept across its pivot_root, so
      * it noticed immediately. */
-    if (fchdir((int)(s32)a0) < 0) return host_err();
-    char guest[PATH_MAX];
-    if (dirfd_guest_path(c->m, (int)(s32)a0, guest) == 0) {
-        strcpy(c->m->cwd, guest);
-        proctab_set_cwd((s32)getpid(), c->m->cwd);   /* keep /proc/<pid>/cwd live */
+    task_lock();   /* the move and the published copy, one step (chdir) */
+    if (fchdir((int)(s32)a0) < 0) {
+        u64 e = host_err();
+        task_unlock();
+        return e;
     }
-    cwd_current(c->m, guest, NULL);   /* ...and the kernel's word on it */
+    char guest[PATH_MAX];
+    if (dirfd_guest_path(c->m, (int)(s32)a0, guest) == 0)
+        cwd_publish_locked(c->m, guest);   /* keep /proc/<pid>/cwd live */
+    cwd_current_locked(c->m, guest, NULL);   /* ...and the kernel's word on it */
+    task_unlock();
     return 0;
 }
 
@@ -2424,7 +2434,7 @@ SYSDEF(chroot) {
     path_unpin(&pin);
     if (sr < 0) return e;
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
-    strcpy(m->chroot_base, canon);
+    croot_set(m, canon);
     return 0;
 }
 
@@ -2596,7 +2606,7 @@ SYSDEF(pivot_root) {
     if (r < 0) return (u64)(s64)r;
     r = bind_add(m, ocanon, roothost, path_host_root(m, "/"), 0);
     if (r < 0) return (u64)(s64)r;
-    strcpy(m->chroot_base, ncanon);
+    croot_set(m, ncanon);
     return 0;
 }
 

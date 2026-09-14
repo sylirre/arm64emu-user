@@ -366,7 +366,7 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
  * at a 64 MB limit a kernel gave it 65016 KB while this killed it at the same
  * 8124 KB, an eighth of the stack it had asked for and been granted. */
 static u64 stack_size_for(struct Machine *m) {
-    u64 rl = m->rlim[G_RLIMIT_STACK].rlim_cur;
+    u64 rl = rlim_cur(m, G_RLIMIT_STACK);
 
     if (rl == G_RLIM_INFINITY) return STK_LIM;
     if (rl > STACK_MAX) return STACK_MAX;
@@ -375,7 +375,7 @@ static u64 stack_size_for(struct Machine *m) {
 
 u64 exec_arg_budget(struct Machine *m) {
     u64 limit = STK_LIM / 4 * 3;
-    u64 stkrl = m->rlim[G_RLIMIT_STACK].rlim_cur;
+    u64 stkrl = rlim_cur(m, G_RLIMIT_STACK);
 
     if (stkrl != G_RLIM_INFINITY && stkrl / 4 < limit) limit = stkrl / 4;
     if (limit < G_ARG_MAX) limit = G_ARG_MAX;
@@ -525,10 +525,12 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     /* Credentials (fake identity when -fake-id, else the real host ids).
      * AT_SECURE reflects a setuid/setgid transition (do_execve set euid/egid
      * from the file's bits before this reload), telling libc to run guarded. */
-    u32 at_uid = m->fake_id ? m->cred.ruid : (u32)getuid();
-    u32 at_euid = m->fake_id ? m->cred.euid : (u32)geteuid();
-    u32 at_gid = m->fake_id ? m->cred.rgid : (u32)getgid();
-    u32 at_egid = m->fake_id ? m->cred.egid : (u32)getegid();
+    Cred cr;
+    cred_get(m, &cr);
+    u32 at_uid = m->fake_id ? cr.ruid : (u32)getuid();
+    u32 at_euid = m->fake_id ? cr.euid : (u32)geteuid();
+    u32 at_gid = m->fake_id ? cr.rgid : (u32)getgid();
+    u32 at_egid = m->fake_id ? cr.egid : (u32)getegid();
     u64 at_secure = (at_uid != at_euid || at_gid != at_egid) ? 1 : 0;
     /* setup_new_exec: a new image is dumpable again, unless it is a secure
      * one, which gets fs.suid_dumpable -- 0, the compiled-in default. */
@@ -639,8 +641,10 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
      * {cmdline,environ,auxv,exe,cwd} see the guest view (and this process counts
      * as a guest PID for the hidden /proc view). Covers the initial exec and
      * every execve reload. */
+    char cwd[PATH_MAX];
+    cwd_get(m, cwd);   /* one thread by now (de_thread), but the copy is the rule */
     proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,
-                     m->exec_path, m->cwd, m->environ, m->environ_len,
+                     m->exec_path, cwd, m->environ, m->environ_len,
                      m->auxv, m->auxv_len);
     /* ...and the address-space figures, which the mappings above published
      * before the image spans they carry were recorded (those are assigned
