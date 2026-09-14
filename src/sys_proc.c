@@ -489,6 +489,7 @@ static void futex_wake_addr(CPU *c, u64 va) {
 
 static void *thread_entry(void *arg) {
     GThread *t = arg;
+    sig_kick_timer_init();   /* the capture kick's timer, aimed at this thread */
     sig_tls_prewarm();   /* before any handler can fire on this thread: a
                           * first emulated-TLS access mallocs (Bionic) */
     s32 tid = (s32)syscall(SYS_gettid);
@@ -536,6 +537,7 @@ static void *thread_entry(void *arg) {
      * joiners. */
     jit_thread_exit();
     sig_tls_release();   /* and whatever this thread's signal queue grew into */
+    sig_kick_timer_fini();
     /* Leave the address space's thread count *before* releasing a joiner. That
      * count is what tells the rest of the emulator how many guest threads are
      * live -- it gates the retired-backing drain, and de_thread waits on it --

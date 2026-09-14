@@ -124,7 +124,47 @@ int emu_loop(CPU *c) {
             unsigned ec = (unsigned)(esr >> 26);
             switch (ec) {
                 case EC_SVC64:
+                    /* A signal that arrived while the engine was in guest code
+                     * is delivered BEFORE the syscall runs, as a kernel delivers
+                     * one that lands on a task in user mode: before its next
+                     * instruction. The engines check the lever at their safe
+                     * points -- every instruction for the interpreter, block
+                     * entries for the JIT -- so one that landed after the last
+                     * check and before the SVC is found here, with the syscall
+                     * not yet dispatched. Dispatched first, a blocking syscall
+                     * never came back: the host signal that carried the guest's
+                     * had been consumed queuing it, and nothing was left to
+                     * interrupt the wait -- glibc's setxid broadcast wedged a
+                     * thread blocking on the setxid lock a few instructions
+                     * after a sibling's SIGSETXID landed (tests/fixtures/
+                     * sigsvc.c). So the SVC is stepped back over and left for
+                     * after the handler: the frame is built at it, and the
+                     * return re-executes it, exactly the kernel's order. Only
+                     * for what WILL be delivered -- a blocked or ignored signal
+                     * stays queued and the syscall proceeds -- and for the
+                     * emulator's own call-outs, which need this thread at the
+                     * loop boundary rather than in a wait: a tracer's kick
+                     * (ptrace_service_kick) and execve's de_thread (stop_gen).
+                     *
+                     * A capture that lands after this check and before the
+                     * host syscall is entered is the one neither this nor the
+                     * EINTR can catch; the flag raised first is what makes
+                     * such a capture arm the kick timer that will (signal.c,
+                     * "the capture kick"). Raised before the check, so that a
+                     * capture between the two is seen by the check or arms
+                     * the timer -- never neither. */
+                    g_sig_in_syscall = 1;
+                    if (UNLIKELY(g_sig_npend) &&
+                        (g_ptrace_kick ||
+                         __atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) !=
+                             g_tls.stop_gen ||
+                         sig_pending_deliverable(c->m))) {
+                        g_sig_in_syscall = 0;
+                        c->pc -= 4;
+                        break;
+                    }
                     syscall_dispatch(c);
+                    g_sig_in_syscall = 0;
                     break;
                 case EC_DABORT_LOWER:
                 case EC_DABORT_SAME: {
@@ -195,6 +235,9 @@ int emu_loop(CPU *c) {
 
         /* Deliver any host-caught guest signal at this safe boundary. */
         if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
+        /* The boundary has been reached: a kick timer armed by a capture
+         * inside a syscall handler has done its job, or was never needed. */
+        sig_kick_timer_disarm();
 
         /* Adopt a pending PTRACE_ATTACH/SEIZE or service a PTRACE_INTERRUPT
          * (the kick signal set g_ptrace_kick and reused g_sig_npend to exit the

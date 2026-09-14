@@ -527,6 +527,14 @@ extern __thread volatile sig_atomic_t g_sig_npend;
  * sig_kick_net): the EINTR it inflicted is ours, not the guest's, and the
  * syscall it hit is restarted rather than reported. */
 extern __thread volatile sig_atomic_t g_sig_selfintr;
+/* The capture kick (signal.c): raised by the run loop from the SVC check to
+ * the dispatcher's return, so a guest signal captured meanwhile arms the
+ * timer that will bring this thread out of whatever host syscall the handler
+ * enters after the capture. */
+extern __thread volatile sig_atomic_t g_sig_in_syscall;
+void sig_kick_timer_init(void);     /* before a thread runs guest code */
+void sig_kick_timer_fini(void);     /* as it ends */
+void sig_kick_timer_disarm(void);   /* the run loop's delivery point */
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
 /* do_sigaction: swap the disposition of `sig` under the siglock stand-in, so a

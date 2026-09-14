@@ -355,7 +355,13 @@ void sig_tls_release(void) { sigq_reset(); }
  * it takes: whatever was pending at that moment ran in the child too, at its
  * next unblock. Also lifts anything the gate had blocked host-side, since the
  * child holds nothing back for the kernel. */
-void sig_fork_child(void) { sigq_reset(); }
+void sig_fork_child(void) {
+    sigq_reset();
+    /* The kick timer is the forking thread's and did not come across (no
+     * POSIX timer does): this thread, the child's only one, makes its own
+     * (the inherited handle is not deleted -- it is not ours to delete). */
+    sig_kick_timer_init();
+}
 
 /* Append one captured signal. Async-signal-safe: no allocation, no lock, and
  * the only producer is this thread's own handlers, which never nest. Returns
@@ -439,6 +445,98 @@ static int g_sig_remap_armed[2];          /* [0]: 32, [1]: 33 (atomic flags) */
  * read any of them (SIGRTMAX is a function call on glibc, so none of the three
  * can carry its default as a static initializer). */
 int g_sig_kicksig;
+
+/* ---- the capture kick: a guest signal must not sleep behind a syscall ------
+ *
+ * A guest signal reaches this thread as a host signal, and the host handler
+ * (host_catcher) queues it for the run loop to deliver at its next safe
+ * boundary. Where the thread is at that instant decides how it gets there:
+ * in guest code, the engines' levers bring it out; blocked in a host
+ * syscall, the handler's return gives that syscall EINTR (none of the
+ * catchers has SA_RESTART) and the dispatcher brings it out. There is a third
+ * place, and it used to be a hole: inside the dispatcher but BEFORE the
+ * host syscall has been entered -- the handler runs, queues the signal, and
+ * returns to a thread that then enters the syscall and sleeps, with nothing
+ * left to interrupt it, the host signal having been consumed queuing it. A
+ * kernel has no such hole: a signal that arrives before a task enters a
+ * syscall is delivered before the task's next instruction, and one pending
+ * at entry makes an interruptible wait return at once.
+ *
+ * Narrow as the window is, glibc's setxid broadcast walks straight into it:
+ * every setresuid signals every other thread and waits for each to run its
+ * handler, and a thread that has just returned from that handler re-enters
+ * the futex it was interrupted in -- pthread_join, the setxid lock -- in the
+ * same microseconds the next broadcast reaches it. tests/fixtures/sigsvc.c
+ * wedged in three runs of three.
+ *
+ * So a capture that lands while the run loop is between its SVC check and
+ * the dispatcher's return (g_sig_in_syscall, loop.c) arms a one-shot host
+ * timer aimed at this thread (SIGEV_THREAD_ID, the reserved
+ * kick signal, CLOCK_MONOTONIC), first at 200 us and then every millisecond
+ * until the run loop reaches its delivery point and disarms it. Wherever the
+ * thread is by then, the kick brings it to the boundary: a syscall it has
+ * entered gets the EINTR the capture could not give it (sig_kick_net sets
+ * the self-interrupt flag, so the guest never sees that EINTR: the call is
+ * restarted around the delivery like any of our own interruptions); one it
+ * has not yet entered is preceded by the SVC check (loop.c). A kick that
+ * finds nothing to do -- the boundary was reached on its own before the
+ * timer fired -- is the same invisible restart. The timer is per thread,
+ * created before the thread runs guest code and deleted when it ends; it is
+ * not inherited by fork (no POSIX timer is), so a child makes its own. Where
+ * a timer cannot be had (a host out of them), the hole stays as it was and
+ * says so once. */
+#define SIGQ_KICK_MAGIC 0x6b49434b   /* 'kICK': si_value of the timer's signal */
+__thread volatile sig_atomic_t g_sig_in_syscall;
+static __thread timer_t g_kick_timer;
+static __thread int g_kick_timer_ok;
+static __thread volatile sig_atomic_t g_kick_armed;
+
+void sig_kick_timer_init(void) {
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo = g_sig_kicksig;
+    sev.sigev_value.sival_int = SIGQ_KICK_MAGIC;
+#ifdef sigev_notify_thread_id
+    sev.sigev_notify_thread_id = (pid_t)syscall(SYS_gettid);
+#else
+    sev._sigev_un._tid = (pid_t)syscall(SYS_gettid);   /* glibc union field */
+#endif
+    g_kick_armed = 0;
+    g_kick_timer_ok = timer_create(CLOCK_MONOTONIC, &sev, &g_kick_timer) == 0;
+    if (!g_kick_timer_ok) {
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "arm64chroot: no host timer for the signal kick "
+                            "(%s); a guest signal caught as a thread enters a "
+                            "blocking syscall may wait for it\n",
+                    strerror(errno));
+    }
+}
+
+void sig_kick_timer_fini(void) {
+    if (!g_kick_timer_ok) return;
+    timer_delete(g_kick_timer);
+    g_kick_timer_ok = 0;
+    g_kick_armed = 0;
+}
+
+/* From the capture handler: timer_settime is a bare syscall, and the flag is
+ * this thread's own. */
+static void sig_kick_timer_arm(void) {
+    if (!g_kick_timer_ok || g_kick_armed) return;
+    g_kick_armed = 1;
+    struct itimerspec its = { { 0, 1000000L }, { 0, 200000L } };
+    timer_settime(g_kick_timer, 0, &its, NULL);
+}
+
+/* From the run loop, at its delivery point. */
+void sig_kick_timer_disarm(void) {
+    if (!g_kick_armed) return;
+    g_kick_armed = 0;
+    struct itimerspec its = { { 0, 0 }, { 0, 0 } };
+    timer_settime(g_kick_timer, 0, &its, NULL);
+}
 
 static int sig_remap_to_guest(int sig) {
     if (sig == SIG_REMAP32_HOST &&
@@ -561,6 +659,10 @@ void sig_tls_prewarm(void) {
     if (!sigq) { sigq = sigq_base; sigq_cap = SIGQ_MIN; }   /* the queue itself */
     (void)*(volatile sig_atomic_t *)&g_sig_npend;
     (void)*(volatile sig_atomic_t *)&g_ptrace_kick;   /* sig_kick_net */
+    (void)*(volatile sig_atomic_t *)&g_sig_in_syscall; /* the kick timer's */
+    (void)*(volatile sig_atomic_t *)&g_kick_armed;
+    (void)*(volatile int *)&g_kick_timer_ok;
+    (void)*(volatile timer_t *)&g_kick_timer;
     (void)*(volatile s32 *)&g_tls.tid;                /* handlers read g_tls */
     bus_tls_prewarm();   /* mem.c: bus_catcher's g_bus_jb/g_bus_armed/g_bus_cpu */
     jit_tls_prewarm();   /* jit.c: g_jit_env, jit_signal_interrupt's target */
@@ -610,6 +712,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     if (g_tls.sigmask & (1ULL << (p->signo - 1))) g_sig_selfintr = 1;
     if (!sigq_push(p, uctx)) return;
     jit_signal_interrupt();   /* make generated code exit at its next entry */
+    if (g_sig_in_syscall) sig_kick_timer_arm();   /* see the kick timer above */
 }
 
 /* A guest signal set as the host numbers that stand for it: what the kernel
@@ -856,6 +959,16 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
                      wait4/waitid is the whole effect; no other flags, and
                      invisible to the guest -- including the EINTR, which
                      restarts whatever else of ours it landed on */
+    }
+    if (si->si_code == SI_TIMER && si->si_value.sival_int == SIGQ_KICK_MAGIC) {
+        /* The capture kick timer (above): nothing to record, the queued
+         * signal is already there -- this only has to bring the thread to
+         * the loop boundary, out of whatever host syscall it entered after
+         * the capture, and invisibly. */
+        g_sig_selfintr = 1;
+        g_sig_npend = 1;
+        jit_signal_interrupt();
+        return;
     }
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == DETHREAD_MAGIC) {
         /* execve's de_thread call-out. Nothing else to record: the run loop's

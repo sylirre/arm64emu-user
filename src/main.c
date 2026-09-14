@@ -929,6 +929,8 @@ int main(int argc, char **argv)
     /* Arm the ptrace attach stop-kick net (reserved RT signal) so a later
      * PTRACE_ATTACH/SEIZE/INTERRUPT can stop this process cooperatively. */
     sig_install_kick_net();
+    sig_kick_timer_init();   /* the capture kick's timer for the main thread:
+                              * aimed at the reserved number just chosen */
     sig_inherit_host_mask(m);   /* the guest starts with the mask it was given
                                  * (execve keeps it), and the host's is the
                                  * guest's from here on -- after the reserved

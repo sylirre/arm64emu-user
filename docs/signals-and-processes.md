@@ -187,6 +187,47 @@ after signal delivery so a real guest signal's own disposition — a frame, or t
 `SA_RESTART` rewind above — decides first. The PC test distinguishes "just
 returned from that syscall" from a stale flag.
 
+##### A signal caught on the way into a syscall
+
+A guest signal reaches a thread as a host signal, and the host handler queues
+it for the run loop to deliver at its next safe boundary. Where the thread is
+at that instant decides how it gets there: in guest code, the engines' levers
+bring it out (every instruction for the interpreter, block entries for the
+JIT); blocked in a host syscall, the handler's return gives that syscall
+`EINTR` (no catcher has `SA_RESTART`) and the dispatcher brings it out. Two
+more places used to be holes. A capture that landed after the engine's last
+check and before the SVC — inside the JIT block that ends in it — was found
+only once the syscall had been dispatched, and a blocking one never came back;
+a kernel delivers a signal that lands on a task in user mode before its next
+instruction, so the run loop now checks before dispatching an SVC and, when a
+deliverable signal (or one of the emulator's own call-outs: a tracer's kick,
+execve's `de_thread`) is waiting, steps back over the SVC and lets the delivery
+build its frame there — the handler runs first and the syscall on return,
+exactly the kernel's order (`loop.c`). And a capture that lands after that
+check and before the host syscall is entered is beyond the reach of both:
+the handler runs, queues the signal, and returns to a thread that then enters
+the syscall and sleeps, with the host signal that carried the guest's already
+consumed. A kernel has no such window (a signal pending at entry makes an
+interruptible wait return at once); here it is closed by the **capture kick**
+(`signal.c`): while the loop is between the SVC check and the dispatcher's
+return, a capture arms a one-shot host timer aimed at the thread
+(`SIGEV_THREAD_ID`, the reserved kick signal, 200 µs and then every
+millisecond) that the loop disarms at its delivery point; a syscall entered
+meanwhile gets from the kick the `EINTR` the capture could not give it, marked
+as the emulator's own so the guest never sees it — the call is restarted
+around the delivery like any of the emulator's interruptions. The timer is per
+thread, made before the thread runs guest code and deleted as it ends, and a
+fork child makes its own (no POSIX timer is inherited).
+
+Narrow as those windows are, glibc's setxid broadcast walks straight into
+them: every `setresuid` signals every other thread and waits for each to run
+its handler, and a thread returning from that handler re-enters the futex it
+was interrupted in — `pthread_join`, the setxid lock — in the same microseconds
+the next broadcast reaches it. `tests/fixtures/sigsvc.c` (four threads
+spinning on a syscall, two calling `setresuid(-1, -1, -1)` in turn) wedged in
+three runs of three in either engine; a threaded program dropping privileges
+is the everyday shape of it.
+
 A restarted call must not restart its **timeout** as well, or a 5 s `poll`
 interrupted at 4 s would wait 9 s. The kernel restarts against the original
 deadline, so time the task spent stopped counts against the wait; the same is

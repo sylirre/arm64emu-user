@@ -1078,6 +1078,28 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- a guest signal caught on the way into a syscall (src/loop.c, the SVC
+# check; src/signal.c, the capture kick). glibc's setxid broadcast signals
+# every thread and waits for each handler, and a thread re-entering the futex
+# it was interrupted in meets the next broadcast in the same microseconds: the
+# signal was queued behind a wait nothing could interrupt, and the process
+# wedged -- 3 runs of 3 in either engine. Self-checking: the point is that it
+# finishes. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/sigsvc.bin \
+            tests/fixtures/sigsvc.c $A64_TESTLIBS 2>/dev/null; then
+        for eng in "" "--jit"; do
+            lbl="fixture: sigsvc${eng:+ (jit)}"
+            got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/sigsvc.bin 2>/dev/null); rc=$?
+            if [ "$got" = "done" ] && [ "$rc" = 0 ]; then pass=$((pass+1)); echo "PASS $lbl"
+            else fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$got')"; fi
+        done
+        fx_rm tests/fixtures/sigsvc.bin
+    else
+        skip_build "fixtures/sigsvc"
+    fi
+fi
+
 # ---- the seccomp chain under concurrent installers (src/sys_seccomp.c): eight
 # threads pushing onto one chain must leave every filter on it, a filter one
 # thread installs binds the rest, and the chain budget (MAX_INSNS_PER_PATH,
