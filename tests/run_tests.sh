@@ -1580,6 +1580,28 @@ for base in memfd_seals memfd_ro_share mfdsync mmap_eof; do
     fi
 done
 
+# ---- the tier's seals across the broker's idle grace (src/proctab.c): a
+# registered memfd must keep the session daemon alive while a holder lives,
+# and an exchange made from under as_lock (mmap's) must never spawn one. It
+# used to lose the seals after ten idle seconds, and abort on the respawn.
+# Self-checking against what a real kernel prints; the sleep is the point,
+# so one engine. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/memfd_idle.bin \
+            tests/fixtures/memfd_idle.c 2>/dev/null; then
+        expect=$'seal=0\nget=8\nget-after=8\nmmap-shared-w=1\nmmap-shared-r=1\nchild-get=8\nchild=1'
+        got=$(A64_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / tests/fixtures/memfd_idle.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: memfd_idle (memfd-tier)"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: memfd_idle (memfd-tier)"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        fx_rm tests/fixtures/memfd_idle.bin
+    else
+        skip_build "fixtures/memfd_idle"
+    fi
+fi
+
 # ---- and the tier a pre-6.x host kernel puts the NATIVE memfd path on ----
 # F_SEAL_WRITE takes a deny-writable reference on the inode, and a kernel older
 # than 6.x counts every shared mapping against it before asking whether the

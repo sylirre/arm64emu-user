@@ -545,11 +545,26 @@ static s32 g_next_shmid = 1;
  * writable MAP_SHARED mappings per process (the VM_MAYWRITE criterion),
  * which is what F_ADD_SEALS(F_SEAL_WRITE) must refuse with EBUSY; the
  * per-pid start-time rows let a SIGKILL'd mapper's count be reclaimed the
- * same way shm attach rows are. Entries live until the daemon retires --
- * once no emulator process is left, no guest fd can exist either. */
+ * same way shm attach rows are.
+ *
+ * An entry lives while a process that holds the memfd may still be alive,
+ * and it is the entry that keeps the DAEMON alive: the session daemon
+ * retires after a grace period with nothing to serve, and the memfd
+ * registry used to count for nothing there, so a guest that created and
+ * sealed a memfd and touched it again ten seconds later found a fresh
+ * daemon with no record of it -- the seals gone (a write-sealed memfd
+ * mapped writable), and the respawn that found it made from under mmap's
+ * as_lock, which is a fork the fork barrier forbids (an abort). Every
+ * process that registers or looks the entry up is recorded as a holder
+ * with its start time (hold[]), like the writable mappers; the idle check
+ * reclaims the dead ones and keeps the daemon while any is left. A
+ * process that got the fd by fork or SCM_RIGHTS and never used it is the
+ * one this cannot see; it is also the one that never asks. */
 #define MFD_TAB_MAX   256   /* MFD_NAME_MAX comes from machine.h */
 #define MFD_WR_TRACK  32
+#define MFD_HOLD_TRACK 32
 struct MfdWr { s32 pid; u64 start; u32 n; };
+struct MfdHold { s32 pid; u64 start; };
 struct Mfd {
     int used;
     u64 dev, ino;
@@ -558,6 +573,8 @@ struct Mfd {
     char name[MFD_NAME_MAX];  /* guest-visible memfd name, for /proc views */
     struct MfdWr wr[MFD_WR_TRACK];
     int nwr;
+    struct MfdHold hold[MFD_HOLD_TRACK];
+    int nhold;
     /* A mode the host would not hold. Android's SELinux policy refuses an app
      * every mode change on a memfd, so a guest that takes the execute bit off
      * one of its own gets EACCES from a call Linux allows -- and the exec
@@ -581,6 +598,46 @@ static struct Mfd *mfd_find(u64 dev, u64 ino) {
         if (g_mfd[i].used && g_mfd[i].dev == dev && g_mfd[i].ino == ino)
             return &g_mfd[i];
     return NULL;
+}
+
+/* Drop the holders that are gone (a reused pid has another start time). */
+static void mfd_hold_reclaim(struct Mfd *e) {
+    for (int i = 0; i < e->nhold; ) {
+        if (proc_starttime(e->hold[i].pid) != e->hold[i].start)
+            e->hold[i] = e->hold[--e->nhold];
+        else i++;
+    }
+}
+
+/* Note `pid` as a holder of `e`: it registered the memfd, or asked about
+ * it, which is what a process does with a memfd it holds. A table with no
+ * room for one more keeps the ones it has -- the entry then lives as long
+ * as they do, not as long as the newcomer. */
+static void mfd_hold_add(struct Mfd *e, s32 pid) {
+    if (pid <= 0) return;
+    for (int i = 0; i < e->nhold; i++)
+        if (e->hold[i].pid == pid) {
+            e->hold[i].start = proc_starttime(pid);   /* a reused pid: re-stamp */
+            return;
+        }
+    if (e->nhold == MFD_HOLD_TRACK) mfd_hold_reclaim(e);
+    if (e->nhold == MFD_HOLD_TRACK) return;
+    e->hold[e->nhold].pid = pid;
+    e->hold[e->nhold].start = proc_starttime(pid);
+    e->nhold++;
+}
+
+/* Does any registered memfd still have a live holder? The daemon's idle
+ * check: reclaims on the way, so a table of dead holders costs one pass. */
+static int mfd_any_live(void) {
+    int live = 0;
+    for (int i = 0; i < MFD_TAB_MAX; i++) {
+        struct Mfd *e = &g_mfd[i];
+        if (!e->used) continue;
+        mfd_hold_reclaim(e);
+        if (e->nhold) live = 1;
+    }
+    return live;
 }
 static s32 mfd_do_reg(struct BReq *q, int rfd, int cfd) {
     char name[MFD_NAME_MAX];
@@ -615,6 +672,7 @@ static s32 mfd_do_reg(struct BReq *q, int rfd, int cfd) {
     e->seals = (u32)q->val;
     e->fd = pin;
     memcpy(e->name, name, sizeof e->name);
+    mfd_hold_add(e, q->pid);
     return 0;
 }
 static void mfd_wr_reclaim(struct Mfd *e) {
@@ -667,6 +725,7 @@ static s32 mfd_do_mode(struct BReq *q, int rfd) {
     }
     e->mode = (u32)q->val & 07777u;
     e->has_mode = 1;
+    mfd_hold_add(e, q->pid);
     return 0;
 }
 
@@ -1891,6 +1950,7 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
         /* A mode-only entry describes a NATIVE memfd: its seals are the
          * kernel's, and answering from here would hide them. */
         if (!e || !e->tier) { r.ret = -ENOENT; break; }
+        mfd_hold_add(e, q->pid);   /* asking is holding */
         r.ret = (s32)e->seals;
         r.size = strlen(e->name);
         mfd_name = e->name;              /* payload follows the BResp */
@@ -2015,7 +2075,8 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
             /* idle grace elapsed: leave once nothing anchors the session */
             ipc_reclaim();
             if ((!serve_proctab || !broker_table_live(tab)) && !shm_any_live() &&
-                !sem_any_live() && !msg_any_live() && !g_nwait) break;
+                !sem_any_live() && !msg_any_live() && !mfd_any_live() &&
+                !g_nwait) break;
             last_active = now;   /* anchored: re-arm the grace window */
         }
     }
@@ -2824,6 +2885,15 @@ static int shm_connect(struct Machine *m) {
     struct sockaddr_un a;
     socklen_t al = m->shared_proc ? broker_addr(&a, fnv1a32(m->rootfs), 0)
                                   : broker_addr(&a, 0, m->shm_session);
+    /* A daemon that is not there is spawned -- which forks, and a fork under
+     * one of the emulator's locks is what the fork barrier aborts on
+     * (emu_fork_check). The memfd registry is asked from under as_lock: mmap
+     * resolves a tier memfd's seals there, and every region insert or delete
+     * adjusts the mapping census. Those exchanges connect and never spawn;
+     * with the registry anchoring the daemon while a holder lives
+     * (mfd_any_live), the daemon they find missing is one that was killed,
+     * and the exchange fails as it would against any daemon that is gone. */
+    int may_spawn = !g_emu_lk_held && !g_emu_as_depth;
     int spawns = 0;
     for (int attempt = 0; attempt < 100; attempt++) {
         /* The socket is the emulator's own for as long as the exchange lasts
@@ -2848,6 +2918,7 @@ static int shm_connect(struct Machine *m) {
         close(s);
         fdwin_leave();
         if (e != ECONNREFUSED && e != ENOENT) return -1;
+        if (!may_spawn) return -1;
         /* Spawn a shm-only daemon on the first miss (a --shared-proc proctab
          * daemon, if any, already owns this rendezvous and answers shm too). */
         if (spawns == 0 || attempt % 16 == 0) {

@@ -1601,6 +1601,18 @@ the `/proc/self/fd/N` spelling of the same object, and into `exec_perm_check`
 answering about the host's mode. Unlike the seals it is not monotonic, so
 nothing caches it. `A64_MEMFD_CHMOD_FORCE_DENY=1` forces that tier on any host.
 
+The registry lives in the session's broker daemon, which retires after a
+grace period with nothing to serve — and a registered memfd counts as
+something to serve: every process that registers one or asks about it is
+recorded as a holder with its start time, the idle check reclaims the dead
+ones and keeps the daemon while any is left (`mfd_any_live`). It used to count
+for nothing, so a guest that created and sealed a memfd and touched it again
+ten seconds later found a fresh daemon with no record of it — the seals gone, a
+write-sealed memfd mapped writable — and the respawn that found it was made
+from under `mmap`'s `as_lock`, a fork the fork barrier aborts on. An exchange
+made under an emulator lock now never spawns (`shm_connect`): the daemon it
+finds missing is one that was killed, and it fails as against any daemon that
+is gone. `tests/fixtures/memfd_idle.c` sleeps past the grace and asks again.
 `A64_MEMFD_FORCE_FILE=1` forces the file tier on
 any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
