@@ -90,9 +90,9 @@ struct ProcEnt {
     u8  userns;                  /* the owner faked CLONE_NEWUSER */
     u8  sg_deny;                 /* setgroups: "deny" latched */
     u8  uid_claim, gid_claim;    /* the single allowed write, CAS-claimed */
-    u32 uid_len, gid_len;        /* published AFTER the text below */
-    char uid_map[IDMAP_MAX];     /* kernel read-back form, "" until written */
-    char gid_map[IDMAP_MAX];
+    u32 uid_n, gid_n;            /* extents held, published AFTER them */
+    IdExtent uid_map[IDMAP_EXTENTS];   /* as validated, 0 extents until written */
+    IdExtent gid_map[IDMAP_EXTENTS];
 
     /* seccomp mode + installed filter count of the owner, for another process
      * reading its /proc/<pid>/status (sys_procfs.c). Outside the seqlock like
@@ -226,12 +226,13 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v6 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v7 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
      * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
      * faked user namespace's id maps; v5 the owner's seccomp state; v6 its
-     * non-guest host tasks.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v6.%u.%08x",
+     * non-guest host tasks; v7 holds the id maps as extents, all 340 of the
+     * kernel's ceiling, where v6 held 256 bytes of their text.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v7.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -298,9 +299,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v5.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v6.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v5.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v6.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2266,8 +2267,8 @@ int proctab_reserve(void) {
         e->start = 0;
         __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
         e->sg_deny = e->uid_claim = e->gid_claim = 0;
-        __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->uid_n, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->gid_n, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->seccomp, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->nforeign, 0, __ATOMIC_RELAXED);
         return i;
@@ -2369,8 +2370,8 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     if (claimed || (!reserved && e->start != start)) {
         __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
         e->sg_deny = e->uid_claim = e->gid_claim = 0;
-        __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->uid_n, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->gid_n, 0, __ATOMIC_RELAXED);
     }
     /* fetch_add, not load+store: two threads of one guest process can reach a
      * writer at once (a concurrent chdir via proctab_set_cwd), and a lost
@@ -2666,8 +2667,8 @@ void proctab_userns_fresh(s32 pid) {
     struct ProcEnt *e = resolve_entry(pid);
     if (!e) return;   /* table full: Machine answers, for us alone */
     e->sg_deny = e->uid_claim = e->gid_claim = 0;
-    __atomic_store_n(&e->uid_len, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&e->gid_len, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->uid_n, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->gid_n, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->userns, 1, __ATOMIC_RELEASE);   /* last: gates readers */
 }
 
@@ -2686,17 +2687,17 @@ void proctab_userns_seed(int slot, int fresh) {
     if (fresh) { e->userns = 1; return; }
     struct ProcEnt *p = own_entry();
     if (!p || !__atomic_load_n(&p->userns, __ATOMIC_ACQUIRE)) return;
-    u32 ul = __atomic_load_n(&p->uid_len, __ATOMIC_ACQUIRE);
-    u32 gl = __atomic_load_n(&p->gid_len, __ATOMIC_ACQUIRE);
-    if (ul > IDMAP_MAX) ul = IDMAP_MAX;
-    if (gl > IDMAP_MAX) gl = IDMAP_MAX;
-    if (ul) memcpy(e->uid_map, p->uid_map, ul);
-    if (gl) memcpy(e->gid_map, p->gid_map, gl);
+    u32 un = __atomic_load_n(&p->uid_n, __ATOMIC_ACQUIRE);
+    u32 gn = __atomic_load_n(&p->gid_n, __ATOMIC_ACQUIRE);
+    if (un > IDMAP_EXTENTS) un = IDMAP_EXTENTS;
+    if (gn > IDMAP_EXTENTS) gn = IDMAP_EXTENTS;
+    if (un) memcpy(e->uid_map, p->uid_map, un * sizeof *e->uid_map);
+    if (gn) memcpy(e->gid_map, p->gid_map, gn * sizeof *e->gid_map);
     e->sg_deny = __atomic_load_n(&p->sg_deny, __ATOMIC_ACQUIRE);
-    e->uid_claim = ul ? 1 : 0;   /* an inherited map is already written */
-    e->gid_claim = gl ? 1 : 0;
-    e->uid_len = ul;
-    e->gid_len = gl;
+    e->uid_claim = un ? 1 : 0;   /* an inherited map is already written */
+    e->gid_claim = gn ? 1 : 0;
+    e->uid_n = un;
+    e->gid_n = gn;
     e->userns = 1;
 }
 
@@ -2706,47 +2707,29 @@ int proctab_userns(s32 pid) {
     return e && __atomic_load_n(&e->userns, __ATOMIC_ACQUIRE);
 }
 
-/* Read one of the three files for `pid` into `out`. Returns 1 when this record
- * answered (`*len` set, possibly 0 for a map nobody has written), 0 to leave
- * the caller with its own Machine state. */
-int proctab_idmap_read(s32 pid, int kind, char *out, u32 outsz, u32 *len) {
-    *len = 0;
+/* Read one of the two maps of `pid` into `out` (IDMAP_EXTENTS of room).
+ * Returns 1 when this record answered (`*n` set, possibly 0 for a map nobody
+ * has written), 0 to leave the caller with its own Machine state. */
+int proctab_idmap_read(s32 pid, int kind, IdExtent *out, u32 *n) {
+    *n = 0;
     struct ProcEnt *e = resolve_entry(pid);
     if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
-    if (kind == PT_IDMAP_SG) {
-        /* Never empty: the kernel always reports one word or the other. */
-        const char *s = __atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE)
-                        ? "deny\n" : "allow\n";
-        u32 n = (u32)strlen(s);
-        if (n <= outsz) { memcpy(out, s, n); *len = n; }
-        return 1;
-    }
     int uid = kind == PT_IDMAP_UID;
-    u32 n = __atomic_load_n(uid ? &e->uid_len : &e->gid_len, __ATOMIC_ACQUIRE);
-    if (n > IDMAP_MAX) n = IDMAP_MAX;   /* a foreign build's value: clamp */
-    if (n > outsz) n = outsz;
-    if (n) memcpy(out, uid ? e->uid_map : e->gid_map, n);
-    *len = n;
+    u32 k = __atomic_load_n(uid ? &e->uid_n : &e->gid_n, __ATOMIC_ACQUIRE);
+    if (k > IDMAP_EXTENTS) k = IDMAP_EXTENTS;   /* a foreign build's value: clamp */
+    if (k) memcpy(out, uid ? e->uid_map : e->gid_map, k * sizeof *out);
+    *n = k;
     return 1;
 }
 
-/* Write one of the three files for `pid`. `text` is the kernel read-back form
- * the caller already validated ("deny\n"/"allow\n" for setgroups). Returns 1
- * when this record took the write, with *err 0 or the errno the kernel's
- * ordering rules call for; 0 to leave the caller with its own Machine state. */
-int proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err) {
+/* Write one map of `pid`: `ext` are the extents the caller already validated.
+ * Returns 1 when this record took the write, with *err 0 or the errno the
+ * kernel's ordering rules call for; 0 to leave the caller with its own
+ * Machine state. */
+int proctab_idmap_write(s32 pid, int kind, const IdExtent *ext, u32 n, int *err) {
     struct ProcEnt *e = resolve_entry(pid);
     if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
     *err = 0;
-    if (kind == PT_IDMAP_SG) {
-        /* Settable only until gid_map is written (the decision has been used by
-         * then), and never back from "deny" to "allow". */
-        int deny = len >= 4 && !memcmp(text, "deny", 4);
-        if (__atomic_load_n(&e->gid_len, __ATOMIC_ACQUIRE)) *err = -EPERM;
-        else if (!deny && __atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE)) *err = -EPERM;
-        else __atomic_store_n(&e->sg_deny, (u8)deny, __ATOMIC_RELEASE);
-        return 1;
-    }
     int uid = kind == PT_IDMAP_UID;
     u8 expect = 0;
     if (!__atomic_compare_exchange_n(uid ? &e->uid_claim : &e->gid_claim,
@@ -2755,10 +2738,35 @@ int proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err) 
         *err = -EPERM;   /* the kernel's one successful write per map */
         return 1;
     }
-    if (len > IDMAP_MAX) len = IDMAP_MAX;
-    if (len) memcpy(uid ? e->uid_map : e->gid_map, text, len);
-    /* Length last, so a reader that sees it takes bytes already in place. */
-    __atomic_store_n(uid ? &e->uid_len : &e->gid_len, len, __ATOMIC_RELEASE);
+    if (n > IDMAP_EXTENTS) n = IDMAP_EXTENTS;
+    if (n) memcpy(uid ? e->uid_map : e->gid_map, ext, n * sizeof *ext);
+    /* Count last, so a reader that sees it takes extents already in place. */
+    __atomic_store_n(uid ? &e->uid_n : &e->gid_n, n, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* The setgroups latch of `pid`: never empty, the kernel always reports one
+ * word or the other. */
+int proctab_setgroups_read(s32 pid, int *deny) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
+    *deny = __atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE) != 0;
+    return 1;
+}
+
+/* "deny" is settable only until gid_map is written (the decision has been
+ * used by then); "allow" is refused once "deny" stands, and is otherwise a
+ * no-op that succeeds -- after gid_map too, which used to be refused here. */
+int proctab_setgroups_write(s32 pid, int deny, int *err) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e || !__atomic_load_n(&e->userns, __ATOMIC_ACQUIRE)) return 0;
+    *err = 0;
+    if (deny) {
+        if (__atomic_load_n(&e->gid_n, __ATOMIC_ACQUIRE)) *err = -EPERM;
+        else __atomic_store_n(&e->sg_deny, 1, __ATOMIC_RELEASE);
+    } else if (__atomic_load_n(&e->sg_deny, __ATOMIC_ACQUIRE)) {
+        *err = -EPERM;
+    }
     return 1;
 }
 

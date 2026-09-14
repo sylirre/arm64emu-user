@@ -76,6 +76,13 @@ struct Bind {
                              * always visible to a reader that straddles it. */
 };
 
+/* One extent of a faked user namespace's id map, as the kernel keeps it
+ * (struct uid_gid_extent), and the kernel's ceiling on how many one map holds
+ * (UID_GID_MAP_MAX_EXTENTS). Held in this form rather than as the read-back
+ * text so the whole ceiling fits: the text is 34 bytes an extent. */
+typedef struct { u32 first, lower_first, count; } IdExtent;
+#define IDMAP_EXTENTS 340
+
 struct Machine {
     CPU cpu;
 
@@ -301,10 +308,9 @@ struct Machine {
      * here. Inherited by fork, like the namespace fiction itself. */
     u8 fake_userns;
     u8 uid_map_set, gid_map_set;   /* written once already (kernel's rule) */
-    u8 setgroups_set, setgroups_deny;
-#define IDMAP_MAX 256
-    char uid_map[IDMAP_MAX];       /* kernel-formatted text, "" until written */
-    char gid_map[IDMAP_MAX];
+    u8 setgroups_deny;             /* "deny" written: a one-way latch */
+    u16 uid_map_n, gid_map_n;      /* extents held below, 0 until written */
+    IdExtent uid_map[IDMAP_EXTENTS], gid_map[IDMAP_EXTENTS];
 
     /* seccomp-BPF (sys_seccomp.c). A guest filter is evaluated by the syscall
      * dispatcher, not installed on the host: a host filter would see the
@@ -1202,13 +1208,16 @@ s32  proctab_pid_at(int slot);
  * was recorded (proctab_userns), and from its own Machine otherwise. */
 #define PT_IDMAP_UID 0
 #define PT_IDMAP_GID 1
-#define PT_IDMAP_SG  2
 void proctab_userns_fresh(s32 pid);            /* unshare(CLONE_NEWUSER) */
 void proctab_userns_seed(int slot, int fresh); /* pre-fork, into a reservation */
 int  proctab_userns(s32 pid);                  /* has one recorded here? */
-/* Both return 1 when the registry answered, 0 to fall back to Machine state. */
-int  proctab_idmap_read(s32 pid, int kind, char *out, u32 outsz, u32 *len);
-int  proctab_idmap_write(s32 pid, int kind, const char *text, u32 len, int *err);
+/* All four return 1 when the registry answered, 0 to fall back to Machine
+ * state. A map is its extents (IDMAP_EXTENTS of room at `out`), already
+ * validated by the caller; setgroups is the "deny" latch. */
+int  proctab_idmap_read(s32 pid, int kind, IdExtent *out, u32 *n);
+int  proctab_idmap_write(s32 pid, int kind, const IdExtent *ext, u32 n, int *err);
+int  proctab_setgroups_read(s32 pid, int *deny);
+int  proctab_setgroups_write(s32 pid, int deny, int *err);
 
 /* Guest seccomp state, in the registry for the same reason: /proc/<pid>/status
  * Seccomp:/Seccomp_filters: is readable for any process, and a guest filter

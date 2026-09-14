@@ -643,10 +643,20 @@ static void put_stat(int fd, struct Machine *m) {
  * registry (proctab.c) and Machine only backs the case where the registry has
  * no answer: no slot for the pid, or a table that degraded off entirely. */
 
-/* Registry-side name for a PF_* id-map kind. */
+/* Registry-side name for a PF_UIDMAP / PF_GIDMAP kind. */
 static int pt_idmap_kind(int kind) {
-    return kind == PF_UIDMAP ? PT_IDMAP_UID :
-           kind == PF_GIDMAP ? PT_IDMAP_GID : PT_IDMAP_SG;
+    return kind == PF_UIDMAP ? PT_IDMAP_UID : PT_IDMAP_GID;
+}
+
+/* The kernel's read-back form, one line an extent (uid_m_show). */
+static void put_extents(int fd, const IdExtent *e, u32 n) {
+    char line[40];
+    for (u32 i = 0; i < n; i++) {
+        int k = snprintf(line, sizeof line, "%10u %10u %10u\n",
+                         e[i].first, e[i].lower_first, e[i].count);
+        ssize_t w = write(fd, line, (size_t)k);
+        (void)w;
+    }
 }
 
 /* `pid` is the process whose namespace this is: 0 means our own.
@@ -659,22 +669,24 @@ static int pt_idmap_kind(int kind) {
 static void put_idmap(int fd, struct Machine *m, int kind, s32 pid) {
     if (!pid) pid = (s32)getpid();
     int self = pid == (s32)getpid();
-    char buf[IDMAP_MAX];
-    u32 len = 0;
-    int reg = proctab_idmap_read(pid, pt_idmap_kind(kind), buf, sizeof buf, &len);
-    if (!reg && !self) return;          /* only we can answer from Machine */
     if (kind == PF_SETGROUPS) {
         /* "deny" is a one-way latch, so either side holding it decides. */
-        int deny = (reg && len >= 4 && !memcmp(buf, "deny", 4)) ||
-                   (self && m->setgroups_deny);
+        int rdeny = 0;
+        int reg = proctab_setgroups_read(pid, &rdeny);
+        if (!reg && !self) return;      /* only we can answer from Machine */
+        int deny = (reg && rdeny) || (self && m->setgroups_deny);
         const char *s = deny ? "deny\n" : "allow\n";
         ssize_t w = write(fd, s, strlen(s));
         (void)w;
         return;
     }
-    if (reg && len) { ssize_t w = write(fd, buf, len); (void)w; return; }
-    const char *s = kind == PF_UIDMAP ? m->uid_map : m->gid_map;
-    if (*s) { ssize_t w = write(fd, s, strlen(s)); (void)w; }
+    IdExtent ext[IDMAP_EXTENTS];
+    u32 n = 0;
+    int reg = proctab_idmap_read(pid, pt_idmap_kind(kind), ext, &n);
+    if (!reg && !self) return;          /* only we can answer from Machine */
+    if (reg && n) { put_extents(fd, ext, n); return; }
+    if (kind == PF_UIDMAP) put_extents(fd, m->uid_map, m->uid_map_n);
+    else                   put_extents(fd, m->gid_map, m->gid_map_n);
 }
 
 /* A fork child taking over its parent's user namespace. Maps written *for* the
@@ -685,54 +697,85 @@ static void put_idmap(int fd, struct Machine *m, int kind, s32 pid) {
  * for, and the registry's own copy of them is seeded separately (into the slot
  * reserved for this child before the fork, see proctab.c). */
 void procfs_idmap_inherit(struct Machine *m, s32 from) {
-    char buf[IDMAP_MAX];
-    u32 len = 0;
-    if (!m->uid_map_set && proctab_idmap_read(from, PT_IDMAP_UID, buf, sizeof buf, &len) && len) {
-        if (len >= IDMAP_MAX) len = IDMAP_MAX - 1;
-        memcpy(m->uid_map, buf, len);
-        m->uid_map[len] = 0;
+    u32 n = 0;
+    if (!m->uid_map_set && proctab_idmap_read(from, PT_IDMAP_UID, m->uid_map, &n) && n) {
+        m->uid_map_n = (u16)n;
         m->uid_map_set = 1;
     }
-    if (!m->gid_map_set && proctab_idmap_read(from, PT_IDMAP_GID, buf, sizeof buf, &len) && len) {
-        if (len >= IDMAP_MAX) len = IDMAP_MAX - 1;
-        memcpy(m->gid_map, buf, len);
-        m->gid_map[len] = 0;
+    if (!m->gid_map_set && proctab_idmap_read(from, PT_IDMAP_GID, m->gid_map, &n) && n) {
+        m->gid_map_n = (u16)n;
         m->gid_map_set = 1;
     }
-    if (proctab_idmap_read(from, PT_IDMAP_SG, buf, sizeof buf, &len) &&
-        len >= 4 && !memcmp(buf, "deny", 4)) {
+    int deny = 0;
+    if (proctab_setgroups_read(from, &deny) && deny) {
         m->setgroups_deny = 1;   /* a one-way latch: only ever pulled forward */
-        m->setgroups_set = 1;
     }
 }
 
-/* Parse one written map into the kernel's read-back form ("%10u %10u %10u\n"
- * per extent). Returns 0, or -errno for what the kernel would reject. */
-static int idmap_format(const char *in, size_t len, char *out, size_t outsz) {
-    size_t o = 0;
-    int lines = 0;
-    for (size_t i = 0; i < len; ) {
-        while (i < len && (in[i] == ' ' || in[i] == '\t' || in[i] == '\n')) i++;
-        if (i >= len) break;
-        unsigned long v[3];
+/* The kernel's isspace(): what skip_spaces() steps over and what may follow
+ * a field. */
+static int ksp(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\v' || ch == '\f' || ch == '\r';
+}
+
+/* Parse one written map exactly as map_write does (kernel/user_namespace.c):
+ * the buffer is a string (a NUL ends it; a line is up to a newline, and a
+ * line there is nothing on is an error, not a blank to skip); each of the
+ * three fields is a decimal simple_strtoul() -- no sign, no radix prefix,
+ * and no overflow error either: the value lands in a u32, so it is the
+ * number modulo 2^32, which is why the fields are accumulated in one -- with
+ * whitespace after the first two and nothing but whitespace after the third;
+ * a first or lower_first of -1 is refused, so is a count of zero or one that
+ * carries either range past 2^32, and so is an extent whose upper or lower
+ * range meets an earlier extent's; the kernel holds at most IDMAP_EXTENTS,
+ * and an empty map is no map. Returns the extent count, or -EINVAL.
+ *
+ * It used to accumulate in an unsigned long and refuse anything past
+ * 0xffffffff -- a value the kernel wraps -- which on an ILP32 host could not
+ * even be reached, so the two hosts disagreed with each other and both with
+ * the kernel; and it skipped blank lines, took no notice of a wrapping or
+ * overlapping extent, and held seven extents' worth of text. */
+static int idmap_parse(const u8 *in, size_t len, IdExtent *out) {
+    size_t i = 0, end = len;
+    for (size_t k = 0; k < len; k++) if (!in[k]) { end = k; break; }   /* memdup_user_nul */
+    int n = 0;
+    for (;;) {
+        /* Find the end of this line. A newline that ends the buffer ends the
+         * loop after this line; one followed by more text starts another. */
+        size_t eol = i;
+        while (eol < end && in[eol] != '\n') eol++;
+        int more = eol < end && eol + 1 < end;
+        u32 v[3];
         for (int f = 0; f < 3; f++) {
-            if (i >= len || in[i] < '0' || in[i] > '9') return -EINVAL;
-            unsigned long n = 0;
-            while (i < len && in[i] >= '0' && in[i] <= '9') {
-                n = n * 10 + (unsigned long)(in[i++] - '0');
-                if (n > 0xffffffffUL) return -EINVAL;
-            }
-            v[f] = n;
-            while (i < len && (in[i] == ' ' || in[i] == '\t')) i++;
+            while (i < eol && ksp((char)in[i])) i++;
+            if (i >= eol || in[i] < '0' || in[i] > '9') return -EINVAL;
+            u32 acc = 0;
+            while (i < eol && in[i] >= '0' && in[i] <= '9')
+                acc = acc * 10u + (u32)(in[i++] - '0');
+            v[f] = acc;
+            /* whitespace must follow the first two fields; the third may end
+             * the line */
+            if (f < 2 && !(i < eol && ksp((char)in[i]))) return -EINVAL;
         }
-        if (i < len && in[i] != '\n') return -EINVAL;
-        if (v[2] == 0) return -EINVAL;       /* zero-length extent */
-        if (o + 34 > outsz) return -EINVAL;  /* more extents than we hold */
-        o += (size_t)snprintf(out + o, outsz - o, "%10lu %10lu %10lu\n",
-                              v[0], v[1], v[2]);
-        lines++;
+        while (i < eol && ksp((char)in[i])) i++;
+        if (i < eol) return -EINVAL;             /* trailing junk */
+        if (v[0] == 0xffffffffu || v[1] == 0xffffffffu) return -EINVAL;
+        if (v[0] + v[2] <= v[0]) return -EINVAL;   /* count 0, or the range wraps */
+        if (v[1] + v[2] <= v[1]) return -EINVAL;
+        u32 ulast = v[0] + v[2] - 1, llast = v[1] + v[2] - 1;
+        for (int k = 0; k < n; k++) {             /* mappings_overlap */
+            u32 pu = out[k].first, pl = out[k].lower_first;
+            u32 pulast = pu + out[k].count - 1, pllast = pl + out[k].count - 1;
+            if (pu <= ulast && pulast >= v[0]) return -EINVAL;
+            if (pl <= llast && pllast >= v[1]) return -EINVAL;
+        }
+        if (n + 1 == IDMAP_EXTENTS && more) return -EINVAL;
+        out[n].first = v[0]; out[n].lower_first = v[1]; out[n].count = v[2];
+        n++;
+        if (!more) break;
+        i = eol + 1;
     }
-    return lines ? 0 : -EINVAL;   /* an empty map is EINVAL, as in the kernel */
+    return n;
 }
 
 /* write(2) landing on one of the three files. Enforces the kernel's one-shot
@@ -772,59 +815,69 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
     if (!reg && !self) { *ret = -ESRCH; return 1; }
 
     if (kind == PF_SETGROUPS) {
-        /* "allow" or "deny", and only until gid_map is set -- afterwards the
-         * kernel refuses, since the decision has already been used. Nor may
-         * "deny" be taken back. */
+        /* proc_setgroups_write: fewer than 8 bytes, "allow" or "deny" and
+         * then nothing but whitespace (a NUL ends the buffer as it does the
+         * kernel's copy). "deny" holds only until gid_map is written -- the
+         * decision has been used by then -- and is never taken back: "allow"
+         * over it is EPERM, and is otherwise a no-op that succeeds, after
+         * gid_map too. A prefix ("denyx") used to pass, and "allow" after
+         * gid_map used to be refused. */
+        if (len >= 8) { *ret = -EINVAL; return 1; }
+        char kbuf[8];
+        memcpy(kbuf, buf, len);
+        kbuf[len] = 0;
         int deny;
-        if (len >= 4 && !memcmp(buf, "deny", 4))       deny = 1;
-        else if (len >= 5 && !memcmp(buf, "allow", 5)) deny = 0;
+        size_t p;
+        if (!strncmp(kbuf, "deny", 4))       { deny = 1; p = 4; }
+        else if (!strncmp(kbuf, "allow", 5)) { deny = 0; p = 5; }
         else { *ret = -EINVAL; return 1; }
-        if (self && (m->gid_map_set || (m->setgroups_deny && !deny))) {
+        while (kbuf[p] && ksp(kbuf[p])) p++;
+        if (kbuf[p]) { *ret = -EINVAL; return 1; }
+        if (self && (deny ? m->gid_map_set : m->setgroups_deny)) {
             *ret = -EPERM;
             return 1;
         }
-        if (reg && proctab_idmap_write(tpid, PT_IDMAP_SG, deny ? "deny\n" : "allow\n",
-                                       deny ? 5 : 6, &err)) {
+        if (reg && proctab_setgroups_write(tpid, deny, &err)) {
             /* Mirror our own writes into Machine so the fallback never
              * contradicts the registry if the slot later goes away. */
-            if (!err && self) { m->setgroups_deny = (u8)deny; m->setgroups_set = 1; }
+            if (!err && self && deny) m->setgroups_deny = 1;
             *ret = err ? err : (s64)len;
             return 1;
         }
         if (!self) { *ret = -ESRCH; return 1; }
-        m->setgroups_deny = (u8)deny;
-        m->setgroups_set = 1;
+        if (deny) m->setgroups_deny = 1;
         *ret = (s64)len;
         return 1;
     }
-    /* One shot per map, tested before anything is parsed -- the kernel's order,
-     * so a second write is EPERM whatever it holds rather than EINVAL. The
-     * registry's own claim is what actually enforces it; this only gets the
-     * errno right for the ordinary sequential case. */
+    /* map_write's order: a write of a page or more is EINVAL before anything
+     * else is looked at; then one shot per map, tested before anything is
+     * parsed, so a second write is EPERM whatever it holds rather than
+     * EINVAL. The registry's own claim is what actually enforces the one
+     * shot; this only gets the errno right for the ordinary sequential case. */
+    if (len >= 4096) { *ret = -EINVAL; return 1; }
     int written = self && (kind == PF_UIDMAP ? m->uid_map_set : m->gid_map_set);
     if (reg && !written) {
-        char cur[IDMAP_MAX];
-        u32 curlen = 0;
-        proctab_idmap_read(tpid, pt_idmap_kind(kind), cur, sizeof cur, &curlen);
-        written = curlen != 0;
+        IdExtent cur[IDMAP_EXTENTS];
+        u32 curn = 0;
+        proctab_idmap_read(tpid, pt_idmap_kind(kind), cur, &curn);
+        written = curn != 0;
     }
     if (written) { *ret = -EPERM; return 1; }
-    char fmt[IDMAP_MAX];
-    fmt[0] = 0;
-    int r = idmap_format((const char *)buf, len, fmt, sizeof fmt);
-    if (r < 0) { *ret = r; return 1; }
-    if (reg && proctab_idmap_write(tpid, pt_idmap_kind(kind), fmt,
-                                   (u32)strlen(fmt), &err)) {
+    IdExtent ext[IDMAP_EXTENTS];
+    int n = idmap_parse(buf, len, ext);
+    if (n < 0) { *ret = n; return 1; }
+    IdExtent *mine = kind == PF_UIDMAP ? m->uid_map : m->gid_map;
+    u16 *mine_n    = kind == PF_UIDMAP ? &m->uid_map_n : &m->gid_map_n;
+    u8  *mine_set  = kind == PF_UIDMAP ? &m->uid_map_set : &m->gid_map_set;
+    if (reg && proctab_idmap_write(tpid, pt_idmap_kind(kind), ext, (u32)n, &err)) {
         if (!err && self) {
-            if (kind == PF_UIDMAP) { memcpy(m->uid_map, fmt, sizeof fmt); m->uid_map_set = 1; }
-            else                   { memcpy(m->gid_map, fmt, sizeof fmt); m->gid_map_set = 1; }
+            memcpy(mine, ext, (size_t)n * sizeof *ext); *mine_n = (u16)n; *mine_set = 1;
         }
         *ret = err ? err : (s64)len;
         return 1;
     }
     if (!self) { *ret = -ESRCH; return 1; }
-    if (kind == PF_UIDMAP) { memcpy(m->uid_map, fmt, sizeof fmt); m->uid_map_set = 1; }
-    else                   { memcpy(m->gid_map, fmt, sizeof fmt); m->gid_map_set = 1; }
+    memcpy(mine, ext, (size_t)n * sizeof *ext); *mine_n = (u16)n; *mine_set = 1;
     *ret = (s64)len;
     return 1;
 }

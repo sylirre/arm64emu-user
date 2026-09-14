@@ -865,7 +865,7 @@ PTDIRS="/dev/shm ${XDG_RUNTIME_DIR:-} ${TMPDIR:-} /data/local/tmp /tmp"
 pt_registry() {   # the registry file this host's shared_dir() picked, if any
     for d in $PTDIRS; do
         [ -n "$d" ] || continue
-        for f in "$d"/arm64chroot-proctab.v6."$(id -u)".*; do
+        for f in "$d"/arm64chroot-proctab.v7."$(id -u)".*; do
             [ -f "$f" ] && { echo "$f"; return 0; }
         done
     done
@@ -873,7 +873,7 @@ pt_registry() {   # the registry file this host's shared_dir() picked, if any
 }
 if [ -x "$ALPINE/bin/busybox" ]; then
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v6."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v7."$(id -u)".* 2>/dev/null
     done
     rm -f "$ALPINE/tmp/apid"
     A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
@@ -915,7 +915,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$reg" "$victim"
     fi
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v6."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v7."$(id -u)".* 2>/dev/null
     done
 fi
 
@@ -2742,6 +2742,17 @@ check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsi
 # fchownat flag refusals, the SIOCGIF* ioctls on a non-socket and on a bad
 # pointer, a seccomp shift by X >= 32. Self-checking: qemu differs on most.
 check_fixture smallabi $'domainname=[(none)]\ngetfl_largefile=1\ngetdents_short: r=one errno=0\ngetdents_unmapped: r=-1 errno=14 pos_kept=1\ngetdents_rest: r=some errno=0\nstatx_badflag: 22\nstatx_synctype_both: 22\nstatx_reserved_mask: 22\nstatx_badflag_noent: 22\nstatx_ok: 0\nfchownat_badflag: 22\nfchownat_ok: 0\nifflags_devnull: 25\nifconf_devnull_fault: 25\nifname_devnull_null: 25\nifflags_sock: r=0 errno=0 up=1\nifflags_fault: 14\nifflags_null: 14\nifconf_fault: 14\nifname_fault: 14\nifflags_badfd: 9\nseccomp_shift_x: exited=1 code=0\ndone'
+
+# What a faked user namespace accepts as its uid_map / gid_map / setgroups:
+# line for line the kernel's own parsers (map_write and proc_setgroups_write),
+# including the u32 wrap of a field, the wrapping and overlapping extents it
+# refuses, the 340-extent and one-page ceilings, and a parent writing its
+# child's 340 extents through the shared registry. Self-checking for the same
+# reason as userns_race: no oracle can take the writes. Both registry tiers,
+# since the record is what used to truncate.
+check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\ntwo_lines: 18 back=0:1000:1,1:1001:1\ntabs: 9 back=0:1000:1\ncr: 10 back=0:1000:1\nleading_space: 11 back=0:1000:1\ntrailing_space: 10 back=0:1000:1\nblank_between: -22\nblank_trailing: -22\nblank_leading: -22\nspace_only_line: -22\njunk: -22\ntwo_fields: -22\none_field: -22\nempty: -22\nnewline_only: -22\nplus: -22\nminus: -22\nhex: -22\nglued: -22\nnul_ends: 23 back=0:1000:1\nnul_after_newline: 11 back=0:1000:1\nwrap_first: 18 back=0:1000:1\nwrap_lower: 15 back=0:1000:1\nwrap_huge: 28 back=5:1000:1\nfirst_minus1: -22\nlower_minus1: -22\ncount_zero: -22\nfirst_wraps: -22\nlower_wraps: -22\nfirst_to_end: 18 back=4294967294:1000:1\nlower_to_end: 15 back=0:4294967294:1\noverlap_upper: -22\noverlap_lower: -22\noverlap_touch: -22\nadjacent: 21 back=0:1000:10,10:1010:10\nduplicate: -22\nextents_340: 3630 back=0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nextents_341: -22\nextents_340_blank: -22\nbytes_4095: 4095 back=0:100000:1,11:100011:1,23:100023:1,35:100035:1,...(298 extents)\nbytes_4096: -22\nbytes_4096_junk: -22\nsg_deny: 4\nsg_allow: 5\nsg_deny_nl: 5\nsg_allow_nl: 6\nsg_denyx: -22\nsg_allowx: -22\nsg_deny_ws: 7\nsg_allow_ws: 7\nsg_deny_junk: -22\nsg_den: -22\nsg_empty: -22\nsg_8bytes: -22\nsg_Deny: -22\ngid_map: 9\nallow_after_gid_map: 5\ndeny_after_gid_map: -1\ngid_map_again: -1\ngid_map_again_junk: -1\ngid_map_again_page: -22\ndeny: 4\ndeny_again: 4\nallow_after_deny: -1\nallowx_after_deny: -22\nsetgroups_back: deny\ngid_map_after_deny: 9\nparent_writes_340: 3630\nparent_writes_again: -1\nparent_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\ngrandchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_status: 0\ndone' \
+    "A64_PROCTAB_FORCE_FILE=1" "file-registry tier"
+
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
 # afresh -- zeroes behind private anonymous memory, the file again behind a
 # private file mapping, the same pages behind a shared one. Self-checking:

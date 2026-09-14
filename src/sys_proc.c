@@ -1065,9 +1065,9 @@ SYSDEF(clone) {
          * for the initial one. A fresh namespace starts with empty maps. */
         if (flags & G_CLONE_NEWUSER) {
             m->fake_userns = 1;
-            m->uid_map_set = m->gid_map_set = m->setgroups_set = 0;
+            m->uid_map_set = m->gid_map_set = 0;
             m->setgroups_deny = 0;
-            m->uid_map[0] = m->gid_map[0] = 0;
+            m->uid_map_n = m->gid_map_n = 0;
         } else if (m->fake_userns) {
             /* Otherwise we keep the parent's namespace -- and its maps, which
              * may live only in the shared registry (whoever wrote them for the
@@ -2622,9 +2622,9 @@ SYSDEF(unshare) {
     if (a0 & G_CLONE_NEWUSER) {
         struct Machine *m = c->m;
         m->fake_userns = 1;
-        m->uid_map_set = m->gid_map_set = m->setgroups_set = 0;
+        m->uid_map_set = m->gid_map_set = 0;
         m->setgroups_deny = 0;
-        m->uid_map[0] = m->gid_map[0] = 0;
+        m->uid_map_n = m->gid_map_n = 0;
         /* Publish the namespace where a parent can find it and write our maps
          * for us -- the usual way they get written. Our registry slot reaches
          * back to the reservation made before we were forked, so this lands

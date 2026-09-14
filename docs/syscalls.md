@@ -1151,10 +1151,27 @@ then make the consequences the caller depends on true:
   so a real write is refused and bubblewrap dies with "setting up uid map".
   They are synthesized instead (`sys_procfs.c`), take one write each as the
   kernel's one-shot rule requires (a second returns `EPERM` whatever it holds,
-  since the rule is tested before the parse; a malformed first write `EINVAL`;
-  `setgroups` after `gid_map` `EPERM`), and read back in the kernel's
-  `%10u %10u %10u` form. The maps are *reported*, not applied: they change no id
-  the guest sees — `--fake-id` is how a guest becomes root here.
+  since the rule is tested before the parse — though a write of a page or more
+  is `EINVAL` before even that), and read back in the kernel's
+  `%10u %10u %10u` form. What a write must look like is `map_write`'s own
+  grammar, line for line: the buffer is a string of lines, a line with nothing
+  on it an error rather than a blank to skip; a field is a `simple_strtoul`,
+  decimal digits with no sign or radix prefix and no overflow — the value lands
+  in a `u32`, so it is taken modulo 2^32 (the emulator accumulates in one for
+  that reason, where an `unsigned long` used to answer `EINVAL` on a 64-bit
+  host and wrap on a 32-bit one); a `first` or `lower_first` of `-1`, a zero
+  count, a count that carries either range past 2^32, and an extent whose
+  upper or lower range meets an earlier one's are refused; and a map holds up
+  to the kernel's 340 extents (`UID_GID_MAP_MAX_EXTENTS`), kept as extents
+  rather than as text so the whole ceiling fits (a 256-byte text record used to
+  cut a map off at seven). `setgroups` takes fewer than 8 bytes, `allow` or
+  `deny` followed by whitespace alone (`denyx` used to pass); `deny` is refused
+  once `gid_map` is written, `allow` once `deny` stands, and `allow` is
+  otherwise a no-op that succeeds — after `gid_map` too, which used to be
+  refused. `tests/fixtures/idmapparse.c` holds all of it, verdicts read off
+  the kernel source since no oracle can take the writes. The maps are
+  *reported*, not applied: they change no id the guest sees — `--fake-id` is
+  how a guest becomes root here.
 
   Both spellings are served, because both are used. `/proc/self/...` covers a
   guest that maps its own ids; `/proc/<child>/...` covers the usual arrangement,
