@@ -2675,13 +2675,16 @@ check_fixture regionmerge $'image_lines_few=1\none=1\nsplit=3\nmerged=1\nwhole=1
 # children carry none.
 check_fixture forkfds $'openers: bad=0/200\nfifo_open: bad=0/50\nsemop: bad=0/50\ndone'
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
-# EEXIST and of the MAP_TYPE check), a hint below it is raised to it,
-# MREMAP_FIXED below it is EPERM after mremap_to's unmaps, shmat too -- and an
-# address SHM_RND rounds to zero is still a fixed request for page zero.
-# Self-checking: qemu-user validates MAP_TYPE before the host kernel can
-# answer EPERM and rounds a shmat address away instead of down to zero; the
-# expected block is a real kernel's, taken natively with this same program.
-check_fixture mmapminaddr $'fixed0: errno=1\nfixed4k: errno=1\nfixed_span: errno=1\nfixed_none0: errno=1\nfixed_notype: errno=1\nnoreplace4k: errno=1\nhint4k: high\nhint4k_odd: high\nhint0: high\nfixed64k: high\nmremap_fixed_low: errno=1\ntail_gone=1\nhead_kept=1\nshmat_low: errno=1\nshmat_round0: errno=1\nshmat_round0_remap: errno=22\nshmat_exact_low: errno=1\nzero_unmapped=1\ndone'
+# EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands
+# on the limit itself, at_min), MREMAP_FIXED below it is EPERM after
+# mremap_to's unmaps, shmat too -- and an address SHM_RND rounds to zero is
+# still a fixed request for page zero. The limit is the host's and differs
+# between hosts (65536 on x86-64 Ubuntu, 32768 on its arm64 kernels), so the
+# fixture takes its addresses relative to it. Self-checking: qemu-user
+# validates MAP_TYPE before the host kernel can answer EPERM and rounds a
+# shmat address away instead of down to zero; the expected block is a real
+# kernel's, taken natively with this same program.
+check_fixture mmapminaddr $'fixed0: errno=1\nfixed_below: errno=1\nfixed_span: errno=1\nfixed_none0: errno=1\nfixed_notype: errno=1\nnoreplace_below: errno=1\nhint_below: at_min\nhint_below_odd: at_min\nhint0: high\nfixed_min: at_min\nmremap_fixed_low: errno=1\ntail_gone=1\nhead_kept=1\nshmat_low: errno=1\nshmat_round0: errno=1\nshmat_round0_remap: errno=22\nshmat_exact_low: errno=1\nzero_unmapped=1\ndone'
 # sched_getaffinity / sched_setaffinity / getcpu are the host thread's own: a
 # guest thread is a host thread. They used to answer one CPU for everyone and
 # ignore every setaffinity (nproc 1 while /proc/cpuinfo listed the machine).

@@ -33,13 +33,17 @@ static void anon_memfd_close(int fd) { fdheld_close(fd); }
 
 /* vm.mmap_min_addr, the host's: the lowest address a fixed mapping may name
  * (security_mmap_addr answers EPERM below it) and what a lower hint is raised
- * to (round_hint_to_min). Read once; the kernel's compiled-in default where
- * the file cannot be read, and what the guest reads from the passthrough
- * /proc/sys/vm/mmap_min_addr agrees with it. */
+ * to (round_hint_to_min). Read once; what the guest reads from the
+ * passthrough /proc/sys/vm/mmap_min_addr agrees with it -- a host that has
+ * it at 0 lets the guest have page zero, as it would let any process of its
+ * own -- and the x86-64 kernels' compiled-in 65536 where the file cannot be
+ * read. It is the host's, so it differs between hosts: an arm64 kernel builds
+ * with 32768 (the defconfig, Debian's and Android's alike), which is what an
+ * Ubuntu arm64 machine runs at where its x86-64 one runs at 65536. */
 u64 mmap_min_addr(void) {
-    static u64 cached;
+    static u64 cached;   /* the limit + 1: a read 0 must not read as unread */
     u64 v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
-    if (v) return v;
+    if (v) return v - 1;
     v = 65536;
     char buf[32];
     fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
@@ -49,12 +53,13 @@ u64 mmap_min_addr(void) {
         close(fd);
         if (n > 0) {
             buf[n] = 0;
-            u64 p = strtoull(buf, NULL, 10);
-            if (p) v = PG_UP(p);
+            char *e;
+            u64 p = strtoull(buf, &e, 10);
+            if (e != buf) v = PG_UP(p);
         }
     }
     fdwin_leave();
-    __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+    __atomic_store_n(&cached, v + 1, __ATOMIC_RELAXED);
     return v;
 }
 
