@@ -410,7 +410,13 @@ answered inside the timeout bracket like `ppoll`'s.
 
 The `timer_create` family (`sys_time.c`) wraps host libc timers behind a
 per-process slot table: the guest `timer_t` is a slot index, the slot holds the
-opaque host handle **and the guest's 64-bit sigval**. Notification passes
+opaque host handle **and the guest's 64-bit sigval**. The table has no ceiling
+of its own below the kernel's, which is the `int` the id is: it is 25 segments
+of doubling size (64, 128, …), each allocated on first use and never moved, so
+the capture handler's lookup stays a plain load through a pointer published
+with a release store — a fixed table of 64 used to answer `EAGAIN` to the 65th
+timer where a kernel keeps allocating (`tests/fixtures/timers_many.c`; qemu-user
+holds 32 of its own, so it is no oracle here). Notification passes
 through — signal numbers are shared, a `SIGEV_THREAD_ID` tid is the host tid,
 and the fired `SI_TIMER` siginfo rides the capture ring like any other
 host-caught signal — but the sigval travels *out of band*: the host timer

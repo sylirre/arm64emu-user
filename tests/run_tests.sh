@@ -2743,6 +2743,11 @@ check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsi
 # pointer, a seccomp shift by X >= 32. Self-checking: qemu differs on most.
 check_fixture smallabi $'domainname=[(none)]\ngetfl_largefile=1\ngetdents_short: r=one errno=0\ngetdents_unmapped: r=-1 errno=14 pos_kept=1\ngetdents_rest: r=some errno=0\nstatx_badflag: 22\nstatx_synctype_both: 22\nstatx_reserved_mask: 22\nstatx_badflag_noent: 22\nstatx_ok: 0\nfchownat_badflag: 22\nfchownat_ok: 0\nifflags_devnull: 25\nifconf_devnull_fault: 25\nifname_devnull_null: 25\nifflags_sock: r=0 errno=0 up=1\nifflags_fault: 14\nifflags_null: 14\nifconf_fault: 14\nifname_fault: 14\nifflags_badfd: 9\nseccomp_shift_x: exited=1 code=0\ndone'
 
+# POSIX timers past any small table: 300 created with deletions in between,
+# and a signalling one from the far end delivering its own sigval and id. The
+# emulator used to hold 64. Self-checking: qemu-user holds 32 of its own.
+check_fixture timers_many $'created 300\nreplaced 150\ntimer 0: code=-2 si_timerid_matches=1 sival_matches=1\ntimer 64: code=-2 si_timerid_matches=1 sival_matches=1\ntimer 128: code=-2 si_timerid_matches=1 sival_matches=1\ntimer 200: code=-2 si_timerid_matches=1 sival_matches=1\ntimer 298: code=-2 si_timerid_matches=1 sival_matches=1\ndelete 200: 1\ngettime 200: 22\ngettime 199: 0\ngettime 201: 0\ndone'
+
 # What a faked user namespace accepts as its uid_map / gid_map / setgroups:
 # line for line the kernel's own parsers (map_write and proc_setgroups_write),
 # including the u32 wrap of a field, the wrapping and overlapping extents it

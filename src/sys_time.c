@@ -223,45 +223,109 @@ SYSDEF(timerfd_gettime) {
  * either, where it would spawn a host helper thread on a junk guest function
  * pointer: anything but SIGNAL/NONE/THREAD_ID is -EINVAL, exactly the
  * kernel's rule. */
-#define PTIMER_MAX 64
-static struct {
+
+/* The slot table grows without a ceiling below the kernel's own, which is
+ * the int the timer id is: 25 segments of doubling size, segment k holding
+ * PTIMER_SEG0 << k slots for ids from PTIMER_SEG0 * (2^k - 1), together
+ * every id up to INT_MAX - 64, allocated on first use and never moved -- a
+ * fixed table of 64 used to answer EAGAIN to the 65th timer where a kernel
+ * keeps allocating. A segment is published with a release store into a fixed
+ * pointer array, so the async-signal-safe reader (ptimer_siginfo, in the
+ * capture handler) sees a whole segment or none, and a slot's own state word
+ * gates its contents as before. Segments are freed by nobody: a fork child
+ * keeps its copies and clears the slots in place. */
+#define PTIMER_SEG0 64
+#define PTIMER_SEGS 25
+struct PTimer {
     int state;                /* 0 free, 1 mid-claim, 2 live (atomic) */
     timer_t host;
     u64 gvalue;               /* the guest sigevent's 64-bit sigval */
-} g_ptimers[PTIMER_MAX];
+};
+static struct PTimer *g_ptimer_seg[PTIMER_SEGS];
+
+static inline u32 ptimer_seg_size(int k)  { return (u32)PTIMER_SEG0 << k; }
+static inline u32 ptimer_seg_base(int k)  { return (u32)PTIMER_SEG0 * ((1u << k) - 1); }
+
+/* The slot for a guest timer id, or NULL: negative, or in a segment nobody
+ * has allocated. Plain loads only (the capture handler calls this). */
+static struct PTimer *ptimer_slot(s32 id) {
+    if (id < 0) return NULL;
+    u32 n = (u32)id / PTIMER_SEG0 + 1;      /* 1-based 64-slot block number */
+    int k = 31 - __builtin_clz(n);          /* segment: floor(log2(n)) */
+    if (k >= PTIMER_SEGS) return NULL;      /* the top 64 ids: never handed out */
+    struct PTimer *seg = __atomic_load_n(&g_ptimer_seg[k], __ATOMIC_ACQUIRE);
+    return seg ? &seg[(u32)id - ptimer_seg_base(k)] : NULL;
+}
 
 /* Capture-time SI_TIMER fixup (host_catcher, so async-signal-safe: plain
  * loads only): the full guest sigval for the timer at `slot`. Returns 1 and
  * fills *val for a live slot, 0 otherwise (raced deletion: the caller keeps
  * the raw host value). */
 int ptimer_siginfo(s32 slot, u64 *val) {
-    if (slot < 0 || slot >= PTIMER_MAX) return 0;
-    if (__atomic_load_n(&g_ptimers[slot].state, __ATOMIC_ACQUIRE) != 2) return 0;
-    *val = g_ptimers[slot].gvalue;
+    struct PTimer *t = ptimer_slot(slot);
+    if (!t || __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != 2) return 0;
+    *val = t->gvalue;
     return 1;
 }
 
-/* Live-slot lookup for a guest timer id. Returns 0 and fills *ht, or -EINVAL. */
+/* Live-slot lookup for a guest timer id. Returns 0 and fills *ht, or -EINVAL.
+ * The id is the kernel's timer_t, an int: the register's high half is not
+ * part of it. */
 static int ptimer_get(u64 gid, timer_t *ht) {
-    if (gid >= PTIMER_MAX) return -EINVAL;
-    if (__atomic_load_n(&g_ptimers[gid].state, __ATOMIC_ACQUIRE) != 2)
-        return -EINVAL;
-    *ht = g_ptimers[gid].host;
+    struct PTimer *t = ptimer_slot((s32)gid);
+    if (!t || __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != 2) return -EINVAL;
+    *ht = t->host;
     return 0;
 }
 
+/* Claim a free slot (state 0 -> 1), growing the table by a segment when
+ * every allocated one is full. Returns the slot's id, or -1 when a segment
+ * could not be allocated (the kernel's EAGAIN: out of timer structures). */
+static s32 ptimer_claim(struct PTimer **out) {
+    for (int k = 0; k < PTIMER_SEGS; k++) {
+        struct PTimer *seg = __atomic_load_n(&g_ptimer_seg[k], __ATOMIC_ACQUIRE);
+        if (!seg) {
+            struct PTimer *fresh = calloc(ptimer_seg_size(k), sizeof *fresh);
+            if (!fresh) return -1;
+            struct PTimer *expect = NULL;
+            if (__atomic_compare_exchange_n(&g_ptimer_seg[k], &expect, fresh, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                seg = fresh;
+            else { free(fresh); seg = expect; }   /* another thread grew it first */
+        }
+        u32 n = ptimer_seg_size(k);
+        for (u32 i = 0; i < n; i++) {
+            int free_slot = 0;
+            if (__atomic_compare_exchange_n(&seg[i].state, &free_slot, 1,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+                *out = &seg[i];
+                return (s32)(ptimer_seg_base(k) + i);
+            }
+        }
+    }
+    return -1;   /* every int id is taken */
+}
+
+/* Every allocated slot, for the two sweeps below. */
+#define PTIMER_FOREACH(t) \
+    for (int k_ = 0; k_ < PTIMER_SEGS; k_++) \
+        for (struct PTimer *t = g_ptimer_seg[k_], *end_ = t ? t + ptimer_seg_size(k_) : NULL; \
+             t && t < end_; t++)
+
 /* execve: delete the host timers (they must not fire into the new image). */
 void ptimers_exec_clear(void) {
-    for (int i = 0; i < PTIMER_MAX; i++)
-        if (__atomic_load_n(&g_ptimers[i].state, __ATOMIC_ACQUIRE) == 2) {
-            timer_delete(g_ptimers[i].host);
-            __atomic_store_n(&g_ptimers[i].state, 0, __ATOMIC_RELEASE);
+    PTIMER_FOREACH(t)
+        if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == 2) {
+            timer_delete(t->host);
+            __atomic_store_n(&t->state, 0, __ATOMIC_RELEASE);
         }
 }
 
 /* fork child: the host did not inherit the timers; drop the table copy. */
 void ptimers_fork_clear(void) {
-    memset(g_ptimers, 0, sizeof g_ptimers);
+    PTIMER_FOREACH(t)
+        __atomic_store_n(&t->state, 0, __ATOMIC_RELAXED);
 }
 
 SYSDEF(timer_create) {
@@ -269,16 +333,8 @@ SYSDEF(timer_create) {
      * kernel-default notification (NULL sigevent) carries that id in
      * sival_int, so it must exist before the sigevent is built. */
     if (!clockid_allowed((s32)a0)) return (u64)(s64)-EINVAL;
-    int slot = -1;
-    for (int i = 0; i < PTIMER_MAX; i++) {
-        int free_slot = 0;
-        if (__atomic_compare_exchange_n(&g_ptimers[i].state, &free_slot, 1,
-                                        false, __ATOMIC_ACQ_REL,
-                                        __ATOMIC_RELAXED)) {
-            slot = i;
-            break;
-        }
-    }
+    struct PTimer *t;
+    s32 slot = ptimer_claim(&t);
     if (slot < 0) return (u64)(s64)-EAGAIN;   /* kernel: out of timers */
 
     struct sigevent sev;
@@ -344,12 +400,12 @@ SYSDEF(timer_create) {
         }
     }
     if (err) {
-        __atomic_store_n(&g_ptimers[slot].state, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&t->state, 0, __ATOMIC_RELEASE);
         return (u64)(s64)err;
     }
-    g_ptimers[slot].host = ht;
-    g_ptimers[slot].gvalue = gvalue;
-    __atomic_store_n(&g_ptimers[slot].state, 2, __ATOMIC_RELEASE);
+    t->host = ht;
+    t->gvalue = gvalue;
+    __atomic_store_n(&t->state, 2, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -404,6 +460,6 @@ SYSDEF(timer_delete) {
     int r = ptimer_get(a0, &ht);
     if (r < 0) return (u64)(s64)r;
     timer_delete(ht);
-    __atomic_store_n(&g_ptimers[a0].state, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&ptimer_slot((s32)a0)->state, 0, __ATOMIC_RELEASE);
     return 0;
 }
