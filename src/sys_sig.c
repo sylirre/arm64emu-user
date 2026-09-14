@@ -455,7 +455,7 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
 SYSDEF(signalfd4) {
     /* (fd, mask, sizemask, flags): fd < 0 creates one, fd >= 0 replaces the
      * mask of an existing signalfd -- one of ours, or EINVAL as the kernel
-     * answers for any fd that is not a signalfd. SIGKILL/SIGSTOP are silently
+     * answers for any open fd that is not a signalfd. SIGKILL/SIGSTOP are silently
      * dropped from the mask, as the kernel does. The mask goes to the host as
      * the host numbers the guest's stand for (sig_guest_set_to_host: 32/33
      * through their carriers; the numbers the emulator's nets own are left
@@ -463,20 +463,28 @@ SYSDEF(signalfd4) {
      * flag bits are the kernel's own on both sides. */
     (void)a4; (void)a5;
     struct Machine *m = c->m;
+    /* sys_signalfd4's order: the size (a size_t, judged whole), then the mask
+     * copy, then do_signalfd4's flags -- an int, so the register's high half
+     * is not part of it -- and only then the descriptor. The flags used to
+     * be judged before the copy as well, so a bad mask beside a bad flag was
+     * EINVAL where the kernel answers EFAULT, and judged as 64 bits, so a
+     * high bit the kernel never sees was refused. */
     if (a2 != 8) return (u64)(s64)-EINVAL;
-    if (a3 & ~(u64)(G_SFD_CLOEXEC | G_SFD_NONBLOCK)) return (u64)(s64)-EINVAL;
     u64 mask;
     if (copy_from_guest(c, &mask, a1, 8) < 0) return (u64)(s64)-EFAULT;
-    if (a3 & ~(u64)(G_SFD_CLOEXEC | G_SFD_NONBLOCK))   /* do_signalfd4's order:
-                                                        * after the mask copy */
-        return (u64)(s64)-EINVAL;
+    unsigned gflags = (unsigned)a3;
+    if (gflags & ~(unsigned)(G_SFD_CLOEXEC | G_SFD_NONBLOCK)) return (u64)(s64)-EINVAL;
     mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     u64 hmask = sig_guest_set_to_host(mask);
     int fd = (int)(s32)a0;
-    int hflags = ((a3 & G_SFD_CLOEXEC) ? O_CLOEXEC : 0) |
-                 ((a3 & G_SFD_NONBLOCK) ? O_NONBLOCK : 0);
+    int hflags = ((gflags & G_SFD_CLOEXEC) ? O_CLOEXEC : 0) |
+                 ((gflags & G_SFD_NONBLOCK) ? O_NONBLOCK : 0);
     if (fd >= 0) {
-        if (!sigfd_tracked(m, fd)) return (u64)(s64)-EINVAL;
+        /* One of ours, or the kernel's answer for what it is: no descriptor
+         * at all is EBADF (fdget), one that is not a signalfd EINVAL. Both
+         * used to be EINVAL. */
+        if (!sigfd_tracked(m, fd))
+            return fcntl(fd, F_GETFD) < 0 ? (u64)(s64)-EBADF : (u64)(s64)-EINVAL;
         long r = syscall(SYS_signalfd4, fd, &hmask, (size_t)8, hflags);
         return r < 0 ? host_err() : (u64)(s32)fd;
     }
