@@ -441,6 +441,14 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
 void sigfd_unmark_fd(struct Machine *m, int fd);
 int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM */
 
+/* sys_proc.c: the task lock (machine.h, EMU_LK_TASK) over the process-wide
+ * Machine fields that are written rarely and read from any thread --
+ * credentials, resource limits, the published cwd and the chroot root, the
+ * seccomp chain. Writers take it; readers take it to copy out what they need
+ * and use the copy. Nothing that blocks or forks may run under it. */
+void task_lock(void);
+void task_unlock(void);
+
 /* sys_seccomp.c: guest seccomp-BPF. seccomp_gate runs the installed filters
  * for one guest syscall; it returns 1 when the call must not run (with *ret as
  * the guest's return value), 0 to proceed, and does not return at all for a

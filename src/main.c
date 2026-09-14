@@ -567,6 +567,7 @@ static void emu_atfork_prepare(void) {
     sig_locks_take();        /* sfd_lock */
     sigact_locks_take();     /* sigact_lock — inside sfd_lock by rank (signal.c) */
     robust_locks_take();     /* robust_lock — its walk copies guest memory */
+    task_locks_take();       /* task_lock — nothing nests inside it */
     mem_locks_take();        /* casp16, then as_lock — innermost */
     fdheld_fork_prepare();   /* the fd-window barrier: last, so that a window
                               * is never waiting on a lock this already holds
@@ -575,6 +576,7 @@ static void emu_atfork_prepare(void) {
 static void emu_atfork_parent(void) {
     fdheld_fork_parent();
     mem_locks_drop();        /* innermost first, mirroring prepare */
+    task_locks_drop();
     robust_locks_drop();
     sigact_locks_drop();
     sig_locks_drop();
@@ -590,6 +592,7 @@ static void emu_atfork_child(void) {
     proctab_fork_child();
     fdheld_fork_child();     /* close what sibling threads held (machine.h) */
     mem_locks_reinit();
+    task_locks_reinit();
     robust_locks_reinit();
     sigact_locks_reinit();
     sig_locks_reinit();

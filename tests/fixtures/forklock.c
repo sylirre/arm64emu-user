@@ -10,7 +10,7 @@
  *      while libc's SIGEV_THREAD helper is running.
  *
  *   2. the pthread_atfork prepare handlers must acquire in an order compatible
- *      with the nesting real code uses. as_lock is the innermost of the seven:
+ *      with the nesting real code uses. as_lock is the innermost of the eight:
  *      a netlink critical section takes it whenever copying the guest's request
  *      misses that thread's D-TLB. Were prepare to take as_lock *before*
  *      nl_lock -- which is what reordering the *_atfork_init() calls in main.c

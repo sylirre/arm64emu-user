@@ -1078,6 +1078,32 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- the seccomp chain under concurrent installers (src/sys_seccomp.c): eight
+# threads pushing onto one chain must leave every filter on it, a filter one
+# thread installs binds the rest, and the chain budget (MAX_INSNS_PER_PATH,
+# counted the way the kernel counts it) says ENOMEM where a 6.x kernel does.
+# Self-checking for the same reason as seccomp_probe; every install passes
+# TSYNC so a real kernel prints the same block. Catches the unlocked push
+# (7 of 8 runs short by one or two filters), so it runs in both engines. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/seccomp_threads.bin \
+            tests/fixtures/seccomp_threads.c $A64_TESTLIBS 2>/dev/null; then
+        expect=$'nnp=0\nchild_installed=3641 enomem=1\nchild_status_filters=3641\nchild_exit=1\nthreads=8 per=300 failures=0\nfilters=2401 expected=2401\nmode=2\nchdir=-1 1\ndone'
+        for eng in "" "--jit"; do
+            lbl="fixture: seccomp_threads${eng:+ (jit)}"
+            got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/seccomp_threads.bin 2>/dev/null)
+            if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm tests/fixtures/seccomp_threads.bin
+    else
+        skip_build "fixtures/seccomp_threads"
+    fi
+fi
+
 # ---- /proc/<pid>/status lines that describe the guest, not the emulator
 # (src/sys_procfs.c put_status). Self-checking: qemu-user has neither guest
 # seccomp nor an emulated ptrace, so it would report the host task's own state

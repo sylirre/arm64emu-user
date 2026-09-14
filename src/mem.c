@@ -286,7 +286,8 @@ __thread int g_emu_as_depth;
 /* Indexed by rank, i.e. by bit position (machine.h). */
 static const char *const emu_lk_names[] = {
     "the jit stats lock", "pf_lock", "est_lock", "nl_lock",
-    "sfd_lock", "sigact_lock", "robust_lock", "casp16_lock", "as_lock",
+    "sfd_lock", "sigact_lock", "robust_lock", "task_lock", "casp16_lock",
+    "as_lock",
 };
 #define EMU_LK_COUNT ((int)(sizeof emu_lk_names / sizeof *emu_lk_names))
 _Static_assert(1u << (EMU_LK_COUNT - 1) == EMU_LK_AS,
@@ -432,7 +433,7 @@ void as_unlock(void) { g_emu_as_depth--; pthread_mutex_unlock(&g_as_lock); }
  * that order. This file owns the two innermost locks and they nest with each
  * other -- a CASP retry can miss the D-TLB and take as_lock underneath
  * casp16_mutex_lock -- so mem_locks_take() takes casp16 first, and as_lock,
- * innermost of all seven, last of all.
+ * innermost of all eight, last of all.
  *
  * Raw pthread calls, not casp16_mutex_lock()/as_lock(): these are called from
  * inside fork(), where the per-thread held-lock mask describes the state

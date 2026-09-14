@@ -672,7 +672,14 @@ absolute loads inside `seccomp_data`, the ALU/JMP/RET/MISC subset (which has no
 `BPF_MOD`: a 3.7 addition to the packet filter that seccomp's list was never
 extended to), jumps forward and in range, a `RET` last, a shift by an immediate
 below 32, no constant division by zero — anything else is `EINVAL` at install
-time. What runs runs as the kernel's converted
+time. The chain has the kernel's budget too (`seccomp_attach_filter`,
+`MAX_INSNS_PER_PATH`): the new program's length plus every installed one's plus
+four per stacked filter must fit in 32768 or the install is `ENOMEM`, counted
+the way the kernel counts it — the length of the eBPF the classic program is
+converted into (three of prologue, two for a `RET K`, five for a division by
+`X`, one or two for a conditional jump depending on which branch falls through,
+one more for a negative constant), so 3641 one-instruction filters go in and
+the 3642nd does not, exactly as on a 6.x kernel. What runs runs as the kernel's converted
 program does: a division by a zero `X` ends the program with 0 (a kill), and a
 shift by an `X` of 32 or more shifts by `X & 31` — the interpreter's own
 masking since its undefined-behaviour fix, and what the JITs' shift instructions
@@ -693,7 +700,14 @@ behavior rather than its per-thread default), so a filter installed by one
 thread applies to the process — a deliberate choice, since every real installer
 either is single-threaded at the time or asks for `TSYNC`, and a per-thread
 chain would need the seccomp state moved out of the shared registry slot every
-reader of `/proc/<pid>/status` consults; and user notification does not exist
+reader of `/proc/<pid>/status` consults. Sharing it means installs race: the
+push onto the chain head is made under the task lock (`sys_proc.c`, the
+stand-in for the kernel's `siglock` here), the head is stored with release
+semantics and every dispatcher takes it with an acquire load, nodes are
+immutable once linked and never freed — so eight threads installing at once
+leave every filter on the chain (`tests/fixtures/seccomp_threads.c`), where a
+plain pointer lost one of two that met, and a weakly ordered host could walk
+a node whose contents had not arrived. And user notification does not exist
 here — servicing a notification fd would mean parking guest syscalls on an
 external agent — so the emulator answers as a kernel without the feature (any
 before 5.0) does: `SECCOMP_FILTER_FLAG_NEW_LISTENER` is a flag it does not

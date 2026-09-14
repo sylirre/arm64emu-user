@@ -299,7 +299,12 @@ struct Machine {
      * architecture -- and killing the emulator is not what the guest asked
      * for. The chain is newest-first, malloc'd, and so copied by fork and kept
      * across execve, exactly as the kernel keeps filters. Threads share it,
-     * which is the kernel's TSYNC behavior rather than its default. */
+     * which is the kernel's TSYNC behavior rather than its default. Installed
+     * under the task lock (sys_proc.c) and read without one: the head is
+     * published with a release store and every reader takes it with an
+     * acquire load, nodes are immutable once linked and never freed. The mode
+     * byte is stored after the chain, so a dispatcher that finds it set finds
+     * the filter that set it. */
     u8 seccomp_mode;          /* G_SECCOMP_MODE_* (0 = none: the hot path) */
     void *seccomp_filters;    /* struct SeccompProg *, newest first */
 
@@ -653,6 +658,9 @@ void sigact_locks_reinit(void);
 void robust_locks_take(void);    /* robust_lock — sys_proc.c */
 void robust_locks_drop(void);
 void robust_locks_reinit(void);
+void task_locks_take(void);      /* task_lock — sys_proc.c */
+void task_locks_drop(void);
+void task_locks_reinit(void);
 void netlink_locks_take(void);   /* nl_lock */
 void netlink_locks_drop(void);
 void netlink_locks_reinit(void);
@@ -663,7 +671,7 @@ void procfs_locks_reinit(void);
 /* ---- fork safety: the rule those triples impose --------------------------
  *
  * prepare takes every one of these locks, so a thread that forks while already
- * holding one deadlocks against itself on the six non-recursive ones -- and on
+ * holding one deadlocks against itself on the seven non-recursive ones -- and on
  * the recursive as_lock it does something quieter and worse: prepare succeeds,
  * then the child's handler re-initializes the mutex under the surviving thread,
  * which goes on believing it holds it. Neither failure appears anywhere near
@@ -692,11 +700,16 @@ enum {
     EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (by rank) */
     EMU_LK_ROBUST = 1u << 6,   /* sys_proc.c     — the robust-list registry;
                                 * its walk copies guest memory (as_lock) */
-    EMU_LK_CASP16 = 1u << 7,   /* mem.c          */
-    EMU_LK_AS     = 1u << 8,   /* mem.c as_lock  — innermost; counted, not
+    EMU_LK_TASK   = 1u << 7,   /* sys_proc.c     — task_lock: the process-wide
+                                * Machine fields written rarely and read from
+                                * any thread (credentials, rlimits, cwd and
+                                * root, the seccomp chain); nothing but the
+                                * registry's lock-free publish runs under it */
+    EMU_LK_CASP16 = 1u << 8,   /* mem.c          */
+    EMU_LK_AS     = 1u << 9,   /* mem.c as_lock  — innermost; counted, not
                                 * flagged, because it legitimately re-enters */
 };
-extern __thread unsigned g_emu_lk_held;   /* the six non-recursive locks */
+extern __thread unsigned g_emu_lk_held;   /* the seven non-recursive locks */
 extern __thread int g_emu_as_depth;       /* as_lock, which nests: a count */
 
 /* ---- lock order, checked rather than merely written down -----------------
@@ -732,7 +745,8 @@ void emu_fdwin_lock_warn(unsigned taking);
 _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
                EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
                EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_ROBUST &&
-               EMU_LK_ROBUST < EMU_LK_CASP16 && EMU_LK_CASP16 < EMU_LK_AS,
+               EMU_LK_ROBUST < EMU_LK_TASK && EMU_LK_TASK < EMU_LK_CASP16 &&
+               EMU_LK_CASP16 < EMU_LK_AS,
                "EMU_LK_* bits are ranks: keep them in the order "
                "emu_atfork_prepare (main.c) takes the locks");
 

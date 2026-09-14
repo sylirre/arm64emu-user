@@ -559,7 +559,8 @@ void syscall_dispatch(CPU *c) {
     s64 scret = 0;
     u16 sctrap = 0;   /* SECCOMP_RET_DATA of a trapping filter -> si_errno */
     int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
-    if (UNLIKELY(m->seccomp_mode)) scskip = seccomp_gate(c, nr, av, &scret, &sctrap);
+    if (UNLIKELY(__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)))
+        scskip = seccomp_gate(c, nr, av, &scret, &sctrap);
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;

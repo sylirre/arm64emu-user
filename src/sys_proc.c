@@ -184,6 +184,34 @@ SYSDEF(exit_group) {
     process_exit(c);
 }
 
+/* ---- the task lock -------------------------------------------------------
+ *
+ * struct Machine is shared by every thread of the process, and a handful of
+ * its fields are process-wide state that one thread writes while another
+ * reads: the credentials, the resource limits, the published cwd and the
+ * chroot root, the seccomp chain. A kernel keeps each behind a lock of its own
+ * (the cred RCU swap, task_lock for rlim, fs->lock for cwd and root, siglock
+ * for seccomp); here they were plain fields, and plain fields written in
+ * pieces are read in pieces -- a setreuid that copied the whole Cred back
+ * lost a sibling's setfsgid, prlimit64's old-value read and its write were two
+ * steps a second prlimit64 could land between, a chdir's strcpy was readable
+ * half-done by a resolver, and two seccomp installs racing on the chain head
+ * kept one filter of the two. This is the one lock for all of them: none is
+ * written often, none is read on a hot path, and nothing that could block or
+ * fork runs under it -- a host chdir or setrlimit, the registry's lock-free
+ * publish -- so one rank (EMU_LK_TASK, machine.h) is enough. Readers copy
+ * what they need out under it and use the copy. */
+static pthread_mutex_t task_lock_ = PTHREAD_MUTEX_INITIALIZER;
+
+void task_lock(void)   { EMU_LOCK(&task_lock_, EMU_LK_TASK); }
+void task_unlock(void) { EMU_UNLOCK(&task_lock_, EMU_LK_TASK); }
+
+/* Raw pthread calls on purpose: main()'s atfork handlers call these from inside
+ * fork(), where the per-thread held-lock mask must not move (mem.c). */
+void task_locks_take(void)   { pthread_mutex_lock(&task_lock_); }
+void task_locks_drop(void)   { pthread_mutex_unlock(&task_lock_); }
+void task_locks_reinit(void) { pthread_mutex_init(&task_lock_, NULL); }
+
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
 SYSDEF(getppid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getppid(); }
 SYSDEF(gettid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)g_tls.tid; }
@@ -795,7 +823,7 @@ SYSDEF(clone) {
      * and read /proc/<child>/status before the child has run a single
      * instruction, and a real kernel answers that read with the inherited
      * state, never a blank. */
-    if (m->seccomp_mode) {
+    if (__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)) {
         u32 nf = 0;
         u8 md = (u8)seccomp_status(m, &nf);
         proctab_seccomp_seed(rsv, md, nf);
@@ -829,7 +857,7 @@ SYSDEF(clone) {
         /* seccomp survives fork, but the reservation was zeroed before it, so
          * republish the inherited chain into our own record. Skipped for the
          * unfiltered fork, which is nearly every fork. */
-        if (m->seccomp_mode) seccomp_publish(m);
+        if (__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)) seccomp_publish(m);
         g_tls.tid = getpid();             /* new process: tid == pid */
         /* Only our own thread came across, so anything else the host lists in
          * our thread group is not a guest thread. Re-sampled rather than
@@ -2618,7 +2646,7 @@ SYSDEF(prctl) {
         case PR_SET_SECCOMP:
             return (u64)seccomp_prctl_set(c, a1, a2);
         case PR_GET_SECCOMP:
-            return c->m->seccomp_mode;
+            return __atomic_load_n(&c->m->seccomp_mode, __ATOMIC_RELAXED);
         default:
             return (u64)(s64)-EINVAL;
     }

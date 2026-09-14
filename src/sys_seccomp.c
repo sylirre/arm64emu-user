@@ -26,10 +26,22 @@
 #include "sys.h"
 
 /* One installed program. The chain is newest-first: the kernel evaluates every
- * filter and keeps the most severe answer, so order only matters for ties. */
+ * filter and keeps the most severe answer, so order only matters for ties.
+ *
+ * A node is immutable once published and is never freed (the chain is kept
+ * across execve and copied by fork, as the kernel keeps filters), so the
+ * dispatcher walks it without a lock: the head is stored with release
+ * semantics under the task lock, which serializes installers, and loaded with
+ * acquire semantics by every reader -- so a reader that sees a node sees its
+ * length, its instructions and its `prev`, on a weakly ordered host as well
+ * as on x86. It used to be a plain pointer written by whoever got there:
+ * two threads installing at once read the same head and one filter of the
+ * two was lost, and an arm64 reader could take the new head before the
+ * node's contents had reached it. */
 struct SeccompProg {
     struct SeccompProg *prev;
     u32 len;
+    u32 elen;   /* the kernel's converted length, for the chain budget */
     GSockFilter insns[];
 };
 
@@ -148,6 +160,65 @@ static int bpf_validate(const GSockFilter *f, u32 len) {
     return BPF_CLASS(f[len - 1].code) == BPF_RET ? 0 : -EINVAL;
 }
 
+/* The installed chain, as every reader takes it (see struct SeccompProg). */
+static struct SeccompProg *chain_head(struct Machine *m) {
+    return __atomic_load_n((struct SeccompProg **)&m->seccomp_filters,
+                           __ATOMIC_ACQUIRE);
+}
+
+/* The kernel does not run the classic program: it converts it to eBPF
+ * (bpf_convert_filter) and runs that, and the length of the conversion is
+ * what its chain budget counts (seccomp_attach_filter, MAX_INSNS_PER_PATH).
+ * This is that length, for a program bpf_validate has accepted: a prologue of
+ * three (A and X cleared, the context register set), one instruction for
+ * almost everything, two for a RET K (a move and the exit), five for a
+ * division by X (the zero check that exits with 0), and for a conditional
+ * jump one when its false branch falls through, one when its true branch does
+ * and the test has an inverse (JEQ, JGT, JGE), two otherwise (the test and a
+ * JA) -- plus one when the constant compared against is negative as an s32,
+ * which eBPF's sign-extended immediate cannot hold and goes through a
+ * register instead. Measured against a 6.x kernel for every shape
+ * (tests/fixtures/seccomp_threads.c holds the one-instruction case: 3641
+ * filters before ENOMEM). */
+static u32 ebpf_len(const GSockFilter *f, u32 len) {
+    u32 n = 3;
+    for (u32 pc = 0; pc < len; pc++) {
+        u16 code = f[pc].code;
+        switch (BPF_CLASS(code)) {
+        case BPF_ALU:
+            n += code == (BPF_ALU | BPF_DIV | BPF_X) ? 5 : 1;
+            break;
+        case BPF_JMP:
+            if (BPF_OP(code) == BPF_JA) { n += 1; break; }
+            if (BPF_SRC(code) == BPF_K && (s32)f[pc].k < 0) n += 1;
+            if (f[pc].jf == 0) n += 1;
+            else if (f[pc].jt == 0 && BPF_OP(code) != BPF_JSET) n += 1;
+            else n += 2;
+            break;
+        case BPF_RET:
+            n += (code & 0x18) == BPF_K ? 2 : 1;
+            break;
+        default:   /* LD, LDX, ST, STX, MISC: one each */
+            n += 1;
+            break;
+        }
+    }
+    return n;
+}
+
+/* The chain budget: the new program's converted length plus, for every filter
+ * already installed, its length and a four-instruction penalty, must fit in
+ * MAX_INSNS_PER_PATH or the install is ENOMEM (seccomp_attach_filter). It
+ * bounds what a guest can make every one of its syscalls run through -- and
+ * what it can make the emulator malloc. Caller holds the task lock. */
+#define MAX_INSNS_PER_PATH 32768
+static int chain_has_room(struct Machine *m, u32 elen) {
+    u64 total = elen;
+    for (struct SeccompProg *w = chain_head(m); w; w = w->prev)
+        total += (u64)w->elen + 4;
+    return total <= MAX_INSNS_PER_PATH;
+}
+
 /* Run one validated program. Division by zero aborts the program with 0,
  * matching the kernel's interpreter (0 is SECCOMP_RET_KILL_THREAD -- severe,
  * but that is the kernel's answer to a broken filter too). */
@@ -227,7 +298,7 @@ static u32 bpf_run(const GSockFilter *f, u32 len, const GSeccompData *d) {
  * data, which is the order the kernel walks in. */
 static u32 seccomp_run_chain(struct Machine *m, const GSeccompData *d) {
     u32 ret = G_SECCOMP_RET_ALLOW;
-    for (struct SeccompProg *p = m->seccomp_filters; p; p = p->prev) {
+    for (struct SeccompProg *p = chain_head(m); p; p = p->prev) {
         u32 cur = bpf_run(p->insns, p->len, d);
         if ((cur & G_SECCOMP_RET_ACTION) < (ret & G_SECCOMP_RET_ACTION)) ret = cur;
     }
@@ -248,7 +319,7 @@ static int strict_allows(u64 nr) {
  * si_errno; 0 to proceed. Killing actions do not return at all. */
 int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data) {
     struct Machine *m = c->m;
-    if (m->seccomp_mode == G_SECCOMP_MODE_STRICT) {
+    if (__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED) == G_SECCOMP_MODE_STRICT) {
         if (strict_allows(nr)) return 0;
         guest_terminate_by_signal(c, SIGKILL);
     }
@@ -300,9 +371,18 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data) {
 
 /* A process cannot switch modes: strict after a filter (or the other way) is
  * EINVAL, while stacking another filter onto filter mode is the normal path
- * (seccomp_may_assign_mode). */
+ * (seccomp_may_assign_mode). Caller holds the task lock: the check and the
+ * mode store it guards are one step, as they are under the kernel's siglock. */
 static int may_assign_mode(struct Machine *m, u8 mode) {
-    return m->seccomp_mode == 0 || m->seccomp_mode == mode;
+    u8 cur = __atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED);
+    return cur == 0 || cur == mode;
+}
+
+/* Enter a mode, publishing the chain first: a dispatcher that sees the mode
+ * byte set and then loads the head must find the filter that set it there.
+ * Caller holds the task lock. */
+static void assign_mode(struct Machine *m, u8 mode) {
+    __atomic_store_n(&m->seccomp_mode, mode, __ATOMIC_RELEASE);
 }
 
 /* /proc/<pid>/status Seccomp: / Seccomp_filters: (sys_procfs.c).
@@ -315,17 +395,34 @@ static int may_assign_mode(struct Machine *m, u8 mode) {
  *
  * Publishing to the shared registry on every install keeps the answer available
  * to another process reading /proc/<pid>/status, the way the id maps are. */
-int seccomp_status(struct Machine *m, u32 *nfilters) {
+static int seccomp_status_locked(struct Machine *m, u32 *nfilters) {
     u32 n = 0;
-    for (struct SeccompProg *p = m->seccomp_filters; p; p = p->prev) n++;
+    for (struct SeccompProg *p = chain_head(m); p; p = p->prev) n++;
     if (nfilters) *nfilters = n;
-    return m->seccomp_mode;
+    return __atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED);
+}
+
+/* Under the task lock, so the mode and the count are one install's pair. */
+int seccomp_status(struct Machine *m, u32 *nfilters) {
+    task_lock();
+    int mode = seccomp_status_locked(m, nfilters);
+    task_unlock();
+    return mode;
+}
+
+/* Publishes are serialized by the lock like the installs they follow: two
+ * racing installs could otherwise publish their counts in the other order,
+ * and the registry would hold 1 after 2. Caller holds the task lock. */
+static void seccomp_publish_locked(struct Machine *m) {
+    u32 n = 0;
+    u8 mode = (u8)seccomp_status_locked(m, &n);
+    proctab_seccomp_set(mode, n);
 }
 
 void seccomp_publish(struct Machine *m) {
-    u32 n = 0;
-    u8 mode = (u8)seccomp_status(m, &n);
-    proctab_seccomp_set(mode, n);
+    task_lock();
+    seccomp_publish_locked(m);
+    task_unlock();
 }
 
 /* Install a filter: copy the program in, validate it, push it on the chain.
@@ -373,23 +470,52 @@ static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     }
     int r = bpf_validate(p->insns, len);
     if (r < 0) { free(p); return r; }
-    if (!may_assign_mode(m, G_SECCOMP_MODE_FILTER)) { free(p); return -EINVAL; }
     p->len = len;
-    p->prev = m->seccomp_filters;
-    m->seccomp_filters = p;
-    m->seccomp_mode = G_SECCOMP_MODE_FILTER;
-    seccomp_publish(m);
+    p->elen = ebpf_len(p->insns, len);
+    /* The push: head read, node linked, head stored, all under the lock that
+     * every other installer takes, so no two of them link to the same head;
+     * the release store is what a lock-free reader's acquire load pairs with.
+     * The mode check and the budget are judged under it too, against the
+     * chain this push joins rather than one a sibling may still be growing. */
+    task_lock();
+    if (!may_assign_mode(m, G_SECCOMP_MODE_FILTER)) {
+        task_unlock();
+        free(p);
+        return -EINVAL;
+    }
+    if (!chain_has_room(m, p->elen)) {
+        task_unlock();
+        free(p);
+        return -ENOMEM;
+    }
+    p->prev = chain_head(m);
+    __atomic_store_n((struct SeccompProg **)&m->seccomp_filters, p,
+                     __ATOMIC_RELEASE);
+    assign_mode(m, G_SECCOMP_MODE_FILTER);
+    seccomp_publish_locked(m);
+    task_unlock();
     return 0;
 }
 
 /* prctl(PR_SET_SECCOMP) -- the older way in, still what bubblewrap uses. */
-s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va) {
-    if (mode == G_SECCOMP_MODE_STRICT) {
-        if (!may_assign_mode(c->m, G_SECCOMP_MODE_STRICT)) return -EINVAL;
-        c->m->seccomp_mode = G_SECCOMP_MODE_STRICT;
-        seccomp_publish(c->m);
-        return 0;
+/* Strict mode. Enforcement is local to this process, but the Seccomp: line
+ * of its /proc/<pid>/status is read by OTHER processes, which can only see
+ * what the shared registry says, so the transition is published like a
+ * filter install is. */
+static s64 seccomp_set_strict(struct Machine *m) {
+    task_lock();
+    if (!may_assign_mode(m, G_SECCOMP_MODE_STRICT)) {
+        task_unlock();
+        return -EINVAL;
     }
+    assign_mode(m, G_SECCOMP_MODE_STRICT);
+    seccomp_publish_locked(m);
+    task_unlock();
+    return 0;
+}
+
+s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va) {
+    if (mode == G_SECCOMP_MODE_STRICT) return seccomp_set_strict(c->m);
     if (mode == G_SECCOMP_MODE_FILTER) return seccomp_install(c, 0, prog_va);
     return -EINVAL;
 }
@@ -399,14 +525,7 @@ SYSDEF(seccomp) {
     switch (a0) {
     case G_SECCOMP_SET_MODE_STRICT:
         if (a1 != 0 || a2 != 0) return (u64)(s64)-EINVAL;
-        if (!may_assign_mode(c->m, G_SECCOMP_MODE_STRICT)) return (u64)(s64)-EINVAL;
-        c->m->seccomp_mode = G_SECCOMP_MODE_STRICT;
-        /* Enforcement is local to this process, but the Seccomp: line of its
-         * /proc/<pid>/status is read by OTHER processes, which can only see
-         * what the shared registry says -- and the prctl spelling of this same
-         * transition has always published it. */
-        seccomp_publish(c->m);
-        return 0;
+        return (u64)seccomp_set_strict(c->m);
     case G_SECCOMP_SET_MODE_FILTER:
         return (u64)seccomp_install(c, a1, a2);
     case G_SECCOMP_GET_ACTION_AVAIL: {
