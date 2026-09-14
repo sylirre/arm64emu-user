@@ -1316,11 +1316,20 @@ SYSDEF(newfstatat) {
     unsigned gf = (unsigned)a3;
     struct stat st;
     int r;
+    /* vfs_statx judges the flags before the name is looked up: a bit outside
+     * these is EINVAL ahead of any EFAULT or ENOENT the path would earn. They
+     * used to go unjudged, so fstatat(..., 0x1) answered the stat. */
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_NO_AUTOMOUNT | G_AT_EMPTY_PATH |
+               G_AT_STATX_SYNC_TYPE))
+        return (u64)(s64)-EINVAL;
     if (gf & G_AT_EMPTY_PATH) {
         char gpath[PATH_MAX];
         long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
-        if (n == 0 || a1 == 0) {   /* fstat by fd */
-            r = fstat((int)(s32)a0, &st);
+        if (n == 0 || a1 == 0) {
+            /* stat by descriptor -- and for AT_FDCWD the working directory,
+             * which is what an empty name looks up to there (a plain fstat
+             * of -100 answered EBADF instead) */
+            r = fstatat((int)(s32)a0, "", &st, AT_EMPTY_PATH);
             if (r < 0) return host_err();
 #ifdef L2S_ENABLED
             if (c->m->link2symlink) l2s_fix_fd((int)(s32)a0, &st);
@@ -2611,15 +2620,30 @@ SYSDEF(pivot_root) {
 }
 
 /* umount2(target=a0, flags=a1): remove the bind mounted at exactly target.
- * FORCE/DETACH/EXPIRE are accepted and ignored; UMOUNT_NOFOLLOW leaves a final
+ * FORCE/DETACH/EXPIRE are accepted and ignored (EXPIRE's two-call expiry
+ * mark is not kept: the first call unmounts); UMOUNT_NOFOLLOW leaves a final
  * symlink unresolved. Gated on fake-root like mount. */
 SYSDEF(umount2) {
     struct Machine *m = c->m;
-    if (!fake_root(m)) return (u64)(s64)-EPERM;
-    unsigned rf = ((unsigned)a1 & G_UMOUNT_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    char host[PATH_MAX], canon[PATH_MAX];
-    int r = resolve_at(c, G_AT_FDCWD, a0, rf, host, canon);
+    unsigned gf = (unsigned)a1;
+    /* ksys_umount's order: the flags are judged first, the name is looked up
+     * second, and only then is the caller's privilege asked about -- so a
+     * stray bit is EINVAL whoever calls, and an unprivileged caller naming a
+     * path that does not exist hears ENOENT, not EPERM. */
+    if (gf & ~(G_MNT_FORCE | G_MNT_DETACH | G_MNT_EXPIRE | G_UMOUNT_NOFOLLOW))
+        return (u64)(s64)-EINVAL;
+    unsigned rf = (gf & G_UMOUNT_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    char canon[PATH_MAX];
+    PathPin pin;
+    int r = resolve_pin(c, G_AT_FDCWD, a0, rf, &pin, canon);
     if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&pin, 0);   /* the target must exist (the resolver is lexical) */
+    path_unpin(&pin);
+    if (r < 0) return (u64)(s64)r;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    /* MNT_EXPIRE is exclusive with the two that unmount at once (do_umount). */
+    if ((gf & G_MNT_EXPIRE) && (gf & (G_MNT_FORCE | G_MNT_DETACH)))
+        return (u64)(s64)-EINVAL;
     return (u64)(s64)bind_remove(m, canon);
 }
 
@@ -2652,6 +2676,9 @@ SYSDEF(mkdirat) {
 }
 
 SYSDEF(unlinkat) {
+    /* The one flag, judged before the name is even read (sys_unlinkat). A
+     * stray bit used to be ignored and the file removed all the same. */
+    if ((unsigned)a2 & ~(unsigned)G_AT_REMOVEDIR) return (u64)(s64)-EINVAL;
     PathPin pin;
     int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
@@ -2791,6 +2818,12 @@ SYSDEF(symlinkat) {
 SYSDEF(linkat) {
     PathPin p1, p2;
     unsigned gf = (unsigned)a4;
+    /* do_linkat judges the flags before either name is looked up. A stray bit
+     * used to be ignored and the link made all the same. (AT_EMPTY_PATH on an
+     * empty old name is the fd-linking form the advertised 6.1 ABI refuses an
+     * unprivileged caller with ENOENT, which is what the resolver answers for
+     * the empty name; on a non-empty one it changes nothing there either.) */
+    if (gf & ~(G_AT_SYMLINK_FOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
     unsigned rf = (gf & G_AT_SYMLINK_FOLLOW) ? 0 : PATH_NOFOLLOW_LAST;
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
@@ -2967,23 +3000,63 @@ SYSDEF(fchown) {
     return chattr_result(c->m, fchown((int)a0, (uid_t)a1, (gid_t)a2));
 }
 
+/* The two tv_nsec values that are not a nanosecond count (<linux/stat.h>). */
+#define G_UTIME_NOW  ((1LL << 30) - 1)
+#define G_UTIME_OMIT ((1LL << 30) - 2)
+static int utime_nsec_valid(s64 n) {
+    return n == G_UTIME_NOW || n == G_UTIME_OMIT || (n >= 0 && n <= 999999999);
+}
+
+/* utimensat(dfd, path, times, flags), in the kernel's own order (fs/utimes.c):
+ * the times are read first (EFAULT), a pair of UTIME_OMITs is a success that
+ * looks at nothing else, then the flags are judged (EINVAL), and only then is
+ * the file found -- by descriptor for a NULL path (do_utimes_fd, which takes
+ * no flags at all; AT_FDCWD there is a name lookup of NULL, EFAULT), by
+ * descriptor again for an empty path under AT_EMPTY_PATH (the working
+ * directory when that descriptor is AT_FDCWD), by name otherwise. A bad
+ * nanosecond field is EINVAL only after the lookup (vfs_utimes), so it is
+ * judged on the guest's 64-bit value -- a 32-bit host's long could make a
+ * valid one of it -- and then handed to the host as a value no kernel
+ * accepts, which keeps the host's own ordering: ENOENT or EBADF first.
+ *
+ * It used to stamp a file named beside a stray flag bit, answer EBADF where
+ * the kernel answers EFAULT or EINVAL, and refuse the AT_EMPTY_PATH form with
+ * ENOENT, so a guest's futimens(2) of an O_PATH descriptor never landed. */
 SYSDEF(utimensat) {
     struct timespec ts[2], *tsp = NULL;
     if (a2) {
         GTimespec g[2];
         if (copy_from_guest(c, g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        if (g[0].tv_nsec == G_UTIME_OMIT && g[1].tv_nsec == G_UTIME_OMIT) return 0;
         ts[0].tv_sec = (time_t)g[0].tv_sec; ts[0].tv_nsec = (long)g[0].tv_nsec;
         ts[1].tv_sec = (time_t)g[1].tv_sec; ts[1].tv_nsec = (long)g[1].tv_nsec;
+        if (!utime_nsec_valid(g[0].tv_nsec) || !utime_nsec_valid(g[1].tv_nsec))
+            ts[0].tv_nsec = ts[1].tv_nsec = -1;
         tsp = ts;
     }
-    if (a1 == 0) {   /* NULL path: operate on the fd itself */
-        if (fd_ro(c->m, (int)(s32)a0)) return (u64)(s64)-EROFS;
-        return futimens((int)(s32)a0, tsp) < 0 ? host_err() : 0;
+    unsigned gf = (unsigned)a3;
+    int dfd = (int)(s32)a0;
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
+    if (a1 == 0) {   /* NULL path: the descriptor itself */
+        if (dfd == G_AT_FDCWD) return (u64)(s64)-EFAULT;
+        if (gf) return (u64)(s64)-EINVAL;
+        if (fd_ro(c->m, dfd)) return (u64)(s64)-EROFS;
+        return futimens(dfd, tsp) < 0 ? host_err() : 0;
+    }
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (n < 0) return (u64)(s64)n;
+    if (n == 0 && (gf & G_AT_EMPTY_PATH) && dfd != G_AT_FDCWD) {
+        /* Named by descriptor, so the bind is asked about the fd (fchownat's
+         * AT_EMPTY_PATH form does the same; there is no path for host_ro). */
+        if (fd_ro(c->m, dfd)) return (u64)(s64)-EROFS;
+        return utimensat(dfd, "", tsp, AT_EMPTY_PATH) < 0 ? host_err() : 0;
     }
     PathPin pin;
-    unsigned gf = (unsigned)a3;
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
+    /* An empty name under AT_EMPTY_PATH at AT_FDCWD is the working directory. */
+    int r = path_resolve_pin(c->m, dfd, n == 0 && (gf & G_AT_EMPTY_PATH) ? "." : gpath,
+                             rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     /* As fchownat: timestamps belong to the shared data, so a no-follow stamp
      * on an emulated hardlink has to land on the backing. Left alone, the call

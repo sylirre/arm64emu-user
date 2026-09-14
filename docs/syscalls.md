@@ -72,6 +72,23 @@ is not the oracle for most, so the expected block is a native run's):
   `SS_AUTODISARM` on top, anything else `EINVAL` (`docs/signals-and-processes.md`
   has the rest of `sigaltstack`, `SS_AUTODISARM` included;
   `tests/fixtures/altstackflags.c`).
+- The rest of the path family judges its flags the same way, before the name
+  is read or looked up and so before any effect: `newfstatat` takes
+  `AT_SYMLINK_NOFOLLOW`/`AT_NO_AUTOMOUNT`/`AT_EMPTY_PATH` and the
+  `AT_STATX_*` sync type, `unlinkat` only `AT_REMOVEDIR`, `linkat`
+  `AT_SYMLINK_FOLLOW`/`AT_EMPTY_PATH`, `utimensat`
+  `AT_SYMLINK_NOFOLLOW`/`AT_EMPTY_PATH`, `umount2` the four `MNT_*`/`UMOUNT_*`
+  bits — and judges them first, then looks the target up, and only then asks
+  whether the caller is fake-root, so a nonexistent target is `ENOENT` for an
+  unprivileged guest too. A stray bit used to be ignored and the file removed,
+  linked or stamped all the same. Beside them: `fstatat(AT_FDCWD, "",
+  AT_EMPTY_PATH)` and `utimensat`'s equivalent name the working directory;
+  `utimensat(fd, "", times, AT_EMPTY_PATH)` stamps the descriptor (an `O_PATH`
+  `futimens(3)` used to fail `ENOENT`); its `NULL`-path form takes no flags at
+  all and is `EFAULT` at `AT_FDCWD`; a pair of `UTIME_OMIT`s succeeds before
+  the flags or the path are looked at; and a bad `tv_nsec` is `EINVAL` only
+  after the lookup, judged on the guest's 64-bit value rather than on what a
+  32-bit host's `long` makes of it (`tests/c/atflags.c`).
 - The `SIOCGIF*` interface ioctls are answered on a socket alone — they reach
   `dev_ioctl` only through `sock_do_ioctl`, and a file's ioctl op answers them
   `ENOTTY` — and a pointer they cannot copy through (null included) is
