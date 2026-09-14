@@ -666,16 +666,21 @@ static void *thread_entry(void *arg) {
     robust_list_exit_self(c);   /* its robust futexes, before the tid clear */
     as_thread_exit(&m->as);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
-    free(t);
     /* Last thread of a group whose main thread has already parked: nobody else
      * is left to tear the process down or carry its status out. The count can
      * only reach zero that way -- a live main thread is always counted, and it
      * exits through process_exit rather than through here -- so demand the
      * parked leader explicitly: if the count word ever again reads a bogus
      * zero (an execve reload transient did, before as_reinit_live), the wrong
-     * outcome is a leaked zombie, not a live process torn down. */
+     * outcome is a leaked zombie, not a live process torn down.
+     *
+     * Decided while `t` is still ours: process_exit walks guest memory through
+     * this CPU (every sibling's robust list, a vfork child's write-back) and
+     * never returns, so the block goes down with the process rather than being
+     * freed first and read afterwards. */
     if (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) == 0) process_exit(c);
+    free(t);
     return NULL;
 }
 
