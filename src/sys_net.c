@@ -1263,16 +1263,20 @@ SYSDEF(sendmmsg) {
 }
 
 /* Wait for `fd` to become readable, but never past `deadline` (monotonic ns).
- * 1 readable, 0 the deadline arrived first, -1 error/interrupted (errno set). */
+ * 1 readable, 0 the deadline arrived first, -1 error/interrupted (errno set).
+ * A deadline further off than poll's int of milliseconds can say is waited
+ * for in pieces: the cast alone kept the low 32 bits of the count, which for
+ * a span of a few thousand years is some small number of milliseconds, and
+ * the wait ended there. */
 static int wait_readable(int fd, u64 deadline) {
-    u64 now = mono_ns();
-    if (now >= deadline) return 0;
-    u64 left = deadline - now;
-    int ms = (int)((left + 999999ULL) / 1000000ULL);   /* round up: never early */
-    if (ms < 0) ms = -1;                               /* absurdly far: block */
-    struct pollfd p = { fd, POLLIN, 0 };
-    int r = poll(&p, 1, ms);
-    return r > 0 ? 1 : r;
+    for (;;) {
+        u64 now = mono_ns();
+        if (now >= deadline) return 0;
+        u64 ms = (deadline - now + 999999ULL) / 1000000ULL;   /* round up: never early */
+        struct pollfd p = { fd, POLLIN, 0 };
+        int r = poll(&p, 1, ms > INT_MAX ? INT_MAX : (int)ms);
+        if (r != 0) return r > 0 ? 1 : r;
+    }
 }
 
 /* recvmmsg(fd, msgvec, vlen, flags, timeout).
@@ -1298,7 +1302,8 @@ SYSDEF(recvmmsg) {
     int flags = (int)a3;
     if (vlen > 1024) vlen = 1024;
     int have_tmo = 0;
-    u64 deadline = 0;
+    u64 deadline = 0;           /* for the waits: monotonic ns, saturating */
+    s64 end_sec = 0, end_nsec = 0;   /* for the remainder: the kernel's form */
     if (a4) {
         GTimespec gt;
         if (copy_from_guest(c, &gt, a4, sizeof gt) < 0) return (u64)(s64)-EFAULT;
@@ -1306,8 +1311,27 @@ SYSDEF(recvmmsg) {
             return (u64)(s64)-EINVAL;
         struct timespec rel = { (time_t)gt.tv_sec, (long)gt.tv_nsec };
         syscall_wait_begin(&rel);   /* a restart keeps the deadline (syscall.c) */
-        deadline = mono_ns() +
-                   (u64)rel.tv_sec * 1000000000ULL + (u64)rel.tv_nsec;
+        /* The deadline as the kernel keeps it (poll_select_set_timeout ->
+         * timespec64_add_safe): now plus the span, normalized, and the end of
+         * time -- TIME64_MAX seconds -- where the sum does not fit. A span too
+         * large to hold means "never", and the remainder written back is the
+         * end of time minus now. The waits use the same deadline in
+         * nanoseconds, saturating the same way (sys.h): multiplied out, the
+         * span wrapped -- 2^60 seconds is exactly 0 mod 2^64 -- and the call
+         * came back empty, its deadline "already passed". */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        u64 ns = (u64)now.tv_nsec + (u64)rel.tv_nsec;
+        u64 sec = (u64)now.tv_sec + (u64)rel.tv_sec + (ns >= 1000000000ULL);
+        ns %= 1000000000ULL;
+        if (sec < (u64)now.tv_sec || sec < (u64)rel.tv_sec || sec > (u64)INT64_MAX) {
+            end_sec = INT64_MAX;
+            end_nsec = 0;
+        } else {
+            end_sec = (s64)sec;
+            end_nsec = (s64)ns;
+        }
+        deadline = span_ns_sat((u64)end_sec, (u64)end_nsec);
         have_tmo = 1;
     }
     int got = 0;
@@ -1375,10 +1399,15 @@ SYSDEF(recvmmsg) {
     /* The remainder goes back only on a call that received something, as the
      * kernel does (it returns early for 0 and for an error). */
     if (have_tmo && got > 0) {
-        u64 now = mono_ns();
-        u64 left = now < deadline ? deadline - now : 0;
-        GTimespec out = { (s64)(left / 1000000000ULL),
-                          (s64)(left % 1000000000ULL) };
+        /* timespec64_sub(end_time, now), clamped at zero as the kernel clamps
+         * it -- in the kernel's own form, so a saturated deadline reads back
+         * as the end of time minus now rather than as some other number. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        s64 ls = end_sec - (s64)now.tv_sec, ln = end_nsec - (s64)now.tv_nsec;
+        if (ln < 0) { ls--; ln += 1000000000LL; }
+        if (ls < 0) { ls = 0; ln = 0; }
+        GTimespec out = { ls, ln };
         if (copy_to_guest(c, a4, &out, sizeof out) < 0) return (u64)(s64)-EFAULT;
     }
     return (u64)got;

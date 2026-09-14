@@ -15,7 +15,9 @@
  * deliberately not reproduced by the emulator and equally deliberately not
  * tested here, because the oracle would hang.
  *
- * Self-checking: qemu-user does not model the timeout either.
+ * Self-checking: qemu-user does not model the timeout either (its recvmmsg
+ * loops recvmsg per vector without the MSG_WAITFORONE rule, and blocks for
+ * datagrams that never come).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -102,5 +104,29 @@ int main(void) {
     errno = 0;
     r = rmmsg(sv[0], v, 4, MSG_WAITFORONE, NULL);
     printf("no-tmo %ld %d\n", r, r < 0 ? errno : 0);
+
+    /* A span too large to hold in nanoseconds. The kernel's deadline
+     * arithmetic saturates (timespec64_add_safe: the end of time, TIME64_MAX
+     * seconds), so 2^60 s means "never" and the datagrams already queued
+     * come back at once, with a remainder that is the end of time minus now
+     * -- the emulator's multiplication wrapped, 2^60 * 10^9 being 0 mod 2^64,
+     * and the call came back empty, its deadline "already passed". */
+    feed(2);
+    memset(v, 0, sizeof v);
+    for (int i = 0; i < 4; i++) { v[i].msg_hdr.msg_iov = &iov[i]; v[i].msg_hdr.msg_iovlen = 1; }
+    t.tv_sec = (time_t)1 << 60; t.tv_nsec = 0;
+    errno = 0;
+    r = rmmsg(sv[0], v, 4, MSG_WAITFORONE, &t);
+    printf("huge %ld %d rem-big=%d\n", r, r < 0 ? errno : 0,
+           t.tv_sec > ((time_t)1 << 59) && t.tv_nsec >= 0 && t.tv_nsec < 1000000000L);
+    /* The largest span there is. */
+    feed(1);
+    memset(v, 0, sizeof v);
+    for (int i = 0; i < 4; i++) { v[i].msg_hdr.msg_iov = &iov[i]; v[i].msg_hdr.msg_iovlen = 1; }
+    t.tv_sec = (time_t)0x7fffffffffffffffLL; t.tv_nsec = 999999999L;
+    errno = 0;
+    r = rmmsg(sv[0], v, 4, MSG_WAITFORONE, &t);
+    printf("max %ld %d rem-big=%d\n", r, r < 0 ? errno : 0,
+           t.tv_sec > ((time_t)1 << 59) && t.tv_nsec >= 0 && t.tv_nsec < 1000000000L);
     return 0;
 }

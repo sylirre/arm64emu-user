@@ -49,6 +49,21 @@ static inline u64 mono_ns(void) {
     return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
 }
 
+/* A relative timespec as nanoseconds, and a deadline made from one -- both
+ * saturating, the way a kernel's timespec64_to_ktime and timespec64_add_safe
+ * saturate. The guest's seconds are 64 bits wide and valid up to the last of
+ * them, so a span past 2^64 ns (some 584 years) means "never": multiplied
+ * out, it wrapped to whatever the product left -- 2^60 seconds is exactly 0,
+ * and a wait of that span ended at once. A saturated deadline compares as
+ * later than any clock reading. */
+static inline u64 span_ns_sat(u64 sec, u64 nsec) {
+    if (sec > (UINT64_MAX - nsec) / 1000000000ULL) return UINT64_MAX;
+    return sec * 1000000000ULL + nsec;
+}
+static inline u64 deadline_sat(u64 now, u64 span) {
+    return span > UINT64_MAX - now ? UINT64_MAX : now + span;
+}
+
 /* ---- one transfer's byte count ------------------------------------------
  * A read/write count is a guest u64 and this emulator has to turn it into a
  * host size_t and a bounce buffer, neither of which the kernel needs: it

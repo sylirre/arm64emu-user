@@ -3397,12 +3397,9 @@ typedef struct { u64 va; u64 deadline; } PwaitTmo;
 static void pwait_tmo_arm(PwaitTmo *t, u64 va, const struct timespec *ts) {
     t->va = 0;
     if (!va || !ts || (ts->tv_sec == 0 && ts->tv_nsec == 0)) return;
-    u64 now = mono_ns();
-    u64 want = (u64)ts->tv_sec > UINT64_MAX / 1000000000ULL
-                   ? UINT64_MAX
-                   : (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
     t->va = va;
-    t->deadline = want > UINT64_MAX - now ? UINT64_MAX : now + want;
+    t->deadline = deadline_sat(mono_ns(),
+                               span_ns_sat((u64)ts->tv_sec, (u64)ts->tv_nsec));
 }
 
 static u64 pwait_tmo_finish(CPU *c, const PwaitTmo *t, u64 ret) {

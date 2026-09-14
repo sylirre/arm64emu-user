@@ -491,7 +491,12 @@ void syscall_wait_begin(struct timespec *ts) {
     if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
         g_tls.sc_wait_t0 = (u64)now.tv_sec * 1000000000ULL + (u64)now.tv_nsec;
     if (!ts || !g_tls.sc_waited_ns) return;
-    u64 want = (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
+    /* Saturating: a span past 2^64 ns is "never", and subtracting what an
+     * earlier attempt waited from it leaves "never" (sys.h). Multiplied
+     * out, 2^60 seconds wrapped to 0 and a restarted nanosleep of that span
+     * -- a tracer's attach is what restarts one -- returned at once. */
+    u64 want = span_ns_sat((u64)ts->tv_sec, (u64)ts->tv_nsec);
+    if (want == UINT64_MAX) return;
     u64 left = want > g_tls.sc_waited_ns ? want - g_tls.sc_waited_ns : 0;
     ts->tv_sec = (time_t)(left / 1000000000ULL);
     ts->tv_nsec = (long)(left % 1000000000ULL);

@@ -233,7 +233,13 @@ interrupted at 4 s would wait 9 s. The kernel restarts against the original
 deadline, so time the task spent stopped counts against the wait; the same is
 achieved by having each timed wait declare its relative timeout
 (`syscall_wait_begin`, and `_ms` for the `poll`/`epoll` millisecond form), which
-shrinks it by however long earlier attempts already waited. Absolute deadlines —
+shrinks it by however long earlier attempts already waited — in saturating
+arithmetic (`span_ns_sat`, `sys.h`), the way a kernel's `timespec64_to_ktime`
+saturates: the guest's seconds are 64 bits wide, and a span that does not fit
+in nanoseconds means "never", not whatever the product wraps to. Multiplied
+out, 2^60 seconds is exactly 0 mod 2^64, so a `nanosleep` of that span
+restarted by a tracer's attach was handed a span of 0 and returned at once
+(`tests/ptrace/attach_hugesleep.c`). Absolute deadlines —
 `clock_nanosleep(TIMER_ABSTIME)`, `FUTEX_WAIT_BITSET` and the PI futex ops — are
 exact under a plain restart and declare nothing. `rt_sigsuspend` and
 `rt_sigtimedwait` sleep in their host namesakes and loop over the kick's

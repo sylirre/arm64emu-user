@@ -1843,7 +1843,7 @@ if [ ! -x tests/fixtures/recvmmsg_tmo.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/recvmmsg_tmo.c $A64_TESTLIBS 2>/dev/null || true
 fi
 if [ -x tests/fixtures/recvmmsg_tmo.bin ]; then
-    expect=$'bad-nsec -1 22\nneg-sec -1 22\nbad-ptr -1 14\nwaitforone 2 0 len0=1 len1=1\nremainder-shrank 1\nzero-tmo -1 11 quick=1\nno-tmo 1 0'
+    expect=$'bad-nsec -1 22\nneg-sec -1 22\nbad-ptr -1 14\nwaitforone 2 0 len0=1 len1=1\nremainder-shrank 1\nzero-tmo -1 11 quick=1\nno-tmo 1 0\nhuge 2 0 rem-big=1\nmax 1 0 rem-big=1'
     got=$(timeout -k 5 60 "$EMU" / tests/fixtures/recvmmsg_tmo.bin 2>/dev/null)
     if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: recvmmsg_tmo"
     else

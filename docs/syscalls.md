@@ -899,8 +899,16 @@ without it, the call really does wait for all `vlen`. One case is deliberately
 not reproduced: the kernel checks the deadline only *after* a datagram arrives,
 so a `recvmmsg` blocking for one blocks past the timeout forever — its own
 manual page lists this under **BUGS** — whereas here the deadline bounds every
-wait. `tests/fixtures/recvmmsg_tmo.c` covers every case the kernel terminates
-in; `qemu-user` hangs on that program, so it is not the oracle either.
+wait. The deadline is kept in the kernel's own form (`timespec64_add_safe`: now
+plus the span, or the end of time — `TIME64_MAX` seconds — where the sum does
+not fit), so a span too large to hold means "never" and the remainder written
+back is the end of time minus now; the waits use the same deadline in
+nanoseconds, saturating the same way, and one further off than `poll`'s `int`
+of milliseconds can say is waited for in pieces. The plain multiplication
+this replaced wrapped — 2^60 seconds is exactly 0 mod 2^64 — and the call came
+back empty, its deadline "already passed". `tests/fixtures/recvmmsg_tmo.c`
+covers every case the kernel terminates in; `qemu-user` hangs on that program,
+so it is not the oracle either.
 
 **Interface-query ioctls.** The read-only `SIOCGIF*` family that `ifconfig` /
 net-tools issue on an `AF_INET` socket — `SIOCGIFCONF` (enumerate) plus the
