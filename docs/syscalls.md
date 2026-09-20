@@ -1310,7 +1310,24 @@ then make the consequences the caller depends on true:
   anyone's, and a row left behind would aim the next refresh's `ftruncate` at
   whatever opened next — and when the table held eight rows, that many of
   them stopped every later view from being tracked at all
-  (`tests/c/procfsrefresh.c`). The guest program's name is also set as the process `comm`
+  (`tests/c/procfsrefresh.c`). Every synthesized view is in that table, not
+  only the time-varying and the written-through ones, because the table is
+  also where the **access mode** lives: the memfd behind a view is `O_RDWR`
+  whatever the guest asked for, so the mode the guest opened it in
+  (`PfFd.acc`) is enforced by the emulator — `EBADF` for a write through a
+  descriptor opened `O_RDONLY` (a guest could rewrite its own `maps`, or set
+  an id map through a read-only descriptor) and for a read through one opened
+  `O_WRONLY`, from every read and write face including `pwritev`, which used
+  to bypass the id-map write hook altogether; `sendfile`, `splice` and
+  `copy_file_range` *into* a view answer `EBADF` for a read-only descriptor
+  and otherwise `EINVAL` (no `splice_write` on a proc file) or `EXDEV`
+  (`copy_file_range` across superblocks, 5.19+); and `mmap` of one answers,
+  in `do_mmap`'s order, `EACCES` for a mode the mapping needs and the
+  descriptor lacks, then `ENODEV` for a per-process file (no mmap operation)
+  or `EIO` for a `proc_create`d global (`proc_reg_mmap` with no `proc_mmap`)
+  — asked before the address-space lock, whose rank is below the table's. A
+  view the table cannot take is withheld with `ENOMEM`, since an unenforced
+  one would be a silent lie (`tests/fixtures/procmode.c`). The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
   for every guest process. `status` is rebuilt line by line instead
   (`put_status`): most of it — `State`, `PPid`, `FDSize`, `Threads`, the

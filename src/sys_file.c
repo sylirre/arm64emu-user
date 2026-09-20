@@ -1026,7 +1026,7 @@ SYSDEF(read) {
     if (a2 != 0 && nl_is_fd(c->m, (int)a0) &&
         nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
         return nlret;
-    procfs_pre_read(c, (int)a0, -1);
+    { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
     size_t len = rw_count(a2);
     if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
@@ -1079,7 +1079,7 @@ SYSDEF(readv) {
     if (nl_is_fd(c->m, (int)a0) &&
         nl_maybe_readv(c, (int)a0, a1, (unsigned)a2, &nlret))
         return nlret;
-    procfs_pre_read(c, (int)a0, -1);
+    { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
@@ -1180,7 +1180,7 @@ SYSDEF(writev) {
 }
 
 SYSDEF(pread64) {
-    procfs_pre_read(c, (int)a0, (s64)a3);
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
     size_t len = rw_count(a2);
     if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
     u8 *buf = malloc(len ? len : 1);
@@ -1216,7 +1216,7 @@ SYSDEF(pwrite64) {
  * historically didn't declare the wrapper, so issue the raw syscall there with
  * the offset in a single register and pos_h = 0. */
 SYSDEF(preadv2) {
-    procfs_pre_read(c, (int)a0, (s64)a3);   /* -1 = current pos, as here */
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }   /* -1 = current pos, as here */
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
@@ -1249,6 +1249,29 @@ SYSDEF(preadv2) {
     return (u64)n;
 }
 
+/* The pwritev pair below: a synthesized /proc file takes the gathered bytes
+ * through the write hook, never through the memfd (the id maps of a faked
+ * user namespace, and EBADF for a view opened read-only). Returns 1 with
+ * *ret set when the hook consumed the call. */
+static int pwritev_procfs(CPU *c, int fd, const struct iovec *iov, int cnt,
+                          s64 off, u64 *ret) {
+    if (!c->m->pf_fds_count) return 0;   /* the hook's own fast path */
+    size_t tot = 0;
+    for (int i = 0; i < cnt; i++) tot += iov[i].iov_len;
+    u8 *flat = malloc(tot ? tot : 1);
+    if (!flat) { *ret = (u64)(s64)-ENOMEM; return 1; }
+    size_t o = 0;
+    for (int i = 0; i < cnt; i++) {
+        memcpy(flat + o, iov[i].iov_base, iov[i].iov_len);
+        o += iov[i].iov_len;
+    }
+    s64 pr;
+    int consumed = procfs_pre_write(c, fd, flat, tot, off, &pr);
+    free(flat);
+    if (consumed) *ret = (u64)pr;
+    return consumed;
+}
+
 SYSDEF(pwritev2) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[1024];
@@ -1264,6 +1287,7 @@ SYSDEF(pwritev2) {
             free(bounce);
             return (u64)(s64)-EFAULT;
         }
+    { u64 pr; if (pwritev_procfs(c, (int)a0, iov, cnt, (s64)a3, &pr)) { free(bounce); return pr; } }
     ssize_t n;
 #if defined(__BIONIC__) && defined(SYS_pwritev2)
     n = syscall(SYS_pwritev2, (int)a0, iov, cnt, (long)(off_t)a3, 0L, (int)a5);
@@ -1282,7 +1306,7 @@ SYSDEF(pwritev2) {
  * position" escape -- the kernel rejects any negative offset with EINVAL --
  * and the host wrapper reproduces that. */
 SYSDEF(preadv) {
-    procfs_pre_read(c, (int)a0, (s64)a3);
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
     struct iovec iov[1024];
     GIovec g[1024];
     u8 *bounce;
@@ -1325,6 +1349,7 @@ SYSDEF(pwritev) {
             free(bounce);
             return (u64)(s64)-EFAULT;
         }
+    { u64 pr; if (pwritev_procfs(c, (int)a0, iov, cnt, (s64)a3, &pr)) { free(bounce); return pr; } }
     ssize_t n = pwritev((int)a0, iov, cnt, (off_t)a3);
     u64 e = n < 0 ? host_err() : 0;
     free(bounce);
@@ -3191,7 +3216,24 @@ SYSDEF(sync_file_range) {
     return r < 0 ? host_err() : 0;
 }
 
+/* A synthesized /proc file as the destination of a splice-family call. The
+ * kernel's proc files have no splice_write: do_splice_from answers EINVAL --
+ * after the FMODE_WRITE check every one of these makes first, so a read-only
+ * descriptor is EBADF. copy_file_range is EXDEV instead (a different
+ * superblock with no copy_file_range of its own). The memfd behind the view
+ * would have taken the bytes: a guest could rewrite its own /proc/self/maps
+ * with sendfile, or land an id map in the memfd where the write hook never
+ * sees it. */
+static int procfs_out_denied(CPU *c, int fd, int nofs_err, u64 *ret) {
+    int acc;
+    if (!procfs_fd_synth(c->m, fd, &acc)) return 0;
+    *ret = (u64)(s64)(acc == O_RDONLY ? -EBADF : -nofs_err);
+    return 1;
+}
+
 SYSDEF(sendfile) {
+    u64 pd;
+    if (procfs_out_denied(c, (int)a0, EINVAL, &pd)) return pd;   /* out_fd */
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;   /* out_fd */
     off_t off, *offp = NULL;
     if (a2) {
@@ -3716,6 +3758,8 @@ SYSDEF(splice) {
      * I/O error ("(standard input): Function not implemented") -- so we forward
      * to the host rather than stub. */
     loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    u64 pd;
+    if (procfs_out_denied(c, (int)a2, EINVAL, &pd)) return pd;   /* fd_out */
     if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
@@ -3741,6 +3785,8 @@ SYSDEF(copy_file_range) {
      * marshalling as splice; forwarded so callers that don't fall back on ENOSYS
      * (like splice's grep case) keep working. */
     loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    u64 pd;
+    if (procfs_out_denied(c, (int)a2, EXDEV, &pd)) return pd;    /* fd_out */
     if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
     if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
     if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }

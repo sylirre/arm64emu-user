@@ -357,6 +357,9 @@ struct Machine {
         int fd;
         u8 kind;              /* PF_* kind (sys_procfs.c) */
         u8 self;              /* PF_STATUS: the file describes this Machine */
+        u8 acc;               /* the guest's O_ACCMODE at open: the backing
+                               * memfd is O_RDWR whatever the guest asked,
+                               * so read/write enforce the mode from here */
         s32 pid;              /* whose file: another guest PID or TID, or 0
                                * for ours (PF_STATUS always names a TID) */
         u64 dev, ino;         /* memfd identity: the stale-entry check on fd

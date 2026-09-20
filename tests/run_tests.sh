@@ -2552,6 +2552,16 @@ check_fixture pvriov $'plain      8 touched=1\nplaindata ABCDEFGH\nlneg       -2
 # the mapping it claims to be. (qemu-user is a 64-bit process here and would
 # only ever take the mapped branch, so it is no oracle for the other one.)
 check_fixture hugemap $'anon_priv ok\nanon_shared ok\nfile_priv ok\nfile_shared ok\ngrow ok\ndone'
+# A synthesized /proc file honours the mode it was opened in. The memfd behind
+# a view is O_RDWR whatever the guest asked, so a write through an O_RDONLY
+# descriptor used to land in it (a guest could rewrite its own maps, or set an
+# id map read-only), a read through an O_WRONLY one used to succeed, and the
+# splice family and mmap reached the memfd too. Self-checking: the writable
+# views exist only for a faked user namespace, which qemu cannot fake. The
+# expectations are the kernel's answers for its own files (EBADF for the mode,
+# EINVAL/EXDEV for a splice or copy_file_range into a proc file, EACCES then
+# ENODEV/EIO for a mapping).
+check_fixture procmode $'unshare=0\nuid_ro_open=1\nuid_ro_write=EBADF\nuid_ro_pwrite=EBADF\nuid_ro_writev=EBADF\nuid_ro_pwritev=EBADF\nuid_ro_read=0\nsg_pwritev=5\nsg_readback=deny\ngid_wo_open=1\ngid_wo_read=EBADF\ngid_wo_pread=EBADF\ngid_wo_write=9\ngid_readback=         0       1000          1\nuid_rw_read=0\nuid_rw_write=9\nuid_rw_readback=         0       1000          1\nmaps_wo_open=EACCES\nmaps_write=EBADF\nmaps_pwrite=EBADF\nmaps_sendfile=EBADF\nmaps_splice=EBADF\nmaps_cfr=EBADF\nmaps_mmap=ENODEV\nmaps_unchanged=1\ngid_wo_sendfile=EINVAL\ngid_wo_cfr=EXDEV\ngid_wo_mmap=EACCES\nloadavg_mmap=EIO\nloadavg_write=EBADF\ndone'
 # The guest's own memory footprint, as its own /proc reports it -- and as
 # another guest process's /proc reports that one. Self-checking:
 # status/statm/stat are host-passthrough unless synthesized, and the host

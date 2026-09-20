@@ -182,7 +182,8 @@ SYSDEF(brk) {
     return r;
 }
 
-static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                       int procfs_err) {
     AddrSpace *as = &c->m->as;
     u64 addr = a0, len = a1;
     int prot = (int)a2, flags = (int)a3, fd = (int)(s32)a4;
@@ -315,6 +316,13 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     } else {
         if (off & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
         int shared = (flags & G_MAP_SHARED) ? 1 : 0;
+        /* A synthesized /proc file: the kernel's proc files take no mapping
+         * (sys.h, procfs_mmap_denied -- asked before the address-space lock,
+         * whose rank is below the /proc table's, and applied here, where
+         * do_mmap asks for the file's mmap operation). The memfd behind the
+         * view could be mapped -- shared and writable, whatever mode the
+         * guest opened it in. */
+        if (procfs_err) return (u64)(s64)-procfs_err;
         /* memfd tier: the backing file has no seals the host could apply, so
          * mmap asks the registry. F_SEAL_WRITE refuses any shared mapping
          * that is or could become writable (the kernel's VM_MAYWRITE test:
@@ -419,8 +427,11 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
 }
 
 SYSDEF(mmap) {
+    int pe = ((int)a3 & G_MAP_ANONYMOUS) ? 0
+           : procfs_mmap_denied(c->m, (int)(s32)a4, ((int)a3 & G_MAP_SHARED) != 0,
+                                ((int)a2 & PROT_WRITE) != 0);   /* the same bits on every host */
     as_lock();
-    u64 r = mmap_locked(c, a0, a1, a2, a3, a4, a5);
+    u64 r = mmap_locked(c, a0, a1, a2, a3, a4, a5, pe);
     as_unlock();
     return r;
 }

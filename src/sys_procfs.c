@@ -62,6 +62,7 @@ enum {
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
     PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT, PF_CPUINFO,
+    PF_SNAPSHOT,   /* an open-time snapshot with no refresh of its own */
 };
 
 /* put_mounts format selector. */
@@ -784,24 +785,23 @@ static int idmap_parse(const u8 *in, size_t len, IdExtent *out) {
  * offset or -1 for the fd's own position: the kernel only accepts a map write
  * at offset 0, and a write that landed in the backing memfd instead would be a
  * silent lie (unformatted on read-back, and the one-shot rule unapplied). */
+static int pf_find_locked(struct Machine *m, int fd);
+
 int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *ret) {
     struct Machine *m = c->m;
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
-    int i;
-    for (i = 0; i < m->pf_fds_count; i++)
-        if (m->pf_fds[i].fd == fd) break;
-    if (i == m->pf_fds_count) { EMU_UNLOCK(&pf_lock, EMU_LK_PF); return 0; }
-    struct stat st;   /* both halves of the identity: see procfs_pre_read */
-    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
-        (u64)st.st_dev != m->pf_fds[i].dev) {
-        m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
-        EMU_UNLOCK(&pf_lock, EMU_LK_PF);
-        return 0;
-    }
-    int kind = m->pf_fds[i].kind;
+    int i = pf_find_locked(m, fd);
+    if (i < 0) { EMU_UNLOCK(&pf_lock, EMU_LK_PF); return 0; }
+    int kind = m->pf_fds[i].kind, acc = m->pf_fds[i].acc;
     s32 tpid = m->pf_fds[i].pid ? m->pf_fds[i].pid : (s32)getpid();
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    /* The descriptor's mode, which the kernel checks before anything about
+     * the file (FMODE_WRITE in vfs_write): a view opened read-only takes no
+     * write. The memfd behind it would have -- a guest could rewrite its own
+     * /proc/self/maps, or set an id map through a descriptor it opened
+     * O_RDONLY, where a kernel answers EBADF. */
+    if (acc == O_RDONLY) { *ret = -EBADF; return 1; }
     if (kind != PF_UIDMAP && kind != PF_GIDMAP && kind != PF_SETGROUPS) return 0;
     if (off < 0) off = lseek(fd, 0, SEEK_CUR);
     if (off != 0) { *ret = -EINVAL; return 1; }
@@ -888,7 +888,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
  * clobbering an innocent file. Returns 0, or -ENOMEM when the table could not
  * grow -- the caller then withholds the descriptor, since an untracked
  * written-through file is a silent lie (its writes land in the memfd). */
-static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
+static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self, int acc) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -errno;
     int r = 0;
@@ -901,6 +901,7 @@ static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
         t[m->pf_fds_count].fd = fd;
         t[m->pf_fds_count].kind = (u8)kind;
         t[m->pf_fds_count].self = (u8)self;
+        t[m->pf_fds_count].acc = (u8)(acc & O_ACCMODE);
         t[m->pf_fds_count].pid = pid;
         t[m->pf_fds_count].dev = (u64)st.st_dev;
         t[m->pf_fds_count].ino = (u64)st.st_ino;
@@ -908,6 +909,88 @@ static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self) {
     }
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
     return r;
+}
+
+/* Hand a built view to the guest: rewound, CLOEXEC as asked, and tracked --
+ * every one of them, since the tracking is what enforces the access mode the
+ * guest opened it in (the memfd is O_RDWR). A view the table cannot take is
+ * withheld with ENOMEM rather than handed out unenforced: a read-only file
+ * that takes writes, or a written-through one whose writes land in the memfd,
+ * would be a silent lie either way. Sets *ret and returns 1, as procfs_open's
+ * callers expect. */
+static int pf_hand(struct Machine *m, int fd, int kind, s32 pid, int self,
+                   int gflags, s64 *ret) {
+    lseek(fd, 0, SEEK_SET);
+    if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
+    if (pf_track(m, fd, kind, pid, self, gflags) < 0) {
+        fdheld_close(fd);
+        *ret = -ENOMEM;
+        return 1;
+    }
+    *ret = fdheld_forget(fd);
+    return 1;
+}
+
+/* The kinds regenerated on a rewind (procfs_pre_read). The rest are
+ * open-time snapshots, tracked for their access mode alone. */
+static int pf_refreshes(int kind) {
+    switch (kind) {
+    case PF_LOADAVG: case PF_UPTIME: case PF_STAT: case PF_LIMITS:
+    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
+    case PF_STATUS: case PF_STATM: case PF_PIDSTAT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Look fd up, verifying it is still the memfd the entry was made for (both
+ * halves of the identity, as procfs_pre_read explains); a stale entry is
+ * dropped. Caller holds pf_lock. Returns the index or -1. */
+static int pf_find_locked(struct Machine *m, int fd) {
+    int i;
+    for (i = 0; i < m->pf_fds_count; i++)
+        if (m->pf_fds[i].fd == fd) break;
+    if (i == m->pf_fds_count) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
+        (u64)st.st_dev != m->pf_fds[i].dev) {
+        m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
+        return -1;
+    }
+    return i;
+}
+
+int procfs_fd_synth(struct Machine *m, int fd, int *acc) {
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
+    int i = pf_find_locked(m, fd);
+    if (i >= 0 && acc) *acc = m->pf_fds[i].acc;
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return i >= 0;
+}
+
+int procfs_mmap_denied(struct Machine *m, int fd, int shared, int prot_write) {
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
+    int e = 0;
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
+    int i = pf_find_locked(m, fd);
+    if (i >= 0) {
+        int acc = m->pf_fds[i].acc;
+        if ((shared && prot_write && acc == O_RDONLY) || acc == O_WRONLY)
+            e = EACCES;   /* the mode, before the file is asked anything */
+        else switch (m->pf_fds[i].kind) {
+        case PF_LOADAVG: case PF_UPTIME: case PF_VERSION: case PF_CPUINFO:
+        case PF_STAT: case PF_OVERFLOWID:
+            e = EIO;      /* proc_create'd: proc_reg_mmap with no proc_mmap */
+            break;
+        default:
+            e = ENODEV;   /* a per-process file: file_operations with no mmap */
+            break;
+        }
+    }
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return e;
 }
 
 void procfs_unmark_fd(struct Machine *m, int fd) {
@@ -955,24 +1038,21 @@ int procfs_track_dup(struct Machine *m, int oldfd, int newfd) {
     return r;
 }
 
-void procfs_pre_read(CPU *c, int fd, s64 off) {
+int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
     struct Machine *m = c->m;
-    if (!m->pf_fds_count) return;   /* unlocked fast path; benign race */
+    int refused = 0;
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
-    int i;
-    for (i = 0; i < m->pf_fds_count; i++)
-        if (m->pf_fds[i].fd == fd) break;
-    if (i == m->pf_fds_count) goto out;
-    struct stat st;
     /* Device and inode, not the inode alone: the number repeats across
      * filesystems, and everything below rewrites this descriptor from byte
      * zero -- an entry that matched a recycled fd by luck would truncate
      * whatever the guest opened next. */
-    if (fstat(fd, &st) != 0 || (u64)st.st_ino != m->pf_fds[i].ino ||
-        (u64)st.st_dev != m->pf_fds[i].dev) {
-        m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];   /* stale: fd reused */
-        goto out;
-    }
+    int i = pf_find_locked(m, fd);
+    if (i < 0) goto out;
+    /* A view opened write-only (an id map about to be written) is not for
+     * reading: EBADF, as vfs_read answers for the kernel's own file. */
+    if (m->pf_fds[i].acc == O_WRONLY) { refused = 1; goto out; }
+    if (!pf_refreshes(m->pf_fds[i].kind)) goto out;   /* an open-time snapshot */
     if (off < 0) off = lseek(fd, 0, SEEK_CUR);
     if (off != 0) goto out;   /* mid-file: keep the current snapshot */
     if (ftruncate(fd, 0) != 0) goto out;   /* memfd: cannot fail in practice */
@@ -1025,6 +1105,8 @@ void procfs_pre_read(CPU *c, int fd, s64 off) {
     lseek(fd, 0, SEEK_SET);
 out:
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    if (refused) { *ret = -EBADF; return 1; }
+    return 0;
 }
 
 /* Anonymous backing for a synthesized /proc view. a64_anonfd falls back to an
@@ -1690,10 +1772,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fd = synth_memfd();
         if (fd < 0) { *ret = synth_denied(); return 1; }   /* never the host file */
         if (clen) { ssize_t w = write(fd, cbuf, clen); (void)w; }
-        lseek(fd, 0, SEEK_SET);
-        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fdheld_forget(fd);
-        return 1;
+        return pf_hand(m, fd, PF_CMDLINE, opid, 0, gflags, ret);
     }
 
     /* /proc/<pid>/{mounts,mountinfo,mountstats} of ANOTHER guest process: the
@@ -1714,10 +1793,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fmt = !strcmp(mtail, "mountinfo")  ? MNT_MOUNTINFO :
                   !strcmp(mtail, "mountstats") ? MNT_MOUNTSTATS : MNT_MOUNTS;
         put_mounts(fd, m, fmt);
-        lseek(fd, 0, SEEK_SET);
-        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fdheld_forget(fd);
-        return 1;
+        return pf_hand(m, fd, fmt == MNT_MOUNTINFO ? PF_MOUNTINFO :
+                              fmt == MNT_MOUNTSTATS ? PF_MOUNTSTATS : PF_MOUNTS,
+                       mpid, 0, gflags, ret);
     }
 
     /* /proc/<pid>/{environ,auxv} of ANOTHER guest process: served from the guest
@@ -1745,10 +1823,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fd = synth_memfd();
         if (fd < 0) { *ret = synth_denied(); return 1; }   /* never the host file */
         if (blen) { ssize_t w = write(fd, buf, blen); (void)w; }
-        lseek(fd, 0, SEEK_SET);
-        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        *ret = fdheld_forget(fd);
-        return 1;
+        return pf_hand(m, fd, etail[0] == 'a' ? PF_AUXV : PF_ENVIRON, epid, 0,
+                       gflags, ret);
     }
 
     /* Address-space files of ANOTHER guest process: refused, never passed
@@ -1785,13 +1861,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             int fd = synth_memfd();
             if (fd < 0) { *ret = -ENOENT; return 1; }   /* deny, never the host file */
             put_idmap(fd, m, k, upid);
-            lseek(fd, 0, SEEK_SET);
-            if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-            /* Written through, and re-read after: a descriptor this cannot
-             * track would take the write into the memfd and call it done. */
-            if (pf_track(m, fd, k, upid, 0) < 0) { fdheld_close(fd); *ret = -ENOMEM; return 1; }
-            *ret = fdheld_forget(fd);
-            return 1;
+            /* Written through, and re-read after (pf_hand tracks it). */
+            return pf_hand(m, fd, k, upid, 0, gflags, ret);
         }
     }
 
@@ -1818,11 +1889,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             *ret = -ENOMEM;
             return 1;
         }
-        lseek(fd, 0, SEEK_SET);
-        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        if (tid > 0) pf_track(m, fd, PF_STATUS, tid, self);
-        *ret = fdheld_forget(fd);
-        return 1;
+        /* A task the rewrite could not name (tid 0) has no refresh to go
+         * back to: the view is a snapshot then, tracked like any other. */
+        return pf_hand(m, fd, tid > 0 ? PF_STATUS : PF_SNAPSHOT, tid, self, gflags, ret);
     }
 
     /* /proc/<pid>/statm and /proc/<pid>/stat: their sizes are the emulator's
@@ -1871,11 +1940,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             *ret = -ENOMEM;
             return 1;
         }
-        lseek(fd, 0, SEEK_SET);
-        if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
-        pf_track(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, !szpid);
-        *ret = fdheld_forget(fd);
-        return 1;
+        return pf_hand(m, fd, is_statm ? PF_STATM : PF_PIDSTAT, sttid, !szpid,
+                       gflags, ret);
     }
 
     const char *tail = self_tail(canon);
@@ -1974,18 +2040,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
                         put_idmap(fd, m, kind, 0); break;
     }
     (void)wr;   /* memfd write: no short/failed writes short of ENOMEM */
-    lseek(fd, 0, SEEK_SET);
-    if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
-    /* Time-varying, or written through. An untracked time-varying file just
-     * keeps its open-time snapshot; an untracked written-through one would
-     * take the write into the memfd and call it done, so that one is refused. */
-    if ((kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT ||
-         kind == PF_LIMITS || writable) &&
-        pf_track(m, fd, kind, 0, 1) < 0 && writable) {
-        fdheld_close(fd);
-        *ret = -ENOMEM;
-        return 1;
-    }
-    *ret = fdheld_forget(fd);
-    return 1;
+    /* Time-varying (refreshed on a rewind), written through, or a snapshot:
+     * tracked alike, for the access mode. */
+    return pf_hand(m, fd, kind, 0, 1, gflags, ret);
 }

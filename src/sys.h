@@ -427,22 +427,43 @@ void ptimers_fork_clear(void);
  * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
 
-/* The time-varying synthesized files (loadavg/uptime/stat) are regenerated
+/* Every synthesized file is a descriptor the emulator tracks by number, with
+ * the access mode the guest opened it in: the backing memfd is O_RDWR
+ * whatever the guest asked, so the mode is enforced here, not by the host --
+ * a read of a write-only id map and a write to a read-only view are EBADF,
+ * as they are on the kernel's own files.
+ *
+ * The time-varying synthesized files (loadavg/uptime/stat) are regenerated
  * when a read starts at offset 0 — procps opens them once and lseek(0)+reads
  * every refresh cycle, so an open-time snapshot would freeze top/vmstat.
  * Call before the host read; off = the explicit pread-family offset, or -1
- * for the fd's current position (read/readv). */
-void procfs_pre_read(CPU *c, int fd, s64 off);
+ * for the fd's current position (read/readv). Returns 1 with *ret set (an
+ * errno) when the read is refused, 0 to let it proceed. */
+int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret);
 /* Drop refresh tracking for a closing fd. */
 void procfs_unmark_fd(struct Machine *m, int fd);
 /* newfd is a second name for oldfd's file (fd_track_dup): a written-through
  * id-map file has to be recognised under it too. 0 or -ENOMEM. */
 int  procfs_track_dup(struct Machine *m, int oldfd, int newfd);
-/* A write to a synthesized /proc file that accepts one (the id maps of a faked
- * user namespace). Returns 1 with *ret set to the guest return value when it
+/* A write to a synthesized /proc file: consumed by the ones that accept one
+ * (the id maps of a faked user namespace), EBADF for a descriptor opened
+ * read-only. Returns 1 with *ret set to the guest return value when it
  * consumed the write, 0 for an ordinary fd. */
 int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
                      s64 *ret);
+/* Is fd a synthesized /proc file? *acc receives the guest's O_ACCMODE. The
+ * kernel's proc files take no splice_write and no mmap, so sendfile, splice
+ * and copy_file_range INTO one, and a mapping of one, are refused by the
+ * callers that ask (EBADF for a read-only descriptor first, as the kernel
+ * checks FMODE_WRITE before anything else). */
+int procfs_fd_synth(struct Machine *m, int fd, int *acc);
+/* mmap of a synthesized /proc file: 0, or the errno the kernel's own file
+ * answers, in do_mmap's order -- EACCES for a mode the mapping needs and the
+ * descriptor lacks (write for a shared writable one, read for any), then
+ * ENODEV for a per-process file (no mmap operation at all) or EIO for a
+ * global one (proc_reg_mmap, whose entry has no proc_mmap). `shared` and
+ * `prot_write` are the mapping's. */
+int procfs_mmap_denied(struct Machine *m, int fd, int shared, int prot_write);
 /* Copy `from`'s recorded id maps into this Machine, for a fork child taking
  * over its parent's user namespace: maps a parent wrote for us went to the
  * shared registry, never to the Machine copy we inherit. */
