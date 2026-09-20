@@ -607,7 +607,21 @@ same table, because no sandbox helper gets off the ground without them:
 
 Any other real filesystem type returns `EPERM`, as does every call unless the
 guest is fake-root (`--fake-id`, `euid 0`), matching the kernel's `CAP_SYS_ADMIN`
-requirement (the `--bind` CLI stays the unprivileged startup path).
+requirement (the `--bind` CLI stays the unprivileged startup path). The
+arguments are imported first, the way `sys_mount` imports them and in its
+order: the type string, then the source, then the options page, then
+(`do_mount`) the target path — and only then, in `path_mount`, `MS_NOUSER`
+(`EINVAL`) and the caller's privilege. A string is `EFAULT` when unreadable and
+`EINVAL` at `PATH_MAX` or longer (`strndup_user`); the options are one page
+copied as far as it is readable (`copy_mount_options` tolerates a short copy,
+and the page's last byte is always a NUL), `EFAULT` only when not a single byte
+is; a target that is not there is `ENOENT` whatever the call would have done at
+it, a propagation change included. The tmpfs branch used to be the only reader
+of the options, into 256 bytes, falling back to the defaults for a pointer it
+could not read, and nothing read them for any other flavor
+(`tests/fixtures/mountargs.c`). `MS_BIND` with no source, or an empty one, is
+`EINVAL` (`do_loopback`); a new filesystem with no type is `EINVAL`
+(`do_new_mount`) and one on a file is `ENOTDIR` (`graft_tree`).
 
 The bind table is **process-shared** — a `MAP_SHARED` region created before the
 first fork (`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by

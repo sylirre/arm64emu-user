@@ -2532,6 +2532,35 @@ static int pin_isdir(PathPin *p, int want_dir) {
     return (want_dir && !S_ISDIR(st.st_mode)) ? -ENOTDIR : 0;
 }
 
+/* mount(2)'s user-memory arguments, imported the way sys_mount imports them
+ * and in its order, before anything about the call is decided: the type
+ * string, then the source, then the options page, then (in do_mount) the
+ * target path -- and only then, in path_mount, the caller's privilege. A
+ * string is EFAULT when unreadable and EINVAL at PATH_MAX or longer
+ * (strndup_user); the options are a page copied as far as it is readable
+ * (copy_mount_options tolerates a short copy), and EFAULT only when not a
+ * single byte is -- so a null pointer means "no options" and a bad one is an
+ * error whatever the mount was going to be. The tmpfs branch used to be the
+ * only reader of the options, and it fell back to the defaults for a pointer
+ * it could not read; nothing read them at all for any other flavor. */
+static int mount_str(CPU *c, u64 va, char *out) {   /* out >= PATH_MAX */
+    out[0] = 0;
+    if (!va) return 0;
+    long n = copy_str_from_guest(c, out, va, PATH_MAX);
+    if (n == -ENAMETOOLONG) return -EINVAL;
+    return n < 0 ? (int)n : 0;
+}
+static int mount_options(CPU *c, u64 va, char *out) {   /* out is 4096 */
+    out[0] = 0;
+    if (!va) return 0;
+    size_t room = rw_room(c, va, 4096, ACC_READ);
+    if (!room) return -EFAULT;
+    if (copy_from_guest(c, out, va, room) < 0) return -EFAULT;
+    if (room < 4096) memset(out + room, 0, 4096 - room);
+    out[4095] = 0;   /* path_mount: the page's last byte is always a NUL */
+    return 0;
+}
+
 /* mount(source=a0, target=a1, fstype=a2, flags=a3, data=a4): bind-mount
  * emulation over the process-shared bind table (path.c). Real-filesystem mounts need
  * privilege we do not have, so only bind mounts, per-mount remount (ro/rw), and
@@ -2543,41 +2572,45 @@ static int pin_isdir(PathPin *p, int want_dir) {
  * an inherent limit of prefix-based reverse mapping also present for CLI binds. */
 SYSDEF(mount) {
     struct Machine *m = c->m;
-    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    char fstype[PATH_MAX], source[PATH_MAX], data[4096];
+    int r = mount_str(c, a2, fstype);
+    if (r == 0) r = mount_str(c, a0, source);
+    if (r == 0) r = mount_options(c, a4, data);
+    if (r < 0) return (u64)(s64)r;
+    /* The target (do_mount's user_path_at): it has to exist, whatever the
+     * call is going to do at it -- a propagation change on a name that is
+     * not there is ENOENT, not a success. Pinned for the moment, so the
+     * question "is it a directory" the new-filesystem flavors ask is asked of
+     * the thing the walk found. */
+    char tcanon[PATH_MAX];
+    PathPin tp;
+    r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&tp, 1);
+    path_unpin(&tp);
+    if (r < 0 && r != -ENOTDIR) return (u64)(s64)r;
+    int tisdir = r == 0;
+
     unsigned long flags = (unsigned long)a3;
     if ((flags & G_MS_MGC_MSK) == G_MS_MGC_VAL)      /* strip legacy mount magic */
         flags &= ~(unsigned long)G_MS_MGC_MSK;
+    if (flags & (1UL << 31)) return (u64)(s64)-EINVAL;   /* MS_NOUSER: never from user space */
+    if (!fake_root(m)) return (u64)(s64)-EPERM;         /* may_mount */
 
-    /* Propagation-only change (e.g. bwrap's MS_REC|MS_PRIVATE on "/"): a no-op
-     * here, but it must succeed. Checked first — it carries no real source and
-     * makes no new mount. */
-    if ((flags & (G_MS_PRIVATE | G_MS_SLAVE | G_MS_SHARED | G_MS_UNBINDABLE)) &&
-        !(flags & (G_MS_BIND | G_MS_REMOUNT | G_MS_MOVE)))
-        return 0;
-
-    if (flags & G_MS_MOVE) return (u64)(s64)-EINVAL;   /* not supported */
-
-    if (flags & G_MS_REMOUNT) {                        /* change ro/rw on a bind */
-        char host[PATH_MAX], canon[PATH_MAX];
-        int r = resolve_at(c, G_AT_FDCWD, a1, 0, host, canon);
-        if (r < 0) return (u64)(s64)r;
-        return (u64)(s64)bind_remount(m, canon, (flags & G_MS_RDONLY) ? 1 : 0);
-    }
+    /* path_mount's dispatch, in its order: remount, bind, propagation change,
+     * move, new mount. */
+    if (flags & G_MS_REMOUNT)                          /* change ro/rw on a bind */
+        return (u64)(s64)bind_remount(m, tcanon, (flags & G_MS_RDONLY) ? 1 : 0);
 
     if (flags & G_MS_BIND) {                           /* new bind mount */
-        char shost[PATH_MAX], thost[PATH_MAX], tcanon[PATH_MAX], scanon[PATH_MAX];
-        PathPin sp, tp;
-        int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &sp, scanon);   /* source */
+        char shost[PATH_MAX], scanon[PATH_MAX];
+        PathPin sp;
+        if (!source[0]) return (u64)(s64)-EINVAL;      /* do_loopback: no source */
+        r = path_resolve_pin(m, G_AT_FDCWD, source, 0, &sp, scanon);   /* source */
         if (r < 0) return (u64)(s64)r;
         r = pin_isdir(&sp, 0);                                   /* must exist */
         strcpy(shost, sp.host);
         path_unpin(&sp);
-        if (r < 0) return (u64)(s64)r;
-        r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);      /* mountpoint */
-        if (r < 0) return (u64)(s64)r;
-        r = pin_isdir(&tp, 0);                                   /* must exist */
-        strcpy(thost, tp.host);
-        path_unpin(&tp);
         if (r < 0) return (u64)(s64)r;
         /* The source is a GUEST path, so only its host-owned prefix may ever be
          * opened by name -- the guest can rename every component below it. */
@@ -2586,36 +2619,36 @@ SYSDEF(mount) {
         return r < 0 ? (u64)(s64)r : 0;
     }
 
+    /* Propagation-only change (e.g. bwrap's MS_REC|MS_PRIVATE on "/"): a no-op
+     * here, but it must succeed. It carries no real source and makes no new
+     * mount. */
+    if (flags & (G_MS_PRIVATE | G_MS_SLAVE | G_MS_SHARED | G_MS_UNBINDABLE))
+        return 0;
+
+    if (flags & G_MS_MOVE) return (u64)(s64)-EINVAL;   /* not supported */
+
+    /* A new mount: do_new_mount wants a type. */
+    if (!a2) return (u64)(s64)-EINVAL;
+
     /* tmpfs: no real filesystem is created (that needs privilege we do not
      * have), but what a caller wants from one -- an empty writable tree that
      * hides the mountpoint's contents until umount -- is exactly a bind of a
      * fresh host directory. bubblewrap builds its whole sandbox in a tmpfs, so
      * without this no sandbox helper gets off the ground. ramfs is the same
      * deal. Anything else really is a filesystem we cannot fabricate. */
-    char fstype[64] = {0};
-    if (a2 && copy_str_from_guest(c, fstype, a2, sizeof fstype) < 0)
-        return (u64)(s64)-EFAULT;
     if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs")) {
-        char tcanon[PATH_MAX], backing[PATH_MAX];
-        PathPin tp;
-        int r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
-        if (r < 0) return (u64)(s64)r;
-        r = pin_isdir(&tp, 1);
-        path_unpin(&tp);
-        if (r < 0) return (u64)(s64)r;
+        char backing[PATH_MAX];
+        if (!tisdir) return (u64)(s64)-ENOTDIR;
         r = tmpfs_dir_new(m, backing);
         if (r < 0) return (u64)(s64)r;
         /* mode= from the option string, like the kernel's tmpfs parser; the
          * default matches the kernel's (0755, not the /tmp 01777 an fstab sets). */
-        char data[256] = {0};
-        if (a4 && copy_str_from_guest(c, data, a4, sizeof data) >= 0) {
-            const char *mp = strstr(data, "mode=");
-            if (mp && (mp == data || mp[-1] == ',')) {
-                unsigned mode = 0;
-                const char *p = mp + 5;
-                for (; *p >= '0' && *p <= '7'; p++) mode = mode * 8 + (unsigned)(*p - '0');
-                if (p != mp + 5) chmod(backing, (mode_t)(mode & 07777));
-            }
+        const char *mp = strstr(data, "mode=");
+        if (mp && (mp == data || mp[-1] == ',')) {
+            unsigned mode = 0;
+            const char *p = mp + 5;
+            for (; *p >= '0' && *p <= '7'; p++) mode = mode * 8 + (unsigned)(*p - '0');
+            if (p != mp + 5) chmod(backing, (mode_t)(mode & 07777));
         }
         /* The backing directory is ours, in a host-owned dir: trusted whole. */
         r = bind_add(m, tcanon, backing, (unsigned)strlen(backing),
@@ -2636,13 +2669,7 @@ SYSDEF(mount) {
     const char *zone = !strcmp(fstype, "proc")   && !m->no_proc ? "/proc"    :
                        !strcmp(fstype, "devpts") && !m->no_dev  ? "/dev/pts" : NULL;
     if (zone) {
-        char tcanon[PATH_MAX];
-        PathPin tp;
-        int r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
-        if (r < 0) return (u64)(s64)r;
-        r = pin_isdir(&tp, 1);
-        path_unpin(&tp);
-        if (r < 0) return (u64)(s64)r;
+        if (!tisdir) return (u64)(s64)-ENOTDIR;
         r = bind_add(m, tcanon, zone, path_host_root(m, zone), 0);
         return r < 0 ? (u64)(s64)r : 0;
     }

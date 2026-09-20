@@ -2508,6 +2508,25 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     done
     fx_rm "tests/fixtures/$name.bin"
 }
+# ---- mount(2)'s arguments, imported in the kernel's order: type, source, the
+# options page (EFAULT only when none of it is readable, otherwise as far as it
+# goes), then the target, then privilege and the kind of mount. Self-checking:
+# qemu-user performs real mounts. Run as fake root for the mounts themselves,
+# and unprivileged for the order of EPERM against the argument errors. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/mountargs.bin \
+            tests/fixtures/mountargs.c 2>/dev/null; then
+        head=$'type_bad=EFAULT\ntype_long=EINVAL\nsource_bad=EFAULT\nsource_long=EINVAL\ndata_bad=EFAULT\ndata_bad_bind=EFAULT\ndata_bad_tmpfs=EFAULT\ntarget_bad=EFAULT\ntarget_missing=ENOENT\ntarget_missing_bind=ENOENT\nnouser=EINVAL'
+        got=$("$EMU" --fake-id / tests/fixtures/mountargs.bin 2>/dev/null)
+        fixture_verdict "mountargs (fake root)" "$head"$'\nprivate=0\nbind_nosrc=EINVAL\nbind_emptysrc=EINVAL\ntmpfs_notype=EINVAL\ntmpfs_edge=0\nedge_mode=7\numount=0\ntmpfs_late=0\nlate_mode=700\numount=0\ntmpfs_page=0\numount=0\ntmpfs_on_file=ENOTDIR\ndone' "$got"
+        got=$("$EMU" / tests/fixtures/mountargs.bin 2>/dev/null)
+        fixture_verdict "mountargs (unprivileged)" "$head"$'\nprivate=EPERM\ndone' "$got"
+        fx_rm tests/fixtures/mountargs.bin
+    else
+        skip_build "fixtures/mountargs"
+    fi
+fi
+
 check_fixture robust $'get0 rc=0 len=24\nset_badlen rc=-1 err=22\nkept rc=0 same=1\nset rc=0\nget rc=0 head=0x12340 len=24\nget_nopid rc=-1 err=3'
 # SO_GET_FILTER answers in instructions what it was asked in bytes, so the
 # caller's optlen bounds nothing the kernel writes: a 600-instruction filter
