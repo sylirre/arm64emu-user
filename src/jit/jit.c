@@ -839,7 +839,11 @@ void jit_fork_child(void) {
     memset(g_jit_envs, 0, sizeof g_jit_envs);
     JitEnv *env = &g_jit_env;
     if (env->active) jit_env_destroy(env);
-    if (g_jit_stats > 0) {
+    /* Read the way every other site reads it (the declaration): a fork
+     * child is single-threaded, but the exiting thread below is not alone,
+     * and a sibling's jstat_bump can be clearing the flag on an allocation
+     * failure at that very moment. */
+    if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) > 0) {
         /* Report per process; the mutex may be held by a dead thread. */
         pthread_mutex_init(&g_jstat_mu, NULL);
         free(t_jstat);
@@ -855,7 +859,7 @@ void jit_thread_exit(void) {
     t_ir = NULL;
     JitEnv *env = &g_jit_env;
     if (!env->active) return;
-    if (g_jit_stats > 0) jstat_merge(env->c->icount);
+    if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) > 0) jstat_merge(env->c->icount);
     registry_del(env);
     jit_env_destroy(env);
 }
