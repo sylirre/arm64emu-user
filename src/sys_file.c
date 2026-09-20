@@ -1484,13 +1484,24 @@ SYSDEF(readlinkat) {
     ssize_t rn;
     /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
      * state; report the guest-view target instead. */
-    int magic = path_proc_magic(c->m, canon, buf);
+    int gone = 0;
+    int magic = path_proc_magic(c->m, canon, buf, &gone);
     if (magic == 0 && proc_zone_path(host))
-        magic = path_proc_magic(c->m, host, buf);
+        magic = path_proc_magic(c->m, host, buf, &gone);
     if (magic < 0) { path_unpin(&pin); return (u64)(s64)magic; }   /* guest process */
     if (magic > 0) {
-        rn = (ssize_t)strlen(buf);
         path_unpin(&pin);
+        rn = (ssize_t)strlen(buf);
+        /* The cwd link of an unlinked directory is spelled "<path> (deleted)",
+         * and d_path answers ENAMETOOLONG when that does not fit the PATH_MAX
+         * the link is read into -- which a path of PATH_MAX - 1 bytes leaves
+         * no room for. Bounded here; it used to be an unchecked strcat. */
+        if (gone) {
+            static const char sfx[] = " (deleted)";
+            if ((size_t)rn + sizeof sfx > sizeof buf) return (u64)(s64)-ENAMETOOLONG;
+            memcpy(buf + rn, sfx, sizeof sfx);
+            rn += (ssize_t)(sizeof sfx - 1);
+        }
     } else {
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {

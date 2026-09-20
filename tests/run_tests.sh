@@ -240,7 +240,14 @@ for cfile in tests/c/*.c; do
     # in that comparison, so name the skip rather than report a difference
     # between two filesystems. (A recorded oracle never runs here, and the
     # rootfs staging it does need works on any host.)
-    if [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ] &&
+    # And a test whose answers need the rootfs to be "/" says so in a
+    # STATIC-ONLY: marker naming why -- the dyn row runs under the glibc
+    # rootfs, whose host prefix bounds every guest path at PATH_MAX minus its
+    # own length, so a path that has to fill PATH_MAX cannot be built there.
+    static_only=$(grep -m1 -o 'STATIC-ONLY:[^*]*' "$cfile" | sed 's/^STATIC-ONLY: *//')
+    if [ -n "$static_only" ]; then
+        skip=$((skip+1)); echo "SKIP c/${base}(dyn) (static-only: $static_only)"
+    elif [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ] &&
        grep -q '"/tmp' "$cfile"; then
         skip=$((skip+1)); echo "SKIP c/${base}(dyn) (host has no /tmp for the oracle side)"
     elif [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null &&

@@ -538,8 +538,20 @@ unlinked cwd is `ENOENT` from `getcwd`, flagged for the walk — the names in it
 answer `ENOENT` whatever a directory created at the old path holds by now, `.`
 pins as the host's own `AT_FDCWD` (the inode the name no longer reaches), `..`
 climbs to the parent's *current* path, read off an `O_PATH` descriptor of it —
-and named `(deleted)` by the `/proc/self/cwd` link (`tests/c/cwdinode.c`, with
-qemu doing real `chdir`s as the oracle). The guest starts at `/`, or where the
+and named `<path> (deleted)` by the `/proc/self/cwd` link (`tests/c/cwdinode.c`,
+with qemu doing real `chdir`s as the oracle). The suffix is `readlinkat`'s to
+append, bounded: `d_path` answers `ENAMETOOLONG` when the ten extra bytes do
+not fit the `PATH_MAX` the link is read into, which a canonical path of
+`PATH_MAX - 1` bytes (a rootfs of `/`, or a bind whose host prefix is shorter
+than its mount point) leaves no room for — it used to be an unchecked `strcat`
+onto a `PATH_MAX` stack buffer. The walk never sees the suffix: following
+`/proc/self/cwd` while the directory is unlinked lands the walk on the inode
+the way a relative path does, with the last known path as a trusted prefix and
+the unlinked flag answering the rest (`stat("/proc/self/cwd")` and the `.`
+forms succeed, a name in it is `ENOENT`), where it used to walk a path spelled
+with the suffix and answer `ENOENT` for all of them (`tests/c/cwdlong.c`).
+Another process's `cwd` link is served from the registry, which records no
+unlinking: it reports the path last published. The guest starts at `/`, or where the
 host was launched if that lies inside the rootfs, or at `-w/--work-dir dir`
 (resolved with `path_resolve`, so `--bind` and symlinks apply), and the host
 moves there at startup: nothing of the emulator's own depends on where it was

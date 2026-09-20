@@ -994,7 +994,7 @@ int exec_open_pinned(const PathPin *p);
 /* Magic /proc self-link (exe/cwd/root, self or own-pid spelling): writes the
  * guest-view target to tgt (>= PATH_MAX) and returns 1; 0 if not magic;
  * -errno for a link that must be refused (map_files, see below). */
-int path_proc_magic(struct Machine *m, const char *canon, char *tgt);
+int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *deleted);
 /* Does this per-task /proc tail name an address-space file (maps, smaps, mem,
  * pagemap, map_files/..., ...)? Their host answers describe the emulator, so
  * none of them may pass through -- for another guest process or for this one. */

@@ -371,7 +371,18 @@ int proc_own_fd_denied(const char *host) {
  * denying is the only safe answer there, since falling through would report the
  * host link, and that names the emulator's own binary and the host cwd. The
  * map_files links are refused outright for the same reason, self included --
- * see proc_map_files_link. */
+ * see proc_map_files_link.
+ *
+ * `deleted`, when non-NULL, reports the one target that names no path: the
+ * cwd link of a working directory since unlinked. The kernel's d_path spells
+ * that "<path> (deleted)", and tgt carries the PLAIN path -- the caller that
+ * reports the link (readlinkat) appends the suffix, bounded, and answers
+ * ENAMETOOLONG where it does not fit, as d_path does; the walk takes the flag
+ * instead, since the suffix is not a name to walk (it used to be spliced in
+ * as one, which was an unchecked strcat of ten bytes onto a canonical path
+ * that fills the whole buffer under a rootfs of "/"). Another process's cwd
+ * is served from the registry, which records no unlinking; it is reported
+ * as the path it last published. */
 /* Per-task /proc files that describe an address space. Not one of them has a
  * guest answer that could be read off the host file: the host's describe the
  * EMULATOR -- its own mappings, at its own foreign-ISA addresses, naming its
@@ -400,7 +411,8 @@ static int proc_map_files_link(const char *t) {
     return !strncmp(t, "map_files/", 10) && t[10];
 }
 
-int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
+int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *deleted) {
+    if (deleted) *deleted = 0;
     if (m->no_proc) return 0;   /* --no-proc: no /proc emulation at all */
     if (strncmp(canon, "/proc/", 6)) return 0;
 
@@ -411,7 +423,7 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt) {
         if (!strcmp(tail, "cwd"))  {
             int gone = 0;
             cwd_current(m, tgt, &gone);   /* the kernel's own link, guest view */
-            if (gone) strcat(tgt, " (deleted)");
+            if (deleted) *deleted = gone;
             return 1;
         }
         if (!strcmp(tail, "root")) { strcpy(tgt, "/"); return 1; }
@@ -1706,10 +1718,25 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
          * elsewhere asks for /newroot/proc/self/exe -- and the host path a
          * passthrough resolves to *is* the canonical spelling, so check both;
          * otherwise the walk follows the host link and leaks emulator state. */
-        int magic = path_proc_magic(m, canon, tgt);
+        int gone = 0;
+        int magic = path_proc_magic(m, canon, tgt, &gone);
         if (magic == 0 && proc_zone_path(hostbuf))
-            magic = path_proc_magic(m, hostbuf, tgt);
+            magic = path_proc_magic(m, hostbuf, tgt, &gone);
         if (magic < 0) return magic;      /* guest process, no guest target */
+        if (magic > 0 && gone) {
+            /* Our cwd link, and the directory has been unlinked: the link
+             * resolves to the inode, which no path names any more. Take the
+             * walk to it the way a walk that STARTS in it gets there -- the
+             * last known path as the canonical prefix, trusted the way a
+             * starting directory is (nothing below it is asked to exist), and
+             * the unlinked flag, which answers what follows: "." and nothing
+             * are the inode itself, ".." climbs out, any name is ENOENT. */
+            if (++nlinks > 40) return -ELOOP;
+            strcpy(canon, tgt);
+            depth = trusted = canon_depth(canon, croot);
+            cwd_gone = 1;
+            continue;
+        }
         if (magic > 0) {
             tn = (ssize_t)strlen(tgt);
         } else {
