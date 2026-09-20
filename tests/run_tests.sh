@@ -1700,7 +1700,7 @@ fi
 # --fake-id because the permission check takes a different branch for a faked
 # identity, and every fallback has to be right in both.
 if [ -x tests/fixtures/ownfdexec.bin ]; then
-    expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\nnoexec=13\ndone'
+    expect=$'REOPEN-OK write_denied=1\nscript=0\nELF-OK\nelf=0\nELF-OK\nexecveat=0\nnoexec=13\nsparse size_ok=1 head=1 mid=1 tail=1 holes_kept=1\ndone'
     for ofx_id in "" "--fake-id"; do
         for ofx_deny in 0 1; do
             for ofx_chmod in 0 1; do

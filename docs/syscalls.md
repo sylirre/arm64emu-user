@@ -1368,6 +1368,14 @@ then make the consequences the caller depends on true:
   `O_RDONLY` `open` of a memfd-backed path returns a sealed-memfd snapshot of
   its contents (writes keep failing, as they would on the sealed original;
   `proc_own_fd_path` in `src/path.c`, fallback in `sys_file.c` openat). The
+  snapshot copies the file's **data extents** (`SEEK_DATA`/`SEEK_HOLE`,
+  `snapshot_data`) and sets the length once at the end, so it costs what the
+  guest itself wrote: a memfd is sparse, and a guest can `ftruncate` one to a
+  terabyte for the price of a syscall, which a copy read through to EOF turned
+  into a terabyte of zeros read and written — minutes, and every hole made
+  real in the host's memory — on a request the guest could repeat at will. A
+  filesystem that cannot answer `SEEK_DATA` is copied through as before
+  (`tests/fixtures/ownfdexec.c`, leg 5, over every tier). The
   execute-permission check (`exec_perm_check`, `sys_proc.c`) makes the same
   turn: with the path refused it applies the kernel's rule to the mode the
   descriptor reported rather than re-asking the path through `access(2)`, which

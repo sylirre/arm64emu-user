@@ -738,6 +738,50 @@ int l2s_deref_pin(struct Machine *m, PathPin *p) {
 #endif
 }
 
+/* Copy `from` into `to`, data extents only. The copy is bounded by what the
+ * guest itself WROTE, not by the size it gave the file: a memfd is sparse, and
+ * a guest can ftruncate one to a terabyte for the price of a syscall. Reading
+ * that through to EOF used to be a terabyte of zeros read and written --
+ * minutes of the emulator's time, and every hole made real in the snapshot,
+ * which is the host's memory, on a request the guest can repeat at will. So
+ * the copy walks the file's data extents (SEEK_DATA/SEEK_HOLE, which shmem
+ * has had since 3.8, and the tier's backing filesystems too), copies those,
+ * and sets the length once at the end, leaving the holes holes. A filesystem
+ * that cannot answer SEEK_DATA (EINVAL) is copied through, as before; ENXIO
+ * is the end of the data. What remains is proportional to the guest's own
+ * writes, which it paid for in the same currency. Returns 0 or -1. */
+static int snapshot_data(int from, int to) {
+    struct stat st;
+    if (fstat(from, &st) < 0) return -1;
+    char buf[65536];
+    off_t off = 0, size = st.st_size;
+    while (off < size) {
+        off_t dstart = lseek(from, off, SEEK_DATA);
+        if (dstart < 0) {
+            if (errno == ENXIO) break;              /* holes to the end */
+            if (errno != EINVAL) return -1;
+            dstart = off;                           /* no extent map: all data */
+        }
+        off_t dend = lseek(from, dstart, SEEK_HOLE);
+        if (dend < 0) {
+            if (errno != EINVAL) return -1;
+            dend = size;
+        }
+        for (off = dstart; off < dend; ) {
+            size_t want = (size_t)(dend - off) < sizeof buf ? (size_t)(dend - off) : sizeof buf;
+            ssize_t rd = pread(from, buf, want, off);
+            if (rd == 0) break;                     /* shrunk under us */
+            if (rd < 0 || pwrite(to, buf, (size_t)rd, off) != rd) return -1;
+            off += rd;
+        }
+        off = dend;
+    }
+    /* The length the guest set, holes included; a file resized meanwhile is
+     * left the length it has now, as a plain copy would have found it. */
+    if (fstat(from, &st) < 0) return -1;
+    return ftruncate(to, st.st_size);
+}
+
 /* Fallback when the host refuses to re-open one of our own fds by path:
  * Android's SELinux denies opening /proc/self/fd/N when N is a memfd (sealed
  * or not, EACCES), and apk-tools' triggers are scripts in a sealed memfd that
@@ -792,17 +836,10 @@ static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
     }
     fdheld_add(nfd);
     fdwin_leave();
-    char buf[65536];
-    off_t off = 0;
-    for (;;) {
-        ssize_t rd = pread(own, buf, sizeof buf, off);
-        if (rd == 0) break;
-        if (rd < 0 || pwrite(nfd, buf, (size_t)rd, off) != rd) {
-            fdheld_close(nfd);
-            errno = EACCES;
-            return -1;
-        }
-        off += rd;
+    if (snapshot_data(own, nfd) < 0) {
+        fdheld_close(nfd);
+        errno = EACCES;
+        return -1;
     }
     if (*tiered) {
         /* Sealed where the seals live for this tier. Without the registry

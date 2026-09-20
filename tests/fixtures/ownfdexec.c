@@ -130,6 +130,38 @@ int main(int argc, char **argv) {
     char npath[32];
     snprintf(npath, sizeof npath, "/proc/self/fd/%d", nfd);
     printf("noexec=%d\n", run_child_err(npath, (char *[]){npath, NULL}));
+
+    /* Leg 5: a SPARSE memfd re-opened read-only through its link -- 256 MiB
+     * long with a few bytes of data at either end. Where the host refuses the
+     * path form the emulator answers with a snapshot, and a snapshot that
+     * read the file through to EOF cost the size the guest gave it: every
+     * hole read as zeros and written back as real pages of the host's
+     * memory, a request the guest could repeat at will. The snapshot has to
+     * be the file's data, not its length: same size, same bytes at both
+     * ends, and no more blocks than the original has (a little slack for
+     * the tier whose backing is a plain file). */
+    int spf = mfd_create("sparse", MFD_ALLOW_SEALING);
+    if (spf < 0) { printf("no sparse memfd\n"); return 1; }
+    const off_t big = (off_t)256 << 20;
+    if (pwrite(spf, "head", 4, 0) != 4 || ftruncate(spf, big) != 0 ||
+        pwrite(spf, "tail", 4, big - 4) != 4) { printf("no sparse file\n"); return 1; }
+    fcntl(spf, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
+    struct stat src, snap;
+    fstat(spf, &src);
+    char sppath[32];
+    snprintf(sppath, sizeof sppath, "/proc/self/fd/%d", spf);
+    int rfd = open(sppath, O_RDONLY);
+    if (rfd < 0) { printf("sparse reopen failed\n"); return 1; }
+    char head[5] = {0}, tail[5] = {0};
+    fstat(rfd, &snap);
+    int hk = pread(rfd, head, 4, 0) == 4 && !memcmp(head, "head", 4);
+    int tk = pread(rfd, tail, 4, big - 4) == 4 && !memcmp(tail, "tail", 4);
+    char mid[8] = {1,1,1,1,1,1,1,1};
+    int mk = pread(rfd, mid, 8, big / 2) == 8 && !memcmp(mid, "\0\0\0\0\0\0\0\0", 8);
+    printf("sparse size_ok=%d head=%d mid=%d tail=%d holes_kept=%d\n",
+           snap.st_size == big, hk, mk, tk,
+           (long long)snap.st_blocks * 512 <= (long long)src.st_blocks * 512 + (1 << 20));
+    close(rfd);
     printf("done\n");
     return 0;
 }
