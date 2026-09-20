@@ -797,8 +797,46 @@ static ssize_t cmsg_g2h(const struct Machine *m, const u8 *gb, size_t glen,
     return (ssize_t)hoff;
 }
 
+/* Close every descriptor in the SCM_RIGHTS elements from `hoff` on: the ones
+ * the walk below is not going to report. The host kernel installed them --
+ * against ITS buffer, which on an ILP32 host holds more of them than the
+ * guest's can -- and a descriptor the guest is never told the number of is
+ * one it can never close, a hidden entry in its own table. */
+static void cmsg_close_rights(const u8 *hb, size_t hoff, size_t hlen) {
+    while (hoff + CMSG_ALIGN(sizeof(struct cmsghdr)) <= hlen) {
+        struct cmsghdr ch;
+        memcpy(&ch, hb + hoff, sizeof ch);
+        size_t clen = ch.cmsg_len;
+        if (clen < CMSG_LEN(0) || clen > hlen - hoff) break;
+        if (ch.cmsg_level == SOL_SOCKET && ch.cmsg_type == SCM_RIGHTS) {
+            size_t nfd = (clen - CMSG_LEN(0)) / sizeof(int);
+            const u8 *fdp = hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr));
+            for (size_t i = 0; i < nfd; i++) {
+                int rfd;
+                memcpy(&rfd, fdp + i * sizeof(int), sizeof rfd);
+                close(rfd);
+            }
+        }
+        hoff += CMSG_ALIGN(clen);
+    }
+}
+
 /* Host control buffer -> guest, in the guest's layout and bounded by the
- * guest's buffer. Sets *ctrunc when anything had to be dropped or cut short. */
+ * guest's buffer. Sets *ctrunc when anything had to be dropped or cut short.
+ *
+ * Whatever is dropped or cut short from an SCM_RIGHTS element is CLOSED. The
+ * kernel installs only as many descriptors as the caller's buffer has room to
+ * report (scm_detach_fds: fdmax from the remaining controllen, the rest of
+ * the file list is released unopened), so every installed descriptor is a
+ * reported one. Here the host has already installed them into a buffer of
+ * its own layout, and on an ILP32 host that layout is four bytes tighter per
+ * element than the guest's -- so the host fits descriptors the guest's
+ * buffer cannot report. Those used to stay open: trimmed from the element by
+ * the generic truncation below, or left in an element the walk never reached,
+ * with the guest told MSG_CTRUNC and nothing else. The trim is now decided
+ * where the element is walked, from the room the guest's buffer has left,
+ * and an element the walk cannot place is closed along with everything after
+ * it. */
 static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
                        u8 *gb, size_t gcap, int *ctrunc, int fdcap) {
     size_t hoff = 0, goff = 0;
@@ -811,6 +849,7 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
          * shorten what is passed on, and the walk still has to step over the
          * whole of what arrived. */
         size_t hstep = CMSG_ALIGN(clen);
+        size_t avail = gcap - goff;
         {
             s32 lvl = ch.cmsg_level, typ = ch.cmsg_type;
             if (lvl == SOL_SOCKET && typ == SCM_RIGHTS) {
@@ -823,14 +862,25 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
                  * ones it drops are closed here, since the guest never learns
                  * the numbers and could not close them itself.
                  *
+                 * And every one is subject to the guest's buffer: scm_max_fds
+                 * is how many the room left can carry after a header (a
+                 * buffer that holds only the header carries none, and then
+                 * no element is emitted at all), the descriptors past that
+                 * are never installed -- so the ones the host installed past
+                 * it are closed here, the same way. The kernel takes the
+                 * lowest free numbers in order, as the host did, so the
+                 * survivors are exactly the set it would have installed.
+                 *
                  * The survivors are then classified: they may be another
                  * process's tier memfds, and the cache must stop assuming these
                  * numbers are plain files. */
                 size_t nfd = (clen - CMSG_LEN(0)) / sizeof(int);
                 const u8 *fdp = hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr));
                 size_t keep = nfd;
+                size_t fit = avail > GCMSG_HDRLEN ? (avail - GCMSG_HDRLEN) / sizeof(int) : 0;
+                if (keep > fit) keep = fit;
                 int rfd;
-                for (size_t i = 0; i < nfd; i++) {
+                for (size_t i = 0; i < keep; i++) {
                     memcpy(&rfd, fdp + i * sizeof(int), sizeof rfd);
                     if (rfd >= fdcap) { keep = i; break; }
                 }
@@ -852,15 +902,19 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
         }
         size_t dlen = clen - CMSG_LEN(0);
         u64 gel = GCMSG_HDRLEN + (u64)dlen;
-        size_t avail = gcap - goff;
         if (gel > avail) {
             /* Too big for what is left. The kernel's put_cmsg does not drop
              * the element -- it writes the header with the *truncated* length,
              * copies as much payload as fits, and raises MSG_CTRUNC. An ILP32
              * host reaches this where a real LP64 kernel would, because the
-             * guest's element is four bytes bigger than the host's. */
+             * guest's element is four bytes bigger than the host's. (Never an
+             * SCM_RIGHTS element: those were cut to fit above, descriptors
+             * and all.) */
             *ctrunc = 1;
-            if (avail < GCMSG_HDRLEN) break;   /* not even a header fits */
+            if (avail < GCMSG_HDRLEN) {          /* not even a header fits */
+                cmsg_close_rights(hb, hoff, hlen);
+                return goff;
+            }
             gel = avail;
             dlen = (size_t)gel - GCMSG_HDRLEN;
         }
@@ -886,7 +940,10 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
         goff += gstep;
         hoff += hstep;
     }
-    if (hoff < hlen) *ctrunc = 1;   /* elements left over that never fit */
+    if (hoff < hlen) {
+        *ctrunc = 1;   /* elements left over that never fit */
+        cmsg_close_rights(hb, hoff, hlen);
+    }
     return goff;
 }
 

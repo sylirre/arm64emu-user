@@ -2528,6 +2528,14 @@ check_fixture sockoptlen $'plain=0\nhi32=0\nhi32_zero=-22\nneg=-22\nneg_min=-22\
 # where a kernel answers EINVAL, and dies outright on the past-INT_MAX rows.
 check_fixture cmsgvalid $'short15 snd=-1 err=22 peer=-1 perr=11\nzerolen snd=-1 err=22 peer=-1 perr=11\nonelen  snd=-1 err=22 peer=-1 perr=11\nover17  snd=-1 err=22 peer=-1 perr=11\nover25  snd=-1 err=22 peer=-1 perr=11\nempty16 snd=1 err=0 peer=1 perr=0\nfd20/24 snd=1 err=0 peer=1 perr=0\nfd20/23 snd=1 err=0 peer=1 perr=0\nlvl16   snd=1 err=0 peer=1 perr=0\nnohdr8  snd=1 err=0 peer=1 perr=0\n2nd_bad snd=-1 err=22 peer=-1 perr=11\n2nd_ok  snd=1 err=0 peer=1 perr=0\nnullsnd=-1 err=14\nnullbig=-1 err=105\nnullrcv=1 err=0 ctrunc=1 ctl=0\nhugesnd=-1 err=105\nhugercv=1 err=0 ctl=0\npassfd snd=1 rcv=1 fd=1 ok=1\ndone'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+# SCM_RIGHTS into a control buffer with room for fewer descriptors than were
+# sent: the kernel installs only what the buffer can report and releases the
+# rest. The host had already installed them against ITS layout -- four bytes
+# tighter per element on an ILP32 host -- so descriptors the guest's buffer
+# could not report stayed open in its table, unreported. `installed` is the
+# fd-table delta the receive left behind. Self-checking because qemu-user
+# installs every descriptor sent and never raises MSG_CTRUNC.
+check_fixture scmfit $'one_fits: sent=1 recv=1 ctrunc=1 controllen=20 creds=0 rights_len=20 reported=1 installed=1\nheader: sent=1 recv=1 ctrunc=1 controllen=0 creds=0 rights_len=-1 reported=0 installed=0\ncred_zero: sent=1 recv=1 ctrunc=1 controllen=32 creds=1 rights_len=-1 reported=0 installed=0\ncred_short: sent=1 recv=1 ctrunc=1 controllen=32 creds=1 rights_len=-1 reported=0 installed=0\nall: sent=1 recv=1 ctrunc=0 controllen=32 creds=0 rights_len=28 reported=3 installed=3\ndone'
 # process_vm_readv/writev iovec validation and the order the two vectors are
 # imported in. Self-checking: qemu-user answers ENOSYS for both syscalls. A
 # length that is negative as an ssize_t is EINVAL before anything is copied --
