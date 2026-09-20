@@ -139,7 +139,9 @@ on the host.
 Command line option `--bind src:dst` exposes host directory `src` at guest
 path `dst`, like a `mount --bind ./src ./dst`. The binding can be read-write
 (default) and read-only, in both cases configuration is permanent and set
-during emulator invocation.
+during emulator invocation: the guest cannot unmount a `--bind` or make a
+read-only one writable, even as fake root, just as a kernel locks the mounts
+a namespace inherited from a more privileged one.
 
 Multiple directories can be shared by repeating `--bind src:dst` as needed. 
 

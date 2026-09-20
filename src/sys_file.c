@@ -67,8 +67,29 @@ int oflags_h2g(int h) {
 
 /* 1 if `host` (a resolved host path) lies under a read-only -bind mount, so a
  * mutating syscall on it must return -EROFS. bind_of_host matches the bound
- * host prefix at a '/' boundary; non-bind paths never match. */
+ * host prefix at a '/' boundary; non-bind paths never match.
+ *
+ * A path in the /proc zone passes through the resolver verbatim, and the fd
+ * links there -- /proc/self/fd/N, /proc/<pid>/fd/N, task/<tid>/fd/N, and the
+ * /dev/fd/N and /dev/std* that resolve to them -- name an open description,
+ * which the kernel judges by the MOUNT it was opened through: re-opening one
+ * for writing on a read-only mount is EROFS, and so is truncate, chmod,
+ * chown, utimensat or setxattr named that way. Judged by the bound prefix
+ * alone, "/proc/self/fd/N" matched nothing, so a guest holding a read-only
+ * (or O_PATH) descriptor of a file under a :ro bind re-opened it writable
+ * through its own link -- with O_TRUNC, if it liked. The link is followed
+ * here, once, for every caller. An anonymous target (pipe:[N]) is nothing a
+ * bind can cover. */
 static int host_ro(struct Machine *m, const char *host) {
+    if (bind_count() == 0) return 0;
+    char tgt[PATH_MAX];
+    if (proc_zone_path(host)) {
+        ssize_t n = readlink(host, tgt, sizeof tgt - 1);
+        if (n <= 0) return 0;
+        tgt[n] = 0;
+        if (tgt[0] != '/') return 0;
+        host = tgt;
+    }
     int i = bind_of_host(m, host, NULL);
     return i >= 0 && bind_ro(i);
 }
@@ -901,13 +922,36 @@ SYSDEF(openat) {
         return (u64)(s64)-EMFILE;
     }
     const char *host = pin.host;
-    /* Write intent (non-RDONLY, or create/truncate) into a :ro bind -> EROFS.
-     * O_CREAT/O_TRUNC/O_ACCMODE are in the pass-through set, so the host bits
-     * apply to the guest flags unchanged. */
-    if (((gflags & O_ACCMODE) != O_RDONLY || (gflags & (O_CREAT | O_TRUNC))) &&
-        host_ro(c->m, host)) {
-        path_unpin(&pin);
-        return (u64)(s64)-EROFS;
+    /* Write intent into a :ro bind -> EROFS: an access mode other than
+     * O_RDONLY, or O_TRUNC (which the kernel counts as write access), or a
+     * creation the open would have to perform. O_CREAT/O_TRUNC/O_ACCMODE are
+     * in the pass-through set, so the host bits apply to the guest flags
+     * unchanged.
+     *
+     * O_CREAT on a name that EXISTS is not a write: open_last_lookups drops
+     * the create (its EROFS is remembered only for the case where the lookup
+     * finds nothing) and the open proceeds read-only, so a kernel answers
+     * that open with a descriptor, O_EXCL with EEXIST, and a directory with
+     * EISDIR. Rather than trust a look before the open, the host is never
+     * handed O_CREAT here: a missing name then answers ENOENT, which is the
+     * EROFS a kernel gives for the create it would have had to do. */
+    int hflags = oflags_g2h(gflags);
+    int ro = 0;
+    if ((gflags & (O_ACCMODE | O_CREAT | O_TRUNC)) && (ro = host_ro(c->m, host))) {
+        if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & O_TRUNC)) {
+            path_unpin(&pin);
+            return (u64)(s64)-EROFS;
+        }
+        if (gflags & O_CREAT) {
+            struct stat est;
+            int er = fstatat(pin.dfd, pin.name, &est,
+                             pin.pinned ? AT_SYMLINK_NOFOLLOW : 0) < 0 ? errno : 0;
+            if (er == ENOENT) er = EROFS;
+            else if (!er && (gflags & O_EXCL)) er = EEXIST;
+            else if (!er && S_ISDIR(est.st_mode)) er = EISDIR;
+            if (er) { path_unpin(&pin); return (u64)(s64)-er; }
+            hflags &= ~(O_CREAT | O_EXCL);
+        }
     }
     /* maps/cmdline/mounts: the guest view. A sandbox reaches /proc under
      * another name (/newroot/proc/...), and the host path such a lookup
@@ -939,8 +983,11 @@ SYSDEF(openat) {
                      /* Pinned means path_resolve already followed the final
                       * component; a symlink standing there now is the race,
                       * and O_NOFOLLOW is what refuses to walk into it. */
-                     oflags_g2h(gflags) | (pin.pinned ? O_NOFOLLOW : 0),
+                     hflags | (pin.pinned ? O_NOFOLLOW : 0),
                      (mode_t)a3);
+    /* The name went missing between the look above and the open: still the
+     * create a read-only mount refuses. */
+    if (fd < 0 && errno == ENOENT && ro && (gflags & O_CREAT)) errno = EROFS;
     /* A guest that passed O_NOFOLLOW about one of the emulated-hardlink
      * scheme's names has just been told ELOOP about a name that is a regular
      * file to it, and that a host with real hardlinks would have opened. Only
@@ -949,7 +996,7 @@ SYSDEF(openat) {
      * followed the link and the pin already names the backing. */
     if (fd < 0 && errno == ELOOP && (gflags & G_O_NOFOLLOW) &&
         l2s_deref_pin(c->m, &pin))
-        fd = openat(pin.dfd, pin.name, oflags_g2h(gflags) | O_NOFOLLOW, (mode_t)a3);
+        fd = openat(pin.dfd, pin.name, hflags | O_NOFOLLOW, (mode_t)a3);
     {   /* Close the pin before anything else allocates a descriptor. */
         int e = errno, dfd = pin.dfd;
         path_unpin(&pin);
@@ -2613,9 +2660,19 @@ SYSDEF(mount) {
         path_unpin(&sp);
         if (r < 0) return (u64)(s64)r;
         /* The source is a GUEST path, so only its host-owned prefix may ever be
-         * opened by name -- the guest can rename every component below it. */
+         * opened by name -- the guest can rename every component below it.
+         * The new mount is a clone of the one the source lies on (clone_mnt
+         * copies its flags): a subtree of a read-only mount comes out
+         * read-only, and one whose read-only flag is locked -- a :ro --bind
+         * -- stays that way at the new point too, or the guest could bind the
+         * invoker's read-only tree somewhere writable and be done with it.
+         * The unmount lock is not copied (do_loopback clears MNT_LOCKED): the
+         * guest made this one, so it may take it away again. */
+        int sslot = bind_slot_of_canon(scanon);
+        int sro = sslot >= 0 && bind_ro(sslot);
+        int slock = sslot >= 0 ? (bind_locked(sslot) & BIND_LOCK_RO) : 0;
         r = bind_add(m, tcanon, shost, path_host_root(m, scanon),
-                     (flags & G_MS_RDONLY) ? 1 : 0);
+                     (sro || (flags & G_MS_RDONLY)) ? 1 : 0, slock);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2652,7 +2709,7 @@ SYSDEF(mount) {
         }
         /* The backing directory is ours, in a host-owned dir: trusted whole. */
         r = bind_add(m, tcanon, backing, (unsigned)strlen(backing),
-                     (flags & G_MS_RDONLY) ? 1 : 0);
+                     (flags & G_MS_RDONLY) ? 1 : 0, 0);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2670,7 +2727,7 @@ SYSDEF(mount) {
                        !strcmp(fstype, "devpts") && !m->no_dev  ? "/dev/pts" : NULL;
     if (zone) {
         if (!tisdir) return (u64)(s64)-ENOTDIR;
-        r = bind_add(m, tcanon, zone, path_host_root(m, zone), 0);
+        r = bind_add(m, tcanon, zone, path_host_root(m, zone), 0, 0);
         return r < 0 ? (u64)(s64)r : 0;
     }
 
@@ -2713,7 +2770,7 @@ SYSDEF(pivot_root) {
     char roothost[PATH_MAX];
     r = path_resolve(m, G_AT_FDCWD, "/", 0, roothost, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = bind_add(m, ocanon, roothost, path_host_root(m, "/"), 0);
+    r = bind_add(m, ocanon, roothost, path_host_root(m, "/"), 0, 0);
     if (r < 0) return (u64)(s64)r;
     croot_set(m, ncanon);
     return 0;
@@ -2925,14 +2982,33 @@ SYSDEF(linkat) {
      * the empty name; on a non-empty one it changes nothing there either.) */
     if (gf & ~(G_AT_SYMLINK_FOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
     unsigned rf = (gf & G_AT_SYMLINK_FOLLOW) ? 0 : PATH_NOFOLLOW_LAST;
-    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, NULL);
+    char canon1[PATH_MAX], canon2[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, canon1);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, canon2);
     if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
     const char *h2 = p2.host;
     if (host_ro(c->m, h2)) {                          /* new name on a :ro bind */
         path_unpin(&p1); path_unpin(&p2);
         return (u64)(s64)-EROFS;
+    }
+    /* A hard link is a second name for the INODE, and do_linkat refuses one
+     * that would cross mounts (old_path.mnt != new_path.mnt is EXDEV, after
+     * the new name's EROFS). That rule is what keeps a read-only mount
+     * read-only: the new name would be a writable alias of a file the mount
+     * protects -- and the host, seeing one filesystem, made the link. Binds
+     * are mounts here, so the same rule applies, judged by the mount each name
+     * resolved through: the bind covering its canonical path, or the rootfs.
+     * An old name that is a /proc fd link (an O_TMPFILE being published, a
+     * descriptor being named) has no canonical mount, only a host location,
+     * and a --bind whose source lies inside the rootfs gives its files a
+     * second guest route the canonical path does not show. Both are answered
+     * by the same test an open for writing gets: a host location under a
+     * read-only bind is EXDEV to link from, whichever way it was named. */
+    int mnt1 = proc_zone_path(p1.host) ? -2 : bind_slot_of_canon(canon1);
+    if ((mnt1 != -2 && mnt1 != bind_slot_of_canon(canon2)) || host_ro(c->m, p1.host)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EXDEV;
     }
     /* Pinned, the old name has already been followed as far as the guest asked,
      * so AT_SYMLINK_FOLLOW must not be passed on -- a symlink standing there now

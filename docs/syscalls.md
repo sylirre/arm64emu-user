@@ -575,7 +575,73 @@ reference to the *mount*, not to the file — so a plain read-only open was
 otherwise enough to change the host file's metadata through a read-only bind.
 The `fchownat` hole was the quiet one: under `--fake-id`, `chattr_result` turns
 the host's own `EPERM` into a reported success, so the guest was told the change
-had taken effect). Binds are listed in the
+had taken effect).
+
+The model behind that is the kernel's: a read-only mount is judged at every
+*name* (`mnt_want_write` at open, create, unlink, rename, link, chmod, chown,
+utimes, truncate, xattr), and the calls that write through a descriptor —
+`write`, `pwrite`, `writev`, `sendfile`, `splice`, `copy_file_range`,
+`MAP_SHARED|PROT_WRITE` and an `mprotect` to it — check nothing, because a
+descriptor that can write on a read-only mount cannot exist: the mount refuses
+to open one, and a kernel refuses to remount a mount read-only while one is
+open (`EBUSY`, counted per mount). The emulator keeps the first half exact and
+cannot keep the second — which mount a descriptor was opened through is not
+recorded, and a host-path scan of the session's descriptors would refuse the
+`mount --bind /x /x; mount -o remount,ro /x` idiom whenever any process had a
+file under `/x` open for writing through the *original* mount, which a kernel
+allows — so a guest's own `remount,ro` over descriptors it already holds open
+for writing succeeds, and those descriptors keep writing, as they would have
+had the remount been refused. No `--bind` is ever in that state: it is
+read-only before the guest exists. What had to be closed were the ways a
+guest could still *obtain* a writable descriptor, or a writable alias, under a
+`:ro` mount:
+
+- **A descriptor's own `/proc` link.** `/proc/self/fd/N`, `/proc/<pid>/fd/N`,
+  `task/<tid>/fd/N`, and the `/dev/fd/N` and `/dev/std*` that resolve there,
+  pass through the resolver verbatim, so the bound host prefix matched nothing
+  and a read-only (or `O_PATH`) descriptor of a file under a `:ro` bind
+  re-opened writable through its own link — `O_TRUNC` included — and
+  `truncate`, `chmod`, `utimensat` and `setxattr` named that way went to the
+  host file. A kernel judges such a re-open by the mount the description was
+  opened through. `host_ro` now follows a `/proc`-zone link once, for every
+  caller.
+- **A hard link out of the mount** is a second, writable name for the inode,
+  and on the host — which sees one filesystem — `link("/ro/f", "/tmp/f")`
+  succeeded. `do_linkat` refuses a link across mounts (`EXDEV`, after the new
+  name's `EROFS`), and that rule is what keeps a read-only mount read-only;
+  `linkat` applies it, judged by the bind each name's canonical path resolves
+  through (`bind_slot_of_canon`, the rootfs proper being `-1`). An old name
+  given as a `/proc` fd link (an `O_TMPFILE` being published) has no canonical
+  mount, and a `--bind` whose source lies *inside* the rootfs gives its files a
+  second guest route the canonical path does not show; both are answered by
+  the same test an open for writing gets — a host location under a read-only
+  bind is `EXDEV` to link from — so what cannot be opened for writing cannot
+  be linked out either. `rename` is not a second name and is left to the host.
+- **`O_CREAT` on a name that exists** is not a write: `open_last_lookups`
+  drops the create and the open proceeds read-only, so a kernel admits
+  `open(existing, O_RDONLY|O_CREAT)` on a read-only mount, answers `O_EXCL`
+  with `EEXIST` and a directory with `EISDIR`, and refuses only the create it
+  would have had to do. `openat` matches that without trusting a look before
+  the open: the host is never handed `O_CREAT` under a `:ro` bind, so a name
+  that has gone missing answers `ENOENT`, reported as the `EROFS` of the
+  create.
+- **Locks.** A `--bind` is the *invoker's* mount, and the guest — fake-root at
+  most — used to be able to `mount -o remount,rw` or `umount` it. The kernel
+  locks a mount inherited from a more privileged namespace: `MNT_LOCKED`
+  (`umount2` is `EINVAL`, detach or not) and, if it was read-only there,
+  `MNT_LOCK_READONLY` (clearing the flag is `EPERM`; setting it on a locked
+  read-write mount, and clearing it again, are fine — the lock is on the flag
+  as inherited). Every `--bind` carries `BIND_LOCKED`, a `:ro` one
+  `BIND_LOCK_RO` as well (`struct Bind.locked`). A guest's `mount --bind` of a
+  subtree of a bind is a clone of that mount (`clone_mnt` copies its flags):
+  it comes out read-only if the source was, and with the read-only lock if the
+  source's was locked — or the guest could bind the invoker's read-only tree
+  somewhere writable — but without the unmount lock (`do_loopback` clears
+  `MNT_LOCKED`), since the guest made it. A guest's own mounts are never
+  locked. `tests/fixtures/robind.c` runs all of it, as an unprivileged guest
+  and as fake root.
+
+Binds are listed in the
 synthesized `/proc/mounts` and `/proc/mountinfo`. A bind destination is a pure
 resolution overlay with no physical dirent in the rootfs, so `getdents64`
 (`bind_inject_dents` in `sys_file.c`) splices the mount point into a listing of
@@ -587,7 +653,9 @@ stays reachable by name but unlisted.
 **Runtime `mount(2)` / `umount2(2)`.** The guest can add and drop binds at run
 time, not just via `--bind`: `mount(src, dst, …, MS_BIND, …)` resolves `src` to
 its host path and `dst` to a canonical guest mount point and registers a new
-bind; `MS_REMOUNT` toggles a bind's `:ro`; `umount2(dst)` removes it (`sys_mount`
+bind (inheriting the read-only flag, and its lock, of the mount the source lies
+on — see *Locks* above); `MS_REMOUNT` toggles a bind's `:ro` (`EPERM` on a
+locked one); `umount2(dst)` removes it (`EINVAL` on a `--bind`) (`sys_mount`
 / `sys_umount2`). Propagation-only changes (`MS_PRIVATE`/`MS_SHARED`/…) are accepted as no-ops and
 `MS_MOVE` returns `EINVAL`. Three filesystem types are emulated on top of the
 same table, because no sandbox helper gets off the ground without them:

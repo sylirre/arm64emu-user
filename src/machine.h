@@ -48,6 +48,17 @@ typedef struct {
  * private copy of the table (bindtab_unshare), which its fork children keep
  * sharing -- that is the one exception to session-wide visibility. */
 #define BIND_MAX 64
+/* The kernel's MNT_LOCKED and MNT_LOCK_READONLY: a mount inherited from a more
+ * privileged namespace cannot be unmounted, and if it was read-only there its
+ * read-only flag cannot be cleared. A --bind is exactly that -- the invoker
+ * made it, the guest (fake-root at most) did not -- so a guest that could
+ * `mount -o remount,rw` or `umount` a :ro one had the invoker's protection
+ * for the asking. A guest's own mounts are never locked: it can undo what it
+ * did. A `mount --bind` of a subtree of a locked mount inherits the read-only
+ * lock and not the unmount one, as do_loopback clears MNT_LOCKED and copies
+ * the rest of the flags. */
+#define BIND_LOCKED  1      /* umount2 -> EINVAL */
+#define BIND_LOCK_RO 2      /* remount clearing ro -> EPERM */
 struct Bind {
     char guest[PATH_MAX];   /* canonical guest mount point, no trailing slash */
     char host[PATH_MAX];    /* realpath'd host source directory */
@@ -59,6 +70,8 @@ struct Bind {
                              * GUEST named (mount --bind inside the guest, whose
                              * every component it can rename). */
     int ro;                 /* read-only mount (atomic) */
+    int locked;             /* BIND_LOCK* bits: what the guest may not undo.
+                             * Fixed for the slot's life, like guest/host. */
     int active;             /* 0 free, -1 mid-claim, 1 live (atomic) */
     unsigned seq;           /* mount order: the stack position. Slot indices
                              * cannot serve -- a freed slot is reused by the
@@ -1113,19 +1126,29 @@ int  host_random_bytes(void *buf, size_t len);
  * parameter is vestigial — the table is shared, not per-Machine — but kept so
  * call sites read naturally.) */
 int bind_add(struct Machine *m, const char *guest_canon, const char *host,
-             unsigned hroot, int ro);
+             unsigned hroot, int ro, int locked);
 /* What to pass as bind_add's `hroot` for a source named by a guest path. */
 unsigned path_host_root(struct Machine *m, const char *canon);
+/* bind_remount answers -EPERM for clearing a locked read-only flag, bind_remove
+ * -EINVAL for a locked mount (BIND_LOCK*), as the kernel does for a mount it
+ * inherited from a more privileged namespace. */
 int bind_remount(struct Machine *m, const char *guest_canon, int ro);
 int bind_remove(struct Machine *m, const char *guest_canon);
 
 /* Read side for consumers outside path.c. bind_ro reports whether live slot i is
- * a read-only mount (host_ro in sys_file.c). bind_count is the high-water slot
- * bound; bind_get snapshots live slot i's guest/host/ro (put_mounts in
- * sys_procfs.c) and returns 1, or 0 if the slot is not live. */
+ * a read-only mount (host_ro in sys_file.c); bind_locked its BIND_LOCK* bits.
+ * bind_count is the high-water slot bound; bind_get snapshots live slot i's
+ * guest/host/ro (put_mounts in sys_procfs.c) and returns 1, or 0 if the slot
+ * is not live. bind_slot_of_canon is the resolver's own forward match asked
+ * for the slot rather than the host path: the mount a canonical guest path
+ * resolves through, -1 for the rootfs proper -- the identity linkat(2) needs
+ * (a hard link may not cross mounts) and the mount a `mount --bind` source
+ * inherits its flags from. */
 int bind_ro(int i);
+int bind_locked(int i);
 int bind_count(void);
 int bind_get(int i, char *guest_out, char *host_out, int *ro_out);
+int bind_slot_of_canon(const char *canon);
 
 /* proctab.c: cross-process guest-PID registry in shared memory. Each guest
  * process publishes its NUL-joined argv, guest exe path, cwd, NUL-joined

@@ -523,8 +523,11 @@ static void add_bind(struct Machine *m, const char *spec) {
     }
     /* Register into the shared bind table (same path the runtime mount(2) uses). */
     /* A --bind source is a host path the invoker chose: nothing the guest can
-     * rename lies above it, so all of it may be opened by name (path.c). */
-    int r = bind_add(m, guest, host, (unsigned)strlen(host), ro);
+     * rename lies above it, so all of it may be opened by name (path.c). And
+     * the mount is the invoker's, not the guest's: locked against umount, and
+     * a :ro one against being made writable (machine.h, BIND_LOCK*). */
+    int r = bind_add(m, guest, host, (unsigned)strlen(host), ro,
+                     BIND_LOCKED | (ro ? BIND_LOCK_RO : 0));
     if (r == -ENOMEM) {
         fprintf(stderr, "arm64chroot: too many --bind mounts (max %d)\n", BIND_MAX);
         exit(2);

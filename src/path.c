@@ -649,6 +649,7 @@ void bindtab_unshare(void) {
         if (!bind_snap(i, NULL, t->e[i].guest, t->e[i].host, NULL, &sq,
                        &t->e[i].hroot)) continue;
         t->e[i].ro = __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+        t->e[i].locked = __atomic_load_n(&g_binds[i].locked, __ATOMIC_SEQ_CST);
         t->e[i].seq = sq;
         t->e[i].lock = 0;     /* fresh region: nothing has ever written here */
         t->e[i].active = 1;   /* private region: no other reader yet */
@@ -956,9 +957,11 @@ static int bind_snap(int i, const char *pfx, char *guest_out, char *host_out,
     return 0;
 }
 
-static int bind_match(struct Machine *m, const char *canon, char *host_out,
-                     size_t *hroot) {
-    (void)m;
+/* The selection: the slot whose mount point covers `canon`, -1 for none. The
+ * winner's host path (staged into host_out, >= PATH_MAX), mount-point length
+ * and host-owned root come out through the optional pointers. */
+static int bind_best(const char *canon, char *host_out, size_t *glen_out,
+                     unsigned *hroot_out) {
     char host[PATH_MAX];
     int best = -1;
     size_t bestlen = 0;
@@ -968,19 +971,34 @@ static int bind_match(struct Machine *m, const char *canon, char *host_out,
     for (int i = 0; i < n; i++) {
         size_t gl;
         unsigned sq, hr;
-        if (!bind_snap(i, canon, NULL, host, &gl, &sq, &hr)) continue;
+        if (!bind_snap(i, canon, NULL, host_out ? host : NULL, &gl, &sq, &hr)) continue;
         /* Longest prefix wins; on a tie the *topmost* (latest) mount does, as
          * on a real mount stack -- pivot_root's second step deliberately mounts
          * the old root over the new one and then detaches it again. */
         if (best < 0 || gl > bestlen || (gl == bestlen && sq > bestseq)) {
             best = i; bestlen = gl; bestseq = sq; besthr = hr;
-            memcpy(host_out, host, strlen(host) + 1);   /* stage the winner */
+            if (host_out) memcpy(host_out, host, strlen(host) + 1);   /* stage the winner */
         }
     }
+    if (glen_out) *glen_out = bestlen;
+    if (hroot_out) *hroot_out = besthr;
+    return best;
+}
+
+static int bind_match(struct Machine *m, const char *canon, char *host_out,
+                     size_t *hroot) {
+    (void)m;
+    size_t bestlen;
+    unsigned besthr;
+    int best = bind_best(canon, host_out, &bestlen, &besthr);
     if (best < 0) return 0;
     if (hroot) *hroot = besthr;   /* how much of the mount's root is host-owned */
     int r = join_host(host_out, canon + bestlen, host_out);   /* appends in place */
     return r < 0 ? r : 1;
+}
+
+int bind_slot_of_canon(const char *canon) {
+    return bind_best(canon, NULL, NULL, NULL);
 }
 
 /* Reverse of bind_match: a host path back to its guest view. See machine.h. */
@@ -1020,7 +1038,7 @@ int bind_of_host(const struct Machine *m, const char *hostpath, char *guest_out)
  * CAS'ing active 0 -> -1, filled, then published with a store to 1; readers
  * (bind_match/bind_of_host above) skip anything not observed as 1. */
 int bind_add(struct Machine *m, const char *guest_canon, const char *host,
-             unsigned hroot, int ro) {
+             unsigned hroot, int ro, int locked) {
     (void)m;
     if (strlen(guest_canon) + 1 > PATH_MAX || strlen(host) + 1 > PATH_MAX)
         return -ENAMETOOLONG;
@@ -1043,6 +1061,7 @@ int bind_add(struct Machine *m, const char *guest_canon, const char *host,
         strcpy(g_binds[i].host, host);
         g_binds[i].hroot = hroot;
         g_binds[i].ro = ro;
+        g_binds[i].locked = locked;
         g_binds[i].seq = __atomic_fetch_add(g_bindseq, 1, __ATOMIC_SEQ_CST) + 1;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         __atomic_fetch_add(&g_binds[i].lock, 1, __ATOMIC_RELAXED);   /* even */
@@ -1079,6 +1098,12 @@ int bind_remount(struct Machine *m, const char *guest_canon, int ro) {
     (void)m;
     int i = bind_top_at(guest_canon);
     if (i < 0) return -EINVAL;
+    /* can_change_locked_flags: a read-only flag locked by a more privileged
+     * namespace stays set. Setting it on a locked read-write mount is fine,
+     * and so is clearing it again then -- the lock is on the flag as it was
+     * when inherited, not on the mount. */
+    if (!ro && (__atomic_load_n(&g_binds[i].locked, __ATOMIC_SEQ_CST) & BIND_LOCK_RO))
+        return -EPERM;
     __atomic_store_n(&g_binds[i].ro, ro, __ATOMIC_SEQ_CST);
     return 0;
 }
@@ -1087,6 +1112,9 @@ int bind_remove(struct Machine *m, const char *guest_canon) {
     (void)m;
     int i = bind_top_at(guest_canon);
     if (i < 0) return -EINVAL;
+    /* do_umount: MNT_LOCKED is EINVAL, detach or not. */
+    if (__atomic_load_n(&g_binds[i].locked, __ATOMIC_SEQ_CST) & BIND_LOCKED)
+        return -EINVAL;
     int expect = 1;                         /* lose a race with a concurrent umount */
     if (!__atomic_compare_exchange_n(&g_binds[i].active, &expect, 0,
                                      0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
@@ -1167,6 +1195,12 @@ int bind_ro(int i) {
     if (i < 0 || i >= BIND_MAX) return 0;
     if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) return 0;
     return __atomic_load_n(&g_binds[i].ro, __ATOMIC_SEQ_CST);
+}
+
+int bind_locked(int i) {
+    if (i < 0 || i >= BIND_MAX) return 0;
+    if (__atomic_load_n(&g_binds[i].active, __ATOMIC_SEQ_CST) != 1) return 0;
+    return __atomic_load_n(&g_binds[i].locked, __ATOMIC_SEQ_CST);
 }
 
 int bind_count(void) { return __atomic_load_n(g_nbinds, __ATOMIC_SEQ_CST); }

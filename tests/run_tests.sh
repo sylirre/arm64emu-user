@@ -2434,20 +2434,40 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
         rm -rf "$ROSRC"; mkdir -p "$ROSRC"; echo content > "$ROSRC/f"
         chmod 644 "$ROSRC/f"
         got=$("$EMU" --bind "$ROSRC:/ro:ro" "$ALPINE" /tmp/robind.bin 2>/dev/null)
-        expect=$'path_chmod=EROFS\npath_truncate=EROFS\nopen_rdonly=1\nfchmod=EROFS\nfchown=EROFS\nftruncate=EROFS\nfallocate=EROFS\nfutimens=EROFS\nfsetxattr=EROFS\nfchownat_empty=EROFS\nsetflags=EROFS\nmode=644 size_nonzero=1\nopen_wronly=EROFS\ndone'
-        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS bind: :ro blocks fd-based mutation"
+        # The re-open rows: a descriptor's own /proc link (and /dev/fd) is how
+        # the kernel re-opens a file, judged by the mount it was opened
+        # through; the link rows: a hard link may not cross mounts (EXDEV), or
+        # a read-only mount would hand out a writable alias of its inode; and
+        # O_CREAT on a name that exists is not a create, so it is admitted
+        # read-only where a missing name is the create the mount refuses.
+        expect=$'path_chmod=EROFS\npath_truncate=EROFS\nopen_rdonly=1\nfchmod=EROFS\nfchown=EROFS\nftruncate=EROFS\nfallocate=EROFS\nfutimens=EROFS\nfsetxattr=EROFS\nfchownat_empty=EROFS\nsetflags=EROFS\nmode=644 size_nonzero=1\nopen_wronly=EROFS\nreopen_wronly=EROFS\nreopen_rdwr=EROFS\nreopen_opath_trunc=EROFS\nreopen_rdonly_creat=ok\nlink_truncate=EROFS\nlink_chmod=EROFS\nlink_utimens=EROFS\nlink_setxattr=EROFS\ncreat_existing=ok\ncreat_missing=EROFS\ncreat_excl=File exists\nnothing_created=1\nlink_out=EXDEV\nlink_out_fd=EXDEV\nlink_in=EROFS'
+        if [ "$got" = "$expect"$'\ndone' ]; then pass=$((pass+1)); echo "PASS bind: :ro blocks fd-based mutation"
         else
             fail=$((fail+1)); echo "FAIL bind: :ro blocks fd-based mutation"
+            diff <(echo "$expect"$'\ndone') <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        # As fake root: a --bind is the invoker's mount, locked the way a mount
+        # inherited from a more privileged namespace is -- a :ro one cannot be
+        # remounted writable (EPERM) and none can be unmounted (EINVAL); a
+        # `mount --bind` of its subtree is read-only and locked read-only too.
+        # A bind the guest makes itself stays its own to undo.
+        got=$("$EMU" --fake-id --bind "$ROSRC:/ro:ro" "$ALPINE" /tmp/robind.bin 2>/dev/null)
+        expect="$expect"$'\nremount_rw=expected\nremount_ro=ok\numount=expected\numount_detach=expected\nstill_ro=EROFS\nrebind=ok\nrebind_ro=EROFS\nrebind_remount_rw=expected\nrebind_umount=ok\nown_bind=ok\nown_ro=EROFS\nown_remount_rw=ok\nown_rw=ok\nown_umount=ok\ndone'
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS bind: :ro is locked against the guest"
+        else
+            fail=$((fail+1)); echo "FAIL bind: :ro is locked against the guest"
             diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
         fi
-        # The host file must be untouched: mode 644 and its content intact.
+        # The host file must be untouched: mode 644 and its content intact,
+        # and no alias of it left behind.
         hmode=$(stat -c %a "$ROSRC/f" 2>/dev/null)
-        if [ "$hmode" = "644" ] && [ "$(cat "$ROSRC/f")" = "content" ]; then
+        hlinks=$(stat -c %h "$ROSRC/f" 2>/dev/null)
+        if [ "$hmode" = "644" ] && [ "$hlinks" = 1 ] && [ "$(cat "$ROSRC/f")" = "content" ]; then
             pass=$((pass+1)); echo "PASS bind: host file untouched through :ro"
         else
-            fail=$((fail+1)); echo "FAIL bind: host file untouched through :ro (mode=$hmode)"
+            fail=$((fail+1)); echo "FAIL bind: host file untouched through :ro (mode=$hmode links=$hlinks)"
         fi
-        rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin"; fx_rm tests/fixtures/robind.bin
+        rm -rf "$ROSRC" "$ALPINE/tmp/robind.bin" "$ALPINE/tmp/robind_alias"; fx_rm tests/fixtures/robind.bin
     else
         skip_build "fixtures/robind"
     fi
