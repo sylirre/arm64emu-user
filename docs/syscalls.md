@@ -1403,7 +1403,14 @@ then make the consequences the caller depends on true:
   to bypass the id-map write hook altogether; `sendfile`, `splice` and
   `copy_file_range` *into* a view answer `EBADF` for a read-only descriptor
   and otherwise `EINVAL` (no `splice_write` on a proc file) or `EXDEV`
-  (`copy_file_range` across superblocks, 5.19+); and `mmap` of one answers,
+  (`copy_file_range` across superblocks, 5.19+); the reflink ioctls
+  (`FICLONE`, `FICLONERANGE`) with a view on *either* side answer in
+  `do_clone_file_range`'s order — `EXDEV` across superblocks before anything
+  is asked about either file (every `/proc` file is one superblock, the
+  passthrough ones included), `EBADF` for the modes, then `EOPNOTSUPP`
+  (procfs has no `remap_file_range`) — rather than reaching the backing,
+  which on a reflinking host filesystem the host used to clone straight into
+  (`reflink_denied`, `tests/fixtures/reflinkobj.c`); and `mmap` of one answers,
   in `do_mmap`'s order, `EACCES` for a mode the mapping needs and the
   descriptor lacks, then `ENODEV` for a per-process file (no mmap operation)
   or `EIO` for a `proc_create`d global (`proc_reg_mmap` with no `proc_mmap`)
@@ -1686,11 +1693,22 @@ fd so the inode number cannot be recycled into an unrelated file while its
 entry lives.
 
 Enforcement is the emulator's: `write`/`pwrite*`/`writev`/`pwritev*`,
-`sendfile`/`copy_file_range` (out-fd), `ftruncate`, `fallocate` and `mmap`
-consult a per-process classification cache first (`sys_misc.c`). Only the
-sites that can introduce a tier memfd into a process mark the cache —
-creation, an `SCM_RIGHTS` receipt, `dup`, and a path re-open through a
-`/proc` fd link — so ordinary descriptors never pay a lookup. Seals only
+`sendfile`/`splice`/`copy_file_range` (out-fd), `ftruncate`, `fallocate`
+and `mmap` consult a per-process classification cache first
+(`sys_misc.c`), and the reflink ioctls (`FICLONE`, `FICLONERANGE`) with a
+tier memfd on either side are answered as a kernel answers for a memfd —
+`EXDEV` against a file on any other superblock, `EBADF` for the modes,
+`EOPNOTSUPP` between two memfds (shmem has no `remap_file_range`) — before
+the seals are even a question, since the host would otherwise clone a
+file's blocks into the backing under `F_SEAL_WRITE`, or the backing out
+into a file (`reflink_denied` in `sys_file.c`). Only the sites that can
+introduce a tier memfd into a process mark the cache — creation, an
+`SCM_RIGHTS` receipt, `dup`, and a re-open through a `/proc` fd link
+(judged by the new descriptor's own link target, not by the path's
+spelling: the resolver hands the kernel the magic link itself, so the path
+never names the backing, and a test on it classed nothing — a re-open
+wrote through `F_SEAL_WRITE`) — so ordinary descriptors never pay a
+lookup. Seals only
 accumulate, so a cached restrictive bit is trusted after an identity
 `fstat`, while a permissive answer re-asks the broker (another process may
 have sealed the inode meanwhile). `F_ADD_SEALS` honors `F_SEAL_SEAL`

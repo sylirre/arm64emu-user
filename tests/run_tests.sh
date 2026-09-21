@@ -2831,6 +2831,19 @@ check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\
 # qemu fails the call; the private file row needs a 5.13+ host (marker).
 check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_maymove: Invalid argument\nanon_written: ok moved=1 new=7 old=0\nanon_untouched: ok moved=1 new=0 old=0\nunrounded: ok moved=1 new=8 old=0\nfixed: ok at_dst=1 new=9 old=0\nshared_memfd: ok moved=1 new=5 old=5\nprivate_memfd_written: ok moved=1 new=6 old=5\nprivate_memfd_clean: ok moved=1 new=5 old=5\nprivate_file: ok moved=1 new=0 old=0\nshared_file: ok moved=1 new=0 old=0\ndone'
 
+# The fs reflink ioctls against the emulator's own objects (sys_file.c
+# reflink_denied): a synthesized /proc view or a tier memfd on either side of
+# FICLONE/FICLONERANGE answers as a kernel's proc file or memfd does -- EXDEV
+# across superblocks, EBADF for the modes, EOPNOTSUPP for the filesystem --
+# and never reaches the unlinked backing file, which on a reflinking host
+# filesystem the host used to clone into past every write gate (and out of).
+# Also the re-open of a tier memfd through its /proc fd link, which came back
+# unclassed and wrote through F_SEAL_WRITE. Self-checking: the block is the
+# native kernel's, and qemu-user hands the host an ordinary file for maps.
+# The tier row is the one with a backing file of its own to protect.
+check_fixture reflinkobj $'reopen=1\nmaps<-zero=EXDEV/EXDEV\nmaps<-exe=EXDEV/EXDEV\ncomm<-zero=EXDEV/EXDEV\nmaps<-m1=EXDEV/EXDEV\nm1<-maps=EXDEV/EXDEV\nm1<-zero=EXDEV/EXDEV\nm1<-exe=EXDEV/EXDEV\nreg<-m1=EXDEV/EXDEV\nm1<-reg=EXDEV/EXDEV\nmaps<-maps=EBADF/EBADF\nmaps<-comm=EBADF/EBADF\ncomm<-comm=EBADF/EBADF\nm2ro<-m1=EBADF/EBADF\nm2ap<-m1=EBADF/EBADF\nm1<-m2ap=EBADF/EBADF\ncomm<-maps=EOPNOTSUPP/EOPNOTSUPP\nm1<-m2=EOPNOTSUPP/EOPNOTSUPP\nm1<-m1=EOPNOTSUPP/EOPNOTSUPP\nm1<-(-1)=EBADF/EBADF\nm1<-999=EBADF/EBADF\nmaps<-999=EBADF/EBADF\n999<-m1=EBADF/EBADF\nm1<-hi32(m2)=EOPNOTSUPP\nm1<-badptr=EFAULT\n999<-badptr=EBADF\nseal=0\nsealed<-m2=EOPNOTSUPP/EOPNOTSUPP\nsealed<-exe=EXDEV/EXDEV\ncontent=aaaa\nreopen_rw=1\nreopen_write=EPERM\nreopen_pwrite=EPERM\nreopen_seals=8\ncontent=aaaa\ndone' \
+    "A64_MEMFD_FORCE_FILE=1" "memfd-tier"
+
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
 # Self-checking rather than qemu-diffed: the emulator answers *differently*

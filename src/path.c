@@ -344,6 +344,17 @@ int proc_own_fd_path(const char *host) {
     return *p ? -1 : (int)fd;
 }
 
+/* Whether `host` names a descriptor through a /proc fd link at all: fd/N
+ * under self, thread-self, a pid or a pid's task -- any process's, since a
+ * same-uid neighbour's links open too. What such an open hands back is
+ * decided by the link's target, not by the spelling, and the caller reads
+ * that off the new descriptor. */
+int proc_fd_link_path(const char *host) {
+    if (strncmp(host, "/proc/", 6)) return 0;
+    const char *p = strstr(host + 6, "/fd/");
+    return p && p[4] >= '0' && p[4] <= '9';
+}
+
 /* Test knob for the tier above. Every caller that can serve a request from the
  * descriptor tries the path first, and on an ordinary Linux host the path form
  * always works -- so those fallbacks have coverage on a device and nowhere

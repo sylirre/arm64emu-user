@@ -1016,12 +1016,28 @@ SYSDEF(openat) {
     if (fd >= 0 && !fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     if (fd >= 0) {
         mfd_track_close(fd);   /* fresh number: drop any stale class */
-        /* A path re-open of a tier memfd (through a /proc fd link) hands
-         * back a new fd to the sealed inode; the host would let write(2)
-         * through where a real memfd's seal forbids it, so class the fd for
-         * the enforcement checks. A tier-backed snapshot from the fallback
-         * above is the same case reached the other way. */
-        if (snap_tiered || strstr(host, "/a64-memfd.")) mfd_track_recv(fd);
+        /* A path re-open of a tier memfd (through a /proc fd link -- this
+         * process's own, or another's /proc/<pid>/fd/N) hands back a new fd
+         * to the sealed inode; the host would let write(2) through where a
+         * real memfd's seal forbids it, so class the fd for the enforcement
+         * checks. Judged by what was OPENED, from the new descriptor's own
+         * link: the resolver hands the kernel the magic link itself (the
+         * backing is unlinked and has no other name), so the path spelling
+         * never names the backing -- a test on it classed nothing, and a
+         * guest wrote through F_SEAL_WRITE by re-opening /proc/self/fd/N
+         * (tests/fixtures/reflinkobj.c). A tier-backed snapshot from the
+         * fallback above is the same case reached the other way. */
+        if (snap_tiered) {
+            mfd_track_recv(fd);
+        } else if (proc_fd_link_path(host)) {
+            char l[64], t[PATH_MAX];
+            snprintf(l, sizeof l, "/proc/self/fd/%d", fd);
+            ssize_t tn = readlink(l, t, sizeof t - 1);
+            if (tn > 0) {
+                t[tn] = 0;
+                if (strstr(t, "/a64-memfd.")) mfd_track_recv(fd);
+            }
+        }
     }
     return fd < 0 ? host_err() : (u64)fd;
 }
@@ -2102,15 +2118,57 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
     { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
     { 0x4b33 /*KDGKBTYPE*/,   1, 1 },   /* char keyboard type, out; ENOTTY off a real VT */
-    /* fs reflink (copy-on-write clone) ioctls, arch-independent cmd values.
-     * cp --reflink=auto (coreutils default) issues these on every copy. Guest
-     * fd == host fd, so they forward verbatim; host_err() hands back the real
-     * errno (EOPNOTSUPP/EXDEV) so the guest falls back to a plain copy. Unlike
-     * the tty entries above, FICLONE's "int" payload is a by-value source fd,
-     * not a pointer -> it takes the size-0 int-arg path (a2 passed through). */
-    { 0x40049409 /*FICLONE*/,      0, 0 },
-    { 0x4020940D /*FICLONERANGE*/, 32, 2 }, /* struct file_clone_range: 4 u64, in */
 };
+
+/* The fs reflink ioctls -- FICLONE, FICLONERANGE -- clone the SOURCE fd's
+ * blocks into the DESTINATION (the ioctl's own fd). The emulator's objects
+ * that stand in for a kernel's are the synthesized /proc views and the memfd
+ * tier's files, and both are backed by an ordinary unlinked file on whatever
+ * filesystem the writable-dir chain landed on (path.c tmpfs_base). On one
+ * that reflinks -- btrfs, xfs -- the host clones straight into the backing,
+ * and none of the write-family gates ever see it: a guest could plant a
+ * file's blocks under F_SEAL_WRITE, rewrite its own maps through an O_RDONLY
+ * descriptor, or clone a memfd's content OUT into a file, where a kernel
+ * answers EXDEV/EOPNOTSUPP (neither procfs nor shmem has remap_file_range).
+ *
+ * Decided here, in do_clone_file_range's order and only when one of the two
+ * is such an object -- a pair of the host's own files is the host's call:
+ *   1. the two on different superblocks: EXDEV, before anything is asked
+ *      about either file. Every /proc file is one superblock, the passthrough
+ *      ones (the host's procfs) included; every memfd is another;
+ *   2. generic_file_rw_checks: source readable, destination writable and not
+ *      O_APPEND, else EBADF -- a view's mode is the one the guest opened it
+ *      in (PfFd.acc), a tier memfd's is its own descriptor's;
+ *   3. no remap_file_range on the filesystem: EOPNOTSUPP.
+ * A source that is not open is EBADF (fdget) ahead of all three, and that is
+ * what the host answers for it whatever the destination is. */
+static int reflink_denied(CPU *c, int dst, int src, u64 *ret) {
+    int dacc = 0, sacc = 0;
+    int dsyn = procfs_fd_synth(c->m, dst, &dacc);
+    int ssyn = procfs_fd_synth(c->m, src, &sacc);
+    int dm = !dsyn && mfd_resolve(c, dst, NULL, NULL, NULL) >= 0;
+    int sm = !ssyn && mfd_resolve(c, src, NULL, NULL, NULL) >= 0;
+    if (!dsyn && !ssyn && !dm && !sm) return 0;
+    if (fcntl(src, F_GETFD) < 0) return 0;              /* EBADF, from the host */
+    /* One side a view, the other a host file: on the host's procfs it shares
+     * the view's superblock (a passthrough /proc file), anywhere else not. */
+    int dp = dsyn, sp = ssyn;
+    struct statfs fs;
+    if (dp && !sp && !sm && fstatfs(src, &fs) == 0 && fs.f_type == 0x9fa0 /*PROC_SUPER_MAGIC*/)
+        sp = 1;
+    if (sp && !dp && !dm && fstatfs(dst, &fs) == 0 && fs.f_type == 0x9fa0)
+        dp = 1;
+    if (dp != sp || dm != sm) { *ret = (u64)(s64)-EXDEV; return 1; }
+    int dfl = dsyn ? dacc : fcntl(dst, F_GETFL);
+    int sfl = ssyn ? sacc : fcntl(src, F_GETFL);
+    if (dfl < 0 || sfl < 0) return 0;
+    if ((sfl & O_ACCMODE) == O_WRONLY || (dfl & O_ACCMODE) == O_RDONLY ||
+        (dfl & O_APPEND))
+        *ret = (u64)(s64)-EBADF;
+    else
+        *ret = (u64)(s64)-EOPNOTSUPP;
+    return 1;
+}
 
 SYSDEF(ioctl) {
     u32 cmd = (u32)a1;
@@ -2135,6 +2193,36 @@ SYSDEF(ioctl) {
         if (r < 0) { u64 err = host_err(); free(buf); return err; }
         if (copy_to_guest(c, a2, buf, total) < 0) { free(buf); return (u64)(s64)-EFAULT; }
         free(buf);
+        return (u64)r;
+    }
+    /* fs reflink (copy-on-write clone) ioctls, arch-independent cmd values.
+     * cp --reflink=auto (coreutils default) issues these on every copy. Guest
+     * fd == host fd, so they forward verbatim once reflink_denied has spoken
+     * for the emulator's own objects; host_err() hands back the real errno
+     * (EOPNOTSUPP/EXDEV) so the guest falls back to a plain copy. FICLONE's
+     * "int" payload is the source fd by value, not a pointer; FICLONERANGE's
+     * is a struct file_clone_range (4 u64, the first an __s64 src_fd), whose
+     * layout is the same on every host. The kernel looks the source up by
+     * its low 32 bits (fdget takes an unsigned int), after the destination
+     * (the ioctl's fdget) and, for the range form, after the struct copy. */
+    if (cmd == 0x40049409 /*FICLONE*/ || cmd == 0x4020940D /*FICLONERANGE*/) {
+        if (fcntl((int)a0, F_GETFD) < 0) return host_err();          /* EBADF */
+        u64 fr[4] = { a2, 0, 0, 0 };
+        if (cmd == 0x4020940D && copy_from_guest(c, fr, a2, sizeof fr) < 0)
+            return (u64)(s64)-EFAULT;
+        u64 ret;
+        if (reflink_denied(c, (int)a0, (int)(u32)fr[0], &ret)) return ret;
+        int r = cmd == 0x40049409 ? ioctl((int)a0, cmd, (unsigned long)a2)
+                                  : ioctl((int)a0, cmd, fr);
+        if (r < 0) return host_err();
+        /* A whole-file clone makes the destination the source's size, which
+         * can shrink it under a mapping of it, exactly as ftruncate can: the
+         * pages past the new end must stop resolving (mem.c as_file_resized).
+         * The range form only ever grows it; the fstat is the same either
+         * way and this is cp's cold path. */
+        struct stat st;
+        if (fstat((int)a0, &st) == 0)
+            as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)st.st_size);
         return (u64)r;
     }
     /* FS_IOC_GETFLAGS/SETFLAGS carry sizeof(long) in the size field, so the 64-bit
