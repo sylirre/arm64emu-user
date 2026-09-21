@@ -675,19 +675,35 @@ SYSDEF(getsockopt) {
      * above precisely because it does not -- and this is the check that keeps
      * a future one from copying out of the emulator's memory. */
     if ((size_t)sl > cap) sl = (socklen_t)cap;
-    /* -fake-id: SO_PEERCRED reports the peer's *real* invoking uid/gid; present
-     * the fake identity instead (same remap as stat ownership), so peer-uid
-     * checks — tmux's server ACL, polkit, ... — agree with getuid(). struct
-     * ucred is {pid,uid,gid}, three u32s; the layout is identical on arm64/x86.
-     * The pid is left as the host pid (no guest-view consumer checks it). */
-    if (c->m->fake_id && (int)a1 == SOL_SOCKET && (int)a2 == SO_PEERCRED && sl >= 12) {
-        u32 uid, gid;
-        memcpy(&uid, buf + 4, 4);
-        memcpy(&gid, buf + 8, 4);
-        uid = remap_uid(c->m, uid);
-        gid = remap_gid(c->m, gid);
-        memcpy(buf + 4, &uid, 4);
-        memcpy(buf + 8, &gid, 4);
+    /* SO_PEERCRED: struct ucred is {pid,uid,gid}, three u32s, the same layout
+     * on every host, and the kernel copies out as much of it as was asked for
+     * -- so each field is translated when it was answered at all. The pid is
+     * the peer's as the guest may see it (proctab_pid_view, held: the socket
+     * keeps its peer's pid alive), 0 for a host process at the other end --
+     * a guest connected to a host daemon's socket through a bind used to read
+     * the daemon's host pid here, a process it can see nowhere else. Under
+     * -fake-id the uid/gid are the peer's *real* invoking ones; present the
+     * fake identity instead (same remap as stat ownership), so peer-uid
+     * checks — tmux's server ACL, polkit, ... — agree with getuid(). */
+    if ((int)a1 == SOL_SOCKET && (int)a2 == SO_PEERCRED) {
+        if (sl >= 4) {
+            s32 pid;
+            memcpy(&pid, buf, 4);
+            pid = proctab_pid_view(pid, 1);
+            memcpy(buf, &pid, 4);
+        }
+        if (c->m->fake_id && sl >= 8) {
+            u32 uid;
+            memcpy(&uid, buf + 4, 4);
+            uid = remap_uid(c->m, uid);
+            memcpy(buf + 4, &uid, 4);
+        }
+        if (c->m->fake_id && sl >= 12) {
+            u32 gid;
+            memcpy(&gid, buf + 8, 4);
+            gid = remap_gid(c->m, gid);
+            memcpy(buf + 8, &gid, 4);
+        }
     }
     u64 e = 0;
     u32 real = sl;
@@ -927,15 +943,31 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
         memcpy(gb + goff + 12, &type, 4);
         memcpy(gb + goff + GCMSG_HDRLEN,
                hb + hoff + CMSG_ALIGN(sizeof(struct cmsghdr)), dlen);
-        /* The peer's credentials as the guest knows them (cred_g2h above). */
-        if (m->fake_id && level == SOL_SOCKET && type == SCM_CREDENTIALS && dlen >= 12) {
-            u32 uid, gid;
-            memcpy(&uid, gb + goff + GCMSG_HDRLEN + 4, 4);
-            memcpy(&gid, gb + goff + GCMSG_HDRLEN + 8, 4);
-            uid = remap_uid(m, uid);
-            gid = remap_gid(m, gid);
-            memcpy(gb + goff + GCMSG_HDRLEN + 4, &uid, 4);
-            memcpy(gb + goff + GCMSG_HDRLEN + 8, &gid, 4);
+        /* The sender's credentials as the guest knows them: the pid as the
+         * guest may see it (proctab_pid_view, held: the message keeps the
+         * sender's pid alive), 0 for a host process -- and, under -fake-id,
+         * the fake uid/gid (cred_g2h above). Field by field, since a truncated
+         * element carries only the head of the struct. */
+        if (level == SOL_SOCKET && type == SCM_CREDENTIALS) {
+            u8 *cr = gb + goff + GCMSG_HDRLEN;
+            if (dlen >= 4) {
+                s32 pid;
+                memcpy(&pid, cr, 4);
+                pid = proctab_pid_view(pid, 1);
+                memcpy(cr, &pid, 4);
+            }
+            if (m->fake_id && dlen >= 8) {
+                u32 uid;
+                memcpy(&uid, cr + 4, 4);
+                uid = remap_uid(m, uid);
+                memcpy(cr + 4, &uid, 4);
+            }
+            if (m->fake_id && dlen >= 12) {
+                u32 gid;
+                memcpy(&gid, cr + 8, 4);
+                gid = remap_gid(m, gid);
+                memcpy(cr + 8, &gid, 4);
+            }
         }
         goff += gstep;
         hoff += hstep;

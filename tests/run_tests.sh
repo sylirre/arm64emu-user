@@ -2878,6 +2878,41 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# A socket peer's pid as the guest may see it: SO_PEERCRED and SCM_CREDENTIALS
+# (sys_net.c). Both used to hand the guest the pid the host reported, so a
+# guest connected to a host daemon's socket read the daemon's host pid. The
+# rule is pid_vnr's for a caller in a pid namespace: the number for a guest
+# task, 0 for a host process; and the socket keeps its peer's pid, so a guest
+# client that already exited is still named. Self-checking: qemu-user forwards
+# the raw answer. The host rows need a peer on this side of the emulator
+# (tests/hostsock.c, built with the host compiler); without one the guest-only
+# rows still run.
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/peerpid.bin \
+            tests/fixtures/peerpid.c 2>/dev/null; then
+        exp_g=$'pair_peercred=ok pid=self uid_self=1\npair_peercred_short=ok len=4 pid=self\nchild_creds=1 pid=peer uid_self=1\nconn_peercred=ok pid=peer uid_self=1\nconn_peercred_short=ok len=4 pid=peer\ngone_peercred=ok pid=peer uid_self=1\ngone_peercred_short=ok len=4 pid=peer'
+        if [ -n "$HCC" ] && "$HCC" -O2 -o tests/hostsock.bin tests/hostsock.c 2>/dev/null; then
+            exp_h="$exp_g"$'\nhost_peercred=ok pid=0 uid_self=1\nhost_peercred_short=ok len=4 pid=0\nhost_creds=1 pid=0 uid_self=1\ndone'
+            for fid in "" "-u"; do
+                sockp=$(mktemp -u); ready=$(mktemp)
+                ./tests/hostsock.bin "$sockp" > "$ready" & hs=$!
+                for i in $(seq 50); do grep -q ready "$ready" 2>/dev/null && break; sleep 0.1; done
+                got=$(timeout -k 5 60 "$EMU" $fid / tests/fixtures/peerpid.bin "$sockp" "$hs" 2>/dev/null)
+                kill "$hs" 2>/dev/null; wait "$hs" 2>/dev/null
+                rm -f "$sockp" "$ready"
+                fixture_verdict "peerpid (host peer${fid:+, fake-id})" "$exp_h" "$got"
+            done
+            rm -f tests/hostsock.bin
+        else
+            got=$(timeout -k 5 60 "$EMU" / tests/fixtures/peerpid.bin 2>/dev/null)
+            fixture_verdict "peerpid" "$exp_g"$'\ndone' "$got"
+        fi
+        fx_rm tests/fixtures/peerpid.bin
+    else
+        skip_build "fixtures/peerpid"
+    fi
+fi
+
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
 # Self-checking rather than qemu-diffed: the emulator answers *differently*

@@ -2141,7 +2141,17 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   it stands for, and any credentials received (including the ones `SO_PASSCRED`
   makes the kernel attach) come back through the remap. A third party's ids
   stay the host's refusal — a fake root has `CAP_SETUID` in its own eyes and
-  the host has not (`tests/fixtures/fakecred.c`).
+  the host has not (`tests/fixtures/fakecred.c`). The **pid** in both is held
+  to the hidden-process view whether or not `--fake-id` is on
+  (`proctab_pid_view`): the peer's number when it names a guest task, 0 for a
+  host process — `pid_vnr`'s answer for a peer outside the caller's pid
+  namespace — where a guest connected to a host daemon's socket through a
+  bind used to read the daemon's host pid. The socket keeps a reference on
+  its peer's pid, so a guest client that exited before the server asked is
+  still named, as on a kernel. Each field is translated on its own, since
+  the kernel hands out as much of the struct as was asked for
+  (`tests/fixtures/peerpid.c`, with `tests/hostsock.c` as the peer on the
+  host side).
 - **`/proc/<pid>/status`** (`sys_procfs.c`): the `Uid:`/`Gid:`/`Groups:` lines
   of the host file carry the real invoking uid, but `ps`/`top` read them (not
   `getuid()`) to name the USER/GROUP. Under fake-id those lines are rewritten
