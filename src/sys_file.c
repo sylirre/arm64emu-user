@@ -2414,7 +2414,13 @@ SYSDEF(fcntl) {
             if (r < 0) return host_err();
             if (cmd == 5 || cmd == 36) {   /* GETLK: copy the result back */
                 l_type = fl.l_type; l_whence = fl.l_whence;
-                l_start = fl.l_start; l_len = fl.l_len; l_pid = fl.l_pid;
+                l_start = fl.l_start; l_len = fl.l_len;
+                /* The conflicting lock's owner as the guest may see it: a
+                 * kernel reports 0 for a holder outside the caller's pid
+                 * namespace (locks_translate_pid), and a host process holding
+                 * a lock on a shared file is exactly that to the guest -- its
+                 * raw pid used to come back here. -1 (an OFD lock's) passes. */
+                l_pid = proctab_pid_view((s32)fl.l_pid, 0);
                 memcpy(gfl + 0, &l_type, 2);  memcpy(gfl + 2, &l_whence, 2);
                 memcpy(gfl + 8, &l_start, 8); memcpy(gfl + 16, &l_len, 8);
                 memcpy(gfl + 24, &l_pid, 4);

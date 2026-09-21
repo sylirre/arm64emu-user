@@ -2563,6 +2563,48 @@ int proctab_has_task(s32 tid) {
     return 1;
 }
 
+/* A task id in a field the KERNEL reports to the guest -- the owner of a
+ * conflicting record lock (F_GETLK's l_pid, /proc/locks), the peer of a
+ * socket (SO_PEERCRED, SCM_CREDENTIALS), an fd's async owner (F_GETOWN) --
+ * as the guest may see it: the number when it names a guest task, 0 when it
+ * names one the guest cannot see, which is pid_vnr's answer for a task
+ * outside the caller's pid namespace. A raw number there was a host pid the
+ * guest could learn by locking a shared file or connecting to a host daemon's
+ * socket, with nothing else about that process visible to it. Non-positive
+ * values pass as they are: 0 is already "nobody", and a negative one is the
+ * kernel's own marker (-1 for an OFD lock's owner, a remote lock's pid).
+ *
+ * `held` says the kernel holds a reference on the pid (a socket keeps its
+ * peer's, an fd its owner's), so the number stays allocated after the task
+ * is gone and a kernel still reports it in the namespace it was allocated
+ * in: a task that is gone from the host altogether is then shown -- a guest
+ * client that sent and exited before the server asked keeps its pid, and a
+ * dead host process's number names nothing. A record lock keeps a raw number
+ * instead, which a kernel translates afresh and answers 0 for once the task
+ * is gone, so those callers pass 0. */
+s32 proctab_pid_view(s32 pid, int held) {
+    if (pid <= 0) return pid;
+    if (proctab_has_task(pid)) return pid;
+    if (held && kill((pid_t)pid, 0) < 0 && errno == ESRCH) return pid;
+    return 0;
+}
+
+/* The same for a process group id (F_GETOWN's negative form, F_OWNER_PGRP):
+ * one the guest can see is one a guest process leads or belongs to -- the
+ * kernel keeps a group's pid alive while any member remains, and a group is
+ * visible where its number was allocated -- and this process's own, which
+ * getpgid(0) already discloses (sys_proc.c, pid_visible). */
+int proctab_pgrp_visible(s32 pgid) {
+    if (pgid <= 0) return 0;
+    if (pgid == (s32)getpgrp() || proctab_has(pgid)) return 1;
+    int n = proctab_slots();
+    for (int i = 0; i < n; i++) {
+        s32 pid = proctab_pid_at(i);
+        if (pid > 0 && getpgid((pid_t)pid) == (pid_t)pgid) return 1;
+    }
+    return 0;
+}
+
 /* Snapshot the whole mutable payload (cmdline, environ, auxv, exe, cwd) for
  * `pid` via a seqlock read, then confirm the entry's starttime still matches
  * the live process. Returns 1 on a fresh hit, 0 on miss/stale.

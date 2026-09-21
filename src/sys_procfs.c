@@ -62,6 +62,7 @@ enum {
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
     PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT, PF_CPUINFO,
+    PF_LOCKS,
     PF_SNAPSHOT,   /* an open-time snapshot with no refresh of its own */
 };
 
@@ -362,6 +363,106 @@ static int overflowid_blocked(int is_gid) {
  * reach, and the readable one passes through when it is not. */
 static void put_overflowid(int fd) {
     dprintf(fd, "65534\n");
+}
+
+/* One line of the host's /proc/locks, as the kernel would show it to a caller
+ * in a pid namespace of its own (fs/locks.c). A lock is
+ *
+ *   N: POSIX  ADVISORY  WRITE 4242 08:01:1234 0 EOF
+ *
+ * and a request queued behind it follows, with the same N, as
+ *
+ *   N: -> POSIX  ADVISORY  WRITE 4243 08:01:1234 0 EOF
+ *
+ * (deeper waiters carry more leading blanks before the arrow). The pid is
+ * the fourth field after the number and the optional arrow, whatever the
+ * type -- POSIX/FLOCK/OFDLCK/LEASE all print three words before it. Returns
+ * 0 to leave the line out, 1 when it was written; *hidden carries "the lock
+ * this waiter is queued on was left out" from one line to the next. */
+static int put_locks_line(int fd, const char *ln, size_t len, int *hidden) {
+    size_t i = 0;
+    while (i < len && ln[i] != ' ') i++;                /* "N:" */
+    while (i < len && ln[i] == ' ') i++;
+    int waiter = 0;
+    if (i + 2 <= len && ln[i] == '-' && ln[i + 1] == '>') {
+        waiter = 1;
+        i += 2;
+        while (i < len && ln[i] == ' ') i++;
+    }
+    for (int t = 0; t < 3; t++) {                       /* type, flags, mode */
+        while (i < len && ln[i] != ' ') i++;
+        while (i < len && ln[i] == ' ') i++;
+    }
+    size_t ps = i;
+    while (i < len && ln[i] != ' ') i++;
+    size_t pe = i;
+    if (pe == ps || pe == len) {
+        /* Not a line this reader understands: never shown as it is, since the
+         * one thing known about it is that it may name a host process. */
+        if (!waiter) *hidden = 1;
+        return 0;
+    }
+    long pid = strtol(ln + ps, NULL, 10);
+    s32 view = proctab_pid_view(pid > 0x7fffffff ? 0x7fffffff : (s32)pid, 0);
+    if (!waiter) {
+        /* locks_show: a lock whose owner translates to nobody is skipped, and
+         * with it everything queued behind it. An OFD lock's -1 is shown. */
+        *hidden = pid > 0 && view == 0;
+        if (*hidden) return 0;
+    } else if (*hidden) {
+        return 0;
+    }
+    /* lock_get_status: a waiter the caller cannot see is shown with pid 0. */
+    if (view == (s32)pid) {
+        dprintf(fd, "%.*s\n", (int)len, ln);
+    } else {
+        dprintf(fd, "%.*s%d%.*s\n", (int)ps, ln, (int)view,
+                (int)(len - pe), ln + pe);
+    }
+    return 1;
+}
+
+/* /proc/locks. The host's file lists every record lock on the machine with
+ * its holder's host pid, and passed through it named host processes the guest
+ * is shown nowhere else -- kill(2), /proc and F_GETLK all hide them. What a
+ * kernel shows a caller in a pid namespace is the rule (locks_show,
+ * lock_get_status): a lock whose owner the caller cannot see is left out
+ * together with the requests queued behind it, a queued request whose owner
+ * the caller cannot see is shown with pid 0, and the numbering keeps its
+ * gaps, since the iterator counts the hidden entries too. Each line keeps its
+ * own bytes apart from the pid field, so the fixed-width layout that
+ * lslocks(8) and its kind parse survives. Returns 0, or -1 when the host's
+ * file cannot be opened (the caller lets the host answer that itself: nothing
+ * is disclosed by an open the host refuses). */
+static int put_locks(int fd) {
+    fdwin_enter();   /* the host file's fd is ours, briefly (machine.h) */
+    int hfd = open("/proc/locks", O_RDONLY | O_CLOEXEC);
+    if (hfd < 0) { fdwin_leave(); return -1; }
+    size_t cap = 16384, n = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        if (n == cap) {
+            char *nb = cap < (1u << 24) ? realloc(buf, cap * 2) : NULL;
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb; cap *= 2;
+        }
+        ssize_t r = read(hfd, buf + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    close(hfd);
+    fdwin_leave();
+    if (!buf) return 0;                    /* out of memory: an empty view */
+    int hidden = 0;
+    for (size_t i = 0; i < n; ) {
+        size_t e = i;
+        while (e < n && buf[e] != '\n') e++;
+        put_locks_line(fd, buf + i, e - i, &hidden);
+        i = e + 1;
+    }
+    free(buf);
+    return 0;
 }
 
 /* /proc/<pid>/limits from the guest's own table rather than the host's.
@@ -935,7 +1036,7 @@ static int pf_hand(struct Machine *m, int fd, int kind, s32 pid, int self,
  * open-time snapshots, tracked for their access mode alone. */
 static int pf_refreshes(int kind) {
     switch (kind) {
-    case PF_LOADAVG: case PF_UPTIME: case PF_STAT: case PF_LIMITS:
+    case PF_LOADAVG: case PF_UPTIME: case PF_STAT: case PF_LIMITS: case PF_LOCKS:
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
     case PF_STATUS: case PF_STATM: case PF_PIDSTAT:
         return 1;
@@ -981,7 +1082,7 @@ int procfs_mmap_denied(struct Machine *m, int fd, int shared, int prot_write) {
             e = EACCES;   /* the mode, before the file is asked anything */
         else switch (m->pf_fds[i].kind) {
         case PF_LOADAVG: case PF_UPTIME: case PF_VERSION: case PF_CPUINFO:
-        case PF_STAT: case PF_OVERFLOWID:
+        case PF_STAT: case PF_OVERFLOWID: case PF_LOCKS:
             e = EIO;      /* proc_create'd: proc_reg_mmap with no proc_mmap */
             break;
         default:
@@ -1062,6 +1163,7 @@ int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
     case PF_UPTIME:  put_uptime(fd, m); break;
     case PF_STAT:    put_stat(fd, m);   break;
     case PF_LIMITS:  put_limits(fd, m); break;   /* setrlimit since the open */
+    case PF_LOCKS:   put_locks(fd);     break;   /* locks come and go */
     /* Re-read after a write must show what was written -- by us or, for a
      * child's namespace, by whoever set it up. */
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
@@ -1991,6 +2093,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int is_gid = !strcmp(canon, "/proc/sys/kernel/overflowgid");
         if (!overflowid_blocked(is_gid)) return 0;   /* readable host file wins */
         kind = PF_OVERFLOWID;
+    } else if (!strcmp(canon, "/proc/locks")) {
+        kind = PF_LOCKS;   /* the host's, minus the holders the guest cannot see */
     } else {
         return 0;
     }
@@ -2035,6 +2139,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     case PF_CPUINFO:    put_cpuinfo(fd); break;
     case PF_STAT:       put_stat(fd, m); break;
     case PF_OVERFLOWID: put_overflowid(fd); break;
+    case PF_LOCKS:
+        /* Not one of the host-global views that may fall through: the host's
+         * file is the one with the host's pids in it. An open the host itself
+         * refuses is left to the host, which discloses nothing that way. */
+        if (put_locks(fd) < 0) { fdheld_close(fd); return 0; }
+        break;
     case PF_LIMITS:     put_limits(fd, m); break;
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
                         put_idmap(fd, m, kind, 0); break;

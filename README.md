@@ -125,7 +125,7 @@ Pass `--no-dev` to disable this passthrough entirely; /dev is then served from
 the rootfs only, so bind your own (e.g. `--bind /dev:/dev`) if you need it.
 
 Many /proc entries are synthesized: maps, cmdline, comm, environ, auxv,
-mounts, mountinfo, mountstats, loadavg, uptime, version. The /proc/stat and
+mounts, mountinfo, mountstats, loadavg, uptime, version, locks. The /proc/stat and
 /proc/sys/kernel/overflow{u,g}id are synthesized only when they can't be read
 (Android OS primarily). Pass `--no-proc` to disable the synthesis entirely;
 /proc is then served from the rootfs only (bind your own, e.g.

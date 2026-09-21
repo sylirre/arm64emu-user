@@ -1556,9 +1556,19 @@ then make the consequences the caller depends on true:
   name — and `/proc/self/map_files/`, whose symlinks reopen whatever the
   emulator has mapped, rootfs or not. The `map_files` links are refused during
   path resolution (`path_proc_magic`), so `readlink` cannot report the host
-  target either. Limits: beyond the registry cap extra guest processes fall back
-  to the emulator cmdline and are hidden, and `stat`/`status` memory/state
-  fields still describe the emulator process.
+  target either. The ids the **kernel reports** to the guest are held to the
+  same view (`proctab_pid_view`): the owner of a conflicting record lock in
+  `F_GETLK`/`F_OFD_GETLK`'s `l_pid`, and `/proc/locks` — synthesized from the
+  host's file the way `locks_show` shows it to a caller in a pid namespace: a
+  lock whose owner the guest cannot see is left out together with the
+  requests queued behind it, a queued request whose owner it cannot see is
+  shown with pid 0, an OFD lock's `-1` stands, and the numbering keeps the
+  gaps the kernel's iterator leaves. A host process holding a lock on a
+  shared file used to be named by both faces, with nothing else about it
+  visible (`tests/fixtures/lockspid.c`, with `tests/hostlock.c` as the holder
+  on the host side). Limits: beyond the registry cap extra guest processes
+  fall back to the emulator cmdline and are hidden, and `stat`/`status`
+  memory/state fields still describe the emulator process.
 
 ## System V IPC (`src/sys_ipc.c`)
 

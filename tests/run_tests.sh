@@ -2844,6 +2844,40 @@ check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_m
 check_fixture reflinkobj $'reopen=1\nmaps<-zero=EXDEV/EXDEV\nmaps<-exe=EXDEV/EXDEV\ncomm<-zero=EXDEV/EXDEV\nmaps<-m1=EXDEV/EXDEV\nm1<-maps=EXDEV/EXDEV\nm1<-zero=EXDEV/EXDEV\nm1<-exe=EXDEV/EXDEV\nreg<-m1=EXDEV/EXDEV\nm1<-reg=EXDEV/EXDEV\nmaps<-maps=EBADF/EBADF\nmaps<-comm=EBADF/EBADF\ncomm<-comm=EBADF/EBADF\nm2ro<-m1=EBADF/EBADF\nm2ap<-m1=EBADF/EBADF\nm1<-m2ap=EBADF/EBADF\ncomm<-maps=EOPNOTSUPP/EOPNOTSUPP\nm1<-m2=EOPNOTSUPP/EOPNOTSUPP\nm1<-m1=EOPNOTSUPP/EOPNOTSUPP\nm1<-(-1)=EBADF/EBADF\nm1<-999=EBADF/EBADF\nmaps<-999=EBADF/EBADF\n999<-m1=EBADF/EBADF\nm1<-hi32(m2)=EOPNOTSUPP\nm1<-badptr=EFAULT\n999<-badptr=EBADF\nseal=0\nsealed<-m2=EOPNOTSUPP/EOPNOTSUPP\nsealed<-exe=EXDEV/EXDEV\ncontent=aaaa\nreopen_rw=1\nreopen_write=EPERM\nreopen_pwrite=EPERM\nreopen_seals=8\ncontent=aaaa\ndone' \
     "A64_MEMFD_FORCE_FILE=1" "memfd-tier"
 
+# Record-lock owners as the guest may see them: F_GETLK / F_OFD_GETLK's l_pid
+# and /proc/locks (sys_file.c, sys_procfs.c put_locks). Guest pids are host
+# pids, and both used to hand the guest the host's raw answer, so a lock a
+# HOST process held on a shared file named that process -- one kill(2), /proc
+# and every other face keep hidden. The rule is the kernel's for a caller in
+# a pid namespace: 0 for a holder it cannot see, that lock and the requests
+# queued behind it left out of /proc/locks, a queued request it cannot see
+# shown with pid 0, an OFD lock's -1 as it is. Self-checking: qemu-user
+# forwards the raw answer. The host rows need a locker on this side of the
+# emulator (tests/hostlock.c, built with the host compiler); without one the
+# guest-only rows still run.
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/lockspid.bin \
+            tests/fixtures/lockspid.c 2>/dev/null; then
+        exp_g=$'posix_getlk=WRLCK pid=guest\nposix_ofd_getlk=WRLCK pid=guest\nposix_in_locks=1\nwaiter_in_locks=1\nwaiter_became_holder=1\nofd_getlk=WRLCK pid=-1\nofd_ofd_getlk=WRLCK pid=-1\nofd_in_locks=1'
+        if [ -n "$HCC" ] && "$HCC" -O2 -o tests/hostlock.bin tests/hostlock.c 2>/dev/null; then
+            lockf=$(mktemp); ready=$(mktemp)
+            ./tests/hostlock.bin "$lockf" > "$ready" & hl=$!
+            for i in $(seq 50); do grep -q ready "$ready" 2>/dev/null && break; sleep 0.1; done
+            got=$(timeout -k 5 60 "$EMU" / tests/fixtures/lockspid.bin "$lockf" "$hl" 2>/dev/null)
+            kill "$hl" 2>/dev/null; wait "$hl" 2>/dev/null
+            rm -f "$lockf" "$ready" tests/hostlock.bin
+            fixture_verdict "lockspid (host holder)" \
+                "$exp_g"$'\nhost_getlk=WRLCK pid=0\nhost_ofd_getlk=WRLCK pid=0\nhost_in_locks=0\nhost_waiter_in_locks=0\ndone' "$got"
+        else
+            got=$(timeout -k 5 60 "$EMU" / tests/fixtures/lockspid.bin 2>/dev/null)
+            fixture_verdict "lockspid" "$exp_g"$'\ndone' "$got"
+        fi
+        fx_rm tests/fixtures/lockspid.bin
+    else
+        skip_build "fixtures/lockspid"
+    fi
+fi
+
 
 # ---- faked net namespace: rtnetlink refusals become acks (sys_netlink.c).
 # Self-checking rather than qemu-diffed: the emulator answers *differently*

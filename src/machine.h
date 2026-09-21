@@ -1227,6 +1227,14 @@ s32  proctab_task_tgid(s32 tid);
 int  proctab_has_task(s32 tid);
 int  proctab_slots(void);
 s32  proctab_pid_at(int slot);
+/* And for the ids the kernel REPORTS to the guest (a lock owner, a socket
+ * peer, an fd's async owner): the number when it names a guest task, 0 for
+ * one the guest cannot see -- pid_vnr's answer across a pid namespace.
+ * `held` for a pid the kernel keeps a reference on (a peer, an owner), whose
+ * number outlives the task. A process group is visible when a guest process
+ * leads or belongs to it, or it is this process's own. */
+s32  proctab_pid_view(s32 pid, int held);
+int  proctab_pgrp_visible(s32 pgid);
 
 /* Id maps of a faked user namespace, kept in the registry rather than in the
  * owner's Machine because the standard setup has the PARENT write the child's
