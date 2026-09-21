@@ -149,7 +149,17 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   contained exactly as `kill`'s is (see *Target containment* in
   `docs/signals-and-processes.md`), and `F_SETSIG`'s argument is a **guest**
   signal number, which for 32/33 has to ride a host carrier like every other one
-  the guest sends (`F_GETSIG` maps it back).
+  the guest sends (`F_GETSIG` maps it back). What `F_GETOWN`/`F_GETOWN_EX`
+  report is held to the hidden-process view the same way (`owner_view`): a
+  descriptor can arrive with an owner already on it — inherited from
+  whatever started the emulator, or received over `SCM_RIGHTS` from a host
+  process — and its host pid came back raw, where a kernel answers `pid_vnr`'s
+  0 for an owner outside the caller's pid namespace (a group counts as
+  visible when a guest process leads or belongs to it). `F_GETOWN` is
+  composed from the typed `F_GETOWN_EX` answer as `f_getown` composes it —
+  pid, or `-pgid` for a group — because the scalar forward treated every
+  negative return as an error and reported a stale errno for every
+  group-owned descriptor (`tests/fixtures/peerpid.c`).
 - *An optval is not always opaque bytes.* `setsockopt` passes most option
   buffers through unchanged, but `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`
   take a `struct sock_fprog` whose second field is a **pointer** to the

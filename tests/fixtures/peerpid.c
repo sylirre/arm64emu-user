@@ -1,5 +1,5 @@
 /* A socket peer's pid as the guest may see it: SO_PEERCRED and
- * SCM_CREDENTIALS.
+ * SCM_CREDENTIALS -- and a descriptor's async owner, F_GETOWN / F_GETOWN_EX.
  *
  * Guest pids are host pids, and both faces used to hand the guest the pid
  * the host reported -- so a guest connected to a host daemon's socket (any
@@ -11,15 +11,22 @@
  * (a server that asks after a short-lived client has gone reads its pid, as
  * on a kernel). The uid/gid stay the real ones without -fake-id.
  *
+ * An fd's async owner is the same story: F_SETOWN admits only ids the guest
+ * can see, but a descriptor received over SCM_RIGHTS from a host process
+ * arrives with its owner already set, and F_GETOWN reported it raw -- and
+ * reported every group-owned descriptor (-pgid) as an error besides.
+ *
  * Rows: a guest child as the peer (its pid, live and after it exited, from
- * both faces) and -- with a host peer's socket path and pid named on the
- * command line -- a host process as the peer (0 from both, the uid still
- * the caller's own). Self-checking: qemu-user forwards the raw answer, and
- * the host block is what the kernel prints for a caller in a child pid
- * namespace. Run as
+ * both faces), this process's own owners (itself, its thread, its group,
+ * both query forms), and -- with a host peer's socket path and pid named on
+ * the command line -- a host process as the peer (0 from both, the uid still
+ * the caller's own) handing over descriptors it owns (0 from both forms).
+ * Self-checking: qemu-user forwards the raw answer, and the host block is
+ * what the kernel prints for a caller in a child pid namespace. Run as
  *   arm64chroot / tests/fixtures/peerpid.bin [<host socket path> <host pid>] */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +81,21 @@ static void creds_recv(const char *label, int fd, int child, int *fds) {
     }
     printf("%s=%zd pid=%s uid_self=%d\n", label, n, got, uid_self);
 }
+/* F_GETOWN and F_GETOWN_EX on one descriptor. `peer` is the owner's real
+ * pid (or the group leader's), so the report is named relative to it. */
+static void owner(const char *label, int fd, int peer) {
+    errno = 0;
+    int r = fcntl(fd, F_GETOWN);
+    int e = errno;
+    struct f_owner_ex ex = { -1, -1 };
+    int rx = fcntl(fd, F_GETOWN_EX, &ex);
+    printf("%s: getown=%s%s getown_ex=%s type=%d pid=%s\n", label,
+           r < 0 && e ? strerror(e) : r < 0 ? "-" : "",
+           r < 0 && e ? "" : pidname(r < 0 ? -r : r, peer),
+           rx < 0 ? strerror(errno) : "ok", rx < 0 ? -1 : (int)ex.type,
+           rx < 0 ? "?" : pidname((int)ex.pid, peer));
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* A guest child as the peer. */
@@ -107,6 +129,16 @@ int main(int argc, char **argv) {
     peercred("pair_peercred", sp[0], (int)k);
     int fds[2];
     creds_recv("child_creds", sp[0], (int)k, fds);
+    /* This process's own owners, every form: pid, tid, group (which it must
+     * lead to name it; setpgid puts it at the head of one of its own). */
+    owner("own_none", sp[0], (int)getpid());
+    if (fcntl(sp[0], F_SETOWN, getpid()) < 0) return 1;
+    owner("own_pid", sp[0], (int)getpid());
+    struct f_owner_ex tex = { F_OWNER_TID, (int)getpid() };
+    if (fcntl(sp[0], F_SETOWN_EX, &tex) < 0) return 1;
+    owner("own_tid", sp[0], (int)getpid());
+    if (setpgid(0, 0) < 0 || fcntl(sp[0], F_SETOWN, -getpid()) < 0) return 1;
+    owner("own_pgrp", sp[0], (int)getpid());
     /* A connection the child makes: the peer is the child, alive and then
      * gone -- the socket keeps its pid. */
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -151,6 +183,11 @@ int main(int argc, char **argv) {
         }
         peercred("host_peercred", hs, atoi(argv[2]));
         creds_recv("host_creds", hs, atoi(argv[2]), fds);
+        printf("host_fds=%d\n", fds[0] >= 0 && fds[1] >= 0);
+        /* Its descriptors, owned by it and by its group. The group's leader is
+         * not known here, so a raw answer reads "other". */
+        if (fds[0] >= 0) owner("host_fd_pid", fds[0], atoi(argv[2]));
+        if (fds[1] >= 0) owner("host_fd_pgrp", fds[1], atoi(argv[2]));
         close(hs);
     }
     printf("done\n");

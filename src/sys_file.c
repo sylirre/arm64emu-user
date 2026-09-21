@@ -2313,6 +2313,19 @@ SYSDEF(ioctl) {
  * here is a way to signal it (machine.h, proctab_has_task). 0 clears the owner.
  * `pgrp` selects the process-group reading of a positive id, which F_SETOWN
  * spells as a negative one. */
+/* The owner an fd REPORTS (F_GETOWN, F_GETOWN_EX), as the guest may see it:
+ * the setters above admit only ids the guest can see, but a descriptor can
+ * arrive with an owner already on it -- inherited from whatever started the
+ * emulator, or received over SCM_RIGHTS from a host process -- and its host
+ * pid came back raw. The kernel answers pid_vnr for a caller in another pid
+ * namespace: the number when it was allocated there, 0 otherwise. The fd
+ * keeps a reference on its owner's pid (held), and a group is visible when a
+ * guest process leads or belongs to it (proctab_pgrp_visible). */
+static s32 owner_view(s32 id, int pgrp) {
+    if (!pgrp) return proctab_pid_view(id, 1);
+    return proctab_pgrp_visible(id) ? id : 0;
+}
+
 static int owner_allowed(s32 id, int pgrp) {
     if (!id) return 1;                       /* clear */
     if (id < 0) {
@@ -2448,11 +2461,31 @@ SYSDEF(fcntl) {
             int r = fcntl(fd, cmd == 15 ? F_SETOWN_EX : F_GETOWN_EX, &ex);
             if (r < 0) return host_err();
             if (cmd == 16) {
-                type = (s32)ex.type; pid = (s32)ex.pid;
+                type = (s32)ex.type;
+                pid = owner_view((s32)ex.pid, type == 2);
                 memcpy(gex + 0, &type, 4); memcpy(gex + 4, &pid, 4);
                 if (copy_to_guest(c, a2, gex, sizeof gex) < 0) return (u64)(s64)-EFAULT;
             }
             return (u64)r;
+        }
+        case 9: {   /* F_GETOWN: pid, or -pgid for a process group -- f_getown's
+                     * own composition, from the typed answer (a libc's F_GETOWN
+                     * wrapper answers -pgid too, and forwarding that through the
+                     * "negative is an error" return here reported a stale errno
+                     * for every group-owned descriptor). */
+            struct f_owner_ex ex;
+            int r = fcntl(fd, F_GETOWN_EX, &ex);
+            if (r < 0) return host_err();
+            s32 pid = owner_view((s32)ex.pid, ex.type == 2 /* F_OWNER_PGRP */);
+            return (u64)(s64)(ex.type == 2 ? -pid : pid);
+        }
+#else
+        case 9: {   /* F_GETOWN on a host too old for the typed form (< 2.6.32):
+                     * the raw answer, pid or -pgid, held to the same view. */
+            errno = 0;
+            int r = fcntl(fd, F_GETOWN);
+            if (r < 0 && errno) return host_err();
+            return (u64)(s64)(r < 0 ? -owner_view(-r, 1) : owner_view(r, 0));
         }
 #endif
         /* Async-I/O ownership: an id the guest supplies, contained as above. */
@@ -2491,10 +2524,10 @@ SYSDEF(fcntl) {
             return r < 0 ? host_err() : (u64)r;
         }
         /* The rest of the scalar-argument commands, forwarded as they are:
-         * F_GETOWN, F_SETLEASE/F_GETLEASE, F_NOTIFY, F_DUPFD_QUERY and
-         * F_CREATED_QUERY (whose argument is an fd, and guest fd == host fd),
-         * F_SETPIPE_SZ/F_GETPIPE_SZ. */
-        case 9: case 1024: case 1025: case 1026: case 1027: case 1028:
+         * F_SETLEASE/F_GETLEASE, F_NOTIFY, F_DUPFD_QUERY and F_CREATED_QUERY
+         * (whose argument is an fd, and guest fd == host fd),
+         * F_SETPIPE_SZ/F_GETPIPE_SZ. (F_GETOWN is above, with F_GETOWN_EX.) */
+        case 1024: case 1025: case 1026: case 1027: case 1028:
         case 1031: case 1032: {
             int r = fcntl(fd, cmd, (int)a2);
             return r < 0 ? host_err() : (u64)r;
