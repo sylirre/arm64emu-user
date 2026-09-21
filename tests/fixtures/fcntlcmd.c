@@ -12,8 +12,10 @@
  *    (or EINVAL on a kernel without it -- it was removed again for files),
  *    never EFAULT, which is what forwarding the guest VA looks like.
  *  - F_SETOWN/F_SETOWN_EX name a task that will be sent SIGIO, so they are
- *    contained like kill(2): our own parent is a live host process outside the
- *    guest and must be refused. F_SETSIG carries a GUEST signal number, which
+ *    contained like kill(2): a live host process outside the guest, named on
+ *    the command line by the harness (its own shell; it used to be our parent,
+ *    which getppid now reports as 0 for the top-level guest process), must be
+ *    refused. F_SETSIG carries a GUEST signal number, which
  *    for 32/33 rides a host carrier (those numbers are the host libc's own);
  *    F_GETSIG must give the guest's number back, not the carrier's.
  *  - A process GROUP owner (the negative spelling) is a whole set of tasks the
@@ -35,7 +37,8 @@ static const char *r0(long r) {
          : errno == EFAULT ? "EFAULT" : "err";
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    pid_t host = argc > 1 ? (pid_t)atoi(argv[1]) : 1;   /* outside the guest */
     int p[2];
     if (pipe(p) < 0) { perror("pipe"); return 1; }
     int fd = p[0];
@@ -50,10 +53,10 @@ int main(void) {
     long r = fcntl(fd, 1035 /* F_GET_RW_HINT */, &hint);
     printf("rw_hint=%s\n", (r >= 0 || errno == EINVAL) ? "translated" : r0(r));
 
-    printf("setown-host=%s\n", r0(fcntl(fd, F_SETOWN, getppid())));
+    printf("setown-host=%s\n", r0(fcntl(fd, F_SETOWN, host)));
     printf("setown-self=%s\n", r0(fcntl(fd, F_SETOWN, getpid())));
     printf("getown=%d\n", fcntl(fd, F_GETOWN) == getpid());
-    struct f_owner_ex ex = { F_OWNER_PID, getppid() };
+    struct f_owner_ex ex = { F_OWNER_PID, host };
     printf("setown_ex-host=%s\n", r0(fcntl(fd, F_SETOWN_EX, &ex)));
     ex.type = F_OWNER_PID; ex.pid = getpid();
     printf("setown_ex-self=%s\n", r0(fcntl(fd, F_SETOWN_EX, &ex)));

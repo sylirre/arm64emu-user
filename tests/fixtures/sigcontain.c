@@ -6,9 +6,12 @@
  * any process of the invoking user: kill(-1, SIGKILL) would take down the
  * user's shell and session, and the emulator's own IPC broker daemon with it.
  * A host process outside the guest must look like it does through /proc --
- * absent -- so every id-taking syscall answers ESRCH for one. Our own parent is
- * the ideal witness: it is a live same-uid process (the shell running the test)
- * that is not part of the guest, and a native run answers 0 for it.
+ * absent -- so every id-taking syscall answers ESRCH for one. The witness is
+ * a live same-uid process that is not part of the guest, named on the command
+ * line by the harness (the shell running the test); a native run answers 0
+ * for it. It used to be our own parent, which getppid now reports as 0 for
+ * the top-level guest process -- the kernel's answer for a parent outside the
+ * caller's pid namespace -- and kill(0) is the caller's own group.
  *
  * The other half is that containment did not break the guest's own signalling:
  * self, own tid, a child, and a real process-group delivery that the child
@@ -18,6 +21,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -31,8 +35,8 @@ static const char *res(int r) {
 
 static void on_usr1(int s) { (void)s; }
 
-int main(void) {
-    pid_t host = getppid();          /* outside the guest: the shell that ran us */
+int main(int argc, char **argv) {
+    pid_t host = argc > 1 ? (pid_t)atoi(argv[1]) : 1;   /* outside the guest */
     siginfo_t si;
     memset(&si, 0, sizeof si);
     si.si_code = SI_QUEUE;

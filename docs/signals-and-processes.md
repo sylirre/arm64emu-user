@@ -639,6 +639,14 @@ it read the CPU time of any host process and walked the host pid space asking
 which pids exist. The second needs none: guest fd **is** host fd, so it can only
 name a descriptor the guest already holds.
 
+The other direction — an id the kernel *reports* — takes the pid-namespace
+answer: `getppid` (and the `PPid:` line and stat field of the synthesized
+`/proc` views) is 0 when the parent is not a guest process, which the
+top-level guest's is not, and a lock owner, a socket peer or an fd's async
+owner the guest cannot see reads as 0 (`proctab_pid_view`, `docs/syscalls.md`).
+`getpgid(0)`/`getsid(0)` are the exception and stay the host's: the guest
+hands those back to `setpgid` and `tcsetpgrp`, so job control needs them real.
+
 A process **group** is a set rather than a task, so the rule differs: `F_SETOWN`
 with a negative id, `F_SETOWN_EX` with `F_OWNER_PGRP`, and `setpgid`'s target
 group are admitted only when a **guest process leads** the group. Membership is

@@ -1566,8 +1566,17 @@ then make the consequences the caller depends on true:
   name — and `/proc/self/map_files/`, whose symlinks reopen whatever the
   emulator has mapped, rootfs or not. The `map_files` links are refused during
   path resolution (`path_proc_magic`), so `readlink` cannot report the host
-  target either. The ids the **kernel reports** to the guest are held to the
-  same view (`proctab_pid_view`): the owner of a conflicting record lock in
+  target either. The **parent** is held to the view too (`proc_ppid_view`):
+  `getppid`, the `PPid:` line of `status` and field 4 of `stat` answer 0
+  when the parent is not a guest process — the kernel's answer for a parent
+  outside the caller's pid namespace — which the top-level guest's parent
+  (whatever started the emulator) and the host init or subreaper an orphan
+  is reparented to are not; the raw host pid used to come back
+  (`tests/fixtures/hostprobe.c`). The process group and session ids stay the
+  host's (`pid_visible`): those the guest hands back to `setpgid` and
+  `tcsetpgrp`, so job control needs them real. The ids the **kernel
+  reports** to the guest are held to the same view (`proctab_pid_view`): the
+  owner of a conflicting record lock in
   `F_GETLK`/`F_OFD_GETLK`'s `l_pid`, and `/proc/locks` — synthesized from the
   host's file the way `locks_show` shows it to a caller in a pid namespace: a
   lock whose owner the guest cannot see is left out together with the

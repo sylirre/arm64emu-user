@@ -2049,12 +2049,12 @@ fi
 # rather than forwarded with the guest's raw third argument (a pointer-taking
 # command the kernel grows would then read or write through a guest VA as a host
 # address), the known pointer-taking ones must be translated (never EFAULT), and
-# F_SETOWN must not be able to name a host process. ----
+# F_SETOWN must not be able to name a host process (this shell's pid). ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/fcntlcmd.bin \
             tests/fixtures/fcntlcmd.c 2>/dev/null; then
         expect=$'unknown=EINVAL\nunknown-hi=EINVAL\nrw_hint=translated\nsetown-host=ESRCH\nsetown-self=ok\ngetown=1\nsetown_ex-host=ESRCH\nsetown_ex-self=ok\nsetown-pgrp-initial=as-expected\nsetown-pgrp-own=ok\nsetown-pgrp-guest=ok\nsetsig=ok\ngetsig=32\nsetsig0=ok\ngetsig0=0\nsetsig-bad=EINVAL\npipesz=1\ngetlease=ok\ndone'
-        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/fcntlcmd.bin 2>/dev/null)
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/fcntlcmd.bin $$ 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: fcntlcmd"
         else
             fail=$((fail+1)); echo "FAIL fixture: fcntlcmd"
@@ -2132,14 +2132,17 @@ fi
 # qemu-user forwards every one of them raw, so it answers for the host process
 # (verified: getpgid/getsid/capget/sched_getaffinity all report "ok" under
 # qemu for the emulator's own host parent, and a dynamic CPU clockid reads
-# that process's CPU time). The witness is getppid(), which for the top-level
-# guest process names whatever started the emulator -- a live host process the
-# guest may not see. ----
+# that process's CPU time). The witness is this shell's own pid -- a live
+# host process the guest may not see. It used to be getppid(), which for the
+# top-level guest process named whatever started the emulator; that is now
+# 0, as a kernel answers for a parent outside the caller's pid namespace,
+# from getppid, the status file's PPid line and the stat file alike (the
+# first rows). ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/hostprobe.bin \
             tests/fixtures/hostprobe.c 2>/dev/null; then
-        expect=$'clock-host-proc=EINVAL\nclock-host-thread=EINVAL\nclock-self-proc=ok\nclock-self-thread=ok\nclock-res-host=EINVAL\nclock-monotonic=ok\ngetpgid-host=ESRCH\ngetpgid-self=ok\ngetsid-host=ESRCH\ngetsid-self=ok\nsetpgid-host=ESRCH\naffinity-host=ESRCH\naffinity-self=ok\nsetaffinity-host=ESRCH\ncapget-host=ESRCH\ncapget-self=ok\ndone'
-        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/hostprobe.bin 2>/dev/null)
+        expect=$'getppid=0\nstatus-ppid=0 stat-ppid=0\nclock-host-proc=EINVAL\nclock-host-thread=EINVAL\nclock-self-proc=ok\nclock-self-thread=ok\nclock-res-host=EINVAL\nclock-monotonic=ok\ngetpgid-host=ESRCH\ngetpgid-self=ok\ngetsid-host=ESRCH\ngetsid-self=ok\nsetpgid-host=ESRCH\naffinity-host=ESRCH\naffinity-self=ok\nsetaffinity-host=ESRCH\ncapget-host=ESRCH\ncapget-self=ok\ndone'
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/hostprobe.bin $$ 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: hostprobe"
         else
             fail=$((fail+1)); echo "FAIL fixture: hostprobe"
@@ -2400,14 +2403,14 @@ fi
 # scheduler family) must not reach a host process. Self-checking: qemu-user
 # passes every id straight through, so it answers "ok" for exactly the cases
 # that have to be ESRCH -- it is the counter-example, not the oracle. The
-# fixture's witness is its own parent: a live same-uid process outside the
+# fixture's witness is this shell's pid: a live same-uid process outside the
 # guest. The second half proves the guest's own signalling still works,
 # including a real process-group delivery the child confirms. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/sigcontain.bin \
             tests/fixtures/sigcontain.c 2>/dev/null; then
         expect=$'kill-host=ESRCH\nkill-init=ESRCH\ntgkill-host=ESRCH\ntkill-host=ESRCH\nsigqueue-host=ESRCH\ngetprio-host=ESRCH\nsetprio-host=ESRCH\nsched-host=ESRCH\nkill-self=ok\ntkill-self=ok\ngetprio-self=ok\nkill-child=ok\nkill-all=ok\nkill-group=ok\ngroup-delivered=1\ndone'
-        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/sigcontain.bin 2>/dev/null)
+        got=$(timeout -k 5 120 "$EMU" / tests/fixtures/sigcontain.bin $$ 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: sigcontain"
         else
             fail=$((fail+1)); echo "FAIL fixture: sigcontain"

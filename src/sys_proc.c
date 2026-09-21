@@ -236,7 +236,20 @@ static void children_reaped(s64 maxrss) {
 }
 
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
-SYSDEF(getppid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getppid(); }
+/* The parent as the guest may see it: a kernel answers 0 for a parent
+ * outside the caller's pid namespace (task_tgid_vnr of real_parent), and the
+ * top-level guest process's parent -- whatever started the emulator -- is
+ * exactly that, as is the host's init or subreaper an orphan is reparented
+ * to. The raw host pid used to come back, a process the guest can see
+ * nowhere else. The same view covers the PPid line of /proc/<pid>/status
+ * and field 4 of /proc/<pid>/stat (sys_procfs.c, proc_ppid_view). */
+s32 proc_ppid_view(s32 ppid) {
+    return ppid > 0 && proctab_has(ppid) ? ppid : 0;
+}
+SYSDEF(getppid) {
+    (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;
+    return (u64)proc_ppid_view((s32)getppid());
+}
 SYSDEF(gettid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)g_tls.tid; }
 
 /* ---- credential policy (-fake-id). "Privileged" == fake euid is root. ----
@@ -2617,7 +2630,10 @@ SYSDEF(waitid) {
  * Note what is NOT contained: the value getpgid(0)/getsid(0) reports for this
  * process is the host's, and stays so. It has to be -- it is the id the guest
  * hands back to setpgid and to tcsetpgrp, and a shell compares it against
- * tcgetpgrp -- and it discloses one id rather than a way to enumerate them. */
+ * tcgetpgrp -- and it discloses one id rather than a way to enumerate them.
+ * (getppid is different: nothing hands the parent's id back to the kernel,
+ * so it takes the pid-namespace answer, 0 for a parent outside -- see
+ * proc_ppid_view.) */
 static int pid_visible(s32 pid) { return pid == 0 || proctab_has_task(pid); }
 
 SYSDEF(setpgid) {

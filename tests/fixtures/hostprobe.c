@@ -2,11 +2,13 @@
  * outside the guest. Self-checking: qemu-user forwards every one of these raw,
  * so it answers for the host process and cannot be the oracle here.
  *
- * The witness is getppid(): run as the top-level guest process, this process's
- * parent is whatever started the emulator -- a live host process that is not a
- * guest process, hidden from the guest's /proc and refused by kill(2). Every
- * call below that names it must refuse it the same way, and every call that
- * names ourselves must still work.
+ * The witness is a live host process that is not a guest process, named on
+ * the command line by the harness (its own shell) -- hidden from the guest's
+ * /proc and refused by kill(2). It used to be getppid(), which for the
+ * top-level guest process named whatever started the emulator; that answer
+ * is now 0, as a kernel's is for a parent outside the caller's pid namespace
+ * (the first rows). Every call below that names the witness must refuse it,
+ * and every call that names ourselves must still work.
  *
  * The dynamic clockids are the same question in an encoded form: a NEGATIVE
  * clockid is ((~pid) << 3) | which, so clock_gettime(2) was a way to read the
@@ -19,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sched.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 
 static const char *r0(long r) {
@@ -62,8 +65,27 @@ static int syslog_rows(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "syslog")) return syslog_rows();
-    int host = (int)getppid(), self = (int)getpid();
+    int host = argc > 1 ? atoi(argv[1]) : 1, self = (int)getpid();
     struct timespec ts;
+
+    /* The parent of the top-level guest process is outside the guest: 0 from
+     * getppid, from the PPid line and from field 4 of the stat file. */
+    printf("getppid=%d\n", (int)getppid());
+    {
+        char b[4096], *l;
+        int ppid_status = -1, ppid_stat = -1;
+        FILE *f = fopen("/proc/self/status", "r");
+        if (f) {
+            while (fgets(b, sizeof b, f))
+                if (!strncmp(b, "PPid:", 5)) ppid_status = atoi(b + 5);
+            fclose(f);
+        }
+        f = fopen("/proc/self/stat", "r");
+        if (f && fgets(b, sizeof b, f) && (l = strrchr(b, ')')))
+            sscanf(l + 1, " %*c %d", &ppid_stat);
+        if (f) fclose(f);
+        printf("status-ppid=%d stat-ppid=%d\n", ppid_status, ppid_stat);
+    }
 
     printf("clock-host-proc=%s\n", r0(clock_gettime(PROC_CLOCK(host), &ts)));
     printf("clock-host-thread=%s\n", r0(clock_gettime(THREAD_CLOCK(host), &ts)));

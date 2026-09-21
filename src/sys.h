@@ -467,6 +467,10 @@ struct rusage;
 void children_rusage(struct rusage *ru);
 int  children_cpu_net(s64 *ut_us, s64 *st_us);
 s64  cpu_us_to_ticks(s64 us);
+/* A parent pid as the guest may see it (sys_proc.c): the number when the
+ * parent is a guest process, 0 for one outside -- the kernel's answer for a
+ * parent outside the caller's pid namespace. getppid, status PPid, stat. */
+s32  proc_ppid_view(s32 ppid);
 /* mmap of a synthesized /proc file: 0, or the errno the kernel's own file
  * answers, in do_mmap's order -- EACCES for a mode the mapping needs and the
  * descriptor lacks (write for a shared writable one, read for any), then

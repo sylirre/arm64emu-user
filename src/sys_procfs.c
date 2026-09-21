@@ -1447,14 +1447,17 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
 
 /* Guest view of /proc/<pid>/status: pass the host file through, rewriting the
  * lines that describe the EMULATOR rather than the guest and dropping the ones
- * that describe the host's architecture. Everything else -- State, PPid,
- * FDSize, Threads, the context-switch counters -- is a real property of the
- * process being asked about and stands as it is.
+ * that describe the host's architecture. Everything else -- State, FDSize,
+ * Threads, the context-switch counters -- is a real property of the process
+ * being asked about and stands as it is.
  *
  * What has to be rewritten, and why the host file cannot answer it:
  *   TracerPid  the emulated ptrace never host-attaches (ptracetab.c), so the
  *              host task has no tracer to report even while a guest gdb has it
  *              stopped -- and a real one would name a host pid regardless.
+ *   PPid       the parent as the guest may see it: 0 when it is not a guest
+ *              process, which the top-level guest's -- whatever started the
+ *              emulator -- is not (sys_proc.c proc_ppid_view, as getppid).
  *   Seccomp    a guest filter is evaluated here and never installed on the
  *              host (sys_seccomp.c), so a filtered guest reads 0; and where the
  *              emulator itself runs under a filter the guest never asked for
@@ -1622,6 +1625,15 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             dprintf(fd, "TracerPid:\t%d\n", (int)ptrace_tracer_of(tid));
             goto next_line;
         }
+        /* The parent as the guest may see it (sys_proc.c proc_ppid_view): a
+         * kernel prints 0 for a parent outside the reader's pid namespace,
+         * and the top-level guest's parent is whatever started the emulator.
+         * Every guest process's file, since the one whose parent is not a
+         * guest is precisely the one another guest reads to find out. */
+        if (is_key(p, "PPid")) {
+            dprintf(fd, "PPid:\t%d\n", (int)proc_ppid_view((s32)strtol(p + 5, NULL, 10)));
+            goto next_line;
+        }
         if (nforeign && is_key(p, "Threads")) {
             int t = (int)strtol(p + 8, NULL, 10) - nforeign;
             dprintf(fd, "Threads:\t%d\n", t > 0 ? t : 1);
@@ -1746,6 +1758,11 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
 static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
                          int self, s32 opid, const char *tok, int f, u64 *out) {
     switch (f) {
+    case 4:                                                   /* ppid */
+        /* As getppid answers it: 0 for a parent that is not a guest process
+         * (proc_ppid_view), which is what the top-level guest's is. */
+        *out = (u64)proc_ppid_view((s32)strtol(tok, NULL, 10));
+        return 1;
     case 16: case 17: {                                       /* cutime, cstime */
         /* The children's CPU time is the host's figure less what the
          * emulator's own reaped helpers charged to it (sys_proc.c
