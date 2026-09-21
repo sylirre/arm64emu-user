@@ -212,6 +212,29 @@ void task_locks_take(void)   { pthread_mutex_lock(&task_lock_); }
 void task_locks_drop(void)   { pthread_mutex_unlock(&task_lock_); }
 void task_locks_reinit(void) { pthread_mutex_init(&task_lock_, NULL); }
 
+/* The RSS high-water mark over this process's reaped children, which is what
+ * getrusage(RUSAGE_CHILDREN) reports as ru_maxrss. Kept here rather than
+ * read from the host because the host's figure also holds what the emulator's
+ * own reaped children left in it -- the broker spawn's middle child, a copy
+ * of this whole process for the instant it lived (proctab.c, helper_charge)
+ * -- and a maximum cannot be subtracted from. The kernel folds a child in at
+ * exactly one place, the wait that reaps its zombie (wait_task_zombie), and
+ * every such wait is one of the host wait calls below, so this is the same
+ * figure the kernel keeps minus the helpers: a child that only stopped or
+ * continued is not folded, nor is one reaped WNOWAIT, nor one the guest's
+ * SIG_IGN for SIGCHLD had the kernel discard. Per process, as the kernel's
+ * is: zeroed in a fork child, kept across exec. */
+static s64 g_cmaxrss;
+
+static void children_reaped(s64 maxrss) {
+    s64 cur = __atomic_load_n(&g_cmaxrss, __ATOMIC_RELAXED);
+    while (maxrss > cur &&
+           !__atomic_compare_exchange_n(&g_cmaxrss, &cur, maxrss, 1,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+    proctab_ctime_republish();   /* no-op unless a helper was ever charged */
+}
+
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
 SYSDEF(getppid) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getppid(); }
 SYSDEF(gettid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)g_tls.tid; }
@@ -1020,6 +1043,7 @@ SYSDEF(clone) {
          * parent's main thread was doing, this child has a live leader. */
         m->leader_parked = 0;
         m->group_exit_code = 0;
+        g_cmaxrss = 0;                    /* a new process has reaped nothing */
         jit_fork_child();                 /* fork discipline for the JIT state */
         /* What the parent asked fork to leave out of this child, or to hand it
          * empty (madvise MADV_DONTFORK / MADV_WIPEONFORK): the host fork copied
@@ -2352,8 +2376,8 @@ SYSDEF(wait4) {
         if (!ptrace_available() || !ptrace_any_trace() ||
             !ptrace_have_tracee((s32)wpid)) {
             int status;
-            struct rusage ru;
-            pid_t pid = wait4(wpid, &status, options, a3 ? &ru : NULL);
+            struct rusage ru;   /* always taken: children_reaped needs it */
+            pid_t pid = wait4(wpid, &status, options, &ru);
             if (pid < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -2371,6 +2395,8 @@ SYSDEF(wait4) {
              * appear in a race window (TRACEME after the gate check); drop it
              * so it cannot go stale. No-op otherwise. */
             if (pid > 0 && ptrace_any_trace()) ptrace_note_reaped((s32)pid);
+            if (pid > 0 && (WIFEXITED(status) || WIFSIGNALED(status)))
+                children_reaped((s64)ru.ru_maxrss);
             if (a1) {
                 s32 gs = status;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2401,10 +2427,12 @@ SYSDEF(wait4) {
         }
         int status;
         struct rusage ru;
-        pid_t pid = wait4(wpid, &status, options | WNOHANG, a3 ? &ru : NULL);
+        pid_t pid = wait4(wpid, &status, options | WNOHANG, &ru);
         int werr = errno;
         if (pid > 0) {
             ptrace_note_reaped((s32)pid);
+            if (WIFEXITED(status) || WIFSIGNALED(status))
+                children_reaped((s64)ru.ru_maxrss);
             if (a1) {
                 s32 gs = status;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2482,7 +2510,7 @@ SYSDEF(waitid) {
              * the wait4-less way to get a child's accounting. Kernel layout, so
              * see KRusage. */
             int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si, options,
-                                 a4 ? &ru : NULL);
+                                 &ru);   /* always taken: children_reaped */
             if (r < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -2497,6 +2525,10 @@ SYSDEF(waitid) {
             /* Defensive: see the matching wait4 comment. */
             if (si.si_pid != 0 && ptrace_any_trace())
                 ptrace_note_reaped((s32)si.si_pid);
+            if (si.si_pid != 0 && !(options & WNOWAIT) &&
+                (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+                 si.si_code == CLD_DUMPED))
+                children_reaped((s64)ru.maxrss);
             /* Only a wait that found a child writes rusage (the kernel copies it
              * out under `err > 0`), so a WNOHANG that found nothing must not. */
             if (a4 && si.si_pid != 0) {
@@ -2528,10 +2560,14 @@ SYSDEF(waitid) {
         memset(&si, 0, sizeof si);
         memset(&ru, 0, sizeof ru);
         int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
-                             options | WNOHANG, a4 ? &ru : NULL);
+                             options | WNOHANG, &ru);
         int werr = errno;
         if (r == 0 && si.si_pid != 0) {
             ptrace_note_reaped((s32)si.si_pid);
+            if (!(options & WNOWAIT) &&
+                (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+                 si.si_code == CLD_DUMPED))
+                children_reaped((s64)ru.maxrss);
             if (a4) {
                 GRusage g;
                 rusage_out_k(&g, &ru);
@@ -3250,12 +3286,46 @@ SYSDEF(sched_rr_get_interval) {
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
+/* RUSAGE_CHILDREN as the guest's own children account for it: the host's
+ * figure minus what the emulator's own reaped children charged to it
+ * (proctab_children_adjust), and the high-water mark this file tracks itself
+ * (g_cmaxrss, above). Everything that reports children's usage -- getrusage,
+ * times, the cutime/cstime fields of /proc/<pid>/stat -- draws on this. */
+void children_rusage(struct rusage *ru) {
+    if (getrusage(RUSAGE_CHILDREN, ru) < 0) memset(ru, 0, sizeof *ru);
+    proctab_children_adjust(ru);
+    ru->ru_maxrss = (long)__atomic_load_n(&g_cmaxrss, __ATOMIC_RELAXED);
+}
+
 SYSDEF(getrusage) {
     struct rusage ru;
-    if (getrusage((int)(s32)a0, &ru) < 0) return host_err();
+    if ((s32)a0 == RUSAGE_CHILDREN) {
+        children_rusage(&ru);
+    } else if (getrusage((int)(s32)a0, &ru) < 0) {
+        return host_err();
+    }
     GRusage g;
     rusage_out(&g, &ru);
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+/* The children's CPU time net of the helpers, in microseconds, for the
+ * cutime/cstime fields of this process's own /proc/<pid>/stat: 0 when
+ * nothing was ever charged and the host's fields are exact. */
+int children_cpu_net(s64 *ut_us, s64 *st_us) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) < 0 || !proctab_children_adjust(&ru))
+        return 0;
+    *ut_us = (s64)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec;
+    *st_us = (s64)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
+    return 1;
+}
+
+/* Microseconds of CPU time as the clock ticks times(2) and /proc/<pid>/stat
+ * count in (USER_HZ, 100 on every Linux architecture and so the guest's),
+ * rounded down as the kernel's nsec_to_clock_t rounds. */
+s64 cpu_us_to_ticks(s64 us) {
+    return us / 10000;
 }
 
 SYSDEF(times) {
@@ -3265,6 +3335,14 @@ SYSDEF(times) {
     struct { s64 utime, stime, cutime, cstime; } g = {
         (s64)t.tms_utime, (s64)t.tms_stime, (s64)t.tms_cutime, (s64)t.tms_cstime
     };
+    /* The children's fields carry the helpers' time too. Recomputed from the
+     * adjusted figure only once something was charged, so an exact host
+     * answer stays exactly the host's. */
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) == 0 && proctab_children_adjust(&ru)) {
+        g.cutime = cpu_us_to_ticks((s64)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec);
+        g.cstime = cpu_us_to_ticks((s64)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec);
+    }
     if (a0 && copy_to_guest(c, a0, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
     return (u64)r;
 }

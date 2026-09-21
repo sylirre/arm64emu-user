@@ -1264,6 +1264,20 @@ int  proctab_setgroups_write(s32 pid, int deny, int *err);
 void proctab_mem_publish(const ProcMem *pm);          /* the owner, on change */
 void proctab_mem_seed(int slot, const ProcMem *pm);   /* pre-fork, as seccomp */
 int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown */
+
+/* What the emulator's own reaped children (the broker spawn's middle child)
+ * cost this process, taken back out of RUSAGE_CHILDREN (proctab.c):
+ *   proctab_children_adjust   subtract it from a host RUSAGE_CHILDREN figure;
+ *                             0 when nothing was ever charged (figure exact)
+ *   proctab_ctime_republish   publish the net children's CPU time to our
+ *                             registry slot, for another process's reader of
+ *                             our /proc/<pid>/stat; a no-op until something
+ *                             was charged, so a reap costs nothing extra
+ *   proctab_ctime_get         that publication, 1 when there is one */
+struct rusage;
+int  proctab_children_adjust(struct rusage *ru);
+void proctab_ctime_republish(void);
+int  proctab_ctime_get(s32 pid, s64 *ut_us, s64 *st_us);
 /* Drop the publisher's cached slot: a fork child inherits its parent's. */
 void proctab_fork_child(void);
 

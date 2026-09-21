@@ -118,6 +118,15 @@ struct ProcEnt {
      * nothing for an instant, never the wrong tid. See proc_foreign_sample. */
     s32 foreign[PROCTAB_FOREIGN];
     u8  nforeign;                /* published last (release) */
+
+    /* The owner's children's CPU time net of the emulator's own reaped
+     * helpers (proctab_ctime_republish), for another process reading its
+     * /proc/<pid>/stat cutime/cstime: the host's fields include what the
+     * broker spawn's middle child cost, which only the owner knows. Owner-
+     * written, each word atomic; `ctime_net` says they were ever published,
+     * before which the host's own fields are exact. */
+    s64 cutime_us, cstime_us;
+    u8  ctime_net;
 };
 
 /* Store a process's non-guest host tasks into its entry: tids first, count
@@ -299,9 +308,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v6.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v7.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v6.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v7.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2119,6 +2128,84 @@ static void proctab_close_inherited(void) {
     for (int fd = 3; fd < hi; fd++) close(fd);    /* matches do_execve's walk */
 }
 
+/* ---- what the emulator's own reaped children cost ----------------------
+ * The broker spawn below is a double fork: the middle child forks the daemon
+ * and exits, and this process reaps it. The kernel folds a reaped child's
+ * usage into the parent's RUSAGE_CHILDREN -- its CPU time, its faults, and
+ * as the RSS high-water mark what was a copy of this whole process -- so a
+ * guest that never forked read a child's worth of usage there after its
+ * first shmget: in getrusage, in times(2), in its own /proc/<pid>/stat. The
+ * middle child's usage is recorded here at the reap and taken back out of
+ * every face that reports children's usage (proctab_children_adjust). The
+ * high-water mark is a maximum, which no subtraction undoes: sys_proc.c
+ * keeps its own over the guest's reaped children instead, at the wait calls
+ * that are the only place the kernel folds one in. Per process, exactly as
+ * the kernel's figure is: a fork child starts from nothing
+ * (proctab_fork_child), an exec keeps it. Plain atomics, so a fork under a
+ * sibling's charge inherits no lock. */
+static struct {
+    s64 utime_us, stime_us, minflt, majflt, nswap, inblock, oublock,
+        msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
+} g_helper;
+static int g_helper_any;
+static struct ProcEnt *own_entry(void);          /* the registry half, below */
+static struct ProcEnt *entry_of(s32 pid);
+
+static void helper_charge(const struct rusage *ru) {
+#define HADD(f, v) __atomic_fetch_add(&g_helper.f, (s64)(v), __ATOMIC_RELAXED)
+    HADD(utime_us, (s64)ru->ru_utime.tv_sec * 1000000 + ru->ru_utime.tv_usec);
+    HADD(stime_us, (s64)ru->ru_stime.tv_sec * 1000000 + ru->ru_stime.tv_usec);
+    HADD(minflt, ru->ru_minflt);   HADD(majflt, ru->ru_majflt);
+    HADD(nswap, ru->ru_nswap);     HADD(inblock, ru->ru_inblock);
+    HADD(oublock, ru->ru_oublock); HADD(msgsnd, ru->ru_msgsnd);
+    HADD(msgrcv, ru->ru_msgrcv);   HADD(nsignals, ru->ru_nsignals);
+    HADD(nvcsw, ru->ru_nvcsw);     HADD(nivcsw, ru->ru_nivcsw);
+#undef HADD
+    __atomic_store_n(&g_helper_any, 1, __ATOMIC_RELEASE);
+    proctab_ctime_republish();
+}
+
+int proctab_children_adjust(struct rusage *ru) {
+    if (!__atomic_load_n(&g_helper_any, __ATOMIC_ACQUIRE)) return 0;
+#define HSUB(f) __atomic_load_n(&g_helper.f, __ATOMIC_RELAXED)
+    s64 ut = (s64)ru->ru_utime.tv_sec * 1000000 + ru->ru_utime.tv_usec - HSUB(utime_us);
+    s64 st = (s64)ru->ru_stime.tv_sec * 1000000 + ru->ru_stime.tv_usec - HSUB(stime_us);
+    if (ut < 0) ut = 0;
+    if (st < 0) st = 0;
+    ru->ru_utime.tv_sec = (time_t)(ut / 1000000); ru->ru_utime.tv_usec = (suseconds_t)(ut % 1000000);
+    ru->ru_stime.tv_sec = (time_t)(st / 1000000); ru->ru_stime.tv_usec = (suseconds_t)(st % 1000000);
+#define HTAKE(rf, f) do { s64 v_ = (s64)ru->rf - HSUB(f); ru->rf = v_ < 0 ? 0 : (long)v_; } while (0)
+    HTAKE(ru_minflt, minflt);   HTAKE(ru_majflt, majflt);
+    HTAKE(ru_nswap, nswap);     HTAKE(ru_inblock, inblock);
+    HTAKE(ru_oublock, oublock); HTAKE(ru_msgsnd, msgsnd);
+    HTAKE(ru_msgrcv, msgrcv);   HTAKE(ru_nsignals, nsignals);
+    HTAKE(ru_nvcsw, nvcsw);     HTAKE(ru_nivcsw, nivcsw);
+#undef HTAKE
+#undef HSUB
+    return 1;
+}
+
+void proctab_ctime_republish(void) {
+    if (!__atomic_load_n(&g_helper_any, __ATOMIC_ACQUIRE)) return;
+    struct ProcEnt *e = own_entry();
+    if (!e) return;
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) < 0) return;
+    proctab_children_adjust(&ru);
+    __atomic_store_n(&e->cutime_us, (s64)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->cstime_us, (s64)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->ctime_net, 1, __ATOMIC_RELEASE);
+}
+
+int proctab_ctime_get(s32 pid, s64 *ut_us, s64 *st_us) {
+    if (!g_tab || pid <= 0) return 0;
+    struct ProcEnt *e = entry_of(pid);
+    if (!e || !__atomic_load_n(&e->ctime_net, __ATOMIC_ACQUIRE)) return 0;
+    *ut_us = __atomic_load_n(&e->cutime_us, __ATOMIC_RELAXED);
+    *st_us = __atomic_load_n(&e->cstime_us, __ATOMIC_RELAXED);
+    return 1;
+}
+
 /* Spawn the broker as a detached grandchild (double-fork + setsid: reparented
  * to init, own session, immune to the shell's job-control signals). Idempotent
  * under races — a second daemon's bind() fails and it exits. Parent returns at
@@ -2133,7 +2220,16 @@ static void proctab_spawn_broker(struct sockaddr_un *a, socklen_t al, size_t siz
     emu_fork_check("the System V IPC broker spawn");
     pid_t p = fork();
     if (p < 0) return;
-    if (p > 0) { waitpid(p, NULL, 0); return; }   /* reap the middle child */
+    if (p > 0) {
+        /* Reap the middle child -- through EINTR, or a signal landing here
+         * left it a zombie for the guest's next wait(-1) to collect under a
+         * pid it never forked -- and charge what it cost (helper_charge). */
+        struct rusage ru;
+        pid_t w;
+        do w = wait4(p, NULL, 0, &ru); while (w < 0 && errno == EINTR);
+        if (w == p) helper_charge(&ru);
+        return;
+    }
     /* middle child */
     setsid();
     p = fork();
@@ -2817,7 +2913,13 @@ int proctab_setgroups_write(s32 pid, int deny, int *err) {
 /* Publish our own mode + filter count. Called on every install, and once by a
  * fork child for the chain it inherited (proctab_reserve zeroed the slot, and
  * the parent's concurrent register leaves a reservation's sub-record alone). */
-void proctab_fork_child(void) { g_mem_ent = NULL; }
+void proctab_fork_child(void) {
+    g_mem_ent = NULL;
+    /* A new process has reaped nothing: its RUSAGE_CHILDREN starts at zero,
+     * and so does what is to be taken back out of it. */
+    memset(&g_helper, 0, sizeof g_helper);
+    g_helper_any = 0;
+}
 
 void proctab_mem_publish(const ProcMem *pm) {
     struct ProcEnt *e = g_mem_ent;

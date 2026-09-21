@@ -2844,6 +2844,29 @@ check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_m
 check_fixture reflinkobj $'reopen=1\nmaps<-zero=EXDEV/EXDEV\nmaps<-exe=EXDEV/EXDEV\ncomm<-zero=EXDEV/EXDEV\nmaps<-m1=EXDEV/EXDEV\nm1<-maps=EXDEV/EXDEV\nm1<-zero=EXDEV/EXDEV\nm1<-exe=EXDEV/EXDEV\nreg<-m1=EXDEV/EXDEV\nm1<-reg=EXDEV/EXDEV\nmaps<-maps=EBADF/EBADF\nmaps<-comm=EBADF/EBADF\ncomm<-comm=EBADF/EBADF\nm2ro<-m1=EBADF/EBADF\nm2ap<-m1=EBADF/EBADF\nm1<-m2ap=EBADF/EBADF\ncomm<-maps=EOPNOTSUPP/EOPNOTSUPP\nm1<-m2=EOPNOTSUPP/EOPNOTSUPP\nm1<-m1=EOPNOTSUPP/EOPNOTSUPP\nm1<-(-1)=EBADF/EBADF\nm1<-999=EBADF/EBADF\nmaps<-999=EBADF/EBADF\n999<-m1=EBADF/EBADF\nm1<-hi32(m2)=EOPNOTSUPP\nm1<-badptr=EFAULT\n999<-badptr=EBADF\nseal=0\nsealed<-m2=EOPNOTSUPP/EOPNOTSUPP\nsealed<-exe=EXDEV/EXDEV\ncontent=aaaa\nreopen_rw=1\nreopen_write=EPERM\nreopen_pwrite=EPERM\nreopen_seals=8\ncontent=aaaa\ndone' \
     "A64_MEMFD_FORCE_FILE=1" "memfd-tier"
 
+# RUSAGE_CHILDREN is the guest's own children's (sys_proc.c children_rusage,
+# proctab.c helper_charge): the broker spawn's middle child, which the
+# emulator reaps, used to be folded into it by the kernel -- its CPU time,
+# its faults, the resident set of a copy of the whole emulator -- so a guest
+# that never forked read a child's worth of usage after its first shmget,
+# from getrusage, times(2) and its own /proc/<pid>/stat. Self-checking: every
+# row is a relation a kernel keeps true, and the same program prints the
+# same block natively. The registry-broker spawn of --shared-proc is the same
+# double fork, made before the guest runs at all.
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/helperusage.bin \
+            tests/fixtures/helperusage.c 2>/dev/null; then
+        expect=$'before=1\nafter_shmget=1 times=1 stat=1\nchild: maxrss=1 cpu=1 times_agree=1 stat_agree=1\nfork_child: zero=1 times=1 stat=1 parent_agrees=1\ndone'
+        got=$(timeout -k 5 60 "$EMU" / tests/fixtures/helperusage.bin 2>/dev/null)
+        fixture_verdict "helperusage" "$expect" "$got"
+        got=$(timeout -k 5 60 "$EMU" --shared-proc / tests/fixtures/helperusage.bin 2>/dev/null)
+        fixture_verdict "helperusage (--shared-proc)" "$expect" "$got"
+        fx_rm tests/fixtures/helperusage.bin
+    else
+        skip_build "fixtures/helperusage"
+    fi
+fi
+
 # Record-lock owners as the guest may see them: F_GETLK / F_OFD_GETLK's l_pid
 # and /proc/locks (sys_file.c, sys_procfs.c put_locks). Guest pids are host
 # pids, and both used to hand the guest the host's raw answer, so a lock a

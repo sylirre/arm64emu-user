@@ -457,6 +457,16 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
  * callers that ask (EBADF for a read-only descriptor first, as the kernel
  * checks FMODE_WRITE before anything else). */
 int procfs_fd_synth(struct Machine *m, int fd, int *acc);
+/* The guest's children's usage (sys_proc.c): RUSAGE_CHILDREN as the guest's
+ * own children account for it -- the host's figure less what the emulator's
+ * own reaped helpers charged (proctab.c), and the RSS high-water mark tracked
+ * over the guest's reaped children; the CPU part of that in microseconds
+ * (1 only once a helper was charged, before which the host's fields are
+ * exact); and microseconds to the USER_HZ ticks the stat file counts in. */
+struct rusage;
+void children_rusage(struct rusage *ru);
+int  children_cpu_net(s64 *ut_us, s64 *st_us);
+s64  cpu_us_to_ticks(s64 us);
 /* mmap of a synthesized /proc file: 0, or the errno the kernel's own file
  * answers, in do_mmap's order -- EACCES for a mode the mapping needs and the
  * descriptor lacks (write for a shared writable one, read for any), then

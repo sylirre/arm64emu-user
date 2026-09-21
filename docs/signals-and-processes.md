@@ -1217,6 +1217,29 @@ and the accounting died with the task. `waitid`'s fifth argument is a raw-syscal
 parameter that no libc wrapper exposes (glibc, musl and Bionic all pass `NULL`),
 so the host side of that path uses `syscall(SYS_waitid, ...)` directly.
 
+**`RUSAGE_CHILDREN` is the guest's children's.** The IPC broker is spawned by
+a double fork whose middle child the emulator reaps (`proctab_spawn_broker`),
+and the kernel folds a reaped child's usage into the parent's
+`RUSAGE_CHILDREN` — its CPU time, its faults, and as `ru_maxrss` the resident
+set of what was a copy of the whole emulator — so a guest that never forked
+read a child's worth of usage after its first `shmget`, from `getrusage`,
+`times(2)` and the `cutime`/`cstime` fields of its own `/proc/<pid>/stat`.
+What the middle child cost is recorded at that reap (`helper_charge`) and
+taken back out of every face that reports children's usage
+(`proctab_children_adjust`); the high-water mark, a maximum no subtraction
+undoes, is tracked by the wait calls themselves over the guest's reaped
+children (`children_reaped`, at the one place the kernel folds a child in —
+a zombie reaped without `WNOWAIT`, never a stop, a continue, or a child a
+`SIG_IGN`'d `SIGCHLD` had the kernel discard). Both are per process as the
+kernel's figure is: zeroed in a fork child, kept across exec. Another
+process reading this one's stat file gets the net children's time from the
+registry slot, published at each reap once anything was charged
+(`proctab_ctime_republish`), so an unaffected process costs its reaps nothing
+extra and the host's fields stand exactly (`tests/fixtures/helperusage.c`).
+The reap of the middle child itself now loops on `EINTR`: interrupted, it
+left a zombie for the guest's next `wait(-1)` to collect under a pid the
+guest never forked.
+
 Everyone else — no registry, nobody tracing in the session (`any_trace`), or no
 live tracee of the caller matching the waited id (`ptrace_have_tracee`) — keeps
 the original genuinely **blocking** host `wait4`/`waitid`: the kernel provides

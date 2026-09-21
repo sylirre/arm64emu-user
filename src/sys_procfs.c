@@ -78,7 +78,7 @@ static pthread_mutex_t pf_lock = PTHREAD_MUTEX_INITIALIZER;
 static int put_status(int fd, struct Machine *m, const char *canon, int self,
                       s32 *tid_out);
 static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
-                       const AsMem *mi, int self, const char *canon,
+                       const AsMem *mi, int self, s32 opid, const char *canon,
                        s32 *tid_out);
 static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
                      const AsMem *mi, const char *canon);
@@ -1199,7 +1199,8 @@ int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
         }
         int st = m->pf_fds[i].kind == PF_STATM
                      ? put_statm(fd, m, &pm, mi, path)
-                     : put_pidstat(fd, m, &pm, mi, self, path, NULL);
+                     : put_pidstat(fd, m, &pm, mi, self, self ? 0 : m->pf_fds[i].pid,
+                                   path, NULL);
         if (st < 0) m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
         break;
     }
@@ -1743,8 +1744,21 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
  * real property of the task and stands. `rss` is in pages, the rest in bytes,
  * as the kernel prints them. Returns 0 for a field this does not answer. */
 static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
-                         int self, const char *tok, int f, u64 *out) {
+                         int self, s32 opid, const char *tok, int f, u64 *out) {
     switch (f) {
+    case 16: case 17: {                                       /* cutime, cstime */
+        /* The children's CPU time is the host's figure less what the
+         * emulator's own reaped helpers charged to it (sys_proc.c
+         * children_cpu_net) -- this process's from its own accounting,
+         * another guest's from what that one published (proctab_ctime_get).
+         * Neither has anything to say until a helper was charged, and until
+         * then the host's field is exact. */
+        s64 ut, st;
+        if (self ? !children_cpu_net(&ut, &st) : !proctab_ctime_get(opid, &ut, &st))
+            return 0;
+        *out = (u64)cpu_us_to_ticks(f == 16 ? ut : st);
+        return 1;
+    }
     case 23: *out = pm->size; return 1;                       /* vsize */
     case 24: {                                                /* rss, pages */
         /* A sample taken inside the address space this file describes, where
@@ -1789,7 +1803,7 @@ static int pidstat_field(struct Machine *m, const ProcMem *pm, const AsMem *mi,
  * parentheses, so the split starts at the LAST ')' -- the same rule every
  * reader of this file has to follow. */
 static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
-                       const AsMem *mi, int self, const char *canon,
+                       const AsMem *mi, int self, s32 opid, const char *canon,
                        s32 *tid_out) {
     fdwin_enter();   /* the host file's fd is ours, briefly (machine.h) */
     int hfd = open(canon, O_RDONLY | O_CLOEXEC);
@@ -1813,7 +1827,7 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
     for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
         u64 v;
         if (shorth && f >= 44) break;      /* stand in for a pre-3.3 kernel */
-        if (pidstat_field(m, pm, mi, self, tok, ++f, &v))
+        if (pidstat_field(m, pm, mi, self, opid, tok, ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else
             dprintf(fd, " %s", tok);
@@ -1830,7 +1844,7 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
      * file is opened for is. */
     while (f < 52) {
         u64 v;
-        if (pidstat_field(m, pm, mi, self, "0", ++f, &v))
+        if (pidstat_field(m, pm, mi, self, opid, "0", ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else
             dprintf(fd, " 0");
@@ -2035,7 +2049,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         int fd = synth_memfd();
         if (fd < 0) { *ret = synth_denied(); return 1; }
         int st = is_statm ? put_statm(fd, m, &pm, mi, canon)
-                          : put_pidstat(fd, m, &pm, mi, !szpid, canon, &sttid);
+                          : put_pidstat(fd, m, &pm, mi, !szpid, szpid, canon, &sttid);
         if (st < 0) {
             fdheld_close(fd);
             if (st == -1) return 0;   /* no host file: report that exactly */
