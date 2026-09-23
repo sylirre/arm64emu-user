@@ -839,12 +839,37 @@ SYSDEF(syslog) {
     }
 }
 
+/* personality(2): the calling thread's execution domain -- a task attribute,
+ * so each thread's own (g_tls.personality), inherited by the threads it
+ * creates and by a fork child, kept by an execve less what the exec clears
+ * (do_execve). 0xffffffff only asks; anything else is stored as given and the
+ * old value returned, the kernel's ksys_personality -- except PER_LINUX32,
+ * which arm64_personality refuses on a system with no AArch32 at EL0, and
+ * this one has none: it runs A64 alone.
+ *
+ * What the flags do here is what they do on an arm64 kernel:
+ *   UNAME26             uname's release reads 2.6.<60 + patchlevel> (uname);
+ *   READ_IMPLIES_EXEC   PROT_READ implies PROT_EXEC for mmap, mprotect, shmat
+ *                       and the heap brk grows -- set by the program itself
+ *                       only, since every exec clears it (no noexec mount
+ *                       exists here to be the kernel's exception);
+ *   STICKY_TIMEOUTS     select/pselect6/ppoll leave the caller's timeout
+ *                       alone (and are not restarted across a stop);
+ *   MMAP_PAGE_ZERO      the next exec maps page zero read+exec, where
+ *                       vm.mmap_min_addr allows a mapping there at all;
+ *   ADDR_NO_RANDOMIZE,  nothing to change: this emulator's guest layout is
+ *   ADDR_COMPAT_LAYOUT  never randomized, and places mappings bottom-up;
+ * and a setuid/setgid exec clears the last four of those (PER_CLEAR_ON_SETID).
+ * The value is also what /proc/<pid>/personality and the task/<tid>/
+ * spelling report, for any guest process (sys_procfs.c). This used to be a
+ * single static word: every thread of every process saw one value, nothing
+ * consulted it, and an exec kept whatever was set. */
 SYSDEF(personality) {
-    (void)c; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    static unsigned cur = 0;
-    if ((u32)a0 == 0xffffffff) return cur;
-    unsigned old = cur;
-    cur = (unsigned)a0;
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    u32 want = (u32)a0, old = g_tls.personality;
+    if (want == 0xffffffffu) return old;
+    if ((want & G_PER_MASK) == G_PER_LINUX32) return (u64)(s64)-EINVAL;
+    if (want != old) pers_adopt(c->m, want);
     return old;
 }
 

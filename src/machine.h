@@ -131,6 +131,7 @@ struct Machine {
                                * adopt it; -1 = abandoned, resume unchanged */
     u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
                                * new image inherits (execve preserves it) */
+    u32 dethread_personality; /* ...and its personality, as the exec left it */
 
     /* The guest's main thread called exit(2) while siblings were still
      * running. exit(2) ends only the calling thread, and the kernel keeps such
@@ -311,6 +312,13 @@ struct Machine {
      * One-way latch, fork-inherited with the rest of Machine, kept across
      * execve exactly like the kernel's. */
     u8 no_new_privs;
+
+    /* personality(2) is per thread (g_tls.personality). This is the value a
+     * thread of this process holds unless it or its creator changed it --
+     * the main thread's at the fork or exec that made the process -- which
+     * is what lets every other thread's be published only when it differs
+     * (proctab.c, REQ_PERS). */
+    u32 pers_base;
 
     /* Faked user namespace: a guest that asked for one (clone/unshare with
      * CLONE_NEWUSER) got a plain process, but it now expects to write its id
@@ -731,9 +739,9 @@ void sig_locks_reinit(void);
 void sigact_locks_take(void);    /* sigact_lock — signal.c */
 void sigact_locks_drop(void);
 void sigact_locks_reinit(void);
-void robust_locks_take(void);    /* robust_lock — sys_proc.c */
-void robust_locks_drop(void);
-void robust_locks_reinit(void);
+void thr_locks_take(void);       /* thr_lock — sys_proc.c */
+void thr_locks_drop(void);
+void thr_locks_reinit(void);
 void task_locks_take(void);      /* task_lock — sys_proc.c */
 void task_locks_drop(void);
 void task_locks_reinit(void);
@@ -774,8 +782,9 @@ enum {
     EMU_LK_NL     = 1u << 3,   /* sys_netlink.c  */
     EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
     EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (by rank) */
-    EMU_LK_ROBUST = 1u << 6,   /* sys_proc.c     — the robust-list registry;
-                                * its walk copies guest memory (as_lock) */
+    EMU_LK_THR    = 1u << 6,   /* sys_proc.c     — the guest thread registry
+                                * (robust heads, personalities); the robust
+                                * walk copies guest memory (as_lock) */
     EMU_LK_TASK   = 1u << 7,   /* sys_proc.c     — task_lock: the process-wide
                                 * Machine fields written rarely and read from
                                 * any thread (credentials, rlimits, cwd and
@@ -820,8 +829,8 @@ void emu_fdwin_lock_warn(unsigned taking);
  * them into anything else silently turns the check into noise. */
 _Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
                EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
-               EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_ROBUST &&
-               EMU_LK_ROBUST < EMU_LK_TASK && EMU_LK_TASK < EMU_LK_CASP16 &&
+               EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_THR &&
+               EMU_LK_THR < EMU_LK_TASK && EMU_LK_TASK < EMU_LK_CASP16 &&
                EMU_LK_CASP16 < EMU_LK_AS,
                "EMU_LK_* bits are ranks: keep them in the order "
                "emu_atfork_prepare (main.c) takes the locks");
@@ -1287,6 +1296,18 @@ void proctab_seccomp_set(u8 mode, u32 nfilters);
 void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters); /* pre-fork */
 int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);
 
+/* personality(2) for other processes' /proc (proctab.c, REQ_PERS): the main
+ * thread's value and the base every other thread holds, in the registry; a
+ * thread holding anything else, in the broker. */
+void proctab_pers_main(u32 pers);
+void proctab_pers_seed(int slot, u32 pers);                 /* pre-fork */
+u32  proctab_pers_npub(void);
+void proctab_pers_npub_adj(int delta);
+int  persbroker_put(struct Machine *m, s32 tid, u32 pers);
+void persbroker_del(struct Machine *m, s32 tid);
+void persbroker_clear(struct Machine *m);
+int  proctab_pers_get(struct Machine *m, s32 pid, s32 tid, u32 *out);
+
 /* The owner's non-guest host tasks (proc_foreign_sample), in the registry for
  * the same reason: another process has to strike them out of what the guest
  * sees of this one, and it cannot reach its Machine. Only the owner writes. */
@@ -1409,7 +1430,21 @@ void ipc_fork_child(struct Machine *m);
  * when the group dies at once (exit_group, a fatal signal). */
 void robust_list_exit_self(CPU *c);
 void robust_list_exit_group(CPU *c);
-void robust_fork_child(void);
+/* The guest thread registry (sys_proc.c): every live guest thread of this
+ * process by tid, with its personality. thr_reg_pers answers 0 for a tid it
+ * does not hold. A fork child starts over with its one thread. */
+void thr_reg_add(s32 tid, u32 pers);
+void thr_reg_del(s32 tid);
+void thr_reg_set_pers(s32 tid, u32 pers);
+int  thr_reg_pers(s32 tid, u32 *pers);
+void thr_fork_child(void);
+/* personality(2) (sys_proc.c): the value a process started from the host
+ * begins with; the calling thread taking a new one (registry, host, and
+ * other processes' /proc all told); and a thread taking back what it
+ * published of its own before it goes. */
+u32  pers_initial(void);
+void pers_adopt(struct Machine *m, u32 pers);
+void pers_unpublish_self(struct Machine *m);
 /* vfork (sys_proc.c): a vfork child hands its parent the bytes it wrote and
  * releases it -- at its exec, its exit, its death by a signal. A no-op in any
  * other process. */

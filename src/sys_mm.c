@@ -77,6 +77,16 @@ static u32 prot_g2pte(int prot) {
            ((prot & PROT_EXEC) ? PTE_X : 0);
 }
 
+/* personality(READ_IMPLIES_EXEC): a mapping that may be read may be executed,
+ * for mmap and mprotect alike (do_mmap, do_mprotect_pkey) and for the heap
+ * brk grows (VM_DATA_DEFAULT_FLAGS). The calling thread's own flag, as the
+ * kernel reads current's. The one exception a kernel makes -- a file on a
+ * noexec mount -- has no counterpart here, where no mount is noexec. */
+static u32 prot_rie(int prot) {
+    return ((prot & PROT_READ) && (g_tls.personality & G_READ_IMPLIES_EXEC))
+               ? PTE_X : 0;
+}
+
 /* brk/mmap/mremap/mincore are compound: they read the region list
  * (as_find_region/as_find_free) and then map/unmap, so the whole body runs
  * under as_lock — the lookup stays valid against a concurrent thread's
@@ -166,7 +176,8 @@ static u64 brk_locked(CPU *c, u64 a0) {
          * above (which is the one brk(2) has always had) and this one inside
          * do_brk_flags -- and they are not the same test. */
         if (!data_fits(c->m, new_end - old_end)) return as->brk;
-        if (guest_map_anon(as, old_end, new_end - old_end, PTE_R | PTE_W) < 0)
+        if (guest_map_anon(as, old_end, new_end - old_end,
+                           PTE_R | PTE_W | prot_rie(PROT_READ)) < 0)
             return as->brk;
     } else if (new_end < old_end) {
         guest_unmap(as, new_end, old_end - new_end);
@@ -200,7 +211,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
      * two range checks below subtract from the top instead of adding to the
      * base -- an addr + len that wraps compares as though it fit. */
     if (len > GUEST_TASK_SIZE) return (u64)(s64)-ENOMEM;
-    u32 pte = prot_g2pte(prot);
+    u32 pte = prot_g2pte(prot) | prot_rie(prot);
 
     if (flags & (G_MAP_FIXED | G_MAP_FIXED_NOREPLACE)) {
         if (addr & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
@@ -455,7 +466,8 @@ SYSDEF(mprotect) {
     if (!a1) return 0;
     u64 len = PG_UP(a1);
     if (!len) return (u64)(s64)-ENOMEM;
-    int r = guest_protect(&c->m->as, a0, len, prot_g2pte((int)a2));
+    int r = guest_protect(&c->m->as, a0, len,
+                          prot_g2pte((int)a2) | prot_rie((int)a2));
     return r < 0 ? (u64)(s64)r : 0;
 }
 

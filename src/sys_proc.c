@@ -4,6 +4,7 @@
  * fork() (the interpreter state is inherited by copy), execve reloads the
  * guest image in-process, wait/kill/pgid pass through. Threads (CLONE_VM)
  * arrive in M6. */
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -351,36 +352,143 @@ SYSDEF(set_tid_address) {
 #define G_FUTEX_OWNER_DIED 0x40000000u
 #define G_FUTEX_TID_MASK   0x3fffffffu
 
-/* Every live thread's head, for the group walk. */
-static pthread_mutex_t robust_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { s32 tid; u64 head; } *robust_tab;
-static int robust_n, robust_cap;
+/* ---- the guest thread registry ---------------------------------------------
+ *
+ * Every live guest thread of this process, by tid, with what other threads
+ * have to be able to read of it: its robust-list head (walked for it when the
+ * whole group dies, below) and its personality (another thread's
+ * /proc/<pid>/task/<tid>/personality, sys_procfs.c). It is also the list of
+ * threads execve's de_thread calls out. A thread enters at its start
+ * (thread_entry; main() for the first) and leaves at its exit -- a main
+ * thread parked after its own exit(2) stays, as the kernel's zombie leader
+ * stays a task -- and a fork child keeps only itself. */
+static pthread_mutex_t thr_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ThrEnt { s32 tid; u32 pers; u64 head; } *thr_tab;
+static int thr_n, thr_cap;
 
-void robust_locks_take(void)   { pthread_mutex_lock(&robust_lock); }
-void robust_locks_drop(void)   { pthread_mutex_unlock(&robust_lock); }
-void robust_locks_reinit(void) { pthread_mutex_init(&robust_lock, NULL); }
+void thr_locks_take(void)   { pthread_mutex_lock(&thr_lock); }
+void thr_locks_drop(void)   { pthread_mutex_unlock(&thr_lock); }
+void thr_locks_reinit(void) { pthread_mutex_init(&thr_lock, NULL); }
+
+/* The entry for `tid`, made if there is none. Caller holds thr_lock. */
+static struct ThrEnt *thr_ent(s32 tid) {
+    for (int i = 0; i < thr_n; i++) if (thr_tab[i].tid == tid) return &thr_tab[i];
+    if (thr_n == thr_cap) {
+        int nc = thr_cap ? thr_cap * 2 : 16;
+        void *nb = realloc(thr_tab, (size_t)nc * sizeof *thr_tab);
+        if (!nb) { perror("arm64chroot: realloc"); exit(127); }
+        thr_tab = nb;
+        thr_cap = nc;
+    }
+    struct ThrEnt *e = &thr_tab[thr_n++];
+    e->tid = tid; e->pers = 0; e->head = 0;
+    return e;
+}
+
+void thr_reg_add(s32 tid, u32 pers) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    struct ThrEnt *e = thr_ent(tid);
+    e->pers = pers;
+    e->head = 0;
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+}
+
+void thr_reg_del(s32 tid) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    for (int i = 0; i < thr_n; i++)
+        if (thr_tab[i].tid == tid) { thr_tab[i] = thr_tab[--thr_n]; break; }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+}
+
+void thr_reg_set_pers(s32 tid, u32 pers) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    thr_ent(tid)->pers = pers;
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+}
+
+int thr_reg_pers(s32 tid, u32 *pers) {
+    int found = 0;
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    for (int i = 0; i < thr_n; i++)
+        if (thr_tab[i].tid == tid) { *pers = thr_tab[i].pers; found = 1; break; }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+    return found;
+}
 
 static void robust_tab_set(s32 tid, u64 head) {
-    EMU_LOCK(&robust_lock, EMU_LK_ROBUST);
-    int i;
-    for (i = 0; i < robust_n; i++) if (robust_tab[i].tid == tid) break;
-    if (!head) {
-        if (i < robust_n) robust_tab[i] = robust_tab[--robust_n];
-    } else {
-        if (i == robust_n) {
-            if (robust_n == robust_cap) {
-                int nc = robust_cap ? robust_cap * 2 : 16;
-                void *nb = realloc(robust_tab, (size_t)nc * sizeof *robust_tab);
-                if (!nb) { perror("arm64chroot: realloc"); exit(127); }
-                robust_tab = nb;
-                robust_cap = nc;
-            }
-            robust_n++;
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    thr_ent(tid)->head = head;
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+}
+
+/* ---- personality(2) ----------------------------------------------------------
+ *
+ * A thread's own value is g_tls.personality (sys_personality, sys_misc.c,
+ * says what each flag does here); the registry above holds a copy for the
+ * process's other threads, and proctab.c publishes it for other processes'
+ * /proc: the main thread's in the registry slot, any other thread's in the
+ * broker while it differs from the process's base (m->pers_base).
+ *
+ * One flag also changes what the HOST kernel does for us. STICKY_TIMEOUTS
+ * makes select/pselect/ppoll leave the caller's timeout alone, and -- since a
+ * timeout that was not updated cannot be restarted -- turns the restart a
+ * stop and continue would have given the call into EINTR (poll_select_finish).
+ * The time left is written back here, not by the host, but the stop and the
+ * continue happen to the host thread, in the host call: so the bit is carried
+ * on the host thread's own personality, where the host kernel acts on it.
+ * Nothing else of the value is: READ_IMPLIES_EXEC there would make every
+ * PROT_READ mapping of the emulator's executable (an SELinux execmem denial on
+ * Android), and the rest either says nothing to a process that never execs on
+ * the host or would change what the host's uname tells us. */
+static void pers_host_sticky(u32 pers) {
+    long cur = syscall(SYS_personality, 0xffffffffUL);
+    if (cur == -1) return;   /* refused (a seccomp filter): the guest keeps its
+                              * timeouts all the same, via the write-back */
+    u32 want = ((u32)cur & ~G_STICKY_TIMEOUTS) | (pers & G_STICKY_TIMEOUTS);
+    if (want != (u32)cur) syscall(SYS_personality, (unsigned long)want);
+}
+
+/* The personality a process started from the host begins with: the host
+ * process's own, as a kernel's execve keeps its caller's -- except for the
+ * one type an AArch64 system without AArch32 at EL0 can never hold (its
+ * personality() refuses PER_LINUX32), which a `linux32` wrapper around the
+ * emulator would otherwise hand the guest. What the exec itself clears it
+ * then clears (do_execve). */
+u32 pers_initial(void) {
+    long hp = syscall(SYS_personality, 0xffffffffUL);
+    u32 pers = hp == -1 ? 0 : (u32)hp;
+    if ((pers & G_PER_MASK) == G_PER_LINUX32) pers &= ~G_PER_MASK;
+    return pers;
+}
+
+/* A thread other than the main one publishes its own value while it differs
+ * from the process's base, and takes it back when it no longer does. */
+static void pers_publish(struct Machine *m, u32 pers) {
+    if (pers != m->pers_base) {
+        if (persbroker_put(m, g_tls.tid, pers) == 0) {
+            if (!g_tls.pers_pub) { g_tls.pers_pub = 1; proctab_pers_npub_adj(1); }
+            return;
         }
-        robust_tab[i].tid = tid;
-        robust_tab[i].head = head;
+        /* The broker could not be told; an older value it holds is wrong
+         * now, so take it back too -- the base is the nearer answer. */
     }
-    EMU_UNLOCK(&robust_lock, EMU_LK_ROBUST);
+    pers_unpublish_self(m);
+}
+
+void pers_unpublish_self(struct Machine *m) {
+    if (!g_tls.pers_pub) return;
+    g_tls.pers_pub = 0;
+    proctab_pers_npub_adj(-1);   /* first: a reader never misses a live one */
+    persbroker_del(m, g_tls.tid);
+}
+
+/* The calling thread's personality is now `pers`, wherever it is read. */
+void pers_adopt(struct Machine *m, u32 pers) {
+    g_tls.personality = pers;
+    thr_reg_set_pers(g_tls.tid, pers);
+    pers_host_sticky(pers);
+    if (g_tls.tid == (s32)getpid()) proctab_pers_main(pers);
+    else pers_publish(m, pers);
 }
 
 /* handle_futex_death. 0 to go on, -1 on a fault (the walk ends). */
@@ -441,18 +549,21 @@ void robust_list_exit_self(CPU *c) {
 
 /* Every thread's list, when the whole group dies at once. */
 void robust_list_exit_group(CPU *c) {
-    EMU_LOCK(&robust_lock, EMU_LK_ROBUST);
-    for (int i = 0; i < robust_n; i++)
-        robust_list_walk(c, robust_tab[i].tid, robust_tab[i].head);
-    robust_n = 0;
-    EMU_UNLOCK(&robust_lock, EMU_LK_ROBUST);
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    for (int i = 0; i < thr_n; i++) {
+        u64 head = thr_tab[i].head;
+        thr_tab[i].head = 0;
+        robust_list_walk(c, thr_tab[i].tid, head);
+    }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
     g_tls.robust_head = 0;
 }
 
 /* A fork child has one thread and inherits its registration alone. */
-void robust_fork_child(void) {
-    pthread_mutex_init(&robust_lock, NULL);
-    robust_n = 0;
+void thr_fork_child(void) {
+    pthread_mutex_init(&thr_lock, NULL);
+    thr_n = 0;
+    thr_reg_add(g_tls.tid, g_tls.personality);
     if (g_tls.robust_head) robust_tab_set(g_tls.tid, g_tls.robust_head);
 }
 
@@ -477,6 +588,23 @@ SYSDEF(get_robust_list) {
     return 0;
 }
 
+/* personality(UNAME26), the kernel's override_release: a release the
+ * programs that cannot parse "3.0" and later can -- 2.6.<60 + patchlevel>,
+ * followed by whatever of the real release string is past its first three
+ * dotted numbers (for this one, the "-arm64chroot" suffix). */
+static void uname26_release(char *rel, size_t cap) {
+    const char *rest = GUEST_KREL;
+    int ndots = 0;
+    while (*rest) {
+        if (*rest == '.' && ++ndots >= 3) break;
+        if (!isdigit((unsigned char)*rest) && *rest != '.') break;
+        rest++;
+    }
+    const char *dot = strchr(GUEST_KREL, '.');
+    unsigned patchlevel = dot ? (unsigned)strtoul(dot + 1, NULL, 10) : 0;
+    snprintf(rel, cap, "2.6.%u%s", patchlevel + 60, rest);
+}
+
 SYSDEF(uname) {
     GUtsname g;
     memset(&g, 0, sizeof g);
@@ -486,7 +614,8 @@ SYSDEF(uname) {
     snprintf(g.nodename, sizeof g.nodename, "%s", h.nodename);
     /* Report a fixed modern kernel: glibc refuses to run below its minimum
      * supported version, and the host kernel version is meaningless here. */
-    snprintf(g.release, sizeof g.release, GUEST_KREL);
+    if (g_tls.personality & G_UNAME26) uname26_release(g.release, sizeof g.release);
+    else snprintf(g.release, sizeof g.release, GUEST_KREL);
     snprintf(g.version, sizeof g.version, GUEST_KVER);
     snprintf(g.machine, sizeof g.machine, "aarch64");
     /* The NIS domain name is the host's, as the node name is; a kernel that
@@ -602,6 +731,7 @@ typedef struct {
     struct Machine *m;
     u64 flags, ptid, ctid, tls;
     u64 sigmask;              /* creator's blocked set, inherited (POSIX) */
+    u32 pers;                 /* creator's personality, inherited likewise */
     /* The creator's call-out counters, not the Machine's current ones: if the
      * creator was already out of date -- an execve called it out while it sat
      * in clone() -- then so is this thread, and it must stop at its first
@@ -649,6 +779,9 @@ static void *thread_entry(void *arg) {
     g_tls.image_gen = t->image_gen;
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
+    g_tls.personality = t->pers;
+    g_tls.pers_pub = 0;
+    thr_reg_add(tid, t->pers);
     g_tls.sig_altstack_flags = 2 /*SS_DISABLE*/;   /* sas_ss_reset: a CLONE_VM
                                                     * child starts with none */
     CPU *c = &t->cpu;
@@ -674,6 +807,9 @@ static void *thread_entry(void *arg) {
      * in the initial attach stop only after it, so the creator's clone() is
      * not blocked on the tracer resuming us. */
     ptrace_thread_child_claim(t->pt_tracer, t->pt_options, t->pt_seize);
+    /* A personality its creator changed from the process's base is published
+     * for other processes' /proc before clone() returns the tid to anyone. */
+    if (t->pers != c->m->pers_base) pers_adopt(c->m, t->pers);
     /* Publish the real host tid -- it becomes the guest tid the parked
      * clone() returns. The handshake word lives on the creator's stack, which
      * is guaranteed alive (it is blocked on this word) and never touched by
@@ -699,8 +835,10 @@ static void *thread_entry(void *arg) {
      * joiner has not been woken yet, so it cannot have freed the stack that
      * word lives in. */
     struct Machine *m = t->m;
+    pers_unpublish_self(m);     /* what it published of its personality */
     robust_list_exit_self(c);   /* its robust futexes, before the tid clear */
     as_thread_exit(&m->as);
+    thr_reg_del(g_tls.tid);
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     /* Last thread of a group whose main thread has already parked: nobody else
      * is left to tear the process down or carry its status out. The count can
@@ -892,6 +1030,7 @@ SYSDEF(clone) {
         t->ctid = ctid;
         t->tls = tls;
         t->sigmask = g_tls.sigmask;
+        t->pers = g_tls.personality;
         t->stop_gen = g_tls.stop_gen;
         t->image_gen = g_tls.image_gen;
         /* ptrace thread-follow: a CLONE_THREAD clone is a PTRACE_EVENT_CLONE
@@ -1004,6 +1143,9 @@ SYSDEF(clone) {
         ProcMem pm;
         if (proctab_mem_get((s32)getpid(), &pm)) proctab_mem_seed(rsv, &pm);
     }
+    /* ...and so is the forking thread's personality, which becomes the
+     * child's main thread's and its base. */
+    proctab_pers_seed(rsv, g_tls.personality);
 
     /* vfork's exchange page, before there are two of us to share it. */
     struct VforkBox *box = NULL;
@@ -1084,7 +1226,12 @@ SYSDEF(clone) {
         }
         ptimers_fork_clear();             /* POSIX timers are not inherited */
         sig_fork_child();                 /* nor is the pending-signal set */
-        robust_fork_child();              /* one thread's robust list, its own */
+        /* The forking thread is the child's main thread: its personality is
+         * the child's base, and nothing of it is in the broker (seeded into
+         * the slot by the parent, above). */
+        m->pers_base = g_tls.personality;
+        g_tls.pers_pub = 0;
+        thr_fork_child();                 /* the thread registry: this thread */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
         ipc_fork_child(m);                /* close stray parked-IPC sockets;
                                            * a fresh pid holds no SEM_UNDO */
@@ -1729,6 +1876,8 @@ static void dethread_join(CPU *c) {
          * replaced, and the joiner it was meant for is dying too. */
         if (ptrace_self_active()) ptrace_report_exit(c, 0);
         g_tls.clear_child_tid = 0;
+        g_tls.pers_pub = 0;   /* the exec took back every personality the old
+                               * image's threads published (do_execve) */
         c->stop = true;
         return;
     }
@@ -1774,6 +1923,11 @@ static void dethread_join(CPU *c) {
     g_tls.sc_ret_eintr = 0;
     g_tls.sigmask = m->dethread_sigmask;
     sig_sync_host_mask(m);   /* the exec'ing thread's mask is the new image's */
+    /* ...and so is its personality, as the exec left it. */
+    g_tls.pers_pub = 0;
+    thr_reg_set_pers(g_tls.tid, m->dethread_personality);
+    g_tls.personality = m->dethread_personality;
+    pers_host_sticky(g_tls.personality);
     g_tls.image_gen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);
     g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
     __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
@@ -1803,6 +1957,8 @@ void guest_stop_point(CPU *c) {
          * that never hears of it polls a stale link forever. */
         if (ptrace_self_active()) ptrace_report_exit(c, 0);
         g_tls.clear_child_tid = 0;
+        g_tls.pers_pub = 0;   /* the exec took back every personality the old
+                               * image's threads published (do_execve) */
         c->stop = true;
         return;
     }
@@ -2238,6 +2394,25 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     }
 
     /* Point of no return: tear down and reload. */
+    /* The personality the new image runs with: the exec'ing thread's, less
+     * what a setuid/setgid exec takes away (begin_new_exec's per_clear, on
+     * exactly the bits bprm_fill_uid judged above, whether or not the ids
+     * change) and less READ_IMPLIES_EXEC, which AArch64's SET_PERSONALITY
+     * clears for every 64-bit image -- and which no 64-bit ELF sets again
+     * (elf_read_implies_exec is 0 there). Whatever the old image's threads
+     * published of theirs goes with them; the registration in load_elf
+     * publishes this one as the new image's main thread and base. */
+    {
+        u32 np = g_tls.personality;
+        if (setid_uid || setid_gid) np &= ~G_PER_CLEAR_ON_SETID;
+        np &= ~G_READ_IMPLIES_EXEC;
+        if (proctab_pers_npub()) persbroker_clear(m);
+        g_tls.pers_pub = 0;
+        g_tls.personality = np;
+        thr_reg_set_pers(g_tls.tid, np);
+        m->pers_base = np;
+        m->dethread_personality = np;   /* for the main thread, if it is not us */
+    }
     robust_list_exit_self(c);   /* exec_mm_release: this thread's robust futexes */
     vfork_child_flush(c);       /* ...and a vfork child's writes to its parent,
                                  * released here as exec_mmap releases it */

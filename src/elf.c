@@ -16,6 +16,7 @@
 
 #include "machine.h"
 #include "guest_abi.h"
+#include "sys.h"          /* mmap_min_addr */
 
 #define STACK_TOP   0x7ffffff000ULL
 /* The kernel's own _STK_LIM: the 8 MB reference stack its argument budget is
@@ -657,6 +658,14 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
      * {cmdline,environ,auxv,exe,cwd} see the guest view (and this process counts
      * as a guest PID for the hidden /proc view). Covers the initial exec and
      * every execve reload. */
+    /* personality(MMAP_PAGE_ZERO): SVr4's page zero, read-only and
+     * executable, under the new image -- load_elf_binary maps it with an
+     * ordinary MAP_FIXED vm_mmap and ignores the answer, so it is there only
+     * where a fixed mapping at 0 would be allowed at all: vm.mmap_min_addr at
+     * 0 (mmap's own rule, sys_mm.c), which no stock kernel ships. The flag
+     * survives only a plain exec; a setuid one has already cleared it. */
+    if ((g_tls.personality & G_MMAP_PAGE_ZERO) && mmap_min_addr() == 0)
+        guest_map_anon(&m->as, 0, GUEST_PAGE_SIZE, PTE_R | PTE_X);
     char cwd[PATH_MAX];
     cwd_get(m, cwd);   /* one thread by now (de_thread), but the copy is the rule */
     proctab_register((s32)getpid(), m->cmdline, m->cmdline_len,

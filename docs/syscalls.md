@@ -1953,6 +1953,51 @@ where it recognised `"/memfd:…"`, and build its sealed snapshot from another
 one — with the seals in the registry, since the host will not refuse a write to
 a plain file.
 
+## `personality(2)`
+
+A thread's execution domain is a **task attribute**, so each guest thread has
+its own (`g_tls.personality`): a thread it creates and a process it forks start
+from the creator's, and an `execve` keeps it — whichever thread calls it, since
+de_thread lands the exec'ing thread's on the main thread — less
+`READ_IMPLIES_EXEC`, which AArch64's `SET_PERSONALITY` clears for every 64-bit
+image, and less `PER_CLEAR_ON_SETID` after a setuid/setgid exec (the bits
+`bprm_fill_uid` judges, whether or not the ids change). The first program
+starts from the host process's own value, as a kernel's exec keeps its
+caller's. `0xffffffff` only asks; anything else is stored as given, except
+`PER_LINUX32` in the type byte, which `arm64_personality` refuses with `EINVAL`
+on a system with no AArch32 at EL0 — and this one runs A64 alone.
+
+| flag | what it does here |
+|---|---|
+| `UNAME26` | `uname`'s release reads `2.6.61-arm64chroot` (`override_release`: `2.6.<60 + patchlevel>` and the rest of the real string) |
+| `READ_IMPLIES_EXEC` | a readable mapping is executable: `mmap`, `mprotect`, the heap `brk` grows (`VM_DATA_DEFAULT_FLAGS`), `shmat`. There is no noexec mount here to be the kernel's exception |
+| `STICKY_TIMEOUTS` | `ppoll`/`pselect6` leave the caller's timeout as given, and a stop and continue during the wait is `EINTR` rather than a restart (`poll_select_finish`). The write-back is the emulator's; the restart is the host kernel's to refuse, so this one bit is carried on the host thread's own personality — none of the rest could be: `READ_IMPLIES_EXEC` there would make the emulator's own mappings executable, which Android's SELinux denies |
+| `MMAP_PAGE_ZERO` | the next exec maps page zero read+exec, where `vm.mmap_min_addr` allows a mapping there at all (it never does on a stock kernel) |
+| `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` | nothing to change: the guest layout is never randomized, and mappings are placed bottom-up |
+
+`/proc/<pid>/personality` — and `/proc/self/`, `/proc/thread-self/` and
+`task/<tid>/`, each naming its own task — is synthesized (`sys_procfs.c`, refreshed on a rewind like `status`):
+the host file holds the emulator's value, not the guest's. This process's
+threads are answered from the **thread registry** (`sys_proc.c`, every live
+guest thread by tid, which also holds the robust-list heads). Another process's
+main thread is answered from its registry slot, and so is the value each of its
+other threads holds by default — its base, the main thread's at the fork or exec
+that made the process. A thread that comes to hold anything else, because it
+called `personality()` or was created by one that had, publishes its value in
+the IPC broker (`REQ_PERS`, unbounded, validated against the start times of
+the process and the thread), and the slot counts how many do, so a reader of a
+process that has none asks nobody. Reading the file takes
+`PTRACE_MODE_ATTACH` rights over the task, which yama's `ptrace_scope`
+restricts to a descendant: the host's own copy of the file is read first, and
+a refusal there is left for the guest to meet on the host file.
+
+This used to be one static word shared by every thread of a process, consulted
+by nothing and kept whole across `execve`
+(`tests/c/personality.c` against the oracle for the per-thread, inheritance,
+exec, `/proc` and `STICKY_TIMEOUTS` rows; `tests/fixtures/personality.c` for the
+rest, which qemu-user hands to its host kernel and does not apply to the
+guest).
+
 ## `execve`
 
 `do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, checks that

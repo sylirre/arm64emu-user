@@ -49,6 +49,14 @@ typedef struct {
      * multithreading -- each Go M registers its own gsignal stack, so a shared
      * field routes one thread's signal frame onto another thread's stack. */
     u64 sig_altstack_sp, sig_altstack_size;
+    /* personality(2): a task attribute, so a thread's own. Inherited by a
+     * clone from its creator and by a fork child from the forking thread,
+     * kept across execve less what the exec clears (sys_personality). */
+    u32 personality;
+    u8  pers_pub;             /* this thread's value is published in the
+                               * broker for other processes' /proc views --
+                               * it differs from its process's base value
+                               * (proctab.c, "personality") */
     u32 sig_altstack_flags;   /* the kernel's sas_ss_flags: the ss_flags word
                                * as sigaltstack was given it (SS_AUTODISARM,
                                * or a SS_ONSTACK/SS_DISABLE the caller passed),

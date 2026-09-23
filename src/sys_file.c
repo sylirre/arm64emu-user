@@ -4052,6 +4052,12 @@ static void pwait_tmo_arm(PwaitTmo *t, u64 va, const struct timespec *ts) {
 
 static u64 pwait_tmo_finish(CPU *c, const PwaitTmo *t, u64 ret) {
     if (!t->va) return ret;
+    /* personality(STICKY_TIMEOUTS): the caller's timeout is left as it was
+     * given -- poll_select_finish's first test, ahead of the zero-timeout one.
+     * The stopwatch keeps running, as for a write-back that failed. (The other
+     * half of the flag, no restart across a stop, is the host kernel's to
+     * apply: the bit rides on the host thread's personality, sys_proc.c.) */
+    if (g_tls.personality & G_STICKY_TIMEOUTS) return ret;
     int e = errno;
     u64 now = mono_ns();
     u64 rem = t->deadline > now ? t->deadline - now : 0;

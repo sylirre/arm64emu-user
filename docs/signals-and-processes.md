@@ -723,8 +723,8 @@ lock hierarchy, and `emu_atfork_prepare` in `main.c` is the one place it is
 written down:
 
 ```
-jit stats → pf_lock → est_lock → nl_lock → sfd_lock → sigact_lock → robust_lock → task_lock → casp16 → as_lock
-outermost                                                                                             innermost
+jit stats → pf_lock → est_lock → nl_lock → sfd_lock → sigact_lock → thr_lock → task_lock → casp16 → as_lock
+outermost                                                                                          innermost
 ```
 
 `as_lock` is innermost because **any** critical section that touches guest memory
@@ -735,9 +735,10 @@ the address-space generation, which invalidates that thread's D-TLB and
 *guarantees* the miss. `casp16` sits just above it (a CASP retry can miss the
 D-TLB), `pf_lock` above `est_lock` (the refresh path already holds `pf_lock`),
 and `sigact_lock` under `sfd_lock` (a leftover of the signalfd table once
-re-mirroring dispositions under it; the order is kept); `robust_lock` (the
-robust-futex list registry,
-`sys_proc.c`) sits above `as_lock` because walking a list copies guest memory;
+re-mirroring dispositions under it; the order is kept); `thr_lock` (the guest
+thread registry, `sys_proc.c`: every live thread's robust-futex list head and
+personality) sits above `as_lock` because walking a robust list copies guest
+memory;
 `task_lock` (`sys_proc.c`: the process-wide `Machine` fields written rarely and
 read from any thread — credentials, resource limits, the published cwd and the
 chroot root, the seccomp chain) nests nothing inside it, so it sits just above

@@ -60,8 +60,12 @@ SYSDEF(shmat) {
 
     u64 len = (size + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK;
     if (len == 0) len = GUEST_PAGE_SIZE;
+    /* Executable with SHM_EXEC, and also under personality(READ_IMPLIES_EXEC):
+     * do_shmat maps the segment through do_mmap, which applies that to its
+     * always-readable prot. */
     u32 pte = PTE_R | (readonly ? 0 : PTE_W) |
-              ((shmflg & G_SHM_EXEC) ? PTE_X : 0);
+              (((shmflg & G_SHM_EXEC) ||
+                (g_tls.personality & G_READ_IMPLIES_EXEC)) ? PTE_X : 0);
 
     AddrSpace *as = &c->m->as;
     as_lock();

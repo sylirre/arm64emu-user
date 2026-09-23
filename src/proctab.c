@@ -127,6 +127,17 @@ struct ProcEnt {
      * before which the host's own fields are exact. */
     s64 cutime_us, cstime_us;
     u8  ctime_net;
+
+    /* personality(2) of the owner's threads, for another process reading
+     * /proc/<pid>/personality or /proc/<pid>/task/<tid>/personality
+     * (sys_procfs.c). pers_main is the main thread's own. pers_base is what
+     * every other thread holds unless the broker holds a value for it
+     * (REQ_PERS): one that called personality() for itself, or that such a
+     * thread created -- and pers_npub counts those, so a reader of a process
+     * that has none asks nobody. Owner-written, each word atomic like
+     * `seccomp`; seeded into a fork child's reservation by its parent, and
+     * rewritten by the owner's own registration at every execve. */
+    u32 pers_main, pers_base, pers_npub;
 };
 
 /* Store a process's non-guest host tasks into its entry: tids first, count
@@ -235,13 +246,14 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v7 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v8 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
      * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
      * faked user namespace's id maps; v5 the owner's seccomp state; v6 its
      * non-guest host tasks; v7 holds the id maps as extents, all 340 of the
-     * kernel's ceiling, where v6 held 256 bytes of their text.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v7.%u.%08x",
+     * kernel's ceiling, where v6 held 256 bytes of their text; v8 the owner's
+     * personality.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v8.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -308,9 +320,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v7.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v8.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v7.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v8.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -476,13 +488,18 @@ enum {                        /* BReq.op */
     REQ_MFDSEAL,              /* mtype/size = dev/ino, val = mask to add */
     REQ_MFDMAP,               /* mtype/size = dev/ino, val = +1/-1 writable
                                * MAP_SHARED mappings held by q->pid */
-    REQ_MFDMODE               /* the guest-set mode of a memfd whose host
+    REQ_MFDMODE,              /* the guest-set mode of a memfd whose host
                                * refuses to hold one (Android). arg = 0: read
                                * it (mtype/size = dev/ino) -> ret = mode, or
                                * -ENOENT when none was ever set. arg = 1: set
                                * it (fd rides SCM_RIGHTS so an entry can be
                                * made for a native memfd that had none),
                                * val = mode */
+    REQ_PERS                  /* a thread's personality, for another process's
+                               * /proc (see "personality" below). arg = PERS_*;
+                               * id = the tid; val = the value (PUT); key = the
+                               * target pid (GET, which answers ret = 0 with the
+                               * value in resp.size, or -ENOENT) */
 };
 
 struct BReq {
@@ -1000,6 +1017,94 @@ static s32 shm_do_ctl(struct BReq *q, struct BResp *r) {
         s->key = 0;                  /* unfindable by key henceforth */
         s->rmid = 1;
         if (s->nattch == 0) shm_free(s);
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+/* --- personality (REQ_PERS) -------------------------------------------------
+ * A thread's personality is a task attribute, and /proc/<pid>/task/<tid>/
+ * personality reads it for any thread of any process. The main thread's lives
+ * in its process's registry slot, and so does the value every other thread
+ * holds by default (pers_base, the process's own at its fork or exec); a
+ * thread that comes to hold another -- it called personality() itself, or
+ * one that had created it -- has it kept HERE, unboundedly, for as long as it
+ * differs. Each thread publishes only itself. An entry carries the start
+ * times of its process and of its thread, and is only an answer while both
+ * still match: an owner that dies without taking its entries back (SIGKILL),
+ * a thread that exits without, a tid the kernel hands out again -- none can
+ * make a stale value a live one. */
+enum { PERS_GET = 0, PERS_PUT, PERS_DEL, PERS_CLEAR };
+#define PERS_MAX 65536        /* entries daemon-wide: a bound, not a budget */
+
+struct PersEnt { s32 pid, tid; u64 pstart, tstart; u32 pers; };
+static struct PersEnt *g_pers;
+static int g_pers_n, g_pers_cap;
+
+static u64 task_starttime(s32 pid, s32 tid) {
+    char path[80];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, tid);
+    return starttime_read(path);
+}
+
+static int pers_find(s32 pid, s32 tid) {
+    for (int i = 0; i < g_pers_n; i++)
+        if (g_pers[i].pid == pid && g_pers[i].tid == tid) return i;
+    return -1;
+}
+
+static int pers_live(const struct PersEnt *p) {
+    return proc_starttime(p->pid) == p->pstart &&
+           task_starttime(p->pid, p->tid) == p->tstart;
+}
+
+/* Drop the entries whose thread is gone. Also the idle check's anchor: an
+ * entry left means its owner is alive and may be read. */
+static int pers_any_live(void) {
+    for (int i = 0; i < g_pers_n; )
+        if (!pers_live(&g_pers[i])) g_pers[i] = g_pers[--g_pers_n];
+        else i++;
+    return g_pers_n > 0;
+}
+
+static s32 pers_do(struct BReq *q, struct BResp *r) {
+    int i;
+    switch (q->arg) {
+    case PERS_GET:
+        i = pers_find(q->key, q->id);
+        if (i < 0) return -ENOENT;
+        if (!pers_live(&g_pers[i])) { g_pers[i] = g_pers[--g_pers_n]; return -ENOENT; }
+        r->size = g_pers[i].pers;
+        return 0;
+    case PERS_PUT: {
+        if (q->pid <= 0 || q->id <= 0) return -EINVAL;
+        u64 ps = proc_starttime(q->pid), ts = task_starttime(q->pid, q->id);
+        if (!ps || !ts) return -ESRCH;
+        i = pers_find(q->pid, q->id);
+        if (i < 0) {
+            if (g_pers_n == PERS_MAX) pers_any_live();
+            if (g_pers_n == PERS_MAX) return -ENOSPC;
+            if (g_pers_n == g_pers_cap) {
+                int nc = g_pers_cap ? g_pers_cap * 2 : 64;
+                void *nb = realloc(g_pers, (size_t)nc * sizeof *g_pers);
+                if (!nb) return -ENOMEM;
+                g_pers = nb;
+                g_pers_cap = nc;
+            }
+            i = g_pers_n++;
+        }
+        g_pers[i] = (struct PersEnt){ q->pid, q->id, ps, ts, (u32)q->val };
+        return 0;
+    }
+    case PERS_DEL:
+        i = pers_find(q->pid, q->id);
+        if (i >= 0) g_pers[i] = g_pers[--g_pers_n];
+        return 0;
+    case PERS_CLEAR:
+        for (i = 0; i < g_pers_n; )
+            if (g_pers[i].pid == q->pid) g_pers[i] = g_pers[--g_pers_n];
+            else i++;
         return 0;
     default:
         return -EINVAL;
@@ -1969,6 +2074,7 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
     case REQ_MFDSEAL: r.ret = mfd_do_seal(q); break;
     case REQ_MFDMAP:  r.ret = mfd_do_map(q); break;
     case REQ_MFDMODE: r.ret = mfd_do_mode(q, reqfd); break;
+    case REQ_PERS:    r.ret = pers_do(q, &r); break;
 
     default: r.ret = -EINVAL; break;   /* incl. REQ_CANCEL on a fresh connection */
     }
@@ -2086,7 +2192,7 @@ static void ipc_broker(struct sockaddr_un *a, socklen_t al, size_t size,
             ipc_reclaim();
             if ((!serve_proctab || !broker_table_live(tab)) && !shm_any_live() &&
                 !sem_any_live() && !msg_any_live() && !mfd_any_live() &&
-                !g_nwait) break;
+                !pers_any_live() && !g_nwait) break;
             last_active = now;   /* anchored: re-arm the grace window */
         }
     }
@@ -2367,6 +2473,9 @@ int proctab_reserve(void) {
         __atomic_store_n(&e->gid_n, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->seccomp, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->nforeign, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->pers_main, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->pers_base, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->pers_npub, 0, __ATOMIC_RELAXED);
         return i;
     }
     return -1;
@@ -2499,6 +2608,14 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
         const s32 *ft;
         int nft = proc_foreign_self(&ft);   /* sequenced: ft is set by the call */
         foreign_write(e, ft, nft);
+        /* The image just loaded runs on the main thread alone, with the
+         * personality its exec left it (do_execve), and that is every thread's
+         * base from here on: nothing is published in the broker for it yet.
+         * Same order and reason as the set above. A parent registering its
+         * child's slot seeded these before the fork (proctab_pers_seed). */
+        __atomic_store_n(&e->pers_npub, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->pers_main, g_tls.personality, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->pers_base, g_tls.personality, __ATOMIC_RELEASE);
     }
     /* Built: publish the slot under its real pid (see the claim above). */
     if (claimed || reserved) __atomic_store_n(&e->pid, pid, __ATOMIC_RELEASE);
@@ -3248,6 +3365,80 @@ void mfdbroker_mapadj(struct Machine *m, u64 dev, u64 ino, int delta) {
     q.op = REQ_MFDMAP; q.mtype = (s64)dev; q.size = ino; q.val = delta;
     struct BResp r;
     mfd_rpc(m, &q, &r, -1, NULL, 0, NULL);   /* best-effort, like shmdt */
+}
+
+/* ---- personality: the owner's side and the reader's (see REQ_PERS) ---------- */
+
+/* The main thread's own value, into our slot: every personality() it makes. */
+void proctab_pers_main(u32 pers) {
+    struct ProcEnt *e = own_entry();
+    if (e) __atomic_store_n(&e->pers_main, pers, __ATOMIC_RELEASE);
+}
+
+/* Seed a fork child's reservation with the value its one thread -- its main
+ * thread, and therefore its base -- is about to inherit. The same pre-fork
+ * write as proctab_seccomp_seed, for the same reason: the kernel answers the
+ * child's /proc the moment fork returns its pid. */
+void proctab_pers_seed(int slot, u32 pers) {
+    if (!g_tab || slot < 0 || slot >= g_tab_n) return;
+    struct ProcEnt *e = &g_tab[slot];
+    __atomic_store_n(&e->pers_npub, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->pers_main, pers, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->pers_base, pers, __ATOMIC_RELEASE);
+}
+
+/* How many of our threads hold a value in the broker, and a change to it.
+ * The count goes up after the value is in and down before it is taken out,
+ * so a reader that sees none can never miss one it should have asked for. */
+u32 proctab_pers_npub(void) {
+    struct ProcEnt *e = own_entry();
+    return e ? __atomic_load_n(&e->pers_npub, __ATOMIC_ACQUIRE) : 0;
+}
+void proctab_pers_npub_adj(int delta) {
+    struct ProcEnt *e = own_entry();
+    if (e) __atomic_add_fetch(&e->pers_npub, (u32)delta, __ATOMIC_ACQ_REL);
+}
+
+static int pers_rpc(struct Machine *m, int op, s32 key, s32 tid, u32 pers,
+                    struct BResp *r) {
+    struct BReq q; memset(&q, 0, sizeof q);
+    q.op = REQ_PERS; q.arg = op; q.key = key; q.id = tid; q.val = (s32)pers;
+    return shm_rpc(m, &q, r, NULL);
+}
+
+/* The calling process's thread `tid` holds `pers`: 0, or -errno when the
+ * broker could not be told. */
+int persbroker_put(struct Machine *m, s32 tid, u32 pers) {
+    struct BResp r;
+    if (pers_rpc(m, PERS_PUT, 0, tid, pers, &r) < 0) return -ENOSPC;
+    return r.ret;
+}
+/* ...holds the base again, or is gone. */
+void persbroker_del(struct Machine *m, s32 tid) {
+    struct BResp r;
+    pers_rpc(m, PERS_DEL, 0, tid, 0, &r);
+}
+/* ...none of its threads does any more (an execve). */
+void persbroker_clear(struct Machine *m) {
+    struct BResp r;
+    pers_rpc(m, PERS_CLEAR, 0, 0, 0, &r);
+}
+
+/* Thread `tid` of ANOTHER process `pid`: 1 with *out set, 0 when the registry
+ * does not know the process (the caller then has no guest answer). */
+int proctab_pers_get(struct Machine *m, s32 pid, s32 tid, u32 *out) {
+    struct ProcEnt *e = resolve_entry(pid);
+    if (!e) return 0;
+    if (tid == pid) {
+        *out = __atomic_load_n(&e->pers_main, __ATOMIC_ACQUIRE);
+        return 1;
+    }
+    u32 npub = __atomic_load_n(&e->pers_npub, __ATOMIC_ACQUIRE);
+    *out = __atomic_load_n(&e->pers_base, __ATOMIC_ACQUIRE);
+    struct BResp r;
+    if (npub && pers_rpc(m, PERS_GET, pid, tid, 0, &r) == 0 && r.ret == 0)
+        *out = (u32)r.size;
+    return 1;
 }
 
 /* ---- System V sem/msg broker: client side --------------------------------- */

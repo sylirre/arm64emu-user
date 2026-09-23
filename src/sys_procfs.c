@@ -62,7 +62,7 @@ enum {
     PF_ENVIRON, PF_MOUNTSTATS, PF_AUXV,
     PF_UIDMAP, PF_GIDMAP, PF_SETGROUPS,
     PF_OVERFLOWID, PF_STATUS, PF_LIMITS, PF_STATM, PF_PIDSTAT, PF_CPUINFO,
-    PF_LOCKS,
+    PF_LOCKS, PF_PERS,
     PF_SNAPSHOT,   /* an open-time snapshot with no refresh of its own */
 };
 
@@ -1041,7 +1041,7 @@ static int pf_refreshes(int kind) {
     switch (kind) {
     case PF_LOADAVG: case PF_UPTIME: case PF_STAT: case PF_LIMITS: case PF_LOCKS:
     case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS:
-    case PF_STATUS: case PF_STATM: case PF_PIDSTAT:
+    case PF_STATUS: case PF_STATM: case PF_PIDSTAT: case PF_PERS:
         return 1;
     default:
         return 0;
@@ -1142,9 +1142,107 @@ int procfs_track_dup(struct Machine *m, int oldfd, int newfd) {
     return r;
 }
 
+/* ---- /proc/<pid>/personality ------------------------------------------------
+ *
+ * The kernel's file is "%08x\n" of the personality of the TASK the directory
+ * is for: /proc/<pid>/ and /proc/self/ the thread-group leader's, a
+ * task/<tid>/ directory that thread's, /proc/thread-self/ the caller's -- and
+ * /proc/<tid>/ of a thread that is not a leader, that thread's. The host's
+ * file holds the emulator's own, which is not the guest's (the guest's is
+ * virtual: sys_personality), so it is answered from the guest's: this
+ * process's threads from the thread registry, another process's from what it
+ * published (proctab.c). Reading it takes PTRACE_MODE_ATTACH rights over the
+ * task (lock_trace), which yama's ptrace_scope restricts to a descendant: the
+ * host's own file is read first, and a refusal there is left for the guest to
+ * meet on the host file itself. */
+
+/* The thread group of task `t`: ours when it is one of our threads (the
+ * kernel's own pairing test), else the registry's answer. */
+static s32 pers_group_of(s32 t) {
+    s32 self = (s32)getpid();
+    if (t == self || syscall(SYS_tgkill, (pid_t)self, (pid_t)t, 0) == 0) return self;
+    return proctab_has(t) ? t : proctab_task_tgid(t);
+}
+
+/* "<digits>/" at *pp: the number, with *pp moved past the slash; 0 if not. */
+static s32 pers_num(const char **pp) {
+    const char *p = *pp;
+    u64 n = 0;
+    if (*p < '0' || *p > '9') return 0;
+    for (; *p >= '0' && *p <= '9'; p++)
+        if ((n = n * 10 + (u64)(*p - '0')) > 0x7fffffff) return 0;
+    if (*p != '/') return 0;
+    *pp = p + 1;
+    return (s32)n;
+}
+
+/* Does canon name a personality file? Its task and that task's group. */
+static int pers_target(const char *canon, s32 *tgid, s32 *tid) {
+    if (strncmp(canon, "/proc/", 6)) return 0;
+    const char *p = canon + 6;
+    s32 t, g = 0;
+    if (!strncmp(p, "self/", 5)) {
+        t = g = (s32)getpid();
+        p += 5;
+    } else if (!strncmp(p, "thread-self/", 12)) {
+        t = g_tls.tid;
+        g = (s32)getpid();
+        p += 12;
+        if (strcmp(p, "personality")) return 0;
+        *tgid = g; *tid = t;
+        return 1;
+    } else if (!(t = pers_num(&p))) {
+        return 0;
+    }
+    if (!strncmp(p, "task/", 5)) {
+        p += 5;
+        s32 n = pers_num(&p);
+        if (!n) return 0;
+        if (!g) g = pers_group_of(t);
+        t = n;
+    }
+    if (strcmp(p, "personality")) return 0;
+    if (!g) g = pers_group_of(t);
+    if (g <= 0) return 0;
+    *tgid = g; *tid = t;
+    return 1;
+}
+
+/* The file's text, for task `tid` of this process (`self`) or of another.
+ * -ESRCH once the task is gone, which is what a read of the kernel's file
+ * answers then. */
+static int put_pers(int fd, struct Machine *m, s32 tid, int self) {
+    u32 v;
+    if (self) {
+        if (!thr_reg_pers(tid, &v)) return -ESRCH;
+    } else {
+        s32 tgid = pers_group_of(tid);
+        char tp[64];
+        snprintf(tp, sizeof tp, "/proc/%d/task/%d", (int)tgid, (int)tid);
+        if (tgid <= 0 || access(tp, F_OK) != 0 ||
+            !proctab_pers_get(m, tgid, tid, &v))
+            return -ESRCH;
+    }
+    dprintf(fd, "%08x\n", v);
+    return 0;
+}
+
+/* May the guest read the task's file at all? The host decides, over its own
+ * copy of it: the same task, the same credentials, the same ancestry. */
+static int pers_host_readable(const char *canon) {
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int hfd = open(canon, O_RDONLY | O_CLOEXEC);
+    char b;
+    ssize_t n = hfd >= 0 ? read(hfd, &b, 1) : -1;
+    if (hfd >= 0) close(hfd);
+    fdwin_leave();
+    return n == 1;
+}
+
 int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
     struct Machine *m = c->m;
     int refused = 0;
+    s64 gone = 0;
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
     /* Device and inode, not the inode alone: the number repeats across
@@ -1207,11 +1305,16 @@ int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
         if (st < 0) m->pf_fds[i] = m->pf_fds[--m->pf_fds_count];
         break;
     }
+    /* The task's personality now: a personality() since the open shows. */
+    case PF_PERS:
+        gone = put_pers(fd, m, m->pf_fds[i].pid, m->pf_fds[i].self);
+        break;
     }
     lseek(fd, 0, SEEK_SET);
 out:
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
     if (refused) { *ret = -EBADF; return 1; }
+    if (gone) { *ret = gone; return 1; }
     return 0;
 }
 
@@ -2000,6 +2103,24 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
             /* Written through, and re-read after (pf_hand tracks it). */
             return pf_hand(m, fd, k, upid, 0, gflags, ret);
         }
+    }
+
+    /* /proc/<pid>/personality, every spelling (see put_pers). Not for writing:
+     * the file is 0400 and has no write method, and the host's answer to a
+     * write open is the one to give. */
+    s32 ptgid, ptid;
+    if (pers_target(canon, &ptgid, &ptid)) {
+        if ((gflags & O_ACCMODE) != O_RDONLY) return 0;
+        if (gflags & G_O_DIRECTORY) { *ret = -ENOTDIR; return 1; }
+        if (!pers_host_readable(canon)) return 0;   /* the host's refusal stands */
+        int self = ptgid == (s32)getpid();
+        int fd = synth_memfd();
+        if (fd < 0) { *ret = synth_denied(); return 1; }
+        if (put_pers(fd, m, ptid, self) < 0) {
+            fdheld_close(fd);
+            return 0;   /* gone in between: the host file says so exactly */
+        }
+        return pf_hand(m, fd, PF_PERS, ptid, self, gflags, ret);
     }
 
     /* /proc/<pid>/status: several of its lines describe the emulator and not

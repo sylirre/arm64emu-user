@@ -597,6 +597,22 @@ typedef struct {
 #define G_MNT_EXPIRE      0x4
 #define G_UMOUNT_NOFOLLOW 0x8
 
+/* ---- personality(2) (uapi/linux/personality.h; arch-uniform) ----
+ * The value is the task's, whole: a personality type in the low byte and
+ * flags above it, stored as given. What the flags do here is listed at
+ * sys_personality (sys_misc.c). */
+#define G_PER_MASK             0x00ffu
+#define G_PER_LINUX32          0x0008u
+#define G_UNAME26              0x0020000u
+#define G_ADDR_NO_RANDOMIZE    0x0040000u
+#define G_MMAP_PAGE_ZERO       0x0100000u
+#define G_ADDR_COMPAT_LAYOUT   0x0200000u
+#define G_READ_IMPLIES_EXEC    0x0400000u
+#define G_STICKY_TIMEOUTS      0x4000000u
+/* What a setuid/setgid exec takes away (bprm->per_clear). */
+#define G_PER_CLEAR_ON_SETID   (G_READ_IMPLIES_EXEC | G_ADDR_NO_RANDOMIZE | \
+                                G_ADDR_COMPAT_LAYOUT | G_MMAP_PAGE_ZERO)
+
 /* ---- ptrace(2) ABI (sys_ptrace.c / ptracetab.c) ---- */
 
 /* Requests. arm64 has no legacy PTRACE_GETREGS/GETFPREGS: the register file is

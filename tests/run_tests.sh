@@ -500,14 +500,15 @@ uid1000 r600=0 r640=1 w640=0 x755=1" --fake-id "$ALPINE" /tmp/ci_fakeidacc
     fx_rm tests/fixtures/fakeidacc.bin
     # A setuid/setgid exec raises by bprm_fill_uid's rule: setgid wants group
     # execute beside S_ISGID, and no_new_privs keeps both bits from raising
-    # anything. Each copy is owned by fake root; the children run as 1000.
+    # anything -- and the same rule decides what of the personality the exec
+    # clears. Each copy is owned by fake root; the children run as 1000.
     "$AGCC" -O1 -static -o tests/fixtures/setidexec.bin tests/fixtures/setidexec.c 2>/dev/null &&
         cp tests/fixtures/setidexec.bin "$ALPINE/tmp/ci_setidexec" &&
-        check_fakeid "setid exec: which bits raise" "setuid euid=0 egid=1000 secure=1
-setgid euid=1000 egid=0 secure=1
-setgid-no-gx euid=1000 egid=1000 secure=0
-setuid-nnp euid=1000 egid=1000 secure=0
-setgid-nnp euid=1000 egid=1000 secure=0
+        check_fakeid "setid exec: which bits raise" "setuid euid=0 egid=1000 secure=1 pers=00020000
+setgid euid=1000 egid=0 secure=1 pers=00020000
+setgid-no-gx euid=1000 egid=1000 secure=0 pers=00360000
+setuid-nnp euid=1000 egid=1000 secure=0 pers=00360000
+setgid-nnp euid=1000 egid=1000 secure=0 pers=00360000
 done" --fake-id "$ALPINE" /tmp/ci_setidexec
     rm -f "$ALPINE/tmp/ci_setidexec" "$ALPINE"/tmp/ci_sid*
     fx_rm tests/fixtures/setidexec.bin
@@ -885,7 +886,7 @@ PTDIRS="/dev/shm ${XDG_RUNTIME_DIR:-} ${TMPDIR:-} /data/local/tmp /tmp"
 pt_registry() {   # the registry file this host's shared_dir() picked, if any
     for d in $PTDIRS; do
         [ -n "$d" ] || continue
-        for f in "$d"/arm64chroot-proctab.v7."$(id -u)".*; do
+        for f in "$d"/arm64chroot-proctab.v8."$(id -u)".*; do
             [ -f "$f" ] && { echo "$f"; return 0; }
         done
     done
@@ -893,7 +894,7 @@ pt_registry() {   # the registry file this host's shared_dir() picked, if any
 }
 if [ -x "$ALPINE/bin/busybox" ]; then
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v7."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v8."$(id -u)".* 2>/dev/null
     done
     rm -f "$ALPINE/tmp/apid"
     A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
@@ -935,7 +936,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$reg" "$victim"
     fi
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v7."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v8."$(id -u)".* 2>/dev/null
     done
 fi
 
@@ -2815,6 +2816,33 @@ check_fixture regionmerge $'image_lines_few=1\none=1\nsplit=3\nmerged=1\nwhole=1
 # row). Self-checking: qemu-user has no pins and nothing to leak; a kernel's
 # children carry none.
 check_fixture forkfds $'openers: bad=0/200\nfifo_open: bad=0/50\nsemop: bad=0/50\ndone'
+# personality(2) as an arm64 kernel with no AArch32 at EL0 answers it --
+# PER_LINUX32 refused -- and what its flags do: UNAME26's release string,
+# READ_IMPLIES_EXEC's executable mappings (mmap, mprotect, brk, shmat), the
+# exec that clears that one flag, and MMAP_PAGE_ZERO's page zero at the next
+# exec wherever vm.mmap_min_addr lets anything be mapped there (the row judges
+# against the host's own limit). Self-checking: qemu-user hands the value to
+# its host kernel and applies none of it to the guest. The per-thread and
+# cross-process semantics are c/personality's, against the oracle.
+PERS_EXPECT=$'refuse 0x8: r=-1 errno=22 now=00040000\nrefuse 0x20008: r=-1 errno=22 now=00040000\nrefuse 0x8000008: r=-1 errno=22 now=00040000\nrefuse 0x108: r=-1 errno=22 now=00040000\ntype 0x18 kept: 00000018\nuname26 2.6.61-arm64chroot\nuname 6.1.0-arm64chroot\nrw-page before SIGSEGV\nmmap r r-xp w -w-p none ---p\nmprotect rw rwxp w -w-p\nbrk rwxp\nshmat ro r-xs\nrw-page under it 42\nexec 00120000 mmap(r) r--p rw-page SIGSEGV\npage0 follows the limit\ndone'
+A64_KEEP_TESTBINS=1 check_fixture personality "$PERS_EXPECT"
+# ...and on a host whose vm.mmap_min_addr is 0, where MMAP_PAGE_ZERO does map
+# page zero: no stock kernel ships that, so the sysctl is replaced for the
+# emulator and the guest alike by a bind mount in a bubblewrap sandbox.
+if [ -x tests/fixtures/personality.bin ] && command -v bwrap >/dev/null 2>&1 &&
+   printf '0\n' > tests/.cache/mmap_min_addr0 &&
+   bwrap --ro-bind / / --dev /dev --proc /proc \
+         --ro-bind tests/.cache/mmap_min_addr0 /proc/sys/vm/mmap_min_addr \
+         cat /proc/sys/vm/mmap_min_addr 2>/dev/null | grep -qx 0; then
+    got=$(bwrap --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp \
+                --ro-bind tests/.cache/mmap_min_addr0 /proc/sys/vm/mmap_min_addr \
+                "$EMU" / tests/fixtures/personality.bin 2>/dev/null)
+    fixture_verdict "personality (mmap_min_addr 0)" "$PERS_EXPECT" "$got"
+else
+    skip=$((skip+1))
+    echo "SKIP fixture: personality (mmap_min_addr 0) (no bubblewrap sandbox here to set the sysctl in)"
+fi
+rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
 # EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands
 # on the limit itself, at_min), MREMAP_FIXED below it is EPERM after
