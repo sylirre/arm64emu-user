@@ -518,7 +518,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # A test can be blocked by what the environment the EMULATOR runs in can do,
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
-# (docs/jit.md), and qemu-user is an interposer with defects of its own. Six
+# (docs/jit.md), and qemu-user is an interposer with defects of its own. Seven
 # of them stop correct tests dead, each reproducible in a few lines that never
 # touch the emulator:
 #
@@ -542,6 +542,11 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   to allocate.
 #   fiemap-order    FS_IOC_FIEMAP on a file with no extent map is EOPNOTSUPP
 #                   before the header is read; qemu-user reads it first.
+#   fiemap-badr     FS_IOC_FIEMAP writes the header back whatever the mapping
+#                   answered, so an EBADR's fm_flags name the refused flags;
+#                   qemu-user copies it back only on success. (With no
+#                   filesystem at hand that has an extent map there is
+#                   nothing to ask, and the fixture steps aside by itself.)
 #
 # A fourth names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -660,6 +665,42 @@ int main(void) {
     int pf[2];
     if (pipe(pf)) return 1;
     return !(ioctl(pf[0], 0xc020660b, (void *)0) < 0 && errno == EOPNOTSUPP);
+}
+EOF
+        ;;
+    fiemap-badr) cat <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+    const char *dirs[] = { getenv("TMPDIR"), "/var/tmp", "/tmp", "." };
+    for (unsigned i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+        char p[4096];
+        if (!dirs[i] || !*dirs[i]) continue;
+        snprintf(p, sizeof p, "%s/a64fm.XXXXXX", dirs[i]);
+        int fd = mkstemp(p);
+        if (fd < 0) continue;
+        unlink(p);
+        char b[8192];
+        memset(b, 1, sizeof b);
+        if (write(fd, b, sizeof b) != (ssize_t)sizeof b || fsync(fd)) { close(fd); continue; }
+        struct { struct fiemap f; struct fiemap_extent e[1]; } m;
+        memset(&m, 0, sizeof m);
+        m.f.fm_length = ~0ULL;
+        m.f.fm_extent_count = 1;
+        m.f.fm_flags = FIEMAP_FLAG_SYNC | 0x40000000u;
+        int r = ioctl(fd, FS_IOC_FIEMAP, &m);
+        int e = errno;
+        close(fd);
+        if (r < 0 && e == EBADR) return m.f.fm_flags != 0x40000000u;
+    }
+    return 0;
 }
 EOF
         ;;

@@ -456,6 +456,7 @@ SYSDEF(recvfrom) {
     int r = xfer_begin(c, (int)a0, &g, 1, 1, room < len ? XFER_LEND : 0, NULL, &x);
     if (r < 0) return (u64)(s64)r;
     if (room < len && x.total == room && x.n < XFER_IOV) {
+        if (!x.total) x.n = 0;                /* as msg_import: fault first */
         x.iov[x.n].iov_base = NULL;           /* lent, so iov[] has the room */
         x.iov[x.n].iov_len = len - room;
         x.n++;
@@ -1422,6 +1423,12 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
      * separate mappings gets here. */
     if (zc && mi->x.stage) return -ENOBUFS;
     if (cut && mi->x.total == backed && mi->x.n < XFER_IOV) {
+        /* With nothing lent, the empty segments ahead of the fault go: they
+         * are nothing to a socket, and an interposer between the emulator and
+         * the kernel -- qemu-user, the ARM32 tier's host -- faults only on the
+         * FIRST iovec it cannot lock, and drops a later one, delivering the
+         * datagram into what is left of the vector as if it had fitted. */
+        if (!mi->x.total) mi->x.n = 0;
         mi->x.iov[mi->x.n].iov_base = NULL;
         mi->x.iov[mi->x.n].iov_len = (size_t)(total - backed);
         mi->x.n++;

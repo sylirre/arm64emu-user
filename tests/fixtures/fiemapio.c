@@ -12,8 +12,11 @@
  *
  * Needs a file on a filesystem with an extent map, which tmpfs is not: the
  * fixture looks in $TMPDIR, /var/tmp, /tmp and the working directory, and
- * steps aside (a lone SKIP line) where none has one. The expected output is
- * what this program prints built for the host and run on a real kernel. */
+ * steps aside (a lone SKIP line) where none has one. qemu-user copies the
+ * header back only on success, so it cannot host this:
+ * NEEDS-HOST-SYSCALL: fiemap-badr
+ * The expected output is what this program prints built for the host and run
+ * on a real kernel. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
