@@ -473,6 +473,34 @@ void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len)
     EMU_UNLOCK(&nl_lock, EMU_LK_NL);
 }
 
+void nlr_note_gvec(CPU *c, int fd, const GIovec *seg, int nseg)
+{
+    struct nlmsghdr hdr;
+
+    if (!c->m->fake_netns || !c->m->nlr_fds_count)   /* as nlr_note_request */
+        return;
+    nlr_note_request(c->m, fd, &hdr, gvec_head(c, seg, nseg, &hdr, sizeof(hdr)));
+}
+
+void nlr_fix_gvec(CPU *c, int fd, const GIovec *seg, int nseg, size_t len,
+                  int peek)
+{
+    /* The refusal to rewrite is an NLMSG_ERROR of a few dozen bytes, alone in
+     * the datagram that answers the request; a reply larger than the staging
+     * cap is a dump, which carries none. */
+    if (!c->m->nl_ack_pending || !len)               /* as nlr_fix_reply */
+        return;
+    if (len > XFER_STAGE_MAX)
+        len = XFER_STAGE_MAX;
+    u8 *buf = malloc(len);
+    if (!buf)
+        return;
+    size_t got = gvec_head(c, seg, nseg, buf, len);
+    if (got && nlr_fix_reply(c->m, fd, buf, got, peek))
+        gvec_put(c, seg, nseg, buf, got);
+    free(buf);
+}
+
 int nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek)
 {
     int fixed = 0;

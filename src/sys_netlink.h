@@ -43,6 +43,13 @@ void nlr_note_request(struct Machine *m, int fd, const void *msg, size_t len);
  * MSG_PEEK receive) keeps the note pending for the read that consumes the
  * reply. Returns 1 if a refusal was turned into an ack. */
 int  nlr_fix_reply(struct Machine *m, int fd, void *buf, size_t len, int peek);
+/* The same two, for a message that is in guest memory rather than staged: a
+ * large one goes to the host straight from (and into) the guest's own pages
+ * (sys.h, GuestXfer). `seg` is the guest vector, `len` the bytes received.
+ * Both cost nothing unless a faked namespace's request is in play. */
+void nlr_note_gvec(CPU *c, int fd, const GIovec *seg, int nseg);
+void nlr_fix_gvec(CPU *c, int fd, const GIovec *seg, int nseg, size_t len,
+                  int peek);
 
 /* Sends on a fake fd: the request is parsed and the reply it draws recorded for
  * the receive that follows. Each returns the guest x0 value (a non-negative

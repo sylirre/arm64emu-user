@@ -309,6 +309,64 @@ charge passed RAM+swap. `tests/fixtures/forklock.c` is the regression test —
 it churns from a sibling thread while forking, and used to need 15 GB where it
 now peaks under 500 MB.
 
+### Backing lent to a host syscall is pinned
+
+A large read or write does not go through a bounce buffer (`docs/syscalls.md`,
+*where a transfer's bytes go*): the host syscall is handed the guest's own
+backing, as the runs of host memory under the guest's buffer (`guest_lend`,
+`mem.c`). That is only safe because of the **pin**. The quarantine above is
+built on the fact that a thread parked in a host syscall cannot be holding a
+translated pointer — so it stops holding the quarantine open — and a lending
+thread is exactly a thread parked in a host syscall *whose kernel is holding
+pointers into the backing*. Without a pin, an allocation another thread unmapped
+meanwhile could be released, its host range handed straight back out by the next
+host `mmap` (a new guest mapping, the emulator's own heap), and the host kernel
+would then write the guest's bytes into it.
+
+`guest_lend` walks the buffer page by page under `as_lock` with `translate()`
+— so each page is judged exactly as `rw_room` judges it, a file mapping's page
+the file has grown into is filled, and a vfork child's tracked page is
+snapshotted before the host writes it — and, for each run, bumps the owning
+`HostMap`'s `pins`. A run never spans two allocations, and is extended only
+within one guest segment, so the host sees a segment boundary wherever the
+guest drew one. While an allocation is pinned:
+
+- **it is not retired.** Its last region going away (`hmap_unref`) parks it
+  on `AddrSpace.orphans` instead, and the loan's end (`guest_unlend`) retires
+  it through the quarantine like anything else — the threads that had it
+  translated before the unmap may not have flushed yet.
+- **it is not copied onto new backing under a guest VA that stays put.** A
+  private anonymous mapping grown in place, when the host cannot extend its
+  allocation, used to be copied to a fresh one (`region_extend_backing`, tier
+  4); the host kernel would then go on writing into the old pages, where a
+  kernel — whose mapping grows in place — puts the bytes in the mapping the
+  guest keeps using. That growth is refused while a loan is out, with the
+  `ENOMEM` `mremap` may always give an in-place grow, and a
+  `MREMAP_MAYMOVE` caller moves the mapping instead (after a move, the copy is
+  what a kernel amounts to anyway: a transfer still aimed at the old address
+  cannot land in the moved one). An anonymous shared mapping grown in place is
+  rebuilt on a larger memfd and refused the same way (`as_range_lent`,
+  `sys_mm.c`).
+- **a fork child forgets it.** Only the forking thread comes across, and it
+  is not inside a lending syscall — fork is the syscall it is in — so every
+  pin the child inherits is a sibling's, and `as_lend_fork_child` drops them
+  and retires the orphans before anything else in the child can trip on them.
+
+What a pin does not change is the race a guest writes for itself. A transfer
+still in flight into memory the guest unmaps, or maps over, completes into the
+backing it was given — never into the emulator's, and never into what the guest
+maps there next — where a kernel's copy, going by address, would fault on the
+hole or land in the new mapping; and one moved away under it by
+`MREMAP_DONTUNMAP` can lose what the host writes during the move itself (the
+copy to the destination, and the source's discard to zeroes, are two steps a
+kernel's page-table move is not). Only a program racing its own `munmap` or
+`mremap` against its own `read` can tell, and it is the one case the design
+gives up.
+`tests/fixtures/xferlend.c` checks the part that matters: with a transfer
+parked in a buffer that is unmapped and reserved away, none of the memory mapped
+afterwards receives its bytes, and a mapping grown with a transfer in flight
+has them.
+
 ### `mremap(MREMAP_DONTUNMAP)`
 
 The pages of the old range move to the new one and the old range **stays
@@ -679,10 +737,14 @@ answers it in tiers, never by substituting backing that maps something else:
    object), so a thread still holding a stale translation reaches the very pages
    the new mapping does;
 4. private anonymous memory, which no one else can observe, gets a fresh
-   allocation with the old bytes copied in;
+   allocation with the old bytes copied in — unless a run of it is lent to a
+   host syscall in flight and the mapping is growing in place (see *backing
+   lent to a host syscall is pinned*, above), when the copy would leave that
+   transfer writing into the old pages;
 5. anything left — a private file mapping in a multi-threaded address space
-   that could not be extended in place — is refused with `ENOMEM`, which
-   `mremap(2)` is allowed to return, rather than fabricated.
+   that could not be extended in place, a lent one growing in place — is
+   refused with `ENOMEM`, which `mremap(2)` is allowed to return, rather than
+   fabricated.
 
 `MAP_SHARED|MAP_ANONYMOUS` is the one case rebuilt rather than extended
 (`sys_mm.c`): its backing is a memfd sized when the mapping was made, and
@@ -691,7 +753,8 @@ so it cannot be enlarged — extending the host mapping past the memfd's
 end-of-file would turn the added pages into bus errors, where a kernel grows the
 shmem object. The mapping is rebuilt on a fresh, larger memfd and the old
 contents copied in; what a kernel keeps and this cannot is a sharer from
-*before* the grow — a child forked earlier goes on seeing the old pages.
+*before* the grow — a child forked earlier goes on seeing the old pages. The
+rebuild is refused in place, like tier 4, while a transfer is lent out of it.
 
 An **old length of zero** is the kernel's own special case ("`mremap(0, 0, 0,
 0)` is legal", kept for DOS-emu) and the documented way to *duplicate* a

@@ -359,8 +359,10 @@ src/
     cpu.c sysreg.c   step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect,
-                copy_to/from_guest, mem_host_ptr. Portable to 32-bit hosts:
-                guest VAs never become host pointers except through the table.
+                copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's
+                backing handed to the host syscall, pinned). Portable to 32-bit
+                hosts: guest VAs never become host pointers except through the
+                table.
   exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c        run loop + exception dispatch + signal delivery point +
                 the thread call-out safepoint (stop_gen)

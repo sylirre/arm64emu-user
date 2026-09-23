@@ -898,9 +898,17 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
         for (u64 va = old_addr + old_len; va < old_addr + new_len; va += GUEST_PAGE_SIZE)
             if (as_find_region(as, va)) { busy = 1; break; }
         if (!busy) {
-            int r = shm ? anon_shm_regrow(c, old_addr, old_len, new_len,
-                                          old_addr, prot)
-                        : guest_remap_grow(as, old_addr, old_len, new_len);
+            /* Anonymous shared memory grows by being rebuilt on a larger memfd
+             * and copied across, so in place it has the hazard mem.c refuses
+             * a private copy for (guest_remap_grow): a transfer lent out of it
+             * to a host syscall in flight (guest_lend) would go on landing in
+             * the old memfd, where a kernel's growing segment keeps it. The
+             * same ENOMEM, then, and a MREMAP_MAYMOVE caller moves instead. */
+            int r = shm ? (as_range_lent(as, old_addr, old_len)
+                               ? -ENOMEM
+                               : anon_shm_regrow(c, old_addr, old_len, new_len,
+                                                 old_addr, prot))
+                        : guest_remap_grow(as, old_addr, old_len, new_len, 1);
             if (r == 0) return old_addr;
             if (!(flags & G_MREMAP_MAYMOVE)) return (u64)(s64)r;
         } else if (!(flags & G_MREMAP_MAYMOVE)) {
@@ -959,7 +967,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     int r = guest_remap_move(as, old_addr, keep, new_addr);
     if (r < 0) return (u64)(s64)r;
     if (new_len > old_len) {
-        r = guest_remap_grow(as, new_addr, old_len, new_len);
+        r = guest_remap_grow(as, new_addr, old_len, new_len, 0);
         if (r < 0) {
             /* Nothing to grow onto: put the mapping back where it was rather
              * than leave the guest without it. The old range is free -- this

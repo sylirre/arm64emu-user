@@ -888,7 +888,7 @@ static int idmap_parse(const u8 *in, size_t len, IdExtent *out) {
  * silent lie (unformatted on read-back, and the one-shot rule unapplied). */
 static int pf_find_locked(struct Machine *m, int fd);
 
-int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *ret) {
+int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t len, s64 off, s64 *ret) {
     struct Machine *m = c->m;
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
@@ -925,7 +925,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
          * gid_map used to be refused. */
         if (len >= 8) { *ret = -EINVAL; return 1; }
         char kbuf[8];
-        memcpy(kbuf, buf, len);
+        memcpy(kbuf, head, len);
         kbuf[len] = 0;
         int deny;
         size_t p;
@@ -965,7 +965,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off, s64 *re
     }
     if (written) { *ret = -EPERM; return 1; }
     IdExtent ext[IDMAP_EXTENTS];
-    int n = idmap_parse(buf, len, ext);
+    int n = idmap_parse(head, len, ext);
     if (n < 0) { *ret = n; return 1; }
     IdExtent *mine = kind == PF_UIDMAP ? m->uid_map : m->gid_map;
     u16 *mine_n    = kind == PF_UIDMAP ? &m->uid_map_n : &m->gid_map_n;

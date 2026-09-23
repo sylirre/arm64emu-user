@@ -518,7 +518,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # A test can be blocked by what the environment the EMULATOR runs in can do,
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
-# (docs/jit.md), and qemu-user is an interposer with defects of its own. Three
+# (docs/jit.md), and qemu-user is an interposer with defects of its own. Six
 # of them stop correct tests dead, each reproducible in a few lines that never
 # touch the emulator:
 #
@@ -529,6 +529,19 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   nothing, where a kernel returns the full struct timeval.
 #   waitid-rusage   waitid(2)'s fifth argument, the rusage no libc exposes, is
 #                   ignored outright; the buffer comes back untouched.
+#   iov-fault       an iovec segment qemu-user cannot lock is dropped, and
+#                   the rest of the vector is transferred as if it were all
+#                   there. A kernel copies the vector in order and faults on
+#                   the segment (the emulator hands a receive's missing part
+#                   to the host as an iovec over address 0 for exactly that).
+#   ctrl-budget     sendmsg with a msg_controllen past the optmem budget is
+#                   ENOBUFS on a kernel before the buffer is read (EINVAL
+#                   from a 64-bit kernel's compat walk, which is still an
+#                   answer); qemu-user copies the buffer in first -- a fault
+#                   for one that is not there, or an abort for one too large
+#                   to allocate.
+#   fiemap-order    FS_IOC_FIEMAP on a file with no extent map is EOPNOTSUPP
+#                   before the header is read; qemu-user reads it first.
 #
 # A fourth names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -603,6 +616,50 @@ int main(void) {
     char *a = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
     if (a == MAP_FAILED) return 1;
     return mremap(a, 4096, 4096, MREMAP_MAYMOVE | MREMAP_DONTUNMAP) == MAP_FAILED;
+}
+EOF
+        ;;
+    iov-fault) cat <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+int main(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) return 1;
+    char b[8] = "abcdefg", r[4];
+    if (send(sv[0], b, 8, 0) != 8) return 1;
+    struct iovec v[2] = { { r, 4 }, { 0, 4 } };
+    struct msghdr m = { .msg_iov = v, .msg_iovlen = 2 };
+    return !(recvmsg(sv[1], &m, 0) < 0 && errno == EFAULT);
+}
+EOF
+        ;;
+    ctrl-budget) cat <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+int main(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) return 1;
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_controllen = 64 << 20;
+    if (sendmsg(sv[0], &m, MSG_DONTWAIT) >= 0) return 1;
+    return !(errno == ENOBUFS || errno == EINVAL);
+}
+EOF
+        ;;
+    fiemap-order) cat <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+    int pf[2];
+    if (pipe(pf)) return 1;
+    return !(ioctl(pf[0], 0xc020660b, (void *)0) < 0 && errno == EOPNOTSUPP);
 }
 EOF
         ;;

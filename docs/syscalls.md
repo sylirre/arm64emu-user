@@ -198,20 +198,24 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   **`EDOM`**, not `EINVAL` (`tests/c/socktimeo.c`).
 - *A byte count is a guest `u64`, and it is the guest's to choose.* A kernel
   never allocates for one — it copies between the file and the caller's own
-  pages — while this emulator has to bounce it, so both ends are bounded
+  pages — and neither, for a large transfer, does this emulator any more (see
+  *where a transfer's bytes go*, below), but both ends are still bounded
   (`rw_count`/`rw_room` in `sys.h`). `rw_count` clamps to the kernel's own
   `MAX_RW_COUNT` (`INT_MAX` rounded down to a page), which `rw_verify_area`
   clamps to as well rather than refusing — casting first instead turned a count
   above 4 GB into an unrelated small one on an ILP32 host and transferred that
-  many bytes. `rw_room` then bounds the bounce by the run of the guest's buffer
-  that is actually mapped for the access: a kernel stops where the caller's
-  memory ends and reports the short transfer, so anything past that point could
-  never be delivered — and allocating for it let a guest name a length
-  (`read(fd, buf, 1 TB)`, no such `buf`) that the *emulator* had to find room
-  for. A datagram is the exception on both counts: `recvfrom` may not shorten
-  its buffer (the message would arrive truncated, and it is gone once received)
-  and `sendto` may not either (it would be sent truncated where the kernel
-  refuses it whole), so those clamp only (`tests/fixtures/bigcount.c`).
+  many bytes. `rw_room` then bounds the transfer by the run of the guest's
+  buffer that is actually mapped for the access: a kernel stops where the
+  caller's memory ends and reports the short transfer, so anything past that
+  point could never be delivered — and finding host memory for it let a guest
+  name a length (`read(fd, buf, 1 TB)`, no such `buf`) that the *emulator* had
+  to find room for. A datagram is the exception on both counts: `sendto` may
+  not shorten its buffer (the message would be sent truncated where the kernel
+  refuses it whole), so it demands the whole of it; and `recvfrom` may not
+  either (the message would arrive truncated, and it is gone once received),
+  so what the guest does not have is handed to the host as an iovec over
+  address 0, where the host kernel's copy faults exactly where the guest's
+  would (`tests/fixtures/bigcount.c`, `tests/fixtures/xferfault.c`).
 - *The same count, on the calls that never build a bounce buffer.* `sendfile`,
   `splice` and `copy_file_range` hand the guest's count straight to the host,
   and `getrandom`/`add_key` bound it themselves — all five cast it to a host
@@ -226,11 +230,11 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   by `rw_room`, since it fills a bounce buffer of its own and a kernel stops
   where the caller's memory ends. `tests/fixtures/hugecount.c` covers the five,
   and is self-checking for the same reason `bigcount.c` is.
-- *The vector calls need the same bound, per segment* (`iov_from_guest`,
-  `sys_file.c`). `readv`/`writev` and the `p*v*` family stage the whole gather
-  in one bounce buffer before the transfer, so an unbounded import let a guest
-  name a gigabyte it did not own, and — on the read side — the bytes really
-  read on its behalf were then lost with the `EFAULT`. Each segment is bounded
+- *The vector calls need the same bound, per segment* (`iov_import`,
+  `sys_file.c`). `readv`/`writev` and the `p*v*` family used to stage the whole
+  gather in one bounce buffer before the transfer, so an unbounded import let a
+  guest name a gigabyte it did not own, and — on the read side — the bytes
+  really read on its behalf were then lost with the `EFAULT`. Each segment is bounded
   by `rw_room` and the vector cut where a kernel's copy would stop; what the
   call reports then depends on the file, and it does on a kernel too: a regular
   file (device, tty) reports the **short transfer**, while a pipe or socket
@@ -250,6 +254,67 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   fourteen cases against a real kernel; `qemu-user` disagrees with the kernel
   on nine of them (it validates each segment's whole range up front), so it is
   not the oracle here.
+- *Where a transfer's bytes go* (`xfer_begin`/`xfer_end`, `sys_file.c`, and
+  `guest_lend`, `mem.c`). The host syscall needs host memory to move a
+  transfer through, and it used to be a bounce buffer the size of the whole of
+  it — up to `MAX_RW_COUNT` a call, **committed in full for a write** (the
+  copy in touches every page, even where the guest's own pages were never
+  touched and cost it nothing), and reserved in full for a receive before the
+  socket had anything to deliver. A guest with a gigabyte of untouched
+  `PROT_READ` memory could make the emulator commit a gigabyte per call per
+  thread — and hold it for as long as a `write` to a pipe with no reader
+  blocks. Now a transfer of `XFER_BOUNCE_MAX` (64 KiB) or less is still
+  bounced, which is the cheapest thing for it, and a larger one is **lent**:
+  the runs of host memory under the guest's buffer become the host call's
+  iovecs, **pinned** for the duration (`docs/memory.md` has why a pin is
+  needed and what it holds back), and the host kernel moves the bytes
+  exactly as the guest's kernel would — a datagram whole, a regular-file
+  write atomic against its neighbours, a peek or an `SO_RCVLOWAT` wait as
+  long as the guest asked for — with nothing staged at all. What is still
+  staged is capped at `XFER_STAGE_MAX` (2 MiB) a call:
+  - a guest segment the host can only reach as several runs (a buffer
+    straddling two separate mappings — a glibc heap buffer across two `brk`
+    extensions is one) is lent as several iovecs where the file cannot tell:
+    a regular file, a block device, a pipe, a socket, `/dev/zero` and its
+    major-1 kin. A file whose host driver has only `->read`/`->write` is
+    served one iovec at a time by `do_loop_readv_writev` and answers each
+    piece on its own — an inotify event or a timerfd count that no longer
+    fits the first piece is `EINVAL`, a raw-mode tty that filled the first
+    waits for more input to fill the second — so for those the transfer is
+    staged instead, one host iovec per guest segment, and past the cap it is
+    a short transfer, which such a file may always make and none of them has
+    a record anywhere near that size to lose;
+  - past the 1024 host iovecs one call can take (only a vector over a
+    thousand separate mappings gets there), the rest is staged as one last
+    iovec; a datagram that still does not fit is refused `EMSGSIZE` rather
+    than sent in part;
+  - a signalfd read is staged a batch of 512 records at a time (the records
+    are translated on the way out), which reads as a quieter queue;
+  - `MSG_ZEROCOPY` sends are lent however small they are, since the socket
+    keeps referencing what it was handed after the call returns — a freed
+    bounce buffer would have been reused under it — and one that would
+    need any staging is refused with the `ENOBUFS` a zero-copy send may
+    always get (`tests/fixtures/zcsend.c`);
+  - `FS_IOC_FIEMAP` and a large option value (below) are lent when they are
+    one run, and otherwise staged in front of a `PROT_NONE` guard
+    (`guardbuf_map`, `sys.h`): a kernel that goes past the staged part faults
+    on the guard as it would on the guest's own unmapped tail, and only an
+    ioctl or option that really moves more gets staged whole (a netfilter
+    table, which the kernel then allocates as much for itself). FIEMAP hands
+    back only the header and the extents the kernel wrote, where it used to
+    copy all 56 MB of a million-slot array in and out again (and refused any
+    `fm_extent_count` past a million, where the kernel's own ceiling is
+    `UINT_MAX / 56`); it writes the header back on an error too, as
+    `ioctl_fiemap` does — an `EBADR` names the refused flags in `fm_flags`,
+    which the guest used to read back unchanged — and it is answered by the
+    file first (`EOPNOTSUPP` before the header is read, which a probe with no
+    buffer has the host give).
+
+  `tests/fixtures/xferlend.c` measures the emulator's own peak RSS across
+  256 MB transfers out of untouched memory (flat now; the whole size before)
+  and checks straddling buffers, the iovec overflow and a buffer unmapped or
+  grown with a transfer in flight; `xferfault.c` covers the fault paths and
+  `fiemapio.c` FIEMAP's answers through both shapes of array.
 - *How many segments is a guest `u64` too, and the two families disagree about
   it.* `readv`/`writev` pass `iovcnt` down to the kernel's own `unsigned
   nr_segs` and it is truncated there, so `readv(fd, iov, 1ULL<<32)` really is a
@@ -918,37 +983,55 @@ is an ordinary success and `addrlen` is never read. Nothing here special-cases
 Answering a half-supplied pair with a bare success told a guest its address had
 been written when nothing was.
 
-**A staging buffer is not an ABI limit.** Every socket payload has to be
-bounced through memory of the emulator's own — an `optval`, a control buffer, a
-gather/scatter vector — and the sizes it was willing to bounce used to be flat
-constants: 4 KB for an option value, 4 KB for ancillary data, 16 MiB for a
-vector. A kernel has none of those, so each one was a guest-visible refusal of
+**A staging buffer is not an ABI limit.** Every socket payload has to reach
+the host through memory the host can address — an `optval`, a control buffer, a
+gather/scatter vector — and the sizes the emulator was willing to bounce used to
+be flat constants: 4 KB for an option value, 4 KB for ancillary data, 16 MiB for
+a vector. A kernel has none of those, so each one was a guest-visible refusal of
 something Linux accepts, and the control one was worse than a refusal:
 `cmsg_g2h` used to *stop* at the first element it could not take, so a `sendmsg`
 whose ancillary data ran past 4 KB went out with the rest of it **missing** and
-reported success. Each is now staged at the size the guest asked for and
-bounded the way `read`/`write` already bound theirs — by the guest's own
-memory (`rw_room`, `sys.h`) — so the allocation is something the guest already
-owns rather than a number it merely named:
+reported success. None of them is a flat constant now. A large payload is
+handed over in the guest's own pages (*where a transfer's bytes go*, above),
+and what is still staged is bounded by what a kernel would do with it —
+never by a number the guest merely named:
 
 - `setsockopt`'s `optlen` is an `int` in the kernel's own prototype, so the
   high half of the register is dropped and only then is a negative value
   `EINVAL` (`do_sock_setsockopt`). Reading it as a `size_t` and refusing
   anything too big to stage arrived at that `EINVAL` by accident and refused an
-  ordinary 8 KB option with it. The value must be entirely in guest memory —
-  the copy would find that out a page later anyway, and demanding it first is
-  what bounds the allocation.
-- `getsockopt` stages what the guest asked for, clamped to what the guest's own
-  buffer can take, since anything past that could never have reached it: the
-  kernel's `copy_to_user` stops at the same page, and the writeback still
-  produces that `EFAULT`. The reported length is then never trusted past the
-  staging.
+  ordinary 8 KB option with it. A value past the 4 KB stack staging is handed
+  over in the guest's own pages when it is one run of host memory, and is
+  otherwise staged — at most `XFER_STAGE_MAX` of it, in front of a guard — so
+  a kernel that reads the four bytes an `int` option takes needs no more of
+  the guest's buffer than that, as on a kernel: a value the guest named as
+  256 MB of pages it never touched used to be copied in whole, and one only
+  partly mapped used to be `EFAULT` where the kernel reads the `int` and
+  succeeds. The options translated here (a filter program, a timeout on an
+  ILP32 host) read their own struct and no more, and a filter program's
+  length is judged before a byte of it is read.
+- `getsockopt` answers what the guest asked for, clamped to what the guest's
+  own buffer can take, since anything past that could never have reached it:
+  the kernel's `copy_to_user` stops at the same page, and the writeback still
+  produces that `EFAULT`. Past the stack staging it writes straight into the
+  guest's pages, or through the same bounded guarded staging; the reported
+  length is never trusted past what the kernel can have written.
 - `msg_controllen` is bounded only by `INT_MAX` (`____sys_sendmsg`, which
   answers `ENOBUFS` — not `EINVAL` — for more) and, on a send, by the socket's
-  own `optmem` budget, which is the kernel's to enforce and can only be
-  enforced once it is handed what the guest sent. A *receive* has no ceiling at
-  all: the length there is only the capacity the kernel may fill, so it is
-  clamped to what the guest's buffer can take rather than refused. A send then
+  own `optmem` budget, which the kernel checks — `ENOBUFS` again — **before it
+  reads a byte of the buffer**. Staging the guest's length, as this used to,
+  let a guest name `INT_MAX` of pages it never touched and have them copied in
+  twice over, and answered `EFAULT` for an unmapped buffer the kernel refuses
+  for its size. A large one (past 64 KiB) is therefore put to the host first
+  with no buffer at all (`ctrl_probe`, `sys_net.c`): `ENOBUFS` is the answer,
+  and `EFAULT` — the copy faulting — means the kernel would take that much,
+  so it is staged. A 32-bit emulator on a 64-bit kernel is served by the
+  compat walk, which parses before it sizes and calls an absent buffer
+  `EINVAL`; there the budget is read from `net.core.optmem_max` instead. A
+  *receive* has no ceiling at all: the length there is only the capacity the
+  kernel may fill, so it is clamped to what the guest's buffer can take — and
+  to `XFER_STAGE_MAX`, orders of magnitude past what one message can carry —
+  rather than refused. A send then
   copies the whole buffer in, so a non-zero length the guest cannot back is
   `EFAULT` — `msg_control == NULL` included, which used to be taken for "no
   ancillary data" and sent the message; a *receive* only writes through the
@@ -973,13 +1056,22 @@ owns rather than a number it merely named:
 - The iovec bounds are `__import_iovec`'s own: a segment whose length is
   negative as an `ssize_t` is `EINVAL`, and the running total is *clamped* to
   `MAX_RW_COUNT` rather than refused, so a vector past that is a short transfer
-  and not an error — the same rule `iov_from_guest` follows for `readv`/
+  and not an error — the same rule `iov_import` follows for `readv`/
   `writev`, where a flat 16 MiB ceiling had made `sendmsg` refuse what `writev`
-  on the same fd accepted (`iov_from_guest` had a 1 GiB one of its own until
+  on the same fd accepted (`iov_import` had a 1 GiB one of its own until
   the same rule replaced it). A send demands every segment up front (`sendto`
   does the same); a receive cannot, because shortening the vector would
   truncate a datagram that is gone once received (`recvfrom` makes the same
-  distinction).
+  distinction) — so the part of the vector the guest does not have goes to
+  the host as an iovec over address 0, which no process maps, and the host
+  kernel's copy stops there exactly as the guest's kernel would: `EFAULT` for
+  a datagram that did not fit (and the datagram gone), the bytes up to there
+  for a stream, with the rest still queued. That used to be a receive of the
+  whole named length into a bounce buffer that size, before anything had even
+  arrived, and a failed copy-out afterwards that lost a stream's bytes.
+  The checks run in the order the kernel meets them: the header and its
+  iovec, then the control buffer (its size, then its contents), then the
+  destination address, and the data last of all.
 
 `tests/c/msgbig.c` covers all four against the oracle — including a descriptor
 passed through an 8 KB control buffer whose `SCM_RIGHTS` element begins past

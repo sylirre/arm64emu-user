@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>    /* struct timeval (SO_RCVTIMEO/SO_SNDTIMEO) */
 #include <time.h>       /* clock_gettime (recvmmsg's deadline)               */
@@ -362,17 +363,23 @@ SYSDEF(getpeername) {
     return addr_out(c, a1, a2, &ss, sl, 0);
 }
 
+/* A send the transfer could not cover in full (sys.h: only a vector over a
+ * thousand separate mappings, or a straddling buffer past XFER_STAGE_MAX on a
+ * file that is no socket, gets there): a stream takes the short send it may
+ * always make, but a datagram cannot go in part -- EMSGSIZE, the answer a
+ * protocol gives for a message it will not carry. */
+static int xfer_send_whole(int fd, const GuestXfer *x, size_t want) {
+    if (x->total >= want) return 0;
+    int type = 0;
+    socklen_t tl = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 && type == SOCK_STREAM)
+        return 0;
+    return -EMSGSIZE;
+}
+
 SYSDEF(sendto) {
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
-    /* Bounded, but never shortened: a datagram that does not fit is refused
-     * (EMSGSIZE, by the host), not sent truncated -- so the whole buffer has
-     * to be there, which is what the copy below would have found out after
-     * allocating for it. */
     size_t len = rw_count(a2);
-    if (len && rw_room(c, a1, len, ACC_READ) < len) return (u64)(s64)-EFAULT;
-    u8 *buf = malloc(len ? len : 1);
-    if (!buf) return (u64)(s64)-ENOMEM;
-    if (len && copy_from_guest(c, buf, a1, len) < 0) { free(buf); return (u64)(s64)-EFAULT; }
     struct sockaddr_storage ss;
     socklen_t sl = 0;
     struct sockaddr *dp = NULL;
@@ -383,17 +390,45 @@ SYSDEF(sendto) {
          * EINVAL there, and reporting EFAULT for it sends a caller looking at
          * its pointer instead of its length. bind/connect already pass it on. */
         int ar = addr_in(c, a4, (u32)a5, &ss, &sl);
-        if (ar < 0) { free(buf); return (u64)(s64)ar; }
+        if (ar < 0) return (u64)(s64)ar;
         int tr = unix_path_in(c, &ss, &sl, 1, &dfd);
-        if (tr < 0) { free(buf); return (u64)(s64)tr; }
+        if (tr < 0) return (u64)(s64)tr;
         dp = (struct sockaddr *)&ss;
     }
+    /* Bounded, but never shortened: a datagram that does not fit is refused
+     * (EMSGSIZE, by the host), not sent truncated -- so the whole buffer has
+     * to be there, which is what the copy would find out anyway. Judged after
+     * the address, as __sys_sendto copies that in first and the protocol
+     * copies the data last (msg_import keeps the same order). */
+    if (len && rw_room(c, a1, len, ACC_READ) < len) {
+        fdheld_close(dfd);
+        return (u64)(s64)-EFAULT;
+    }
+    GIovec g = { a1, len };
     /* A reconfiguring rtnetlink request from a guest with a faked network
      * namespace: note it, so the kernel's refusal becomes an ack on receive. */
-    if (len) nlr_note_request(c->m, (int)a0, buf, len);
-    ssize_t n = sendto((int)a0, buf, len, (int)a3, dp, sl);
-    u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
-    free(buf);
+    nlr_note_gvec(c, (int)a0, &g, 1);
+    /* MSG_ZEROCOPY has the socket go on referencing the pages after the call
+     * returns, so those have to be the guest's own (msg_import has the rest). */
+    int zc = (int)a3 & MSG_ZEROCOPY;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, zc ? XFER_LEND : 0, NULL, &x);
+    if (r == 0 && zc && x.stage) { xfer_end(c, &x, 0); r = -ENOBUFS; }
+    if (r == 0 && (r = xfer_send_whole((int)a0, &x, len)) < 0) xfer_end(c, &x, 0);
+    if (r < 0) { fdheld_close(dfd); return (u64)(s64)r; }
+    ssize_t n;
+    if (x.n == 1) {
+        n = sendto((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (int)a3, dp, sl);
+    } else {
+        struct msghdr mh;
+        memset(&mh, 0, sizeof mh);
+        mh.msg_name = dp;
+        mh.msg_namelen = sl;
+        mh.msg_iov = x.iov;
+        mh.msg_iovlen = (size_t)x.n;
+        n = sendmsg((int)a0, &mh, (int)a3);
+    }
+    u64 e = xfer_finish(c, &x, n);   /* before the close(2) below */
     fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return e;
 }
@@ -409,29 +444,48 @@ SYSDEF(recvfrom) {
     /* Clamped only: shortening the buffer would truncate the datagram the host
      * hands over -- and it is gone once received -- while a guest that names
      * more room than it has is still entitled to a datagram that fits in what
-     * it does have, so the room cannot be demanded up front either. */
+     * it does have, so the room cannot be demanded up front either. What it
+     * does not have is handed to the host as an iovec over address 0, where
+     * the host kernel's copy stops exactly where the guest's kernel would
+     * (msg_import has the whole story); this used to allocate everything the
+     * guest named before the socket had anything to deliver. */
     size_t len = rw_count(a2);
-    u8 *buf = malloc(len ? len : 1);
-    if (!buf) return (u64)(s64)-ENOMEM;
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    GIovec g = { a1, room };
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, room < len ? XFER_LEND : 0, NULL, &x);
+    if (r < 0) return (u64)(s64)r;
+    if (room < len && x.total == room && x.n < XFER_IOV) {
+        x.iov[x.n].iov_base = NULL;           /* lent, so iov[] has the room */
+        x.iov[x.n].iov_len = len - room;
+        x.n++;
+    }
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
-    ssize_t n = recvfrom((int)a0, buf, len, (int)a3, (struct sockaddr *)&ss, &sl);
-    if (n < 0) { u64 e = host_err(); free(buf); return e; }
+    ssize_t n;
+    if (x.n == 1) {
+        n = recvfrom((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (int)a3,
+                     (struct sockaddr *)&ss, &sl);
+    } else {
+        struct msghdr mh;
+        memset(&mh, 0, sizeof mh);
+        mh.msg_name = &ss;
+        mh.msg_namelen = sl;
+        mh.msg_iov = x.iov;
+        mh.msg_iovlen = (size_t)x.n;
+        n = recvmsg((int)a0, &mh, (int)a3);
+        sl = mh.msg_namelen;
+    }
+    u64 e = xfer_finish(c, &x, n);
+    if ((s64)e < 0) return e;
     /* Turn the refusal of a request against a faked network namespace into the
      * kernel's own ack, before the guest sees the reply. MSG_TRUNC reports the
      * untruncated length, so clamp to what the buffer actually holds. */
-    if (n > 0)
-        nlr_fix_reply(c->m, (int)a0, buf,
-                      (size_t)n < len ? (size_t)n : len, (int)a3 & MSG_PEEK);
-    /* Copy only what the buffer holds -- with MSG_TRUNC n is the untruncated
-     * datagram length, which exceeds both the bounce allocation and the guest
-     * buffer -- but still report n, as the kernel does. */
-    size_t got = (size_t)n < len ? (size_t)n : len;
-    if (n > 0 && copy_to_guest(c, a1, buf, got) < 0) { free(buf); return (u64)(s64)-EFAULT; }
-    free(buf);
-    u64 e = addr_out(c, a4, a5, &ss, sl, 1);
-    if ((s64)e < 0) return e;
-    return (u64)n;
+    if (n > 0) nlr_fix_gvec(c, (int)a0, &g, 1, (size_t)n < room ? (size_t)n : room,
+                            (int)a3 & MSG_PEEK);
+    u64 ae = addr_out(c, a4, a5, &ss, sl, 1);
+    if ((s64)ae < 0) return ae;
+    return e;
 }
 
 SYSDEF(shutdown) {
@@ -472,9 +526,9 @@ static u64 sockopt_attach_fprog(CPU *c, int fd, int optname, const u8 *gopt,
     return ret;
 }
 
-/* The option value once it is staged host-side. Split out from the syscall so
- * the staging -- a heap allocation for anything the stack buffer cannot hold --
- * has one place to be released, whichever of the branches answers. */
+/* The option value once it is staged host-side: all of it for a generic
+ * option (a longer one goes to sockopt_set_large instead), the head of it --
+ * everything they read -- for the ones translated here. */
 static u64 sockopt_set(CPU *c, u64 a0, u64 a1, u64 a2, const u8 *buf, size_t len) {
     /* Literal guest option values (asm-generic; the host macros match on x86
      * and arm, but the guest ABI is what is being decoded here). */
@@ -512,6 +566,60 @@ static u64 sockopt_set(CPU *c, u64 a0, u64 a1, u64 a2, const u8 *buf, size_t len
     return setsockopt((int)a0, (int)a1, (int)a2, buf, (socklen_t)len) < 0 ? host_err() : 0;
 }
 
+/* The options sockopt_set translates rather than hands through: each reads a
+ * fixed struct of its own and no more, and judges the length before it does. */
+static int sockopt_is_fprog(int level, int name) {
+    return level == SOL_SOCKET && (name == 26 || name == 51);
+}
+static int sockopt_translated(int level, int name) {
+    return sockopt_is_fprog(level, name) ||
+           ((SO_RCVTIMEO != 20 || sizeof(struct timeval) != 16) &&
+            level == SOL_SOCKET && (name == 20 || name == 21));
+}
+
+/* A generic option value past the stack staging: handed to the host in the
+ * guest's own pages when they are one run of host memory (sys.h, GuestXfer),
+ * and otherwise staged -- no more than XFER_STAGE_MAX of it, in front of a
+ * guard (guardbuf_map, sys.h). Staging all of it, as this used to, let a guest
+ * name INT_MAX bytes of untouched pages and have the emulator commit that
+ * much copying them in, for an option a kernel reads four bytes of. Should the
+ * kernel read past what was staged while the guest has more, the option is
+ * one that really takes it all -- a netfilter table, which the kernel then
+ * allocates as much for itself -- and it is staged whole and asked again: the
+ * copy-in happens before anything is applied, so the first attempt changed
+ * nothing. */
+static u64 sockopt_set_large(CPU *c, int fd, int level, int name, u64 va,
+                             size_t len) {
+    size_t room = rw_room(c, va, len, ACC_READ);
+    if (room == len) {
+        GIovec g = { va, len };
+        GuestXfer x;
+        int r = xfer_begin(c, fd, &g, 1, 0, XFER_LEND, NULL, &x);
+        if (r < 0) return (u64)(s64)r;
+        if (x.n == 1 && !x.stage && x.total == len) {
+            int rr = setsockopt(fd, level, name, x.iov[0].iov_base, (socklen_t)len);
+            u64 e = rr < 0 ? host_err() : 0;
+            xfer_end(c, &x, 0);
+            return e;
+        }
+        xfer_end(c, &x, 0);
+    }
+    size_t head = room < XFER_STAGE_MAX ? room : XFER_STAGE_MAX;
+    for (;;) {
+        GuardBuf ob;
+        u8 *p = guardbuf_map(&ob, head, len);
+        if (!p) return (u64)(s64)-ENOMEM;
+        if (head && copy_from_guest(c, p, va, head) < 0) {
+            guardbuf_free(&ob);
+            return (u64)(s64)-EFAULT;
+        }
+        int err = setsockopt(fd, level, name, p, (socklen_t)len) < 0 ? errno : 0;
+        guardbuf_free(&ob);
+        if (err == EFAULT && head < room) { head = room; continue; }
+        return err ? (u64)(s64)-err : 0;
+    }
+}
+
 SYSDEF(setsockopt) {
     /* optlen reaches the kernel as an int and a negative one is EINVAL before
      * anything else is looked at (do_sock_setsockopt). Reading the register as
@@ -521,23 +629,21 @@ SYSDEF(setsockopt) {
      * a guest-visible one. Netfilter's table replace and a large
      * MCAST_MSFILTER are the option values that reach that size; the kernel
      * bounds them by its own optmem_max budget and answers ENOBUFS, which it
-     * can only do once it is handed what the guest sent.
-     *
-     * So stage what the guest actually passed: on the stack while it fits
-     * there, on the heap above that. The guest must back all of it -- the copy
-     * would find that out one page later anyway -- and demanding it first is
-     * what keeps the allocation bounded by the guest's own memory instead of
-     * by a length it merely named (sendto does the same; rw_room in sys.h says
-     * why). */
+     * can only do once it is handed what the guest sent. */
     s32 optlen = (s32)a4;
     if (optlen < 0) return (u64)(s64)-EINVAL;
     size_t len = (size_t)optlen;
     u8 sbuf[4096];
-    u8 *buf = sbuf;
     if (len > sizeof sbuf) {
-        if (rw_room(c, a3, len, ACC_READ) < len) return (u64)(s64)-EFAULT;
-        buf = malloc(len);
-        if (!buf) return (u64)(s64)-ENOMEM;
+        /* A translated option costs only its own struct, and a filter
+         * program's length is judged before a byte is read (EINVAL for
+         * anything but sizeof(sock_fprog), whatever is at the pointer). */
+        if (sockopt_is_fprog((int)a1, (int)a2)) return (u64)(s64)-EINVAL;
+        if (sockopt_translated((int)a1, (int)a2)) {
+            if (copy_from_guest(c, sbuf, a3, 16) < 0) return (u64)(s64)-EFAULT;
+            return sockopt_set(c, a0, a1, a2, sbuf, len);
+        }
+        return sockopt_set_large(c, (int)a0, (int)a1, (int)a2, a3, len);
     }
     /* A zero-length option value stages nothing, and nothing can be read back
      * out of the staging either -- the optlen handed to the host is what makes
@@ -546,13 +652,46 @@ SYSDEF(setsockopt) {
      * `len` bytes through, and untouched stack is not that. (The 32-bit build
      * is where gcc notices, and it is right to.) */
     if (!len) sbuf[0] = 0;
-    else if (copy_from_guest(c, buf, a3, len) < 0) {
-        if (buf != sbuf) free(buf);
-        return (u64)(s64)-EFAULT;
+    else if (copy_from_guest(c, sbuf, a3, len) < 0) return (u64)(s64)-EFAULT;
+    return sockopt_set(c, a0, a1, a2, sbuf, len);   /* errno consumed already */
+}
+
+/* A generic option read back into a buffer past the stack staging -- the
+ * mirror of sockopt_set_large: straight into the guest's pages when they are
+ * one run of host memory, otherwise into no more than XFER_STAGE_MAX in front
+ * of a guard (guardbuf_map, sys.h), and staged whole only for an option that
+ * turns out to write more (a netfilter table's entries, which the kernel
+ * holds that much of itself). `len` is what the kernel may write, already
+ * bounded by the guest's buffer. Returns the length the kernel reported --
+ * never past what it can have written, the check the stack path makes too --
+ * or -errno. */
+static s64 sockopt_get_large(CPU *c, int fd, int level, int name, u64 va,
+                             size_t len) {
+    GIovec g = { va, len };
+    GuestXfer x;
+    int r = xfer_begin(c, fd, &g, 1, 1, XFER_LEND, NULL, &x);
+    if (r < 0) return r;
+    if (x.n == 1 && !x.stage && x.total == len) {
+        socklen_t sl = (socklen_t)len;
+        s64 e = getsockopt(fd, level, name, x.iov[0].iov_base, &sl) < 0 ? -errno : 0;
+        xfer_end(c, &x, 0);
+        if (e < 0) return e;
+        return (size_t)sl > len ? (s64)len : (s64)sl;
     }
-    u64 r = sockopt_set(c, a0, a1, a2, buf, len);   /* errno consumed already */
-    if (buf != sbuf) free(buf);
-    return r;
+    xfer_end(c, &x, 0);
+    size_t head = len < XFER_STAGE_MAX ? len : XFER_STAGE_MAX;
+    for (;;) {
+        GuardBuf ob;
+        u8 *p = guardbuf_map(&ob, head, len);
+        if (!p) return -ENOMEM;
+        socklen_t sl = (socklen_t)len;
+        int err = getsockopt(fd, level, name, p, &sl) < 0 ? errno : 0;
+        if (err == EFAULT && head < len) { guardbuf_free(&ob); head = len; continue; }
+        if (!err && (size_t)sl > head) sl = (socklen_t)head;
+        if (!err && sl && copy_to_guest(c, va, p, sl) < 0) err = EFAULT;
+        guardbuf_free(&ob);
+        return err ? -err : (s64)sl;
+    }
 }
 
 SYSDEF(getsockopt) {
@@ -642,7 +781,7 @@ SYSDEF(getsockopt) {
         if (copy_to_guest(c, a4, &ninsn, 4) < 0) return (u64)(s64)-EFAULT;
         return 0;
     }
-    /* Stage the whole of what the guest asked for, not the first 4 KB of it.
+    /* Answer the whole of what the guest asked for, not the first 4 KB of it.
      * The kernel writes as much of the option as its own length allows and
      * reports what it wrote, so a fixed ceiling here silently truncated any
      * option value larger than it and told the guest the short answer was the
@@ -653,23 +792,28 @@ SYSDEF(getsockopt) {
      * stops at the same page and answers EFAULT, which the writeback below
      * still produces -- and allocating for it would let a guest name a length
      * it has no memory for and leave the emulator to find the room (rw_room,
-     * sys.h). The stack buffer stays the floor, so nothing that fitted before
-     * allocates now. */
+     * sys.h). Past the stack buffer, the answer goes straight into the
+     * guest's pages, or through a bounded staging (sockopt_get_large); the
+     * stack buffer stays the floor, so nothing that fitted before changes.
+     * SO_PEERCRED stays on the stack whatever was asked: it is 12 bytes, and
+     * its fields are rewritten below before the guest may see them. */
     u8 sbuf[4096];
     u8 *buf = sbuf;
     size_t cap = (size_t)(u32)glen;
+    int peercred = (int)a1 == SOL_SOCKET && (int)a2 == SO_PEERCRED;
     if (cap > sizeof sbuf) {
         size_t room = rw_room(c, a3, cap, ACC_WRITE);
         if (cap > room) cap = room;
-        if (cap < sizeof sbuf) cap = sizeof sbuf;
-        if (cap > sizeof sbuf && !(buf = malloc(cap))) return (u64)(s64)-ENOMEM;
+        if (cap < sizeof sbuf || peercred) cap = sizeof sbuf;
+        if (cap > sizeof sbuf) {
+            s64 r = sockopt_get_large(c, (int)a0, (int)a1, (int)a2, a3, cap);
+            if (r < 0) return (u64)r;
+            u32 real = (u32)r;
+            return copy_to_guest(c, a4, &real, 4) < 0 ? (u64)(s64)-EFAULT : 0;
+        }
     }
     socklen_t sl = (socklen_t)cap;
-    if (getsockopt((int)a0, (int)a1, (int)a2, buf, &sl) < 0) {
-        u64 e = host_err();
-        if (buf != sbuf) free(buf);
-        return e;
-    }
+    if (getsockopt((int)a0, (int)a1, (int)a2, buf, &sl) < 0) return host_err();
     /* Never take the reported length past the staging. Options answer in the
      * units they were asked in -- all but SO_GET_FILTER, which is handled
      * above precisely because it does not -- and this is the check that keeps
@@ -705,12 +849,10 @@ SYSDEF(getsockopt) {
             memcpy(buf + 8, &gid, 4);
         }
     }
-    u64 e = 0;
     u32 real = sl;
-    if (sl && copy_to_guest(c, a3, buf, sl) < 0) e = (u64)(s64)-EFAULT;
-    else if (copy_to_guest(c, a4, &real, 4) < 0) e = (u64)(s64)-EFAULT;
-    if (buf != sbuf) free(buf);
-    return e;
+    if (sl && copy_to_guest(c, a3, buf, sl) < 0) return (u64)(s64)-EFAULT;
+    if (copy_to_guest(c, a4, &real, 4) < 0) return (u64)(s64)-EFAULT;
+    return 0;
 }
 
 /* guest msghdr (LP64): {name*, namelen u32, pad, iov*, iovlen u64, control*,
@@ -979,28 +1121,98 @@ static size_t cmsg_h2g(const struct Machine *m, const u8 *hb, size_t hlen,
     return goff;
 }
 
-/* The bytes a gathered vector carries: one message, however many segments the
- * guest spread it over. */
-static size_t iov_total(const struct iovec *iov, int cnt) {
-    size_t n = 0;
-    for (int i = 0; i < cnt; i++) n += iov[i].iov_len;
-    return n;
+/* One sendmsg/recvmsg element on its way to the host: the guest's segments as
+ * the transfer moves them, the transfer itself (sys.h, GuestXfer), the staged
+ * control buffer and the destination's pinned parent directory. msg_import
+ * fills it and msg_release takes down whatever it set up, on every path; a
+ * receive hands its bytes back through xfer_end first (recvmsg_writeback). */
+typedef struct MsgImport {
+    GIovec gi[1024];
+    int nseg;
+    struct iovec iov[XFER_IOV];
+    GuestXfer x;
+    int xfer;                     /* x is live */
+    u8 *ctrl;                     /* host-layout control buffer */
+    size_t ctrl_cap;
+    int dfd;                      /* unix_path_in's directory, or -1 */
+} MsgImport;
+
+static void msg_release(CPU *c, MsgImport *mi) {
+    if (mi->xfer) xfer_end(c, &mi->x, 0);
+    mi->xfer = 0;
+    free(mi->ctrl);
+    mi->ctrl = NULL;
+    fdheld_close(mi->dfd);   /* the pin's parent (unix_path_in) */
+    mi->dfd = -1;
 }
 
-/* Import a guest msghdr into a host one. `gbase_out` comes back holding the
- * guest base of every segment, taken from the single reading of the guest's
- * iovec array below: a receive has to write the data back to those bases after
- * the host call, and re-reading the guest array to find them again would be
- * reading a different array -- a sibling thread sharing the address space can
- * rewrite it (or unmap it) while the call is parked. import_iovec in the
- * kernel snapshots it once and never looks again. Every out-parameter is the
- * caller's to free. */
-static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
-                      struct iovec **iov_out, u64 **gbase_out, u8 **bounce_out,
-                      struct sockaddr_storage *ss, u8 **ctrl_out,
-                      size_t *ctrl_cap_out, int for_send, int *dirfd_out) {
-    *ctrl_out = NULL;
-    *ctrl_cap_out = 0;
+/* The probe msg_import makes before staging a large send's control buffer:
+ * sendmsg with the length and a buffer that is not there. ____sys_sendmsg
+ * sizes the control buffer against the socket's optmem budget before it
+ * copies a byte of it -- ENOBUFS, and the message is not looked at further --
+ * and the copy then faults on the missing buffer, so nothing is ever sent.
+ * EFAULT therefore means the kernel would take this much control data;
+ * anything else is its answer to the call as it stands.
+ *
+ * All but EINVAL, which only a compat host gives: a 32-bit emulator on a
+ * 64-bit kernel is served by cmsghdr_from_user_compat_to_kern, which walks the
+ * elements before it sizes anything, and an absent buffer walks as none at
+ * all. The guest's kernel is a 64-bit one, so its budget is what counts, and
+ * there it has to be read (net.core.optmem_max -- the per-socket figure the
+ * kernel checks against, less what the socket already holds, which a probe
+ * would have seen and a read cannot); where even that cannot be read, a
+ * budget of XFER_STAGE_MAX, some sixteen times the largest default any
+ * kernel has shipped, stands in for it rather than none. */
+static long optmem_max(void) {
+    char buf[32];
+    long v = -1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open("/proc/sys/net/core/optmem_max", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            char *e;
+            long p = strtol(buf, &e, 10);
+            if (e != buf && p > 0) v = p;
+        }
+    }
+    fdwin_leave();
+    return v;
+}
+static int ctrl_probe(int fd, size_t cl) {
+    struct msghdr p;
+    memset(&p, 0, sizeof p);
+    p.msg_controllen = cl;
+    if (sendmsg(fd, &p, MSG_DONTWAIT) >= 0 || errno == EFAULT) return 0;
+    if (errno != EINVAL) return -errno;
+    long om = optmem_max();
+    if (om < 0) om = XFER_STAGE_MAX;
+    return cl > (size_t)om ? -ENOBUFS : 0;
+}
+
+/* Import a guest msghdr into a host one, into `mi`. The guest's iovec array is
+ * read exactly once, and mi->gi keeps that snapshot: a receive writes its data
+ * back to those bases after the host call, and re-reading the guest array to
+ * find them again would be reading a different array -- a sibling thread
+ * sharing the address space can rewrite it (or unmap it) while the call is
+ * parked. import_iovec in the kernel snapshots it once and never looks again.
+ *
+ * Checked in the order ____sys_sendmsg and the protocols meet them: the
+ * header and its iovec array, then the control buffer (its size, then its
+ * contents), then the destination address, and only then the data -- which a
+ * kernel copies last of all, inside the protocol. `sflags` is the send's flags
+ * argument (MSG_ZEROCOPY), `fd` the socket. 0 or -errno; msg_release in
+ * either case. */
+static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
+                      struct sockaddr_storage *ss, int for_send, int sflags,
+                      MsgImport *mi) {
+    mi->nseg = 0;
+    mi->xfer = 0;
+    mi->ctrl = NULL;
+    mi->ctrl_cap = 0;
+    mi->dfd = -1;
     if (copy_from_guest(c, g, va, sizeof *g) < 0) return -EFAULT;
     memset(h, 0, sizeof *h);
     /* msg_namelen is an int, and __copy_msghdr settles it before the iovec:
@@ -1036,21 +1248,20 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
      * and 2^32+1 became a one-segment send, where a kernel refuses both.
      * (readv/writev are the opposite case and deliberately do narrow: their
      * vlen reaches the kernel's own `unsigned nr_segs`, so 2^32 really is
-     * zero segments there. See iov_from_guest in sys_file.c.) */
+     * zero segments there. See iov_import in sys_file.c.) */
     if (g->msg_iovlen > 1024) return -EMSGSIZE;
     unsigned cnt = (unsigned)g->msg_iovlen;
-    GIovec gi[1024];
+    GIovec *gi = mi->gi;
     if (cnt && copy_from_guest(c, gi, g->msg_iov, sizeof(GIovec) * cnt) < 0) return -EFAULT;
     /* Bound every segment on its own, not just the sum: iov_len is a guest u64,
      * so lengths chosen to wrap the host-width total would pass a sum-only check
-     * while each stays huge, and the per-segment copy below uses the unclamped
-     * length. The bounds themselves are __import_iovec's own -- a segment whose
-     * length is negative as an ssize_t is EINVAL, and the running total is
-     * CLAMPED to MAX_RW_COUNT rather than refused, so a vector past that is a
-     * short transfer and not an error. The flat 16 MiB ceiling that used to
-     * stand here refused both, which made a sendmsg of a large buffer EINVAL
-     * where a writev of the same buffer on the same fd went straight through
-     * (iov_from_guest, sys_file.c, which follows the same rule). */
+     * while each stays huge. The bounds themselves are __import_iovec's own -- a
+     * segment whose length is negative as an ssize_t is EINVAL, and the running
+     * total is CLAMPED to MAX_RW_COUNT rather than refused, so a vector past
+     * that is a short transfer and not an error. The flat 16 MiB ceiling that
+     * used to stand here refused both, which made a sendmsg of a large buffer
+     * EINVAL where a writev of the same buffer on the same fd went straight
+     * through (iov_import, sys_file.c, which follows the same rule). */
     u64 total = 0;
     for (unsigned i = 0; i < cnt; i++) {
         if ((s64)gi[i].iov_len < 0) return -EINVAL;
@@ -1058,40 +1269,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
             gi[i].iov_len = A64_MAX_RW_COUNT - total;
         total += gi[i].iov_len;
     }
-    /* A send must have all of it in guest memory: the per-segment copy below
-     * would find that out, but only after allocating for the whole vector, so
-     * demand it up front as sendto does. That is also what bounds the staging
-     * by the guest's own memory rather than by a length it merely named. A
-     * receive cannot demand it -- shortening the vector would truncate a
-     * datagram that is gone once received, and a guest naming more room than it
-     * has is still entitled to one that fits in what it does have (recvfrom
-     * makes the same distinction). */
-    if (for_send)
-        for (unsigned i = 0; i < cnt; i++)
-            if (gi[i].iov_len && rw_room(c, gi[i].iov_base,
-                                         (size_t)gi[i].iov_len, ACC_READ)
-                                     < gi[i].iov_len)
-                return -EFAULT;
-    u8 *bounce = malloc(total ? (size_t)total : 1);
-    struct iovec *iov = malloc(sizeof(struct iovec) * (cnt ? cnt : 1));
-    u64 *gbase = malloc(sizeof(u64) * (cnt ? cnt : 1));
-    if (!bounce || !iov || !gbase) {
-        free(bounce); free(iov); free(gbase); return -ENOMEM;
-    }
-    size_t off = 0;
-    for (unsigned i = 0; i < cnt; i++) {
-        iov[i].iov_base = bounce + off;
-        iov[i].iov_len = gi[i].iov_len;
-        gbase[i] = gi[i].iov_base;
-        if (for_send && gi[i].iov_len &&
-            copy_from_guest(c, bounce + off, gi[i].iov_base, gi[i].iov_len) < 0) {
-            free(bounce); free(iov); free(gbase); return -EFAULT;
-        }
-        off += gi[i].iov_len;
-    }
-    h->msg_iov = iov;
-    h->msg_iovlen = cnt;
-    /* Ancillary data is staged too, and its size is the guest's to choose: the
+    /* Ancillary data is staged, and its size is the guest's to choose: the
      * kernel bounds msg_controllen only by INT_MAX (____sys_sendmsg /
      * ____sys_recvmsg refuse anything past it) and, on a send, by the socket's
      * own optmem budget, which answers ENOBUFS. The fixed 4 KB staging that
@@ -1106,9 +1284,7 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
      * length is only the capacity the kernel may fill, so clamp rather than
      * refuse, which is the same answer for any buffer a guest can actually
      * back and keeps the size_t cast below from truncating on an ILP32 host. */
-    if (for_send && g->msg_controllen > INT_MAX) {
-        free(bounce); free(iov); free(gbase); return -ENOBUFS;
-    }
+    if (for_send && g->msg_controllen > INT_MAX) return -ENOBUFS;
     /* And a send then copies the whole of the buffer in, so a non-zero length
      * the guest cannot back is EFAULT -- msg_control == NULL included, which
      * used to be taken for "no ancillary data" and sent the message. A receive
@@ -1119,8 +1295,20 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
         size_t cl = g->msg_controllen > INT_MAX ? (size_t)INT_MAX
                                                 : (size_t)g->msg_controllen;
         if (for_send) {
+            /* The optmem budget comes first: the kernel sizes the control
+             * buffer against it (sock_kmalloc) before it copies a byte, so a
+             * length past it is ENOBUFS whatever the pointer holds -- and it
+             * is also what bounds the staging below, which a guest could
+             * otherwise size to INT_MAX, twice over, out of pages that cost
+             * it nothing. Asked of the host kernel for anything the small
+             * path would not stage anyway (ctrl_probe); the guest's own
+             * length is what is judged, as its kernel would judge it. */
+            if (cl > XFER_BOUNCE_MAX) {
+                int pr = ctrl_probe(fd, cl);
+                if (pr < 0) return pr;
+            }
             /* The guest must back all of it, which is what bounds the
-             * allocation (as for the iovecs above); the host kernel then
+             * allocation (as for the iovecs below); the host kernel then
              * applies its own optmem ceiling to the converted buffer. Stage
              * the guest's bytes, then rebuild them in the host's cmsghdr
              * layout -- the two differ on an ILP32 host, where the host's
@@ -1133,31 +1321,22 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
              * header), while the conversion writes that element padded. Sizing
              * the staging at the guest's length exactly made such a message
              * EINVAL here where the host sends it. */
-            if (rw_room(c, g->msg_control, cl, ACC_READ) < cl) {
-                free(bounce); free(iov); free(gbase); return -EFAULT;
-            }
+            if (rw_room(c, g->msg_control, cl, ACC_READ) < cl) return -EFAULT;
             /* One guest alignment step of slack: that is the most the padded
              * last element can run past the guest's own length, and the host's
              * own step is never the larger of the two. */
             size_t hcap = cl + (size_t)GCMSG_ALIGN(1);
             u8 *gctrl = malloc(cl);
             u8 *hctrl = calloc(1, hcap);
-            if (!gctrl || !hctrl) {
-                free(gctrl); free(hctrl);
-                free(bounce); free(iov); free(gbase); return -ENOMEM;
-            }
+            if (!gctrl || !hctrl) { free(gctrl); free(hctrl); return -ENOMEM; }
             if (copy_from_guest(c, gctrl, g->msg_control, cl) < 0) {
-                free(gctrl); free(hctrl);
-                free(bounce); free(iov); free(gbase); return -EFAULT;
+                free(gctrl); free(hctrl); return -EFAULT;
             }
             ssize_t hl = cmsg_g2h(c->m, gctrl, cl, hctrl, hcap);
             free(gctrl);
-            if (hl < 0) {
-                free(hctrl);
-                free(bounce); free(iov); free(gbase); return -EINVAL;
-            }
-            *ctrl_out = hctrl;
-            *ctrl_cap_out = hcap;
+            if (hl < 0) { free(hctrl); return -EINVAL; }
+            mi->ctrl = hctrl;
+            mi->ctrl_cap = hcap;
             h->msg_control = hctrl;
             h->msg_controllen = (size_t)hl;
         } else {
@@ -1167,66 +1346,109 @@ static int msg_import(CPU *c, u64 va, GMsghdr *g, struct msghdr *h,
              * MSG_CTRUNC either way -- by the kernel when the buffer is short,
              * and by cmsg_h2g when an ILP32 host's more compact elements expand
              * into the guest's layout, exactly as the kernel reports a control
-             * buffer it outgrew. */
+             * buffer it outgrew -- and by the staging cap, which is orders of
+             * magnitude past all a kernel ever delivers with one message
+             * (SCM_MAX_FD descriptors, a credential, a security label, the
+             * timestamps and the IPv6 option headers together come to a few
+             * KiB). */
             size_t room = rw_room(c, g->msg_control, cl, ACC_WRITE);
             if (cl > room) cl = room;
+            if (cl > XFER_STAGE_MAX) cl = XFER_STAGE_MAX;
             if (cl) {
                 u8 *hctrl = calloc(1, cl);
-                if (!hctrl) {
-                    free(bounce); free(iov); free(gbase); return -ENOMEM;
-                }
-                *ctrl_out = hctrl;
-                *ctrl_cap_out = cl;
+                if (!hctrl) return -ENOMEM;
+                mi->ctrl = hctrl;
+                mi->ctrl_cap = cl;
                 h->msg_control = hctrl;
                 h->msg_controllen = cl;
             }
         }
     }
-    h->msg_flags = g->msg_flags;
-    *iov_out = iov;
-    *gbase_out = gbase;
-    *bounce_out = bounce;
-    /* Translate an AF_UNIX destination path last: unix_path_in may open a dirfd
-     * (for a path that overflows sun_path) which the caller closes after the
-     * send, so doing it after every fallible step above means an error can never
-     * leak that fd. dirfd_out is left -1 by unix_path_in on any error. */
+    /* Translate an AF_UNIX destination path: after the control buffer, which
+     * the protocol parses before it looks for its peer, and before the data,
+     * which it copies last. unix_path_in may open a dirfd (for a path that
+     * overflows sun_path), which msg_release closes; it leaves -1 on error. */
     if (for_send && h->msg_name) {
         socklen_t sl = h->msg_namelen;
-        int tr = unix_path_in(c, ss, &sl, 1, dirfd_out);
-        if (tr < 0) {
-            free(iov); free(gbase); free(bounce);
-            free(*ctrl_out); *ctrl_out = NULL; *ctrl_cap_out = 0;
-            return tr;
-        }
+        int tr = unix_path_in(c, ss, &sl, 1, &mi->dfd);
+        if (tr < 0) return tr;
         h->msg_namelen = sl;
     }
-    return (int)cnt;
+    /* A send must have all of its data in guest memory, as a datagram's copy
+     * finds out before anything is sent; that is also what bounds the transfer
+     * by the guest's own memory rather than by a length it merely named. A
+     * receive cannot demand it -- a guest naming more room than it has is
+     * still entitled to a datagram that fits in what it does have -- so there
+     * the vector is cut where the guest's memory stops, and the rest of it is
+     * handed to the host as an iovec over address 0, which no process maps
+     * (vm.mmap_min_addr). The host kernel's copy then stops exactly where the
+     * guest's own kernel would, and answers as it would: the bytes of a stream
+     * up to there, EFAULT for a datagram that did not fit -- and the datagram
+     * gone either way, which is what a kernel does with one it could not
+     * deliver. This used to receive the whole of what was named into a bounce
+     * buffer that size, before anything had even arrived. */
+    size_t backed = 0;
+    unsigned nseg = cnt;
+    if (for_send) {
+        for (unsigned i = 0; i < cnt; i++)
+            if (gi[i].iov_len && rw_room(c, gi[i].iov_base, (size_t)gi[i].iov_len,
+                                         ACC_READ) < gi[i].iov_len)
+                return -EFAULT;
+        backed = (size_t)total;
+    } else {
+        for (unsigned i = 0; i < cnt; i++) {
+            size_t want = (size_t)gi[i].iov_len;
+            size_t room = want ? rw_room(c, gi[i].iov_base, want, ACC_WRITE) : 0;
+            gi[i].iov_len = room;
+            backed += room;
+            if (room < want) { nseg = i + 1; break; }
+        }
+    }
+    mi->nseg = (int)nseg;
+    int zc = for_send && (sflags & MSG_ZEROCOPY);
+    int cut = backed < total;
+    int r = xfer_begin(c, fd, gi, (int)nseg, !for_send, zc || cut ? XFER_LEND : 0,
+                       mi->iov, &mi->x);
+    if (r < 0) return r;
+    mi->xfer = 1;
+    if (for_send && (r = xfer_send_whole(fd, &mi->x, backed)) < 0) return r;
+    /* A zero-copy send leaves its pages referenced by the socket after the
+     * call returns, until the peer has them: lent guest pages are exactly
+     * that (the guest must not touch them until notified, as on a kernel),
+     * but a staged part would be a buffer of ours, freed and reused while
+     * the kernel still transmits from it. Refuse it with the ENOBUFS a
+     * zero-copy send may always get (the notification budget), which a
+     * caller answers by sending with a copy. Only a vector past a thousand
+     * separate mappings gets here. */
+    if (zc && mi->x.stage) return -ENOBUFS;
+    if (cut && mi->x.total == backed && mi->x.n < XFER_IOV) {
+        mi->x.iov[mi->x.n].iov_base = NULL;
+        mi->x.iov[mi->x.n].iov_len = (size_t)(total - backed);
+        mi->x.n++;
+    }
+    h->msg_iov = mi->x.iov;
+    h->msg_iovlen = (size_t)mi->x.n;
+    h->msg_flags = g->msg_flags;
+    return 0;
 }
 
 SYSDEF(sendmsg) {
     if (nl_is_fd(c->m, (int)a0)) return nl_sendmsg(c, (int)a0, a1);
     GMsghdr g;
     struct msghdr h;
-    struct iovec *iov;
-    u64 *gbase;
-    u8 *bounce;
     struct sockaddr_storage ss;
-    u8 *ctrl;
-    size_t ccap;
-    int dfd = -1;
-    int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, &ctrl, &ccap, 1, &dfd);
-    if (cnt < 0) return (u64)(s64)cnt;   /* dfd == -1 on error: nothing to close */
+    MsgImport mi;
+    int r = msg_import(c, (int)a0, a1, &g, &h, &ss, 1, (int)a2, &mi);
+    if (r < 0) { msg_release(c, &mi); return (u64)(s64)r; }
     /* As in sendto: note a reconfiguring rtnetlink request from a guest with a
-     * faked network namespace. msg_import gathered every segment into the
-     * bounce buffer, in order, so the message is the whole of it -- reading
-     * only the first segment's worth missed a request whose netlink header
-     * straddled two of them, and the refusal it drew was then passed through
-     * where the guest was owed the ack. */
-    if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov_total(iov, cnt));
+     * faked network namespace. The message is the whole of the vector, in
+     * order -- reading only the first segment's worth missed a request whose
+     * netlink header straddled two of them, and the refusal it drew was then
+     * passed through where the guest was owed the ack. */
+    nlr_note_gvec(c, (int)a0, mi.gi, mi.nseg);
     ssize_t n = sendmsg((int)a0, &h, (int)a2);
-    u64 e = n < 0 ? host_err() : (u64)n;   /* before the close(2) below */
-    free(iov); free(gbase); free(bounce); free(ctrl);
-    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
+    u64 e = n < 0 ? host_err() : (u64)n;   /* before the release below */
+    msg_release(c, &mi);
     return e;
 }
 
@@ -1238,19 +1460,20 @@ SYSDEF(sendmsg) {
  * what a kernel does with a datagram whose destination buffer faults: the data
  * is gone and the call reports EFAULT. Reporting success instead would tell
  * the guest bytes were delivered to memory that never received them. */
-static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
-                             struct iovec *iov, const u64 *gbase, u8 *bounce,
-                             struct sockaddr_storage *ss, u8 *ctrl,
-                             size_t ctrl_cap, ssize_t n) {
-    int cnt = (int)h->msg_iovlen;
-    ssize_t left = n;
-    size_t off = 0;
-    for (int i = 0; i < cnt && left > 0; i++) {
-        size_t chunk = (size_t)left < iov[i].iov_len ? (size_t)left : iov[i].iov_len;
-        if (chunk && copy_to_guest(c, gbase[i], bounce + off, chunk) < 0)
-            return -EFAULT;
-        off += iov[i].iov_len;
-        left -= (ssize_t)chunk;
+static int recvmsg_writeback(CPU *c, int fd, u64 hdr_va, GMsghdr *g,
+                             struct msghdr *h, MsgImport *mi,
+                             struct sockaddr_storage *ss, ssize_t n, int peek) {
+    /* The data: whatever of it was staged rather than received straight into
+     * the guest's pages goes back now (sys.h, xfer_end). */
+    mi->xfer = 0;
+    if (xfer_end(c, &mi->x, n > 0 ? (size_t)n : 0) < 0) return -EFAULT;
+    /* Turn the refusal of a request against a faked network namespace into
+     * the kernel's own ack, before the guest sees the reply. MSG_TRUNC reports
+     * the untruncated length, so clamp to what the buffer actually holds. */
+    if (n > 0) {
+        size_t held = 0;
+        for (int i = 0; i < mi->nseg; i++) held += (size_t)mi->gi[i].iov_len;
+        nlr_fix_gvec(c, fd, mi->gi, mi->nseg, (size_t)n < held ? (size_t)n : held, peek);
     }
     if (g->msg_name && h->msg_namelen) {
         socklen_t sl = h->msg_namelen;
@@ -1265,10 +1488,10 @@ static int recvmsg_writeback(CPU *c, u64 hdr_va, GMsghdr *g, struct msghdr *h,
     if (g->msg_control && h->msg_controllen) {
         /* Converted into what msg_import let the kernel write, which is also
          * what the guest's own buffer holds -- the two are the same number. */
-        u8 *gctrl = calloc(1, ctrl_cap ? ctrl_cap : 1);
+        u8 *gctrl = calloc(1, mi->ctrl_cap ? mi->ctrl_cap : 1);
         if (!gctrl) return -ENOMEM;
         int ctrunc = 0;
-        size_t gl = cmsg_h2g(c->m, ctrl, h->msg_controllen, gctrl, ctrl_cap,
+        size_t gl = cmsg_h2g(c->m, mi->ctrl, h->msg_controllen, gctrl, mi->ctrl_cap,
                              &ctrunc, fd_nofile_cap(c->m));
         int bad = gl && copy_to_guest(c, g->msg_control, gctrl, gl) < 0;
         free(gctrl);
@@ -1289,32 +1512,18 @@ SYSDEF(recvmsg) {
         return nlret;
     GMsghdr g;
     struct msghdr h;
-    struct iovec *iov;
-    u64 *gbase;
-    u8 *bounce;
     struct sockaddr_storage ss;
-    u8 *ctrl;
-    size_t ccap;
-    int cnt = msg_import(c, a1, &g, &h, &iov, &gbase, &bounce, &ss, &ctrl, &ccap, 0, NULL);
-    if (cnt < 0) return (u64)(s64)cnt;
+    MsgImport mi;
+    int r = msg_import(c, (int)a0, a1, &g, &h, &ss, 0, 0, &mi);
+    if (r < 0) { msg_release(c, &mi); return (u64)(s64)r; }
     ssize_t n = recvmsg((int)a0, &h, (int)a2);
     if (n < 0) {
         u64 e = host_err();
-        free(iov); free(gbase); free(bounce); free(ctrl);
+        msg_release(c, &mi);
         return e;
     }
-    /* Rewrite a faked-namespace refusal before the reply is scattered back to
-     * the guest. The received bytes are contiguous at the head of the bounce
-     * buffer (msg_import concatenates the iovecs in order), so the whole
-     * datagram is walkable regardless of how the caller split it. */
-    if (n > 0) {
-        size_t total = 0;
-        for (int i = 0; i < cnt; i++) total += iov[i].iov_len;
-        nlr_fix_reply(c->m, (int)a0, bounce,
-                      (size_t)n < total ? (size_t)n : total, (int)a2 & MSG_PEEK);
-    }
-    int wb = recvmsg_writeback(c, a1, &g, &h, iov, gbase, bounce, &ss, ctrl, ccap, n);
-    free(iov); free(gbase); free(bounce); free(ctrl);
+    int wb = recvmsg_writeback(c, (int)a0, a1, &g, &h, &mi, &ss, n, (int)a2 & MSG_PEEK);
+    msg_release(c, &mi);
     return wb < 0 ? (u64)(s64)wb : (u64)n;
 }
 
@@ -1327,6 +1536,7 @@ SYSDEF(sendmmsg) {
     unsigned vlen = (unsigned)a2;
     if (vlen > 1024) vlen = 1024;
     int sent = 0;
+    MsgImport mis, *mi = &mis;    /* one element at a time, reused */
     for (unsigned i = 0; i < vlen; i++) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
         /* Each element is a sendmsg, so a substituted netlink socket has to be
@@ -1342,18 +1552,18 @@ SYSDEF(sendmmsg) {
             sent++;
             continue;
         }
-        GMsghdr g; struct msghdr h; struct iovec *iov; u64 *gbase; u8 *bounce;
-        struct sockaddr_storage ss; u8 *ctrl; size_t ccap;
-        int dfd = -1;
-        int cnt = msg_import(c, entry, &g, &h, &iov, &gbase, &bounce, &ss, &ctrl, &ccap, 1, &dfd);
-        if (cnt < 0) return sent ? (u64)sent : (u64)(s64)cnt;   /* dfd == -1 */
+        GMsghdr g; struct msghdr h; struct sockaddr_storage ss;
+        int r = msg_import(c, (int)a0, entry, &g, &h, &ss, 1, (int)a3, mi);
+        if (r < 0) {
+            msg_release(c, mi);
+            return sent ? (u64)sent : (u64)(s64)r;
+        }
         /* As sendmsg: note a reconfiguring rtnetlink request from a guest whose
          * network namespace was faked, so its refusal can be rewritten. */
-        if (cnt > 0) nlr_note_request(c->m, (int)a0, bounce, iov_total(iov, cnt));
+        nlr_note_gvec(c, (int)a0, mi->gi, mi->nseg);
         ssize_t n = sendmsg((int)a0, &h, (int)a3);
-        u64 e = n < 0 ? host_err() : 0;    /* before the close(2) below */
-        free(iov); free(gbase); free(bounce); free(ctrl);
-        fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
+        u64 e = n < 0 ? host_err() : 0;    /* before the release below */
+        msg_release(c, mi);
         if (n < 0) return sent ? (u64)sent : e;
         u32 mlen = (u32)n;
         if (copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
@@ -1436,6 +1646,7 @@ SYSDEF(recvmmsg) {
         have_tmo = 1;
     }
     int got = 0;
+    MsgImport mis, *mi = &mis;    /* one element at a time, reused */
     for (unsigned i = 0; i < vlen; i++) {
         u64 entry = a1 + (u64)i * GMMSG_STRIDE;
         int mf = flags & ~MSG_WAITFORONE;
@@ -1464,29 +1675,25 @@ SYSDEF(recvmmsg) {
             got++;
             continue;
         }
-        GMsghdr g; struct msghdr h; struct iovec *iov; u64 *gbase; u8 *bounce;
-        struct sockaddr_storage ss; u8 *ctrl; size_t ccap;
-        int cnt = msg_import(c, entry, &g, &h, &iov, &gbase, &bounce, &ss, &ctrl, &ccap, 0, NULL);
-        if (cnt < 0) return got ? (u64)got : (u64)(s64)cnt;
+        GMsghdr g; struct msghdr h; struct sockaddr_storage ss;
+        int r = msg_import(c, (int)a0, entry, &g, &h, &ss, 0, 0, mi);
+        if (r < 0) {
+            msg_release(c, mi);
+            return got ? (u64)got : (u64)(s64)r;
+        }
         ssize_t n = recvmsg((int)a0, &h, mf);
         if (n < 0) {
             u64 e = host_err();
-            free(iov); free(gbase); free(bounce); free(ctrl);
+            msg_release(c, mi);
             if (got) break;   /* return the messages received so far */
             return e;
         }
-        /* Rewrite a faked-namespace refusal, as recvmsg does. */
-        if (n > 0) {
-            size_t total = 0;
-            for (int k = 0; k < cnt; k++) total += iov[k].iov_len;
-            nlr_fix_reply(c->m, (int)a0, bounce,
-                          (size_t)n < total ? (size_t)n : total, mf & MSG_PEEK);
-        }
-        int wb = recvmsg_writeback(c, entry, &g, &h, iov, gbase, bounce, &ss, ctrl, ccap, n);
+        /* The data, the faked-namespace rewrite and the rest, as recvmsg. */
+        int wb = recvmsg_writeback(c, (int)a0, entry, &g, &h, mi, &ss, n, mf & MSG_PEEK);
         u32 mlen = (u32)n;
         if (wb == 0 && copy_to_guest(c, entry + GMMSG_LEN_OFF, &mlen, 4) < 0)
             wb = -EFAULT;
-        free(iov); free(gbase); free(bounce); free(ctrl);
+        msg_release(c, mi);
         /* A message that could not be handed over is still a message that was
          * received: report the ones before it, as the kernel does, and let the
          * next call answer with the error. */

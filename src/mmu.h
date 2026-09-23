@@ -192,6 +192,11 @@ typedef struct HostMap {
     u8    *base;              /* mmap base (host-page aligned) */
     size_t len;               /* mmap length */
     int    refs;              /* Regions referencing this allocation */
+    int    pins;              /* runs of it lent to host syscalls in flight
+                               * (guest_lend): while any are, the allocation
+                               * is neither retired nor given new backing */
+    struct HostMap *orphan_next;  /* on AddrSpace.orphans: no Region left, a
+                                   * loan still out (see hmap_unref) */
 } HostMap;
 
 typedef struct Region {
@@ -268,6 +273,9 @@ typedef struct AddrSpace {
     int nregions, cap_regions;
     RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
     int nretired, cap_retired;
+    HostMap *orphans;         /* allocations whose last Region went while a run
+                               * of them was lent out: retired by the last
+                               * guest_unlend instead (mem.c) */
     int nthreads;             /* guest threads sharing this space (atomic).
                                * 1 means the whole quarantine can go at once: no
                                * other D-TLB exists to hold a stale pointer. */
@@ -332,9 +340,12 @@ int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
  * mapping without touching its backing (so MAP_SHARED, the file behind a file
  * mapping and the protection all survive the move); guest_remap_grow extends
  * the mapping ending at addr + old_len, or fails rather than substitute
- * backing that maps something else. */
+ * backing that maps something else. `in_place` says the mapping has not just
+ * been moved there: such a grow is refused (-ENOMEM) where it would copy a
+ * private mapping lent to a host syscall onto new backing (guest_lend). */
 int  guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst);
-int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len);
+int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
+                      int in_place);
 /* mremap(addr, 0, len, MREMAP_MAYMOVE): a second mapping, at `dst` (free
  * ground), of the shareable object mapped at addr -- len bytes of it from
  * the offset addr names. -EFAULT with nothing under addr, -EINVAL for a
@@ -441,6 +452,42 @@ const Region *as_next_region(AddrSpace *as, u64 va);
 /* Stable host pointer for [va, va+size) if within one guest page and permitted
  * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
+
+/* ---- lending guest memory to a host syscall (mem.c) ----
+ * A large transfer is not staged through a bounce buffer: the host syscall is
+ * handed the guest's own backing instead, as the runs of host memory that back
+ * the guest's buffer -- so the emulator never has to find room for what the
+ * guest merely named, and the host kernel moves the bytes exactly as the
+ * guest's kernel would, datagram, atomicity and all (sys_file.c, xfer_begin).
+ *
+ * What makes that safe is the pin. A thread parked in a host syscall does not
+ * hold the retired-backing quarantine open (as_tlb_block_begin), so without
+ * one an allocation another thread unmapped meanwhile could be released and
+ * its host range reused -- and the host kernel would then write the guest's
+ * bytes into whatever the emulator put there. A pinned allocation is never
+ * retired while its loan is out (its last unmap parks it on the orphan list,
+ * and the last guest_unlend retires it), and the one resize that copies a
+ * mapping to new backing under a guest VA that stays put declines instead, so
+ * a transfer in flight always lands in the pages the guest will look at.
+ *
+ * guest_lend appends the runs backing [va, va+len) -- each page permitted for
+ * `acc`, as rw_room judges it, with a vfork child's write tracking healed on
+ * the way -- to iov[*n..cap), the allocation under each in pin[]. A run is one
+ * allocation's contiguous host memory, extended only by this call, so every
+ * guest segment keeps a run boundary of its own. Returns the bytes covered,
+ * and *why says what stopped it short. guest_unlend releases the first `n`
+ * entries of pin[] (NULL entries are skipped). */
+#define LEND_ALL  0   /* covered the whole range */
+#define LEND_CUT  1   /* a page not mapped for `acc`: where rw_room stops */
+#define LEND_FULL 2   /* `cap` runs are in use */
+struct iovec;
+size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
+                  HostMap **pin, int *n, int cap, int *why);
+void guest_unlend(CPU *c, HostMap **pin, int n);
+/* fork(2) child: the loans of the threads that did not come across are gone. */
+void as_lend_fork_child(AddrSpace *as);
+/* Is any of [addr, addr+len) lent out right now? Caller holds as_lock. */
+int  as_range_lent(AddrSpace *as, u64 addr, u64 len);
 
 /* True on hosts where a pointer is 4 bytes (i686, ARM32). Tables whose entries
  * hold a host pointer AND are indexed by generated code are padded to the same

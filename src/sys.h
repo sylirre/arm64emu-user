@@ -12,6 +12,7 @@
 #include <sys/socket.h>   /* socklen_t (sock_addr_out) */
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>     /* struct iovec (GuestXfer) */
 #include <time.h>
 #include <unistd.h>
 
@@ -66,8 +67,9 @@ static inline u64 deadline_sat(u64 now, u64 span) {
 
 /* ---- one transfer's byte count ------------------------------------------
  * A read/write count is a guest u64 and this emulator has to turn it into a
- * host size_t and a bounce buffer, neither of which the kernel needs: it
- * copies straight between the file and the caller's own pages.
+ * host size_t and host memory to move the bytes through (GuestXfer, below),
+ * neither of which the kernel needs: it copies straight between the file and
+ * the caller's own pages.
  *
  * rw_count bounds it the way the kernel does. MAX_RW_COUNT is INT_MAX rounded
  * down to a page, and rw_verify_area clamps a larger request rather than
@@ -77,13 +79,14 @@ static inline u64 deadline_sat(u64 now, u64 span) {
  * turns a 64-bit count into an unrelated small one and moves the wrong number
  * of bytes.
  *
- * rw_room then bounds the bounce by the guest's own buffer: the run of pages
- * from `va` that are actually mapped for `acc`, up to `len`. A kernel can only
- * copy as far as the caller's memory goes -- it stops there and reports the
- * short transfer -- so anything past this point could never be delivered, and
- * allocating for it lets a guest name a length (read(fd, buf, 1 TB) with no
- * such buf) that the emulator, not the guest, has to find room for. 0 means
- * the buffer is not there at all, which is the kernel's EFAULT. */
+ * rw_room then bounds the transfer by the guest's own buffer: the run of
+ * pages from `va` that are actually mapped for `acc`, up to `len`. A kernel
+ * can only copy as far as the caller's memory goes -- it stops there and
+ * reports the short transfer -- so anything past this point could never be
+ * delivered, and finding host memory for it lets a guest name a length
+ * (read(fd, buf, 1 TB) with no such buf) that the emulator, not the guest,
+ * has to find room for. 0 means the buffer is not there at all, which is the
+ * kernel's EFAULT. */
 #define A64_MAX_RW_COUNT 0x7ffff000u
 static inline size_t rw_count(u64 n) {
     return (size_t)(n > A64_MAX_RW_COUNT ? A64_MAX_RW_COUNT : n);
@@ -99,6 +102,107 @@ static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
     }
     return done;
 }
+
+/* ---- one transfer's bytes, between the guest and a host syscall ----------
+ * The host syscall needs host memory to move a transfer through, and this is
+ * where it comes from. It used to be a bounce buffer the size of the whole
+ * transfer: up to MAX_RW_COUNT per call, committed in full for a write (the
+ * copy in touches every page, even where the guest's own pages were never
+ * touched and cost it nothing), and reserved in full for a receive before the
+ * socket had anything to deliver -- far more than a kernel, which copies
+ * straight between the file and the caller's pages, ever needs.
+ *
+ * Now the bounce is only for small transfers (XFER_BOUNCE_MAX and under),
+ * where it is the cheapest thing to do. A larger one LENDS the guest's own
+ * backing to the host call (guest_lend, mem.c): the runs of host memory under
+ * the guest's buffer become the host call's iovecs, pinned for the duration,
+ * and the host kernel moves the bytes exactly as the guest's kernel would --
+ * a datagram whole, a regular-file write atomic against its neighbours, a peek
+ * as long as the guest asked for. What little is still staged is capped at
+ * XFER_STAGE_MAX a call:
+ *
+ *   - A guest segment the host can only reach as several runs (a buffer
+ *     straddling two mappings) is lent as several host iovecs. That is the
+ *     same transfer for a regular file, a block device, a pipe, a socket and
+ *     /dev/zero and its kin -- every one of those moves an iovec's bytes the
+ *     same however it is split -- but a file whose host driver has only
+ *     ->read/->write is handed one iovec at a time (do_loop_readv_writev),
+ *     and answers each piece on its own: an inotify event or a timerfd count
+ *     that no longer fits the first piece is EINVAL, and a raw-mode tty that
+ *     filled the first waits for more input to fill the second (sys_file.c,
+ *     xfer_split_ok). For those the whole transfer is staged instead, one
+ *     host iovec per guest segment as before -- capped, so past
+ *     XFER_STAGE_MAX it is a short transfer, which such a file is always
+ *     allowed to make and none of them has a record anywhere near that size
+ *     to lose.
+ *   - Past the XFER_IOV host iovecs one call can take (UIO_MAXIOV; only a
+ *     vector over a thousand separate mappings gets there), the rest is
+ *     staged as one last iovec, capped the same way.
+ *
+ * xfer_begin takes the guest vector as the caller has already judged it --
+ * clamped to MAX_RW_COUNT, cut where the guest's memory stops (rw_room) --
+ * and sets up x->iov[0..x->n) for the host call; `to_guest` says the host
+ * call writes guest memory. `iov_store` (XFER_IOV entries, or NULL) is the
+ * caller's own array, used instead of an allocation where it will do. With
+ * XFER_LEND the transfer is lent however small it is, and x->stage says
+ * whether any of it had to be staged regardless (MSG_ZEROCOPY: the kernel
+ * keeps referencing the pages it was handed after the call returns, which a
+ * freed bounce buffer must not be). Returns 0 or -errno; x->total is what the
+ * host call covers, which is less than the vector only where a cap above
+ * applied. xfer_end then hands staged bytes the host call wrote back to the
+ * guest (`done` of them, the call's result) and releases everything: 0, or
+ * -EFAULT when the guest's memory went away meanwhile. */
+#define XFER_BOUNCE_MAX (64u << 10)
+#define XFER_STAGE_MAX  (2u << 20)
+#define XFER_IOV        1024
+#define XFER_LEND       1
+
+typedef struct GuestXfer {
+    struct iovec *iov;            /* what the host call is handed */
+    HostMap **pin;                /* the allocation under each lent run */
+    int n;                        /* entries of iov[] in use */
+    int npin;                     /* ...the first npin of them lent runs */
+    int to_guest;                 /* the host call writes guest memory */
+    const GIovec *seg;            /* the guest vector the bytes belong to */
+    int nseg;
+    u8 *stage;                    /* the bytes staged rather than lent... */
+    size_t stage_len;
+    int stage_seg;                /* ...from here in the guest vector... */
+    u64 stage_off;
+    size_t stage_at;              /* ...at this offset into the transfer */
+    size_t total;                 /* bytes the host call covers */
+    void *heap;                   /* iov[] and pin[] when allocated */
+    struct iovec iov1;            /* iov[] for a one-piece staged transfer */
+} GuestXfer;
+
+int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
+               int flags, struct iovec *iov_store, GuestXfer *x);
+int xfer_end(CPU *c, GuestXfer *x, size_t done);
+/* The host call's answer once the transfer is settled: its own errno taken
+ * first (host_err above), then xfer_end with the bytes it moved -- and EFAULT
+ * if what it read could not be handed back into guest memory that went away
+ * meanwhile. */
+u64 xfer_finish(CPU *c, GuestXfer *x, ssize_t n);
+/* The first min(len, cap) bytes of a guest vector, copied out into `out`:
+ * what a hook that looks at a transfer's head needs (the /proc id maps, the
+ * rtnetlink note). Returns the bytes copied. */
+size_t gvec_head(CPU *c, const GIovec *seg, int nseg, void *out, size_t cap);
+/* ...and back: the first `len` bytes of the vector written from `in`. */
+size_t gvec_put(CPU *c, const GIovec *seg, int nseg, const void *in, size_t len);
+
+/* Host memory for a value the host kernel has to be handed in one piece --
+ * an option value, a FIEMAP buffer -- when the guest's is not: it straddles
+ * two mappings, or is not all there, or is too large to stage. `head` bytes,
+ * placed so the byte after them is the first of a PROT_NONE guard running on
+ * to `len`. A kernel that reads or writes no further than the head sees what
+ * it would have seen in the guest's own buffer, and one that goes further
+ * faults on the guard with EFAULT -- as it would on the guest's own unmapped
+ * tail -- instead of touching anything of the emulator's. The guard is
+ * address space alone (MAP_NORESERVE, never touched). NULL when the host
+ * cannot map it; guardbuf_free releases it. */
+typedef struct { u8 *map; size_t maplen; } GuardBuf;
+u8  *guardbuf_map(GuardBuf *o, size_t head, size_t len);
+void guardbuf_free(GuardBuf *o);
 
 /* ---- the guest's own descriptor ceiling ---------------------------------
  * RLIMIT_NOFILE is the one limit where the guest and the emulator compete for
@@ -447,9 +551,13 @@ void procfs_unmark_fd(struct Machine *m, int fd);
 int  procfs_track_dup(struct Machine *m, int oldfd, int newfd);
 /* A write to a synthesized /proc file: consumed by the ones that accept one
  * (the id maps of a faked user namespace), EBADF for a descriptor opened
- * read-only. Returns 1 with *ret set to the guest return value when it
- * consumed the write, 0 for an ordinary fd. */
-int procfs_pre_write(CPU *c, int fd, const u8 *buf, size_t len, s64 off,
+ * read-only. `head` holds the first min(len, PF_WRITE_HEAD) of the `len`
+ * bytes being written, which is all any of them reads: an id map refuses a
+ * write of a page or more before it looks at a byte. Returns 1 with *ret set
+ * to the guest return value when it consumed the write, 0 for an ordinary
+ * fd. */
+#define PF_WRITE_HEAD 4096
+int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t len, s64 off,
                      s64 *ret);
 /* Is fd a synthesized /proc file? *acc receives the guest's O_ACCMODE. The
  * kernel's proc files take no splice_write and no mmap, so sendfile, splice

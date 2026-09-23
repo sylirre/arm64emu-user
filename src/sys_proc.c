@@ -1043,6 +1043,11 @@ SYSDEF(clone) {
          * of which exist here; keeping theirs would pin this child's quarantine
          * on ghosts that can never publish again. */
         as_tlb_fork_child();
+        /* ...and the backing they had lent to host syscalls in flight is not
+         * lent to anything here (mem.c, guest_lend). Before the DONTFORK unmap
+         * below, which would otherwise park those allocations as orphans no
+         * loan will ever end. */
+        as_lend_fork_child(&m->as);
         /* Any call-out outstanding in the parent belongs to the parent's thread
          * group, which this child is not part of: it inherited the state by
          * copy, together with the only thread it applies to. */

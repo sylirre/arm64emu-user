@@ -471,6 +471,7 @@ static void as_fields_init(AddrSpace *as) {
     as->nregions = as->cap_regions = 0;
     as->retired = NULL;
     as->nretired = as->cap_retired = 0;
+    as->orphans = NULL;
     as->l2spare = NULL;
     as->brk_start = as->brk = 0;
     as->mmap_next = MMAP_FLOOR;
@@ -895,7 +896,10 @@ static void as_drain_retired(AddrSpace *as) {
 /* Entering / leaving a state where this thread cannot execute guest code (the
  * syscall dispatch). While blocked its D-TLB holds the quarantine open for
  * nothing; on the way out it re-publishes the generation its entries actually
- * reflect, so nothing it could still reach is released before it flushes. */
+ * reflect, so nothing it could still reach is released before it flushes.
+ * The HOST KERNEL may be holding pointers into guest backing meanwhile -- a
+ * syscall handed the guest's own pages (guest_lend) -- and those are kept
+ * alive by the loan's pins, not by this thread's epoch. */
 void as_tlb_block_begin(void) {
     if (g_pub_slot < 0) dtlb_publish(g_dtlb_gen);   /* claim a slot to flag */
     if (g_pub_slot >= 0) __atomic_store_n(&g_pub[g_pub_slot].blocked, 1, __ATOMIC_RELEASE);
@@ -922,13 +926,24 @@ static HostMap *hmap_new(u8 *base, size_t len) {
     hm->base = base;
     hm->len = len;
     hm->refs = 1;
+    hm->pins = 0;
+    hm->orphan_next = NULL;
     return hm;
 }
 
 /* Drop one region's reference; the last one retires the whole allocation with
- * its original base and length, whatever trims did to the region since. */
+ * its original base and length, whatever trims did to the region since. An
+ * allocation with a run lent to a host syscall (guest_lend) is not retired
+ * yet: the host kernel may still be moving bytes through it, and a released
+ * range can be handed straight back out by the next host mmap. It waits on
+ * the orphan list, and the loan's end retires it (guest_unlend). */
 static void hmap_unref(AddrSpace *as, HostMap *hm) {
     if (--hm->refs == 0) {
+        if (hm->pins) {
+            hm->orphan_next = as->orphans;
+            as->orphans = hm;
+            return;
+        }
         as_retire(as, hm->base, hm->len);
         free(hm);
     }
@@ -1211,7 +1226,8 @@ static void pte_repoint_range(AddrSpace *as, u64 start, u64 len, u8 *newhost) {
 /* Give `r` `extra` more bytes of host backing directly after its slice,
  * keeping whatever is behind it. Returns 0, or -ENOMEM when that cannot be
  * done -- never a substitute that maps something else. */
-static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
+static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
+                                 int in_place) {
     HostMap *hm = r->hmap;
     u64 rlen = r->end - r->start;
 
@@ -1239,7 +1255,7 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
      * safepoint, not at the instant of the mutation. */
     int alone = __atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) <= 1;
     u8 *nb = NULL;
-    if (alone) {
+    if (alone && !hm->pins) {
         /* (2) Move the slice itself and grow it in one step. mremap carries
          *     the mapping's identity across, so a file stays that file at the
          *     same offsets and a shared segment stays shared. */
@@ -1262,12 +1278,22 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra) {
          *     translation still reaches the very pages the new one does. */
         void *p = mremap(r->host, 0, (size_t)(rlen + extra), MREMAP_MAYMOVE);
         if (p != MAP_FAILED) nb = p;
-    } else if (!r->file) {
+    } else if (!r->file && !(in_place && hm->pins)) {
         /* (4) Private anonymous memory: no one else can observe these pages,
          *     so a fresh allocation holding the same bytes IS the same memory
          *     as far as the guest is concerned. The old backing stays mapped
          *     until the quarantine releases it, which keeps a racing thread's
-         *     stale pointer benign. */
+         *     stale pointer benign.
+         *
+         *     Except while a run of it is lent to a host syscall in flight
+         *     (guest_lend) and the guest VA stays where it is: the host kernel
+         *     goes on writing into the OLD pages, and a kernel -- whose
+         *     mapping grows in place -- would have put those bytes in the
+         *     mapping the guest keeps using. So that growth is refused with
+         *     the ENOMEM mremap may always answer for an in-place grow, and a
+         *     MREMAP_MAYMOVE caller moves the mapping instead; after a move
+         *     the copy is what a kernel amounts to anyway, since a transfer
+         *     still aimed at the old address cannot land in the moved one. */
         u8 *p = host_alloc(rlen + extra, PROT_READ | PROT_WRITE);
         if (p) { memcpy(p, r->host, (size_t)rlen); nb = p; }
     }
@@ -1487,7 +1513,8 @@ int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
 /* Grow the mapping that ends at addr + old_len so that it covers new_len bytes
  * from addr. The guest VA of what is already there does not change; the ground
  * the growth needs must be free. Returns 0 or -errno. */
-int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
+int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
+                          int in_place) {
     if ((addr | old_len | new_len) & GUEST_PAGE_MASK || new_len <= old_len)
         return -EINVAL;
     if (!range_ok(addr, new_len)) return -ENOMEM;
@@ -1512,7 +1539,7 @@ int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
     if (r->anon_shm) return -ENOMEM;
 
     u64 rlen = r->end - r->start, extra = new_len - old_len;
-    int rc = region_extend_backing(as, r, extra);
+    int rc = region_extend_backing(as, r, extra, in_place);
     if (rc < 0) return rc;
     r->end += extra;
     /* A real host mapping of a file gets no page-table entries for the new
@@ -1970,6 +1997,15 @@ void as_destroy(AddrSpace *as) {
         free(as->regions[i].path);
     }
     free(as->regions);
+    /* No loan outlives the image: execve's de_thread has every sibling out of
+     * its syscall before this runs. Whatever the orphan list still holds is
+     * therefore as dead as the rest, and goes with it. */
+    while (as->orphans) {
+        HostMap *hm = as->orphans;
+        as->orphans = hm->orphan_next;
+        munmap(hm->base, hm->len);
+        free(hm);
+    }
     for (int i = 0; i < as->nretired; i++)
         munmap(as->retired[i].addr, as->retired[i].len);
     free(as->retired);
@@ -2502,6 +2538,97 @@ void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
     return translate(c, va, need, &perm);
 }
 
+/* ---- lending guest memory to a host syscall (mmu.h) ---- */
+
+size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
+                  HostMap **pin, int *n, int cap, int *why) {
+    AddrSpace *as = cpu_as(c);
+    u32 need = acc == ACC_WRITE ? PTE_W : PTE_R;
+    const Region *r = NULL;
+    int base = *n;                   /* runs before ours are not extended */
+    size_t done = 0;
+    *why = LEND_ALL;
+    /* Held across the walk, so the page table, the region list and each
+     * run's pin agree: no mapping can change between a page being judged and
+     * its allocation being pinned. translate() takes the lock again on a miss
+     * (it is recursive), and does what rw_room's walk does on the way --
+     * refills a file mapping's page the file has grown into, heals a vfork
+     * child's tracked page, snapshotting it first, so the bytes the host is
+     * about to write reach the parent. */
+    as_lock();
+    while (done < len) {
+        u64 p = va + done;
+        size_t chunk = GUEST_PAGE_SIZE - (size_t)(p & GUEST_PAGE_MASK);
+        if (chunk > len - done) chunk = len - done;
+        bool perm;
+        u8 *h = translate(c, p, need, &perm);
+        u64 a = p & A64_TBI_MASK;
+        if (h && (!r || a < r->start || a >= r->end)) r = as_find_region(as, a);
+        /* A page table entry names its region's own backing; anything else
+         * would be a broken invariant, and is not lent on. */
+        if (!h || !r || h != r->host + (a - r->start)) { *why = LEND_CUT; break; }
+        if (*n > base && pin[*n - 1] == r->hmap &&
+            (u8 *)iov[*n - 1].iov_base + iov[*n - 1].iov_len == h) {
+            iov[*n - 1].iov_len += chunk;
+        } else {
+            if (*n >= cap) { *why = LEND_FULL; break; }
+            iov[*n].iov_base = h;
+            iov[*n].iov_len = chunk;
+            pin[*n] = r->hmap;
+            r->hmap->pins++;
+            (*n)++;
+        }
+        done += chunk;
+    }
+    as_unlock();
+    return done;
+}
+
+void guest_unlend(CPU *c, HostMap **pin, int n) {
+    if (n <= 0) return;
+    AddrSpace *as = cpu_as(c);
+    as_lock();
+    for (int i = 0; i < n; i++) {
+        HostMap *hm = pin[i];
+        if (!hm || --hm->pins || hm->refs) continue;
+        /* The last loan of an allocation whose last region already went: it
+         * was parked on the orphan list by hmap_unref, and is retired now --
+         * through the quarantine like any other, since the threads that had
+         * it translated before the unmap may not have flushed yet. */
+        for (HostMap **pp = &as->orphans; *pp; pp = &(*pp)->orphan_next)
+            if (*pp == hm) { *pp = hm->orphan_next; break; }
+        as_retire(as, hm->base, hm->len);
+        free(hm);
+    }
+    as_drain_retired(as);
+    as_unlock();
+}
+
+/* fork(2) brings the calling thread alone, and it is not inside a syscall
+ * that lent anything -- fork is the syscall it is in. Every pin the child
+ * inherited is a sibling's, for a transfer that is not happening here, and
+ * left standing it would keep an orphan's backing forever and refuse growth
+ * the child is entitled to. */
+void as_lend_fork_child(AddrSpace *as) {
+    as_lock();
+    for (int i = 0; i < as->nregions; i++) as->regions[i].hmap->pins = 0;
+    while (as->orphans) {
+        HostMap *hm = as->orphans;
+        as->orphans = hm->orphan_next;
+        as_retire(as, hm->base, hm->len);
+        free(hm);
+    }
+    as_unlock();
+}
+
+int as_range_lent(AddrSpace *as, u64 addr, u64 len) {
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        if (r->end > addr && r->start < addr + len && r->hmap->pins) return 1;
+    }
+    return 0;
+}
+
 /* ---- bulk copies for the syscall layer (never raise guest exceptions) ----
  *
  * Every one of these is bracketed against a host bus error (BUS_GUARD_BEGIN,
@@ -2727,9 +2854,10 @@ int guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     as_unlock();
     return r;
 }
-int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len) {
+int guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
+                     int in_place) {
     as_lock();
-    int r = guest_remap_grow_impl(as, addr, old_len, new_len);
+    int r = guest_remap_grow_impl(as, addr, old_len, new_len, in_place);
     if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();

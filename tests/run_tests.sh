@@ -2585,6 +2585,39 @@ check_fixture scmfit $'one_fits: sent=1 recv=1 ctrunc=1 controllen=20 creds=0 ri
 # a chunk at a time over the guest's own memory -- and `touched` is the column
 # that says a refused call deposited nothing.
 check_fixture pvriov $'plain      8 touched=1\nplaindata ABCDEFGH\nlneg       -22 touched=0\nrneg       -22 touched=0\nbothneg    -22 touched=0\nlzero_rneg 0 touched=0\nlneg_rzero -22 touched=0\nlcnt0_rbig 0 touched=0\nlcnt1_rbig -22 touched=0\nlbig_rcnt1 -22 touched=0\ncnt0_cnt0  0 touched=0\nrcnt0      0 touched=0\nl_2p32p1   8 touched=1\nl_2p32     0 touched=0\nr_2p32     -22 touched=0\nsplit 8 ABCDEFGH\nw_lneg     -22 touched=0\nw_rneg     -22 touched=0\nw_ok 8 ABCDEFGH\nflags -22\ndone'
+# Large transfers (sys_file.c xfer_begin, mem.c guest_lend): the host call is
+# handed the guest's own pages, pinned, instead of a bounce buffer the size of
+# the transfer -- which was committed in full for a write out of pages the
+# guest never touched, and reserved in full for a receive before anything had
+# arrived. The "flat" rows compare the process's own peak RSS (the emulator's,
+# under it) across a 256 MB transfer; the rest are what a kernel makes of an
+# option value that is not all there, buffers straddling separate mappings,
+# more mappings than a host call takes iovecs, and a buffer unmapped or grown
+# with a transfer into it in flight. Self-checking: qemu-user checks whole
+# buffers up front. The expected output is the fixture's own, run natively.
+check_fixture xferlend $'write_null=ok flat=1\nwritev_null=ok flat=1\npwrite_null=ok flat=1\nsendto_udp=EMSGSIZE flat=1\nsendmsg_stream=ok flat=1\nsetsockopt_big=ok flat=1\ngetsockopt_big=ok len=4 flat=1\nrecv_huge_empty=EAGAIN flat=1\nsetsockopt_partial=ok\nstraddle_zero=8388608 zeroed=1\nstraddle_file=8388608,8388608 same=1\nstraddle_pipe=1 same=1\nmany_runs=4505600,4505600 same=1\nmany_runs_dgram=1024,1024 same=1\nunmap_inflight=1 canary=1\ngrow_inflight=1 data=1\ndone'
+# ...and what a kernel makes of buffers it cannot copy all the way through:
+# a receive whose buffer runs out (the part the guest lacks goes to the host as
+# an iovec over address 0, so the host's copy faults where the guest's kernel
+# would -- a datagram EFAULT and gone, a stream's bytes still queued), a
+# control buffer past the optmem budget (ENOBUFS before a byte is read), and
+# FIEMAP on a file with no extent map (EOPNOTSUPP before the header), and a
+# send's data judged last (after the address, after the control budget).
+# Gated on the emulator's host doing the same (NEEDS-HOST-SYSCALL; qemu-user
+# does none of the three).
+check_fixture xferfault $'ctrl_huge=ENOBUFS flat=1\nctrl_unmapped=ENOBUFS\nrecv_dgram_cut=EFAULT then=EAGAIN small=100\nrecvmsg_dgram_cut=EFAULT then=EAGAIN\nrecv_stream_cut=EFAULT got=-1 total=8192\nfiemap_order=EOPNOTSUPP\nsend_order=EINVAL,ENOBUFS\ndone'
+# FIEMAP's answers through a one-run array (lent) and one across a seam
+# (staged): the extents, the slots it did not fill left alone, and the header
+# written back on an error too -- EBADR's fm_flags name the refused flag, where
+# the guest used to read back the flags it had asked for. Steps aside where no
+# candidate directory has an extent map (tmpfs has none).
+check_fixture fiemapio $'one_run=0 mapped=1 last=1 untouched=1\none_run_badr=53 flags=0x40000000\nstraddle=0 mapped=1 last=1 untouched=1\nstraddle_badr=53 flags=0x40000000\ndone'
+# MSG_ZEROCOPY: the socket keeps referencing what it was handed after the call
+# returns, so it is always handed the guest's own pages -- a bounce buffer was
+# freed and reused while the kernel could still transmit from it. One
+# notification id per send, small and large. Steps aside (a lone SKIP line)
+# where the kernel, or qemu-user, has no SO_ZEROCOPY.
+check_fixture zcsend $'zerocopy=4096,131072 ids=0-0,1-1'
 # A guest mapping wider than a host size_t (4 GiB + 64 KiB). The guest address
 # space is 47 bits wide whatever the host is, so an ILP32 host is asked for
 # mappings it cannot name; mmap/mremap would take the truncated low half and

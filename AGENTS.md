@@ -64,7 +64,7 @@ src/
     decode.c                         A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
     exec_fpsimd.c                    FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
     cpu.c sysreg.c                   Step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*
-  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr. Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
+  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen)
   predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
@@ -78,7 +78,7 @@ src/
   path.c                             Rootfs containment resolver: the walk, plus the pin that hands each syscall a parent-directory fd + final component instead of a path string the host would re-resolve (no concurrent rename can redirect it); bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
   strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
-  sys_file.c                         File & fd syscalls (every path arg via resolve_pin containment)
+  sys_file.c                         File & fd syscalls (every path arg via resolve_pin containment); xfer_begin/xfer_end, where every read/write/send/recv finds host memory for its bytes
   sys_mm.c                           Memory-management syscalls over the guest address space (mem.c)
   sys_ipc.c                          System V IPC syscalls (shm + semaphores + message queues) over the portable IPC broker; shm maps segment fds with guest_map_file, no host SysV IPC or /dev/shm
   sys_proc.c                         Process syscalls (fork/exec/wait/kill, CLONE_VM threads; vfork as a fork whose parent waits and whose child's writes are carried back); execve's cooperative de_thread (rendezvous siblings at a safepoint, land the new image on the main thread); a main thread that exit(2)s while siblings run parks as the kernel's zombie leader instead of ending the process
