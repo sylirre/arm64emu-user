@@ -2664,6 +2664,13 @@ static u64 sat_s64_to(s64 v, unsigned e) {
  * so everything stays in 64-bit arithmetic (portable to 32-bit hosts). */
 static u64 narrow_shr(u64 src, unsigned esize, unsigned shift, int round,
                       int nonsat, int signed_src, int sat_unsigned) {
+    /* No narrowing form has a 128-bit source, and every caller refuses the
+     * encoding that would name one (immh<3>, size 3) as UNDEFINED before it
+     * gets here. Held here too, so a caller that forgets cannot reach the
+     * shifts below outside their range -- esize 64 (1ULL << 64, a shift by
+     * the whole width, sat_s64_to's e < 64) or a zero shift (a shift by -1)
+     * is undefined behaviour in C, not merely a wrong lane. */
+    if (esize - 1u >= 32u || shift - 1u >= 2u * esize - 1u) return 0;
     u64 emask = (1ULL << esize) - 1;
     if (nonsat) {                                   /* SHRN/RSHRN: truncating */
         u64 w = src >> shift;
