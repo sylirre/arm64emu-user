@@ -1228,13 +1228,16 @@ static void pte_repoint_range(AddrSpace *as, u64 start, u64 len, u8 *newhost) {
  * done -- never a substitute that maps something else. */
 static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
                                  int in_place) {
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
     HostMap *hm = r->hmap;
     u64 rlen = r->end - r->start;
+    uintptr_t hpm = (uintptr_t)g_host_pagesz - 1;
 
     /* Neither the grown slice nor the allocation behind it may pass what a
-     * host size_t can hold: every route below hands one of the two to
-     * mremap(2) or to host_alloc (see host_len_ok). */
-    if (!host_len_ok(rlen + extra) || !host_len_ok((u64)hm->len + extra))
+     * host size_t can hold: every route below hands one of the two (the
+     * slice with the host page it starts in) to mremap(2) or to host_alloc
+     * (see host_len_ok). */
+    if (!host_len_ok(rlen + extra + hpm) || !host_len_ok((u64)hm->len + extra))
         return -ENOMEM;
 
     /* (1) The slice runs to the end of its own host allocation: extend the
@@ -1255,13 +1258,34 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
      * safepoint, not at the instant of the mutation. */
     int alone = __atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) <= 1;
     u8 *nb = NULL;
-    if (alone && !hm->pins) {
+    /* Tier (2) hands mremap the slice itself, and mremap works in host pages:
+     * it rounds the slice's length up to one and moves -- or, where the two
+     * lengths round to the same size, leaves in place and calls grown --
+     * everything in the host pages the slice touches. On a host whose pages
+     * are bigger than the guest's, a slice that is not whole host pages
+     * shares one with other guest pages of the same allocation: moving it
+     * took them along (and the hole plug below, rounded the same way, then
+     * zeroed them where their own regions still pointed), and the "grown in
+     * place" answer handed the guest bytes the allocation already held -- what
+     * a shrink had left behind, or another region's slice -- where a kernel
+     * hands over zeroes or the file's own pages, while recording the growth
+     * as if the allocation had grown. Such a slice goes to the tiers below.
+     * Every slice is whole host pages on a host with 4 KB ones. */
+    int whole = !(((uintptr_t)r->host | (uintptr_t)rlen) & hpm);
+    u64 npad = 0;   /* the new backing's bytes in front of the slice */
+    if (alone && !hm->pins && whole) {
         /* (2) Move the slice itself and grow it in one step. mremap carries
          *     the mapping's identity across, so a file stays that file at the
-         *     same offsets and a shared segment stays shared. */
+         *     same offsets and a shared segment stays shared. In place, the
+         *     slice ended its host mapping and the growth is past it: the
+         *     allocation's recorded length covers the new end. */
         void *p = mremap(r->host, (size_t)rlen, (size_t)(rlen + extra),
                          MREMAP_MAYMOVE);
-        if (p == (void *)r->host) { hm->len += (size_t)extra; return 0; } /* in place */
+        if (p == (void *)r->host) {
+            u64 end = (u64)(r->host - hm->base) + rlen + extra;
+            if (end > hm->len) hm->len = (size_t)end;
+            return 0;
+        }
         if (p != MAP_FAILED) {
             /* The move left a hole in the middle of an allocation whose munmap
              * is still described by hm->base/hm->len. Fill it, so the
@@ -1271,19 +1295,29 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
                  MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             nb = p;
         }
+    }
+    if (nb) {
+        /* tier (2) moved it */
     } else if (r->shared) {
-        /* (3) Another guest thread is in this address space. Duplicate the
-         *     mapping rather than move it -- mremap with an old length of zero
-         *     makes a second mapping of the same shared object -- so a stale
-         *     translation still reaches the very pages the new one does. */
-        void *p = mremap(r->host, 0, (size_t)(rlen + extra), MREMAP_MAYMOVE);
-        if (p != MAP_FAILED) nb = p;
+        /* (3) Another guest thread is in this address space, or tier (2)
+         *     could not move the slice. Duplicate the mapping rather than
+         *     move it -- mremap with an old length of zero makes a second
+         *     mapping of the same shared object -- so a stale translation
+         *     still reaches the very pages the new one does. mremap wants a
+         *     host-page-aligned source, and the slice is only guest-page
+         *     aligned on a host with bigger pages: duplicate from the host
+         *     page it starts in and keep the pad in front, as
+         *     guest_remap_dup does. */
+        u64 pad = (u64)((uintptr_t)r->host & hpm);
+        void *p = mremap(r->host - pad, 0, (size_t)(rlen + extra + pad),
+                         MREMAP_MAYMOVE);
+        if (p != MAP_FAILED) { nb = (u8 *)p + pad; npad = pad; }
     } else if (!r->file && !(in_place && hm->pins)) {
-        /* (4) Private anonymous memory: no one else can observe these pages,
-         *     so a fresh allocation holding the same bytes IS the same memory
-         *     as far as the guest is concerned. The old backing stays mapped
-         *     until the quarantine releases it, which keeps a racing thread's
-         *     stale pointer benign.
+        /* (4) Private anonymous memory that tier (2) could not move: no one
+         *     else can observe these pages, so a fresh allocation holding the
+         *     same bytes IS the same memory as far as the guest is concerned.
+         *     The old backing stays mapped until the quarantine releases it,
+         *     which keeps a racing thread's stale pointer benign.
          *
          *     Except while a run of it is lent to a host syscall in flight
          *     (guest_lend) and the guest VA stays where it is: the host kernel
@@ -1297,13 +1331,14 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
         u8 *p = host_alloc(rlen + extra, PROT_READ | PROT_WRITE);
         if (p) { memcpy(p, r->host, (size_t)rlen); nb = p; }
     }
-    /* Left over: a private file mapping in a multi-threaded address space that
-     * could not be extended in place. Copying it into anonymous memory would
-     * drop the file behind it, so report the failure mremap(2) is allowed to
-     * report and let the guest fall back to mmap+copy itself. */
+    /* Left over: a private file mapping that could not be extended in place
+     * and was not moved either -- another thread is running, or the host's
+     * pages are bigger than the guest's. Copying it into anonymous memory
+     * would drop the file behind it, so report the failure mremap(2) is
+     * allowed to report and let the guest fall back to mmap+copy itself. */
     if (!nb) return -ENOMEM;
 
-    HostMap *nh = hmap_new(nb, (size_t)(rlen + extra));
+    HostMap *nh = hmap_new(nb - npad, (size_t)(rlen + extra + npad));
     pte_repoint_range(as, r->start, rlen, nb);
     r->host = nb;
     r->hmap = nh;

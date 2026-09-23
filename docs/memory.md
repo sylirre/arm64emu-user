@@ -731,24 +731,30 @@ answers it in tiers, never by substituting backing that maps something else:
    in place (`mremap`, no move). Nothing moves, so a host pointer another guest
    thread already translated stays valid, and the pages that appear continue the
    same object: the file's next pages, or fresh zeroes for anonymous memory;
-2. otherwise, if this is the only guest thread in the address space, move the
-   slice itself and grow it in one `MREMAP_MAYMOVE` — the mapping's identity
-   travels with it — and plug the hole the move leaves in the old allocation
-   with anonymous pages, so that allocation stays whole for its eventual
-   `munmap`;
-3. with other threads running, a `MAP_SHARED` region is *duplicated* instead
-   (`mremap` with an old length of zero makes a second mapping of the same
-   object), so a thread still holding a stale translation reaches the very pages
-   the new mapping does;
+2. otherwise, if this is the only guest thread in the address space and the
+   slice is whole host pages, move the slice itself and grow it in one
+   `MREMAP_MAYMOVE` — the mapping's identity travels with it — and plug the
+   hole the move leaves in the old allocation with anonymous pages, so that
+   allocation stays whole for its eventual `munmap`. (`mremap` works in host
+   pages: on a host whose pages are bigger than the guest's, a slice sharing
+   one with other guest pages would take them along, the plug would zero
+   them, and two lengths rounding to the same size come back "grown in place"
+   over bytes the allocation already held. Every slice is whole host pages on
+   a host with 4 KB ones.);
+3. with other threads running, or where tier 2 could not move the slice, a
+   `MAP_SHARED` region is *duplicated* instead (`mremap` with an old length of
+   zero makes a second mapping of the same object, from the host page the
+   slice starts in), so a thread still holding a stale translation reaches the
+   very pages the new mapping does;
 4. private anonymous memory, which no one else can observe, gets a fresh
    allocation with the old bytes copied in — unless a run of it is lent to a
    host syscall in flight and the mapping is growing in place (see *backing
    lent to a host syscall is pinned*, above), when the copy would leave that
    transfer writing into the old pages;
-5. anything left — a private file mapping in a multi-threaded address space
-   that could not be extended in place, a lent one growing in place — is
-   refused with `ENOMEM`, which `mremap(2)` is allowed to return, rather than
-   fabricated.
+5. anything left — a private file mapping that could not be extended in place
+   and not moved either (another thread is running, or the slice is not whole
+   host pages), a lent one growing in place — is refused with `ENOMEM`, which
+   `mremap(2)` is allowed to return, rather than fabricated.
 
 `MAP_SHARED|MAP_ANONYMOUS` is the one case rebuilt rather than extended
 (`sys_mm.c`): its backing is a memfd sized when the mapping was made, and
