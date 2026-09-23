@@ -1896,22 +1896,40 @@ missing or unrunnable, where a kernel answers for the file; measured after the
 format was judged, that same `E2BIG` lost to `ENOEXEC`.
 `tests/fixtures/execorder.c` pins the whole sequence.
 
-How **many** entries a vector may have is that same budget and nothing else:
-`import_strvec` charges each one its 8-byte pointer slot plus its bytes and a
-NUL, and stops when it has spent what `exec_arg_budget` allows — so the
-emulator's staging is bounded by the thing that bounds the guest's stack, and
-the exact measurement of the pair follows. A kernel has no count limit worth
-the name (`count()` stops at `MAX_ARG_STRINGS`, two billion); the flat 4096
-entries that used to stand here refused an ordinary `find | xargs rm` over more
-than four thousand short names — a list well inside the byte budget — with
-`E2BIG`. A single string longer than `MAX_ARG_STRLEN` (32 guest pages) is
-`E2BIG` too, which is `copy_strings`'s answer for one, rather than the
-`ENAMETOOLONG` the guest-memory walk that finds it would otherwise report.
+Within the vectors the order is the kernel's too, and it decides the answer
+whenever a list has more than one thing wrong with it. `count()` walks argv's
+pointer array and then envp's to their NULLs, reading nothing they point at
+(`EFAULT` for an entry that cannot be read); `bprm_stack_limits` sets the
+pointer table against the budget (`E2BIG`); and only then are the strings
+copied — the filename first, then envp's **last to first**, then argv's last to
+first — each `EFAULT` when it cannot be read and `E2BIG` when it is longer than
+`MAX_ARG_STRLEN` (32 guest pages) or overruns the one budget all three share.
+So an unreadable envp array is `EFAULT` however far argv overruns, an overrun
+in envp is `E2BIG` ahead of an unreadable argv string, and within a vector the
+later entry answers first. `exec_vecs_import` follows that sequence; it used to
+import argv whole and then envp whole, each first to last, and every one of
+those precedences came back reversed (`tests/fixtures/execvecorder.c`, measured
+against a kernel).
+
+The shared budget is also what bounds the emulator's staging.
+`exec_arg_room` (`src/elf.c`) is exactly what the strings may add up to once
+the pointer table is set aside, the import holds the running total to it
+string by string, and nothing past the point a kernel refuses is ever copied.
+Each vector is **packed** — its pointer table and its strings in a single
+allocation — so it costs the table plus the bytes the budget charges for it,
+not a heap chunk per string on top. Imported each against a full budget of its
+own, with a `strdup` per entry, the pair used to be able to stage roughly two
+budgets of strings, several times over in allocator overhead for short ones,
+before the measurement of the pair refused it. A kernel has no count limit
+worth the name (`count()` stops at `MAX_ARG_STRINGS`, two billion); the flat
+4096 entries that once stood here refused an ordinary `find | xargs rm` over
+more than four thousand short names — a list well inside the byte budget —
+with `E2BIG`.
 
 A **null** argv or envp is an empty vector, not a fault: `count()` in `fs/exec.c`
 walks the array only when the pointer is non-null, so `execve(path, NULL, NULL)`
-is a call a kernel accepts and `import_strvec` dereferencing it unconditionally
-answered `EFAULT` for it. An **empty** argv then gets a single empty string as
+is a call a kernel accepts, and dereferencing it unconditionally answered
+`EFAULT` for it. An **empty** argv then gets a single empty string as
 `argv[0]`, as `do_execveat_common` has done since v5.18: the new image is
 entitled to an `argv[0]`, and a program that starts reading at `argv[1]` would
 otherwise walk straight into `envp`. The shebang rewrite below relies on there
@@ -1924,9 +1942,11 @@ all: a quarter of the guest's `RLIMIT_STACK`, capped at three quarters of the
 **pointer table**, `(max(argc,1) + envc)` slots of 8 bytes, comes out of that
 budget before any of the strings do, since it is built on the same stack. The
 argv and envp strings share what is left, and so does the execfn, which
-`copy_string_kernel` pushes ahead of them. `exec_arg_limit` (`elf.c`) is that
-formula, applied to the *final* argument list — the one a shebang rewrite may
-have grown — while there is still a caller to hand `E2BIG` to.
+`copy_string_kernel` pushes ahead of them. `exec_arg_room` (`elf.c`) is that
+formula as the running bound the import copies the strings against (above),
+and `exec_arg_limit` applies it to the *final* argument list — the one a
+shebang rewrite may have grown — while there is still a caller to hand `E2BIG`
+to.
 
 Counting only the string bytes, as this used to, admitted lists a kernel
 refuses: a guest passing very many very short arguments spends 8 bytes on a
@@ -1948,6 +1968,9 @@ does not imply it, since `ARG_MAX` floors the budget at 128 KB however small
 the limit is. The emulator counts the pointer vector into that test as well,
 which a kernel need not: it lays the vector out after expanding the stack,
 while this writes strings and vector into one mapping that has to hold both.
+`exec_arg_room` folds this test into the same running bound, so a list the
+stack cannot hold is refused at the string where the growth would have
+failed, in the order above.
 `tests/fixtures/execarglimit.c` pins every boundary, and prints the same lines
 when it is built for the host and run on a real kernel.
 

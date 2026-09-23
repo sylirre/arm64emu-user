@@ -323,9 +323,10 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
     return 0;
 }
 
-/* What a kernel lets a new image carry in argv+envp, in two halves of one
- * rule: exec_arg_budget is the budget in bytes, and exec_arg_limit measures a
- * finished argument list against it.
+/* What a kernel lets a new image carry in argv+envp, in three pieces of one
+ * rule: exec_arg_budget is the budget in bytes, exec_arg_room what of it the
+ * strings may spend once the pointer table is set aside, and exec_arg_limit
+ * measures a finished argument list against that.
  *
  * It is measured the way bprm_stack_limits measures it: a quarter of the
  * guest's own stack limit, capped at three quarters of the reference stack and
@@ -373,7 +374,7 @@ static u64 stack_size_for(struct Machine *m) {
     return PG_UP(rl);
 }
 
-u64 exec_arg_budget(struct Machine *m) {
+static u64 exec_arg_budget(struct Machine *m) {
     u64 limit = STK_LIM / 4 * 3;
     u64 stkrl = rlim_cur(m, G_RLIMIT_STACK);
 
@@ -382,32 +383,47 @@ u64 exec_arg_budget(struct Machine *m) {
     return limit;
 }
 
+/* The bytes of string -- execfn, envp and argv together -- a list of argc +
+ * envc entries may carry, in *room; -E2BIG when its pointer table alone does
+ * not fit the budget, which is bprm_stack_limits' refusal and comes before a
+ * single string is read. The import (sys_proc.c) holds the strings to this as
+ * it copies them, in a kernel's order, so its staging never passes the budget
+ * and an overrun is refused at the string where a kernel refuses it.
+ *
+ * 8 bytes a pointer is the GUEST's width, LP64 whatever host this is built
+ * for. max(argc, 1): a kernel counts a slot for argv[0] even when the guest
+ * passed none, and gives the new image one either way.
+ *
+ * ...and all of it has to fit in the stack the image will get, which is that
+ * same RLIMIT_STACK. A kernel copies the strings into the stack VMA as it
+ * grows it and the growth stops at the limit, so get_arg_page fails there and
+ * copy_strings reports E2BIG -- measured: 100 KB of strings is refused at a
+ * 64 KB limit and accepted at a 128 KB one. The budget above does not imply
+ * this, since ARG_MAX floors it at 128 KB however small the limit is. The
+ * vector is counted too, which a kernel does not need to: it lays that out
+ * after expanding the stack, while this writes strings and vector into one
+ * mapping that has to hold both. STACK_FIXED covers what goes above them --
+ * the auxv, the platform and random blocks, and the alignment between. */
+int exec_arg_room(struct Machine *m, u64 argc, u64 envc, u64 *room) {
+    u64 limit = exec_arg_budget(m);
+    u64 ptrtab = ((argc > 1 ? argc : 1) + envc) * 8;   /* counts are < 2^32 */
+
+    if (limit <= ptrtab) return -E2BIG;
+    u64 stk = stack_size_for(m);
+    u64 fit = stk > ptrtab + STACK_FIXED ? stk - ptrtab - STACK_FIXED : 0;
+    *room = limit - ptrtab < fit ? limit - ptrtab : fit;
+    return 0;
+}
+
 int exec_arg_limit(struct Machine *m, const char *canon,
                    char **argv, char **envp) {
-    int argc = 0, envc = 0;
+    u64 argc = 0, envc = 0;
     u64 bytes = strlen(canon) + 1;
-    u64 limit = exec_arg_budget(m);
+    u64 room;
 
     while (argv[argc]) bytes += strlen(argv[argc]) + 1, argc++;
     while (envp[envc]) bytes += strlen(envp[envc]) + 1, envc++;
-
-    /* 8 bytes a pointer is the GUEST's width, LP64 whatever host this is built
-     * for. max(argc, 1): a kernel counts a slot for argv[0] even when the
-     * guest passed none, and gives the new image one either way. */
-    u64 ptrtab = ((u64)(argc > 1 ? argc : 1) + (u64)envc) * 8;
-    if (limit <= ptrtab || bytes > limit - ptrtab) return -E2BIG;
-    /* ...and all of it has to fit in the stack the image will get, which is
-     * that same RLIMIT_STACK. A kernel copies the strings into the stack VMA
-     * as it grows it and the growth stops at the limit, so get_arg_page fails
-     * there and copy_strings reports E2BIG -- measured: 100 KB of strings is
-     * refused at a 64 KB limit and accepted at a 128 KB one. The budget above
-     * does not imply this, since ARG_MAX floors it at 128 KB however small the
-     * limit is. The vector is counted too, which a kernel does not need to:
-     * it lays that out after expanding the stack, while this writes strings
-     * and vector into one mapping that has to hold both. STACK_FIXED covers
-     * what goes above them -- the auxv, the platform and random blocks, and
-     * the alignment between. */
-    if (bytes + ptrtab + STACK_FIXED > stack_size_for(m)) return -E2BIG;
+    if (exec_arg_room(m, argc, envc, &room) < 0 || bytes > room) return -E2BIG;
     return 0;
 }
 

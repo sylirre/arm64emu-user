@@ -1157,63 +1157,37 @@ SYSDEF(clone) {
     return (u64)pid;
 }
 
-/* Import a guest pointer-array (argv/envp) into a host string vector. A null
- * vector is an empty one, not a fault: execve(2)'s count() walks the array only
- * `if (argv.ptr.native != NULL)` and returns 0 otherwise, so execve(path, NULL,
- * NULL) is a legal call. Dereferencing it unconditionally answered EFAULT for
- * one the kernel accepts.
- *
- * How long the vector may be is @budget, the byte budget the new image's
- * arguments have to fit in (exec_arg_budget, elf.c) -- the same one execve is
- * about to measure the pair against exactly. Every entry costs at least its
- * 8-byte pointer slot plus a NUL wherever it lands, so a vector that has spent
- * the whole budget on its own cannot fit alongside the other one either, and
- * the emulator's staging is bounded by the same thing that bounds the guest's
- * stack. A flat ceiling of 4096 entries used to stand here instead. That is
- * not a limit a kernel has -- count() stops at MAX_ARG_STRINGS, two billion --
- * and it is a limit ordinary programs cross: `find | xargs rm` in a directory
- * of more than four thousand short names builds exactly such a list, well
- * inside the byte budget, and every one of those execs came back E2BIG.
- *
- * A string past MAX_ARG_STRLEN (32 guest pages, the size of the staging buffer
- * below) is E2BIG as well, which is what copy_strings answers for one
- * (valid_arg_len); the guest-memory walk that finds it calls it a name too
- * long, which is the wrong error to hand an execve. */
-static char **import_strvec(CPU *c, u64 va, u64 budget, int *err) {
-    int cap = 16, n = 0;
-    u64 used = 0;
-    char **vec = malloc(sizeof(char *) * (size_t)cap);
-    if (!vec) { *err = -ENOMEM; return NULL; }
-    if (va == 0) { vec[0] = NULL; return vec; }
-    for (;;) {
-        u64 p;
-        if (copy_from_guest(c, &p, va + (u64)n * 8, 8) < 0) { *err = -EFAULT; goto fail; }
-        if (n + 1 == cap) {
-            cap *= 2;
-            char **nv = realloc(vec, sizeof(char *) * (size_t)cap);
-            if (!nv) { *err = -ENOMEM; goto fail; }
-            vec = nv;
-        }
-        if (!p) { vec[n] = NULL; return vec; }
-        char buf[131072];
-        long l = copy_str_from_guest(c, buf, p, sizeof buf);
-        if (l == -ENAMETOOLONG) l = -E2BIG;
-        if (l < 0) { *err = (int)l; goto fail; }
-        used += 8 + (u64)l + 1;
-        if (used > budget) { *err = -E2BIG; goto fail; }
-        vec[n] = strdup(buf);
-        if (!vec[n]) { *err = -ENOMEM; goto fail; }
-        n++;
+/* An exec's argument vectors are PACKED: one allocation holding the
+ * NULL-terminated pointer array and, after it, the strings it points at. A
+ * vector then costs its table plus its bytes -- the two things the argument
+ * budget counts (exec_arg_room, elf.c) -- where a strdup per entry cost a heap
+ * chunk per string besides, several times the one byte an empty argument is
+ * charged. Freed with a single free(). */
+static char **strvec_new(u64 n, u64 bytes) {
+    u64 size = (n + 1) * sizeof(char *) + bytes;
+    if (size > SIZE_MAX) return NULL;
+    char **v = malloc((size_t)size);
+    if (v) v[n] = NULL;
+    return v;
+}
+
+/* A packed vector holding copies of `n` host strings. */
+static char **strvec_pack(char *const *src, u64 n) {
+    u64 bytes = 0;
+    for (u64 i = 0; i < n; i++) bytes += strlen(src[i]) + 1;
+    char **v = strvec_new(n, bytes);
+    if (!v) return NULL;
+    char *s = (char *)(v + n + 1);
+    for (u64 i = 0; i < n; i++) {
+        size_t l = strlen(src[i]) + 1;
+        memcpy(s, src[i], l);
+        v[i] = s;
+        s += l;
     }
-fail:
-    for (int i = 0; i < n; i++) free(vec[i]);
-    free(vec);
-    return NULL;
+    return v;
 }
 
 static void free_strvec(char **v) {
-    if (!v) return;
-    for (int i = 0; v[i]; i++) free(v[i]);
     free(v);
 }
 
@@ -1225,59 +1199,180 @@ static void free_execvecs(char **argv, char **envp) {
     free_strvec(envp);
 }
 
-/* execve: resolve through the rootfs, handle shebangs, reload in-process. */
-/* Deep-copy a NULL-terminated string vector. */
-static char **dup_strvec(char **v) {
-    int n = 0;
-    while (v[n]) n++;
-    char **out = malloc(sizeof(char *) * (size_t)(n + 1));
-    if (!out) return NULL;
-    for (int i = 0; i < n; i++) {
-        out[i] = strdup(v[i]);
-        if (!out[i]) { out[i] = NULL; free_strvec(out); return NULL; }
+#define G_MAX_ARG_STRINGS 0x7fffffffULL      /* count()'s ceiling */
+#define G_MAX_ARG_STRLEN  (32ULL * 4096)     /* one string, its NUL included */
+
+/* count(): walk a guest pointer array to its NULL without reading anything it
+ * points at, into *n. A null array is an empty one, not a fault -- count()
+ * walks it only `if (argv.ptr.native != NULL)` -- so execve(path, NULL, NULL)
+ * is a legal call. An entry that cannot be read is EFAULT, one past
+ * MAX_ARG_STRINGS is E2BIG. Read a batch at a time: a list may be very long,
+ * and an entry straddling into a page that is not there is as unreadable as
+ * one wholly inside it. */
+static int strvec_count(CPU *c, u64 va, u64 *n) {
+    u64 buf[512];
+    *n = 0;
+    if (!va) return 0;
+    for (;;) {
+        size_t got = copy_from_guest_partial(c, buf, va + *n * 8, sizeof buf);
+        for (size_t k = 0; k < got / 8; k++) {
+            if (!buf[k]) return 0;
+            if (*n >= G_MAX_ARG_STRINGS) return -E2BIG;
+            (*n)++;
+        }
+        if (got < sizeof buf) return -EFAULT;
     }
-    out[n] = NULL;
-    return out;
+}
+
+/* strnlen_user(str, MAX_ARG_STRLEN): the size of the guest string at `va`
+ * with its NUL, 0 when it cannot be read as far as that NUL, or more than
+ * MAX_ARG_STRLEN when there is none within it. */
+static u64 guest_strsize(CPU *c, u64 va) {
+    char b[1024];
+    u64 n = 0;
+    while (n < G_MAX_ARG_STRLEN) {
+        size_t chunk = sizeof b - (size_t)((va + n) & (sizeof b - 1));
+        if (chunk > G_MAX_ARG_STRLEN - n) chunk = (size_t)(G_MAX_ARG_STRLEN - n);
+        size_t got = copy_from_guest_partial(c, b, va + n, chunk);
+        char *z = memchr(b, 0, got);
+        if (z) return n + (u64)(z - b) + 1;
+        if (got < chunk) return 0;
+        n += chunk;
+    }
+    return G_MAX_ARG_STRLEN + 1;
+}
+
+/* One vector's strings, measured the way copy_strings measures them: LAST to
+ * first, each read out of the guest's array afresh, EFAULT for one that cannot
+ * be read, E2BIG for one longer than MAX_ARG_STRLEN (valid_arg_len) or that
+ * takes *used past `room`. The sizes are parked in the vector's own pointer
+ * slots, which the copy below turns into pointers; *bytes is their total. */
+static int strvec_measure(CPU *c, u64 va, u64 n, char **v, u64 room,
+                          u64 *used, u64 *bytes) {
+    *bytes = 0;
+    for (u64 i = n; i-- > 0; ) {
+        u64 p;
+        if (copy_from_guest(c, &p, va + i * 8, 8) < 0) return -EFAULT;
+        u64 len = guest_strsize(c, p);
+        if (!len) return -EFAULT;
+        if (len > G_MAX_ARG_STRLEN) return -E2BIG;
+        *used += len;
+        if (*used > room) return -E2BIG;
+        v[i] = (char *)(uintptr_t)len;
+        *bytes += len;
+    }
+    return 0;
+}
+
+/* ...and copied, into the room strvec_measure sized. The pointer is read
+ * again, as copy_strings reads it once per string: a guest that rewrites its
+ * array or its strings meanwhile gets what a kernel copying the measured
+ * length would give it, with the NUL this side's C strings need put back. */
+static int strvec_fill(CPU *c, u64 va, u64 n, char **v) {
+    char *s = (char *)(v + n + 1);
+    for (u64 i = 0; i < n; i++) {
+        size_t len = (size_t)(uintptr_t)v[i];
+        u64 p;
+        if (copy_from_guest(c, &p, va + i * 8, 8) < 0 ||
+            copy_from_guest(c, s, p, len) < 0)
+            return -EFAULT;
+        s[len - 1] = '\0';
+        v[i] = s;
+        s += len;
+    }
+    return 0;
+}
+
+/* Import argv and envp from guest memory in do_execveat_common's order, which
+ * is what decides the error when more than one thing is wrong with a list:
+ * count() walks argv's array and then envp's (EFAULT), bprm_stack_limits sets
+ * the pointer table against the budget (E2BIG), and then the strings are
+ * copied -- the filename first, then envp's last to first, then argv's last to
+ * first -- against the one budget all three share. So an unreadable envp array
+ * is EFAULT however far argv overruns, an overrun in envp is E2BIG ahead of an
+ * unreadable argv string, and within a vector the later entry is the one that
+ * answers (tests/fixtures/execvecorder.c, measured against a kernel).
+ *
+ * That shared budget also bounds the staging: exec_arg_room is exactly what
+ * the strings may add up to, and the tables are the part of the budget it set
+ * aside for them, so nothing is copied past the point a kernel would refuse.
+ * Each vector used to be imported whole, argv and then envp, each against the
+ * full budget -- roughly two budgets of strings staged before the pair was
+ * measured, with a heap chunk per string on top.
+ *
+ * `canon` is the filename measured ahead of the strings, as exec_arg_limit
+ * measures it. */
+static int exec_vecs_import(CPU *c, const char *canon, u64 av, u64 ev,
+                            char ***argv, char ***envp) {
+    u64 argc, envc, room, abytes, ebytes;
+    int r;
+
+    *argv = *envp = NULL;
+    if ((r = strvec_count(c, av, &argc)) < 0 ||
+        (r = strvec_count(c, ev, &envc)) < 0 ||
+        (r = exec_arg_room(c->m, argc, envc, &room)) < 0)
+        return r;
+    u64 used = strlen(canon) + 1;           /* copy_string_kernel(filename) */
+    if (used > room) return -E2BIG;
+    char **a = strvec_new(argc, 0), **e = strvec_new(envc, 0);
+    if (!a || !e) { r = -ENOMEM; goto fail; }
+    if ((r = strvec_measure(c, ev, envc, e, room, &used, &ebytes)) < 0 ||
+        (r = strvec_measure(c, av, argc, a, room, &used, &abytes)) < 0)
+        goto fail;
+    /* An empty argv gets its "" last of all, and it is charged too. */
+    if (!argc && used + 1 > room) { r = -E2BIG; goto fail; }
+    char **na = realloc(a, (size_t)((argc + 1) * sizeof(char *) + abytes));
+    if (!na) { r = -ENOMEM; goto fail; }
+    a = na;
+    char **ne = realloc(e, (size_t)((envc + 1) * sizeof(char *) + ebytes));
+    if (!ne) { r = -ENOMEM; goto fail; }
+    e = ne;
+    if ((r = strvec_fill(c, av, argc, a)) < 0 ||
+        (r = strvec_fill(c, ev, envc, e)) < 0)
+        goto fail;
+    *argv = a;
+    *envp = e;
+    return 0;
+fail:
+    free(a);
+    free(e);
+    return r;
 }
 
 /* The argv/envp an exec is to run with, as do_execve's own private vectors:
  * imported from the guest's memory, or copied from the host vectors the
  * initial exec hands over (main.c, whose own copies must survive this). The
- * import is bounded by the argument budget -- see import_strvec -- and its
- * E2BIG, like its EFAULT, belongs to the caller of execve(2): this runs where
- * a kernel's count() does, with the image already open. Returns 0 or -errno,
- * and leaves both NULL on failure. */
-static int exec_vecs_take(CPU *c, ExecVec av, ExecVec ev,
+ * import's E2BIG, like its EFAULT, belongs to the caller of execve(2): this
+ * runs where a kernel's count() does, with the image already open. Returns 0
+ * or -errno, and leaves both NULL on failure. */
+static int exec_vecs_take(CPU *c, const char *canon, ExecVec av, ExecVec ev,
                           char ***argv, char ***envp) {
-    int err = 0;
-
     if (av.vec) {                      /* the initial exec: already host-side */
-        *argv = dup_strvec(av.vec);
-        *envp = dup_strvec(ev.vec);
+        u64 argc = 0, envc = 0;
+        while (av.vec[argc]) argc++;
+        while (ev.vec[envc]) envc++;
+        *argv = strvec_pack(av.vec, argc);
+        *envp = strvec_pack(ev.vec, envc);
+        if (!*argv || !*envp) {
+            free_execvecs(*argv, *envp);
+            *argv = *envp = NULL;
+            return -ENOMEM;
+        }
     } else {
-        u64 budget = exec_arg_budget(c->m);
-        *argv = import_strvec(c, av.va, budget, &err);
-        if (*argv) *envp = import_strvec(c, ev.va, budget, &err);
-    }
-    if (!*argv || !*envp) {
-        free_execvecs(*argv, *envp);
-        *argv = *envp = NULL;
-        return err ? err : -ENOMEM;
+        int r = exec_vecs_import(c, canon, av.va, ev.va, argv, envp);
+        if (r < 0) return r;
     }
     /* An empty argv becomes a single empty string, as do_execveat_common has
      * done since v5.18: the new image is entitled to an argv[0], and a program
      * that starts reading at argv[1] would otherwise walk straight into envp.
      * The shebang rewrite in do_execve drops argv[0] and relies on there being
-     * one. A kernel does this before it measures the list, and so does this --
-     * the byte it adds is part of what is measured. */
+     * one. A kernel copies it last, after argv's own strings, out of the same
+     * budget -- the import charges it there, and exec_arg_limit measures it
+     * with the rest. */
     if (!(*argv)[0]) {
-        char **nv = malloc(sizeof(char *) * 2);
-        if (nv) {
-            nv[0] = strdup("");
-            nv[1] = NULL;
-        }
-        if (!nv || !nv[0]) {
-            free(nv);
+        char *empty[] = { (char *)"" };
+        char **nv = strvec_pack(empty, 1);
+        if (!nv) {
             free_execvecs(*argv, *envp);
             *argv = *envp = NULL;
             return -ENOMEM;
@@ -1989,7 +2084,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * that is not there or EACCES for one that may not be run, and the
          * EFAULT of an argv the guest cannot back did the same. */
         if (!argv) {
-            r = exec_vecs_take(c, argv_in, envp_in, &argv, &envp);
+            r = exec_vecs_take(c, canon, argv_in, envp_in, &argv, &envp);
             if (r < 0) { exec_close_image(imgfd); return (u64)(s64)r; }
         }
         /* ...and measured, which is bprm_stack_limits' place in that same
@@ -2046,24 +2141,18 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
              * which a kernel-side lookup takes as the working directory: a
              * directory is not a regular file, so EACCES, never ENOENT. */
             if (!*interp) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)-EACCES; }
-            int oldc = 0;
+            size_t oldc = 0;
             while (argv[oldc]) oldc++;
-            char **nv = malloc(sizeof(char *) * (size_t)(oldc + 3));
+            char **tv = malloc(sizeof(char *) * (oldc + 2));
+            if (!tv) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOMEM; }
+            size_t k = 0;
+            tv[k++] = interp;
+            if (arg) tv[k++] = arg;
+            tv[k++] = pathbuf;           /* script path as seen by the guest */
+            for (size_t i = 1; i < oldc; i++) tv[k++] = argv[i];
+            char **nv = strvec_pack(tv, k);
+            free(tv);
             if (!nv) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)-ENOMEM; }
-            int k = 0;
-            nv[k++] = strdup(interp);
-            if (arg) nv[k++] = strdup(arg);
-            nv[k++] = strdup(pathbuf);   /* script path as seen by the guest */
-            for (int i = 1; i < oldc; i++) nv[k++] = strdup(argv[i]);
-            nv[k] = NULL;
-            for (int i = 0; i < k; i++)
-                if (!nv[i]) {   /* a NULL hole would silently truncate argv */
-                    for (int j = 0; j < k; j++) free(nv[j]);
-                    free(nv);
-                    exec_close_image(imgfd);
-                    free_execvecs(argv, envp);
-                    return (u64)(s64)-ENOMEM;
-                }
             free_strvec(argv);          /* free the previous working copy */
             argv = nv;
             /* The rewritten list is measured before the interpreter is looked

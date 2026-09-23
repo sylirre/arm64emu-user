@@ -858,9 +858,11 @@ void elf_hwcaps(u64 *hwcap, u64 *hwcap2);
  * again for the initial exec, which has no such caller (elf.c). */
 int exec_arg_limit(struct Machine *m, const char *canon,
                    char **argv, char **envp);
-/* That budget on its own, in bytes: the bound the import of one of the two
- * vectors is held to, before the pair can be measured exactly (elf.c). */
-u64 exec_arg_budget(struct Machine *m);
+/* What of that budget the strings of an argc + envc entry list may spend,
+ * once the pointer table is set aside: 0 with *room set, or -E2BIG when the
+ * table alone does not fit. The bound execve's import holds the strings to as
+ * it copies them (elf.c). */
+int exec_arg_room(struct Machine *m, u64 argc, u64 envc, u64 *room);
 /* Can execve load this program? Validates the ELF on `fd` and the interpreter
  * it names without touching the address space, so a refusal still has a caller
  * to reach (elf.c). The interpreter it opened comes back in *interp_fd (-1 for
