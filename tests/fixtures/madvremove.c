@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -88,6 +89,32 @@ int main(void) {
     r = m(both, 3 * pg, MADV_REMOVE);
     printf("remove_mixed=%ld shared_punched=%d private_kept=%c\n", r, both[0] == 0 && both[2 * pg - 1] == 0, both[2 * pg]);
     printf("remove_unaligned=%ld remove_zerolen=%ld\n", m(shm + 1, pg, MADV_REMOVE), m(shm, 0, MADV_REMOVE));
+    /* A read-only page punched on its own, its writable neighbour then
+     * written: where host pages are larger than 4 KB the two share one, and
+     * the punch must not leave that page read-only under the neighbour. */
+    char *ros = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    memset(ros, 'r', 4 * pg);
+    mprotect(ros, pg, PROT_READ);
+    r = m(ros, pg, MADV_REMOVE);
+    ros[pg] = 'w';
+    ros[3 * pg] = 'w';
+    printf("remove_roslice=%ld punched=%d neighbours=%c%c\n", r, ros[0] == 0 && ros[pg - 1] == 0, ros[pg], ros[3 * pg]);
+    /* Pages of a shared file mapping past end-of-file: nothing there to
+     * punch, and a success -- the file is one page, the mapping eight. (On a
+     * 16 KB host the first lies in the host page holding end-of-file, the
+     * second in one wholly past it, which the host will not let anyone touch.) */
+    char tmpe[] = "/tmp/madvreXXXXXX";
+    int efd = mkstemp(tmpe);
+    if (efd < 0) return 1;
+    unlink(tmpe);
+    if (write(efd, buf, sizeof buf) != (ssize_t)sizeof buf) return 1;
+    char *pe = mmap(NULL, 8 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, efd, 0);
+    if (pe == MAP_FAILED) return 1;
+    long r1 = m(pe + pg, pg, MADV_REMOVE);
+    long r5 = m(pe + 5 * pg, pg, MADV_REMOVE);
+    struct stat est;
+    fstat(efd, &est);
+    printf("remove_past_eof=%ld,%ld size=%lld kept=%c\n", r1, r5, (long long)est.st_size, pe[pg - 1]);
 
     /* Populate. */
     char *ro = mmap(NULL, pg, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

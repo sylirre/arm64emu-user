@@ -114,7 +114,11 @@ empty-length success or a hole's `ENOMEM`. The accepted set is a 6.1 kernel's
 (below), `MADV_REMOVE` punches a hole in the object behind a shared mapping
 (`madv_remove`: the host mapping *is* a mapping of that object, so the host's
 own `MADV_REMOVE` punches it for every sharer — with the partial host pages of
-a >4 KB host zeroed through the mapping instead — and `madvise_remove`'s
+a >4 KB host zeroed through the mapping instead, a host page the guest made
+read-only widened for it and left widened (it is shared with the guest pages
+around the range, which may be writable: the rule `guest_protect` follows on
+such a host), and a host page wholly past a file's end, which has nothing to
+punch and which the host answers with a bus error, skipped — and `madvise_remove`'s
 refusals are kept: `EINVAL` for private anonymous memory, which has no object,
 `EACCES` for a private file mapping or a shared one of a file not opened for
 writing, the walk done up to the first refusal and a hole `ENOMEM` at the end),

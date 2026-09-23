@@ -2820,9 +2820,13 @@ check_fixture prctlset $'dumpable=1\nset_dump0=0 get=0\nset_dump2=-22 set_dump1=
 # EACCES on a private or read-only shared file mapping, done up to the first
 # refusal; MADV_POPULATE_READ/WRITE are EINVAL without the permission asked,
 # EFAULT past a file's end, ENOMEM across a hole. Both used to be accepted
-# and ignored. Self-checking: qemu-user passes neither through; the expected
-# block is a real kernel's, taken natively.
-check_fixture madvremove $'remove_priv=-22\nremove_shm=0 punched=1 neighbours=ss\nchild_punch=1 seen_here=1 rest=t\nremove_shm_ro=0 punched=1\nremove_fpriv=-13\nremove_fsro=-13\nremove_fshw=0 punched=1 file_hole=1 file_kept=1\nremove_hole=-12 before=1 after=1\npopr_hole=-12 popw_hole=-12 popr_holestart=-12\nremove_mixed=-22 shared_punched=1 private_kept=y\nremove_unaligned=-22 remove_zerolen=0\npopw_ro=-22 popr_ro=0\npopr_none=-22 popw_none=-22\npopw_rw=0 popr_rw=0\npopw_fsro=-22 popr_fsro=0\npopr_in=0 popr_past_eof=-14 popw_past_eof=-14\ndone'
+# and ignored. The roslice and past_eof rows are for a host with pages larger
+# than 4 KB, where a punch zeroes partial host pages through the mapping: it
+# must neither leave a host page read-only under a writable neighbour nor
+# touch a host page wholly past the file's end. Self-checking: qemu-user
+# passes neither through; the expected block is a real kernel's, taken
+# natively.
+check_fixture madvremove $'remove_priv=-22\nremove_shm=0 punched=1 neighbours=ss\nchild_punch=1 seen_here=1 rest=t\nremove_shm_ro=0 punched=1\nremove_fpriv=-13\nremove_fsro=-13\nremove_fshw=0 punched=1 file_hole=1 file_kept=1\nremove_hole=-12 before=1 after=1\npopr_hole=-12 popw_hole=-12 popr_holestart=-12\nremove_mixed=-22 shared_punched=1 private_kept=y\nremove_unaligned=-22 remove_zerolen=0\nremove_roslice=0 punched=1 neighbours=ww\nremove_past_eof=0,0 size=4096 kept=f\npopw_ro=-22 popr_ro=0\npopr_none=-22 popw_none=-22\npopw_rw=0 popr_rw=0\npopw_fsro=-22 popr_fsro=0\npopr_in=0 popr_past_eof=-14 popw_past_eof=-14\ndone'
 # Robust futexes: a PTHREAD_MUTEX_ROBUST owner that dies -- a thread exiting,
 # a process exiting, one killed by a fault, one killed by a SIGTERM it never
 # set a disposition for, one exec'ing, a sibling thread of a group that

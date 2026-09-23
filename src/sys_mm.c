@@ -525,6 +525,20 @@ static int madv_valid(int adv) {
     }
 }
 
+/* Zero part of a shared mapping's host page through the mapping -- how a host
+ * with pages larger than the guest's punches the guest pages that share one
+ * with pages outside the range (madv_remove). Bracketed against a host bus
+ * error, which is what the host answers for a page wholly past the file's
+ * end: the guest's kernel would have punched nothing there, since there is
+ * nothing there to punch, so the fault is simply the end of the job and not
+ * an error -- where unguarded it was a SIGBUS on the emulator itself. */
+static int shared_zero(CPU *c, u8 *p, size_t n) {
+    BUS_GUARD_BEGIN(c, -EFAULT);
+    memset(p, 0, n);
+    BUS_GUARD_END();
+    return 0;
+}
+
 /* madvise_remove, over the guest's regions (see the call site). */
 static u64 madv_remove(CPU *c, u64 start, u64 end) {
     AddrSpace *as = &c->m->as;
@@ -554,17 +568,32 @@ static u64 madv_remove(CPU *c, u64 start, u64 end) {
             break;
         }
         /* The partial host pages (a host with pages bigger than 4 KB only):
-         * zeroed through the mapping, which reaches the object the same way. */
+         * zeroed through the mapping, which reaches the object the same way.
+         *
+         * A guest page the guest made read-only may sit on a host page that
+         * is not writable either, and is then widened first -- and left
+         * widened. The host page is shared with the guest pages around this
+         * one, possibly of another region of the same mapping that IS
+         * writable, so taking write access away again afterwards, as this
+         * used to, turned the next store to such a neighbour -- the zeroing
+         * of the very next region in this walk, or any guest thread's --
+         * into a host SIGSEGV that no guest can be handed. Leaving it is the
+         * rule guest_protect already follows on such a host (mem.c): a host
+         * page is only ever widened there, and the guest's protection stays
+         * enforced by its own page table. */
         if (alo > ahi) alo = ahi = lo;   /* the range lies inside one host page */
         u8 *parts[2][2] = { { lo, alo < hi ? alo : hi }, { ahi > lo ? ahi : lo, hi } };
         for (int i = 0; i < 2; i++) {
             if (parts[i][1] <= parts[i][0]) continue;
-            int writable = (r->prot & PTE_W) != 0;
             u8 *pg = (u8 *)((uintptr_t)parts[i][0] & ~hmask);
-            if (!writable) mprotect(pg, (size_t)hps, PROT_READ | PROT_WRITE);
-            memset(parts[i][0], 0, (size_t)(parts[i][1] - parts[i][0]));
-            if (!writable) mprotect(pg, (size_t)hps, PROT_READ);
+            if (!(r->prot & PTE_W) &&
+                mprotect(pg, (size_t)hps, PROT_READ | PROT_WRITE) != 0) {
+                err = -errno;   /* nothing written: the host page is as it was */
+                break;
+            }
+            shared_zero(c, parts[i][0], (size_t)(parts[i][1] - parts[i][0]));
         }
+        if (err) break;
         va = stop;
     }
     as_unlock();
@@ -643,9 +672,10 @@ SYSDEF(madvise) {
      * advice takes. The host mapping IS a mapping of that object, so the
      * host's own MADV_REMOVE does the punching; where the host's pages are
      * larger than the guest's, the interior is punched and the partial host
-     * pages at either end are zeroed through the mapping instead, made
-     * writable for the moment if the guest had taken that away (the object
-     * allows it: wr_ok). It used to be accepted and ignored. */
+     * pages at either end are zeroed through the mapping instead, widened to
+     * writable first if the guest had taken that away (the object allows it:
+     * wr_ok) and never narrowed again, since a host page is shared with the
+     * guest pages around the range. It used to be accepted and ignored. */
     if (adv == G_MADV_REMOVE) return madv_remove(c, a0, end);
     /* MADV_POPULATE_READ / _WRITE prefault the range: nothing a guest can see
      * afterwards, but the refusals are its business -- a mapping without the
