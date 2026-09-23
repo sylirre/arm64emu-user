@@ -395,16 +395,16 @@ SYSDEF(sendto) {
         if (tr < 0) return (u64)(s64)tr;
         dp = (struct sockaddr *)&ss;
     }
-    /* Bounded, but never shortened: a datagram that does not fit is refused
-     * (EMSGSIZE, by the host), not sent truncated -- so the whole buffer has
-     * to be there, which is what the copy would find out anyway. Judged after
-     * the address, as __sys_sendto copies that in first and the protocol
-     * copies the data last (msg_import keeps the same order). */
-    if (len && rw_room(c, a1, len, ACC_READ) < len) {
-        fdheld_close(dfd);
-        return (u64)(s64)-EFAULT;
-    }
-    GIovec g = { a1, len };
+    /* As far as the guest's memory goes, and the rest handed to the host as a
+     * fault in the same place (sys.h): the protocol copies the data last,
+     * after the address above and everything else it checks, and it is what
+     * decides what a fault means -- nothing sent of a datagram, the packets
+     * of a stream it copied whole. The whole buffer used to be demanded up
+     * front, which made every such send EFAULT, and ahead of the protocol's
+     * own answers. */
+    size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     /* A reconfiguring rtnetlink request from a guest with a faked network
      * namespace: note it, so the kernel's refusal becomes an ack on receive. */
     nlr_note_gvec(c, (int)a0, &g, 1);
@@ -412,9 +412,11 @@ SYSDEF(sendto) {
      * returns, so those have to be the guest's own (msg_import has the rest). */
     int zc = (int)a3 & MSG_ZEROCOPY;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 0, zc ? XFER_LEND : 0, NULL, &x);
-    if (r == 0 && zc && x.stage) { xfer_end(c, &x, 0); r = -ENOBUFS; }
-    if (r == 0 && (r = xfer_send_whole((int)a0, &x, len)) < 0) xfer_end(c, &x, 0);
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, zc ? XFER_LEND : 0, &cut, NULL, &x);
+    /* (A guarded staging is a file that is no socket -- sys.h: a socket
+     * takes its fault lent -- and the host answers ENOTSOCK without looking.) */
+    if (r == 0 && zc && x.stage && !x.guarded) { xfer_end(c, &x, 0); r = -ENOBUFS; }
+    if (r == 0 && (r = xfer_send_whole((int)a0, &x, room)) < 0) xfer_end(c, &x, 0);
     if (r < 0) { fdheld_close(dfd); return (u64)(s64)r; }
     ssize_t n;
     if (x.n == 1) {
@@ -445,22 +447,17 @@ SYSDEF(recvfrom) {
      * hands over -- and it is gone once received -- while a guest that names
      * more room than it has is still entitled to a datagram that fits in what
      * it does have, so the room cannot be demanded up front either. What it
-     * does not have is handed to the host as an iovec over address 0, where
+     * does not have is handed to the host as a fault in the same place, where
      * the host kernel's copy stops exactly where the guest's kernel would
-     * (msg_import has the whole story); this used to allocate everything the
-     * guest named before the socket had anything to deliver. */
+     * (sys.h); this used to allocate everything the guest named before the
+     * socket had anything to deliver. */
     size_t len = rw_count(a2);
     size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
     GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 1, room < len ? XFER_LEND : 0, NULL, &x);
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
-    if (room < len && x.total == room && x.n < XFER_IOV) {
-        if (!x.total) x.n = 0;                /* as msg_import: fault first */
-        x.iov[x.n].iov_base = NULL;           /* lent, so iov[] has the room */
-        x.iov[x.n].iov_len = len - room;
-        x.n++;
-    }
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     ssize_t n;
@@ -595,7 +592,7 @@ static u64 sockopt_set_large(CPU *c, int fd, int level, int name, u64 va,
     if (room == len) {
         GIovec g = { va, len };
         GuestXfer x;
-        int r = xfer_begin(c, fd, &g, 1, 0, XFER_LEND, NULL, &x);
+        int r = xfer_begin(c, fd, &g, 1, 0, XFER_LEND, NULL, NULL, &x);
         if (r < 0) return (u64)(s64)r;
         if (x.n == 1 && !x.stage && x.total == len) {
             int rr = setsockopt(fd, level, name, x.iov[0].iov_base, (socklen_t)len);
@@ -670,7 +667,7 @@ static s64 sockopt_get_large(CPU *c, int fd, int level, int name, u64 va,
                              size_t len) {
     GIovec g = { va, len };
     GuestXfer x;
-    int r = xfer_begin(c, fd, &g, 1, 1, XFER_LEND, NULL, &x);
+    int r = xfer_begin(c, fd, &g, 1, 1, XFER_LEND, NULL, NULL, &x);
     if (r < 0) return r;
     if (x.n == 1 && !x.stage && x.total == len) {
         socklen_t sl = (socklen_t)len;
@@ -1375,41 +1372,38 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
         if (tr < 0) return tr;
         h->msg_namelen = sl;
     }
-    /* A send must have all of its data in guest memory, as a datagram's copy
-     * finds out before anything is sent; that is also what bounds the transfer
-     * by the guest's own memory rather than by a length it merely named. A
-     * receive cannot demand it -- a guest naming more room than it has is
-     * still entitled to a datagram that fits in what it does have -- so there
-     * the vector is cut where the guest's memory stops, and the rest of it is
-     * handed to the host as an iovec over address 0, which no process maps
-     * (vm.mmap_min_addr). The host kernel's copy then stops exactly where the
-     * guest's own kernel would, and answers as it would: the bytes of a stream
-     * up to there, EFAULT for a datagram that did not fit -- and the datagram
-     * gone either way, which is what a kernel does with one it could not
-     * deliver. This used to receive the whole of what was named into a bounce
-     * buffer that size, before anything had even arrived. */
+    /* The data, as far as the guest's memory goes: the vector is cut where it
+     * stops, and the rest of what was named is handed to the host as a fault
+     * in the same place (sys.h), so the host kernel's copy stops exactly where
+     * the guest's own kernel would, and answers as it would -- on a receive,
+     * the bytes of a stream up to there, EFAULT for a datagram that did not
+     * fit, and the datagram gone either way; on a send, EFAULT with nothing
+     * sent of a datagram, the packets of a stream it copied whole. That is
+     * also what bounds the transfer by the guest's own memory rather than by a
+     * length it merely named. A receive used to take the whole of what was
+     * named into a bounce buffer that size, before anything had even arrived,
+     * and a send used to demand all of its data up front: EFAULT for every
+     * stream it would have sent part of. */
     size_t backed = 0;
     unsigned nseg = cnt;
-    if (for_send) {
-        for (unsigned i = 0; i < cnt; i++)
-            if (gi[i].iov_len && rw_room(c, gi[i].iov_base, (size_t)gi[i].iov_len,
-                                         ACC_READ) < gi[i].iov_len)
-                return -EFAULT;
-        backed = (size_t)total;
-    } else {
-        for (unsigned i = 0; i < cnt; i++) {
-            size_t want = (size_t)gi[i].iov_len;
-            size_t room = want ? rw_room(c, gi[i].iov_base, want, ACC_WRITE) : 0;
-            gi[i].iov_len = room;
-            backed += room;
-            if (room < want) { nseg = i + 1; break; }
+    XferCut cut = { 0, 0 };
+    for (unsigned i = 0; i < cnt; i++) {
+        size_t want = (size_t)gi[i].iov_len;
+        size_t room = want ? rw_room(c, gi[i].iov_base, want,
+                                     for_send ? ACC_READ : ACC_WRITE) : 0;
+        gi[i].iov_len = room;
+        backed += room;
+        if (room < want) {
+            cut.seg = want - room;
+            cut.after = (size_t)total - backed - cut.seg;
+            nseg = i + 1;
+            break;
         }
     }
     mi->nseg = (int)nseg;
     int zc = for_send && (sflags & MSG_ZEROCOPY);
-    int cut = backed < total;
-    int r = xfer_begin(c, fd, gi, (int)nseg, !for_send, zc || cut ? XFER_LEND : 0,
-                       mi->iov, &mi->x);
+    int r = xfer_begin(c, fd, gi, (int)nseg, !for_send, zc ? XFER_LEND : 0,
+                       &cut, mi->iov, &mi->x);
     if (r < 0) return r;
     mi->xfer = 1;
     if (for_send && (r = xfer_send_whole(fd, &mi->x, backed)) < 0) return r;
@@ -1420,19 +1414,9 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
      * the kernel still transmits from it. Refuse it with the ENOBUFS a
      * zero-copy send may always get (the notification budget), which a
      * caller answers by sending with a copy. Only a vector past a thousand
-     * separate mappings gets here. */
-    if (zc && mi->x.stage) return -ENOBUFS;
-    if (cut && mi->x.total == backed && mi->x.n < XFER_IOV) {
-        /* With nothing lent, the empty segments ahead of the fault go: they
-         * are nothing to a socket, and an interposer between the emulator and
-         * the kernel -- qemu-user, the ARM32 tier's host -- faults only on the
-         * FIRST iovec it cannot lock, and drops a later one, delivering the
-         * datagram into what is left of the vector as if it had fitted. */
-        if (!mi->x.total) mi->x.n = 0;
-        mi->x.iov[mi->x.n].iov_base = NULL;
-        mi->x.iov[mi->x.n].iov_len = (size_t)(total - backed);
-        mi->x.n++;
-    }
+     * separate mappings gets here. (A guarded staging is a file that is no
+     * socket, as in sendto.) */
+    if (zc && mi->x.stage && !mi->x.guarded) return -ENOBUFS;
     h->msg_iov = mi->x.iov;
     h->msg_iovlen = (size_t)mi->x.n;
     h->msg_flags = g->msg_flags;

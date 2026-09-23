@@ -531,9 +531,13 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   ignored outright; the buffer comes back untouched.
 #   iov-fault       an iovec segment qemu-user cannot lock is dropped, and
 #                   the rest of the vector is transferred as if it were all
-#                   there. A kernel copies the vector in order and faults on
-#                   the segment (the emulator hands a receive's missing part
-#                   to the host as an iovec over address 0 for exactly that).
+#                   there; a read(2)/write(2) buffer it cannot lock in full is
+#                   EFAULT before the file sees the call. A kernel copies in
+#                   order and faults where the memory stops, with whatever
+#                   that means to the file -- an eventfd's count consumed
+#                   first (the emulator hands the part of a transfer the guest
+#                   does not have to the host as a fault in the same place,
+#                   for exactly that: an iovec over address 0, or a guard).
 #   ctrl-budget     sendmsg with a msg_controllen past the optmem budget is
 #                   ENOBUFS on a kernel before the buffer is read (EINVAL
 #                   from a 64-bit kernel's compat walk, which is still an
@@ -627,8 +631,12 @@ EOF
     iov-fault) cat <<'EOF'
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdint.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <unistd.h>
 int main(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) return 1;
@@ -636,7 +644,16 @@ int main(void) {
     if (send(sv[0], b, 8, 0) != 8) return 1;
     struct iovec v[2] = { { r, 4 }, { 0, 4 } };
     struct msghdr m = { .msg_iov = v, .msg_iovlen = 2 };
-    return !(recvmsg(sv[1], &m, 0) < 0 && errno == EFAULT);
+    if (!(recvmsg(sv[1], &m, 0) < 0 && errno == EFAULT)) return 1;
+    long pg = sysconf(_SC_PAGESIZE);
+    char *p = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || munmap(p + pg, pg)) return 1;
+    int ef = eventfd(5, EFD_NONBLOCK);
+    if (ef < 0) return 1;
+    if (!(read(ef, p + pg - 4, 8) < 0 && errno == EFAULT)) return 1;
+    uint64_t c;
+    return !(read(ef, &c, 8) < 0 && errno == EAGAIN);   /* consumed */
 }
 EOF
         ;;

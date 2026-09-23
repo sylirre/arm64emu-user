@@ -1912,14 +1912,16 @@ fi
 
 # ---- vector I/O into memory the guest does not have. A kernel copies straight
 # into the caller's pages and stops where they do; a regular file reports the
-# short transfer, a pipe or a socket rolls the copy back and answers EFAULT,
-# and nothing addressable at all is EFAULT with the file untouched. The
-# emulator stages every vector call through a bounce buffer, so it has to work
-# that out from the guest's page table first -- it used to allocate for
-# everything the guest named, run the transfer and only then find the
-# destination missing, losing the bytes it had consumed. Self-checking: the
-# block below is what a real kernel prints for this program, natively, and
-# qemu-user disagrees with it on nine of the fourteen rows.
+# short transfer, a pipe or a socket whose first buffer or packet the fault
+# lands in rolls the copy back and answers EFAULT, and nothing addressable at
+# all is EFAULT with the file untouched. The emulator measures the guest's
+# memory before the call and hands the host a fault where it stops, for the
+# host kernel to answer -- it used to allocate for everything the guest named,
+# run the transfer and only then find the destination missing, losing the
+# bytes it had consumed. Self-checking: the block below is what a real kernel
+# prints for this program, natively, and qemu-user disagrees with it on nine
+# of the fourteen rows -- so it cannot be the emulator's host either, and the
+# fixture is gated on the iov-fault probe (tests/hostenv.sh).
 #
 # The last three rows are the other half of the same question: how long a
 # vector may be. A kernel refuses only a segment whose length is negative as an
@@ -1927,6 +1929,10 @@ fi
 # than one call can move is a short transfer -- where a flat 1 GiB ceiling here
 # used to make it EINVAL, on the same buffer a read(2) of the same fd moved
 # without complaint. ----
+if ! a64_emu_syscall_ok iov-fault; then
+    skip=$((skip+1))
+    echo "SKIP fixture: iovroom (the emulator's host cannot: iov-fault)"
+else
 if [ ! -x tests/fixtures/iovroom.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o tests/fixtures/iovroom.bin \
         tests/fixtures/iovroom.c $A64_TESTLIBS 2>/dev/null || true
@@ -1958,6 +1964,7 @@ dgram-write        -1 14 left=-11"
     fx_rm tests/fixtures/iovroom.bin
 else
     skip_build "fixtures/iovroom"
+fi
 fi
 
 # ---- how many iovec segments a vector call was given. readv/writev truncate
@@ -2607,6 +2614,18 @@ check_fixture xferlend $'write_null=ok flat=1\nwritev_null=ok flat=1\npwrite_nul
 # Gated on the emulator's host doing the same (NEEDS-HOST-SYSCALL; qemu-user
 # does none of the three).
 check_fixture xferfault $'ctrl_huge=ENOBUFS flat=1\nctrl_unmapped=ENOBUFS\nrecv_dgram_cut=EFAULT then=EAGAIN small=100\nrecvmsg_dgram_cut=EFAULT then=EAGAIN\nrecv_stream_cut=EFAULT got=-1 total=8192\nfiemap_order=EOPNOTSUPP\nsend_order=EINVAL,ENOBUFS\ndone'
+# The same question for read(2), write(2), sendto and the vector calls, over
+# the files whose answers differ: a stream's packets and a pipe's buffers
+# copied whole before the fault, EFAULT with nothing consumed or sent when it
+# lands in the first; a datagram EFAULT, gone or never sent; an eventfd's
+# count, a signalfd record and an inotify event consumed by the fault; and
+# 0, EAGAIN, EPIPE or /dev/null's count where the call never reaches the copy.
+# The emulator used to decide all of it itself -- a short transfer for every
+# scalar call (a truncated datagram sent), EFAULT for every vector one on a
+# pipe or socket, EFAULT for any buffer with nothing mapped -- and is now
+# answered by the host kernel, handed a fault in the same place (sys.h).
+# Gated like xferfault: qemu-user drops the fault, or refuses the call first.
+check_fixture rwfault $'stream_read_one=EFAULT left=8192\nstream_read_two=4096 left=4096\nstream_read_part=EFAULT left=100\nstream_readv_two=4096 left=4096\nstream_readv_none=EFAULT left=10\nstream_write=EFAULT sent=0\nstream_sendmsg=EFAULT sent=0\nstream_read_eof=0\nstream_send_big=n some=1 arrived_all=1\ndgram_read=EFAULT left=0\ndgram_write=EFAULT sent=0\ndgram_sendto=EFAULT sent=0\npipe_read_part=EFAULT left=100\npipe_write_part=EFAULT sent=0\npipe_write_merge=EFAULT sent=10\npipe_read_empty=EAGAIN\npipe_read_eof=0\npipe_write_noreader=EPIPE\neventfd_read_part=EFAULT then=EAGAIN\neventfd_readv_none=EFAULT then=EAGAIN\neventfd_write_part=EFAULT then=EAGAIN\ninotify_read_part=EFAULT left=32\ninotify_read_short=EFAULT left=0\nsignalfd_read_part=128 left=128\nsignalfd_read_none=EFAULT left=128\nfile_read_eof=0\nfile_pread_eof=0\nfile_write_none=EFAULT\nfile_write_part=4096\nfile_pwrite_part=4096\nfile_pread_part=4096\nnull_write_none=10\nnull_write_part=8192\nnull_read_none=0\nnull_writev_none=10\ndone'
 # FIEMAP's answers through a one-run array (lent) and one across a seam
 # (staged): the extents, the slots it did not fill left alone, and the header
 # written back on an error too -- EBADR's fm_flags name the refused flag, where
@@ -2871,7 +2890,7 @@ check_fixture timers_many $'created 300\nreplaced 150\ntimer 0: code=-2 si_timer
 # child's 340 extents through the shared registry. Self-checking for the same
 # reason as userns_race: no oracle can take the writes. Both registry tiers,
 # since the record is what used to truncate.
-check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\ntwo_lines: 18 back=0:1000:1,1:1001:1\ntabs: 9 back=0:1000:1\ncr: 10 back=0:1000:1\nleading_space: 11 back=0:1000:1\ntrailing_space: 10 back=0:1000:1\nblank_between: -22\nblank_trailing: -22\nblank_leading: -22\nspace_only_line: -22\njunk: -22\ntwo_fields: -22\none_field: -22\nempty: -22\nnewline_only: -22\nplus: -22\nminus: -22\nhex: -22\nglued: -22\nnul_ends: 23 back=0:1000:1\nnul_after_newline: 11 back=0:1000:1\nwrap_first: 18 back=0:1000:1\nwrap_lower: 15 back=0:1000:1\nwrap_huge: 28 back=5:1000:1\nfirst_minus1: -22\nlower_minus1: -22\ncount_zero: -22\nfirst_wraps: -22\nlower_wraps: -22\nfirst_to_end: 18 back=4294967294:1000:1\nlower_to_end: 15 back=0:4294967294:1\noverlap_upper: -22\noverlap_lower: -22\noverlap_touch: -22\nadjacent: 21 back=0:1000:10,10:1010:10\nduplicate: -22\nextents_340: 3630 back=0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nextents_341: -22\nextents_340_blank: -22\nbytes_4095: 4095 back=0:100000:1,11:100011:1,23:100023:1,35:100035:1,...(298 extents)\nbytes_4096: -22\nbytes_4096_junk: -22\nsg_deny: 4\nsg_allow: 5\nsg_deny_nl: 5\nsg_allow_nl: 6\nsg_denyx: -22\nsg_allowx: -22\nsg_deny_ws: 7\nsg_allow_ws: 7\nsg_deny_junk: -22\nsg_den: -22\nsg_empty: -22\nsg_8bytes: -22\nsg_Deny: -22\ngid_map: 9\nallow_after_gid_map: 5\ndeny_after_gid_map: -1\ngid_map_again: -1\ngid_map_again_junk: -1\ngid_map_again_page: -22\ndeny: 4\ndeny_again: 4\nallow_after_deny: -1\nallowx_after_deny: -22\nsetgroups_back: deny\ngid_map_after_deny: 9\nparent_writes_340: 3630\nparent_writes_again: -1\nparent_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\ngrandchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_status: 0\ndone' \
+check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\ntwo_lines: 18 back=0:1000:1,1:1001:1\ntabs: 9 back=0:1000:1\ncr: 10 back=0:1000:1\nleading_space: 11 back=0:1000:1\ntrailing_space: 10 back=0:1000:1\nblank_between: -22\nblank_trailing: -22\nblank_leading: -22\nspace_only_line: -22\njunk: -22\ntwo_fields: -22\none_field: -22\nempty: -22\nnewline_only: -22\nplus: -22\nminus: -22\nhex: -22\nglued: -22\nnul_ends: 23 back=0:1000:1\nnul_after_newline: 11 back=0:1000:1\nwrap_first: 18 back=0:1000:1\nwrap_lower: 15 back=0:1000:1\nwrap_huge: 28 back=5:1000:1\nfirst_minus1: -22\nlower_minus1: -22\ncount_zero: -22\nfirst_wraps: -22\nlower_wraps: -22\nfirst_to_end: 18 back=4294967294:1000:1\nlower_to_end: 15 back=0:4294967294:1\noverlap_upper: -22\noverlap_lower: -22\noverlap_touch: -22\nadjacent: 21 back=0:1000:10,10:1010:10\nduplicate: -22\nextents_340: 3630 back=0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nextents_341: -22\nextents_340_blank: -22\nbytes_4095: 4095 back=0:100000:1,11:100011:1,23:100023:1,35:100035:1,...(298 extents)\nbytes_4096: -22\nbytes_4096_junk: -22\ncut: -14\ncut_page: -22\nsg_deny: 4\nsg_allow: 5\nsg_deny_nl: 5\nsg_allow_nl: 6\nsg_denyx: -22\nsg_allowx: -22\nsg_deny_ws: 7\nsg_allow_ws: 7\nsg_deny_junk: -22\nsg_den: -22\nsg_empty: -22\nsg_8bytes: -22\nsg_Deny: -22\nsg_cut: -14\nsg_cut_8: -22\ngid_map: 9\nallow_after_gid_map: 5\ndeny_after_gid_map: -1\ngid_map_again: -1\ngid_map_again_junk: -1\ngid_map_again_page: -22\ndeny: 4\ndeny_again: 4\nallow_after_deny: -1\nallowx_after_deny: -22\nsetgroups_back: deny\ngid_map_after_deny: 9\nparent_writes_340: 3630\nparent_writes_again: -1\nparent_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\ngrandchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_status: 0\ndone' \
     "A64_PROCTAB_FORCE_FILE=1" "file-registry tier"
 
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped

@@ -3,28 +3,27 @@
  * A kernel copies straight between the file and the caller's own pages: it
  * stops at the first address the caller does not have, and what it reports
  * then depends on the file.  A regular file (a device, a tty) reports the
- * short transfer.  A pipe or a socket rolls the copy back and answers EFAULT
- * for the whole call -- with nothing consumed and nothing sent, except that a
- * datagram read still costs the datagram.  Nothing addressable at all is
- * EFAULT everywhere, with the file untouched.
+ * short transfer.  A pipe or a socket whose first buffer or packet the fault
+ * lands in rolls the copy back and answers EFAULT for the whole call -- with
+ * nothing consumed and nothing sent, except that a datagram read still costs
+ * the datagram (tests/fixtures/rwfault.c has the later-buffer cases, which
+ * are short transfers).  Nothing addressable at all is EFAULT here, with the
+ * file untouched.
  *
- * The emulator cannot copy in place -- it stages every vector call through a
- * bounce buffer -- so it has to work all of that out from the guest's page
- * table before it touches the fd.  It used to do none of it: it allocated for
- * everything the guest named (a gigabyte the guest did not own was a gigabyte
- * the emulator had to find), ran the transfer, and only then discovered the
- * destination was missing, losing the bytes it had already consumed.
+ * The emulator cannot copy in place, so it measures the guest's page table
+ * before the call and hands the host the guest's own pages up to where they
+ * stop, and a fault from there on, for the host kernel to answer as it does.
+ * It used to do none of it: it allocated for everything the guest named (a
+ * gigabyte the guest did not own was a gigabyte the emulator had to find),
+ * ran the transfer, and only then discovered the destination was missing,
+ * losing the bytes it had already consumed.
  *
  * Every row's expected value was measured on a real kernel.  Self-checking:
  * qemu-user validates each segment's whole range up front and answers EFAULT
- * for all of them, including the two a kernel completes.
- *
- * One deliberate difference is not checked here: after an EFAULT on a pipe or
- * a stream socket a kernel leaves in the guest's buffer the bytes it copied
- * before rolling the read back, and the emulator, which never touches the fd
- * in that case, leaves it alone.  A call that returned EFAULT says nothing
- * about its buffer, and matching it would mean consuming what the kernel put
- * back.
+ * for all of them, including the two a kernel completes -- and drops a
+ * segment it cannot lock when it is the emulator's host, so it cannot be
+ * that either:
+ * NEEDS-HOST-SYSCALL: iov-fault
  */
 #define _GNU_SOURCE
 #include <errno.h>

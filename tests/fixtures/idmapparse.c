@@ -9,6 +9,8 @@
  * parse. The verdicts below are read off the kernel source:
  *
  *  - a write of PAGE_SIZE or more is EINVAL before anything else is looked at;
+ *  - the text is copied in next, whole, so a buffer that is not all there is
+ *    EFAULT -- after that check, and before the one-shot test and the parse;
  *  - the buffer is a string (a NUL ends it) of lines; a line with nothing on
  *    it is an error, not a blank to skip, except that a newline ending the
  *    buffer opens no line;
@@ -37,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -90,16 +93,30 @@ static void map_case(const char *name, const void *s, size_t n) {
 }
 #define MAP(name, s) map_case(name, s, strlen(s))
 
-static void sg_case(const char *name, const char *s) {
+static void sg_case_n(const char *name, const char *s, size_t n) {
     fflush(stdout);
     pid_t k = fork();
     if (k == 0) {
         if (unshare(CLONE_NEWUSER) != 0) { printf("%s: unshare=%d\n", name, errno); _exit(0); }
-        printf("%s: %ld\n", name, wr("/proc/self/setgroups", s, strlen(s)));
+        printf("%s: %ld\n", name, wr("/proc/self/setgroups", s, n));
         fflush(stdout);
         _exit(0);
     }
     waitpid(k, NULL, 0);
+}
+static void sg_case(const char *name, const char *s) { sg_case_n(name, s, strlen(s)); }
+
+/* `s` placed at the very end of a page with nothing mapped after it: a write
+ * naming more than strlen(s) bytes of it runs off the guest's memory. */
+static const char *at_hole(const char *s) {
+    static char *pg;
+    if (!pg) {
+        pg = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pg == MAP_FAILED || munmap(pg + 4096, 4096)) exit(1);
+    }
+    size_t n = strlen(s);
+    memcpy(pg + 4096 - n, s, n);
+    return pg + 4096 - n;
 }
 
 int main(void) {
@@ -171,6 +188,8 @@ int main(void) {
     memcpy(big, "junk", 4);
     map_case("bytes_4096_junk", big, bn);
     free(big);
+    map_case("cut", at_hole("0 1000 1"), 9);
+    map_case("cut_page", at_hole("0 1000 1"), 4096);
     /* ---- setgroups ---- */
     sg_case("sg_deny", "deny");
     sg_case("sg_allow", "allow");
@@ -185,6 +204,8 @@ int main(void) {
     sg_case("sg_empty", "");
     sg_case("sg_8bytes", "allow\n\n\n");
     sg_case("sg_Deny", "Deny");
+    sg_case_n("sg_cut", at_hole("deny"), 5);
+    sg_case_n("sg_cut_8", at_hole("deny"), 8);
     /* ---- order ---- */
     fflush(stdout);
     if (fork() == 0) {

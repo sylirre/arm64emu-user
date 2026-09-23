@@ -208,18 +208,45 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   `MAX_RW_COUNT` (`INT_MAX` rounded down to a page), which `rw_verify_area`
   clamps to as well rather than refusing — casting first instead turned a count
   above 4 GB into an unrelated small one on an ILP32 host and transferred that
-  many bytes. `rw_room` then bounds the transfer by the run of the guest's
-  buffer that is actually mapped for the access: a kernel stops where the
-  caller's memory ends and reports the short transfer, so anything past that
-  point could never be delivered — and finding host memory for it let a guest
-  name a length (`read(fd, buf, 1 TB)`, no such `buf`) that the *emulator* had
-  to find room for. A datagram is the exception on both counts: `sendto` may
-  not shorten its buffer (the message would be sent truncated where the kernel
-  refuses it whole), so it demands the whole of it; and `recvfrom` may not
-  either (the message would arrive truncated, and it is gone once received),
-  so what the guest does not have is handed to the host as an iovec over
-  address 0, where the host kernel's copy faults exactly where the guest's
-  would (`tests/fixtures/bigcount.c`, `tests/fixtures/xferfault.c`).
+  many bytes. `rw_room` then measures the run of the guest's buffer that is
+  actually mapped for the access: a kernel faults where the caller's memory
+  ends, so nothing past that point can ever be moved — and finding host memory
+  for it let a guest name a length (`read(fd, buf, 1 TB)`, no such `buf`) that
+  the *emulator* had to find room for. What the fault *means* is the file's
+  business (*a buffer the guest has only part of*, below), so the rest is not
+  dropped: it goes to the host as a fault in the same place
+  (`tests/fixtures/bigcount.c`, `tests/fixtures/xferfault.c`,
+  `tests/fixtures/rwfault.c`).
+- *A buffer the guest has only part of, or none of* (`XferCut`, `sys.h`;
+  `xfer_begin`, `sys_file.c`). A kernel's answer to such a call is not one
+  answer — measured against one: a regular file reports the short transfer; a
+  pipe or a stream socket reports the bytes of the pipe buffers or packets it
+  copied whole before the one the fault landed in, and **`EFAULT`** with
+  nothing consumed or sent if that was the first; a datagram is `EFAULT`, gone
+  when received and never sent; an eventfd consumes its count, a signalfd the
+  record, an inotify descriptor the event, and then they fault; and a call
+  that never reaches the copy answers as if the buffer were whole — `0` at the
+  end of a file or pipe, `EAGAIN`, `EPIPE`, `/dev/null`'s full count. The
+  emulator used to decide instead, and got most of it wrong: every scalar call
+  became a short transfer of what was mapped (a **truncated datagram sent**,
+  an eventfd count refused as too small), every vector call on a pipe or
+  socket `EFAULT` before the fd was touched (even where a kernel returns the
+  packets it had), a send `EFAULT` whenever any of it was missing, and a
+  buffer with nothing mapped `EFAULT` ahead of everything. Now the host kernel
+  is handed the fault where the guest's kernel would meet it, and gives every
+  one of those answers itself. A file that takes an iovec whole (a regular
+  file, a block device, a pipe, a socket, the memory devices) gets the whole
+  transfer lent and the rest as one more iovec over address 0, which no
+  process maps — with nothing lent, the empty segments before it are dropped,
+  since qemu-user faults only on the *first* iovec it cannot lock. Any other
+  file may be served by a driver with only `->read`/`->write`, called once per
+  iovec with that iovec's length, so the segment the fault is in reaches it as
+  one host iovec of the guest's length: the transfer is staged in front of a
+  `PROT_NONE` guard (`guardbuf_map`) that begins where the guest's memory
+  ends, and past `XFER_STAGE_MAX` of it it is a short transfer instead. A
+  signalfd read takes as many records as reach the guest's memory, plus the
+  one whose copy faults. `tests/fixtures/rwfault.c` pins 35 such cases against
+  a real kernel; the old code got 27 of them wrong.
 - *The same count, on the calls that never build a bounce buffer.* `sendfile`,
   `splice` and `copy_file_range` hand the guest's count straight to the host,
   and `getrandom`/`add_key`/`setxattr` bound it themselves — all six cast it
@@ -241,12 +268,12 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   gather in one bounce buffer before the transfer, so an unbounded import let a
   guest name a gigabyte it did not own, and — on the read side — the bytes
   really read on its behalf were then lost with the `EFAULT`. Each segment is bounded
-  by `rw_room` and the vector cut where a kernel's copy would stop; what the
-  call reports then depends on the file, and it does on a kernel too: a regular
-  file (device, tty) reports the **short transfer**, while a pipe or socket
-  rolls the copy back and answers **`EFAULT`** with nothing consumed or sent —
-  except that a datagram read still costs the datagram. Nothing addressable at
-  all is `EFAULT` everywhere, answered before the fd is touched.
+  by `rw_room` and the vector cut where a kernel's copy would stop, and the
+  rest handed to the host as the fault (*a buffer the guest has only part
+  of*, above): a regular file (device, tty) reports the **short transfer**,
+  while a pipe or socket whose first buffer or packet the fault lands in rolls
+  the copy back and answers **`EFAULT`** with nothing consumed or sent —
+  except that a datagram read still costs the datagram.
 
   How *long* a segment may be is `__import_iovec`'s rule, the same one the
   socket calls follow (below): only a length that is negative as an `ssize_t`
@@ -259,7 +286,8 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   ceiling bought no headroom either. `tests/fixtures/iovroom.c` pins all
   fourteen cases against a real kernel; `qemu-user` disagrees with the kernel
   on nine of them (it validates each segment's whole range up front), so it is
-  not the oracle here.
+  not the oracle here — nor, for the same reason, a host this can run on
+  (the `iov-fault` probe, `tests/hostenv.sh`).
 - *Where a transfer's bytes go* (`xfer_begin`/`xfer_end`, `sys_file.c`, and
   `guest_lend`, `mem.c`). The host syscall needs host memory to move a
   transfer through, and it used to be a bounce buffer the size of the whole of
@@ -1065,16 +1093,19 @@ never by a number the guest merely named:
   and not an error — the same rule `iov_import` follows for `readv`/
   `writev`, where a flat 16 MiB ceiling had made `sendmsg` refuse what `writev`
   on the same fd accepted (`iov_import` had a 1 GiB one of its own until
-  the same rule replaced it). A send demands every segment up front (`sendto`
-  does the same); a receive cannot, because shortening the vector would
-  truncate a datagram that is gone once received (`recvfrom` makes the same
-  distinction) — so the part of the vector the guest does not have goes to
-  the host as an iovec over address 0, which no process maps, and the host
-  kernel's copy stops there exactly as the guest's kernel would: `EFAULT` for
-  a datagram that did not fit (and the datagram gone), the bytes up to there
-  for a stream, with the rest still queued. That used to be a receive of the
-  whole named length into a bounce buffer that size, before anything had even
-  arrived, and a failed copy-out afterwards that lost a stream's bytes.
+  the same rule replaced it). Neither direction may shorten the vector — a
+  datagram would be sent truncated, or arrive truncated and be gone once
+  received — so the part the guest does not have goes to the host as an
+  iovec over address 0, which no process maps, and the host kernel's copy
+  stops there exactly as the guest's kernel would (`sendto` and `recvfrom` do
+  the same): on a receive, `EFAULT` for a datagram that did not fit (and the
+  datagram gone), the bytes up to there for a stream, with the rest still
+  queued; on a send, `EFAULT` with nothing sent of a datagram, and the packets
+  of a stream it copied whole. That used to be a receive of the whole named
+  length into a bounce buffer that size, before anything had even arrived,
+  and a failed copy-out afterwards that lost a stream's bytes — and a send
+  that demanded every segment up front, `EFAULT` for any stream a kernel would
+  have sent part of.
   The checks run in the order the kernel meets them: the header and its
   iovec, then the control buffer (its size, then its contents), then the
   destination address, and the data last of all.

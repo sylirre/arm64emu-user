@@ -150,15 +150,12 @@ void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
  *
  * What comes back in gout[0..count) is the vector as the transfer is to move
  * it: every length clamped and cut as below, so its sum is the most the call
- * may move, and xfer_begin (sys.h) then finds the host memory for it. */
-/* *efault_out is how a vector the guest could not fully back is reported:
- *   0  the transfer's own result is the answer (the usual case, and the
- *      short-transfer case);
- *   1  the call answers EFAULT and must not touch the fd at all;
- *   2  the call answers EFAULT, but the transfer happens first. */
-static int iov_import(CPU *c, int fd, u64 iov_va, unsigned cnt, GIovec *gout,
-                      int writeback, int *efault_out) {
-    *efault_out = 0;
+ * may move of the guest's own memory, and *cut is what the guest named past
+ * that -- which xfer_begin (sys.h) hands the host as a fault, for the file to
+ * answer as it does. */
+static int iov_import(CPU *c, u64 iov_va, unsigned cnt, GIovec *gout,
+                      int writeback, XferCut *cut) {
+    cut->seg = cut->after = 0;
     /* `cnt` is deliberately narrow. The guest passes iovcnt in a 64-bit
      * register and the kernel takes it as `unsigned long`, but it reaches
      * import_iovec's `unsigned nr_segs` and is truncated there -- so on a real
@@ -200,43 +197,24 @@ static int iov_import(CPU *c, int fd, u64 iov_va, unsigned cnt, GIovec *gout,
      * without this it went looking for -- and then really consumed from the
      * fd -- everything the guest named, only to discover afterwards that the
      * destination was not there. A guest could name a gigabyte it does not
-     * own and the emulator, not the guest, had to find room for it, and the
-     * bytes read on its behalf were lost with the EFAULT.
+     * own and the emulator, not the guest, had to find room for it.
      *
-     * Cut the vector where the kernel's copy stops. What that means for the
-     * call then depends on the file, because on a kernel it does -- all of the
-     * following measured against one:
-     *   regular file, device, tty  the short transfer IS the answer;
-     *   pipe, stream socket        EFAULT, and nothing is consumed or sent --
-     *                              the copy is rolled back;
-     *   datagram socket, reading   EFAULT, and the datagram is gone anyway,
-     *                              which a clamped read of it also does;
-     *   datagram socket, writing   EFAULT, and nothing is sent.
-     * So *efault_out tells the caller which of the three shapes to produce.
-     * Nothing addressable at all is EFAULT everywhere, answered before the fd
-     * is touched -- as a kernel does, having copied nothing. */
+     * Cut the vector where the kernel's copy stops, and report the rest in
+     * *cut. What the fault means for the call is the file's to say -- it is
+     * not one answer, and deciding it here from the file's type (EFAULT for
+     * every pipe and socket, before the fd was touched) was wrong for most of
+     * them: sys.h has the list. */
     AccType acc = writeback ? ACC_WRITE : ACC_READ;
-    size_t total = 0;
     unsigned nseg = 0;
-    int cut = 0;
     for (; nseg < cnt; nseg++) {
         size_t want = (size_t)gout[nseg].iov_len;
         size_t room = want ? rw_room(c, gout[nseg].iov_base, want, acc) : 0;
         gout[nseg].iov_len = room;
-        total += room;
-        if (room < want) { nseg++; cut = 1; break; }
-    }
-    if (cut) {
-        if (!total) return -EFAULT;
-        struct stat st;
-        if (fstat(fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
-            *efault_out = 1;                       /* leave the fd untouched */
-            int type = 0;
-            socklen_t tl = sizeof type;
-            if (writeback && S_ISSOCK(st.st_mode) &&
-                getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) == 0 &&
-                type != SOCK_STREAM)
-                *efault_out = 2;                   /* the datagram goes either way */
+        if (room < want) {
+            cut->seg = want - room;
+            for (unsigned i = nseg + 1; i < cnt; i++) cut->after += (size_t)gout[i].iov_len;
+            nseg++;
+            break;
         }
     }
     return (int)nseg;
@@ -307,15 +285,79 @@ static int xfer_stage(CPU *c, GuestXfer *x, int sseg, u64 soff, size_t len,
     return 0;
 }
 
+/* The transfer staged whole in front of a guard, for a file that may answer
+ * each iovec on its own (sys.h): the segment the guest's memory stops in goes
+ * as one iovec of the length the guest named for it, the guard beginning
+ * where the guest's memory ends, and the segments after it as an iovec over
+ * address 0. The guard is as long as the rest of that segment -- address
+ * space only -- or, on a host that cannot find that much (an ILP32 one, for
+ * a length near MAX_RW_COUNT), as long as it can find: a driver faults on its
+ * first page all the same, and then merely sees a shorter segment than the
+ * guest named. `want` is the sum of the vector, at most XFER_STAGE_MAX. */
+static int xfer_guard(CPU *c, GuestXfer *x, size_t want, const XferCut *cut,
+                      struct iovec *iov_store) {
+    size_t ps = (size_t)sysconf(_SC_PAGESIZE), g = cut->seg;
+    u8 *b;
+    while (!(b = guardbuf_map(&x->guard, want, want + g))) {
+        if (g <= ps) return -ENOMEM;
+        g = g / 2 > ps ? g / 2 : ps;
+    }
+    x->guarded = 1;
+    x->stage = b;
+    x->stage_len = want;
+    int n = x->nseg + (cut->after ? 1 : 0);
+    x->iov = n <= 1 ? &x->iov1 : iov_store;
+    if (!x->iov) {
+        if (!(x->heap = malloc(sizeof *x->iov * (size_t)n))) return -ENOMEM;
+        x->iov = x->heap;
+    }
+    size_t off = 0;
+    for (int i = 0; i < x->nseg; i++) {
+        size_t len = (size_t)x->seg[i].iov_len;
+        if (!x->to_guest && len && copy_from_guest(c, b + off, x->seg[i].iov_base, len) < 0)
+            return -EFAULT;
+        x->iov[x->n].iov_base = b + off;
+        x->iov[x->n].iov_len = len + (i == x->nseg - 1 ? g : 0);
+        x->n++;
+        off += len;
+    }
+    if (cut->after) {
+        x->iov[x->n].iov_base = NULL;
+        x->iov[x->n].iov_len = cut->after;
+        x->n++;
+    }
+    x->total = want;
+    return 0;
+}
+
 int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
-               int flags, struct iovec *iov_store, GuestXfer *x) {
+               int flags, const XferCut *cut, struct iovec *iov_store,
+               GuestXfer *x) {
     memset(x, 0, sizeof *x);
     x->seg = seg;
     x->nseg = nseg;
     x->to_guest = to_guest;
     size_t want = 0;
     for (int i = 0; i < nseg; i++) want += (size_t)seg[i].iov_len;
+    size_t fault = cut ? cut->seg + cut->after : 0;
+    int split = -1;
     int r;
+
+    /* Cut short of what the guest named: the host is handed the fault too
+     * (sys.h), after the whole transfer lent, or in front of a guard. */
+    if (fault) {
+        if (!xfer_split_ok(fd, &split)) {
+            if (want <= XFER_STAGE_MAX) {
+                if ((r = xfer_guard(c, x, want, cut, iov_store)) < 0) {
+                    xfer_end(c, x, 0);
+                    return r;
+                }
+                return 0;
+            }
+            fault = 0;   /* moved as any other transfer is, short of it (sys.h) */
+        }
+        flags |= XFER_LEND;
+    }
 
     if (want <= XFER_BOUNCE_MAX && !(flags & XFER_LEND)) {
         x->iov = nseg <= 1 ? &x->iov1 : iov_store;
@@ -332,13 +374,16 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
     x->iov = iov_store ? iov_store : x->heap;
     x->pin = (HostMap **)((u8 *)x->heap + isz);
     AccType acc = to_guest ? ACC_WRITE : ACC_READ;
-    int split = -1;
+    /* The runs one call can lend: an iovec is left for a staged rest, and
+     * one for the fault. */
+    int cap = XFER_IOV - 2;
+    int gone = 0;   /* the guest's memory went away under the walk */
     for (int i = 0; i < nseg; i++) {
         size_t len = (size_t)seg[i].iov_len;
         if (!len) {
             /* An empty segment is still a segment to a file that answers
              * per iovec; nothing to lend, and no pin under it. */
-            if (x->n < XFER_IOV - 1) {
+            if (x->n < cap) {
                 x->iov[x->n].iov_base = NULL;
                 x->iov[x->n].iov_len = 0;
                 x->pin[x->n++] = NULL;
@@ -348,7 +393,7 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
         }
         int before = x->n, why;
         size_t got = guest_lend(c, seg[i].iov_base, len, acc, x->iov, x->pin,
-                                &x->n, XFER_IOV - 1, &why);
+                                &x->n, cap, &why);
         x->npin = x->n;
         if (x->n - before > 1 && !xfer_split_ok(fd, &split)) {
             /* This segment is more than one run and the file may answer each
@@ -368,10 +413,23 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
             size_t rest = want - x->total;
             if (rest > XFER_STAGE_MAX) rest = XFER_STAGE_MAX;
             if ((r = xfer_stage(c, x, i, got, rest, 0)) < 0) { xfer_end(c, x, 0); return r; }
+        } else {
+            /* LEND_CUT: the guest's memory went away since the caller
+             * measured it, and the transfer ends there, as the kernel's copy
+             * would -- faulting there, where the file can be told. */
+            gone = 1;
         }
-        /* LEND_CUT: the guest's memory went away since the caller measured
-         * it, and the transfer ends there, as the kernel's copy would. */
         break;
+    }
+    /* The fault, where the guest's memory stops: after all of it, or where it
+     * went, and not after a staging cap that ends the transfer short of it.
+     * A file that answers per iovec is only ever handed one by xfer_guard. */
+    if ((gone || (fault && x->total == want)) && xfer_split_ok(fd, &split)) {
+        if (!x->total) x->n = x->npin = 0;   /* nothing lent: the fault leads */
+        x->iov[x->n].iov_base = NULL;
+        x->iov[x->n].iov_len = (want - x->total) + fault;
+        x->n++;
+        return 0;
     }
     if (!x->total && want) { xfer_end(c, x, 0); return -EFAULT; }
     return 0;
@@ -395,10 +453,12 @@ int xfer_end(CPU *c, GuestXfer *x, size_t done) {
         }
     }
     guest_unlend(c, x->pin, x->npin);
-    free(x->stage);
+    if (x->guarded) guardbuf_free(&x->guard);
+    else free(x->stage);
     free(x->heap);
     x->stage = NULL;
     x->heap = NULL;
+    x->guarded = 0;
     x->npin = x->n = 0;
     return r;
 }
@@ -454,20 +514,17 @@ void guardbuf_free(GuardBuf *o) {
 
 /* A write aimed at a synthesized /proc file (procfs_pre_write): the hook
  * reads no further than PF_WRITE_HEAD into what is being written, so that is
- * all that is copied out for it. Returns 1 with *ret set when it answered. */
+ * all that is copied out for it -- and only as far as the guest's memory
+ * goes, `seg` being the vector cut there and `len` what the guest named: a
+ * file that copies the write in faults where the copy does, which is after
+ * the checks it makes first. Returns 1 with *ret set when it answered. */
 static int procfs_write_hook(CPU *c, int fd, const GIovec *seg, int nseg,
                              size_t len, s64 off, s64 *ret) {
     if (!c->m->pf_fds_count) return 0;       /* the hook's own fast path */
     u8 head[PF_WRITE_HEAD];
     size_t want = len < sizeof head ? len : sizeof head;
-    if (gvec_head(c, seg, nseg, head, want) < want) {
-        /* The guest's memory went away since it was measured: not ours to
-         * answer unless the file is, and the transfer will say so itself. */
-        if (!procfs_fd_synth(c->m, fd, NULL)) return 0;
-        *ret = -EFAULT;
-        return 1;
-    }
-    return procfs_pre_write(c, fd, head, len, off, ret);
+    size_t have = gvec_head(c, seg, nseg, head, want);
+    return procfs_pre_write(c, fd, head, have, len, off, ret);
 }
 
 /* A signalfd's records are translated on their way to the guest (sys_sig.c,
@@ -475,16 +532,31 @@ static int procfs_write_hook(CPU *c, int fd, const GIovec *seg, int nseg,
  * worth, where a guest naming a larger buffer used to have the whole of it
  * allocated for what is at most a few pending signals. A read that returns
  * fewer records than are pending is what a signalfd does whenever the buffer
- * is short of them, and the next read takes the rest. `seg` is the vector,
- * `tot` its sum -- 0 included, which sigfd_fill answers as the kernel's
- * read(2) does. */
+ * is short of them, and the next read takes the rest. `seg` is the vector as
+ * far as the guest's memory goes, `tot` what the guest named -- 0 included,
+ * which sigfd_fill answers as the kernel's read(2) does.
+ *
+ * signalfd_read takes its record count from the length named, dequeues a
+ * record and then copies it out, one at a time: a record whose copy faults
+ * has been dequeued all the same, and is lost, the call answering with the
+ * records before it -- or EFAULT, with none. So where the guest's memory
+ * stops short of `tot`, as many records are taken as reach it, plus that one;
+ * sizing the read by the memory alone, as this used to, left it queued, and
+ * answered EINVAL where fewer bytes than one record were mapped. */
 #define SIGFD_BATCH (64u << 10)             /* 512 signalfd_siginfo records */
 static u64 sigfd_read_guest(CPU *c, int fd, const GIovec *seg, int nseg, size_t tot) {
+    const size_t rec = sizeof(GSignalfdSiginfo);
+    size_t room = 0;
+    for (int i = 0; i < nseg; i++) room += (size_t)seg[i].iov_len;
     size_t len = tot < SIGFD_BATCH ? tot : SIGFD_BATCH;
+    if (room < tot && len > (room / rec + 1) * rec) len = (room / rec + 1) * rec;
     u8 *buf = malloc(len ? len : 1);
     if (!buf) return (u64)(s64)-ENOMEM;
     s64 r = sigfd_fill(c, fd, buf, len);
-    if (r > 0 && gvec_put(c, seg, nseg, buf, (size_t)r) < (size_t)r) r = -EFAULT;
+    if (r > 0) {
+        size_t put = gvec_put(c, seg, nseg, buf, (size_t)r);
+        if (put < (size_t)r) r = put / rec ? (s64)(put / rec * rec) : -EFAULT;
+    }
     free(buf);
     return (u64)r;
 }
@@ -1331,13 +1403,16 @@ SYSDEF(read) {
         nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
         return nlret;
     { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
+    /* As far as the guest's memory goes, and the rest handed to the host as a
+     * fault in the same place, for the file to answer as it does (sys.h). */
     size_t len = rw_count(a2);
-    if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
-    GIovec g = { a1, len };
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     /* A signalfd's records are translated on the way out (sys_sig.c). */
     if (sigfd_tracked(c->m, (int)a0)) return sigfd_read_guest(c, (int)a0, &g, 1, len);
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, NULL, &x);
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n = x.n == 1 ? read((int)a0, x.iov[0].iov_base, x.iov[0].iov_len)
                          : readv((int)a0, x.iov, x.n);
@@ -1350,9 +1425,10 @@ SYSDEF(write) {
      * default destination to write to -- it would answer ENOTCONN. */
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
-    size_t len = rw_count(a2);
-    if (len && !(len = rw_room(c, a1, len, ACC_READ))) return (u64)(s64)-EFAULT;
-    GIovec g = { a1, len };
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     s64 pr;
     if (procfs_write_hook(c, (int)a0, &g, 1, len, -1, &pr)) return (u64)pr;
     /* A netlink socket needs no destination address, so a reconfiguring
@@ -1363,7 +1439,7 @@ SYSDEF(write) {
      * calls). Fake-netlink fds never reach this: they were routed above. */
     nlr_note_gvec(c, (int)a0, &g, 1);
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, NULL, &x);
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n = x.n == 1 ? write((int)a0, x.iov[0].iov_base, x.iov[0].iov_len)
                          : writev((int)a0, x.iov, x.n);
@@ -1380,13 +1456,11 @@ SYSDEF(readv) {
     { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 1, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault == 1) return (u64)(s64)-EFAULT;
-    u64 e;
     if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: records translated */
-        size_t tot = 0;
+        size_t tot = cut.seg + cut.after;
         for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
         /* A vector of no bytes never reaches the file at all: do_iter_read
          * answers 0 the moment the imported total is zero, ahead of every
@@ -1396,18 +1470,12 @@ SYSDEF(readv) {
          * shortcut and signalfd_read sees the zero itself, and the wrong one
          * for readv(fd, iov, 0). Both measured against a kernel. */
         if (!tot) return 0;
-        e = sigfd_read_guest(c, (int)a0, g, cnt, tot);
-    } else {
-        GuestXfer x;
-        int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, iov, &x);
-        if (r < 0) return (u64)(s64)r;
-        e = xfer_finish(c, &x, readv((int)a0, x.iov, x.n));
+        return sigfd_read_guest(c, (int)a0, g, cnt, tot);
     }
-    /* The guest could not back the whole vector and this file answers such a
-     * call as a whole (iov_import): the bytes above are the ones a kernel
-     * would have managed to hand over before it said so. */
-    if (efault && (s64)e >= 0) return (u64)(s64)-EFAULT;
-    return e;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    return xfer_finish(c, &x, readv((int)a0, x.iov, x.n));
 }
 
 SYSDEF(writev) {
@@ -1416,11 +1484,10 @@ SYSDEF(writev) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 0, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault) return (u64)(s64)-EFAULT;
-    size_t tot = 0;
+    size_t tot = cut.seg + cut.after;
     for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
     /* A synthesized file that takes writes (an id map) gets the gathered bytes
      * as one write, which is the only shape the kernel accepts anyway. */
@@ -1430,18 +1497,19 @@ SYSDEF(writev) {
      * ack rewrite is keyed on is the whole of it. */
     nlr_note_gvec(c, (int)a0, g, cnt);
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, iov, &x);
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
     if (r < 0) return (u64)(s64)r;
     return xfer_finish(c, &x, writev((int)a0, x.iov, x.n));
 }
 
 SYSDEF(pread64) {
     { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
-    size_t len = rw_count(a2);
-    if (len && !(len = rw_room(c, a1, len, ACC_WRITE))) return (u64)(s64)-EFAULT;
-    GIovec g = { a1, len };
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, NULL, &x);
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n = x.n == 1 ? pread((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (off_t)a3)
                          : preadv((int)a0, x.iov, x.n, (off_t)a3);
@@ -1450,13 +1518,14 @@ SYSDEF(pread64) {
 
 SYSDEF(pwrite64) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
-    size_t len = rw_count(a2);
-    if (len && !(len = rw_room(c, a1, len, ACC_READ))) return (u64)(s64)-EFAULT;
-    GIovec g = { a1, len };
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0 };
     s64 pr;
     if (procfs_write_hook(c, (int)a0, &g, 1, len, (s64)a3, &pr)) return (u64)pr;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, NULL, &x);
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n = x.n == 1 ? pwrite((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (off_t)a3)
                          : pwritev((int)a0, x.iov, x.n, (off_t)a3);
@@ -1475,12 +1544,11 @@ SYSDEF(preadv2) {
     { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }   /* -1 = current pos, as here */
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 1, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault == 1) return (u64)(s64)-EFAULT;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, iov, &x);
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n;
 #if defined(__BIONIC__) && defined(SYS_preadv2)
@@ -1488,31 +1556,25 @@ SYSDEF(preadv2) {
 #else
     n = preadv2((int)a0, x.iov, x.n, (off_t)a3, (int)a5);
 #endif
-    u64 e = xfer_finish(c, &x, n);
-    /* The guest could not back the whole vector and this file answers such a
-     * call as a whole (iov_import): the bytes above are the ones a kernel
-     * would have managed to hand over before it said so. */
-    if (efault && (s64)e >= 0) return (u64)(s64)-EFAULT;
-    return e;
+    return xfer_finish(c, &x, n);
 }
 
 SYSDEF(pwritev2) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 0, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault) return (u64)(s64)-EFAULT;
     /* A synthesized /proc file takes the gathered bytes through the write
      * hook, never through the memfd (the id maps of a faked user namespace,
      * and EBADF for a view opened read-only). */
-    size_t tot = 0;
+    size_t tot = cut.seg + cut.after;
     for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
     s64 pr;
     if (procfs_write_hook(c, (int)a0, g, cnt, tot, (s64)a3, &pr)) return (u64)pr;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, iov, &x);
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
     if (r < 0) return (u64)(s64)r;
     ssize_t n;
 #if defined(__BIONIC__) && defined(SYS_pwritev2)
@@ -1532,33 +1594,28 @@ SYSDEF(preadv) {
     { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 1, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault == 1) return (u64)(s64)-EFAULT;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, iov, &x);
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
     if (r < 0) return (u64)(s64)r;
-    u64 e = xfer_finish(c, &x, preadv((int)a0, x.iov, x.n, (off_t)a3));
-    /* As in preadv2. */
-    if (efault && (s64)e >= 0) return (u64)(s64)-EFAULT;
-    return e;
+    return xfer_finish(c, &x, preadv((int)a0, x.iov, x.n, (off_t)a3));
 }
 
 SYSDEF(pwritev) {
     if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     struct iovec iov[XFER_IOV];
     GIovec g[1024];
-    int efault;
-    int cnt = iov_import(c, (int)a0, a1, (unsigned)a2, g, 0, &efault);
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
     if (cnt < 0) return (u64)(s64)cnt;
-    if (efault) return (u64)(s64)-EFAULT;
-    size_t tot = 0;
+    size_t tot = cut.seg + cut.after;
     for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
     s64 pr;
     if (procfs_write_hook(c, (int)a0, g, cnt, tot, (s64)a3, &pr)) return (u64)pr;
     GuestXfer x;
-    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, iov, &x);
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
     if (r < 0) return (u64)(s64)r;
     return xfer_finish(c, &x, pwritev((int)a0, x.iov, x.n, (off_t)a3));
 }
@@ -2354,7 +2411,7 @@ SYSDEF(ioctl) {
         if (room == total) {
             GIovec g = { a2, room };
             GuestXfer x;
-            int xr = xfer_begin(c, (int)a0, &g, 1, 1, XFER_LEND, NULL, &x);
+            int xr = xfer_begin(c, (int)a0, &g, 1, 1, XFER_LEND, NULL, NULL, &x);
             if (xr < 0) return (u64)(s64)xr;
             if (x.n == 1 && !x.stage && x.total == room) {
                 int r = ioctl((int)a0, cmd, x.iov[0].iov_base);

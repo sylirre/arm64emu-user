@@ -888,7 +888,8 @@ static int idmap_parse(const u8 *in, size_t len, IdExtent *out) {
  * silent lie (unformatted on read-back, and the one-shot rule unapplied). */
 static int pf_find_locked(struct Machine *m, int fd);
 
-int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t len, s64 off, s64 *ret) {
+int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t have, size_t len,
+                     s64 off, s64 *ret) {
     struct Machine *m = c->m;
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
@@ -924,6 +925,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t len, s64 off, s64 *r
          * gid_map too. A prefix ("denyx") used to pass, and "allow" after
          * gid_map used to be refused. */
         if (len >= 8) { *ret = -EINVAL; return 1; }
+        if (have < len) { *ret = -EFAULT; return 1; }   /* copy_from_user */
         char kbuf[8];
         memcpy(kbuf, head, len);
         kbuf[len] = 0;
@@ -956,6 +958,7 @@ int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t len, s64 off, s64 *r
      * EINVAL. The registry's own claim is what actually enforces the one
      * shot; this only gets the errno right for the ordinary sequential case. */
     if (len >= 4096) { *ret = -EINVAL; return 1; }
+    if (have < len) { *ret = -EFAULT; return 1; }       /* memdup_user_nul */
     int written = self && (kind == PF_UIDMAP ? m->uid_map_set : m->gid_map_set);
     if (reg && !written) {
         IdExtent cur[IDMAP_EXTENTS];
