@@ -219,8 +219,8 @@ arm64chroot --fake-id 1000       ./rootfs /bin/sh   # uid=gid=1000
 The whole `get*()`/`set*()` credential syscall family works with real Linux
 privilege rules: a fake euid of 0 is privileged, a dropped identity cannot
 regain it. Executables with setuid/setgid bit take on the file owner's
-(remapped) identity on exec, `AT_SECURE` is set on such transitions, `capget`
-reports full capabilities for fake-root.
+(remapped) identity on exec (unless `no_new_privs` is set), `AT_SECURE` is
+set on such transitions, `capget` reports full capabilities for fake-root.
 
 `stat` present a consistent view: a file the host reports as owned by the
 real invoking user appears owned by the fake identity. `chown` or `chmod`

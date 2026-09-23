@@ -498,6 +498,19 @@ euid1000 real_r600=1 eff_r600=0
 uid1000 r600=0 r640=1 w640=0 x755=1" --fake-id "$ALPINE" /tmp/ci_fakeidacc
     rm -f "$ALPINE/tmp/ci_fakeidacc" "$ALPINE"/tmp/ci_fa[0-9][0-9][0-9]
     fx_rm tests/fixtures/fakeidacc.bin
+    # A setuid/setgid exec raises by bprm_fill_uid's rule: setgid wants group
+    # execute beside S_ISGID, and no_new_privs keeps both bits from raising
+    # anything. Each copy is owned by fake root; the children run as 1000.
+    "$AGCC" -O1 -static -o tests/fixtures/setidexec.bin tests/fixtures/setidexec.c 2>/dev/null &&
+        cp tests/fixtures/setidexec.bin "$ALPINE/tmp/ci_setidexec" &&
+        check_fakeid "setid exec: which bits raise" "setuid euid=0 egid=1000 secure=1
+setgid euid=1000 egid=0 secure=1
+setgid-no-gx euid=1000 egid=1000 secure=0
+setuid-nnp euid=1000 egid=1000 secure=0
+setgid-nnp euid=1000 egid=1000 secure=0
+done" --fake-id "$ALPINE" /tmp/ci_setidexec
+    rm -f "$ALPINE/tmp/ci_setidexec" "$ALPINE"/tmp/ci_sid*
+    fx_rm tests/fixtures/setidexec.bin
     # SCM_CREDENTIALS: the guest sends the identity it knows ({pid, getuid(),
     # getgid()}) and the kernel judges the ids against the sender's REAL ones,
     # so a fake root sending uid 0 was refused EPERM; the peer must read back

@@ -2292,8 +2292,11 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   `setfsgid`, and a `getresuid` could return a triple no setter ever wrote
   (`tests/fixtures/credrace.c`).
 - **setuid/setgid bit on exec**: `do_execve` reads the file's mode; `S_ISUID`
-  sets `euid/suid/fsuid` to the file owner's *remapped* id, `S_ISGID` the group.
-  `AT_SECURE` follows a real transition (`euid != ruid`). The raise is applied
+  sets `euid/suid/fsuid` to the file owner's *remapped* id, `S_ISGID` the group
+  — but only with group execute beside it (`S_ISGID` alone is the old
+  mandatory-locking mark, which `bprm_fill_uid` does not treat as setgid), and
+  neither once the process has set `no_new_privs`. `AT_SECURE` follows a real
+  transition (`euid != ruid`) (`tests/fixtures/setidexec.c`). The raise is applied
   past the point of no return, where a kernel's `commit_creds` runs: the one
   refusal still ahead of it (`de_thread`) returns to the *old* image, which must
   not go on running with privilege it never exec'd into.

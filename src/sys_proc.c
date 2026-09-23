@@ -2198,18 +2198,28 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * the fake identity. euid/fsuid (and saved id) take the file owner; the
      * real uid is unchanged. AT_SECURE then follows from euid != ruid.
      *
+     * Which bits count is bprm_fill_uid's rule, not the mode's letter: under
+     * no_new_privs neither does (that is the whole of the flag's promise --
+     * bubblewrap sets it and then runs whatever the sandbox holds, a setuid
+     * su included), and S_ISGID without group execute is not setgid at all
+     * but the old mandatory-locking mark, so the group is raised only when
+     * both are set. Both used to be honored as the bits alone.
+     *
      * Computed here, next to the resolution that decided which file this is,
      * but only *applied* past the point of no return below: a kernel raises
      * privilege as part of committing to the new image, and the one refusal
      * still ahead of us (de_thread) must leave the caller exactly as it was --
      * an execve that returns an error and a raised euid would be a real
      * privilege leak, since the old image goes on running with it. */
+    int setid_uid = !m->no_new_privs && (img_st.st_mode & S_ISUID);
+    int setid_gid = !m->no_new_privs &&
+                    (img_st.st_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP);
     int raise_uid = 0, raise_gid = 0;
     u32 new_euid = 0, new_egid = 0;
     if (m->fake_id) {
-        if (img_st.st_mode & S_ISUID)
+        if (setid_uid)
             { raise_uid = 1; new_euid = remap_uid(m, img_st.st_uid); }
-        if (img_st.st_mode & S_ISGID)
+        if (setid_gid)
             { raise_gid = 1; new_egid = remap_gid(m, img_st.st_gid); }
     }
 
@@ -2906,17 +2916,17 @@ SYSDEF(prctl) {
         }
         case PR_SET_KEEPCAPS:
             return prctl(PR_SET_KEEPCAPS, (unsigned long)a1) < 0 ? host_err() : 0;
-        /* "No new privileges" is already true of every guest here: execve maps
-         * the ELF into the emulator's own address space and never honors a
-         * setuid bit, so nothing the guest can exec grants it anything. Set the
-         * host flag anyway -- guest processes *are* host processes, so the
-         * kernel's own fork/execve inheritance then applies for free -- but do
-         * not fail the guest if the host refuses (pre-3.5 kernel), since the
-         * guarantee does not depend on it. PR_GET is answered from the recorded
-         * intent, not from the host task, so an inherited flag (Android zygote
-         * sets one before its seccomp filter) is not reported as the guest's.
-         * Kernel argument rules: arg2 must be 1, arg3..arg5 zero, never clears.
-         * bubblewrap dies on the spot if this returns an error. */
+        /* "No new privileges": execve honors a setuid or setgid bit only for
+         * the fake identity (--fake-id), and not at all once this is set
+         * (do_execve). The host flag is set too -- guest processes *are* host
+         * processes, so the kernel's own fork/execve inheritance then applies
+         * for free -- but the guest is not failed if the host refuses (pre-3.5
+         * kernel), since the guarantee is the recorded flag's, not the host's.
+         * PR_GET is answered from the recorded intent, not from the host task,
+         * so an inherited flag (Android zygote sets one before its seccomp
+         * filter) is not reported as the guest's. Kernel argument rules: arg2
+         * must be 1, arg3..arg5 zero, never clears. bubblewrap dies on the spot
+         * if this returns an error. */
         case PR_SET_NO_NEW_PRIVS:
             if (a1 != 1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
             (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
