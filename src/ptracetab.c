@@ -422,6 +422,17 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
                 pt_self_detach();
                 return 0;
             }
+            /* Another thread's execve is dismantling our thread group. The
+             * kernel's de_thread SIGKILLs every other thread, which ends a
+             * traced stop like any other sleep: leave, with nothing to
+             * inject, for the safepoint where this thread dies -- or, the main
+             * thread, takes the new image over (sys_proc.c). The tracer hears
+             * of it there, as the exit or the exec a kernel reports. The kick
+             * that called us out ends the wait above at once. */
+            if (dethread_callout(c->m)) {
+                __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE);
+                return 0;
+            }
             /* Our stop still unreaped after 500ms: the publish-time wake may
              * have raced the tracer's blocking wait entry (or landed on the
              * wrong thread of a multithreaded tracer). Re-kick until the stop

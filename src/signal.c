@@ -1677,16 +1677,158 @@ int sig_pending_deliverable(struct Machine *m) {
 /* Is a signal that will KILL this process waiting: unblocked, at SIG_DFL, and
  * default-terminate. What a killable wait -- the vfork parent's, whose
  * kernel counterpart wait_for_completion_killable ends for a fatal signal and
- * nothing else -- looks at (sys_proc.c). */
+ * nothing else, and execve's de_thread (sys_proc.c) -- looks at. The number,
+ * or 0. */
 int sig_pending_fatal(struct Machine *m) {
     sigq_sync();
     for (int sig = 1; sig <= 64; sig++) {
         if (!sigq_pend(sig)) continue;
         if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
         if (sig_action_handler(m, sig) == GSIG_DFL && sig_default_terminates(sig))
-            return 1;
+            return sig;
     }
     return 0;
+}
+
+/* ---- de_thread: the signals of the threads an execve dismantles ----------
+ *
+ * A kernel's de_thread SIGKILLs every other thread and waits for them, and
+ * the signals sent meanwhile go where they would go to any thread group with
+ * dying members: a fatal one kills the group, execve and all (complete_signal
+ * makes it group-wide); a process-directed one is dequeued by a thread that is
+ * not dying -- the exec'ing one -- and the new image receives it; one aimed
+ * at a dying thread dies with it. Here a thread parked at the rendezvous
+ * would otherwise go on capturing whatever the host delivered to it, and a
+ * victim's capture ring ends with the victim. So a parked thread holds
+ * blocked, host-side, every signal but those that would kill the process
+ * (sig_park_mask): the host then routes a process-directed signal to a thread
+ * that is not parked, as the kernel's wants_signal would, and the fatal ones
+ * still land somewhere that acts on them.
+ *
+ * What a thread had already captured when it parked is handed over
+ * (sig_handover_give): a victim's entries except the ones tkill/tgkill aimed
+ * at it (SI_TKILL, the one thread-directed kind a siginfo tells apart), and
+ * the whole ring of an exec'ing thread that is not the main one -- in the
+ * kernel it becomes the leader and keeps its own pending signals, where here
+ * the main thread carries on in its place. The main thread takes them into
+ * its own ring once the new image is its (sig_handover_take). */
+void sig_park_mask(struct Machine *m) {
+    u64 keep = 0;   /* guest signals that would kill: left to the host */
+    for (int sig = 1; sig <= 64; sig++)
+        if (!(g_tls.sigmask & (1ULL << (sig - 1))) &&
+            sig_action_handler(m, sig) == GSIG_DFL && sig_default_terminates(sig))
+            keep |= 1ULL << (sig - 1);
+    host_set_mask(sig_set_to_host(~keep));
+}
+
+/* ...and an exec'ing thread that has handed its image over: it is gone as far
+ * as the guest is concerned (in the kernel its tid is), so nothing more of the
+ * guest's is to land on it -- the fatal signals included, which the main
+ * thread, parked, is there to take. */
+void sig_quiet_mask(void) {
+    host_set_mask(sig_set_to_host(~0ULL));
+}
+
+static PendSig *dt_hand;           /* handed over, oldest first */
+static int dt_hand_n, dt_hand_cap;
+static char dt_hand_lk;            /* victims give at once: a spin flag */
+
+static void dt_hand_add(const PendSig *p) {   /* caller holds dt_hand_lk */
+    if (dt_hand_n == dt_hand_cap) {
+        int nc = dt_hand_cap ? dt_hand_cap * 2 : 32;
+        void *nb = realloc(dt_hand, (size_t)nc * sizeof *dt_hand);
+        if (!nb) return;   /* dropped, as a full queue drops */
+        dt_hand = nb;
+        dt_hand_cap = nc;
+    }
+    dt_hand[dt_hand_n++] = *p;
+}
+
+/* Take one of the host's pending signals in `set` (host numbers) without
+ * waiting: the signal, or <= 0. Raw, with a raw 8-byte set, because a libc's
+ * sigset_t cannot always spell the RT signals (Bionic's 32-bit one); and a
+ * zero timeout is zero whether the kernel reads it as two 32-bit words or two
+ * 64-bit ones. The host takes its own queue first (dequeue_signal). */
+static int host_take_pending(u64 set, siginfo_t *si) {
+    u64 zero[2] = { 0, 0 };
+    return (int)syscall(SYS_rt_sigtimedwait, &set, si, zero, (size_t)8);
+}
+
+void sig_handover_give(int all) {
+    sigset_t allsig, prev;
+    sigfillset(&allsig);
+    pthread_sigmask(SIG_BLOCK, &allsig, &prev);   /* the ring's producer */
+    sigq_sync();
+    while (__atomic_test_and_set(&dt_hand_lk, __ATOMIC_ACQUIRE)) ;
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
+        if (all || sigq[t].code != SI_TKILL) dt_hand_add(&sigq[t]);
+    /* The exec'ing thread's signals the host holds for it -- blocked ones,
+     * which never reach the ring -- are the new image's as well: the
+     * kernel's exec'ing thread keeps its own pending set. (The process's
+     * shared ones come along too, which only moves them to where they would
+     * have been delivered anyway.) */
+    if (all) {
+        siginfo_t si;
+        int hs;
+        while ((hs = host_take_pending(sig_set_to_host(~0ULL), &si)) > 0) {
+            PendSig p;
+            pendsig_from_host(&p, hs, &si);
+            dt_hand_add(&p);
+        }
+    }
+    __atomic_clear(&dt_hand_lk, __ATOMIC_RELEASE);
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+}
+
+/* The host's thread-private pending set for the calling thread: /proc's
+ * SigPnd, the one place it is told apart from the process's shared set. 0
+ * where it cannot be read. */
+static u64 host_private_pending(void) {
+    u64 v = 0;
+    char line[128];
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    FILE *f = fopen("/proc/thread-self/status", "re");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "SigPnd:", 7)) { v = strtoull(line + 7, NULL, 16); break; }
+        fclose(f);
+    }
+    fdwin_leave();
+    return v;
+}
+
+/* The main thread taking over from an exec'ing sibling: what was sent to IT
+ * -- by tkill/tgkill, and still in its ring, or held by the host for it while
+ * blocked -- was sent to the old leader, which the kernel kills, and a dying
+ * thread's own signals die with it. The process's shared ones stay. */
+void sig_leader_takeover(void) {
+    sigset_t allsig, prev;
+    sigfillset(&allsig);
+    pthread_sigmask(SIG_BLOCK, &allsig, &prev);
+    sigq_sync();
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
+        if (sigq[t].code == SI_TKILL) sigq_take(t);   /* moves the older ones up */
+    /* Taken one at a time, each by its own number: the host dequeues a
+     * thread's own queue before the process's, so a signal in both loses
+     * only its private instance. Bounded, in case the file reads stale. */
+    for (int round = 0; round < 256; round++) {
+        u64 pend = host_private_pending() & sig_set_to_host(~0ULL);
+        if (!pend) break;
+        siginfo_t si;
+        host_take_pending(pend & -pend, &si);
+    }
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+}
+
+void sig_handover_take(void) {
+    sigset_t allsig, prev;
+    sigfillset(&allsig);
+    pthread_sigmask(SIG_BLOCK, &allsig, &prev);
+    while (__atomic_test_and_set(&dt_hand_lk, __ATOMIC_ACQUIRE)) ;
+    for (int i = 0; i < dt_hand_n; i++) sigq_push(&dt_hand[i], NULL);
+    dt_hand_n = 0;
+    __atomic_clear(&dt_hand_lk, __ATOMIC_RELEASE);
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
 }
 
 /* One PendSig as the 128-byte guest siginfo rt_sigtimedwait hands back. */

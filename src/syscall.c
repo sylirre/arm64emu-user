@@ -529,8 +529,14 @@ void syscall_dispatch(CPU *c) {
      * number to -1 to cancel the call — before it runs. Read the register file
      * afterwards so those edits take effect. Gated on a near-always-zero int so
      * the untraced hot path is unchanged. */
-    if (UNLIKELY(g_ptrace_syscall_armed))
+    if (UNLIKELY(g_ptrace_syscall_armed)) {
         ptrace_report_syscall(c, 0);
+        /* Left the stop because another thread's execve is dismantling this
+         * thread group: the kernel's SIGKILL ends a traced stop too, and the
+         * call it was stopped at the entry of is never made. The safepoint
+         * the run loop reaches next is where this thread goes. */
+        if (dethread_callout(c->m)) return;
+    }
 
     u64 nr = c->x[8];
     u64 a0 = c->x[0], a1 = c->x[1], a2 = c->x[2],

@@ -147,6 +147,14 @@ SYSDEF(getrandom) {
             if (rnd || got >= len) break;
         } else if (r < 0 && errno == EINTR) {
             if (got) break;                 /* getrandom returns what it has */
+            /* Nothing yet: the wait is interruptible, as the kernel's is
+             * (-ERESTARTSYS), and it is the dispatcher's to say what the
+             * EINTR means -- a guest signal's (restarted under SA_RESTART) or
+             * the emulator's own kick's (restarted invisibly). Going round
+             * again instead kept a blocked /dev/random read from every
+             * signal, and from the safepoint an execve's de_thread needs. */
+            fdheld_close(fd);
+            return (u64)(s64)-EINTR;
         } else {
             if (!got) {
                 u64 e = r < 0 ? host_err() : 0;   /* len==0 lands here as 0 */

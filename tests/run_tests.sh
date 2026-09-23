@@ -2843,6 +2843,11 @@ else
     echo "SKIP fixture: personality (mmap_min_addr 0) (no bubblewrap sandbox here to set the sysctl in)"
 fi
 rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
+# An execve from a secondary thread: the new image keeps what was pending on
+# the exec'ing thread and on the process, and loses what was pending on the old
+# main thread and on the threads de_thread killed -- the main thread carries on
+# here where the kernel renumbers, so the signals are handed over to it.
+check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndone'
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
 # EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands
 # on the limit itself, at_min), MREMAP_FIXED below it is EPERM after

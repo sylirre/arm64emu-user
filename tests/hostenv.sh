@@ -562,6 +562,16 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   private mapping of the file for the range left behind
 #                   would need a descriptor nothing keeps.
 #
+# And one more names what the host's /proc can tell:
+#
+#   thread-sigpnd   a blocked signal sent to one thread shows in that thread's
+#                   SigPnd line in /proc/thread-self/status -- the one place a
+#                   thread's own pending signals are told apart from the
+#                   process's, which an execve from a secondary thread needs
+#                   (the old main thread's die with it). An interposer that
+#                   holds pending signals in queues of its own, or a host
+#                   without that file, cannot say.
+#
 # A test that needs one says so with a marker line
 #
 #     NEEDS-HOST-SYSCALL: <name> [<name> ...]
@@ -718,6 +728,29 @@ int main(void) {
         if (r < 0 && e == EBADR) return m.f.fm_flags != 0x40000000u;
     }
     return 0;
+}
+EOF
+        ;;
+    thread-sigpnd) cat <<'EOF'
+#define _GNU_SOURCE
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &m, NULL);
+    syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1);
+    FILE *f = fopen("/proc/thread-self/status", "r");
+    char l[128];
+    unsigned long long v = 0;
+    while (f && fgets(l, sizeof l, f))
+        if (!strncmp(l, "SigPnd:", 7)) v = strtoull(l + 7, NULL, 16);
+    return (v >> (SIGUSR1 - 1)) & 1 ? 0 : 1;
 }
 EOF
         ;;

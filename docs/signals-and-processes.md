@@ -246,10 +246,11 @@ exact under a plain restart and declare nothing. `rt_sigsuspend` and
 `EINTR` themselves (a handler of ours ran, nothing for the guest: sleep on);
 a `signalfd` read is the host's read and rewinds like any other call; the IPC
 broker wait polls and never sees the kick at all. The `de_thread` call-out
-they *do* report is restarted where it is cancelled
-(`dethread_restart_syscall`). Covered by `tests/ptrace/attach_no_eintr.c`, which
-asserts both halves: the sleep returns `0`, and it still ends when the guest
-asked rather than one interruption-point later.
+they *do* report is never cancelled — the thread goes on to its death at the
+safepoint, or (the main thread) to the new image. Covered by
+`tests/ptrace/attach_no_eintr.c`, which asserts both halves: the sleep returns
+`0`, and it still ends when the guest asked rather than one interruption-point
+later.
 
 When a sleep *is* reported as interrupted, the remaining time goes out first and
 a copyout that faults is what the call answers: `nanosleep_copyout` returns

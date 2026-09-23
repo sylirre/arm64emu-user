@@ -263,9 +263,10 @@ Prefer one round trip at startup over a channel that fails silently forever.
 ### `/proc/self/task` may list threads that are not yours (any host under an interposer)
 
 "Guest tid == host tid, and the emulator spawns no host threads of its own" is
-load-bearing in several places: it is why `execve`'s de_thread can find its
-siblings by walking `/proc/self/task`, and why the guest's own task directory
-can be the host's, passed straight through. The second half of that sentence is
+load-bearing in several places: it is why the guest's own task directory can be
+the host's, passed straight through, and why `execve`'s de_thread can take the
+host's task count as the guest's (it finds the siblings it calls out in its own
+thread registry now, which needs no `/proc`). The second half of that sentence is
 a promise the emulator keeps about itself — and cannot keep on another process's
 behalf. `qemu-user` holds a thread of its own for the process lifetime, giving
 each fork child one too, so the listing reads `guest threads + 1`.
@@ -289,7 +290,8 @@ ship on the set is empty and none of it fires.
 Two smaller lessons came with it. The `execve` wait now distinguishes its two
 conditions — the guest thread count *must* be satisfied (a thread still
 executing makes replacing the address space unsurvivable) while the host task
-count is fidelity, so its timeout proceeds rather than failing the syscall. And
+count is fidelity, so a bounded wait on it proceeds rather than holding the
+syscall up. And
 identifying by exclusion has one caveat worth stating: if such a task ever
 exited and its tid were later reused by a real guest thread, that thread would
 be hidden. Nothing in practice does — the interposer's thread outlives the

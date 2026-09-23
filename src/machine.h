@@ -114,9 +114,10 @@ struct Machine {
      * than resume the old program's registers against the new address space.
      *
      * The rest is the de_thread handshake itself. Sibling threads park at the
-     * rendezvous and are destroyed only once *every* one of them has arrived,
-     * so a sibling that cannot be reached costs a refused execve instead of a
-     * half-dismantled thread group (see dethread_begin). */
+     * rendezvous and are destroyed only once *every* one of them has arrived
+     * -- waited for as long as that takes, as a kernel's de_thread waits, so
+     * the address space is never replaced under a thread still in it (see
+     * dethread_begin). */
     u32 stop_gen;
     u32 image_gen;
     s32 dethread_req;         /* tid running de_thread, 0 = none */
@@ -1452,6 +1453,15 @@ void vfork_child_flush(CPU *c);
 void vfork_fork_child(void);
 /* signal.c: an unblocked default-terminate signal at SIG_DFL is queued -- the
  * one kind of signal a killable wait (the vfork parent's) ends for. */
-int  sig_pending_fatal(struct Machine *m);
+int  sig_pending_fatal(struct Machine *m);   /* the signal, or 0 */
+/* execve's de_thread (signal.c): a parked thread's host mask, and the pending
+ * signals of the threads it dismantles handed to the main thread. */
+void sig_park_mask(struct Machine *m);
+void sig_quiet_mask(void);
+void sig_handover_give(int all);
+void sig_handover_take(void);
+void sig_leader_takeover(void);
+/* sys_proc.c: another thread's execve is dismantling this thread group. */
+int  dethread_callout(struct Machine *m);
 
 #endif /* A64_MACHINE_H */

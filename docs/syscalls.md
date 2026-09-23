@@ -2228,6 +2228,8 @@ run-loop safepoint, and two things get a thread there:
   guest-directed signal of that number) and does nothing but interrupt the
   syscall. Threads are re-kicked every 10 ms while the rendezvous waits, because
   a thread can enter a *new* blocking syscall after consuming the previous kick.
+  Who to kick comes from the **thread registry** (`sys_proc.c`), the emulator's
+  own list of its guest threads, so no `/proc` is needed to find them.
   The emulator's own blocking loops — `wait4`/`waitid`, `rt_sigsuspend`,
   `rt_sigtimedwait`, `signalfd` reads, parked SysV IPC waiters — poll
   `guest_stop_pending` for the same reason: an interrupted host call there is
@@ -2248,7 +2250,7 @@ after its own `exit(2)` (see [exit](signals-and-processes.md#exit)), and a
 parked one is revived by the hand-over — the same place the kernel reaches by
 releasing a zombie leader and giving its pid to the exec'ing thread.
 `dethread_begin` checks rather than assumes, so a future change that breaks the
-invariant refuses instead of hanging.
+invariant refuses (`ENOSYS`, before anything is dismantled) instead of hanging.
 
 A parked main thread has to be excluded from the single-threaded fast path
 explicitly, because it is not in `as.nthreads`: taking that path with one around
@@ -2256,31 +2258,50 @@ would run the new program on a secondary tid instead of on the pid. For the same
 reason the rendezvous waits for the carrier *by name* (`dethread_carrier_here`)
 and not only by arrival count.
 
-**The handshake is two-phase.** Siblings park at the rendezvous and are told to
-die only once *every* one of them has arrived. A thread the emulator cannot
-reach therefore costs a refused `execve` rather than a half-dismantled thread
-group: after 5 s everyone is released, whatever host syscall the kick
-interrupted is restarted (so the cancellation is invisible to the guest — no
-bare `EINTR` it never asked for), and `execve` returns **`ENOSYS`**, a value it
-never returns on a real kernel and so reads as "the emulator does not do this".
+**The handshake is two-phase, and never gives up.** Siblings park at the
+rendezvous and are told to die once *every* one of them has arrived. A kernel's
+`de_thread` runs past the point of no return: it SIGKILLs the other threads and
+waits for them for as long as that takes — a thread in an uninterruptible sleep
+included — and only a fatal signal, which takes the whole group down with the
+`execve`, ends the wait. So does this one (`dethread_die_if_fatal`, on the
+exec'ing thread and on every parked one). It used to give up after 5 s, release
+everyone and have `execve` answer `ENOSYS`, which a real kernel never does.
+
+Everything the emulator can reach, it reaches: a blocked host syscall is
+interrupted by the kick, a running thread notices at its next loop iteration,
+and a thread sitting in a **ptrace stop** its tracer never ends leaves it
+(`dethread_callout`, `ptracetab.c`) — the kernel's SIGKILL wakes a traced stop
+like any other sleep. It then goes straight to the safepoint: a syscall it was
+stopped at the entry of is never made, a signal it was stopped delivering is not
+delivered, and the tracer hears of the thread the way the kernel's tracer does,
+as an exit with status 0 — or, for the main thread, as the exec stop of the
+image it takes over (`tests/ptrace/execstopped.c`). What is left is a host call
+nothing interrupts, which the kernel waits for as well; after 5 s the wait says
+once on stderr which guest threads it is still waiting for, and goes on waiting.
+Two waits of the emulator's own that swallowed the kick's `EINTR` were fixed for
+this: a blocked `/dev/random` read serving `getrandom` on a host without the
+syscall (now `EINTR` for the dispatcher to judge, as the kernel's is
+interruptible), and the ptrace stop above.
 The rendezvous runs only *after* path resolution and the shebang loop, so
 `ENOENT`/`ENOEXEC` leave the thread group untouched exactly as on a kernel,
 where `de_thread` runs only once the binary is known to be loadable.
 
-Reaching a safepoint takes microseconds, so the timeout expires only for a
-thread that cannot be reached at all — one in an uninterruptible host operation,
-or parked at a ptrace stop its tracer never resumes. Two cases that *would* have
-hit it are handled instead. A guest blocking every signal across
-`ppoll`/`pselect6`/`epoll_pwait` used to block the kick too, so
-`pwait_host_mask` (`sys_file.c`) holds the reserved control signal out of the
-mask those calls install (the same translation now holds it out of every
-mirrored mask, `sig_set_to_host`). And `rt_sigsuspend` loops over the host
-sleep it does, so the kick's interruption alone changes nothing for it: it
-returns early on `guest_stop_pending`, putting its temporary mask back on the
-way out, since no delivery frame is going to. That one is easy to miss from a
-glibc host — `pause()` is not a single syscall, as aarch64 has no `SYS_pause`,
-so glibc issues `ppoll` and reaches the safepoint by the first route while
-Bionic issues `rt_sigsuspend` and reaches it by the second.
+**The dismantled threads are dying, as far as signals go.** A signal sent while
+the rendezvous waits goes where the kernel sends it: a fatal one kills the
+group; a process-directed one is taken by a thread that is not dying — the
+exec'ing one — and the new image receives it; one aimed at a dying thread dies
+with it. A parked thread therefore holds every signal but the fatal ones
+blocked on the host (`sig_park_mask`), so the host routes the rest elsewhere.
+What a thread had already captured is handed over to the main thread with the
+image (`sig_handover_give`/`_take`): a victim's entries except those
+`tkill`/`tgkill` aimed at it (`SI_TKILL`, the one thread-directed kind a
+siginfo tells apart), and the whole pending set of an exec'ing thread that is
+not the main one — its ring and what the host holds for it blocked — since the
+kernel's exec'ing thread becomes the leader and keeps its own. The main thread,
+for its part, drops what was sent to *it* (`sig_leader_takeover`): that was
+sent to the old leader, which the kernel kills (`tests/fixtures/execsigs.c`).
+The ENOSYS path it replaced also lost those signals: an exec'ing thread's ring
+went with it.
 
 **Nothing else is left running when the new program starts.** A kernel's
 `de_thread` has every other thread *gone* first, and a guest can tell the
@@ -2290,12 +2311,13 @@ handed it the image — which by construction cannot have left before publishing
 the hand-over. The first of those is defensive; the second is not, and a program
 caught the difference before it was added.
 
-The two counts are not equally binding, and that decides what a *commit-phase*
-timeout means. While the guest count is above the target a guest thread is still
-executing, and replacing the address space under it is not survivable — that one
-must be satisfied. The host task count is fidelity, so a host that reports it
-late, or reports it wrong, must not be able to turn a working `execve` into
-`ENOSYS`: the wait proceeds on the guest count alone. Reporting it wrong is not
+The two counts are not equally binding. While the guest count is above the
+target a guest thread is still executing, and replacing the address space under
+it is not survivable — that one is waited for as long as it takes (a few frees
+per victim). The host task count is fidelity, so a host that reports it late,
+or reports it wrong, must not be able to hold up a working `execve`: once the
+guest count is down it is given 5 s, and then the reload goes ahead on the
+guest count alone. Reporting it wrong is not
 hypothetical — a user-mode emulator underneath us keeps a thread of its own in
 `/proc/self/task` for the process lifetime, which is why the listing is read
 against the set of host tasks known not to be guest threads
