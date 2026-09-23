@@ -1,12 +1,15 @@
 /* Huge byte counts on the paths bigcount.c does not reach.
  *
- * sendfile, splice, copy_file_range, getrandom and add_key all take a count
- * that is a *guest* 64-bit size_t, and the emulator has to turn it into a host
- * one -- which is 32 bits wide in the ILP32 build (`make test32`). Cast before
- * it is clamped and a count at or above 4 GB becomes an unrelated small one:
- * zero for an exact multiple, so the transfer moves nothing at all, the
- * entropy read hands back no bytes, and the keyring payload that should be
- * refused as too large reads as "no payload" instead.
+ * sendfile, splice, copy_file_range, getrandom, add_key and setxattr all take
+ * a count that is a *guest* 64-bit size_t, and the emulator has to turn it
+ * into a host one -- which is 32 bits wide in the ILP32 build (`make test32`).
+ * Cast before it is clamped and a count at or above 4 GB becomes an unrelated
+ * small one: zero for an exact multiple, so the transfer moves nothing at all,
+ * the entropy read hands back no bytes, the keyring payload that should be
+ * refused as too large reads as "no payload" instead, and an extended
+ * attribute far past XATTR_SIZE_MAX is set. getdents64 is the opposite case:
+ * its count is an unsigned int, and read as the whole register it was a
+ * different count on a 64-bit host.
  *
  * Self-checking rather than oracle-diffed, like bigcount.c: qemu-user answers
  * EFAULT for a count larger than the mapping behind it, where a kernel copies
@@ -18,6 +21,7 @@
  * being tested: the truncated forms all end in a zero-length call. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,5 +100,25 @@ int main(void) {
     long r = syscall(SYS_add_key, "keyring", "hugecount", (void *)0, HUGE,
                      PROCESS_KEYRING);
     printf("huge-addkey %d\n", r < 0 && (errno == EINVAL || errno == ENOSYS));
+
+    /* setxattr's size is a size_t, judged whole against XATTR_SIZE_MAX:
+     * E2BIG before the filesystem is asked anything. Truncated first, it
+     * was a 4096-byte value, set where the filesystem takes one. */
+    int xf = (int)syscall(SYS_memfd_create, "x", 0u);
+    errno = 0;
+    r = syscall(SYS_fsetxattr, xf, "user.hugecount", page, HUGE, 0);
+    printf("huge-setxattr %d\n", r < 0 && errno == E2BIG);
+
+    /* getdents64's count is the other way round: an unsigned int in the
+     * kernel's own prototype, so the high half is not part of it. 2^32 + 5
+     * is a count of 5, too small for a record (EINVAL); 2^32 + 4096 is an
+     * ordinary 4096. */
+    int dfd = open("/", O_RDONLY | O_DIRECTORY);
+    errno = 0;
+    r = syscall(SYS_getdents64, dfd, page, (1ULL << 32) + 5);
+    int small = r < 0 && errno == EINVAL;
+    lseek(dfd, 0, SEEK_SET);
+    r = syscall(SYS_getdents64, dfd, page, HUGE);
+    printf("wide-getdents %d %d\n", small, r > 0);
     return 0;
 }

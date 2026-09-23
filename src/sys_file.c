@@ -1937,7 +1937,12 @@ SYSDEF(getdents64) {
      * dirent in the rootfs: the passthrough /dev device nodes (dev_inject_dents)
      * and virtual bind mount points (bind_inject_dents). Otherwise the raw
      * buffer passes straight through. */
-    size_t len = (size_t)a2;
+    /* The count is an unsigned int in the kernel's own prototype, so the
+     * register's high half is not part of it: getdents64(fd, buf, 2^32 + 5)
+     * is a count of 5, EINVAL for the first record. Read whole, it was a
+     * megabyte's read of the directory on a 64-bit host (and the kernel's
+     * answer on a 32-bit one only because the cast happened to agree). */
+    size_t len = (size_t)(u32)a2;
     if (len > (1u << 20)) len = 1u << 20;
     /* Only as far as the guest's buffer is mapped: filldir64 writes one
      * record at a time and stops at the first that faults, returning what it
@@ -2087,11 +2092,14 @@ static u64 xattr_read(CPU *c, const char *host, int fd, int follow,
     return (u64)r;
 }
 
-/* Sized write shared by {set,lset,fset}xattr. */
+/* Sized write shared by {set,lset,fset}xattr. The size is a guest size_t,
+ * judged whole: cast to an ILP32 host's size_t first, a value of 2^32 + 5
+ * passed the E2BIG check as 5 and set a five-byte value where the kernel
+ * answers E2BIG (xattr_read above compares before it casts, too). */
 static u64 xattr_write(CPU *c, const char *host, int fd, int follow,
                        const char *name, u64 val_va, u64 size, int flags) {
+    if (size > XATTR_BUF_MAX) return (u64)(s64)-E2BIG;
     size_t n = (size_t)size;
-    if (n > XATTR_BUF_MAX) return (u64)(s64)-E2BIG;
     void *buf = NULL;
     if (n) {
         if (!(buf = malloc(n))) return (u64)(s64)-ENOMEM;

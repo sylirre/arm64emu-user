@@ -65,6 +65,10 @@ is not the oracle for most, so the expected block is a native run's):
   (`rw_room`) for that, where it used to read `count` bytes and lose every entry
   past the mapped part when the copy-out failed — and a buffer that was not
   there at all read as an empty directory.
+  Its `count` is an `unsigned int` in the kernel's own prototype, so the
+  register's high half is not part of it: `getdents64(fd, buf, 2^32 + 5)` is a
+  count of 5 and `EINVAL`, where the emulator read the whole register and, on a
+  64-bit host, a megabyte of the directory (`tests/fixtures/hugecount.c`).
 - `statx` refuses both sync bits at once, a reserved mask bit and a flag it does
   not take (`EINVAL`, after the name is read); `fchownat` refuses a flag other
   than `AT_SYMLINK_NOFOLLOW`/`AT_EMPTY_PATH` before it reads the name; and
@@ -218,17 +222,19 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   would (`tests/fixtures/bigcount.c`, `tests/fixtures/xferfault.c`).
 - *The same count, on the calls that never build a bounce buffer.* `sendfile`,
   `splice` and `copy_file_range` hand the guest's count straight to the host,
-  and `getrandom`/`add_key` bound it themselves — all five cast it to a host
-  `size_t` first, which on an ILP32 host is where a 4 GB request became a small
-  one or, for an exact multiple, nothing at all: a transfer that moved no
-  bytes and reported success, `getrandom` handing back no entropy, and a
-  payload length over the kernel's 1 MB cap reading as *no payload*, so
-  `add_key` created the key a kernel answers **`EINVAL`** for. All five clamp
-  the guest value before the cast now, which is what the kernel does with them
+  and `getrandom`/`add_key`/`setxattr` bound it themselves — all six cast it
+  to a host `size_t` first, which on an ILP32 host is where a 4 GB request
+  became a small one or, for an exact multiple, nothing at all: a transfer
+  that moved no bytes and reported success, `getrandom` handing back no
+  entropy, a payload length over the kernel's 1 MB cap reading as *no
+  payload*, so `add_key` created the key a kernel answers **`EINVAL`** for,
+  and `setxattr` setting a small value where a kernel answers **`E2BIG`**.
+  All six clamp the guest value before the cast now, which is what the
+  kernel does with them
   too (`do_sendfile` and `generic_copy_file_checks` cap at `MAX_RW_COUNT`,
   `import_ubuf` caps `getrandom`'s iterator); `getrandom` also bounds the fill
   by `rw_room`, since it fills a bounce buffer of its own and a kernel stops
-  where the caller's memory ends. `tests/fixtures/hugecount.c` covers the five,
+  where the caller's memory ends. `tests/fixtures/hugecount.c` covers the six,
   and is self-checking for the same reason `bigcount.c` is.
 - *The vector calls need the same bound, per segment* (`iov_import`,
   `sys_file.c`). `readv`/`writev` and the `p*v*` family used to stage the whole

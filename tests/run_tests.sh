@@ -1861,7 +1861,8 @@ fi
 
 # ---- the same guest 64-bit count on the paths that never build a bounce
 # buffer: sendfile/splice/copy_file_range hand it straight to the host, and
-# getrandom/add_key bound it themselves. Self-checking for the same reason as
+# getrandom/add_key/setxattr bound it themselves (and getdents64's, an
+# unsigned int, is truncated the kernel's way). Self-checking for the same reason as
 # bigcount above; two rows are yes/no because the number is the host's to pick
 # (a pipe's capacity) or the feature may be missing (copy_file_range before
 # 4.5, keyrings on Android). ----
@@ -1870,7 +1871,7 @@ if [ ! -x tests/fixtures/hugecount.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/hugecount.c $A64_TESTLIBS 2>/dev/null || true
 fi
 if [ -x tests/fixtures/hugecount.bin ]; then
-    expect=$'huge-sendfile 204800 1\nhuge-splice 1\nhuge-cfr 1\nshort-getrandom 4096 1\nhuge-addkey 1'
+    expect=$'huge-sendfile 204800 1\nhuge-splice 1\nhuge-cfr 1\nshort-getrandom 4096 1\nhuge-addkey 1\nhuge-setxattr 1\nwide-getdents 1 1'
     # --host-keyring: add_key reports the facility absent without it, and this
     # row is about the count it bounds, which only the passthrough reaches.
     got=$(timeout -k 5 60 "$EMU" --host-keyring / tests/fixtures/hugecount.bin 2>/dev/null)
