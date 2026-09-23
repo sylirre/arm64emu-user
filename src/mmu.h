@@ -223,10 +223,14 @@ typedef struct Region {
                                * file-backed region -- an anonymous one is the
                                * only kind without it */
     u32  anon_shm;            /* MAP_SHARED|MAP_ANONYMOUS: the backing is a memfd
-                               * this emulator made and sized, not a file the
-                               * guest named -- so mremap cannot grow it in
-                               * place (mem.c), and nothing else may treat its
-                               * end-of-file as the guest's business */
+                               * this emulator made, standing in for the shmem
+                               * object the kernel's shmem_zero_setup makes */
+    u64  shm_size;            /* ...and that object's size, which is the
+                               * mapping's length at mmap time and never
+                               * changes: a page at or past it is past
+                               * end-of-file (a grow reaches there). The
+                               * memfd's own size is rounded up to a host page
+                               * and is no guide on a host with bigger ones */
     u32  mfdcnt;              /* counted in the memfd tier's writable-shared
                                * mapping census (F_SEAL_WRITE's EBUSY check):
                                * region_insert/-delete keep the broker's count
@@ -486,8 +490,6 @@ size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
 void guest_unlend(CPU *c, HostMap **pin, int n);
 /* fork(2) child: the loans of the threads that did not come across are gone. */
 void as_lend_fork_child(AddrSpace *as);
-/* Is any of [addr, addr+len) lent out right now? Caller holds as_lock. */
-int  as_range_lent(AddrSpace *as, u64 addr, u64 len);
 
 /* True on hosts where a pointer is 4 bytes (i686, ARM32). Tables whose entries
  * hold a host pointer AND are indexed by generated code are padded to the same

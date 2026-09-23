@@ -1002,7 +1002,8 @@ static int region_mergeable(const Region *a, const Region *b) {
     if (a->host + (a->end - a->start) != b->host) return 0;
     if (a->prot != b->prot || a->shared != b->shared || a->file != b->file ||
         a->wr_ok != b->wr_ok || a->hostmap != b->hostmap ||
-        a->anon_shm != b->anon_shm || a->mfdcnt != b->mfdcnt ||
+        a->anon_shm != b->anon_shm || a->shm_size != b->shm_size ||
+        a->mfdcnt != b->mfdcnt ||
         a->forkflags != b->forkflags)
         return 0;
     if (a->file && (a->file_off + (a->end - a->start) != b->file_off ||
@@ -1564,14 +1565,16 @@ int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
      * align) has no host mapping of the file to extend: the pages a grow adds
      * could only be fabricated zeroes where the file has content. */
     if (r->file && !r->hostmap) return -ENOMEM;
-    /* Anonymous shared memory is backed by a memfd this emulator sized when
-     * the mapping was made, and nothing may hold that descriptor across guest
-     * execution (guest fd == host fd here), so its size can never be raised
-     * again. Extending the host mapping would put the new pages past
-     * end-of-file, where a touch is a bus error, while a kernel simply grows
-     * the shmem object -- so refuse, and let sys_mm.c rebuild the mapping on
-     * larger backing instead. */
-    if (r->anon_shm) return -ENOMEM;
+    /* Anonymous shared memory grows like any other shared file mapping, and
+     * for the same reason: it IS one, of the shmem object shmem_zero_setup
+     * made at mmap time and sized to that mapping. A kernel's grow extends the
+     * vma over the same object and never resizes it, so every sharer -- a
+     * child forked earlier, a duplicate made with mremap(old_size=0) -- goes
+     * on seeing the same pages, and the pages the grow adds past the object's
+     * end are bus errors (shmem_fault refuses an index at or past i_size).
+     * Extending the host mapping of the memfd is that exactly; as_fault_fill
+     * holds the new pages to shm_size where the memfd, rounded to a host
+     * page, runs further. */
 
     u64 rlen = r->end - r->start, extra = new_len - old_len;
     int rc = region_extend_backing(as, r, extra, in_place);
@@ -2158,7 +2161,13 @@ static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
     if (r && r->hostmap) {
         u64 page = va & ~(u64)GUEST_PAGE_MASK;
         u8 *hp = r->host + (page - r->start);
-        if (host_page_readable(hp)) {
+        /* Anonymous shared memory ends where its object does, not where the
+         * memfd behind it does: that was rounded up to a host page, and on a
+         * host with pages bigger than the guest's the host would hand over
+         * pages the guest's kernel never gave the object. */
+        if (r->anon_shm && r->file_off + (page - r->start) >= r->shm_size)
+            hp = NULL;
+        if (hp && host_page_readable(hp)) {
             u32 prot = vf_pte_prot(r, r->prot);
             pte_set_range(as, page, GUEST_PAGE_SIZE, hp, prot);
             pte = (uintptr_t)hp | prot;
@@ -2654,14 +2663,6 @@ void as_lend_fork_child(AddrSpace *as) {
         free(hm);
     }
     as_unlock();
-}
-
-int as_range_lent(AddrSpace *as, u64 addr, u64 len) {
-    for (int i = 0; i < as->nregions; i++) {
-        const Region *r = &as->regions[i];
-        if (r->end > addr && r->start < addr + len && r->hmap->pins) return 1;
-    }
-    return 0;
 }
 
 /* ---- bulk copies for the syscall layer (never raise guest exceptions) ----

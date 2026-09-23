@@ -348,9 +348,7 @@ guest drew one. While an allocation is pinned:
   `ENOMEM` `mremap` may always give an in-place grow, and a
   `MREMAP_MAYMOVE` caller moves the mapping instead (after a move, the copy is
   what a kernel amounts to anyway: a transfer still aimed at the old address
-  cannot land in the moved one). An anonymous shared mapping grown in place is
-  rebuilt on a larger memfd and refused the same way (`as_range_lent`,
-  `sys_mm.c`).
+  cannot land in the moved one).
 - **a fork child forgets it.** Only the forking thread comes across, and it
   is not inside a lending syscall — fork is the syscall it is in — so every
   pin the child inherits is a sibling's, and `as_lend_fork_child` drops them
@@ -756,15 +754,20 @@ answers it in tiers, never by substituting backing that maps something else:
    host pages), a lent one growing in place — is refused with `ENOMEM`, which
    `mremap(2)` is allowed to return, rather than fabricated.
 
-`MAP_SHARED|MAP_ANONYMOUS` is the one case rebuilt rather than extended
-(`sys_mm.c`): its backing is a memfd sized when the mapping was made, and
-nothing may hold that descriptor across guest execution (guest fd == host fd),
-so it cannot be enlarged — extending the host mapping past the memfd's
-end-of-file would turn the added pages into bus errors, where a kernel grows the
-shmem object. The mapping is rebuilt on a fresh, larger memfd and the old
-contents copied in; what a kernel keeps and this cannot is a sharer from
-*before* the grow — a child forked earlier goes on seeing the old pages. The
-rebuild is refused in place, like tier 4, while a transfer is lent out of it.
+`MAP_SHARED|MAP_ANONYMOUS` grows like any other shared file mapping, because
+that is what it is: `shmem_zero_setup` backs it with a shmem object sized to
+the mapping, and a grow extends the vma over that same object without ever
+resizing it. Every sharer — a child forked earlier, a duplicate made with
+`mremap(old_size=0)` — therefore goes on seeing the same pages, and the pages
+the grow adds past the object's end are bus errors (`shmem_fault` refuses an
+index at or past `i_size`); a mapping shrunk and grown back within the object
+finds its old contents again. The memfd behind the region is extended exactly
+the same way, and the region records the object's size (`shm_size`, the
+mapping's length at `mmap` time) so the fault path holds the added pages to it
+even where the memfd, rounded up to a host page, runs further. This used to
+rebuild the mapping on a fresh, larger memfd, on the belief that a kernel grows
+the object: the new pages read as zeroes where they fault, and every earlier
+sharer was left on the old pages (`tests/c/mremapsem.c`).
 
 An **old length of zero** is the kernel's own special case ("`mremap(0, 0, 0,
 0)` is legal", kept for DOS-emu) and the documented way to *duplicate* a
@@ -779,7 +782,7 @@ anonymous shared segment stays that segment, a file stays that file at that
 offset, and the protection and the memfd census come along in the region
 record. The copy may run past the end of the source mapping, and there the
 pages are past end-of-file — the bus error they are in any file mapping, since
-a shared anonymous segment is a memfd sized when the mapping was made — so they
+a shared anonymous segment is an object sized when the mapping was made — so they
 get no page-table entry and the fault path fills the ones the file has grown
 into, while the pages the source has present are present in the copy from the
 start. Without `MREMAP_MAYMOVE` there is nothing to expand in place and the

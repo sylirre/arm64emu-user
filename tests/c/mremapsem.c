@@ -3,6 +3,8 @@
  * tables and keeps the vma's identity, so a moved MAP_SHARED mapping still
  * writes through to its file, a grown one keeps its protection, and the pages
  * a grow adds to a file mapping are the file's next pages -- not fresh zeros.
+ * Anonymous shared memory is a file mapping too, of a shmem object that never
+ * grows: its sharers stay sharers, and a grow past its end faults.
  * Backed by a memfd so both sides of the differential see the same file (the
  * oracle runs on the host, the emulator inside a rootfs).
  *
@@ -38,6 +40,13 @@ static void onsig(int s) { caught = s; siglongjmp(jb, 1); }
 static int probe_write(volatile char *p) {
     caught = 0;
     if (sigsetjmp(jb, 1) == 0) { *p = 'x'; return 0; }
+    return caught;
+}
+
+/* The same for a read. */
+static int probe_read(volatile char *p) {
+    caught = 0;
+    if (sigsetjmp(jb, 1) == 0) { (void)*p; return 0; }
     return caught;
 }
 
@@ -235,5 +244,78 @@ int main(void) {
     char *s3 = mremap(s2, 2 * 4096, 2 * 4096, MREMAP_MAYMOVE);
     printf("shrink-move %d %d %d\n", s2 == s, s3[0] == 'S', s3[2 * 4096 - 1] == 'S');
     printf("gone sig %d\n", probe_write(s + 2 * 4096));
+
+    /* 11. Anonymous shared memory is one shmem object, sized to the mapping
+     *     when it was made, and a grow extends the mapping over that same
+     *     object without resizing it: a child forked BEFORE the grow still
+     *     shares every page with the grown mapping, both ways, and the pages
+     *     the grow adds past the object's end are bus errors -- in place and
+     *     moved alike. Shrunk and grown back inside the object, a mapping
+     *     finds what the object still holds. */
+    char *gres = mmap(NULL, 3 * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *hdst = mmap(NULL, 2 * 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gres == MAP_FAILED || hdst == MAP_FAILED) { printf("mmap failed\n"); return 1; }
+    char *g = mmap(gres, 4096, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    char *h = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g == MAP_FAILED || h == MAP_FAILED) { printf("mmap failed\n"); return 1; }
+    munmap(gres + 4096, 2 * 4096);   /* room to grow g in place */
+    g[0] = 'g'; h[0] = 'h';
+    int go[2], done[2];
+    if (pipe(go) || pipe(done)) return 1;
+    pid_t kid = fork();
+    if (kid == 0) {
+        char b;
+        if (read(go[0], &b, 1) != 1) _exit(1);
+        int ok = g[1] == 'G' && h[1] == 'H';   /* written after the grow */
+        g[0] = 'k'; h[0] = 'K';
+        if (write(done[1], "d", 1) != 1) _exit(1);
+        _exit(ok ? 0 : 3);
+    }
+    if (kid < 0) return 1;
+    char *g2 = mremap(g, 4096, 3 * 4096, 0);
+    char *h2 = mremap(h, 4096, 2 * 4096, MREMAP_MAYMOVE | MREMAP_FIXED, hdst);
+    if (g2 != MAP_FAILED) g2[1] = 'G';
+    if (h2 != MAP_FAILED) h2[1] = 'H';
+    char ack;
+    if (write(go[1], "g", 1) != 1 || read(done[0], &ack, 1) != 1) return 1;
+    int kst = 0;
+    if (waitpid(kid, &kst, 0) != kid) return 1;
+    if (g2 == MAP_FAILED) printf("shm-past in-place refused %d\n", errno);
+    else printf("shm-past in-place %d %c %d %d %d\n", g2 == g, g2[0],
+                probe_read(g2 + 4096), probe_write(g2 + 2 * 4096),
+                WIFEXITED(kst) ? WEXITSTATUS(kst) : -1);
+    if (h2 == MAP_FAILED) printf("shm-past moved refused %d\n", errno);
+    else printf("shm-past moved %d %c %d %d\n", h2 == hdst, h2[0],
+                probe_read(h2 + 4096), probe_write(h2 + 4096));
+    char *rg = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (rg == MAP_FAILED) { printf("mmap failed\n"); return 1; }
+    rg[2 * 4096] = 'Q';
+    char *rg1 = mremap(rg, 3 * 4096, 4096, 0);
+    char *rg2 = rg1 == MAP_FAILED ? MAP_FAILED : mremap(rg1, 4096, 3 * 4096, 0);
+    if (rg2 == MAP_FAILED) printf("shm-regrow refused %d\n", errno);
+    else printf("shm-regrow %d %c %d\n", rg2 == rg, rg2[2 * 4096],
+                probe_read(rg2 + 4096));
+
+    /* 12. The same object with another thread in the address space, where
+     *     backing may not be moved out from under a live guest VA: the page
+     *     a munmap took from the mapping but not from the object comes back
+     *     with what it held, and the grow past the object's end faults. */
+    running = 0;
+    if (pthread_create(&th, NULL, spin, NULL) != 0) return 1;
+    while (!__atomic_load_n(&running, __ATOMIC_ACQUIRE)) ;
+    char *tm = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (tm == MAP_FAILED) { printf("mmap failed\n"); return 1; }
+    tm[0] = 'm'; tm[4096] = 'M';
+    munmap(tm + 4096, 4096);
+    char *tm2 = mremap(tm, 4096, 3 * 4096, MREMAP_MAYMOVE);
+    __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    if (tm2 == MAP_FAILED) printf("threaded shm refused %d\n", errno);
+    else printf("threaded shm %c %c %d\n", tm2[0], tm2[4096],
+                probe_read(tm2 + 2 * 4096));
     return 0;
 }
