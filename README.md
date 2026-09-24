@@ -356,7 +356,7 @@ src/
     types.h esr.h cpu.h sysreg.h   fixed-width types, ESR, CPU state, sysregs
     decode.c    A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
     exec_fpsimd.c  FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
-    cpu.c sysreg.c   step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*
+    cpu.c sysreg.c   step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect,
                 copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's

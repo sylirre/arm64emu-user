@@ -1418,7 +1418,7 @@ static void branch_system(CPU *c, u32 insn) {
             undefined(c, insn);
         } else if (opc == 1 && ll == 0) {                                 /* BRK */
             cpu_raise_sync(c, esr_make(EC_BRK64, imm16), 0);
-        } else if (opc == 2 && ll == 0) {                                 /* HLT: stop machine (test exit) */
+        } else if (opc == 2 && ll == 0 && c->el != 0) {                   /* HLT: stop machine (test exit); EL0 may not halt */
             fprintf(stderr, "[HLT #%u] x0=0x%llx icount=%llu\n", imm16,
                     (unsigned long long)c->x[0], (unsigned long long)c->icount);
             c->stop = true;
@@ -1433,6 +1433,7 @@ static void branch_system(CPU *c, u32 insn) {
             case 1: set_x(c, 30, c->cur_insn_pc + 4); c->pc = tgt; return;/* BLR */
             case 2: c->pc = reg_x(c, Rn); return;                         /* RET */
             case 4: {                                                     /* ERET */
+                if (c->el == 0) { undefined(c, insn); return; }           /* EL1+ only */
                 u32 spsr = (u32)c->spsr[c->el];
                 u64 elr = c->elr[c->el];
                 cpu_unpack_spsr(c, spsr);

@@ -13,12 +13,14 @@
 // instructions in the same order; the only difference is whether the FSQRT
 // operand makes the gate fire. So the icount an engine reports must be the
 // SAME for both builds, and the harness checks that per engine rather than
-// comparing engines to each other — which it cannot do, because the JIT does
-// not count the trailing HLT block and that constant offset has nothing to do
-// with this bug. Before the fix the JIT's two builds differed by four.
+// comparing engines to each other — the engines need not agree on how the
+// block that ends the program is counted, and that constant offset has
+// nothing to do with this bug. Before the fix the JIT's two builds differed
+// by four.
 //
-// Nothing the guest can read exposes icount, so the harness reads the
-// [HLT #N] diagnostic from stderr.
+// Nothing the guest can read exposes icount, so the program ends on an
+// undefined instruction and the harness reads the icount of the register dump
+// --strace prints when a guest dies of a signal.
 
     .globl _start
 _start:
@@ -41,4 +43,4 @@ _start:
     // close the block so its ninsns actually reaches icount
     b       1f
 1:  mov     x0, #0
-    hlt     #0
+    udf     #0

@@ -1420,20 +1420,21 @@ fi
 # the slow arm's jit_exec1 is the only counter; a class that is both gated and
 # in ninsns retires once and counts twice. Nothing the guest can read exposes
 # icount, and the engines-agree checks above compare guest stdout, so this one
-# reads the icount the HLT diagnostic prints on stderr.
+# ends the program on an undefined instruction and reads the icount of the
+# register dump --strace prints when a guest dies of a signal.
 #
 # Two builds of one source, differing only in whether the FSQRT operand makes
 # the gate fire, executing the same instructions either way: each engine must
-# report the same icount for both. Per engine, not engine against engine — the
-# JIT does not count the trailing HLT block, and that constant offset is not
-# what this is about. ----
+# report the same icount for both. Per engine, not engine against engine — how
+# an engine counts the block that ends the program is a constant offset, and
+# not what this is about. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -nostdlib -static -o tests/fixtures/icount_plain.bin \
             tests/fixtures/icount_gate.S 2>/dev/null &&
        "$AGCC" -nostdlib -static -DNANGATE -o tests/fixtures/icount_nan.bin \
             tests/fixtures/icount_gate.S 2>/dev/null; then
         ic_of() {  # $1 = emulator flags, $2 = image
-            timeout -k 5 60 "$EMU" $1 / "$2" 2>&1 >/dev/null \
+            timeout -k 5 60 "$EMU" $1 --strace / "$2" 2>&1 >/dev/null \
                 | sed -n 's/.*icount=\([0-9]*\).*/\1/p' | tail -1
         }
         ic_bad=""

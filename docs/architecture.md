@@ -64,7 +64,12 @@ void exception_take(CPU*, ExcKind, u64 esr, u64 far, u64 ret_addr);
 In the system emulator this banks SPSR/ELR/ESR/FAR and vectors to the EL1 handler.
 In user mode there is no guest kernel, so the rewritten `exception.c` **records**
 the pending exception into thread-local state and returns; the run loop dispatches
-it. The CPU stays at EL0 for the process's entire life.
+it. The CPU stays at EL0 for the process's entire life, and the core holds it to
+EL0's rules: a system instruction EL1 has not opened to it (`el0_allowed` in
+`sysreg.c`, judged on `SCTLR_EL1`/`CNTKCTL_EL1`, which `sysreg_init` sets as
+Linux does: `DZE`, `UCT`, `UCI` and the virtual counter, never `UMA`), `ERET`,
+`DRPS`, `HLT`, `HVC` and `SMC` are all UNDEFINED there, and reach the program as
+the `SIGILL` a kernel sends (`tests/c/el0sysinsn.c`).
 
 ```c
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
@@ -183,7 +188,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/core/decode.c` | A64 integer/branch/load-store decode+exec; LSE atomics; exclusives as host CAS. |
 | `src/core/exec_fpsimd.c` | Scalar FP, Advanced-SIMD, crypto; FPCR rounding; 32-bit-host-safe (no `__int128` in the hot paths). |
 | `src/core/cpu.c` | `cpu_step` fetch/decode/execute driver; register/condition helpers; debug trace. |
-| `src/core/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads. |
+| `src/core/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads; which of them EL0 may execute. |
 | `src/mmu.h`, `src/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/exception.c` | Pending-exception recorder (the exception seam). |
 | `src/loop.c` | Run loop + exception dispatch + signal delivery point. |
