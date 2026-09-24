@@ -110,7 +110,8 @@ typedef struct {
     s32 tracer;          /* tracer pid, 0 once detached */
     u32 options;         /* PTRACE_O_* */
     u32 state;           /* PT_ST_* (release/acquire flag for the stop fields) */
-    u32 reported;        /* wait4 has already consumed the current stop */
+    u32 reported;        /* a wait (wait4, or waitid without WNOWAIT) has
+                          * consumed the current stop */
     u32 stop_sig;        /* WSTOPSIG of the current stop */
     u32 event;           /* PTRACE_EVENT_* of the current stop (0 = none) */
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
@@ -1298,7 +1299,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
 }
 
 /* ---- tracer: wait4/waitid integration ---- */
-int ptrace_collect(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
+int ptrace_collect(s32 wpid, int flags, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1310,10 +1311,11 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
         u32 st_state = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
         /* Synthetic exit of an auto-attached tracee we cannot host-reap. */
         if (st_state == PT_ST_EXITED) {
+            if (!(flags & PT_WAIT_EXITS)) continue;
             *status = e->exit_status;
             *outpid = t;
             if (ru) *ru = e->ru;   /* before pt_free: the slot is reusable after */
-            pt_free(e);
+            if (!(flags & PT_WAIT_KEEP)) pt_free(e);
             return 1;
         }
         if (st_state != PT_ST_STOPPED) continue;
@@ -1338,7 +1340,11 @@ int ptrace_collect(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
          * from the tracee's last real stop, which is still the truth: it has
          * been parked in its service loop ever since, running no guest code. */
         if (ru) *ru = e->ru;
-        __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
+        /* Collected, unless this is a WNOWAIT look: the kernel's
+         * wait_task_stopped clears the stop's code only then, and a stop
+         * looked at is reported again. */
+        if (!(flags & PT_WAIT_KEEP))
+            __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
         *status = st;
         *outpid = t;
         return 1;
@@ -1370,14 +1376,21 @@ int ptrace_any_trace(void) {
     return g_tab && __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE);
 }
 
-int ptrace_have_tracee(s32 wpid) {
+int ptrace_have_tracee(s32 wpid, int dead_too) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
         PtLink *e = &g_tab->links[i];
-        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
-        if (wpid > 0 && wpid != e->tracee) continue;
+        if (wpid > 0 && wpid != t) continue;
+        /* Dead for sure, and only then: a /proc this host will not show us
+         * leaves a tracee counted, as it leaves a parked one attached. */
+        if (!dead_too &&
+            (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED ||
+             (kill(t, 0) != 0 && errno == ESRCH) || pt_task_zombie(t)))
+            continue;
         return 1;
     }
     return 0;
@@ -1428,7 +1441,7 @@ static int pt_task_zombie(s32 t) { return pt_state_is_dead(pt_task_state(t)); }
  * WIFSIGNALED(SIGKILL) so a sibling tracer polling in wait4 does not hang. Only
  * fires for a non-child tracee; a host-child's death is reaped via the host wait.
  * Returns 1 and fills status/outpid if such a tracee is found, else 0. */
-int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
+int ptrace_reap_dead(s32 wpid, int keep, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1446,7 +1459,7 @@ int ptrace_reap_dead(s32 wpid, int *status, s32 *outpid, PtRusage *ru) {
          * is the one from its last stop (nothing better exists -- the accounting
          * died with the task). */
         if (ru) *ru = e->ru;
-        pt_free(e);
+        if (!keep) pt_free(e);
         return 1;
     }
     return 0;

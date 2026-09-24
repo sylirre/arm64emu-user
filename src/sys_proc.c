@@ -2700,6 +2700,13 @@ SYSDEF(wait4) {
     pid_t wpid = (pid_t)(s32)a0;
     int options = (int)a2;
 
+    /* The kernel's argument checks, made here because the tracer path below
+     * answers from the registry before any host wait4 could make them. */
+    if ((u32)options & ~(G_WNOHANG | G_WUNTRACED | G_WCONTINUED |
+                         G_WNOTHREAD | G_WALL | G_WCLONE))
+        return (u64)(s64)-EINVAL;
+    if (wpid == INT_MIN) return (u64)(s64)-ESRCH;   /* -INT_MIN is undefined */
+
     /* Two modes, re-evaluated every pass (a kick can flip us between them).
      *
      * Fast path -- the caller is not a tracer for wpid (no registry, nobody in
@@ -2720,7 +2727,7 @@ SYSDEF(wait4) {
      * to bump the generation). */
     for (;;) {
         if (!ptrace_available() || !ptrace_any_trace() ||
-            !ptrace_have_tracee((s32)wpid)) {
+            !ptrace_have_tracee((s32)wpid, 1)) {
             int status;
             struct rusage ru;   /* always taken: children_reaped needs it */
             pid_t pid = wait4(wpid, &status, options, &ru);
@@ -2739,10 +2746,11 @@ SYSDEF(wait4) {
             }
             /* Defensive: a link keyed to this pid with us as tracer can only
              * appear in a race window (TRACEME after the gate check); drop it
-             * so it cannot go stale. No-op otherwise. */
-            if (pid > 0 && ptrace_any_trace()) ptrace_note_reaped((s32)pid);
-            if (pid > 0 && (WIFEXITED(status) || WIFSIGNALED(status)))
+             * with the child, so it cannot go stale. No-op otherwise. */
+            if (pid > 0 && (WIFEXITED(status) || WIFSIGNALED(status))) {
+                if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
                 children_reaped((s64)ru.ru_maxrss);
+            }
             if (a1) {
                 s32 gs = status;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2759,7 +2767,7 @@ SYSDEF(wait4) {
         int st;
         s32 rp;
         PtRusage pru;
-        if (ptrace_collect((s32)wpid, &st, &rp, a3 ? &pru : NULL)) {
+        if (ptrace_collect((s32)wpid, PT_WAIT_EXITS, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2776,9 +2784,12 @@ SYSDEF(wait4) {
         pid_t pid = wait4(wpid, &status, options | WNOHANG, &ru);
         int werr = errno;
         if (pid > 0) {
-            ptrace_note_reaped((s32)pid);
-            if (WIFEXITED(status) || WIFSIGNALED(status))
+            /* A reaped child's link goes with it; a stop or a continue
+             * reported leaves the child, and its link, where they are. */
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                ptrace_note_reaped((s32)pid);
                 children_reaped((s64)ru.ru_maxrss);
+            }
             if (a1) {
                 s32 gs = status;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2794,13 +2805,13 @@ SYSDEF(wait4) {
          * the tracee is another parent's child and its stop/exit reaches us only
          * through the registry above, not the host wait. Keep polling while a live
          * tracee remains; a real ECHILD (no children AND no tracees) still returns. */
-        if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee((s32)wpid)))
+        if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee((s32)wpid, 1)))
             return (u64)(s64)(-werr);
         /* A non-child tracee killed by an uncatchable SIGKILL vanishes at the host
          * level with no registry event; detect its dead/zombie process and report
          * the synthetic WIFSIGNALED(SIGKILL) so we do not poll forever. */
         if (pid < 0 && werr == ECHILD &&
-            ptrace_reap_dead((s32)wpid, &st, &rp, a3 ? &pru : NULL)) {
+            ptrace_reap_dead((s32)wpid, 0, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -2838,14 +2849,29 @@ SYSDEF(waitid) {
     int options = (int)a3;
     (void)a5;
 
+    /* The kernel's argument checks (kernel_waitid), made here because the
+     * tracer path below answers from the registry before any host waitid
+     * could make them. */
+    if (((u32)options & ~(G_WNOHANG | G_WNOWAIT | G_WEXITED | G_WSTOPPED |
+                          G_WCONTINUED | G_WNOTHREAD | G_WALL | G_WCLONE)) ||
+        !((u32)options & (G_WEXITED | G_WSTOPPED | G_WCONTINUED)))
+        return (u64)(s64)-EINVAL;
+    if ((u32)a0 > G_P_PIDFD || ((u32)a0 == G_P_PID && (s32)a1 <= 0))
+        return (u64)(s64)-EINVAL;
+
     /* Same two modes as wait4: a real blocking host waitid unless the caller
-     * is a tracer for the waited id, else the registry poll (a ptrace stop is
-     * reported as a CLD_TRAPPED SIGCHLD siginfo, matching the kernel's waitid
-     * view). See sys_wait4 for the full rationale. */
+     * is a tracer for the waited id, else the registry poll. There a tracer
+     * sees its tracees' ptrace stops whatever it waits for, as a CLD_TRAPPED
+     * siginfo whose si_status is the whole stop code (event bits included),
+     * and their exits under WEXITED; WNOWAIT leaves either to be reported
+     * again. See sys_wait4 for the full rationale. */
     s32 wpid = (idtype == P_PID) ? (s32)id : -1;   /* P_ALL/P_PGID: best-effort any */
+    int pflags = ((u32)options & G_WEXITED ? PT_WAIT_EXITS : 0) |
+                 ((u32)options & G_WNOWAIT ? PT_WAIT_KEEP : 0);
+    int dead_too = ((u32)options & (G_WEXITED | G_WCONTINUED)) != 0;
     for (;;) {
         if (!ptrace_available() || !ptrace_any_trace() ||
-            !ptrace_have_tracee(wpid)) {
+            !ptrace_have_tracee(wpid, dead_too)) {
             siginfo_t si;
             KRusage ru;
             memset(&si, 0, sizeof si);
@@ -2869,12 +2895,12 @@ SYSDEF(waitid) {
                 return host_err();
             }
             /* Defensive: see the matching wait4 comment. */
-            if (si.si_pid != 0 && ptrace_any_trace())
-                ptrace_note_reaped((s32)si.si_pid);
             if (si.si_pid != 0 && !(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
-                 si.si_code == CLD_DUMPED))
+                 si.si_code == CLD_DUMPED)) {
+                if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss);
+            }
             /* Only a wait that found a child writes rusage (the kernel copies it
              * out under `err > 0`), so a WNOHANG that found nothing must not. */
             if (a4 && si.si_pid != 0) {
@@ -2890,13 +2916,21 @@ SYSDEF(waitid) {
         int st;
         s32 rp;
         PtRusage pru;
-        if ((options & WSTOPPED) && ptrace_collect(wpid, &st, &rp, a4 ? &pru : NULL)) {
+        if (ptrace_collect(wpid, pflags, &st, &rp, a4 ? &pru : NULL)) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             si.si_signo = SIGCHLD;
-            si.si_code = CLD_TRAPPED;
             si.si_pid = rp;
-            si.si_status = (st >> 8) & 0xff;   /* WSTOPSIG */
+            if (WIFSTOPPED(st)) {
+                si.si_code = CLD_TRAPPED;
+                si.si_status = (int)((u32)st >> 8);   /* the stop's exit_code */
+            } else if (WIFEXITED(st)) {
+                si.si_code = CLD_EXITED;
+                si.si_status = WEXITSTATUS(st);
+            } else {
+                si.si_code = WCOREDUMP(st) ? CLD_DUMPED : CLD_KILLED;
+                si.si_status = WTERMSIG(st);
+            }
             if (a4 && rusage_pt_to_guest(c, a4, &pru) < 0) return (u64)(s64)-EFAULT;
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
@@ -2909,11 +2943,13 @@ SYSDEF(waitid) {
                              options | WNOHANG, &ru);
         int werr = errno;
         if (r == 0 && si.si_pid != 0) {
-            ptrace_note_reaped((s32)si.si_pid);
+            /* As in wait4: only a reap takes the child's link with it. */
             if (!(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
-                 si.si_code == CLD_DUMPED))
+                 si.si_code == CLD_DUMPED)) {
+                ptrace_note_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss);
+            }
             if (a4) {
                 GRusage g;
                 rusage_out_k(&g, &ru);
@@ -2923,13 +2959,14 @@ SYSDEF(waitid) {
             return e ? (u64)(s64)e : 0;
         }
         /* Host ECHILD is not terminal while we trace a live non-child (see wait4). */
-        if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(wpid)))
+        if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(wpid, dead_too)))
             return (u64)(s64)(-werr);
         /* Uncatchable SIGKILL of a non-child tracee: report the synthetic death as
          * a CLD_KILLED SIGCHLD siginfo so waitid does not poll forever (see wait4). */
         int dst, drp;
-        if (r < 0 && werr == ECHILD &&
-            ptrace_reap_dead(wpid, &dst, &drp, a4 ? &pru : NULL)) {
+        if (r < 0 && werr == ECHILD && ((u32)options & G_WEXITED) &&
+            ptrace_reap_dead(wpid, (u32)options & G_WNOWAIT, &dst, &drp,
+                             a4 ? &pru : NULL)) {
             siginfo_t ki;
             memset(&ki, 0, sizeof ki);
             ki.si_signo = SIGCHLD;

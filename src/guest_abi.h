@@ -660,6 +660,21 @@ typedef struct {
 #define G_PTRACE_EVENT_EXIT        6
 #define G_PTRACE_EVENT_STOP        128
 
+/* wait4/waitid options and waitid id types (linux/wait.h). */
+#define G_WNOHANG      0x00000001u
+#define G_WUNTRACED    0x00000002u   /* wait4's name ... */
+#define G_WSTOPPED     0x00000002u   /* ... and waitid's, for the same bit */
+#define G_WEXITED      0x00000004u
+#define G_WCONTINUED   0x00000008u
+#define G_WNOWAIT      0x01000000u
+#define G_WNOTHREAD    0x20000000u   /* __WNOTHREAD */
+#define G_WALL         0x40000000u   /* __WALL */
+#define G_WCLONE       0x80000000u   /* __WCLONE */
+#define G_P_ALL        0
+#define G_P_PID        1
+#define G_P_PGID       2
+#define G_P_PIDFD      3
+
 /* regset note types (linux/elf.h). */
 #define G_NT_PRSTATUS        1
 #define G_NT_PRFPREG         2

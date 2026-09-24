@@ -1269,6 +1269,20 @@ deaths, which run no guest code to bump the generation). It synthesizes the
 status word — `WIFSTOPPED | (WSTOPSIG << 8)`, `+0x80` for syscall stops under
 `PTRACE_O_TRACESYSGOOD`, `event << 8` for event stops.
 
+What each wait is told follows the kernel's `wait_task_stopped` and
+`wait_consider_task` (`ptrace_collect`'s flags). A tracer sees its tracees'
+stops whatever it waits for — `waitid(WEXITED)` alone included — and `waitid`
+reports one as `CLD_TRAPPED` whose `si_status` is the stop's whole code, event
+bits and all (`0x8005` for a `PTRACE_EVENT_STOP`), not `WSTOPSIG` alone. An exit
+reaches `waitid` only under `WEXITED`, as `CLD_EXITED`, `CLD_KILLED` or
+`CLD_DUMPED`, and to a wait for stops alone a dead tracee is nothing to wait
+for — `ECHILD` once it is the last (`ptrace_have_tracee`'s `dead_too`). `WNOWAIT`
+leaves a stop, or a synthetic or dead-tracee exit, to be reported again, and a
+host wait takes a tracee's link with it only when it reaps the child, never at
+a stop, a continue or a `WNOWAIT` look. The kernel's argument checks
+(`kernel_wait4`, `kernel_waitid`) are made before the registry is asked, since
+it answers before any host wait could refuse them (`tests/ptrace/waitid_tracer.c`).
+
 **`rusage` at a stop.** `wait4`/`waitid` fill their `rusage` argument at a ptrace
 stop, not only at a death — the kernel's `wait_task_stopped()` ends in
 `getrusage(p, RUSAGE_BOTH, wo->wo_rusage)` — and `strace -c` is built on exactly
