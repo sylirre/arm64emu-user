@@ -106,11 +106,13 @@ static void leader_park(CPU *c) {
     struct Machine *m = c->m;
     sigset_t all;
     sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, NULL);
-    /* The mask is ours now, so nothing may reopen the pending-signal gate
-     * behind our back: what it holds stays with the kernel, which is the one
-     * place a signal aimed at a parked leader can wait to be seen. */
-    sig_gate_forget();
+    /* Everything blocked, and the pending-signal gate forgotten rather than
+     * opened: what it holds stays with the kernel, which is the one place a
+     * signal aimed at a parked leader can wait to be seen. What the capture
+     * ring already held goes back to the process, for a live thread to take,
+     * as the kernel's exit_signals retargets it -- or with the leader, if it
+     * was the leader's own. */
+    sig_thread_exit();
     jit_thread_exit();   /* hand back the code cache; jit_run builds a fresh
                           * one if this thread is ever revived */
     g_tls.sc_ret_eintr = 0;   /* exit(2) is not a syscall to be restarted */
@@ -826,6 +828,7 @@ static void *thread_entry(void *arg) {
     /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes
      * joiners. */
     jit_thread_exit();
+    sig_thread_exit();   /* what it caught for the process, to another thread */
     sig_tls_release();   /* and whatever this thread's signal queue grew into */
     sig_kick_timer_fini();
     /* Leave the address space's thread count *before* releasing a joiner. That

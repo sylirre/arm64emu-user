@@ -535,6 +535,52 @@ worker, the `sigwait` and `signalfd` workers, `rt_sigtimedwait`,
 `tests/fixtures/sentsync.c` the held-out `SIGSEGV`, which
 qemu-user gets wrong (it hands the read an `EINTR`).
 
+### What a thread caught but will not take
+
+A signal in a thread's capture ring has left the kernel's pending set: the host
+delivered it to the thread, and the ring holds it until the run loop frames it.
+For a signal sent to the process that makes the ring a private queue standing
+in for the process's shared one, and the kernel does something with a shared
+signal that a private queue cannot: when the thread it was meant for blocks it
+before taking it — a handler's `sa_mask`, an `rt_sigprocmask` that raced the
+capture — or exits, the signal stays with the process and a thread that has it
+unblocked takes it (`retarget_shared_pending`, from `__set_task_blocked` and
+`exit_signals`). Here it stayed in the ring: blocked until that thread unblocked
+it, and gone with the thread when it exited, so a `SIGCHLD` or a `kill(2)` a
+worker caught an instant before its `sa_mask` or its `exit(2)` never reached
+the thread `sigwait()`ing for it.
+
+Now such a signal goes back to the kernel (`sig_retarget`, run by
+`sig_sync_host_mask` after every mask change and by `sig_thread_exit` when a
+thread ends or a main thread parks as the zombie leader), queued to our own
+tgid, and the kernel routes it — to a thread that has it unblocked, or into
+the pending set where `sigpending`, `sigtimedwait` and a `signalfd` find it.
+A thread that is its process's only one hands nothing back when it blocks a
+signal: it keeps it pending where it is, which is all a shared queue would do
+with it. And order is kept: the ring holds the *oldest* of what was sent, so
+whatever the host still holds of the same number is taken out first and queued
+again behind the ring's — a real-time signal's instances arrive in the order
+they were sent, and a standard signal keeps the first siginfo, as the kernel's
+coalescing does (`c/sigqdepth`'s flood is what showed a naive hand-back
+reordering them).
+The kernel lets a process queue itself an arbitrary siginfo only from its main
+thread; from any other, an `si_code >= 0` (`SI_USER`, a child's `CLD_*`) is
+`EPERM`. So what goes back is an `SI_QUEUE` carrying a token (our pid, a slot of
+a per-process table, the slot's nonce), and every place the emulator reads a
+host siginfo — the capture handler, the `sigtimedwait` and hand-over dequeues, a
+`signalfd` read — trades it for the siginfo the slot kept. A thread-directed
+signal (`tkill`/`tgkill`, a `SIGEV_THREAD_ID` timer, whose slot says so) stays
+where the kernel keeps it, on the thread's own queue, and dies with the thread.
+The held-out numbers are not handed back while the thread lives — the host
+would deliver them straight to it again — only when it exits, having blocked
+everything first. An exiting thread also no longer opens the pending-signal
+gate on its way out: that pulled what the gate had left in the kernel's queue
+into the ring of a thread about to drop it, where the kernel would have given
+it to another thread. `tests/c/sigretarget.c` has the handler that exits and
+the one that waits, a `SIGCHLD` whose siginfo must survive the trip, three
+instances of a real-time signal that must arrive in order, and the `tgkill`ed
+signal that must not.
+
 ### One disposition, four words
 
 `m->sigact[]` is shared by every thread of the process, and each entry is a

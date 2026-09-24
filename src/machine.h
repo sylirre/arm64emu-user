@@ -650,8 +650,13 @@ int  sig_guest_nr(int host_sig);
 /* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
  * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval
  * cannot ride a 32-bit host kernel's 4-byte one); this returns the slot's
- * stored guest value. Async-signal-safe (plain loads); 1 = live slot. */
-int  ptimer_siginfo(s32 slot, u64 *val);
+ * stored guest value, and whether the timer signals one thread
+ * (SIGEV_THREAD_ID). Async-signal-safe (plain loads); 1 = live slot. */
+int  ptimer_siginfo(s32 slot, u64 *val, int *thread);
+/* signal.c: a signalfd record of a signal a thread handed back to the process
+ * (sig_retarget), rewritten as the signal it stands for. Called before the
+ * record's signal number is translated; 1 = rewritten, guest number and all. */
+int  sig_sfd_requeued(GSignalfdSiginfo *r);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* SECCOMP_RET_TRAP: SIGSYS carrying the blocked syscall (sys_seccomp.c). */
@@ -1459,6 +1464,11 @@ int  sig_pending_fatal(struct Machine *m);   /* the signal, or 0 */
 void sig_park_mask(struct Machine *m);
 void sig_quiet_mask(void);
 void sig_handover_give(int all);
+/* A thread's signals as it goes (thread exit, a main thread parking as the
+ * zombie leader): everything blocked, and what its capture ring holds that
+ * was sent to the process handed back for another thread to take -- the
+ * kernel's exit_signals (signal.c, sig_retarget). */
+void sig_thread_exit(void);
 void sig_handover_take(void);
 void sig_leader_takeover(void);
 /* sys_proc.c: another thread's execve is dismantling this thread group. */

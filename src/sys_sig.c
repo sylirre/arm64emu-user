@@ -429,9 +429,10 @@ int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
 /* read(2) on a signalfd: the host's read, then the translation of what it
  * returned -- whole struct signalfd_siginfo records, ssi_signo back from a
  * carrier to the guest number, a timer's slot index back to its guest sigval
- * and timer id. The blocking, O_NONBLOCK and EINTR behaviour are the file's
- * own (a read interrupted by a signal the guest handles is restartable, as
- * signalfd_read's ERESTARTSYS makes it). */
+ * and timer id, a signal a thread handed back to the process back to the
+ * signal it was (signal.c, sig_retarget). The blocking, O_NONBLOCK and EINTR
+ * behaviour are the file's own (a read interrupted by a signal the guest
+ * handles is restartable, as signalfd_read's ERESTARTSYS makes it). */
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
     (void)c;
     ssize_t n = read(fd, out, len);
@@ -439,10 +440,12 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
     for (size_t off = 0; off + sizeof(GSignalfdSiginfo) <= (size_t)n;
          off += sizeof(GSignalfdSiginfo)) {
         GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
+        if (sig_sfd_requeued(r)) continue;   /* handed back: as it was sent */
         r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
         if (r->ssi_code == SI_TIMER) {
             u64 gv;
-            if (ptimer_siginfo((s32)r->ssi_int, &gv)) {
+            int thr;
+            if (ptimer_siginfo((s32)r->ssi_int, &gv, &thr)) {
                 r->ssi_tid = (u32)r->ssi_int;    /* the guest timer id (slot) */
                 r->ssi_int = (s32)gv;
                 r->ssi_ptr = gv;

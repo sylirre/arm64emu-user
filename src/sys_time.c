@@ -240,6 +240,7 @@ struct PTimer {
     int state;                /* 0 free, 1 mid-claim, 2 live (atomic) */
     timer_t host;
     u64 gvalue;               /* the guest sigevent's 64-bit sigval */
+    int thread;               /* SIGEV_THREAD_ID: its signal is one thread's */
 };
 static struct PTimer *g_ptimer_seg[PTIMER_SEGS];
 
@@ -258,13 +259,15 @@ static struct PTimer *ptimer_slot(s32 id) {
 }
 
 /* Capture-time SI_TIMER fixup (host_catcher, so async-signal-safe: plain
- * loads only): the full guest sigval for the timer at `slot`. Returns 1 and
- * fills *val for a live slot, 0 otherwise (raced deletion: the caller keeps
- * the raw host value). */
-int ptimer_siginfo(s32 slot, u64 *val) {
+ * loads only): the full guest sigval for the timer at `slot`, and whether it
+ * signals one thread (SIGEV_THREAD_ID) rather than the process. Returns 1
+ * and fills *val and *thread for a live slot, 0 otherwise (raced deletion:
+ * the caller keeps the raw host value). */
+int ptimer_siginfo(s32 slot, u64 *val, int *thread) {
     struct PTimer *t = ptimer_slot(slot);
     if (!t || __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != 2) return 0;
     *val = t->gvalue;
+    *thread = t->thread;
     return 1;
 }
 
@@ -343,7 +346,7 @@ SYSDEF(timer_create) {
      * in the guest's full 64-bit value from the slot (see the block comment). */
     sev.sigev_value.sival_int = slot;
     u64 gvalue = (u64)slot;   /* NULL-sigevent kernel default: sival = timer id */
-    int err = 0;
+    int err = 0, thread = 0;
     if (a1) {
         GSigevent g;
         if (copy_from_guest(c, &g, a1, sizeof g) < 0) {
@@ -361,6 +364,7 @@ SYSDEF(timer_create) {
 #else
             sev._sigev_un._tid = (pid_t)g.sigev_tid;   /* glibc union field */
 #endif
+            thread = 1;
             /* fall through */
         case G_SIGEV_SIGNAL:
         case G_SIGEV_NONE: {
@@ -405,6 +409,7 @@ SYSDEF(timer_create) {
     }
     t->host = ht;
     t->gvalue = gvalue;
+    t->thread = thread;
     __atomic_store_n(&t->state, 2, __ATOMIC_RELEASE);
     return 0;
 }

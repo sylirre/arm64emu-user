@@ -123,6 +123,10 @@ typedef struct {
     int pid, uid, status;
     u64 addr;
     s64 value;   /* full guest sigval width, even on a 32-bit host */
+    int thr;     /* aimed at this thread alone (tkill/tgkill, a SIGEV_THREAD_ID
+                  * timer, a traced self-stop): the kernel keeps such a signal
+                  * on the thread's own queue, and it dies with the thread --
+                  * never handed to another (sig_retarget) */
 } PendSig;
 
 #define SIGQ_MIN 32       /* the fixed ring this used to be; now the floor */
@@ -355,8 +359,11 @@ void sig_tls_release(void) { sigq_reset(); }
  * it takes: whatever was pending at that moment ran in the child too, at its
  * next unblock. Also lifts anything the gate had blocked host-side, since the
  * child holds nothing back for the kernel. */
+static void rq_fork_child(void);
+
 void sig_fork_child(void) {
     sigq_reset();
+    rq_fork_child();
     /* The kick timer is the forking thread's and did not come across (no
      * POSIX timer does): this thread, the child's only one, makes its own
      * (the inherited handle is not deleted -- it is not ours to delete). */
@@ -678,7 +685,10 @@ void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, 
  * carrier, the fields the frame writer wants. Async-signal-safe (plain
  * loads): host_catcher runs it, and so does a sigtimedwait that dequeued
  * from the kernel. */
+static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
+
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
+    if (rq_claim(sig, si, p)) return;   /* one this process handed back */
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     p->err = si->si_errno;
@@ -687,16 +697,23 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     p->status = si->si_status;
     p->addr = (u64)(uintptr_t)si->si_addr;
     p->value = (s64)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
+    /* The one kind of thread-directed signal a siginfo names outright. The
+     * guest cannot send another (rt_tgsigqueueinfo is not one of its calls);
+     * the kernel's own per-thread signals -- a write's SIGPIPE, a fault --
+     * are taken at the boundary right after the call that raised them. */
+    p->thr = si->si_code == SI_TKILL;
     if (si->si_code == SI_TIMER) {
         /* A POSIX-timer signal: the host sigval carries only the emulator's
          * timer-slot index (the guest's 8-byte sigval cannot ride a 32-bit
          * host kernel's 4-byte sigval); swap in the slot's stored guest value
          * and make si_timerid the guest timer id. Every SI_TIMER in this
-         * process is one of ours. */
+         * process is one of ours, and the slot says whose it is. */
         u64 gv;
-        if (ptimer_siginfo(si->si_value.sival_int, &gv)) {
+        int thr;
+        if (ptimer_siginfo(si->si_value.sival_int, &gv, &thr)) {
             p->value = (s64)gv;
             p->pid = si->si_value.sival_int;   /* si_timerid slot */
+            p->thr = thr;
         }
     }
 }
@@ -825,6 +842,7 @@ void sig_raise_local(int sig) {
     memset(&p, 0, sizeof p);
     p.signo = sig;
     p.pid = (int)getpid();
+    p.thr = 1;   /* a stop this thread raised for itself: never a host one */
     if (!sigq_push(&p, NULL)) return;
     jit_signal_interrupt();
 }
@@ -1035,6 +1053,303 @@ void sig_install_kick_net(void) {
     sigaction(PTRACE_KICKSIG, &sa, NULL);
 }
 
+/* ---- handing a captured signal back to the process -------------------------
+ *
+ * A signal in a thread's capture ring has left the kernel's pending set: the
+ * host delivered it to this thread, and the ring holds it until the run loop
+ * frames it. For a signal sent to the process that is a private queue
+ * standing in for the process's shared one, and a kernel does something with
+ * a shared signal that a private queue cannot: when the thread it was going
+ * to (complete_signal's pick) blocks it, or exits, the signal stays with the
+ * process, and a thread that has it unblocked takes it instead
+ * (retarget_shared_pending, from __set_task_blocked and from exit_signals).
+ * Here it stayed in the ring -- blocked until this thread unblocked it, gone
+ * when the thread exited: a SIGCHLD or a kill(2) that a worker caught an
+ * instant before a handler's sa_mask or its own exit(2) never reached the
+ * thread sigwait()ing for it.
+ *
+ * So such a signal goes back to the kernel, process-directed (rt_sigqueueinfo
+ * to our own tgid), and the kernel does the rest as it would for any process:
+ * routes it to a thread that has it unblocked, or keeps it pending where
+ * sigpending, sigtimedwait and a signalfd find it. The kernel lets a process
+ * queue itself any siginfo only from its main thread; from any other one an
+ * si_code >= 0 (SI_USER, a child's CLD_*, a timer's SI_KERNEL ...) is EPERM.
+ * So what goes back is an SI_QUEUE carrying a token -- our pid, a slot of
+ * rq_tab and that slot's nonce -- and every place the emulator reads a host
+ * siginfo (the capture handler, the sigtimedwait and hand-over dequeues,
+ * pendsig_from_host all three; a signalfd read, sig_sfd_requeued) trades the
+ * token for the siginfo the slot kept.
+ *
+ * What is thread-directed stays where it is (PendSig.thr): the kernel keeps
+ * it on the thread's own queue, blocked, and it dies with the thread. So do
+ * the numbers the host mask cannot hold (sig_set_to_host leaves out the fault
+ * numbers, SIGSYS and the kick) while the thread lives: handed back, the host
+ * would deliver them straight to it again. An exiting thread hands those back
+ * too, having blocked everything first. */
+#define RQ_SLOTS    4096               /* the token's low 12 bits */
+#define RQ_IDX_BITS 12
+#define RQ_HI       0x52515451u        /* "RQTQ": the high half of a 64-bit sigval */
+typedef struct {
+    int state;                         /* 0 free, 1 being filled, 2 queued (atomic) */
+    u32 nonce;                         /* 20 bits, never 0 */
+    PendSig p;
+} RqSlot;
+static RqSlot *rq_tab;                 /* made on first use, per process */
+static pid_t rq_pid;                   /* ...whose pid the tokens carry */
+static u32 rq_seed, rq_ctr, rq_hint;
+
+/* Is the host siginfo a handed-back signal of ours? If so, take its slot and
+ * put what it kept into *out. Async-signal-safe (the capture handler): atomics
+ * and plain loads. The one holder of a token is the one host instance that
+ * carries it, so a slot is claimed once. */
+static int rq_claim(int sig, const siginfo_t *si, PendSig *out) {
+    if (si->si_code != SI_QUEUE) return 0;
+    RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
+    if (!tab || si->si_pid != rq_pid) return 0;
+    uintptr_t v = (uintptr_t)si->si_value.sival_ptr;
+#if UINTPTR_MAX > 0xffffffffu
+    if ((u32)((u64)v >> 32) != RQ_HI) return 0;
+#endif
+    u32 tok = (u32)v;
+    RqSlot *slot = &tab[tok & (RQ_SLOTS - 1)];
+    if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 2 ||
+        slot->nonce != tok >> RQ_IDX_BITS || slot->p.signo != sig_remap_to_guest(sig))
+        return 0;
+    PendSig p = slot->p;
+    int queued = 2;
+    if (!__atomic_compare_exchange_n(&slot->state, &queued, 0, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return 0;
+    *out = p;
+    return 1;
+}
+
+/* The host's pending set for the process as a whole: /proc's ShdPnd, the one
+ * place it is told apart from a thread's own -- and the same in every
+ * thread's file, so the process's, which a kernel older than thread-self
+ * (3.17) has as well. 0 where it cannot be read. */
+static u64 host_shared_pending(void) {
+    u64 v = 0;
+    char line[128];
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    FILE *f = fopen("/proc/self/status", "re");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "ShdPnd:", 7)) { v = strtoull(line + 7, NULL, 16); break; }
+        fclose(f);
+    }
+    fdwin_leave();
+    return v;
+}
+
+/* Hand one captured signal back to the process. Ordinary context, with the
+ * calling thread's host signals blocked (a sibling may be doing the same).
+ * 0 when the kernel has it -- or already had one: a standard signal pending
+ * for the process is one instance however many are sent, so a second goes
+ * nowhere -- or -errno when it could not be queued (a full table, the
+ * kernel's RLIMIT_SIGPENDING). */
+static int rq_put(const PendSig *p) {
+    int hs = sig_send_host_nr(p->signo);
+    if (p->signo < 32 && (host_shared_pending() & (1ULL << (hs - 1)))) return 0;
+    RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
+    if (!tab) {
+        RqSlot *fresh = calloc(RQ_SLOTS, sizeof *fresh);
+        if (!fresh) return -ENOMEM;
+        u32 seed = 0;
+        if (syscall(SYS_getrandom, &seed, sizeof seed, 0) != (long)sizeof seed)
+            seed = (u32)time(NULL) ^ ((u32)getpid() << 12);
+        rq_seed = seed;
+        rq_pid = getpid();
+        RqSlot *expect = NULL;
+        if (__atomic_compare_exchange_n(&rq_tab, &expect, fresh, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            tab = fresh;
+        else { free(fresh); tab = expect; }   /* a sibling made it first */
+    }
+    u32 start = __atomic_fetch_add(&rq_hint, 1, __ATOMIC_RELAXED), idx = 0;
+    RqSlot *slot = NULL;
+    for (u32 i = 0; i < RQ_SLOTS && !slot; i++) {
+        idx = (start + i) & (RQ_SLOTS - 1);
+        int free_ = 0;
+        if (__atomic_compare_exchange_n(&tab[idx].state, &free_, 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            slot = &tab[idx];
+    }
+    if (!slot) {
+        /* A full table. A negative si_code any thread may queue as it is,
+         * payload and all (a timer's through its slot, as the timer itself
+         * sends it); anything else has no way back. */
+        if (p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        si.si_signo = hs;
+        si.si_code = p->code;
+        si.si_pid = (pid_t)p->pid;
+        si.si_uid = (uid_t)p->uid;
+        if (p->code == SI_TIMER) si.si_value.sival_int = p->pid;
+        else si.si_value.sival_ptr = (void *)(uintptr_t)p->value;
+        return syscall(SYS_rt_sigqueueinfo, rq_pid, hs, &si) != 0 ? -errno : 0;
+    }
+    u32 nonce, tok;
+    do {   /* never 0, and never a value one of the nets reads as its own */
+        nonce = ((__atomic_fetch_add(&rq_ctr, 0x9e3779b1u, __ATOMIC_RELAXED) ^ rq_seed)
+                 >> RQ_IDX_BITS) & 0xfffffu;
+        tok = (nonce << RQ_IDX_BITS) | idx;
+    } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
+             tok == DETHREAD_MAGIC);
+    slot->nonce = nonce;
+    slot->p = *p;
+    __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = hs;
+    si.si_code = SI_QUEUE;
+    si.si_pid = rq_pid;
+    si.si_uid = getuid();
+#if UINTPTR_MAX > 0xffffffffu
+    si.si_value.sival_ptr = (void *)(uintptr_t)(((u64)RQ_HI << 32) | tok);
+#else
+    si.si_value.sival_int = (int)tok;
+#endif
+    if (syscall(SYS_rt_sigqueueinfo, rq_pid, hs, &si) != 0) {
+        int e = errno;
+        __atomic_store_n(&slot->state, 0, __ATOMIC_RELEASE);
+        return -e;
+    }
+    return 0;
+}
+
+/* A signalfd record of a handed-back signal, as the signal it stands for:
+ * the fields signalfd_copyinfo fills for that kind of siginfo. Called with
+ * the record's host signal number still in ssi_signo. 1 = rewritten. */
+int sig_sfd_requeued(GSignalfdSiginfo *r) {
+    if (r->ssi_code != SI_QUEUE) return 0;
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_code = SI_QUEUE;
+    si.si_pid = (pid_t)r->ssi_pid;
+    si.si_value.sival_ptr = (void *)(uintptr_t)r->ssi_ptr;
+    PendSig p;
+    if (!rq_claim((int)r->ssi_signo, &si, &p)) return 0;
+    GSignalfdSiginfo n;
+    memset(&n, 0, sizeof n);
+    n.ssi_signo = (u32)p.signo;
+    n.ssi_errno = p.err;
+    n.ssi_code = p.code;
+    if (p.code > 0 && p.signo == SIGCHLD) {
+        n.ssi_pid = (u32)p.pid;
+        n.ssi_uid = (u32)p.uid;
+        n.ssi_status = p.status;
+    } else if (p.code > 0 && is_sync_sig(p.signo)) {
+        n.ssi_addr = p.addr;
+    } else if (p.code == SI_TIMER) {
+        n.ssi_tid = (u32)p.pid;      /* the guest timer id */
+        n.ssi_int = (s32)p.value;
+        n.ssi_ptr = (u64)p.value;
+    } else {
+        n.ssi_pid = (u32)p.pid;
+        n.ssi_uid = (u32)p.uid;
+        n.ssi_int = (s32)p.value;
+        n.ssi_ptr = (u64)p.value;
+    }
+    *r = n;
+    return 1;
+}
+
+static int host_take_pending(u64 set, siginfo_t *si);
+static u64 host_private_pending(void);
+
+/* retarget_shared_pending, for what this thread's ring holds. While the
+ * thread lives (exiting == 0): what it now blocks, unless thread-directed or
+ * a number the host mask cannot hold -- called right after the host mask
+ * took the new block set, so nothing that is handed back can land here again
+ * before the thread unblocks it -- and only when the process has another
+ * thread to take it: alone, the thread keeps it pending where it is, in the
+ * order it came, which is all a kernel's shared queue would do with it. When
+ * it exits (exiting == 1, everything blocked, the gate forgotten): all of it,
+ * the thread-directed entries dropped as the kernel drops a dead thread's own
+ * queue. An entry the kernel would not take back stays for a live thread and
+ * is dropped by an exiting one, which is what became of every one of them
+ * before.
+ *
+ * The ring holds the OLDEST of what was sent: the host dequeued them into it,
+ * and anything of the same number the host still holds for the process came
+ * later. Queued back as they are, they would go behind it -- a real-time
+ * signal's instances out of the order they were sent in, a standard signal's
+ * later siginfo kept where a kernel keeps the first. So what the host holds of
+ * each number handed back is taken out first and queued again behind the
+ * ring's (a standard signal's dropped: it coalesces into the ring's) -- unless
+ * the thread has one of its own pending too, which the host would hand out
+ * first and which is not the process's to move. */
+static void sig_retarget(int exiting) {
+    if (!sigq || sigq_tail == sigq_head) return;
+    if (!exiting && __atomic_load_n(&g_machine.as.nthreads, __ATOMIC_ACQUIRE) <= 1)
+        return;
+    sigset_t all, prev;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &prev);   /* the ring's producer */
+    u64 go = 0;
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
+        u64 bit = 1ULL << (sigq[t].signo - 1);
+        if (sigq[t].thr) continue;
+        if (!exiting && (!(g_tls.sigmask & bit) || !sig_set_to_host(bit))) continue;
+        go |= bit;
+    }
+    u64 shd = go ? host_shared_pending() : 0, priv = go ? host_private_pending() : 0;
+    for (int sig = 1; sig <= 64 && go; sig++) {
+        u64 bit = 1ULL << (sig - 1);
+        if (!(go & bit)) continue;
+        go &= ~bit;
+        int hs = sig_send_host_nr(sig);
+        u64 hbit = 1ULL << (hs - 1);
+        PendSig *after = NULL;
+        int nafter = 0, cap = 0;
+        if ((shd & hbit) && !(priv & hbit)) {
+            siginfo_t si;
+            while (host_take_pending(hbit, &si) > 0) {
+                if (sig < 32) continue;   /* coalesced into the ring's */
+                if (nafter == cap) {
+                    int nc = cap ? cap * 2 : 16;
+                    PendSig *na = realloc(after, (size_t)nc * sizeof *na);
+                    if (!na) break;   /* the rest stay where they are */
+                    after = na;
+                    cap = nc;
+                }
+                pendsig_from_host(&after[nafter++], hs, &si);
+            }
+        }
+        for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
+            if (sigq[t].signo != sig || sigq[t].thr) continue;
+            PendSig p = sigq[t];
+            if (rq_put(&p) < 0 && !exiting) continue;
+            sigq_take(t);   /* moves the older entries up: t is next to visit */
+        }
+        for (int i = 0; i < nafter; i++) rq_put(&after[i]);
+        free(after);
+    }
+    if (exiting)   /* what is left was the thread's own */
+        while (sigq_tail != sigq_head) sigq_take(sigq_tail);
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+}
+
+void sig_thread_exit(void) {
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    /* What the gate holds back is still in the kernel's queue, which is
+     * where the kernel would keep it: another thread's, or gone with this
+     * one. Opening it now would only pull it in here to be dropped. */
+    sig_gate_forget();
+    sig_retarget(1);
+}
+
+/* fork(2): the child's pending set is empty, and so is what it handed back. */
+static void rq_fork_child(void) {
+    free(rq_tab);
+    rq_tab = NULL;
+    rq_pid = 0;
+}
+
 /* ---- the guest's blocked set IS the host thread's ---------------------------
  *
  * A signal the guest has blocked is not deliverable, and a kernel acts on
@@ -1087,6 +1402,7 @@ static void host_set_mask(u64 mask) {
 void sig_sync_host_mask(struct Machine *m) {
     (void)m;
     host_set_mask(sig_host_wait_mask(g_tls.sigmask));
+    sig_retarget(0);   /* what the thread now blocks, back to the process */
 }
 
 /* rt_sigsuspend's sleep: the host's, under the mask the guest asked for
@@ -1760,8 +2076,13 @@ void sig_handover_give(int all) {
     pthread_sigmask(SIG_BLOCK, &allsig, &prev);   /* the ring's producer */
     sigq_sync();
     while (__atomic_test_and_set(&dt_hand_lk, __ATOMIC_ACQUIRE)) ;
+    /* Given, and so gone from here: the thread's exit would otherwise hand
+     * the same ones back to the process a second time (sig_thread_exit). */
     for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
-        if (all || sigq[t].code != SI_TKILL) dt_hand_add(&sigq[t]);
+        if (all || !sigq[t].thr) {
+            dt_hand_add(&sigq[t]);
+            sigq_take(t);
+        }
     /* The exec'ing thread's signals the host holds for it -- blocked ones,
      * which never reach the ring -- are the new image's as well: the
      * kernel's exec'ing thread keeps its own pending set. (The process's
@@ -1788,6 +2109,10 @@ static u64 host_private_pending(void) {
     char line[128];
     fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     FILE *f = fopen("/proc/thread-self/status", "re");
+    if (!f) {   /* a kernel older than thread-self (3.17) */
+        snprintf(line, sizeof line, "/proc/self/task/%d/status", (int)g_tls.tid);
+        f = fopen(line, "re");
+    }
     if (f) {
         while (fgets(line, sizeof line, f))
             if (!strncmp(line, "SigPnd:", 7)) { v = strtoull(line + 7, NULL, 16); break; }
@@ -1798,16 +2123,17 @@ static u64 host_private_pending(void) {
 }
 
 /* The main thread taking over from an exec'ing sibling: what was sent to IT
- * -- by tkill/tgkill, and still in its ring, or held by the host for it while
- * blocked -- was sent to the old leader, which the kernel kills, and a dying
- * thread's own signals die with it. The process's shared ones stay. */
+ * -- by tkill/tgkill or a timer of its own, and still in its ring, or held by
+ * the host for it while blocked -- was sent to the old leader, which the
+ * kernel kills, and a dying thread's own signals die with it. The process's
+ * shared ones stay. */
 void sig_leader_takeover(void) {
     sigset_t allsig, prev;
     sigfillset(&allsig);
     pthread_sigmask(SIG_BLOCK, &allsig, &prev);
     sigq_sync();
     for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
-        if (sigq[t].code == SI_TKILL) sigq_take(t);   /* moves the older ones up */
+        if (sigq[t].thr) sigq_take(t);   /* moves the older ones up */
     /* Taken one at a time, each by its own number: the host dequeues a
      * thread's own queue before the process's, so a signal in both loses
      * only its private instance. Bounded, in case the file reads stale. */
