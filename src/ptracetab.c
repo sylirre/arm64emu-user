@@ -568,14 +568,72 @@ void ptrace_report_syscall(CPU *c, int is_exit) {
     pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, 0, 0);
 }
 
-void ptrace_report_exec(CPU *c) {
+void ptrace_report_exec(CPU *c, s32 old_tid) {
     if (!g_ptrace_active || !g_self_link) return;
     int event = (g_self_link->options & G_PTRACE_O_TRACEEXEC) ? G_PTRACE_EVENT_EXEC : 0;
     /* After execve a fresh tracee is stopped again and must be re-armed by the
      * tracer, so drop any prior syscall/step arming. */
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
+    /* exec_binprm's ptrace_event(PTRACE_EVENT_EXEC, old_vpid): the tid the
+     * exec'ing thread had, which a tracer following threads needs to retire
+     * that tid (it will never hear of it again). */
+    g_self_link->eventmsg = (u64)(u32)old_tid;
     pt_stop(c, SIGTRAP, event, 0, 0, 0);
+}
+
+/* Release the calling thread's own link without a report: the kernel's
+ * release_task of a leader de_thread replaced, which wakes the tracer (it may
+ * be asleep in wait4) and tells it nothing. */
+static void pt_release_silent(struct Machine *m) {
+    PtLink *e = g_self_link;
+    int was = g_ptrace_active || e;   /* a zombie leader's link still counts */
+    g_self_link = NULL;
+    g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
+    if (!e) return;
+    s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    pt_free(e);
+    if (was) pt_traced_dec(m);
+    __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+    fx_wake(&g_tab->global_gen);
+    pt_wake_tracer(tr);
+}
+
+void *ptrace_exec_handover(void) {
+    PtLink *e = g_self_link;
+    /* The link, and the process's count of traced threads with it, pass to
+     * the main thread as they are: nothing is reported, and nothing freed. */
+    g_self_link = NULL;
+    g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
+    return e;
+}
+
+void ptrace_exec_takeover(CPU *c, void *link) {
+    pt_release_silent(c->m);
+    PtLink *e = link;
+    if (!e) return;
+    /* Keyed by the main tid from here on: the tracer finds the new image's
+     * stops under the pid, as it would the renumbered exec'ing thread's. */
+    __atomic_store_n(&e->tracee, (s32)g_tls.tid, __ATOMIC_RELEASE);
+    g_self_link = e;
+    g_ptrace_active = 1;
+}
+
+void ptrace_leader_zombie(void) {
+    /* Not a tracee in anything it does from here on -- it runs nothing -- but
+     * its link, and its place in the traced count that keeps the death
+     * catchers installed, stay until the group's exit publishes the death or
+     * an execve revives the thread (pt_release_silent). */
+    g_ptrace_active = 0;
+    g_ptrace_syscall_armed = 0;
+    g_ptrace_singlestep = 0;
+    g_ptrace_skip_syscall_stop = 0;
 }
 
 int ptrace_report_signal(CPU *c, int sig) {

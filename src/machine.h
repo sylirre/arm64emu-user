@@ -127,12 +127,15 @@ struct Machine {
                                * leader_parked) is not in as.nthreads, so the
                                * arrival count alone cannot say it arrived */
     s32 dethread_parked;      /* siblings currently waiting at the rendezvous */
-    s32 dethread_state;       /* DT_PENDING / DT_COMMIT / DT_CANCEL */
+    s32 dethread_state;       /* DT_PENDING / DT_COMMIT */
     s32 dethread_done;        /* 1 = the new image is loaded and the carrier may
-                               * adopt it; -1 = abandoned, resume unchanged */
+                               * adopt it */
     u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
                                * new image inherits (execve preserves it) */
     u32 dethread_personality; /* ...and its personality, as the exec left it */
+    void *dethread_ptlink;    /* ...and its ptrace link (ptracetab.c), or NULL:
+                               * the kernel's exec'ing thread keeps its tracer
+                               * under the leader's pid */
 
     /* The guest's main thread called exit(2) while siblings were still
      * running. exit(2) ends only the calling thread, and the kernel keeps such

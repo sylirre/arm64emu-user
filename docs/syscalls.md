@@ -2274,8 +2274,9 @@ and a thread sitting in a **ptrace stop** its tracer never ends leaves it
 like any other sleep. It then goes straight to the safepoint: a syscall it was
 stopped at the entry of is never made, a signal it was stopped delivering is not
 delivered, and the tracer hears of the thread the way the kernel's tracer does,
-as an exit with status 0 — or, for the main thread, as the exec stop of the
-image it takes over (`tests/ptrace/execstopped.c`). What is left is a host call
+as an exit with status 0 — or, for the main thread, not at all: it takes over
+the image, the kernel's old leader is released unreported, and the exec stop
+is the exec'ing thread's, under the pid (`tests/ptrace/execstopped.c`). What is left is a host call
 nothing interrupts, which the kernel waits for as well; after 5 s the wait says
 once on stderr which guest threads it is still waiting for, and goes on waiting.
 Two waits of the emulator's own that swallowed the kick's `EINTR` were fixed for

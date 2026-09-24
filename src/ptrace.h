@@ -86,8 +86,28 @@ void ptrace_thread_child_stop(CPU *c);
 /* Syscall-entry (is_exit==0) / syscall-exit stop. Parks until the tracer
  * resumes; the tracer may have rewritten registers meanwhile. */
 void ptrace_report_syscall(CPU *c, int is_exit);
-/* Post-execve stop (the SIGTRAP a freshly exec'd tracee reports to its tracer). */
-void ptrace_report_exec(CPU *c);
+/* Post-execve stop (the SIGTRAP a freshly exec'd tracee reports to its tracer).
+ * `old_tid` is the tid the exec'ing thread had, which PTRACE_GETEVENTMSG gives
+ * back: the pid itself unless a secondary thread exec'd. */
+void ptrace_report_exec(CPU *c, s32 old_tid);
+/* An execve from a secondary thread. The kernel gives that thread the
+ * leader's pid (de_thread), and its ptrace link goes with it: whoever traces
+ * it -- or nobody -- traces the new image, and the old leader's link is
+ * released without a report. Here the main thread runs the new image, so the
+ * link moves to it: _handover, on the exec'ing thread, takes the calling
+ * thread's link off it without reporting anything (its old tid is not a
+ * thread that died) and returns it, or NULL; _takeover, on the main thread
+ * before it reports the exec, releases its own link silently -- waking its
+ * tracer so a wait re-checks -- and makes `link` its own, keyed by its tid. */
+void *ptrace_exec_handover(void);
+void ptrace_exec_takeover(CPU *c, void *link);
+/* The main thread exit(2)ing while other threads run: the kernel keeps it a
+ * zombie whose death its tracer is not told of until the thread group is
+ * empty (delay_group_leader). The link stays registered, reported by the
+ * group's exit (ptrace_report_exit_group) or released by an execve that
+ * revives the leader (ptrace_exec_takeover); the thread itself stops acting
+ * as a tracee. */
+void ptrace_leader_zombie(void);
 /* Signal-delivery stop: the tracer sees WSTOPSIG==sig and may suppress it or
  * substitute another. Returns the signal to actually deliver (0 = suppressed). */
 int  ptrace_report_signal(CPU *c, int sig);

@@ -153,9 +153,12 @@ SYSDEF(exit) {
 
     if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) > 1) {
         /* The main thread, with siblings still running: the process does not
-         * end here. Report only this thread's own death and release anything
-         * pthread_join'ing it, then park (leader_park). */
-        ptrace_report_exit(c, ws);
+         * end here. Release anything pthread_join'ing it, then park
+         * (leader_park). Its tracer is not told yet: a kernel does not let a
+         * zombie leader be waited for while its group has other threads
+         * (delay_group_leader), and reports the death when the group's last
+         * thread is gone -- or never, if an execve revives the pid. */
+        ptrace_leader_zombie();
         robust_list_exit_self(c);   /* before the tid clear, as mm_release */
         if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
         g_tls.clear_child_tid = 0;
@@ -1979,7 +1982,13 @@ static void dethread_join(CPU *c) {
     g_tls.image_gen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);
     g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
     __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
-    ptrace_report_exec(c);
+    /* ...and so is its ptrace link, if it had one, in place of this thread's
+     * own: the kernel releases the old leader without a word to its tracer,
+     * and the exec'ing thread, renumbered, reports the exec to its own --
+     * under the pid, with its old tid as the event message. */
+    ptrace_exec_takeover(c, m->dethread_ptlink);
+    m->dethread_ptlink = NULL;
+    ptrace_report_exec(c, leaving);
 }
 
 void guest_stop_point(CPU *c) {
@@ -2065,6 +2074,7 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
     __atomic_store_n(&m->dethread_parked, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&m->dethread_done, 0, __ATOMIC_RELAXED);
     m->dethread_sigmask = g_tls.sigmask;
+    m->dethread_ptlink = NULL;
     __atomic_store_n(&m->dethread_state, DT_PENDING, __ATOMIC_RELEASE);
     /* Publish the call-out last: this counter is what the run loop reads. */
     g_tls.stop_gen = stop_gen_bump(m);
@@ -2527,6 +2537,10 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * is told to send us nothing more. */
         sig_quiet_mask();
         sig_handover_give(1);
+        /* ...and so is our ptrace link: the kernel's exec'ing thread keeps
+         * its tracer (or its lack of one) under the leader's pid, and its old
+         * tid is not reported as a thread that died -- it is not one. */
+        m->dethread_ptlink = ptrace_exec_handover();
         __atomic_store_n(&m->dethread_done, 1, __ATOMIC_RELEASE);
         return 0;
     }
@@ -2548,7 +2562,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     /* A traced process reports a stop after execve (with the new image live but
      * before its first instruction), so the tracer can re-arm. No-op on the
      * initial exec / untraced processes. */
-    ptrace_report_exec(c);
+    ptrace_report_exec(c, (s32)g_tls.tid);
     return 0;   /* execution continues at the new entry */
 }
 

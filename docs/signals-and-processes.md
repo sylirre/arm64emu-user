@@ -1093,7 +1093,10 @@ Parking rather than really exiting buys one more thing: the thread stays
 available to carry a new image, so a later multithreaded `execve` still lands on
 the pid (see `de_thread` in [syscalls.md](syscalls.md#execve)). The kernel
 reaches that by renumbering — it releases the zombie leader and hands its pid to
-the exec'ing thread — which is exactly what the emulator cannot do.
+the exec'ing thread — which is exactly what the emulator cannot do. A tracer is
+not told of the parked leader's death while the group has other threads: a
+kernel will not let a zombie leader be waited for then (`delay_group_leader`),
+and the group's exit reports it with the rest.
 
 Whichever thread turns out to be the last one alive then performs the process
 teardown and carries the status out (`process_exit`). The status itself is not
@@ -1202,7 +1205,8 @@ thread-local `g_ptrace_*` int gates the hot paths):
   macro re-fetches and re-classifies each instruction word on change.
 - *execve* stop after the new image is loaded but before its first instruction
   (`do_execve`), so a `PTRACE_TRACEME` + `execve` child stops for its tracer
-  (a `PTRACE_EVENT_EXEC` event stop under `PTRACE_O_TRACEEXEC`).
+  (a `PTRACE_EVENT_EXEC` event stop under `PTRACE_O_TRACEEXEC`, whose
+  `PTRACE_GETEVENTMSG` is the tid the exec'ing thread had).
 - *fork/clone* event stops (`strace -f`) under `PTRACE_O_TRACE{FORK,VFORK,CLONE}`:
   when a traced process forks (`sys_proc.c` clone path), the parent reports a
   `PTRACE_EVENT_{FORK,VFORK,CLONE}` stop carrying the new child's pid for
@@ -1468,9 +1472,19 @@ Unimplemented requests return `-EIO`/`-ESRCH` rather than misbehaving.
 A *multithreaded* `execve` reports as the kernel's does, by a different route
 (see `de_thread` in [syscalls.md](syscalls.md#execve)): each sibling the exec
 kills publishes a `WIFEXITED` status on its own link — without a stop, since
-nothing in that path may block on a tracer collecting it — and the exec stop
-arrives on the **main** thread's tid, because that is where the emulator lands
-the new image rather than renumbering the caller.
+nothing in that path may block on a tracer collecting it. The kernel gives the
+exec'ing thread the leader's pid and releases the old leader, and ptrace follows
+the task, not the number; the emulator lands the new image on the main thread
+instead, so the exec'ing thread's **link moves to it** (`ptrace_exec_handover`,
+`ptrace_exec_takeover`): whoever traced the exec'ing thread — or nobody — traces
+the new image, the exec stop arrives on the main tid with the old tid as its
+event message, that old tid is never reported as a thread that died (it is not
+one), and the main thread's own link is released without a report, its tracer
+only woken to re-check. A tracer of the main thread alone therefore hears
+nothing of an exec a sibling made. A main thread that `exit(2)`s while others
+run is likewise not reported dead until the group is empty
+(`delay_group_leader`; `ptrace_leader_zombie`), and an exec that revives it
+releases that link unreported too (`tests/ptrace/execleader.c`, `mtexec.c`).
 
 Remaining simplifications: in a mixed traced/untraced thread group a group-stop
 stops only the traced threads; only the exiting thread reports the

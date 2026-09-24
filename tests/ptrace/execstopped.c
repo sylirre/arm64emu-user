@@ -12,10 +12,9 @@
  * stopped: the image lands on the main thread, which has to leave its stop to
  * take it over. Both threads are traced here, so the tracer hears of the exec
  * as PTRACE_EVENT_EXEC on the main tid -- which is where a kernel reports the
- * traced exec'ing thread's, the leader's pid being handed to it. (Whether the
- * exec'ing thread's own old tid is reported gone is where the emulator, which
- * lands the image on the main thread rather than renumbering, differs; see
- * mtexec.c. Such reports are let pass.)
+ * traced exec'ing thread's, the leader's pid being handed to it -- and of
+ * nothing before it: the stopped leader is released unreported, and the
+ * exec'ing thread's old tid is not a thread that died.
  *
  * Re-exec'd with an argument, this program is just the new image: it exits 42.
  * The tracer is the tracee's parent, which yama's ptrace_scope allows. */
@@ -113,14 +112,11 @@ static int one(int main_stopped) {
     double t0 = now_s();
     if (write(go[1], "g", 1) != 1) return printf("FAIL: go\n"), 1;
     if (main_stopped) {
-        /* The exec stop, on the main tid; any other tid may only be gone. */
-        for (;;) {
-            pid_t w = waitpid(-1, &st, __WALL);
-            if (w < 0) return printf("FAIL: no exec stop %d\n", errno), 1;
-            if (w == kid && WIFSTOPPED(st) && (st >> 16) == PTRACE_EVENT_EXEC) break;
-            if (w == kid || !WIFEXITED(st))
-                return printf("FAIL: %d before the exec stop %#x\n", (int)w, st), 1;
-        }
+        /* The exec stop, on the main tid, and nothing before it. */
+        pid_t w = waitpid(-1, &st, __WALL);
+        if (w < 0) return printf("FAIL: no exec stop %d\n", errno), 1;
+        if (w != kid || !WIFSTOPPED(st) || (st >> 16) != PTRACE_EVENT_EXEC)
+            return printf("FAIL: %d before the exec stop %#x\n", (int)w, st), 1;
         ptrace(PTRACE_CONT, kid, 0, 0);
         if (waitpid(kid, &st, __WALL) != kid)
             return printf("FAIL: wait %d\n", errno), 1;
