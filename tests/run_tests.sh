@@ -2859,6 +2859,12 @@ check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndo
 # validates MAP_TYPE before the host kernel can answer EPERM and rounds a
 # shmat address away instead of down to zero; the expected block is a real
 # kernel's, taken natively with this same program.
+# mprotect(2)'s rows qemu-user cannot arbitrate (tests/c/mprotectprot.c has
+# the rest): an unsigned long protection, the zero length ahead of it, ENOMEM
+# for a PROT_GROWS* range that touches nothing, PROT_GROWSDOWN reaching down a
+# MAP_GROWSDOWN mapping piece by piece, and MAP_GROWSDOWN's EINVAL coming after
+# a file mapping's EACCES. Self-checking; the expectations are the kernel's.
+check_fixture mprotectgrows $'bit32=-22\nlen0_badprot=0\ngrowsup_hole=-12\ngrowsdown_hole=-12\ngrowsdown=0 r--p r--p r--p\ngrowsdown_split=0 rw-p r--p r-xp r-xp\nmap_growsdown_shared_rw_of_ro=-13\ndone'
 check_fixture mmapminaddr $'fixed0: errno=1\nfixed_below: errno=1\nfixed_span: errno=1\nfixed_none0: errno=1\nfixed_notype: errno=1\nnoreplace_below: errno=1\nhint_below: at_min\nhint_below_odd: at_min\nhint0: high\nfixed_min: at_min\nmremap_fixed_low: errno=1\ntail_gone=1\nhead_kept=1\nshmat_low: errno=1\nshmat_round0: errno=1\nshmat_round0_remap: errno=22\nshmat_exact_low: errno=1\nzero_unmapped=1\ndone'
 # sched_getaffinity / sched_setaffinity / getcpu are the host thread's own: a
 # guest thread is a host thread. They used to answer one CPU for everyone and

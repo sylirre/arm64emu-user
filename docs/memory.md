@@ -689,6 +689,25 @@ so the recorded protection stays exact — for a page with no PTE that record is
 the only thing left to say what protection it gets when the file grows into
 it.
 
+What `mprotect` accepts is arm64's `arch_validate_prot`: `PROT_READ`, `WRITE`,
+`EXEC` and `SEM`, with `PROT_BTI` and `PROT_MTE` only on a CPU that has BTI or
+MTE, which this one is not; any other bit is `EINVAL`, judged after the zero
+length (a no-op whatever the protection) and before any mapping is looked at
+(an unmapped range with a bad protection is `EINVAL`, not `ENOMEM`). `mmap`
+checks nothing of the kind and ignores bits it does not know, as the kernel's
+does. `PROT_GROWSDOWN` names a `VM_GROWSDOWN` region — the stack the ELF loader
+builds, or private anonymous memory mapped `MAP_GROWSDOWN`, which is the only
+kind `mmap` lets that flag make (a shared or file mapping is `EINVAL`) — and
+moves the range's start down to the start of the first region it touches, which
+must be one; that is how glibc makes the whole stack executable for a library
+marked for it. arm64 has no `VM_GROWSUP`, so `PROT_GROWSUP` is `EINVAL` (or
+`ENOMEM` where the range's start is unmapped), and so are the two together,
+before anything else. The flag travels with the region through splits and moves
+the way `vm_flags` do, and a region only merges with one that has it too.
+(`tests/c/mprotectprot.c`, and `tests/fixtures/mprotectgrows.c` for the rows
+qemu-user gets wrong: it truncates the protection to an `int`, validates it
+ahead of the zero length, and knows no `VM_GROWSDOWN` but the main stack's.)
+
 An `mmap` **address hint** without `MAP_FIXED` is treated the way Linux treats it —
 as advisory, not ignored: if `[hint, hint+len)` lies in range and is free the hint
 is honored, otherwise `as_find_free` bump-allocates a fresh range. Honoring the hint

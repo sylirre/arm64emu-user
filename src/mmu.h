@@ -239,6 +239,10 @@ typedef struct Region {
                                * (madvise MADV_DONTFORK / MADV_WIPEONFORK).
                                * Travels with the region through splits, trims
                                * and moves, the way vm_flags travel with a vma */
+    u32  growsdown;           /* VM_GROWSDOWN: the main stack, or anonymous
+                               * private memory mapped MAP_GROWSDOWN. What
+                               * mprotect(PROT_GROWSDOWN) reaches down through
+                               * to the region's start; travels like forkflags */
 } Region;
 
 /* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
@@ -452,6 +456,9 @@ const Region *as_find_region(AddrSpace *as, u64 va);
  * instead of a page at a time -- a range the guest names can span the whole
  * address space, and the kernel walks it vma by vma. Same locking as above. */
 const Region *as_next_region(AddrSpace *as, u64 va);
+/* Mark the region starting at `va` VM_GROWSDOWN (the stack the ELF loader
+ * builds, an mmap(MAP_GROWSDOWN)). Takes as_lock itself. */
+void as_set_growsdown(AddrSpace *as, u64 va);
 
 /* Stable host pointer for [va, va+size) if within one guest page and permitted
  * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */

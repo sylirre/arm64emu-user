@@ -482,6 +482,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     u64 stack_size = stack_size_for(m);
     r = guest_map_anon(&m->as, STACK_TOP - stack_size, stack_size, PTE_R | PTE_W);
     if (r < 0) return r;
+    as_set_growsdown(&m->as, STACK_TOP - stack_size);   /* VM_STACK_FLAGS */
     m->as.stack_top = STACK_TOP;
 
     /* Strings at the top of the stack, in the kernel's layout: argv strings

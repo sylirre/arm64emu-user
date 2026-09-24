@@ -71,6 +71,12 @@ u64 mmap_min_addr(void) {
 #define G_MAP_FIXED     0x10
 #define G_MAP_ANONYMOUS 0x20
 #define G_MAP_FIXED_NOREPLACE 0x100000
+#define G_MAP_GROWSDOWN 0x0100
+
+/* ...and the protection bits beyond PROT_READ/WRITE/EXEC. */
+#define G_PROT_SEM       0x8
+#define G_PROT_GROWSDOWN 0x01000000
+#define G_PROT_GROWSUP   0x02000000
 
 static u32 prot_g2pte(int prot) {
     return ((prot & PROT_READ) ? PTE_R : 0) | ((prot & PROT_WRITE) ? PTE_W : 0) |
@@ -265,6 +271,27 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     if (mtype != G_MAP_SHARED && mtype != G_MAP_PRIVATE &&
         !(mtype == G_MAP_SHARED_VALIDATE && !(flags & G_MAP_ANONYMOUS)))
         return (u64)(s64)-EINVAL;
+    /* MAP_GROWSDOWN makes VM_GROWSDOWN memory, and only private anonymous
+     * memory may be that: do_mmap refuses it for a shared anonymous mapping
+     * in the same switch that checks the type, and for a file mapping at the
+     * end of the file checks -- after the access mode (EACCES) and after a
+     * file with no mmap at all (ENODEV: a directory, a pipe). */
+    if (flags & G_MAP_GROWSDOWN) {
+        if (!(flags & G_MAP_ANONYMOUS)) {
+            if (procfs_err) return (u64)(s64)-procfs_err;
+            int fl = fcntl(fd, F_GETFL);
+            struct stat fst;
+            if (fl < 0 || fstat(fd, &fst) != 0) return (u64)(s64)-EBADF;
+            if (mtype != G_MAP_PRIVATE && (prot & PROT_WRITE) &&
+                (fl & O_ACCMODE) == O_RDONLY)
+                return (u64)(s64)-EACCES;
+            if ((fl & O_ACCMODE) == O_WRONLY) return (u64)(s64)-EACCES;
+            if (S_ISDIR(fst.st_mode) || S_ISFIFO(fst.st_mode))
+                return (u64)(s64)-ENODEV;
+            return (u64)(s64)-EINVAL;
+        }
+        if (mtype == G_MAP_SHARED) return (u64)(s64)-EINVAL;
+    }
 
     /* RLIMIT_AS, charged the way mmap_region charges it: against what the
      * mapping adds to the guest's mapped total, not against its length. The
@@ -327,6 +354,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
             }
         } else {
             r = guest_map_anon(as, addr, len, pte);
+            if (r == 0 && (flags & G_MAP_GROWSDOWN)) as_set_growsdown(as, addr);
         }
     } else {
         if (off & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
@@ -457,17 +485,47 @@ SYSDEF(munmap) {
     return r < 0 ? (u64)(s64)r : 0;
 }
 
+/* mprotect(2), in do_mprotect_pkey's order: PROT_GROWSDOWN together with
+ * PROT_GROWSUP is EINVAL before anything else is looked at; then the start's
+ * alignment; a zero length is a no-op that accepts ANY protection, while a
+ * length whose page round-up wraps describes a range ending at or below its
+ * start (ENOMEM); and only then the protection itself, which arm64's
+ * arch_validate_prot limits to PROT_READ/WRITE/EXEC/SEM -- PROT_BTI and
+ * PROT_MTE join them only on a CPU with BTI or MTE, which this one is not,
+ * and every other bit is EINVAL. That is decided before any mapping is: an
+ * unmapped range with a bad protection is EINVAL, not ENOMEM. (mmap does no
+ * such check and ignores bits it does not know, as the kernel's does.)
+ *
+ * PROT_GROWSDOWN names a VM_GROWSDOWN mapping -- the stack, one mapped
+ * MAP_GROWSDOWN -- and moves the range's start down to that mapping's,
+ * which is how glibc makes the whole stack executable for a library that
+ * needs it (_dl_make_stack_executable). The first mapping the range touches
+ * must be one (EINVAL otherwise; ENOMEM if the range touches none).
+ * PROT_GROWSUP has no mapping to name on arm64, which has no VM_GROWSUP:
+ * EINVAL, or ENOMEM if the range's start is not mapped. */
 SYSDEF(mprotect) {
+    u64 prot = a2, grows = prot & (G_PROT_GROWSDOWN | G_PROT_GROWSUP);
+    prot &= ~grows;
+    if (grows == (G_PROT_GROWSDOWN | G_PROT_GROWSUP)) return (u64)(s64)-EINVAL;
     if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
-    /* do_mprotect_pkey's two length cases, which are not the same: an outright
-     * zero length is a no-op it accepts, while a length whose page round-up
-     * wrapped to zero describes a range ending at or below its start, and that
-     * is ENOMEM. Passing the wrapped zero down looked like the first. */
     if (!a1) return 0;
-    u64 len = PG_UP(a1);
-    if (!len) return (u64)(s64)-ENOMEM;
-    int r = guest_protect(&c->m->as, a0, len,
-                          prot_g2pte((int)a2) | prot_rie((int)a2));
+    u64 start = a0, len = PG_UP(a1), end = start + len;
+    if (!len || end <= start) return (u64)(s64)-ENOMEM;
+    if (prot & ~(u64)(PROT_READ | PROT_WRITE | PROT_EXEC | G_PROT_SEM))
+        return (u64)(s64)-EINVAL;
+    u32 pte = prot_g2pte((int)prot) | prot_rie((int)prot);
+    AddrSpace *as = &c->m->as;
+    int r = 0;
+    as_lock();   /* the mapping found below is the one protected */
+    if (grows) {
+        const Region *first = as_next_region(as, start);
+        if (!first || first->start >= end) r = -ENOMEM;
+        else if (grows & G_PROT_GROWSUP) r = first->start > start ? -ENOMEM : -EINVAL;
+        else if (!first->growsdown) r = -EINVAL;
+        else start = first->start;
+    }
+    if (!r) r = guest_protect(as, start, end - start, pte);
+    as_unlock();
     return r < 0 ? (u64)(s64)r : 0;
 }
 

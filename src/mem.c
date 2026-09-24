@@ -802,6 +802,13 @@ const Region *as_next_region(AddrSpace *as, u64 va) {
     return best;
 }
 
+void as_set_growsdown(AddrSpace *as, u64 va) {
+    as_lock();
+    for (int i = 0; i < as->nregions; i++)
+        if (as->regions[i].start == va) { as->regions[i].growsdown = 1; break; }
+    as_unlock();
+}
+
 /* Host page size handling: host backing is allocated with mmap and is at least
  * guest-page aligned. Each allocation is refcounted (HostMap) and retired whole
  * once no region references it — a punched slice is never released on its own,
@@ -1004,7 +1011,7 @@ static int region_mergeable(const Region *a, const Region *b) {
         a->wr_ok != b->wr_ok || a->hostmap != b->hostmap ||
         a->anon_shm != b->anon_shm || a->shm_size != b->shm_size ||
         a->mfdcnt != b->mfdcnt ||
-        a->forkflags != b->forkflags)
+        a->forkflags != b->forkflags || a->growsdown != b->growsdown)
         return 0;
     if (a->file && (a->file_off + (a->end - a->start) != b->file_off ||
                     a->dev != b->dev || a->ino != b->ino))
