@@ -625,8 +625,12 @@ u64 sig_action_handler(struct Machine *m, int sig);
  * tracee): a tracee gets host catchers for default-terminate signals so its tracer
  * sees the signal-delivery-stop and the WIFSIGNALED death. */
 void sig_trace_update_all(struct Machine *m);
-/* Deliver one deliverable queued signal, if any (called from the run loop). */
+/* Deliver one deliverable queued signal, if any (called from the run loop).
+ * Never on the rt_sigreturn trampoline: that waits for the sigreturn. */
 void sig_deliver_pending(CPU *c);
+/* Is `pc` one of the rt_sigreturn trampoline's two instructions? No signal
+ * is delivered there (signal.c); the run loop and the JIT ask. */
+int sig_on_trampoline(struct Machine *m, u64 pc);
 /* Would sig_deliver_pending act on this thread's queue right now?
  * (rt_sigsuspend's sleep gate; see signal.c.) */
 int sig_pending_deliverable(struct Machine *m);

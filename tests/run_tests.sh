@@ -2882,6 +2882,10 @@ check_fixture affinity $'get: bytes_positive=1 bytes_mult8=1 cpus_positive=1 cpu
 # The ID registers as a user program reads them: the kernel's sanitized view
 # of this emulator's CPU (the MRS a kernel traps and answers). Self-checking:
 # the values are this CPU's; tests/c/idregs.c has what every kernel agrees on.
+# No signal delivered with the pc on the rt_sigreturn trampoline: a pthread_cancel
+# unwinding out of the handler of one could not step through that frame.
+# Self-checking: an emulator property (a kernel may deliver there, rarely).
+check_fixture sigtramp $'on_trampoline=0\ndone'
 check_fixture idregs $'midr 0x411fd070\npfr0 0x110011 pfr1 0 pfr2 0\nzfr0 0 smfr0 0 fpfr0 0\ndfr0 0x6 dfr1 0\nisar0 0x21100110212120 isar1 0x211000 isar2 0x10000 isar3 0\nmmfr0 0x111ff000000 mmfr1 0 mmfr2 0 mmfr3 0 mmfr4 0\nid_isar0 0 id_isar5 0 mvfr0 0 mvfr1 0\ndone'
 check_fixture cpuinfo $'blocks_eq_online=1\none_features_per_block=1\nfeatures_are_hwcap=1\nhas_atomics=1 has_fphp=1 has_mops=1\nno_x86=1\nno_model_name=1\nmidr_ok=1\nids_ascending=1\ndone'
 # The prctl operations a guest process owns because it is a host process

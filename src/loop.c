@@ -118,12 +118,16 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
  * one raised while the thread was out here, after the loop's delivery point
  * had looked, was gone by the time a block could see it: a thread spinning in
  * a block chained to itself went on spinning, its signal undelivered until
- * another arrived. jit_run asks this before entering a block. */
-int emu_callout_due(CPU *c) {
+ * another arrived. jit_run asks this before entering a block.
+ *
+ * `at` is where a frame for the signal would say the thread was: none is
+ * delivered on the rt_sigreturn trampoline (sig_deliver_pending), so a
+ * signal is not due there, and the trampoline gets to run. */
+int emu_callout_due(CPU *c, u64 at) {
     if (!g_sig_npend) return 0;
     return g_ptrace_kick ||
            __atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen ||
-           sig_pending_deliverable(c->m);
+           (!sig_on_trampoline(c->m, at) && sig_pending_deliverable(c->m));
 }
 
 int emu_loop(CPU *c) {
@@ -228,9 +232,14 @@ int emu_loop(CPU *c) {
                      * such a capture arm the kick timer that will (signal.c,
                      * "the capture kick"). Raised before the check, so that a
                      * capture between the two is seen by the check or arms
-                     * the timer -- never neither. */
+                     * the timer -- never neither.
+                     *
+                     * A signal is not delivered at the rt_sigreturn
+                     * trampoline's SVC: it waits for the context the sigreturn
+                     * restores (sig_deliver_pending says why), and the frame
+                     * built here would be at that SVC. */
                     g_sig_in_syscall = 1;
-                    if (UNLIKELY(g_sig_npend) && emu_callout_due(c)) {
+                    if (UNLIKELY(g_sig_npend) && emu_callout_due(c, c->pc - 4)) {
                         g_sig_in_syscall = 0;
                         c->pc -= 4;
                         break;

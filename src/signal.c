@@ -2294,8 +2294,34 @@ void guest_terminate_by_signal(CPU *c, int sig) {
     _exit(128 + sig);
 }
 
+/* Is `pc` one of the two instructions of the rt_sigreturn trampoline?
+ *
+ * A signal is not delivered there: the trampoline runs as one step, and a
+ * signal that arrives while a handler is returning is delivered after the
+ * sigreturn, into the context it restores. A kernel may deliver at either
+ * point -- a signal that arrives on the handler's way out, at the
+ * trampoline's first instruction, is delivered right there, with the frame's
+ * pc pointing at it -- but on a kernel that takes an interrupt landing in a
+ * two-instruction window, and here it is the rule: the trampoline is a block
+ * of its own, so any signal pending when a handler returns is found at its
+ * entry. And an unwinder cannot step through such a frame. libgcc's
+ * aarch64 fallback (linux-unwind.h, which is what finds the frame, the
+ * trampoline having no CFI -- the kernel's vDSO one has none either)
+ * recognizes the code at a frame's return address and reads an rt_sigframe
+ * at that frame's CFA; for the frame the outer handler's sigcontext
+ * describes, the one whose pc IS the trampoline, the CFA it has is the
+ * sigcontext's own address, not the outer rt_sigframe's, and what it reads
+ * as saved registers is the middle of the inner frame. A pthread_cancel
+ * unwinding out of the inner handler then jumped to garbage -- a guest
+ * SIGSEGV in uw_frame_state_for, one run in ten under load, in any program
+ * whose handler returns while another signal is on its way. */
+int sig_on_trampoline(struct Machine *m, u64 pc) {
+    return m->sigtramp_va && pc - m->sigtramp_va < 8;
+}
+
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
+    if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
     sigq_sync();
     while (sigq_tail != sigq_head) {
         PendSig p = sigq[sigq_tail];

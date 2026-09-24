@@ -906,7 +906,7 @@ void jit_run(CPU *c) {
          * flag again, would otherwise wait in a block that loops on itself.
          * Only what the loop would act on -- a signal the guest blocks leaves
          * g_sig_npend set, and returning for it would run nothing at all. */
-        if (UNLIKELY(g_sig_npend) && emu_callout_due(c)) return;
+        if (UNLIKELY(g_sig_npend) && emu_callout_due(c, c->pc)) return;
         if (UNLIKELY(env->flush_count != flush_seen)) {
             flush_seen = env->flush_count;
             prev = NULL;                /* arena reset: pointer is stale */

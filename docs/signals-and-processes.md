@@ -143,6 +143,20 @@ frame and FP registers from somewhere else is the worst possible answer. A
 frame that cannot be read is a bad frame, and the guest dies of `SIGSEGV` --
 what `parse_user_sigframe` does with a failed `__get_user`.
 
+No signal is delivered *on* the trampoline: one that is pending when a handler
+returns waits the two instructions for the sigreturn and is delivered into the
+context it restores (`sig_deliver_pending`, and the run loop's
+deliver-before-the-`SVC` rule stands aside for the trampoline's `SVC`). A
+kernel can deliver there — only when an interrupt lands on those two
+instructions — but here the trampoline is a block of its own, so it was where
+nearly every such signal went, and an unwinder cannot step through that frame:
+libgcc's aarch64 fallback (the trampoline has no CFI, and neither has the
+kernel's vDSO one) reads the saved registers of the frame whose `pc` *is* the
+trampoline at its CFA, which there is the outer sigcontext's own address, so a
+`pthread_cancel` unwinding out of the inner handler jumped to garbage — one run
+in ten, under load, of any program whose handler returned with another signal
+on its way (`tests/fixtures/sigtramp.c`).
+
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`) — for the
 syscalls a kernel restarts, which it decides by the errno the call came back
