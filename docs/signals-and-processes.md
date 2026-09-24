@@ -1188,6 +1188,26 @@ thread-local `g_ptrace_*` int gates the hot paths):
   `strace -p` on `^C`; a real (uncatchable) host `SIGSTOP` would both freeze the
   tracee's service loop (deadlocking the follow-up `DETACH`) and never reach the
   emulator to be reported.
+
+  What such a stop hands on is what the kernel's `ptrace_signal` delivers: the
+  signal the tracer resumed it with, or nothing for 0. Every stop that is a
+  signal-delivery-stop does — the queue's own, a synchronous fault's, and the
+  ones whose signal no queue carried: `PTRACE_ATTACH`'s `SIGSTOP`, an
+  auto-attached child's, a stop signal routed as above, a single-step's and a
+  legacy (non-`TRACEEXEC`, `ATTACH`ed) exec's `SIGTRAP`. Those used to drop it
+  whatever the tracer resumed them with; they queue it now as a signal past
+  its stop (`pt_signal_stop`, `sig_inject_local`), delivered without being
+  reported again — unless the thread blocks it, when, as the kernel requeues
+  it, it is a fresh signal that stops again once unblocked. (A `SEIZE`d
+  tracee is sent no legacy exec `SIGTRAP` at all, as the kernel's
+  `ptrace_event` has it.) A stop signal that a traced thread then takes the
+  default action of is a **group-stop its tracer is told of**
+  (`ptrace_group_stop`: `PTRACE_EVENT_STOP` for a `SEIZE`d tracee, a plain
+  `WSTOPSIG` for an `ATTACH`ed one), which ends when the tracer resumes it,
+  whatever signal it is resumed with (the kernel's `do_jobctl_trap` ignores
+  it) — not a host stop, which froze the thread where its tracer's mailbox
+  could not reach it and was never reported (`tests/ptrace/tracer_death.c`,
+  `groupstop` and `selfstop`).
 - *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
   `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
   dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the
@@ -1453,6 +1473,21 @@ holds the line). The two directions do take opposite views of an unreadable
 `/proc`: the tracer-side test has already waited out a mailbox timeout, so
 unreadable means dead, while the tracee-side one must answer "not a zombie" or a
 host without a readable `/proc` would detach every tracee on sight.
+
+What a tracee then takes with it is what the kernel's `exit_ptrace` leaves it:
+the code its stop has at that moment (`pt_orphaned_sig`). A
+signal-delivery-stop's code is its signal until a wait collects the stop
+(`wait_task_stopped` clears it; a `WNOWAIT` look does not), so a tracer that
+dies before collecting leaves the tracee its signal — ptrace(2): "If the
+tracee is restarted from signal-delivery-stop, the pending signal is
+injected" — and one that collected it leaves nothing. A group-stop outlives
+its tracer either way (`__ptrace_unlink` re-arms `JOBCTL_STOP_PENDING`), so it
+becomes the host stop an untraced process takes; a syscall or event stop
+leaves nothing to deliver. The emulator used to hand on nothing in every
+case: a tracee whose tracer was killed by the same `SIGTERM` it had just been
+stopped for (a shell's `timeout` signals the whole group) ran on, parked in
+whatever it had been doing, with nobody left to end it
+(`tests/ptrace/tracer_death.c`).
 
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,

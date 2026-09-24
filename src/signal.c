@@ -14,7 +14,9 @@
  * __reserved, terminator record, x30 pointed at a trampoline page containing
  * `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel uses the vDSO
  * for this). rt_sigreturn restores everything from the frame at SP. */
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -127,6 +129,8 @@ typedef struct {
                   * timer, a traced self-stop): the kernel keeps such a signal
                   * on the thread's own queue, and it dies with the thread --
                   * never handed to another (sig_retarget) */
+    int ptraced; /* past its signal-delivery stop (sig_inject_local): taken
+                  * without being reported to a tracer again */
 } PendSig;
 
 #define SIGQ_MIN 32       /* the fixed ring this used to be; now the floor */
@@ -704,7 +708,12 @@ void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, 
 static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
 
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
-    if (rq_claim(sig, si, p)) return;   /* one this process handed back */
+    if (rq_claim(sig, si, p)) {   /* one this process handed back */
+        p->ptraced = 0;           /* ...arriving anew: no stop is behind it */
+        return;
+    }
+    p->ptraced = 0;   /* nor behind one that just arrived (host_catcher's
+                       * PendSig is not zeroed: every field is set here) */
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     p->err = si->si_errno;
@@ -863,6 +872,28 @@ void sig_raise_local(int sig) {
     jit_signal_interrupt();
 }
 
+/* The signal a ptrace signal-delivery stop hands on, where its call site does
+ * not take it itself (ptracetab.c's pt_signal_stop): the one the tracer resumed
+ * the thread with, or the stop's own when the tracer died without collecting
+ * the stop. The kernel's ptrace_signal delivers it there and then, with no
+ * second stop, so it is queued as past its stop -- unless the thread blocks
+ * it, when the kernel requeues it as a fresh signal, one that stops again
+ * once it is unblocked. */
+void sig_inject_local(int sig, int code, int pid, u64 addr) {
+    sigq_sync();   /* ordinary context: this one can grow the queue itself */
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = sig;
+    p.code = code;
+    p.pid = pid;
+    p.addr = addr;
+    p.uid = pid ? (int)getuid() : 0;
+    p.thr = 1;
+    p.ptraced = !(g_tls.sigmask & (1ULL << (sig - 1)));
+    if (!sigq_push(&p, NULL)) return;
+    jit_signal_interrupt();
+}
+
 /* Is `sp` inside the guest's alternate signal stack? The kernel keeps no "am I
  * on the altstack" flag -- it asks this of the current stack pointer every time
  * (on_sig_stack), and the bounds are exactly its own: open at the low end,
@@ -900,6 +931,56 @@ static int sig_default_terminates(int sig) {
     default:
         return 1;
     }
+}
+
+/* Is `sig`'s default action to stop the process (a job-control stop)? */
+static int sig_is_stop(int sig) {
+    return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
+/* State, parent, process group and session of host process `pid`, from its
+ * /proc stat; 0 if that cannot be read. */
+static int proc_stat_ids(int pid, char *state, int *ppid, int *pgrp, int *sid) {
+    char path[48], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');   /* comm may hold spaces and parens */
+    return rp && sscanf(rp + 1, " %c %d %d %d", state, ppid, pgrp, sid) == 4;
+}
+
+/* Is this process's group orphaned -- the kernel's is_current_pgrp_orphaned:
+ * no member, zombies and init's children aside, has a parent in another group
+ * of the same session? get_signal discards a SIGTSTP, SIGTTIN or SIGTTOU in
+ * one rather than stop it, which a host stop decides for itself and the
+ * group-stop a traced thread reports instead (ptrace_group_stop) has to be
+ * told. Guest processes are host processes, so the host's /proc knows; one it
+ * will not show counts as a parent that keeps the group attached, erring
+ * towards the stop. Rare: only a traced thread taking such a signal's default
+ * action asks. */
+static int pgrp_orphaned(void) {
+    int pg = (int)getpgrp(), sid = (int)getsid(0), orphaned = 1;
+    fdwin_enter();   /* descriptors of our own, briefly (machine.h) */
+    DIR *d = opendir("/proc");
+    if (!d) { fdwin_leave(); return 0; }
+    struct dirent *de;
+    while (orphaned && (de = readdir(d))) {
+        char *end, st, pst;
+        long pid = strtol(de->d_name, &end, 10);
+        int pp, pgr, se, ppp, ppg, psid;
+        if (*end || pid <= 0) continue;
+        if (!proc_stat_ids((int)pid, &st, &pp, &pgr, &se) || pgr != pg) continue;
+        if (st == 'Z' || st == 'X' || pp == 1) continue;
+        if (!proc_stat_ids(pp, &pst, &ppp, &ppg, &psid) || (ppg != pg && psid == sid))
+            orphaned = 0;
+    }
+    closedir(d);
+    fdwin_leave();
+    return orphaned;
 }
 
 /* ---- SIGSYS safety net ----
@@ -2347,8 +2428,9 @@ void sig_deliver_pending(CPU *c) {
 
         /* ptrace signal-delivery stop: the tracer sees WSTOPSIG==sig and may
          * suppress it (return 0) or substitute another signal before it is
-         * dispositioned. SIGKILL is never interceptable. */
-        if (UNLIKELY(g_ptrace_active)) {
+         * dispositioned. SIGKILL is never interceptable, and a signal a stop
+         * has already handed on is not stopped for again. */
+        if (UNLIKELY(g_ptrace_active) && !p.ptraced) {
             int ns = ptrace_report_signal(c, sig);
             if (ns == 0) continue;              /* suppressed by the tracer */
             if (ns != sig) { sig = ns; p.signo = ns; }
@@ -2364,6 +2446,15 @@ void sig_deliver_pending(CPU *c) {
              * restored (does not return). */
             if (sig_default_terminates(sig))
                 guest_terminate_by_signal(c, sig);
+            /* A traced thread's stop is a group-stop its tracer is told of,
+             * and it ends when the tracer resumes it -- unless the tracer is
+             * gone, when it is the host stop below after all. An orphaned
+             * process group stops for SIGSTOP alone (get_signal), which the
+             * host's own stop would decide by itself. */
+            if (UNLIKELY(g_ptrace_active) && sig_is_stop(sig)) {
+                if (sig != SIGSTOP && pgrp_orphaned()) continue;
+                if (!ptrace_group_stop(c, sig)) continue;
+            }
             /* Default-ignore/continue disposition: let the host default apply. */
             struct sigaction sa;
             memset(&sa, 0, sizeof sa);

@@ -86,7 +86,8 @@ void ptrace_thread_child_stop(CPU *c);
 /* Syscall-entry (is_exit==0) / syscall-exit stop. Parks until the tracer
  * resumes; the tracer may have rewritten registers meanwhile. */
 void ptrace_report_syscall(CPU *c, int is_exit);
-/* Post-execve stop (the SIGTRAP a freshly exec'd tracee reports to its tracer).
+/* Post-execve stop: PTRACE_EVENT_EXEC under PTRACE_O_TRACEEXEC, else the
+ * legacy SIGTRAP a PTRACE_ATTACH'd (never a SEIZE'd) tracee sends itself.
  * `old_tid` is the tid the exec'ing thread had, which PTRACE_GETEVENTMSG gives
  * back: the pid itself unless a secondary thread exec'd. */
 void ptrace_report_exec(CPU *c, s32 old_tid);
@@ -117,6 +118,14 @@ int  ptrace_report_signal(CPU *c, int sig);
 int  ptrace_report_fault(CPU *c, int sig, int si_code, u64 addr);
 /* PTRACE_SINGLESTEP: report the SIGTRAP stop after one stepped instruction. */
 void ptrace_report_singlestep(CPU *c);
+/* A traced thread taking a stop signal's default action: the kernel's
+ * group-stop, which the tracer is told of (do_signal_stop -> do_jobctl_trap)
+ * -- never a host stop, which would freeze the service loop the tracer drives
+ * it with. Parks until the tracer resumes it, ignoring any signal it is
+ * resumed with, and returns 0; or returns `sig` for the caller to stop the
+ * host process with after all, the tracer having died (a group-stop outlives
+ * its tracer), or the thread not being traced. */
+int  ptrace_group_stop(CPU *c, int sig);
 /* If this process is traced and `sig` is a stop signal (SIGSTOP/SIGTSTP/...),
  * queue it for a cooperative ptrace signal-delivery stop and return 1; else 0.
  * The caller (a signal-send syscall) uses this only when the target is self —
