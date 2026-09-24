@@ -410,6 +410,22 @@ static int sigq_push(const PendSig *p, void *uctx) {
     return 1;
 }
 
+/* Lower g_sig_npend for a queue the consumer has just seen empty -- but
+ * lower it FIRST and look again after. The capture handler lands anywhere in
+ * the consumer; it writes the entry, moves the head and then raises the flag,
+ * so one that landed between the consumer's look and a plain store of 0 left
+ * its entry queued behind a lowered flag. Nothing then brought the thread to
+ * the delivery point (the interpreter tests only the flag, and a standard
+ * signal already queued is not queued, or flagged, again), and a thread
+ * flooded with two standard signals stranded both and never ran a handler
+ * again. Lowered first, a capture after the store raises it again, and one
+ * before is in the queue the second look sees. */
+static void sigq_lower_npend(void) {
+    g_sig_npend = 0;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (sigq_tail != sigq_head) g_sig_npend = 1;
+}
+
 /* Remove queue slot `t`, keeping the rest in arrival order: the entries older
  * than it shift up by one and the tail follows them. (Shifting the *newer*
  * ones down instead would have to move the head, which only the handler may
@@ -422,7 +438,7 @@ static void sigq_take(int t) {
         u = prev;
     }
     sigq_tail = sigq_next(sigq_tail);
-    if (sigq_tail == sigq_head) g_sig_npend = 0;
+    if (sigq_tail == sigq_head) sigq_lower_npend();
 }
 
 /* Set by sig_kick_net for every one of the emulator's OWN uses of the reserved
@@ -2334,7 +2350,7 @@ void sig_deliver_pending(CPU *c) {
         deliver_to_handler(c, sig, &p);
         return;   /* one at a time; the next check happens after sigreturn */
     }
-    g_sig_npend = 0;
+    sigq_lower_npend();
 }
 
 /* SECCOMP_RET_TRAP: SIGSYS to the guest, carrying the blocked syscall. It is
