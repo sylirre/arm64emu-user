@@ -42,6 +42,9 @@ int jit_backend_available(void);
  * exception, pending signal, stop/halt, instruction-fetch fault) — the same
  * return contract as pd_run. */
 void jit_run(CPU *c);
+/* loop.c: must the run loop act for this thread before more guest code runs
+ * (a deliverable signal, a tracer's kick, an execve call-out)? */
+int emu_callout_due(CPU *c);
 
 /* ---- Coherence hooks (all cheap no-ops when -jit is off) ---- */
 

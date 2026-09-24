@@ -108,6 +108,24 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
     guest_terminate_by_signal(c, sig);
 }
 
+/* Does the run loop have to act for this thread before any more guest code
+ * runs: a signal to deliver, a tracer's kick to serve (ptrace_service_kick),
+ * an execve's call-out to answer (stop_gen)? All three raise g_sig_npend, the
+ * engines' way out of guest code; this is the question behind it. The
+ * interpreter asks the flag before every instruction and cannot miss one. The
+ * JIT asks a flag of its own at block entries -- the one the capture handler
+ * raises beside g_sig_npend -- and clears it before each block it enters, so
+ * one raised while the thread was out here, after the loop's delivery point
+ * had looked, was gone by the time a block could see it: a thread spinning in
+ * a block chained to itself went on spinning, its signal undelivered until
+ * another arrived. jit_run asks this before entering a block. */
+int emu_callout_due(CPU *c) {
+    if (!g_sig_npend) return 0;
+    return g_ptrace_kick ||
+           __atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen ||
+           sig_pending_deliverable(c->m);
+}
+
 int emu_loop(CPU *c) {
     for (;;) {
         if (UNLIKELY(c->stop)) return 0;
@@ -212,11 +230,7 @@ int emu_loop(CPU *c) {
                      * capture between the two is seen by the check or arms
                      * the timer -- never neither. */
                     g_sig_in_syscall = 1;
-                    if (UNLIKELY(g_sig_npend) &&
-                        (g_ptrace_kick ||
-                         __atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) !=
-                             g_tls.stop_gen ||
-                         sig_pending_deliverable(c->m))) {
+                    if (UNLIKELY(g_sig_npend) && emu_callout_due(c)) {
                         g_sig_in_syscall = 0;
                         c->pc -= 4;
                         break;

@@ -900,6 +900,13 @@ void jit_run(CPU *c) {
     for (;;) {
         if (UNLIKELY(g_tls.pend_exc.valid || c->stop)) return;
         if (UNLIKELY(env->interrupt)) jit_service_interrupt(env);
+        /* The flag just cleared is the only one generated code reads, so what
+         * it stood for has to be answered here: a signal caught while this
+         * thread was outside generated code, with nothing left to raise the
+         * flag again, would otherwise wait in a block that loops on itself.
+         * Only what the loop would act on -- a signal the guest blocks leaves
+         * g_sig_npend set, and returning for it would run nothing at all. */
+        if (UNLIKELY(g_sig_npend) && emu_callout_due(c)) return;
         if (UNLIKELY(env->flush_count != flush_seen)) {
             flush_seen = env->flush_count;
             prev = NULL;                /* arena reset: pointer is stale */

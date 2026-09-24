@@ -282,7 +282,14 @@ a direct chain jump into the block bypassed the predecessor's PC write.
 `interrupt` flag (async-signal-safe: one TLS store). Generated code checks that
 flag at every block entry, so delivery latency is bounded by one block; the
 actual delivery happens only from `emu_loop`, from consistent state, so
-`rt_sigreturn` and `sigaltstack` are unchanged.
+`rt_sigreturn` and `sigaltstack` are unchanged. `jit_run` clears the flag
+before it enters a block, so it first asks what the flag stood for
+(`emu_callout_due`: a deliverable signal, a tracer's kick, an `execve`
+call-out) and returns to the loop if the answer is yes. A signal caught while
+the thread was in the emulator's own code, after the loop's delivery point had
+looked, used to be cleared away with the flag, and a thread spinning in a block
+chained to itself then went on spinning until some other signal arrived
+(`tests/c/sigpaced.c`).
 
 **Self-modifying / remapped code.** The guest must execute `IC IVAU` before
 running written code (this CPU advertises `CTR_EL0.{DIC,IDC}=0`), so the JIT
