@@ -69,7 +69,12 @@ EL0's rules: a system instruction EL1 has not opened to it (`el0_allowed` in
 `sysreg.c`, judged on `SCTLR_EL1`/`CNTKCTL_EL1`, which `sysreg_init` sets as
 Linux does: `DZE`, `UCT`, `UCI` and the virtual counter, never `UMA`), `ERET`,
 `DRPS`, `HLT`, `HVC` and `SMC` are all UNDEFINED there, and reach the program as
-the `SIGILL` a kernel sends (`tests/c/el0sysinsn.c`).
+the `SIGILL` a kernel sends (`tests/c/el0sysinsn.c`). The ID registers are among
+them, and there `loop.c` plays the kernel's part: it answers an `MRS` of that
+space from the kernel's sanitized view of the CPU (`emulate_id_mrs`, the tables
+of `cpufeature.c`: the feature fields a kernel shows, every other field its safe
+value, AArch64 only at EL0 and EL1) and advertises that it does with
+`HWCAP_CPUID` (`tests/c/idregs.c`, `tests/fixtures/idregs.c`).
 
 ```c
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
@@ -191,7 +196,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/core/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads; which of them EL0 may execute. |
 | `src/mmu.h`, `src/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/exception.c` | Pending-exception recorder (the exception seam). |
-| `src/loop.c` | Run loop + exception dispatch + signal delivery point. |
+| `src/loop.c` | Run loop + exception dispatch + signal delivery point; the kernel's EL0 `MRS` emulation of the ID registers. |
 | `src/predecode.h`, `src/predecode.c` | Decoded-instruction cache: classifier + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
 | `src/elf.c` | ELF64 loader, `PT_INTERP`, initial stack/auxv/HWCAP, sigreturn trampoline page. |
 | `src/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |

@@ -15,6 +15,7 @@
 #include "predecode.h"
 #include "jit.h"
 #include "ptrace.h"
+#include "sysreg.h"
 
 /* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c hook):
  * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
@@ -24,6 +25,63 @@ u64 gt_count(CPU *c, bool virt) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     u64 ns = (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
     return ns * 3 / 125;   /* ns -> 24 MHz ticks */
+}
+
+/* EL0's view of the ID registers, as an arm64 kernel presents it. An MRS of
+ * the op0 3, op1 0, CRn 0 space is UNDEFINED at EL0, and instead of the
+ * SIGILL the kernel answers it itself (cpufeature.c, emulate_sys_reg): CRm 0
+ * for MIDR_EL1 (the CPU's), MPIDR_EL1 (0x80000000, whatever the CPU) and
+ * REVIDR_EL1 (0); CRm 2..7 for the feature registers, each field the kernel
+ * shows userspace passed through and every other one read as its safe value
+ * -- a CPU's EL2/EL3, its debug and memory-system details and its AArch32
+ * support are nothing a program is told. The table is the kernel's
+ * (FTR_VISIBLE fields; safe_val of each FTR_HIDDEN one) for every AArch64
+ * register it tracks; an untracked slot reads 0, and so does an AArch32
+ * register (CRm 2 and 3) of a CPU with no AArch32 at EL0, which the kernel
+ * never reads. The rest of the space, CRm 1 included, stays SIGILL. */
+static const struct { u8 crm, op2; u64 visible, hidden; } id_el0_view[] = {
+    { 4, 0, 0x000f000f00ff0000ULL, 0x0000000000000011ULL },  /* ID_AA64PFR0: EL1, EL0 AArch64 only */
+    { 4, 1, 0x0000f0000f000fffULL, 0 },                      /* ID_AA64PFR1 */
+    { 4, 2, 0x0000000f00000ff0ULL, 0 },                      /* ID_AA64PFR2 */
+    { 4, 4, 0x0fffff0f0ffff0ffULL, 0 },                      /* ID_AA64ZFR0 */
+    { 4, 5, 0xbff1ffff73810001ULL, 0 },                      /* ID_AA64SMFR0 */
+    { 4, 7, 0x00000000fc008003ULL, 0 },                      /* ID_AA64FPFR0 */
+    { 5, 0, 0,                     0x0000000000000006ULL },  /* ID_AA64DFR0: DebugVer v8.0 */
+    { 6, 0, 0xf0fffffff0fffff0ULL, 0 },                      /* ID_AA64ISAR0 */
+    { 6, 1, 0xf0fff0ffffffffffULL, 0 },                      /* ID_AA64ISAR1 */
+    { 6, 2, 0x0fff000000ffffffULL, 0 },                      /* ID_AA64ISAR2 */
+    { 6, 3, 0x00000000f00f00f0ULL, 0 },                      /* ID_AA64ISAR3 */
+    { 7, 0, 0xf000000000000000ULL, 0x00000111ff000000ULL },  /* ID_AA64MMFR0: TGran4/64 "none", TGran*_2 "as stage 1" */
+    { 7, 1, 0x0000f00000000000ULL, 0 },                      /* ID_AA64MMFR1 */
+    { 7, 2, 0x0000000f00000000ULL, 0 },                      /* ID_AA64MMFR2 */
+    { 7, 3, 0x00000000000f0000ULL, 0 },                      /* ID_AA64MMFR3 */
+};
+
+/* do_el0_undef's try_emulate_mrs: whether the UNDEFINED instruction at pc is
+ * such an MRS, answered (Rt written, pc past it) if so. */
+static bool emulate_id_mrs(CPU *c) {
+    u32 insn;
+    if (!mem_ifetch(c, c->pc, &insn) || (insn & 0xfff00000u) != 0xd5300000u)
+        return false;                                  /* not an MRS of op0 2/3 */
+    unsigned op0 = 2 | ((insn >> 19) & 1), op1 = (insn >> 16) & 7;
+    unsigned crn = (insn >> 12) & 15, crm = (insn >> 8) & 15, op2 = (insn >> 5) & 7;
+    if (op0 != 3 || op1 != 0 || crn != 0 || crm == 1 || crm > 7) return false;
+    u64 v = 0;
+    if (crm == 0) {
+        if (op2 == 0) v = sysreg_id_read(c, 0, 0);     /* MIDR_EL1 */
+        else if (op2 == 5) v = 1ULL << 31;             /* MPIDR_EL1 */
+        else if (op2 != 6) return false;               /* REVIDR_EL1 reads 0 */
+    } else {
+        for (size_t i = 0; i < sizeof id_el0_view / sizeof *id_el0_view; i++)
+            if (id_el0_view[i].crm == crm && id_el0_view[i].op2 == op2) {
+                v = (sysreg_id_read(c, crm, op2) & id_el0_view[i].visible) |
+                    id_el0_view[i].hidden;
+                break;
+            }
+    }
+    set_x(c, insn & 31, v);
+    c->pc += 4;
+    return true;
 }
 
 /* Fatal guest fault with no guest handler (M1..M4): report, restore the host
@@ -227,6 +285,9 @@ int emu_loop(CPU *c) {
                     break;
                 }
                 case EC_UNKNOWN:
+                    if (emulate_id_mrs(c)) break;
+                    sig_deliver_fault(c, SIGILL, 1, c->pc);
+                    break;
                 default:
                     sig_deliver_fault(c, SIGILL, 1, c->pc);
                     break;

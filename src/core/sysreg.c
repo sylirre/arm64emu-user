@@ -42,7 +42,8 @@ static u64 timer_count(CPU *c, bool virt) {
  * set/way and invalidate-only cache operations, SPSel/PAN/UAO, SYSL, the
  * debug registers, the counter and timers CNTKCTL_EL1 keeps from it, and the
  * registers of features this CPU does not implement (DIT, SSBS, TCO, RNDR,
- * ...). The ID registers (op1 0, CRn 0) EL0 reads directly. */
+ * ...). The ID registers (op1 0, CRn 0) too: EL0 sees them only as the kernel
+ * chooses to present them, by emulating the MRS it traps. */
 static bool el0_allowed(CPU *c, unsigned L, unsigned op0, unsigned op1,
                         unsigned CRn, unsigned CRm, unsigned op2, unsigned Rt) {
     u64 sctlr = c->sctlr[1], kctl = c->cntkctl_el1;
@@ -86,7 +87,7 @@ static bool el0_allowed(CPU *c, unsigned L, unsigned op0, unsigned op1,
     case KEY(3,3,14,3,0): case KEY(3,3,14,3,1): case KEY(3,3,14,3,2):  /* CNTV_* */
         return (kctl & CNTK_EL0VTEN) != 0;
     }
-    return L && op1 == 0 && CRn == 0;        /* ID registers */
+    return false;
 }
 
 static void msr_immediate(CPU *c, u32 insn) {
@@ -133,8 +134,8 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
     (void)insn; (void)op1;
 }
 
-/* MRS: read system register into Rt. */
-static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
+/* MRS: a system register's value. */
+static u64 mrs_value(CPU *c, unsigned key) {
     u64 v = 0;
     switch (key) {
         /* --- identification --- */
@@ -143,7 +144,7 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,0,0,0,6): v = 0; break;                   /* REVIDR_EL1 */
         case KEY(3,3,0,0,1): v = 0x8444c004; break;          /* CTR_EL0 */
         case KEY(3,3,0,0,7): v = 4; break;                   /* DCZID_EL0: BS=4 (64B), DZP=0 */
-        case KEY(3,0,0,4,0): v = 0x110022; break;            /* ID_AA64PFR0_EL1: EL0/EL1=AArch64+32, FP[19:16]=1 & AdvSIMD[23:20]=1 (FEAT_FP16, half-precision arith implemented in exec_fpsimd.c) */
+        case KEY(3,0,0,4,0): v = 0x110011; break;            /* ID_AA64PFR0_EL1: EL0/EL1=AArch64 only (no A32/T32 decoder), FP[19:16]=1 & AdvSIMD[23:20]=1 (FEAT_FP16, half-precision arith implemented in exec_fpsimd.c) */
         case KEY(3,0,0,4,1): v = 0; break;                   /* ID_AA64PFR1_EL1 */
         case KEY(3,0,0,5,0): v = 0x10305106; break;          /* ID_AA64DFR0_EL1 (QEMU cortex-a57) */
         case KEY(3,0,0,5,1): v = 0; break;                   /* ID_AA64DFR1_EL1 */
@@ -216,7 +217,15 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
             v = 0;
             break;
     }
-    set_x(c, Rt, v);
+    return v;
+}
+
+static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
+    set_x(c, Rt, mrs_value(c, key));
+}
+
+u64 sysreg_id_read(CPU *c, unsigned CRm, unsigned op2) {
+    return mrs_value(c, KEY(3, 0, 0, CRm, op2));
 }
 
 /* MSR: write Rt to system register. */

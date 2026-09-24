@@ -14,6 +14,10 @@ void sysreg_exec(CPU *c, u32 insn);
 /* Initialise ID/feature registers at reset. */
 void sysreg_init(CPU *c);
 
+/* The ID register op0 3, op1 0, CRn 0, CRm, op2 as EL1 reads it: what this CPU
+ * implements, before a kernel sanitizes EL0's view of it. */
+u64 sysreg_id_read(CPU *c, unsigned CRm, unsigned op2);
+
 /* Handle an SMC/HVC conduit call (PSCI / SMCCC). Returns true if handled. */
 bool smccc_conduit(CPU *c, bool is_hvc) __attribute__((weak));
 

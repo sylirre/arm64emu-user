@@ -226,7 +226,8 @@ void elf_hwcaps(u64 *hwcap, u64 *hwcap2) {
              G_HWCAP_FPHP | G_HWCAP_ASIMDHP |    /* FEAT_FP16 (exec_fpsimd.c) */
              G_HWCAP_ASIMDRDM | G_HWCAP_JSCVT | G_HWCAP_FCMA |
              G_HWCAP_LRCPC | G_HWCAP_ILRCPC |    /* LDAPR + LDAPUR/STLUR */
-             G_HWCAP_ASIMDDP | G_HWCAP_ASIMDFHM | G_HWCAP_FLAGM;
+             G_HWCAP_ASIMDDP | G_HWCAP_ASIMDFHM | G_HWCAP_FLAGM |
+             G_HWCAP_CPUID;                      /* EL0 ID-register MRS (loop.c) */
     *hwcap2 = G_HWCAP2_FLAGM2 |
               G_HWCAP2_MOPS;                     /* CPYx/SETx (decode.c) */
 }

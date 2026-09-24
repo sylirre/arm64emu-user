@@ -365,7 +365,8 @@ src/
                 table.
   exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c        run loop + exception dispatch + signal delivery point +
-                the thread call-out safepoint (stop_gen)
+                the thread call-out safepoint (stop_gen) + EL0's view of the
+                ID registers (the kernel's MRS emulation)
   predecode.c   decoded-instruction cache: direct-threaded fast path over ~200
                 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):

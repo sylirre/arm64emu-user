@@ -66,7 +66,7 @@ src/
     cpu.c sysreg.c                   Step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
-  loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen)
+  loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
   predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
