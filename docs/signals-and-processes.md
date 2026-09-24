@@ -1383,9 +1383,16 @@ could land on any thread. The handler recognizes a tracer kick by a magic
 setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick` adopts
 the pending attach on the kicked thread's own link (becomes a tracee; `ATTACH`
 also reports an initial `SIGSTOP`, `SEIZE` attaches silently) or, for
-`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. The syscall the kick
-interrupted is then **restarted**, so attaching does not perturb the tracee —
-see "The emulator's own interruptions are invisible to the guest" above. A
+`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. It does so *before* the
+boundary delivers any pending signal, as the kernel's `get_signal` takes a
+ptrace trap before it dequeues one: `ptrace(SEIZE)` has attached by the time it
+returns, so a signal its caller sends next is one the tracer must see stopped
+for — and it arrives with the kick, a standard signal being taken ahead of the
+real-time one. Delivered first, it ran its handler untraced while the tracer
+waited for a stop that never came (`tests/ptrace/seize_signal.c`). The syscall
+the kick interrupted is then **restarted**, so attaching does not perturb the
+tracee — see "The emulator's own interruptions are invisible to the guest"
+above. A
 guest-directed signal of
 the same number is forwarded to the normal capture queue, so the guest keeps
 full use of it. `wait4` collects the stop from the registry (the tracee is not

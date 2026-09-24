@@ -317,16 +317,21 @@ int emu_loop(CPU *c) {
             }
         }
 
+        /* Adopt a pending PTRACE_ATTACH/SEIZE or service a PTRACE_INTERRUPT
+         * (the kick signal set g_ptrace_kick and reused g_sig_npend to exit the
+         * fast path above). Near-always-zero, like the signal check. Before
+         * the signals, as the kernel's get_signal takes a ptrace trap before
+         * it dequeues one: a tracer's ptrace(SEIZE) has returned by the time
+         * its kill(2) sends the next signal, and a standard signal is taken
+         * ahead of the real-time kick, so the two arrive together and the
+         * signal must find the thread traced already. */
+        if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
+
         /* Deliver any host-caught guest signal at this safe boundary. */
         if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
         /* The boundary has been reached: a kick timer armed by a capture
          * inside a syscall handler has done its job, or was never needed. */
         sig_kick_timer_disarm();
-
-        /* Adopt a pending PTRACE_ATTACH/SEIZE or service a PTRACE_INTERRUPT
-         * (the kick signal set g_ptrace_kick and reused g_sig_npend to exit the
-         * fast path above). Near-always-zero, like the signal check. */
-        if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
 
         /* Our own control signal interrupted a host syscall to get this thread
          * here (the attach kick above, a tracee's wake of its tracer, execve's
