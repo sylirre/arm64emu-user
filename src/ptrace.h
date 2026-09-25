@@ -196,7 +196,13 @@ typedef struct {
 int  ptrace_available(void);
 /* Has anyone in the session started tracing? Gates the wait polling path. */
 int  ptrace_any_trace(void);
-/* Does the caller currently trace a task (optionally a specific wpid>0)?
+/* Which tracees a wait asks about, as the kernel's wait_opts has it: any
+ * (P_ALL, wait4(-1)), one task (P_PID, a pidfd's, wait4(pid > 0)), or the
+ * members of a process group (P_PGID, wait4(-pgid), and wait4(0) for the
+ * caller's own, taken when the wait begins) -- eligible_pid. */
+enum { PT_SEL_ANY, PT_SEL_PID, PT_SEL_PGID };
+typedef struct { int type; s32 id; } PtWaitSel;
+/* Does the caller currently trace a task the wait selects?
  * A tracer attached to a non-child via PTRACE_ATTACH/SEIZE has no host child,
  * so a host wait4 ECHILD is not terminal while this is true: the tracee's stop
  * or exit arrives through the registry, not the host wait. A dead tracee
@@ -204,9 +210,9 @@ int  ptrace_any_trace(void);
  * waitid under WEXITED or WCONTINUED): a dead task never stops, so to a wait
  * for stops alone it is nothing to wait for -- ECHILD, as the kernel's
  * wait_consider_task has it. */
-int  ptrace_have_tracee(s32 wpid, int dead_too);
-/* One ready ptrace-stop or synthetic exit of a tracee matching wpid (-1 =
- * any). On success fills *status (a wait-status word: WIFSTOPPED for a stop)
+int  ptrace_have_tracee(PtWaitSel sel, int dead_too);
+/* One ready ptrace-stop or synthetic exit of a tracee the wait selects. On
+ * success fills *status (a wait-status word: WIFSTOPPED for a stop)
  * and *outpid, returns 1; else 0. `ru` (optional) receives the tracee's
  * rusage as of the stop or exit. A tracer sees its tracees' stops whatever
  * it waits for (the kernel's wait_task_stopped); `flags` says what else:
@@ -214,7 +220,7 @@ int  ptrace_have_tracee(s32 wpid, int dead_too);
  * PT_WAIT_KEEP leaves what it reports to be reported again (WNOWAIT). */
 #define PT_WAIT_EXITS 1
 #define PT_WAIT_KEEP  2
-int  ptrace_collect(s32 wpid, int flags, int *status, s32 *outpid, PtRusage *ru);
+int  ptrace_collect(PtWaitSel sel, int flags, int *status, s32 *outpid, PtRusage *ru);
 /* Backstop: a non-child tracee killed by an uncatchable SIGKILL vanishes without
  * a registry event. Detect its dead/zombie host process and report a synthetic
  * WIFSIGNALED(SIGKILL) so a sibling tracer's wait4 poll does not hang. Fills the
@@ -222,7 +228,7 @@ int  ptrace_collect(s32 wpid, int flags, int *status, s32 *outpid, PtRusage *ru)
  * receives the corpse's last published rusage -- nobody ran in it to stamp a
  * fresh one, so it is the snapshot from its last stop. `keep` (WNOWAIT) leaves
  * the death to be reported again. */
-int  ptrace_reap_dead(s32 wpid, int keep, int *status, s32 *outpid, PtRusage *ru);
+int  ptrace_reap_dead(PtWaitSel sel, int keep, int *status, s32 *outpid, PtRusage *ru);
 /* Sample the state-change generation. Take it *before* checking the registry
  * and the host WNOHANG wait, then sleep with ptrace_tracer_wait(gen, ms): a
  * stop/exit published in between bumps the generation and the sleep returns

@@ -123,6 +123,9 @@ typedef struct {
     u32 listening;       /* PTRACE_LISTEN: parked in a group/INTERRUPT stop, awaiting
                           * SIGCONT (group-stop end); "running" to data ptrace ops */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
+    s32 pgid;            /* the tracee's process group as of its last stop or
+                          * death (claimed with the one it had): what a wait
+                          * for a group asks once the task itself is gone */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
     u64 fault_addr;      /* siginfo si_addr for fault stops (SIGSEGV/TRAP/...);
@@ -241,6 +244,7 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
             e->fault_addr = 0;
             e->attach_pending = e->interrupt_pending = 0;
             e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
+            e->pgid = (s32)getpgid((pid_t)tracee);   /* ours or the target's */
             memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
             __atomic_store_n(&e->tracee, tracee, __ATOMIC_RELEASE);
@@ -260,6 +264,7 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
  * A per-thread getrusage is not what the kernel reports either -- RUSAGE_SELF is
  * thread-group-wide, which is what a stopped thread's tracer gets. */
 static void pt_ru_stamp(PtLink *e) {
+    e->pgid = (s32)getpgid(0);   /* the group a wait for one asks about */
     struct rusage s, ch;
     memset(&s, 0, sizeof s);
     memset(&ch, 0, sizeof ch);
@@ -1360,7 +1365,29 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
 }
 
 /* ---- tracer: wait4/waitid integration ---- */
-int ptrace_collect(s32 wpid, int flags, int *status, s32 *outpid, PtRusage *ru) {
+/* Is tracee link `e` (task `t`) one the wait selects (the kernel's
+ * eligible_pid)? A group is asked of the task itself while it is there --
+ * the kernel reads task_pgrp at the wait -- and of the one it had when it
+ * died or last stopped once it is not: a death published and reaped by its
+ * real parent, or a SIGKILL nobody saw. */
+static int pt_selects(const PtLink *e, s32 t, PtWaitSel sel) {
+    switch (sel.type) {
+    case PT_SEL_PID:
+        return t == sel.id;
+    case PT_SEL_PGID: {
+        s32 g = e->pgid;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_EXITED) {
+            pid_t now = getpgid((pid_t)t);
+            if (now > 0) g = (s32)now;
+        }
+        return g == sel.id;
+    }
+    default:
+        return 1;
+    }
+}
+
+int ptrace_collect(PtWaitSel sel, int flags, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1368,7 +1395,7 @@ int ptrace_collect(s32 wpid, int flags, int *status, s32 *outpid, PtRusage *ru) 
         if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
         s32 t = e->tracee;
-        if (wpid > 0 && wpid != t) continue;   /* -1/0 => any child of ours */
+        if (!pt_selects(e, t, sel)) continue;
         u32 st_state = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
         /* Synthetic exit of an auto-attached tracee we cannot host-reap. */
         if (st_state == PT_ST_EXITED) {
@@ -1437,7 +1464,7 @@ int ptrace_any_trace(void) {
     return g_tab && __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE);
 }
 
-int ptrace_have_tracee(s32 wpid, int dead_too) {
+int ptrace_have_tracee(PtWaitSel sel, int dead_too) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1445,7 +1472,7 @@ int ptrace_have_tracee(s32 wpid, int dead_too) {
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
         if (t <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
-        if (wpid > 0 && wpid != t) continue;
+        if (!pt_selects(e, t, sel)) continue;
         /* Dead for sure, and only then: a /proc this host will not show us
          * leaves a tracee counted, as it leaves a parked one attached. */
         if (!dead_too &&
@@ -1502,7 +1529,7 @@ static int pt_task_zombie(s32 t) { return pt_state_is_dead(pt_task_state(t)); }
  * WIFSIGNALED(SIGKILL) so a sibling tracer polling in wait4 does not hang. Only
  * fires for a non-child tracee; a host-child's death is reaped via the host wait.
  * Returns 1 and fills status/outpid if such a tracee is found, else 0. */
-int ptrace_reap_dead(s32 wpid, int keep, int *status, s32 *outpid, PtRusage *ru) {
+int ptrace_reap_dead(PtWaitSel sel, int keep, int *status, s32 *outpid, PtRusage *ru) {
     if (!g_tab) return 0;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1510,7 +1537,7 @@ int ptrace_reap_dead(s32 wpid, int keep, int *status, s32 *outpid, PtRusage *ru)
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
         if (t <= 0) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
-        if (wpid > 0 && wpid != t) continue;
+        if (!pt_selects(e, t, sel)) continue;
         /* A stopped/exited tracee is alive-and-parked / handled by ptrace_collect. */
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
         if (!pt_task_dead(t)) continue;

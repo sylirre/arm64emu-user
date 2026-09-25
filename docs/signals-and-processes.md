@@ -1398,6 +1398,20 @@ a stop, a continue or a `WNOWAIT` look. The kernel's argument checks
 (`kernel_wait4`, `kernel_waitid`) are made before the registry is asked, since
 it answers before any host wait could refuse them (`tests/ptrace/waitid_tracer.c`).
 
+Which tracees a wait asks about is the kernel's `eligible_pid` too (a
+`PtWaitSel`): one pid; a process group — `wait4(-pgid)`, `waitid(P_PGID)`, and
+`wait4(0)` or `P_PGID` 0 for the caller's own, taken when the wait begins; a
+pidfd's process — `waitid(P_PIDFD)`, whose descriptor is looked through
+(`EBADF` for one that is not a pidfd, `EINVAL` for a negative one, and a
+pidfd opened `O_NONBLOCK` makes the wait `WNOHANG` and says `EAGAIN` when it
+finds nothing); or any. A group is asked of the tracee itself while it is
+there — the kernel reads `task_pgrp` at the wait — and of the one it had at
+its last stop or death, stamped into its link, once it is not. The registry
+used to take every one of these but the pid for "any": a tracer waiting for
+one process group was handed a stop from another, and `waitid(P_PIDFD)` the
+first stop of any tracee, whatever the descriptor was
+(`tests/ptrace/waitsel.c`).
+
 **`rusage` at a stop.** `wait4`/`waitid` fill their `rusage` argument at a ptrace
 stop, not only at a death — the kernel's `wait_task_stopped()` ends in
 `getrusage(p, RUSAGE_BOTH, wo->wo_rusage)` — and `strace -c` is built on exactly

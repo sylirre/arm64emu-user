@@ -3104,6 +3104,12 @@ SYSDEF(wait4) {
                          G_WNOTHREAD | G_WALL | G_WCLONE))
         return (u64)(s64)-EINVAL;
     if (wpid == INT_MIN) return (u64)(s64)-ESRCH;   /* -INT_MIN is undefined */
+    /* Which tracees it asks about (kernel_wait4): one pid, a process group --
+     * -pid, or the caller's own for 0, taken now -- or any. */
+    PtWaitSel sel = { PT_SEL_ANY, 0 };
+    if (wpid > 0) { sel.type = PT_SEL_PID; sel.id = (s32)wpid; }
+    else if (wpid < -1) { sel.type = PT_SEL_PGID; sel.id = (s32)-wpid; }
+    else if (wpid == 0) { sel.type = PT_SEL_PGID; sel.id = (s32)getpgid(0); }
 
     /* Two modes, re-evaluated every pass (a kick can flip us between them).
      *
@@ -3134,7 +3140,7 @@ SYSDEF(wait4) {
             clonekid_wait_note(c->m, (u32)options);
         }
         if (!ptrace_available() || !ptrace_any_trace() ||
-            !ptrace_have_tracee((s32)wpid, 1)) {
+            !ptrace_have_tracee(sel, 1)) {
             int status;
             struct rusage ru;   /* always taken: children_reaped needs it */
             pid_t pid = wait4(wpid, &status, (int)hopts, &ru);
@@ -3175,7 +3181,7 @@ SYSDEF(wait4) {
         int st;
         s32 rp;
         PtRusage pru;
-        if (ptrace_collect((s32)wpid, PT_WAIT_EXITS, &st, &rp, a3 ? &pru : NULL)) {
+        if (ptrace_collect(sel, PT_WAIT_EXITS, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -3214,13 +3220,13 @@ SYSDEF(wait4) {
          * the tracee is another parent's child and its stop/exit reaches us only
          * through the registry above, not the host wait. Keep polling while a live
          * tracee remains; a real ECHILD (no children AND no tracees) still returns. */
-        if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee((s32)wpid, 1)))
+        if (pid < 0 && !(werr == ECHILD && ptrace_have_tracee(sel, 1)))
             return (u64)(s64)(-werr);
         /* A non-child tracee killed by an uncatchable SIGKILL vanishes at the host
          * level with no registry event; detect its dead/zombie process and report
          * the synthetic WIFSIGNALED(SIGKILL) so we do not poll forever. */
         if (pid < 0 && werr == ECHILD &&
-            ptrace_reap_dead((s32)wpid, 0, &st, &rp, a3 ? &pru : NULL)) {
+            ptrace_reap_dead(sel, 0, &st, &rp, a3 ? &pru : NULL)) {
             if (a1) {
                 s32 gs = st;
                 if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
@@ -3265,7 +3271,8 @@ SYSDEF(waitid) {
                           G_WCONTINUED | G_WNOTHREAD | G_WALL | G_WCLONE)) ||
         !((u32)options & (G_WEXITED | G_WSTOPPED | G_WCONTINUED)))
         return (u64)(s64)-EINVAL;
-    if ((u32)a0 > G_P_PIDFD || ((u32)a0 == G_P_PID && (s32)a1 <= 0))
+    if ((u32)a0 > G_P_PIDFD || ((u32)a0 == G_P_PID && (s32)a1 <= 0) ||
+        (((u32)a0 == G_P_PGID || (u32)a0 == G_P_PIDFD) && (s32)a1 < 0))
         return (u64)(s64)-EINVAL;
 
     /* Same two modes as wait4: a real blocking host waitid unless the caller
@@ -3273,18 +3280,35 @@ SYSDEF(waitid) {
      * sees its tracees' ptrace stops whatever it waits for, as a CLD_TRAPPED
      * siginfo whose si_status is the whole stop code (event bits included),
      * and their exits under WEXITED; WNOWAIT leaves either to be reported
-     * again. See sys_wait4 for the full rationale. */
-    s32 wpid = (idtype == P_PID) ? (s32)id : -1;   /* P_ALL/P_PGID: best-effort any */
+     * again. See sys_wait4 for the full rationale.
+     *
+     * Which tracees it asks about is kernel_waitid_prepare's: P_PGID's group
+     * (the caller's own for id 0, taken now), and a pidfd's process -- looked
+     * through only when there is a tracee or a clone child to find, and then
+     * with the kernel's refusal of a descriptor that is not a pidfd (EBADF),
+     * which the host would give too. A pidfd opened O_NONBLOCK makes the wait
+     * WNOHANG, and one that finds nothing then says EAGAIN. */
+    PtWaitSel sel = { PT_SEL_ANY, 0 };
+    int nonblock = 0;
+    s32 who = 0;
+    if (idtype == P_PID) {
+        who = (s32)id;
+        sel.type = PT_SEL_PID;
+        sel.id = who;
+    } else if (idtype == P_PGID) {
+        sel.type = PT_SEL_PGID;
+        sel.id = id ? (s32)id : (s32)getpgid(0);
+    } else if (idtype == P_PIDFD && (ptrace_any_trace() || clonekids_live(c->m))) {
+        int e = pidfd_target((int)id, &who, 0);
+        if (e < 0) return (u64)(s64)e;
+        sel.type = PT_SEL_PID;
+        sel.id = who;                  /* -1 once reaped: selects nothing */
+        nonblock = (fcntl((int)id, F_GETFL) & O_NONBLOCK) != 0;
+    }
     /* A clone child is found only where the kernel's rule would find it, and
-     * the host is never asked with __WCLONE (clonekid_wait_ok). A pidfd is
-     * looked through only while there is a clone child to find. */
+     * the host is never asked with __WCLONE (clonekid_wait_ok). */
     u32 hopts = (u32)options;
     {
-        s32 who = 0;
-        if (idtype == P_PID) who = (s32)id;
-        else if (idtype == P_PIDFD && clonekids_live(c->m) &&
-                 pidfd_target((int)id, &who, 0) < 0)
-            who = 0;
         if (who > 0) {
             if (!clonekid_wait_ok(c->m, who, (u32)options, &hopts))
                 return (u64)(s64)-ECHILD;
@@ -3297,7 +3321,7 @@ SYSDEF(waitid) {
     int dead_too = ((u32)options & (G_WEXITED | G_WCONTINUED)) != 0;
     for (;;) {
         if (!ptrace_available() || !ptrace_any_trace() ||
-            !ptrace_have_tracee(wpid, dead_too)) {
+            !ptrace_have_tracee(sel, dead_too)) {
             siginfo_t si;
             KRusage ru;
             memset(&si, 0, sizeof si);
@@ -3343,7 +3367,7 @@ SYSDEF(waitid) {
         int st;
         s32 rp;
         PtRusage pru;
-        if (ptrace_collect(wpid, pflags, &st, &rp, a4 ? &pru : NULL)) {
+        if (ptrace_collect(sel, pflags, &st, &rp, a4 ? &pru : NULL)) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             si.si_signo = SIGCHLD;
@@ -3387,13 +3411,13 @@ SYSDEF(waitid) {
             return e ? (u64)(s64)e : 0;
         }
         /* Host ECHILD is not terminal while we trace a live non-child (see wait4). */
-        if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(wpid, dead_too)))
+        if (r < 0 && !(werr == ECHILD && ptrace_have_tracee(sel, dead_too)))
             return (u64)(s64)(-werr);
         /* Uncatchable SIGKILL of a non-child tracee: report the synthetic death as
          * a CLD_KILLED SIGCHLD siginfo so waitid does not poll forever (see wait4). */
         int dst, drp;
         if (r < 0 && werr == ECHILD && ((u32)options & G_WEXITED) &&
-            ptrace_reap_dead(wpid, (u32)options & G_WNOWAIT, &dst, &drp,
+            ptrace_reap_dead(sel, (u32)options & G_WNOWAIT, &dst, &drp,
                              a4 ? &pru : NULL)) {
             siginfo_t ki;
             memset(&ki, 0, sizeof ki);
@@ -3405,6 +3429,8 @@ SYSDEF(waitid) {
             int e = waitid_out(c, infop, &ki);
             return e ? (u64)(s64)e : 0;
         }
+        if (nonblock && !(options & WNOHANG))
+            return (u64)(s64)-EAGAIN;      /* O_NONBLOCK pidfd, nothing ready */
         if (options & WNOHANG) {           /* nothing ready: zeroed siginfo */
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
