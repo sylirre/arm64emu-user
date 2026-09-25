@@ -35,10 +35,42 @@ provision_glibc_cross() {
     mkdir -p "$GLIBC/lib" "$GLIBC/tmp"
     # SONAME-versioned runtime only — never the libc.so/libm.so linker
     # scripts. ld.so finds these under the rootfs's default /lib.
+    # libgcc_s.so.1 is in no DT_NEEDED list: see glibc_unwinder.
     for so in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 \
-              libdl.so.2 librt.so.1 libresolv.so.2 libnss_files.so.2; do
+              libdl.so.2 librt.so.1 libresolv.so.2 libnss_files.so.2 \
+              libgcc_s.so.1; do
         [ -e "$SYSROOT/lib/$so" ] && cp -a "$SYSROOT/lib/$so" "$GLIBC/lib/"
     done
+    return 0
+}
+
+# The unwinder, as "<host path> <path in the tree>", or nothing where this
+# host has none (Bionic unwinds without one). glibc names it in no DT_NEEDED
+# list -- it dlopen()s libgcc_s.so.1 the first time it unwinds a thread's
+# stack: pthread_cancel, pthread_exit in a thread other than main, a C++
+# throw -- so no probe binary can report it, and without it each of those
+# aborts with "libgcc_s.so.1 must be installed for pthread_cancel to work".
+# The cross sysroot keeps it beside libc; a native host keeps it beside libc
+# too (it is mirrored at the same absolute path, like the rest), or where
+# the compiler says, which is resolved first since it walks through `..`.
+glibc_unwinder() {   # glibc_unwinder [<native runtime objects>]
+    if [ -e "$SYSROOT/lib/libc.so.6" ]; then
+        [ -e "$SYSROOT/lib/libgcc_s.so.1" ] &&
+            printf '%s %s\n' "$SYSROOT/lib/libgcc_s.so.1" "$GLIBC/lib/libgcc_s.so.1"
+        return 0
+    fi
+    libcdir=$(dirname "$(printf '%s\n' "$@" | grep -m1 '/libc\.')" 2>/dev/null)
+    if [ -n "$libcdir" ] && [ -e "$libcdir/libgcc_s.so.1" ]; then
+        printf '%s %s\n' "$libcdir/libgcc_s.so.1" "$GLIBC$libcdir/libgcc_s.so.1"
+        return 0
+    fi
+    [ -n "$AGCC" ] || return 0
+    u=$("$AGCC" -print-file-name=libgcc_s.so.1 2>/dev/null)
+    case "$u" in
+        /*) [ -e "$u" ] || return 0
+            u=$(readlink -f "$u") || return 0
+            printf '%s %s\n' "$u" "$GLIBC$u" ;;
+    esac
     return 0
 }
 
@@ -110,12 +142,20 @@ elf_interp() {   # elf_interp <binary>
 # recorded on x86 -- every dynamic row then dies at 127 with empty output and
 # a passing oracle beside it. The stamp alone cannot see that, so ask.
 glibc_runtime_stale() {
-    [ -e "$SYSROOT/lib/libc.so.6" ] && return 1   # cross runtime: matches by construction
+    if [ -e "$SYSROOT/lib/libc.so.6" ]; then
+        # Cross runtime: matches by construction -- except a tree provisioned
+        # before the unwinder was part of it.
+        set -- $(glibc_unwinder)
+        [ $# = 2 ] && [ ! -e "$2" ] && return 0
+        return 1
+    fi
     libs=$(glibc_native_objects) || return 1      # cannot tell: leave it alone
     [ -n "$libs" ] || return 1
     for so in $libs; do
         [ -e "$GLIBC$so" ] || return 0
     done
+    set -- $(glibc_unwinder $libs)
+    [ $# = 2 ] && [ ! -e "$2" ] && return 0
     return 1
 }
 
@@ -138,6 +178,11 @@ provision_glibc_native() {
         [ -n "$libcdir" ] && [ -e "$libcdir/$extra" ] &&
             cp -aL "$libcdir/$extra" "$GLIBC$libcdir/" 2>/dev/null
     done
+    set -- $(glibc_unwinder $libs)
+    if [ $# = 2 ]; then
+        mkdir -p "$(dirname "$2")"
+        cp -aL "$1" "$2" 2>/dev/null
+    fi
     return 0
 }
 
