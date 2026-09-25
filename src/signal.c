@@ -27,6 +27,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -731,6 +732,7 @@ void sig_tls_prewarm(void) {
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx);
+static int sig_chld_emulating(void);
 
 /* The capture handler, for the nets that own a number and forward what is a
  * signal rather than a fault (mem.c's SIGBUS net). */
@@ -820,9 +822,27 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
                                 p->code == CLD_DUMPED)) {
         int es = clonekid_exit_signal(p->pid);
         if (es >= 0) {
-            if (es == 0 || es > 64) return;
+            if (es == 0 || es > 64) {   /* dies with no signal at all */
+                g_sig_selfintr = 1;     /* ...so it interrupted nothing */
+                return;
+            }
             p->signo = es;
+        } else if (sig_chld_emulating()) {
+            /* An ordinary child the kernel would have reaped at its death
+             * (sig_chld_host): reaped now, and never waited for. Raw, and
+             * WNOHANG: a signal handler, and a wait may have beaten us. */
+            siginfo_t x;
+            syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, NULL);
         }
+    }
+    /* A child's notice (do_notify_parent and _cldstop) is never sent to a
+     * parent that ignores SIGCHLD: caught all the same when the host may not
+     * reap for it, it goes no further. A SIGCHLD someone sent is another
+     * matter -- delivered, and discarded there, as the kernel's would be. */
+    if (p->signo == SIGCHLD && p->code >= CLD_EXITED && p->code <= CLD_CONTINUED &&
+        *(volatile u64 *)&g_machine.sigact[SIGCHLD].handler == GSIG_IGN) {
+        g_sig_selfintr = 1;   /* never sent: it interrupted nothing */
+        return;
     }
     /* A signal the guest has BLOCKED, caught all the same because its number
      * is held out of the mirrored mask (a sent SIGSEGV, a kill(SIGSYS) --
@@ -1644,6 +1664,59 @@ void sigact_locks_take(void)   { pthread_mutex_lock(&sigact_lock); }
 void sigact_locks_drop(void)   { pthread_mutex_unlock(&sigact_lock); }
 void sigact_locks_reinit(void) { pthread_mutex_init(&sigact_lock, NULL); }
 
+/* Does the guest have its children reaped at their death -- SIGCHLD ignored,
+ * or SA_NOCLDWAIT set (do_notify_parent's autoreap)? */
+int sig_chld_reaps(struct Machine *m) {
+    /* Plain loads, read from a signal handler too: on a 32-bit host an 8-byte
+     * atomic of a 4-aligned member may be libatomic's locked one, and a torn
+     * word can only miss a disposition changing as it is read, which the
+     * kernel's own send races the same way. */
+    u64 h = *(volatile u64 *)&m->sigact[SIGCHLD].handler;
+    u64 f = *(volatile u64 *)&m->sigact[SIGCHLD].flags;
+    return h == GSIG_IGN || (f & G_SA_NOCLDWAIT);
+}
+
+/* ...and is the emulator doing that reaping itself, the host being barred
+ * from it by a clone child (sig_chld_host)? Async-signal-safe. */
+static int sig_chld_emulating(void) {
+    return sig_chld_reaps(&g_machine) && clonekids_any();
+}
+
+/* SIGCHLD's host disposition. The kernel acts on the parent's as it sends:
+ * do_notify_parent_cldstop sends no stop or continue notice to a parent that
+ * ignores SIGCHLD or set SA_NOCLDSTOP, and do_notify_parent reaps a child at
+ * its death, never to be waited for, when the parent ignores SIGCHLD or set
+ * SA_NOCLDWAIT (sending an ignoring one nothing). So the host gets the
+ * guest's SIG_IGN or SIG_DFL with both flags, and does the same -- or, where
+ * the emulator has to see the notices (a handler; a clone child's death to
+ * turn into its own signal, clonekids_signalling), the capture handler with
+ * both flags. Only the reaping cannot always go to the host: the kernel reaps
+ * a child whose death signal is SIGCHLD and never a clone child, while to the
+ * host every child is the former. With a clone child about (clonekids_any),
+ * a guest that has its children reaped has SIGCHLD caught instead, and the
+ * capture reaps the ordinary ones (host_catcher) -- a wait that gets to one
+ * first passes it by (sys_proc.c, chld_autoreaped). The flags used to be
+ * dropped altogether: an SA_NOCLDWAIT parent's children stayed to be waited
+ * for, and an SA_NOCLDSTOP one's handler ran for every stop and continue. */
+static void sig_chld_host(struct Machine *m) {
+    u64 h = m->sigact[SIGCHLD].handler;
+    u64 f = m->sigact[SIGCHLD].flags;
+    int reap = h == GSIG_IGN || (f & G_SA_NOCLDWAIT);
+    int any = clonekids_any();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (h > GSIG_IGN || clonekids_signalling() || (reap && any)) {
+        sa.sa_sigaction = host_catcher;
+        sa.sa_flags = SA_SIGINFO;                 /* deliberately no SA_RESTART */
+        sigfillset(&sa.sa_mask);
+    } else {
+        sa.sa_handler = h == GSIG_IGN ? SIG_IGN : SIG_DFL;
+    }
+    if (h == GSIG_IGN || (f & G_SA_NOCLDSTOP)) sa.sa_flags |= SA_NOCLDSTOP;
+    if (reap && !any) sa.sa_flags |= SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &sa, NULL);
+}
+
 /* sig_host_update's body, for callers that already hold sigact_lock. */
 static void sig_host_update_locked(struct Machine *m, int sig) {
     if (sig < 1 || sig > 64 || sig == SIGKILL || sig == SIGSTOP) return;
@@ -1670,6 +1743,7 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
          __atomic_load_n(&g_sig_remap_armed[1], __ATOMIC_ACQUIRE)))
         return;                                  /* armed 32/33 carrier: keep the
                                                     capture handler installed */
+    if (sig == SIGCHLD) { sig_chld_host(m); return; }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     u64 h = m->sigact[sig].handler;
@@ -1691,11 +1765,7 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
          * (sig_sync_host_mask), so the kernel holds it pending, shows it to
          * sigpending, hands it to sigwait or a signalfd, and discards it at
          * the unblock if nobody took it, as it would for any process. */
-        if (sig_default_terminates(sig) ||
-            (sig == SIGCHLD && clonekids_signalling())) {
-            /* ...and SIGCHLD while a clone child is to report its death with
-             * a signal of its own: the host sends SIGCHLD, and only a catcher
-             * can turn it into that one (host_catcher). */
+        if (sig_default_terminates(sig)) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
@@ -1915,6 +1985,51 @@ static int sc_restart_wanted(CPU *c, unsigned saflags) {
     default:
         return 0;
     }
+}
+
+/* ...and when no handler runs at all -- get_signal found the signal ignored,
+ * or its default ignores, continues or stops: every restart code restarts
+ * then (ERESTARTNOHAND and ERESTART_RESTARTBLOCK too), and only a call that
+ * answered a plain EINTR is left with it -- the ones signal(7) names as
+ * failing with EINTR after a stop even with no handler: epoll_pwait, semop,
+ * sigtimedwait, and a socket with a timeout of its own (sock_intr_errno). */
+static int sc_restart_nohandler(CPU *c) {
+    if (!g_tls.sc_ret_eintr) return 0;
+    int fd = (int)(s32)g_tls.sc_orig_x0;
+    switch (g_tls.sc_nr) {
+    case G_NR_epoll_pwait: case G_NR_epoll_pwait2:
+    case G_NR_rt_sigtimedwait:
+    case G_NR_semop: case G_NR_semtimedop:
+        return 0;
+    case G_NR_read: case G_NR_readv: case G_NR_pread64:
+    case G_NR_preadv: case G_NR_preadv2:
+    case G_NR_accept: case G_NR_accept4: case G_NR_recvfrom:
+    case G_NR_recvmsg: case G_NR_recvmmsg:
+        return !sock_timeo_set(fd, SO_RCVTIMEO);
+    case G_NR_write: case G_NR_writev: case G_NR_pwrite64:
+    case G_NR_pwritev: case G_NR_pwritev2:
+    case G_NR_connect: case G_NR_sendto: case G_NR_sendmsg: case G_NR_sendmmsg:
+    case G_NR_sendfile:
+        return !sock_timeo_set(fd, SO_SNDTIMEO);
+    case G_NR_splice:
+        return !sock_timeo_set(fd, SO_RCVTIMEO) &&
+               !sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO);
+    default:
+        return 1;
+    }
+}
+
+/* A signal taken with no handler to run: the host call it interrupted --
+ * our catcher has no SA_RESTART -- is resumed as the kernel would resume it
+ * (loop.c, syscall_restart_internal, after the delivery). One queued only
+ * because a tracer was to see it goes by sc_restart_nohandler, as it does on
+ * a kernel. Any other the kernel never queued at all -- ignored, or ignored
+ * by default, where the kernel discards it as it is sent; the emulator
+ * catches it anyway, for a death signal a clone child's SIGCHLD stands for,
+ * a notice that needs reaping, a number one of its nets owns -- and it
+ * interrupted nothing. */
+static void sig_taken_quietly(CPU *c, int traced) {
+    if (!traced || sc_restart_nohandler(c)) g_sig_selfintr = 1;
 }
 
 /* One PendSig as the guest's 128-byte siginfo, into `si` (zeroed here). The
@@ -2556,7 +2671,7 @@ void sig_deliver_pending(CPU *c) {
         }
 
         u64 h = sig_action_handler(m, sig);
-        if (h == GSIG_IGN) continue;
+        if (h == GSIG_IGN) { sig_taken_quietly(c, g_ptrace_active); continue; }
         if (h == GSIG_DFL) {
             /* A default-terminate signal: the process's death, performed here
              * -- robust futexes marked, registry slot and SEM_UNDO given
@@ -2571,8 +2686,8 @@ void sig_deliver_pending(CPU *c) {
              * process group stops for SIGSTOP alone (get_signal), which the
              * host's own stop would decide by itself. */
             if (UNLIKELY(g_ptrace_active) && sig_is_stop(sig)) {
-                if (sig != SIGSTOP && pgrp_orphaned()) continue;
-                if (!ptrace_group_stop(c, sig)) continue;
+                if (sig != SIGSTOP && pgrp_orphaned()) { sig_taken_quietly(c, 1); continue; }
+                if (!ptrace_group_stop(c, sig)) { sig_taken_quietly(c, 1); continue; }
             }
             /* Default-ignore/continue disposition: let the host default apply. */
             struct sigaction sa;
@@ -2581,6 +2696,9 @@ void sig_deliver_pending(CPU *c) {
             sigaction(sig, &sa, NULL);
             raise(sig);
             sig_host_update(m, sig);   /* stopped+continued: re-mirror */
+            /* A stop is the kernel's too, whoever sent it; the rest it
+             * discards as they are sent unless a tracer is to see them. */
+            sig_taken_quietly(c, g_ptrace_active || sig_is_stop(sig));
             continue;
         }
         deliver_to_handler(c, sig, &p);

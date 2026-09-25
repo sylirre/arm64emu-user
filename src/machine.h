@@ -670,6 +670,14 @@ int  clonekid_exit_signal(s32 pid);
 /* Is a live clone child of this process to report its death with a signal
  * other than none and SIGCHLD -- so SIGCHLD must be caught (signal.c)? */
 int  clonekids_signalling(void);
+/* Has this process a clone child of any kind, born or being born, that no
+ * wait has reaped -- one the host must not reap at its death, as it does
+ * every child of a parent that ignores SIGCHLD (signal.c, sig_chld_host)?
+ * Async-signal-safe. */
+int  clonekids_any(void);
+/* Does the guest have its children reaped at their death -- SIGCHLD ignored,
+ * or SA_NOCLDWAIT (signal.c)? */
+int  sig_chld_reaps(struct Machine *m);
 /* A host syscall the emulator issues knowing a sandbox may refuse it, where
  * the ENOSYS the SIGSYS net answers IS the guest's answer (the pidfd calls,
  * which the Android app filter blocks): no notice when it is trapped. */

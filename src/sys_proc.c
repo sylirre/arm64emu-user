@@ -1038,7 +1038,12 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
  *     as it is sent;
  *   - a wait that names the child -- wait4(pid), waitid(P_PID), a pidfd --
  *     finds it only where the kernel's rule would, and asks the host without
- *     __WCLONE, since to the host it is an ordinary child.
+ *     __WCLONE, since to the host it is an ordinary child;
+ *   - the reaping at death that ignoring SIGCHLD or SA_NOCLDWAIT asks for,
+ *     which the kernel does for an ordinary child only: while a clone child
+ *     is about (clonekids_any), the host is not let do it, and the ordinary
+ *     children are reaped by the capture and passed by by the waits instead
+ *     (signal.c sig_chld_host, chld_autoreaped below).
  * The table is a shared page, so that each child enters ITSELF before it runs
  * a guest instruction: its death, and so its SIGCHLD, cannot come before its
  * entry, however the parent's threads are scheduled. A reaped child's entry
@@ -1062,6 +1067,9 @@ struct CloneKids {
     u32 nbirth;                  /* children with a death signal of their own
                                   * forked but not yet entered: SIGCHLD must be
                                   * caught for them already (clonekids_signalling) */
+    u32 nborn;                   /* every clone child forked but not yet entered:
+                                  * the host must not reap it at its death
+                                  * already (clonekids_any) */
     struct CloneKid e[CK_MAX];
 };
 
@@ -1150,6 +1158,7 @@ static void clonekids_child_start(struct Machine *m, int exitsig) {
     if (exitsig != SIGCHLD) {
         clonekid_enter(m, exitsig);
         if (ck_signals(exitsig)) __atomic_sub_fetch(&t->nbirth, 1, __ATOMIC_ACQ_REL);
+        __atomic_sub_fetch(&t->nborn, 1, __ATOMIC_ACQ_REL);
     }
     m->clonekids = NULL;
     munmap(t, sizeof *t);
@@ -1178,11 +1187,10 @@ static void clonekid_reaped(struct Machine *m, s32 pid) {
     struct CloneKid *k = clonekid_live(m, pid);
     if (!k) return;
     struct CloneKids *t = m->clonekids;
-    int sig = k->sig;
     k->age = __atomic_add_fetch(&t->age, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&k->state, CK_REAPED, __ATOMIC_RELEASE);
     __atomic_sub_fetch(&t->nlive, 1, __ATOMIC_ACQ_REL);
-    if (ck_signals(sig)) sig_host_update(m, SIGCHLD);   /* maybe the last */
+    sig_host_update(m, SIGCHLD);   /* maybe the last, of either kind */
 }
 
 int clonekids_signalling(void) {
@@ -1195,6 +1203,12 @@ int clonekids_signalling(void) {
             ck_signals(t->e[i].sig))
             return 1;
     return 0;
+}
+
+int clonekids_any(void) {
+    struct CloneKids *t = __atomic_load_n(&g_machine.clonekids, __ATOMIC_ACQUIRE);
+    return t && (__atomic_load_n(&t->nborn, __ATOMIC_ACQUIRE) ||
+                 __atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE));
 }
 
 int clonekid_exit_signal(s32 pid) {
@@ -1233,6 +1247,20 @@ static void clonekid_wait_note(struct Machine *m, u32 opts) {
                     "cannot tell a clone child (exit signal other than SIGCHLD) "
                     "from the others: it is found %s __WCLONE\n",
             (opts & G_WCLONE) ? "only without" : "without");
+}
+
+/* A child the kernel would have reaped at its death, which no wait ever
+ * sees: the guest ignores SIGCHLD or set SA_NOCLDWAIT, and a clone child
+ * about kept the host from reaping it itself (signal.c, sig_chld_host). The
+ * capture reaps such a child when its SIGCHLD arrives; a wait that gets to it
+ * first must not report it -- and reaps it, if it only looked (WNOWAIT). */
+static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
+    if (!sig_chld_reaps(m) || !clonekids_any() || clonekid_live(m, pid)) return 0;
+    if (looked) {
+        siginfo_t x;
+        syscall(SYS_waitid, P_PID, (id_t)pid, &x, WEXITED | WNOHANG, NULL);
+    }
+    return 1;
 }
 
 /* ---- pidfds ----
@@ -1534,8 +1562,9 @@ SYSDEF(clone) {
      * once its entry is there to keep SIGCHLD caught instead. */
     int exitsig = (int)(flags & G_CSIGNAL);
     struct CloneKids *ck = exitsig != SIGCHLD ? clonekids_ensure(m) : NULL;
-    if (ck && ck_signals(exitsig)) {
-        __atomic_add_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+    if (ck) {
+        if (ck_signals(exitsig)) __atomic_add_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+        __atomic_add_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
         sig_host_update(m, SIGCHLD);
     }
     /* CLONE_PIDFD: the descriptor, and parent_tid's writability, settled while
@@ -1546,8 +1575,9 @@ SYSDEF(clone) {
         if (r < 0) {
             if (box) munmap(box, VF_BOX_SIZE);
             proctab_release(rsv);
-            if (ck && ck_signals(exitsig)) {
-                __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+            if (ck) {
+                if (ck_signals(exitsig)) __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+                __atomic_sub_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
                 sig_host_update(m, SIGCHLD);
             }
             return (u64)(s64)r;
@@ -1561,8 +1591,9 @@ SYSDEF(clone) {
         if (box) munmap(box, VF_BOX_SIZE);
         proctab_release(rsv);
         if (pidfd_slot >= 0) fdheld_close(pidfd_slot);
-        if (ck && ck_signals(exitsig)) {
-            __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+        if (ck) {
+            if (ck_signals(exitsig)) __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
+            __atomic_sub_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
             sig_host_update(m, SIGCHLD);
         }
         return (u64)(s64)-e;
@@ -3161,6 +3192,7 @@ SYSDEF(wait4) {
              * appear in a race window (TRACEME after the gate check); drop it
              * with the child, so it cannot go stale. No-op otherwise. */
             if (pid > 0 && (WIFEXITED(status) || WIFSIGNALED(status))) {
+                if (chld_autoreaped(c->m, (s32)pid, 0)) continue;
                 if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
                 children_reaped((s64)ru.ru_maxrss);
@@ -3201,6 +3233,7 @@ SYSDEF(wait4) {
             /* A reaped child's link goes with it; a stop or a continue
              * reported leaves the child, and its link, where they are. */
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                if (chld_autoreaped(c->m, (s32)pid, 0)) continue;
                 ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
                 children_reaped((s64)ru.ru_maxrss);
@@ -3344,6 +3377,11 @@ SYSDEF(waitid) {
                 }
                 return host_err();
             }
+            if (si.si_pid != 0 &&
+                (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+                 si.si_code == CLD_DUMPED) &&
+                chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0))
+                continue;
             /* Defensive: see the matching wait4 comment. */
             if (si.si_pid != 0 && !(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
@@ -3393,6 +3431,11 @@ SYSDEF(waitid) {
         int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
                              (int)hopts | WNOHANG, &ru);
         int werr = errno;
+        if (r == 0 && si.si_pid != 0 &&
+            (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+             si.si_code == CLD_DUMPED) &&
+            chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0))
+            continue;
         if (r == 0 && si.si_pid != 0) {
             /* As in wait4: only a reap takes the child's link with it. */
             if (!(options & WNOWAIT) &&

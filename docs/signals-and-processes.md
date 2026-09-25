@@ -31,6 +31,17 @@ row). The same pass takes the dispositions the emulator was started with —
 reads `SIGHUP` back as `SIG_IGN`, as it would from a kernel, instead of `SIG_DFL`
 while the host went on ignoring it.
 
+`SIGCHLD` carries two flags the kernel acts on as it sends a child's notice,
+and the host gets them with the rest of the disposition (`sig_chld_host`):
+`SA_NOCLDSTOP` (no notice of a child's stop or continue) and `SA_NOCLDWAIT` (a
+child reaped at its death, never to be waited for — at `SIG_DFL` too — though
+a handler still hears of it); `SIG_IGN` means both, and no notice at all. Both
+flags used to be dropped: an `SA_NOCLDWAIT` parent's children stayed zombies
+its waits found, and an `SA_NOCLDSTOP` one's handler ran for every stop and
+continue (`tests/fixtures/sigchldflags.c`). The one part the host cannot always
+be given is the reaping, which the kernel does only for a child whose death
+signal is `SIGCHLD` — see *Clone children, and pidfds*.
+
 Synchronous guest faults (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`) never
 come through the host catcher — they arrive from the interpreter as pending
 exceptions and are delivered directly by `sig_deliver_fault`, which has precise
@@ -1029,9 +1040,30 @@ until its pid comes back, since its `SIGCHLD` may still be on its way to a
 thread when the wait reaps it. What is not kept: a wait for *any* child, or for
 a process group, still finds a clone child without `__WCLONE` and misses it with
 one — keeping that would take enumerating the other children — and it says so,
-once, if such a wait ever meets a live clone child. A `SIGCHLD` the guest
-ignores (`SIG_IGN`) still has the host reap a clone child, which a kernel does
-only for an ordinary one.
+once, if such a wait ever meets a live clone child. Nor may the host reap a
+clone child: a parent that ignores `SIGCHLD` or set `SA_NOCLDWAIT` has its
+children reaped at their death — by the kernel, only those whose death signal
+is `SIGCHLD`, and by the host, which knows every child as one of those, all of
+them. So while a clone child is about (`clonekids_any`, counting a child from
+the fork, before it has entered itself), such a parent's `SIGCHLD` is caught
+rather than handed to the host to act on, the capture reaps the ordinary
+children itself, and a wait that gets to one first passes it by
+(`chld_autoreaped`), as a kernel's wait never sees it. The clone child used to
+be reaped by the host with the rest: its signal never came, and its wait was
+`ECHILD` (`tests/fixtures/sigchldflags.c`).
+
+A notice caught only to be dropped — an ordinary child's, to a parent that
+ignores `SIGCHLD` or keeps it at its default — is one the kernel discards as it
+is sent, and it must interrupt nothing: the catcher has no `SA_RESTART`, so the
+host call it cut short is resumed (`sig_taken_quietly`, through the rewind the
+emulator's own interruptions use). So is one a signal with no handler to run
+cut short at delivery: all of them for a signal the kernel would never have
+queued, and for one it queued only because a tracer was to see it, every call
+but those `signal(7)` lists as failing with `EINTR` whatever the disposition
+(`epoll_pwait`, `semop`, `sigtimedwait`, a socket with a timeout of its own —
+`sc_restart_nohandler`). The emulator used to hand the guest the `EINTR`: a
+`read` or an `epoll_wait` failed because a child died, in a process whose
+children's deaths the kernel would never have told it of.
 
 That was mostly theory until pidfds: Go's probe for them is exactly a clone
 child — a `CLONE_PIDFD` vfork child with exit signal 0, waited for through its

@@ -2856,6 +2856,14 @@ check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndo
 # exit signals into its own. The block is the kernel's (6.17), but for the two
 # thread rows, which are the 6.1 the emulator advertises (see the fixture).
 check_fixture clonepidfd $'pidfd_open a thread: EINVAL\nclone pidfd: ok\nwaitid clone pidfd: ok\nclone child: pid_ok=1 status=3\nclone pidfd|parent_settid: EINVAL\nclone pidfd|thread: EINVAL\nclone pidfd|detached: EINVAL\nclone pidfd, null parent_tid: EFAULT\nvfork pidfd: ok\nwaitid exit-0 child without __WCLONE: ECHILD\nwait4 exit-0 child without __WCLONE: ECHILD\nwaitid exit-0 child with __WCLONE: ok\nexit-0 child: pid_ok=1 status=0\nSIGCHLD for the exit-0 child: 0\nwait4 SIGUSR2 child plain: ECHILD\nwait4 SIGUSR2 child with __WALL: ok\nSIGUSR2 child: status=0 SIGCHLD=0 SIGUSR2=1\nwait4 ordinary child with __WCLONE: ECHILD\nwait4 ordinary child: ok\nordinary child: status=5 SIGCHLD=1\ndone'
+# SIGCHLD's SA_NOCLDSTOP and SA_NOCLDWAIT, and SIG_IGN's reaping, which spares
+# a clone child (signal.c, sig_chld_host): the host acts on what it is given
+# of the guest's disposition, and a clone child about keeps it from reaping
+# at all, the capture doing it for the ordinary children instead -- and a
+# notice the kernel would never have sent, caught all the same, interrupts
+# nothing (sig_taken_quietly). Self-checking: qemu-user forks for a clone child, which then signals with
+# SIGCHLD; the block is the kernel's.
+check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone'
 # rt_sigqueueinfo / rt_tgsigqueueinfo read the sender's siginfo as the kernel
 # does -- kernel_siginfo's 48 bytes, the other 80 only for a layout it does not
 # know (and then they must be zero: E2BIG) -- and hand si_errno on. Self-checking
