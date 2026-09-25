@@ -1317,8 +1317,16 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getpid())
         return -ESRCH;
 
-    /* Stop a SEIZE'd (or otherwise running) tracee on demand. */
+    /* KILL and INTERRUPT are the two requests the kernel takes whatever the
+     * tracee is doing (ptrace_check_attach's ignore_state). */
+    if (req == G_PTRACE_KILL) {
+        kill(e->tgid, SIGKILL);   /* pid may be a thread tid: kill its process */
+        return 0;
+    }
+    /* Stop a SEIZE'd tracee on demand -- only a SEIZEd one: an ATTACHed
+     * tracee has no such stop (EIO). */
     if (req == G_PTRACE_INTERRUPT) {
+        if (!e->seize) return -EIO;
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
             return 0;                            /* already stopped */
         __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
@@ -1326,13 +1334,19 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         return 0;
     }
 
-    /* Requests serviceable without a mailbox round-trip. */
+    /* Everything else is ptrace_check_attach's: a tracee in a stop of its
+     * own, where it answers for itself -- one running, or listening (LISTEN
+     * makes a stop "not TRACED" to ptrace(2) and wait(2) alike), is ESRCH.
+     * SETOPTIONS, GETEVENTMSG, GETSIGINFO, DETACH and LISTEN included: they
+     * used to be answered from the link whatever the tracee was doing, and a
+     * resume request on a listening tracee cancelled the listen. */
+    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED ||
+        __atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
+        return -ESRCH;
+
     switch (req) {
     case G_PTRACE_SETOPTIONS:
         __atomic_store_n(&e->options, (u32)data & G_PTRACE_O_MASK, __ATOMIC_RELEASE);
-        return 0;
-    case G_PTRACE_KILL:
-        kill(e->tgid, SIGKILL);   /* pid may be a thread tid: kill its process */
         return 0;
     case G_PTRACE_GETEVENTMSG: {
         u64 msg = e->eventmsg;
@@ -1343,30 +1357,6 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
          * has none, an ATTACHed tracee's group-stop. */
         if (!e->has_siginfo) return -EINVAL;
         return copy_to_guest(c, data, e->siginfo, sizeof e->siginfo) < 0 ? -EFAULT : 0;
-    }
-
-    /* Everything else requires the tracee to be stopped. */
-    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
-        return -ESRCH;
-
-    /* A listening tracee (post-LISTEN, parked in a group-stop awaiting SIGCONT) is
-     * stopped but counts as "running" to ptrace data ops: a resume op cancels the
-     * listen and proceeds, LISTEN is idempotent, and everything else gets -ESRCH
-     * (exactly as the kernel treats a listening tracee). */
-    if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) {
-        switch (req) {
-        case G_PTRACE_CONT: case G_PTRACE_SYSCALL:
-        case G_PTRACE_SINGLESTEP: case G_PTRACE_DETACH:
-            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
-            break;                      /* fall through to the resume handling */
-        case G_PTRACE_LISTEN:
-            return 0;                   /* already listening */
-        default:
-            return -ESRCH;
-        }
-    }
-
-    switch (req) {
     case G_PTRACE_PEEKTEXT:
     case G_PTRACE_PEEKDATA:
         if (pt_cmd(e, pid, PT_CMD_PEEK, addr, 0) < 0) return -ESRCH;
@@ -1436,12 +1426,16 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     case G_PTRACE_DETACH:
         return pt_cmd(e, pid, PT_CMD_DETACH, data, 0);
     case G_PTRACE_LISTEN:
-        /* Only on a SEIZE'd tracee currently in an EVENT_STOP (a group-stop or a
-         * PTRACE_INTERRUPT stop). Keep it parked-but-listening: it does not resume;
-         * a later SIGCONT (ptrace_signal_cont) ends the group-stop with a fresh
-         * EVENT_STOP. No mailbox round-trip -- the tracee stays parked. */
+        /* Only on a SEIZE'd tracee whose stop is a PTRACE_EVENT_STOP trap (a
+         * group-stop or an INTERRUPT), by its siginfo, as the kernel asks --
+         * a signal-delivery-stop of a stop signal is not one (EIO). Keep it
+         * parked-but-listening: it does not resume; a later SIGCONT
+         * (ptrace_signal_cont) ends the group-stop with a fresh EVENT_STOP.
+         * No mailbox round-trip -- the tracee stays parked. */
         if (!e->seize) return -EIO;
-        if (e->event != G_PTRACE_EVENT_STOP) return -EIO;
+        if (!e->has_siginfo ||
+            (pt_r32(e->siginfo, 8) >> 8) != G_PTRACE_EVENT_STOP)
+            return -EIO;
         __atomic_store_n(&e->listening, 1, __ATOMIC_RELEASE);
         return 0;
     default:
@@ -1493,6 +1487,9 @@ int ptrace_collect(PtWaitSel sel, int flags, int *status, s32 *outpid, PtRusage 
         }
         if (st_state != PT_ST_STOPPED) continue;
         if (__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE)) continue;
+        /* A listening stop is not a stop to wait(2) (task_stopped_code): not
+         * even one only looked at (WNOWAIT) before the LISTEN. */
+        if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) continue;
         int sig = (int)e->stop_sig;
         int st;
         if (e->event) {

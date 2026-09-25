@@ -1696,13 +1696,22 @@ and a tracer never saw them (`tests/ptrace/ignored.c`).
 exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can
 read final registers/exit code before it is gone.
 
+**Which requests a tracee must be stopped for.** Every request but `KILL` and
+`INTERRUPT` is the kernel's `ptrace_check_attach`'s: it wants the tracee in a
+stop of its own, and one running — or listening, below — is `ESRCH`. That
+includes `SETOPTIONS`, `GETEVENTMSG`, `GETSIGINFO`, `DETACH` and `LISTEN`, which
+used to be answered from the registry link whatever the tracee was doing.
+`INTERRUPT` and `LISTEN` are a `SEIZE`d tracee's alone (`EIO` for an `ATTACH`ed
+one), and `LISTEN` wants a `PTRACE_EVENT_STOP` trap, told by the stop's siginfo:
+at a signal-delivery-stop it is `EIO` (`tests/ptrace/reqstate.c`).
+
 **Group-stop listening (`PTRACE_LISTEN`).** After a `SEIZE`'d tracee reports a
 group-stop (above), a tracer `LISTEN`s it to let the stop take effect while staying
 notified. The tracee simply stays parked in its service loop; `LISTEN` only sets a
 `listening` flag on the registry link (no resume, no mailbox round-trip). A
-listening tracee counts as *running* to ptrace data ops — `PEEK*`/`GETREGSET`
-return `-ESRCH`, and a resume request (`CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`)
-cancels the listen — matching the kernel. When `SIGCONT` is delivered to a
+listening tracee counts as *running* to `ptrace(2)` and `wait(2)` alike: every
+request but `KILL` and `INTERRUPT` is `ESRCH`, a resume request included (it
+used to cancel the listen), and no wait reports it. When `SIGCONT` is delivered to a
 listening tracee, the send site (`ptrace_signal_cont`, wired into
 `kill`/`tkill`/`tgkill`) ends the group-stop by re-arming the link as a fresh
 `PTRACE_EVENT_STOP` trap (`WSTOPSIG == SIGTRAP`) and waking the tracer; the tracee,
