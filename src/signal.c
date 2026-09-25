@@ -953,19 +953,18 @@ void sig_raise_local(int sig) {
 /* The signal a ptrace signal-delivery stop hands on, where its call site does
  * not take it itself (ptracetab.c's pt_signal_stop): the one the tracer resumed
  * the thread with, or the stop's own when the tracer died without collecting
- * the stop. The kernel's ptrace_signal delivers it there and then, with no
- * second stop, so it is queued as past its stop -- unless the thread blocks
- * it, when the kernel requeues it as a fresh signal, one that stops again
- * once it is unblocked. */
-void sig_inject_local(int sig, int code, int pid, u64 addr) {
+ * the stop, with the siginfo the stop left it (the guest's layout: a tracer's
+ * SETSIGINFO, or ptrace_signal's SI_USER for a substitute). The kernel's
+ * ptrace_signal delivers it there and then, with no second stop, so it is
+ * queued as past its stop -- unless the thread blocks it, when the kernel
+ * requeues it as a fresh signal, one that stops again once it is
+ * unblocked. */
+static void pendsig_from_guest(PendSig *p, int sig, const u8 *si);
+
+void sig_inject_local(int sig, const u8 *si) {
     sigq_sync();   /* ordinary context: this one can grow the queue itself */
     PendSig p;
-    memset(&p, 0, sizeof p);
-    p.signo = sig;
-    p.code = code;
-    p.pid = pid;
-    p.addr = addr;
-    p.uid = pid ? (int)getuid() : 0;
+    pendsig_from_guest(&p, sig, si);
     p.thr = 1;
     p.ptraced = !(g_tls.sigmask & (1ULL << (sig - 1)));
     if (!sigq_push_local(&p)) return;
@@ -1952,6 +1951,33 @@ static void siginfo_to_guest(u8 *si, int sig, const PendSig *info) {
     }
 }
 
+/* siginfo_to_guest's inverse: a guest siginfo -- what a ptrace stop hands
+ * back, with the tracer's SETSIGINFO in it -- as the PendSig it will be
+ * delivered from. The layout is the one siginfo_to_guest writes for `sig` and
+ * the code; thr and ptraced are the caller's to set. */
+static void pendsig_from_guest(PendSig *p, int sig, const u8 *si) {
+    memset(p, 0, sizeof *p);
+    u32 w;
+    u64 q;
+    p->signo = sig;
+    memcpy(&w, si + 4, 4);  p->err = (int)w;
+    memcpy(&w, si + 8, 4);  p->code = (int)w;
+    if (p->code > 0 && sig == SIGCHLD) {
+        memcpy(&w, si + 16, 4); p->pid = (int)w;
+        memcpy(&w, si + 20, 4); p->uid = (int)w;
+        memcpy(&w, si + 24, 4); p->status = (int)w;
+    } else if (p->code > 0 && is_sync_sig(sig)) {
+        memcpy(&q, si + 16, 8); p->addr = q;
+    } else if (sig == SIGSYS && p->code == SIG_SECCOMP_CODE) {
+        memcpy(&q, si + 16, 8); p->addr = q;
+        memcpy(&w, si + 24, 4); p->status = (int)w;
+    } else {
+        memcpy(&w, si + 16, 4); p->pid = (int)w;
+        memcpy(&w, si + 20, 4); p->uid = (int)w;
+        memcpy(&q, si + 24, 8); p->value = (s64)q;
+    }
+}
+
 /* Deliver `sig` to the guest handler in m->sigact[sig] (caller checked it is
  * a real handler). Builds the frame and redirects the CPU. */
 static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
@@ -2512,9 +2538,21 @@ void sig_deliver_pending(CPU *c) {
          * dispositioned. SIGKILL is never interceptable, and a signal a stop
          * has already handed on is not stopped for again. */
         if (UNLIKELY(g_ptrace_active) && !p.ptraced) {
-            int ns = ptrace_report_signal(c, sig);
+            u8 si[128];
+            siginfo_to_guest(si, sig, &p);
+            int ns = ptrace_report_signal(c, sig, si);
             if (ns == 0) continue;              /* suppressed by the tracer */
-            if (ns != sig) { sig = ns; p.signo = ns; }
+            /* What the tracer left: its SETSIGINFO, or SI_USER from it for a
+             * substitute (ptrace_signal). A signal the thread now blocks is
+             * queued again, a fresh one that stops again once unblocked. */
+            int thr = p.thr;
+            pendsig_from_guest(&p, ns, si);
+            p.thr = thr;
+            sig = ns;
+            if (g_tls.sigmask & (1ULL << (sig - 1))) {
+                sigq_push_local(&p);
+                continue;
+            }
         }
 
         u64 h = sig_action_handler(m, sig);
@@ -2558,20 +2596,23 @@ void sig_deliver_pending(CPU *c) {
 void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr) {
     struct Machine *m = c->m;
     int sig = SIGSYS;
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = sig;
+    p.code = SIG_SECCOMP_CODE;
+    p.addr = c->pc;
+    p.status = nr;
+    p.err = data;   /* SECCOMP_RET_DATA -> si_errno, as the kernel does */
     if (UNLIKELY(g_ptrace_active)) {
-        int ns = ptrace_report_fault(c, sig, SIG_SECCOMP_CODE, c->pc);
+        u8 si[128];
+        siginfo_to_guest(si, sig, &p);
+        int ns = ptrace_report_fault(c, sig, si);
         if (ns == 0) return;
+        pendsig_from_guest(&p, ns, si);   /* as the tracer left it */
         sig = ns;
     }
     u64 h = sig_action_handler(m, sig);
     if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
-        PendSig p;
-        memset(&p, 0, sizeof p);
-        p.signo = sig;
-        p.code = SIG_SECCOMP_CODE;
-        p.addr = c->pc;
-        p.status = nr;
-        p.err = data;   /* SECCOMP_RET_DATA -> si_errno, as the kernel does */
         g_tls.sc_ret_eintr = 0;
         deliver_to_handler(c, sig, &p);
         return;
@@ -2590,21 +2631,26 @@ void sig_deliver_fault(CPU *c, int sig, int code, u64 addr) {
      * substitute another signal. The caller's `code` already equals the intended
      * siginfo si_code (BRK->TRAP_BRKPT, SEGV perm->SEGV_ACCERR / else MAPERR,
      * align->1, undef->1). */
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = sig;
+    p.code = code;
+    p.addr = addr;
     if (UNLIKELY(g_ptrace_active)) {
-        int ns = ptrace_report_fault(c, sig, code, addr);
+        u8 si[128];
+        siginfo_to_guest(si, sig, &p);
+        int ns = ptrace_report_fault(c, sig, si);
         if (ns == 0) return;              /* tracer suppressed: resume the guest */
-        sig = ns;                         /* tracer may have substituted it */
+        /* Delivered as the tracer left it: the fault's own siginfo, one it
+         * set, or SI_USER from it for a substitute (ptrace_signal). */
+        pendsig_from_guest(&p, ns, si);
+        sig = ns;
     }
     u64 h = sig_action_handler(m, sig);
     if (h > GSIG_IGN && !(g_tls.sigmask & (1ULL << (sig - 1)))) {
-        PendSig p;
-        memset(&p, 0, sizeof p);
-        p.signo = sig;
-        p.code = code;
-        p.addr = addr;
         g_tls.sc_ret_eintr = 0;
         deliver_to_handler(c, sig, &p);
         return;
     }
-    force_sig_fault(c, sig, code, addr);
+    force_sig_fault(c, sig, p.code, p.addr);
 }

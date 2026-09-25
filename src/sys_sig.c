@@ -519,7 +519,7 @@ SYSDEF(signalfd4) {
 /* The kernel's own list of si_code values each signal defines
  * (known_siginfo_layout): one of these, or any code <= 0 from SI_DETHREAD up,
  * SI_ASYNCNL or SI_KERNEL, is a layout kernel_siginfo holds entirely. */
-static int sqi_layout_known(int sig, s32 code) {
+int sig_layout_known(int sig, s32 code) {
     if (code == 0x80 /* SI_KERNEL */) return 1;
     if (code > 0) {
         int limit;
@@ -558,7 +558,7 @@ static s64 sqi_read(CPU *c, u64 uinfo, int sig, u8 gsi[48]) {
         memcpy(&own, gsi, 4);
         sig = own;
     }
-    if (!sqi_layout_known(sig, code)) {
+    if (!sig_layout_known(sig, code)) {
         u8 rest[80];
         if (copy_from_guest(c, rest, uinfo + 48, sizeof rest) < 0) return -EFAULT;
         for (size_t i = 0; i < sizeof rest; i++)

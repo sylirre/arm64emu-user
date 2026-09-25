@@ -1616,6 +1616,29 @@ stopped for (a shell's `timeout` signals the whole group) ran on, parked in
 whatever it had been doing, with nobody left to end it
 (`tests/ptrace/tracer_death.c`).
 
+**A stop's siginfo (`GETSIGINFO`/`SETSIGINFO`).** Every stop publishes the
+siginfo the kernel's `last_siginfo` would hold, in the guest's layout, on its
+link. A signal-delivery-stop's is the signal's own — who sent it and how
+(`SI_USER` with the sender's pid and uid, `SI_TKILL`, `SI_QUEUE` and its
+payload), a fault's code and address, a seccomp trap's call; the attach
+`SIGSTOP` is `SI_KERNEL` from nobody, as the kernel's private send is. A trap —
+a syscall stop, an event, a `SEIZE`d tracee's group-stop or `INTERRUPT` —
+carries `ptrace_do_notify`'s: its signal, the stop code as `si_code`
+(`SIGTRAP|0x80`, `PTRACE_EVENT_STOP<<8|signr`, ...) and the tracee's own pid.
+An `ATTACH`ed tracee's group-stop has none at all, and both requests are
+`EINVAL` there — the one way its tracer can tell it from a signal-delivery-stop
+of the same signal. `SETSIGINFO` reads the tracer's siginfo as
+`copy_siginfo_from_user` does (48 bytes, and for a layout the kernel does not
+know the rest, which must be zero, else `E2BIG`) and replaces the stop's. When
+the tracer resumes the tracee with the signal it names, that is what the
+signal is delivered with; with any other, the siginfo becomes `SI_USER` from
+the tracer (`ptrace_signal`'s rewrite), and a signal the tracee now blocks is
+queued again, to stop again once unblocked. The emulator used to answer
+`GETSIGINFO` with the signal number, a code of 0 and, for a fault, the
+address — no sender, no payload, nothing a tracer could tell a `kill` from a
+`sigqueue` by, and `strace` printed every signal as `si_code=SI_USER` from pid
+0 — and `SETSIGINFO` was `EIO` (`tests/ptrace/siginfo.c`).
+
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
 exposing its pending wait-status word via `PTRACE_GETEVENTMSG`, so the tracer can
@@ -1647,8 +1670,8 @@ individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
 `TRACECLONE` — including thread creation, `TRACEEXEC`, `TRACEEXIT`),
 `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
-(writable *and* read-only code pages — software breakpoints), `GETSIGINFO`
-(including `si_addr` for faults), `GETEVENTMSG`, `LISTEN`, and the syscall /
+(writable *and* read-only code pages — software breakpoints),
+`GETSIGINFO`/`SETSIGINFO` (each stop's own, above), `GETEVENTMSG`, `LISTEN`, and the syscall /
 signal / group / synchronous-fault / execve / fork-clone-thread / attach /
 pre-exit stops above. Everything works under both the interpreter and `--jit`.
 Unimplemented requests return `-EIO`/`-ESRCH` rather than misbehaving.

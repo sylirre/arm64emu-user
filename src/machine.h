@@ -693,8 +693,13 @@ void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr);
  * (routes a traced process's self-directed stop signal through ptrace). */
 void sig_raise_local(int sig);
 /* Queue the signal a ptrace signal-delivery stop hands on (ptracetab.c), as
- * one past its stop: delivered without being reported again. */
-void sig_inject_local(int sig, int code, int pid, u64 addr);
+ * one past its stop: delivered without being reported again, with the stop's
+ * siginfo as the tracer left it (the guest's 128-byte layout). */
+void sig_inject_local(int sig, const u8 *si);
+/* Does the kernel know the layout of this si_code for this signal
+ * (known_siginfo_layout)? If not, a siginfo read from userspace must be zero
+ * past kernel_siginfo's 48 bytes (sys_sig.c). */
+int  sig_layout_known(int sig, s32 code);
 /* rt_sigreturn implementation. */
 void sig_return(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */

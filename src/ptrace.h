@@ -110,12 +110,14 @@ void ptrace_exec_takeover(CPU *c, void *link);
  * as a tracee. */
 void ptrace_leader_zombie(void);
 /* Signal-delivery stop: the tracer sees WSTOPSIG==sig and may suppress it or
- * substitute another. Returns the signal to actually deliver (0 = suppressed). */
-int  ptrace_report_signal(CPU *c, int sig);
-/* Synchronous-fault stop (BRK breakpoint SIGTRAP, SIGSEGV/SIGBUS/SIGILL/SIGFPE):
- * like ptrace_report_signal but with precise siginfo (si_code, and si_addr for
- * the fault families). Returns the signal to deliver (0 = suppressed). */
-int  ptrace_report_fault(CPU *c, int sig, int si_code, u64 addr);
+ * substitute another. `si` is the signal's siginfo in the guest's layout (what
+ * GETSIGINFO shows) and comes back as the tracer left it: a SETSIGINFO's, or
+ * SI_USER from the tracer for a substitute. Returns the signal to actually
+ * deliver (0 = suppressed). */
+int  ptrace_report_signal(CPU *c, int sig, u8 *si);
+/* Synchronous-fault stop (BRK breakpoint SIGTRAP, SIGSEGV/SIGBUS/SIGILL/SIGFPE,
+ * a seccomp SIGSYS): the same, for a signal no queue carries. */
+int  ptrace_report_fault(CPU *c, int sig, u8 *si);
 /* PTRACE_SINGLESTEP: report the SIGTRAP stop after one stepped instruction. */
 void ptrace_report_singlestep(CPU *c);
 /* A traced thread taking a stop signal's default action: the kernel's

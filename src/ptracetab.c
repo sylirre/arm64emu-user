@@ -127,9 +127,12 @@ typedef struct {
                           * death (claimed with the one it had): what a wait
                           * for a group asks once the task itself is gone */
     u64 eventmsg;        /* PTRACE_GETEVENTMSG payload */
-    s32 si_signo, si_code, si_errno;   /* stored siginfo for GETSIGINFO */
-    u64 fault_addr;      /* siginfo si_addr for fault stops (SIGSEGV/TRAP/...);
-                          * not named si_addr — that is a glibc signal.h macro */
+    u8  siginfo[128];    /* the current stop's siginfo, in the guest's layout:
+                          * what GETSIGINFO reads and SETSIGINFO rewrites (its
+                          * last_siginfo); has_siginfo 0 for a stop that has
+                          * none -- an ATTACHed tracee's group-stop, where
+                          * both are EINVAL */
+    u32 has_siginfo;
     PtRusage ru;         /* accounting as of the current stop (pt_ru_stamp) */
     /* futex mailbox: tracer bumps cmd_seq to submit, tracee bumps done_seq. */
     u32 cmd_seq, done_seq;
@@ -240,8 +243,7 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
             e->tgid = tgid;
             e->tracer = 0; e->options = 0; e->state = PT_ST_RUNNING;
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
-            e->eventmsg = 0; e->si_signo = e->si_code = e->si_errno = 0;
-            e->fault_addr = 0;
+            e->eventmsg = 0; e->has_siginfo = 0;
             e->attach_pending = e->interrupt_pending = 0;
             e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
             e->pgid = (s32)getpgid((pid_t)tracee);   /* ours or the target's */
@@ -391,6 +393,37 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
     }
 }
 
+/* ---- a stop's siginfo (what GETSIGINFO hands the tracer) ---- */
+static void pt_w32(u8 *si, int off, u32 v) { memcpy(si + off, &v, 4); }
+static u32 pt_r32(const u8 *si, int off) { u32 v; memcpy(&v, si + off, 4); return v; }
+
+/* ptrace_do_notify's: a trap -- a syscall stop, an event, a SEIZEd tracee's
+ * group-stop or INTERRUPT -- reports its signal and its stop code (the
+ * status's high bits, e.g. SIGTRAP|0x80, or PTRACE_EVENT_STOP<<8|signr), from
+ * the tracee itself. */
+static void pt_si_notify(u8 *si, int signr, int code) {
+    memset(si, 0, 128);
+    pt_w32(si, 0, (u32)signr);
+    pt_w32(si, 8, (u32)code);
+    pt_w32(si, 16, (u32)g_tls.tid);
+    pt_w32(si, 20, (u32)getuid());
+}
+
+/* A signal of the tracee's own that no queue carried (pt_signal_stop): the
+ * siginfo it is delivered with. A positive code is a fault's (si_addr); any
+ * other is a sent one's (si_pid, and si_uid unless it came from nobody). */
+static void pt_si_signal(u8 *si, int sig, int code, s32 pid, u64 addr) {
+    memset(si, 0, 128);
+    pt_w32(si, 0, (u32)sig);
+    pt_w32(si, 8, (u32)code);
+    if (code > 0 && code != 0x80 /* SI_KERNEL */) {
+        memcpy(si + 16, &addr, 8);
+    } else {
+        pt_w32(si, 16, (u32)pid);
+        pt_w32(si, 20, pid ? (u32)getuid() : 0);
+    }
+}
+
 /* ---- tracee: service loop + stop core ---- */
 /* Host-task liveness, defined with the rest of the tracer side at the bottom:
  * the parked tracee below needs the zombie test, pt_cmd the dead one. */
@@ -427,11 +460,13 @@ static int pt_orphaned_sig(const PtLink *e) {
 
 /* Serve tracer commands while stopped. Returns the signal to inject on resume
  * (0 = none/suppressed), which matters for signal-delivery stops -- or, if the
- * tracer died, the one the stop leaves (pt_orphaned_sig). `seen` is the
+ * tracer died, the one the stop leaves (pt_orphaned_sig) -- and hands back in
+ * `si` (when not NULL) the stop's siginfo as the tracer left it, read before a
+ * detach frees the link. `seen` is the
  * cmd_seq snapshot taken *before* the stop was published (see pt_stop): the
  * tracer can only post a command after observing STOPPED, so any command bumps
  * cmd_seq past `seen` and is never missed by this loop. */
-static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
+static int pt_service_loop(CPU *c, PtLink *e, u32 seen, u8 *si) {
     int inject = 0;
     for (;;) {
         while (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) == seen) {
@@ -535,12 +570,14 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
             g_ptrace_syscall_armed = (e->arg == PT_RES_SYSCALL);
             g_ptrace_singlestep    = (e->arg == PT_RES_SINGLESTEP);
             inject = (int)e->addr;
+            if (si) memcpy(si, e->siginfo, 128);   /* as a SETSIGINFO left it */
             e->result = 0;
             __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE);
             leave = 1;
             break;
         case PT_CMD_DETACH:
             inject = (int)e->addr;
+            if (si) memcpy(si, e->siginfo, 128);   /* before the link is freed */
             e->result = 0;
             /* Answer *before* releasing the link: pt_self_detach frees the
              * registry slot, which a tracer still waiting on the mailbox would
@@ -559,12 +596,12 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen) {
     }
 }
 
-/* Publish a stop and park until the tracer resumes us. Returns the inject sig.
- * si_code/si_addr override the stored siginfo for a fault stop (BRK breakpoint,
- * SIGSEGV, ...); pass 0/0 for syscall/signal/event stops (si_code is then
- * event-derived, matching the wait-status high byte). */
-static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
-                   int si_code, u64 fault_addr) {
+/* Publish a stop and park until the tracer resumes us. Returns the signal to
+ * inject (0 = none). `si` is the stop's siginfo (NULL: a stop that has none),
+ * and comes back as the tracer left it -- rewritten by PTRACE_SETSIGINFO, and
+ * by ptrace_signal's own rule when the tracer resumed us with a signal other
+ * than the one it names: SI_USER, from the tracer. */
+static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
     PtLink *e = g_self_link;
     if (!e) return stop_sig;
     /* Snapshot the mailbox sequence before publishing the stop: a command the
@@ -575,10 +612,9 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
     e->stop_sig = (u32)stop_sig;
     e->event = (u32)event;
     e->syscall_stop = (u32)syscall_stop;
-    e->si_signo = stop_sig;
-    e->si_code = si_code ? si_code : (event ? ((event << 8) | 5 /*SIGTRAP*/) : 0);
-    e->fault_addr = fault_addr;
-    e->si_errno = 0;
+    if (si) memcpy(e->siginfo, si, 128);
+    e->has_siginfo = si != NULL;
+    s32 tracer = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
     pt_ru_stamp(e);
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
@@ -587,8 +623,18 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
      * host wait or a gdb-style SIGCHLD event loop. */
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
-    pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
-    return pt_service_loop(c, e, seen);
+    pt_wake_tracer(tracer);
+    int ns = pt_service_loop(c, e, seen, si);
+    if (ns && si) {
+        if ((u32)ns != pt_r32(si, 0)) {
+            memset(si, 0, 128);
+            pt_w32(si, 0, (u32)ns);
+            pt_w32(si, 8, (u32)SI_USER);
+            pt_w32(si, 16, (u32)tracer);
+            pt_w32(si, 20, (u32)getuid());
+        }
+    }
+    return ns;
 }
 
 /* A signal-delivery stop whose call site has no delivery of its own to hand
@@ -601,17 +647,27 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop,
  * `addr` are the siginfo the stop's own signal carries; a substitute is
  * SI_USER from the tracer (ptrace_signal's rewrite of a changed signal). */
 static void pt_signal_stop(CPU *c, int sig, int event, int code, s32 pid, u64 addr) {
-    s32 tracer = __atomic_load_n(&g_self_link->tracer, __ATOMIC_ACQUIRE);
-    int ns = pt_stop(c, sig, event, 0, 0, 0);
-    if (!ns) return;
-    if (ns == sig) sig_inject_local(ns, code, pid, addr);
-    else           sig_inject_local(ns, SI_USER, tracer, 0);
+    u8 si[128];
+    if (event) pt_si_notify(si, sig, sig | (event << 8));
+    else       pt_si_signal(si, sig, code, pid, addr);
+    int ns = pt_stop(c, sig, event, 0, si);
+    if (ns) sig_inject_local(ns, si);
 }
 
 void ptrace_report_syscall(CPU *c, int is_exit) {
     if (!g_ptrace_active || !g_self_link) return;
     (void)is_exit;
-    pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, 0, 0);
+    u8 si[128];
+    pt_si_notify(si, SIGTRAP, SIGTRAP |
+                 ((g_self_link->options & G_PTRACE_O_TRACESYSGOOD) ? 0x80 : 0));
+    pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, si);
+}
+
+/* An event stop (fork, clone, exec, exit, ...): ptrace_event's trap. */
+static void pt_event_stop(CPU *c, int event) {
+    u8 si[128];
+    pt_si_notify(si, SIGTRAP, (event << 8) | SIGTRAP);
+    pt_stop(c, SIGTRAP, event, 0, si);
 }
 
 void ptrace_report_exec(CPU *c, s32 old_tid) {
@@ -629,7 +685,7 @@ void ptrace_report_exec(CPU *c, s32 old_tid) {
      * exec'ing thread had, which a tracer following threads needs to retire
      * that tid (it will never hear of it again). */
     g_self_link->eventmsg = (u64)(u32)old_tid;
-    if (event) pt_stop(c, SIGTRAP, event, 0, 0, 0);
+    if (event) pt_event_stop(c, event);
     else       pt_signal_stop(c, SIGTRAP, 0, SI_USER, (s32)getpid(), 0);
 }
 
@@ -687,13 +743,13 @@ void ptrace_leader_zombie(void) {
     g_ptrace_skip_syscall_stop = 0;
 }
 
-int ptrace_report_signal(CPU *c, int sig) {
+int ptrace_report_signal(CPU *c, int sig, u8 *si) {
     if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
     /* A SEIZE'd tracee reports a stop signal as a group-stop (PTRACE_EVENT_STOP,
      * WSTOPSIG == the stop signal); a PTRACE_ATTACH'd tracee sees it as a plain
      * signal-delivery-stop (event 0), matching the kernel. */
     int event = (g_self_link->seize && pt_is_stopsig(sig)) ? G_PTRACE_EVENT_STOP : 0;
-    return pt_stop(c, sig, event, 0, 0, 0);
+    return pt_stop(c, sig, event, 0, si);
 }
 
 /* Synchronous-fault stop (software breakpoint BRK, SIGSEGV/SIGBUS/SIGILL/...):
@@ -701,9 +757,9 @@ int ptrace_report_signal(CPU *c, int sig) {
  * fault families, si_addr) before the guest handler/fatal decision. Returns 0
  * if the tracer suppressed it (resume the guest), else the signal to deliver
  * (the original, or one the tracer substituted). SIGKILL is never intercepted. */
-int ptrace_report_fault(CPU *c, int sig, int si_code, u64 addr) {
+int ptrace_report_fault(CPU *c, int sig, u8 *si) {
     if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
-    return pt_stop(c, sig, 0, 0, si_code, addr);
+    return pt_stop(c, sig, 0, 0, si);
 }
 
 void ptrace_report_singlestep(CPU *c) {
@@ -720,7 +776,7 @@ void ptrace_report_exit_stop(CPU *c, int wstatus) {
      * wait-status word via PTRACE_GETEVENTMSG so the tracer can read final
      * registers/exit code. On resume the caller proceeds to the real exit. */
     g_self_link->eventmsg = (u64)(u32)wstatus;
-    pt_stop(c, SIGTRAP, G_PTRACE_EVENT_EXIT, 0, 0, 0);
+    pt_event_stop(c, G_PTRACE_EVENT_EXIT);
 }
 
 /* Run-loop boundary: a tracer PTRACE_ATTACH/SEIZE/INTERRUPT'd us via the kick
@@ -748,7 +804,7 @@ void ptrace_service_kick(CPU *c) {
     if (g_self_link &&
         __atomic_load_n(&g_self_link->interrupt_pending, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&g_self_link->interrupt_pending, 0, __ATOMIC_RELEASE);
-        pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+        pt_event_stop(c, G_PTRACE_EVENT_STOP);
     }
     /* A stop signal (SIGSTOP/SIGTSTP/...) another process sent us as a tracee:
      * report it as a cooperative group-stop with that signal as WSTOPSIG. */
@@ -770,9 +826,14 @@ int ptrace_group_stop(CPU *c, int sig) {
      * tracee, a plain WSTOPSIG for an ATTACH'd one. The trap's return is
      * ignored there, so is the signal the tracer resumes it with here. */
     int event = g_self_link->seize ? G_PTRACE_EVENT_STOP : 0;
+    u8 si[128];
+    pt_si_notify(si, sig, sig | (event << 8));
     pt_in_group_stop = 1;
     pt_orphaned = 0;
-    pt_stop(c, sig, event, 0, 0, 0);
+    /* An ATTACHed tracee's group-stop has no siginfo at all (ptrace_stop's
+     * NULL): GETSIGINFO's EINVAL is how its tracer tells it from a
+     * signal-delivery-stop of the same signal. */
+    pt_stop(c, sig, event, 0, event ? si : NULL);
     pt_in_group_stop = 0;
     return pt_orphaned ? sig : 0;
 }
@@ -904,7 +965,7 @@ s32 ptrace_tracer_of(s32 tid) {
 void ptrace_report_event(CPU *c, int event, u64 msg) {
     if (!g_ptrace_active || !g_self_link) return;
     g_self_link->eventmsg = msg;
-    pt_stop(c, SIGTRAP, event, 0, 0, 0);
+    pt_event_stop(c, event);
 }
 
 /* Child side of a clone/fork. `event` is nonzero when the parent's tracer is
@@ -967,7 +1028,7 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
     /* Initial attach stop: an auto-attached child of a SEIZE'd tracee stops
      * with PTRACE_EVENT_STOP, of an ATTACH'd one with SIGSTOP (kernel
      * behavior). The tracer sees it, (re)sets options and resumes us. */
-    if (seize) pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+    if (seize) pt_event_stop(c, G_PTRACE_EVENT_STOP);
     else       pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);   /* sigaddset'd */
     /* On resume the tracer has typically armed PTRACE_SYSCALL; skip the spurious
      * syscall-exit of the clone we were born from (we never entered it). */
@@ -1001,7 +1062,7 @@ void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize) {
  * the clone syscall it was born from. */
 void ptrace_thread_child_stop(CPU *c) {
     if (!g_ptrace_active || !g_self_link) return;
-    if (g_self_link->seize) pt_stop(c, SIGTRAP, G_PTRACE_EVENT_STOP, 0, 0, 0);
+    if (g_self_link->seize) pt_event_stop(c, G_PTRACE_EVENT_STOP);
     else                    pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);
 }
 
@@ -1163,9 +1224,13 @@ int ptrace_signal_cont(s32 id, int sig) {
         e->stop_sig = SIGTRAP;
         e->event = G_PTRACE_EVENT_STOP;
         e->syscall_stop = 0;
-        e->si_signo = SIGTRAP;
-        e->si_code = (G_PTRACE_EVENT_STOP << 8) | SIGTRAP;
-        e->si_errno = 0;
+        /* The trap the tracee takes, as if it notified it itself. */
+        memset(e->siginfo, 0, sizeof e->siginfo);
+        pt_w32(e->siginfo, 0, SIGTRAP);
+        pt_w32(e->siginfo, 8, (G_PTRACE_EVENT_STOP << 8) | SIGTRAP);
+        pt_w32(e->siginfo, 16, (u32)t);
+        pt_w32(e->siginfo, 20, (u32)getuid());
+        e->has_siginfo = 1;
         /* state is already PT_ST_STOPPED (the tracee never left its service loop). */
         __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
@@ -1271,23 +1336,11 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         u64 msg = e->eventmsg;
         return copy_to_guest(c, data, &msg, 8) < 0 ? -EFAULT : 0;
     }
-    case G_PTRACE_GETSIGINFO: {
-        u8 si[128];
-        memset(si, 0, sizeof si);
-        s32 *w = (s32 *)si;
-        w[0] = e->si_signo;
-        w[1] = e->si_errno;
-        w[2] = e->si_code;
-        /* Fault signals carry si_addr in the _sigfault union, at byte offset 16
-         * on arm64 (after si_signo/si_errno/si_code and pointer alignment pad).
-         * gdb reads it for SIGSEGV/SIGBUS; TRAP_BRKPT carries the BRK PC. */
-        switch (e->si_signo) {
-        case SIGSEGV: case SIGBUS: case SIGILL: case SIGFPE: case SIGTRAP:
-            memcpy(si + 16, &e->fault_addr, 8);
-            break;
-        }
-        return copy_to_guest(c, data, si, sizeof si) < 0 ? -EFAULT : 0;
-    }
+    case G_PTRACE_GETSIGINFO:
+        /* The stop's own siginfo (ptrace_getsiginfo): EINVAL for a stop that
+         * has none, an ATTACHed tracee's group-stop. */
+        if (!e->has_siginfo) return -EINVAL;
+        return copy_to_guest(c, data, e->siginfo, sizeof e->siginfo) < 0 ? -EFAULT : 0;
     }
 
     /* Everything else requires the tracee to be stopped. */
@@ -1327,6 +1380,26 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         return e->result < 0 ? -EIO : 0;
     case G_PTRACE_POKEUSR:
         return -EIO;   /* user-area writes not modelled (gdb uses SETREGSET) */
+    case G_PTRACE_SETSIGINFO: {
+        /* ptrace_setsiginfo: the tracer's siginfo replaces the stop's, read as
+         * copy_siginfo_from_user reads one -- kernel_siginfo's 48 bytes, and
+         * for a layout the kernel does not know the rest, which must be zero
+         * -- and is what the signal is delivered with if the tracee is resumed
+         * with the signal it names. A stop with none (an ATTACHed group-stop)
+         * takes none: EINVAL. */
+        u8 si[128];
+        memset(si, 0, sizeof si);
+        if (copy_from_guest(c, si, data, 48) < 0) return -EFAULT;
+        if (!sig_layout_known((int)pt_r32(si, 0), (s32)pt_r32(si, 8))) {
+            u8 rest[80];
+            if (copy_from_guest(c, rest, data + 48, sizeof rest) < 0) return -EFAULT;
+            for (size_t i = 0; i < sizeof rest; i++)
+                if (rest[i]) return -E2BIG;
+        }
+        if (!e->has_siginfo) return -EINVAL;
+        memcpy(e->siginfo, si, sizeof si);
+        return 0;
+    }
     case G_PTRACE_GETREGSET: {
         GIovec iov;
         if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
