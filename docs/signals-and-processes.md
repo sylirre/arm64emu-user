@@ -77,7 +77,18 @@ hold what a kernel's pending queue holds, by the kernel's own two rules:
 
 Growth belongs to the consumer: the capture handler cannot allocate, so it
 asks and the next consumer (every one of them starts with `sigq_sync`) does it
-with signals blocked. That leaves the case no queue can be sized for — the
+with signals blocked — every host signal but the host libc's own (32 up to its
+`SIGRTMIN`: glibc's setxid broadcast and musl's `__synccall` wait for every
+thread to answer theirs), by the raw syscall with the kernel's 64-bit set
+(`host_block_all`). A `sigfillset`'d `sigset_t` is four bytes on 32-bit Bionic
+and blocked nothing above 32 there — none of the RT signals a flood is made of.
+The same goes for the few places a thread queues a signal for itself (a traced
+self-stop, the signal a ptrace stop hands on, `sigq_push_local`): the handler
+is the only writer of the queue's head, and one that landed inside such a push
+wrote the same slot, losing an entry and leaving its count raised — after which
+a standard signal of that number was taken for pending and never queued again.
+
+That leaves the case no queue can be sized for — the
 **burst**, where the kernel delivers a whole pile of signals back to back with
 none of the emulator's own code running in between. A thread parked in a
 blocking syscall while a flood queues up behind it wakes to exactly that.

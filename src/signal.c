@@ -194,6 +194,31 @@ static int sigq_limit(void) {
 
 static int sigq_next(int t) { return t + 1 == sigq_cap ? 0 : t + 1; }
 
+/* The queue's critical sections, where the capture handler must not land:
+ * every host signal blocked but the host libc's own (32 up to its SIGRTMIN --
+ * glibc's setxid broadcast and musl's __synccall wait for every thread to
+ * answer theirs, and a thread that exits with one blocked never does), and
+ * the mask before, to put back. By the raw syscall with the kernel's 64-bit
+ * set: a sigfillset'd sigset_t is four bytes on 32-bit Bionic and blocked
+ * nothing above 32 there -- none of the RT signals a flood is made of. */
+static u64 host_block_all(void) {
+    u64 all = ~0ULL, prev = 0;
+    for (int s = 32; s < SIGRTMIN && s <= 64; s++) all &= ~(1ULL << (s - 1));
+#ifdef SYS_rt_sigprocmask
+    if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8) == 0)
+        return prev;
+#endif
+    sigset_t s, o;
+    sigfillset(&s);
+    sigemptyset(&o);
+    pthread_sigmask(SIG_BLOCK, &s, &o);
+    for (int i = 1; i <= 64; i++)
+        if (sigismember(&o, i) == 1) prev |= 1ULL << (i - 1);
+    return prev;
+}
+
+static void host_set_mask(u64 mask);   /* the restore: SIG_SETMASK, raw */
+
 /* Ordinary context: double the queue, up to the limit. Signals are blocked
  * across the swap only -- the allocation itself is done first, outside it --
  * so the capture handler can never be appending into the buffer being
@@ -206,9 +231,7 @@ static void sigq_regrow(void) {
     if (want > lim) want = lim;
     PendSig *nb = malloc((size_t)want * sizeof *nb);
     if (!nb) return;   /* keep what we have: the gate covers the shortfall */
-    sigset_t all, prev;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, &prev);
+    u64 prev = host_block_all();
     int n = 0;
     for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) nb[n++] = sigq[t];
     PendSig *old = sigq == sigq_base ? NULL : sigq;
@@ -216,7 +239,7 @@ static void sigq_regrow(void) {
     sigq_cap = want;
     sigq_tail = 0;
     sigq_head = n;
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
     free(old);
 }
 
@@ -337,9 +360,7 @@ static void sigq_reset(void) {
      * blocks back: this thread is starting over (a new image, or an ending
      * thread) and nothing here is holding anything for the kernel. */
     sigq_ungate_now();
-    sigset_t all, prev;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, &prev);
+    u64 prev = host_block_all();
     PendSig *old = sigq == sigq_base ? NULL : sigq;
     sigq = sigq_base;
     sigq_cap = SIGQ_MIN;
@@ -349,7 +370,7 @@ static void sigq_reset(void) {
                        * entries: the queue this reset leaves behind is empty */
     memset((void *)sigq_cnt, 0, sizeof sigq_cnt);
     g_sig_npend = 0;
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
     free(old);
 }
 
@@ -375,7 +396,8 @@ void sig_fork_child(void) {
 }
 
 /* Append one captured signal. Async-signal-safe: no allocation, no lock, and
- * the only producer is this thread's own handlers, which never nest. Returns
+ * the only producer is this thread's own handlers, which never nest -- or the
+ * thread itself with them kept out (sigq_push_local). Returns
  * 0 when it is not queued -- because a standard signal is already pending, as
  * on a kernel, or because the queue is full and it had to be dropped. */
 static int sigq_push(const PendSig *p, void *uctx) {
@@ -412,6 +434,19 @@ static int sigq_push(const PendSig *p, void *uctx) {
      * and sigq_gate sees that and returns. */
     if (cap - 2 - used < SIGQ_GATE) sigq_gate(uctx);
     return 1;
+}
+
+/* sigq_push from ordinary context. The capture handler is the ring's
+ * producer, and the only writer of its head: one landing between this
+ * thread's read of the head and its store of the next one wrote the same slot
+ * -- one of the two entries lost, and its count left raised, after which a
+ * standard signal of that number was taken for pending and never queued
+ * again. So the handler is kept out for the push. */
+static int sigq_push_local(const PendSig *p) {
+    u64 prev = host_block_all();
+    int r = sigq_push(p, NULL);
+    host_set_mask(prev);
+    return r;
 }
 
 /* Lower g_sig_npend for a queue the consumer has just seen empty -- but
@@ -911,7 +946,7 @@ void sig_raise_local(int sig) {
     p.signo = sig;
     p.pid = (int)getpid();
     p.thr = 1;   /* a stop this thread raised for itself: never a host one */
-    if (!sigq_push(&p, NULL)) return;
+    if (!sigq_push_local(&p)) return;
     jit_signal_interrupt();
 }
 
@@ -933,7 +968,7 @@ void sig_inject_local(int sig, int code, int pid, u64 addr) {
     p.uid = pid ? (int)getuid() : 0;
     p.thr = 1;
     p.ptraced = !(g_tls.sigmask & (1ULL << (sig - 1)));
-    if (!sigq_push(&p, NULL)) return;
+    if (!sigq_push_local(&p)) return;
     jit_signal_interrupt();
 }
 
@@ -1434,9 +1469,7 @@ static void sig_retarget(int exiting) {
     if (!sigq || sigq_tail == sigq_head) return;
     if (!exiting && __atomic_load_n(&g_machine.as.nthreads, __ATOMIC_ACQUIRE) <= 1)
         return;
-    sigset_t all, prev;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, &prev);   /* the ring's producer */
+    u64 prev = host_block_all();   /* the ring's producer */
     u64 go = 0;
     for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
         u64 bit = 1ULL << (sigq[t].signo - 1);
@@ -1478,13 +1511,11 @@ static void sig_retarget(int exiting) {
     }
     if (exiting)   /* what is left was the thread's own */
         while (sigq_tail != sigq_head) sigq_take(sigq_tail);
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
 }
 
 void sig_thread_exit(void) {
-    sigset_t all;
-    sigfillset(&all);
-    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    (void)host_block_all();
     /* What the gate holds back is still in the kernel's queue, which is
      * where the kernel would keep it: another thread's, or gone with this
      * one. Opening it now would only pull it in here to be dropped. */
@@ -2224,9 +2255,7 @@ static int host_take_pending(u64 set, siginfo_t *si) {
 }
 
 void sig_handover_give(int all) {
-    sigset_t allsig, prev;
-    sigfillset(&allsig);
-    pthread_sigmask(SIG_BLOCK, &allsig, &prev);   /* the ring's producer */
+    u64 prev = host_block_all();   /* the ring's producer */
     sigq_sync();
     while (__atomic_test_and_set(&dt_hand_lk, __ATOMIC_ACQUIRE)) ;
     /* Given, and so gone from here: the thread's exit would otherwise hand
@@ -2251,7 +2280,7 @@ void sig_handover_give(int all) {
         }
     }
     __atomic_clear(&dt_hand_lk, __ATOMIC_RELEASE);
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
 }
 
 /* The host's thread-private pending set for the calling thread: /proc's
@@ -2281,9 +2310,7 @@ static u64 host_private_pending(void) {
  * kernel kills, and a dying thread's own signals die with it. The process's
  * shared ones stay. */
 void sig_leader_takeover(void) {
-    sigset_t allsig, prev;
-    sigfillset(&allsig);
-    pthread_sigmask(SIG_BLOCK, &allsig, &prev);
+    u64 prev = host_block_all();
     sigq_sync();
     for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
         if (sigq[t].thr) sigq_take(t);   /* moves the older ones up */
@@ -2296,18 +2323,16 @@ void sig_leader_takeover(void) {
         siginfo_t si;
         host_take_pending(pend & -pend, &si);
     }
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
 }
 
 void sig_handover_take(void) {
-    sigset_t allsig, prev;
-    sigfillset(&allsig);
-    pthread_sigmask(SIG_BLOCK, &allsig, &prev);
+    u64 prev = host_block_all();
     while (__atomic_test_and_set(&dt_hand_lk, __ATOMIC_ACQUIRE)) ;
     for (int i = 0; i < dt_hand_n; i++) sigq_push(&dt_hand[i], NULL);
     dt_hand_n = 0;
     __atomic_clear(&dt_hand_lk, __ATOMIC_RELEASE);
-    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    host_set_mask(prev);
 }
 
 /* One PendSig as the 128-byte guest siginfo rt_sigtimedwait hands back. */
