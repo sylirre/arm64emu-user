@@ -913,8 +913,13 @@ do by themselves; it used to end the program here (`tests/fixtures/smallabi.c`).
 `SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
 `TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, plus the filter's
 own `SECCOMP_RET_DATA` in `si_errno` — that is how one filter tells its several
-traps apart — with the call skipped and `-ENOSYS` left behind), `TRACE` (no listener here, so the kernel's no-tracer answer:
-skip and `ENOSYS`), `KILL_THREAD`/`KILL_PROCESS` and unknown actions (SIGSYS
+traps apart — with the call skipped and `-ENOSYS` left behind), `TRACE` (a
+`PTRACE_EVENT_SECCOMP` stop for a tracer that set `PTRACE_O_TRACESECCOMP`, the
+filter's data as its event message, after which the call runs as the tracer left
+it — renumbered, and judged again, a second `TRACE` allowing it, or skipped
+with a result of the tracer's; with nobody asking, skip and `ENOSYS` — it used
+to be that whatever the tracer had asked, and `strace --seccomp-bpf` found the
+filter "unavailable"), `KILL_THREAD`/`KILL_PROCESS` and unknown actions (SIGSYS
 death) are all implemented, as is strict mode (`read`/`write`/`exit`/
 `rt_sigreturn` only, SIGKILL for the rest). Filters stack, every one runs, and
 the most severe answer wins with the newest breaking ties. `no_new_privs` is

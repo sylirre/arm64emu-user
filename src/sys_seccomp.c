@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "sys.h"
+#include "ptrace.h"
 
 /* One installed program. The chain is newest-first: the kernel evaluates every
  * filter and keeps the most severe answer, so order only matters for ties.
@@ -317,8 +318,12 @@ static int strict_allows(u64 nr) {
  * syscall must NOT run, with *ret holding what the guest sees; 2 when a SIGSYS
  * is owed as well, with *trap_data holding the filter's SECCOMP_RET_DATA for
  * si_errno; 0 to proceed. Killing actions do not return at all. */
-int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data) {
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int recheck) {
     struct Machine *m = c->m;
+    /* PTRACE_O_SUSPEND_SECCOMP: a checkpointer's tracee runs unfiltered while
+     * it is traced so (__secure_computing), strict mode included. */
+    if (ptrace_self_active() && (ptrace_self_options() & G_PTRACE_O_SUSPEND_SECCOMP))
+        return 0;
     if (__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED) == G_SECCOMP_MODE_STRICT) {
         if (strict_allows(nr)) return 0;
         guest_terminate_by_signal(c, SIGKILL);
@@ -353,11 +358,27 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data) {
         *ret = -ENOSYS;
         *trap_data = (u16)(action & G_SECCOMP_RET_DATA);
         return 2;
-    case G_SECCOMP_RET_TRACE:
-        /* No tracer is listening for seccomp events here, and the kernel's
-         * answer to that is to skip the call and return ENOSYS. */
-        *ret = -ENOSYS;
-        return 1;
+    case G_SECCOMP_RET_TRACE: {
+        /* A tracer that asked for seccomp events (PTRACE_O_TRACESECCOMP) is
+         * told, with the filter's data as the event message, and may rewrite
+         * the call -- its number included, -1 skipping it with the x0 it
+         * leaves -- which the filters then judge again, a second RET_TRACE
+         * allowing it (__seccomp_filter's recheck_after_trace). With nobody
+         * to tell, the call is skipped with ENOSYS. It used to be ENOSYS
+         * either way: the option was taken and nothing came of it. */
+        if (recheck) return 0;
+        if (!ptrace_self_active() ||
+            !(ptrace_self_options() & G_PTRACE_O_TRACESECCOMP)) {
+            *ret = -ENOSYS;
+            return 1;
+        }
+        ptrace_report_event(c, G_PTRACE_EVENT_SECCOMP, action & G_SECCOMP_RET_DATA);
+        if ((s64)c->x[8] < 0) { *ret = (s64)c->x[0]; return 1; }
+        u64 now[6];
+        for (int i = 0; i < 6; i++) now[i] = c->x[i];
+        int r = seccomp_gate(c, c->x[8], now, ret, trap_data, 1);
+        return r ? r : 3;   /* allowed: the call as the tracer left it */
+    }
     case G_SECCOMP_RET_KILL_THREAD:
     case G_SECCOMP_RET_KILL_PROCESS:
     default:

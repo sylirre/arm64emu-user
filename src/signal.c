@@ -2856,6 +2856,8 @@ void guest_terminate_by_signal(CPU *c, int sig) {
      * we died and its wait4 poll hangs. */
     ptrace_report_exit_stop(c, sig & 0x7f);
     ptrace_report_exit_group(sig & 0x7f);
+    ptrace_tracer_exit();                /* a tracer's tracees: detached, or
+                                          * killed under PTRACE_O_EXITKILL */
     proctab_unregister((s32)getpid());   /* drop the guest-PID registry slot */
     sembroker_exit(c->m);                /* apply SEM_UNDO now, not at the
                                           * broker's reclaim tick */

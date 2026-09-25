@@ -76,6 +76,8 @@ static __attribute__((noreturn)) void process_exit(CPU *c) {
      * link (a parked sibling dies inside its service loop; its tracer would
      * otherwise poll a stale link forever). */
     ptrace_report_exit_group((code & 0xff) << 8);
+    ptrace_tracer_exit();       /* ...and, a tracer, its tracees: detached, or
+                                 * killed under PTRACE_O_EXITKILL */
     shm_detach_all(m);          /* drop this process's shm attaches (nattch--) */
     sembroker_exit(m);          /* apply this process's SEM_UNDO adjustments */
     tmpfs_session_cleanup(m);   /* session root only: drop emulated tmpfs trees */
@@ -2243,8 +2245,40 @@ void proc_foreign_sample(void) {
 int proc_foreign_self(const s32 **out) { *out = g_foreign; return g_nforeign; }
 
 static int is_foreign_task(s32 tid) {
-    for (int i = 0; i < g_nforeign; i++) if (g_foreign[i] == tid) return 1;
+    int n = __atomic_load_n(&g_nforeign, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (__atomic_load_n(&g_foreign[i], __ATOMIC_RELAXED) == tid) return 1;
     return 0;
+}
+
+/* The one host thread the emulator runs of its own, the tracer watchdog
+ * (ptracetab.c), joins the set while it lives, and so is no guest thread to
+ * the guest -- not in /proc/<pid>/task or Threads:, not waited for by
+ * de_thread, not a tgkill target. Readers take no lock: an entry is written
+ * before the count that covers it, and one removed is replaced by the last
+ * before the count drops, so none present is ever missed. */
+void proc_foreign_add(s32 tid) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);   /* writers only; fork takes it too */
+    int n = g_nforeign;
+    if (n < PROCTAB_FOREIGN) {
+        __atomic_store_n(&g_foreign[n], tid, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_nforeign, n + 1, __ATOMIC_RELEASE);
+    }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+    proctab_foreign_publish(g_foreign, g_nforeign);
+}
+
+void proc_foreign_del(s32 tid) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    int n = g_nforeign;
+    for (int i = 0; i < n; i++)
+        if (g_foreign[i] == tid) {
+            __atomic_store_n(&g_foreign[i], g_foreign[n - 1], __ATOMIC_RELAXED);
+            __atomic_store_n(&g_nforeign, n - 1, __ATOMIC_RELEASE);
+            break;
+        }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+    proctab_foreign_publish(g_foreign, g_nforeign);
 }
 
 /* The same question from outside this file, for the containment checks that

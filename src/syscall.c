@@ -574,7 +574,18 @@ void syscall_dispatch(CPU *c) {
     u16 sctrap = 0;   /* SECCOMP_RET_DATA of a trapping filter -> si_errno */
     int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
     if (UNLIKELY(__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)))
-        scskip = seccomp_gate(c, nr, av, &scret, &sctrap);
+        scskip = seccomp_gate(c, nr, av, &scret, &sctrap, 0);
+    if (UNLIKELY(scskip == 3)) {
+        /* Allowed after a PTRACE_EVENT_SECCOMP stop: the call is what the
+         * tracer left in the registers. */
+        scskip = 0;
+        nr = c->x[8];
+        a0 = c->x[0]; a1 = c->x[1]; a2 = c->x[2];
+        a3 = c->x[3]; a4 = c->x[4]; a5 = c->x[5];
+        av[0] = a0; av[1] = a1; av[2] = a2; av[3] = a3; av[4] = a4; av[5] = a5;
+        g_tls.sc_orig_x0 = a0;
+        g_tls.sc_nr = nr;
+    }
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;

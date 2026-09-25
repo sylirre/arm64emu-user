@@ -215,6 +215,8 @@ static u64 proc_starttime(s32 pid) {
     return starttime_read(path);
 }
 
+u64 proctab_starttime(s32 pid) { return pid > 0 ? proc_starttime(pid) : 0; }
+
 /* fnv1a32 (per-rootfs registry key) lives in machine.h, shared with the
  * abstract-socket tag in main.c. */
 

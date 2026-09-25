@@ -605,6 +605,13 @@ int  proc_foreign_tasks(s32 pid, s32 *out, int max);   /* count written */
 /* Is `tid` one of THIS process's non-guest host tasks? For the callers that
  * already know the tid is in our thread group and need to know no more. */
 int  proc_task_is_foreign(s32 tid);
+/* A host thread of the emulator's own joining or leaving the set (the tracer
+ * watchdog, ptracetab.c): never a guest thread, and never shown as one. */
+void proc_foreign_add(s32 tid);
+void proc_foreign_del(s32 tid);
+/* proctab.c: host process `pid`'s start time (/proc/<pid>/stat field 22), 0
+ * where it cannot be read -- what tells a pid from a later one reusing it. */
+u64  proctab_starttime(s32 pid);
 
 /* Run-loop safepoint: called out of line when m->stop_gen no longer matches
  * this thread's copy. Adopts a newly exec'd image, joins a de_thread
@@ -1266,7 +1273,9 @@ int bind_slot_of_canon(const char *canon);
 #define PROCTAB_ENVIRON  2048    /* per-entry environ cap (truncated beyond) */
 #define PROCTAB_PATH     1024    /* per-entry exe/cwd path cap (truncated beyond) */
 #define PROCTAB_AUXV      512    /* per-entry auxv cap (elf.c emits 320 bytes) */
-#define PROCTAB_FOREIGN     4    /* per-entry non-guest host tasks (proc_foreign_sample) */
+#define PROCTAB_FOREIGN     5    /* per-entry non-guest host tasks: an interposer's
+                                  * (proc_foreign_sample), and the emulator's own
+                                  * tracer watchdog (ptracetab.c) */
 
 /* One seqlock-consistent read of a registry entry's mutable payload. Byte
  * counts, not NUL-terminated (callers append a terminator where needed). */

@@ -659,9 +659,12 @@ int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM
 
 /* sys_seccomp.c: guest seccomp-BPF. seccomp_gate runs the installed filters
  * for one guest syscall; it returns 1 when the call must not run (with *ret as
- * the guest's return value), 0 to proceed, and does not return at all for a
- * killing action. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
-int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data);
+ * the guest's return value), 2 for that with a SIGSYS to deliver, 0 to
+ * proceed, 3 to proceed with the call as a tracer's PTRACE_EVENT_SECCOMP stop
+ * left it in the registers, and does not return at all for a killing action.
+ * `recheck`: the filters' second look after such a stop, where a RET_TRACE
+ * allows. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int recheck);
 s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
 /* This process's seccomp mode (G_SECCOMP_MODE_*) and installed filter count,
  * for /proc/self/status; seccomp_publish mirrors the same pair into the shared

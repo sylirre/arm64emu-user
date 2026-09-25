@@ -650,8 +650,11 @@ typedef struct {
 #define G_PTRACE_O_TRACEEXEC      0x00000010
 #define G_PTRACE_O_TRACEVFORKDONE 0x00000020
 #define G_PTRACE_O_TRACEEXIT      0x00000040
-#define G_PTRACE_O_EXITKILL       0x00000100
-#define G_PTRACE_O_MASK           0x000003ff
+#define G_PTRACE_O_TRACESECCOMP   0x00000080
+#define G_PTRACE_O_EXITKILL       0x00100000   /* 1 << 20 */
+#define G_PTRACE_O_SUSPEND_SECCOMP 0x00200000  /* 1 << 21 */
+#define G_PTRACE_O_MASK           (0x000000ffu | G_PTRACE_O_EXITKILL | \
+                                   G_PTRACE_O_SUSPEND_SECCOMP)
 
 /* Event codes reported in status bits [15:8] of a WIFSTOPPED status. */
 #define G_PTRACE_EVENT_FORK        1
@@ -660,6 +663,7 @@ typedef struct {
 #define G_PTRACE_EVENT_EXEC        4
 #define G_PTRACE_EVENT_VFORK_DONE  5
 #define G_PTRACE_EVENT_EXIT        6
+#define G_PTRACE_EVENT_SECCOMP     7
 #define G_PTRACE_EVENT_STOP        128
 
 /* wait4/waitid options and waitid id types (linux/wait.h). */

@@ -150,6 +150,9 @@ void ptrace_wake_stopped(s32 tgid);
  * stop (parked until SIGCONT). Called for a kick, and by the thread that has
  * just begun a group stop (signal.c). */
 void ptrace_jobctl_service(CPU *c);
+/* The calling process, a tracer, is exiting: detach its tracees, killing
+ * those that asked for it (PTRACE_O_EXITKILL) -- the kernel's exit_ptrace. */
+void ptrace_tracer_exit(void);
 /* Exit of the calling thread: release its tracee link (or publish a synthetic
  * exit for the tracer to collect -- always for a secondary thread, whose death
  * is never host-waitable, and for a process whose tracer is not its host

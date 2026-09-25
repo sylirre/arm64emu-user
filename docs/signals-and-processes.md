@@ -1615,11 +1615,27 @@ poll (above) would hang. Two mechanisms close this:
   death is a `SIGKILL`, so the synthesized signal is accurate.
 
 **Death of a tracer.** The mirror case, and the one that can wedge a guest: the
-kernel's `exit_ptrace` detaches a dying tracer's tracees, but nothing here runs
-in the tracer to do that — a tracer is not a tracee, so it holds no link of its
-own to publish anything on. Each parked tracee therefore checks for itself, once
-per service-loop slice, and **auto-detaches and runs free** when its tracer is
-gone. The liveness test has to be the same one `ptrace_reap_dead` applies in the
+kernel's `exit_ptrace` detaches a dying tracer's tracees — or, for one traced
+with `PTRACE_O_EXITKILL`, sends it `SIGKILL`. A tracer that exits in order does
+that itself (`ptrace_tracer_exit`, from `exit_group` and the fatal-signal
+death); one killed outright runs nothing, and its tracees must find out for
+themselves. Each parked tracee checks, once per service-loop slice, and
+**auto-detaches and runs free** when its tracer is gone — or dies, under
+`EXITKILL`. A *running* one never looked, so while any thread of a process is
+traced one host thread of the emulator's own watches its tracers every 100 ms
+(`pt_watchdog`): a thread whose tracer is gone has the tracer cleared on its link
+and is kicked to leave the trace at its next boundary, or the process is
+killed, under `EXITKILL`. The thread blocks every signal, holds no descriptor,
+and is in the process's foreign-task set, so the guest never sees it (not in
+`/proc/<pid>/task` or `Threads:`, not waited for by `de_thread`, not a `tgkill`
+target); it ends once no thread is traced. The liveness test also compares the
+tracer's start time, recorded as it attached, against the process now under its
+number, which may be a later one (`pt_tracer_gone`). A link nobody will collect
+— a tracee killed by `SIGKILL` with its tracer gone — is freed when its real
+parent reaps it, or when the registry needs the slot. `EXITKILL` used to be taken
+as `1 << 8`, a bit no kernel has, the real one masked away, and nothing done with
+either; a running tracee of a dead tracer stayed traced, its `TracerPid` the
+dead tracer's, until it next stopped (`tests/ptrace/exitkill.c`). The liveness test has to be the same one `ptrace_reap_dead` applies in the
 other direction and for the same reason: `kill(tracer, 0)` succeeds on a
 **zombie** tracer — one whose own parent has not reaped it yet — so a tracee that
 trusted `kill` alone stayed parked for as long as the corpse lingered, re-kicking
@@ -1772,7 +1788,10 @@ attached while stopped is reported stopped by `SIGSTOP`.
 (all per task — a multithreaded tracee's threads attach, stop and report
 individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
 `info threads`), `SETOPTIONS` (`TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`,
-`TRACECLONE` — including thread creation, `TRACEEXEC`, `TRACEEXIT`),
+`TRACECLONE` — including thread creation, `TRACEEXEC`, `TRACEVFORKDONE`,
+`TRACEEXIT`, `TRACESECCOMP`, `EXITKILL`, and `SUSPEND_SECCOMP` for a
+privileged tracer — `EPERM` otherwise; any other bit is `EINVAL`, and `EIO` on a
+`SEIZE`, as the kernel answers: `tests/ptrace/options.c`),
 `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints),
