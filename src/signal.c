@@ -151,6 +151,10 @@ static __thread volatile sig_atomic_t sigq_grow_req;
  * constant time, which a queue that may hold thousands of entries needs --
  * sig_pending_deliverable is polled from every blocking wait there is. */
 static __thread u16 sigq_cnt[65];
+/* ...and the entries a ptrace stop just handed on (PendSig.ptraced) and the
+ * thread-directed ones (PendSig.thr), which sigq_pick ranks first: while there
+ * are none, its scan can stop at the first entry of the number it wants. */
+static __thread u32 sigq_ninj, sigq_nthr;
 /* Host signals the gate blocked, and so the ones it may unblock again: the
  * emulator's own mask is not the guest's, and what was blocked before the
  * gate shut stays blocked after it opens. */
@@ -370,6 +374,7 @@ static void sigq_reset(void) {
     sigq_gated = 0;   /* anything caught during the ungate above goes with the
                        * entries: the queue this reset leaves behind is empty */
     memset((void *)sigq_cnt, 0, sizeof sigq_cnt);
+    sigq_ninj = sigq_nthr = 0;
     g_sig_npend = 0;
     host_set_mask(prev);
     free(old);
@@ -427,6 +432,8 @@ static int sigq_push(const PendSig *p, void *uctx) {
     }
     sigq[head] = *p;
     __atomic_fetch_add(&sigq_cnt[sig], 1, __ATOMIC_RELAXED);
+    if (p->ptraced) __atomic_fetch_add(&sigq_ninj, 1, __ATOMIC_RELAXED);
+    if (p->thr) __atomic_fetch_add(&sigq_nthr, 1, __ATOMIC_RELAXED);
     sigq_head = next;
     g_sig_npend = 1;
     /* Room for SIGQ_GATE more and no consumer in sight: shut the gate now,
@@ -472,6 +479,8 @@ static void sigq_lower_npend(void) {
  * write.) */
 static void sigq_take(int t) {
     __atomic_fetch_sub(&sigq_cnt[sigq[t].signo], 1, __ATOMIC_RELAXED);
+    if (sigq[t].ptraced) __atomic_fetch_sub(&sigq_ninj, 1, __ATOMIC_RELAXED);
+    if (sigq[t].thr) __atomic_fetch_sub(&sigq_nthr, 1, __ATOMIC_RELAXED);
     for (int u = t; u != sigq_tail; ) {
         int prev = u ? u - 1 : sigq_cap - 1;
         sigq[u] = sigq[prev];
@@ -479,6 +488,55 @@ static void sigq_take(int t) {
     }
     sigq_tail = sigq_next(sigq_tail);
     if (sigq_tail == sigq_head) sigq_lower_npend();
+}
+
+static int is_sync_sig(int sig);
+
+/* The kernel's SYNCHRONOUS_MASK: taken ahead of any other pending signal of
+ * the same queue, whatever its number (next_signal). */
+static int sig_sync_prio(int sig) {
+    return is_sync_sig(sig) || sig == SIGSYS;
+}
+
+/* The slot of the entry the kernel's dequeue_signal would take next, among
+ * the numbers in `allowed` (-1 if none): the thread's own queue before the
+ * process's, and within either a synchronous signal first, then the lowest
+ * number, then the oldest of that number (next_signal) -- ahead of all of
+ * them, one a ptrace stop has just handed on, which is in hand rather than
+ * pending. The ring holds what the host dequeued for this thread in the
+ * host's own order, which is this one for everything it took in one go; but
+ * what piles up across time -- signals caught while the thread sat in a
+ * ptrace stop, an attach's SIGSTOP (ptrace_service_kick) -- used to be taken
+ * oldest first, whatever its number and queue. */
+static int sigq_pick(u64 allowed) {
+    u64 pend = 0;
+    for (int s = 1; s <= 64; s++)
+        if (sigq_pend(s)) pend |= 1ULL << (s - 1);
+    pend &= allowed;
+    if (!pend) return -1;
+    u64 sync = pend & ((1ULL << (SIGSEGV - 1)) | (1ULL << (SIGBUS - 1)) |
+                       (1ULL << (SIGILL - 1)) | (1ULL << (SIGTRAP - 1)) |
+                       (1ULL << (SIGFPE - 1)) | (1ULL << (SIGSYS - 1)));
+    int first = __builtin_ctzll(sync ? sync : pend) + 1;
+    /* The best key there can be: with no injected or thread-directed entry
+     * about, the first entry of `first` is it. */
+    u32 floor = (__atomic_load_n(&sigq_ninj, __ATOMIC_RELAXED) ? 0 : 1u << 9) |
+                (__atomic_load_n(&sigq_nthr, __ATOMIC_RELAXED) ? 0 : 1u << 8) |
+                (sig_sync_prio(first) ? 0 : 1u << 7) | (u32)first;
+    int best = -1;
+    u32 bestkey = ~0u;
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
+        const PendSig *q = &sigq[t];
+        if (!(allowed & (1ULL << (q->signo - 1)))) continue;
+        u32 key = (q->ptraced ? 0 : 1u << 9) | (q->thr ? 0 : 1u << 8) |
+                  (sig_sync_prio(q->signo) ? 0 : 1u << 7) | (u32)q->signo;
+        if (key < bestkey) {
+            bestkey = key;
+            best = t;
+            if (key <= floor) break;
+        }
+    }
+    return best;
 }
 
 /* Set by sig_kick_net for every one of the emulator's OWN uses of the reserved
@@ -966,6 +1024,26 @@ void sig_raise_local(int sig) {
     p.signo = sig;
     p.pid = (int)getpid();
     p.thr = 1;   /* a stop this thread raised for itself: never a host one */
+    if (!sigq_push_local(&p)) return;
+    jit_signal_interrupt();
+}
+
+/* PTRACE_ATTACH's SIGSTOP (ptrace_attach's send_sig_info(SEND_SIG_PRIV)): a
+ * signal on the thread's own queue, SI_KERNEL from nobody, which the thread
+ * takes in the kernel's order with the rest (sigq_pick) -- after a
+ * thread-directed signal of a lower number already pending, before anything
+ * sent to the process. It used to be a stop taken on the spot, ahead of
+ * everything. Its stop interrupts the call the attach cut short, as a
+ * signal's would: the kick's own interruption, which would be invisible,
+ * becomes the stop's. */
+void sig_raise_attach_stop(void) {
+    sigq_sync();
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = SIGSTOP;
+    p.code = 0x80;   /* SI_KERNEL */
+    p.thr = 1;
+    g_sig_selfintr = 0;
     if (!sigq_push_local(&p)) return;
     jit_signal_interrupt();
 }
@@ -2042,6 +2120,15 @@ static void sig_taken_quietly(CPU *c, int traced) {
     if (!traced || sc_restart_nohandler(c)) g_sig_selfintr = 1;
 }
 
+/* A ptrace trap a tracer's request caused (PTRACE_INTERRUPT's): the call its
+ * kick cut short is the trap's, as the kernel's signal_wake_up of the tracee
+ * makes it -- no longer an interruption of the emulator's own, invisible --
+ * and resumes by the rule for a call no handler ran for. */
+void sig_after_trap(CPU *c) {
+    g_sig_selfintr = 0;
+    if (sc_restart_nohandler(c)) g_sig_selfintr = 1;
+}
+
 /* One PendSig as the guest's 128-byte siginfo, into `si` (zeroed here). The
  * layout is the one siginfo_layout picks: by the signal for a kernel-raised
  * instance (si_code > 0 -- a fault's address, a child's status, a seccomp
@@ -2522,9 +2609,8 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
     }
     for (;;) {
         sigq_sync();
-        for (int t = sigq_tail; t != sigq_head; t = sigq_next(t)) {
-            int sig = sigq[t].signo;
-            if (!(set & (1ULL << (sig - 1)))) continue;
+        int t = sigq_pick(set);   /* in the kernel's order, as dequeue_signal */
+        if (t >= 0) {
             PendSig p = sigq[t];
             sigq_take(t);
             if (info_va && pendsig_to_guest(c, &p, info_va) < 0) return -EFAULT;
@@ -2637,26 +2723,13 @@ void sig_deliver_pending(CPU *c) {
     if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
     sigq_sync();
     while (sigq_tail != sigq_head) {
-        PendSig p = sigq[sigq_tail];
+        /* The kernel's next, of those not blocked -- none, and what is queued
+         * waits for the unblock (the counts say so without a walk). */
+        int pick = sigq_pick(~g_tls.sigmask);
+        if (pick < 0) return;
+        PendSig p = sigq[pick];
         int sig = p.signo;
-        if (g_tls.sigmask & (1ULL << (sig - 1))) {
-            /* Blocked: leave it queued. Scan the rest for an unblocked one --
-             * but only once the counts say there is one, so a queue full of
-             * blocked signals is not walked at every safe point. */
-            u64 pend = 0;
-            for (int t = 1; t <= 64; t++)
-                if (sigq_pend(t)) pend |= 1ULL << (t - 1);
-            if (!(pend & ~g_tls.sigmask)) return;
-            int found = -1;
-            for (int t = sigq_next(sigq_tail); t != sigq_head; t = sigq_next(t))
-                if (!(g_tls.sigmask & (1ULL << (sigq[t].signo - 1)))) { found = t; break; }
-            if (found < 0) return;
-            p = sigq[found];
-            sig = p.signo;
-            sigq_take(found);
-        } else {
-            sigq_take(sigq_tail);
-        }
+        sigq_take(pick);
 
         /* ptrace signal-delivery stop: the tracer sees WSTOPSIG==sig and may
          * suppress it (return 0) or substitute another signal before it is
@@ -2666,7 +2739,10 @@ void sig_deliver_pending(CPU *c) {
             u8 si[128];
             siginfo_to_guest(si, sig, &p);
             int ns = ptrace_report_signal(c, sig, si);
-            if (ns == 0) continue;              /* suppressed by the tracer */
+            if (ns == 0) {                      /* suppressed by the tracer */
+                sig_taken_quietly(c, 1);
+                continue;
+            }
             /* What the tracer left: its SETSIGINFO, or SI_USER from it for a
              * substitute (ptrace_signal). A signal the thread now blocks is
              * queued again, a fresh one that stops again once unblocked. */

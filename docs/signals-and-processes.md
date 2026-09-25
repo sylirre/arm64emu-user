@@ -1555,9 +1555,25 @@ the SIGSYS net) sets **thread-local** flags, and a process-directed `sigqueue`
 could land on any thread. The handler recognizes a tracer kick by a magic
 `si_value` and — having no `SA_RESTART` — interrupts any blocked host syscall,
 setting `g_ptrace_kick`. At the run-loop boundary `ptrace_service_kick` adopts
-the pending attach on the kicked thread's own link (becomes a tracee; `ATTACH`
-also reports an initial `SIGSTOP`, `SEIZE` attaches silently) or, for
-`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. It does so *before* the
+the pending attach on the kicked thread's own link (becomes a tracee; `SEIZE`
+attaches silently, `ATTACH` queues the `SIGSTOP` below) or, for
+`PTRACE_INTERRUPT`, reports the `PTRACE_EVENT_STOP`. `ATTACH`'s `SIGSTOP` is
+the kernel's `send_sig_info(SEND_SIG_PRIV)`: a signal on the thread's *own*
+queue, `SI_KERNEL` from nobody (`sig_raise_attach_stop`), which the thread
+takes in the kernel's order with whatever else is pending — the thread's own
+signals before the process's, a synchronous one first within each, then the
+lowest number, then the oldest (`next_signal`; `sigq_pick`, which the delivery
+point and `rt_sigtimedwait` both use). So a thread-directed signal of a lower
+number pending with the attach is reported before the `SIGSTOP`, and anything
+sent to the process after it. It used to be a stop taken on the spot, ahead of
+everything; and what piled up while a tracee sat in a stop was taken oldest
+first, whatever its number (`tests/ptrace/attachorder.c`, which finds its
+window in a vfork parent: its wait for the child ends only with the child, in
+the kernel and the emulator alike, so the attach and the signals after it all
+wait there together). The call a tracer's stop cut short — the attach's
+`SIGSTOP`, an `INTERRUPT` — is the stop's, not an interruption of the
+emulator's own: it resumes as one no handler ran for, which leaves an
+`epoll_wait` with its `EINTR` (`sig_after_trap`, `sc_restart_nohandler`). It does so *before* the
 boundary delivers any pending signal, as the kernel's `get_signal` takes a
 ptrace trap before it dequeues one: `ptrace(SEIZE)` has attached by the time it
 returns, so a signal its caller sends next is one the tracer must see stopped
@@ -1571,12 +1587,11 @@ child then looks for an attach already pending on its own and flags it again.
 Cleared with the rest, the kick of a `SEIZE` that won that race was lost: the
 attach succeeded, and the child ran untraced, a fault killing it that should
 have stopped it (`tests/ptrace/seize_newborn.c`). The syscall
-the kick interrupted is then **restarted**, so attaching does not perturb the
-tracee — see "The emulator's own interruptions are invisible to the guest"
-above. A
-guest-directed signal of
-the same number is forwarded to the normal capture queue, so the guest keeps
-full use of it. `wait4` collects the stop from the registry (the tracee is not
+the kick interrupted is then **restarted**, so a `SEIZE` does not perturb the
+tracee at all — see "The emulator's own interruptions are invisible to the
+guest" above — and the stop an `ATTACH` or an `INTERRUPT` brings only as a
+kernel's does (above). A guest-directed signal of the same number is forwarded
+to the normal capture queue, so the guest keeps full use of it. `wait4` collects the stop from the registry (the tracee is not
 the tracer's host child), and the tracee's stop already sends the tracer a
 `SIGCHLD` (so gdb's async loop wakes).
 

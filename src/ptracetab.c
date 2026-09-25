@@ -798,8 +798,10 @@ void ptrace_service_kick(CPU *c) {
         g_self_link = e;
         g_ptrace_active = 1;
         pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
-        /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV). */
-        if (!e->seize) { pt_signal_stop(c, SIGSTOP, 0, 0x80 /* SI_KERNEL */, 0, 0); return; }
+        /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV) -- queued
+         * on this thread, to be taken in the kernel's order with what else is
+         * pending (sig_raise_attach_stop), and reported as it is taken. */
+        if (!e->seize) { sig_raise_attach_stop(); return; }
         /* SEIZE: attached without a stop; fall through in case an INTERRUPT
          * kick coalesced with this attach kick into one g_ptrace_kick. */
     }
@@ -807,6 +809,7 @@ void ptrace_service_kick(CPU *c) {
         __atomic_load_n(&g_self_link->interrupt_pending, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&g_self_link->interrupt_pending, 0, __ATOMIC_RELEASE);
         pt_event_stop(c, G_PTRACE_EVENT_STOP);
+        sig_after_trap(c);
     }
     /* A stop signal (SIGSTOP/SIGTSTP/...) another process sent us as a tracee:
      * report it as a cooperative group-stop with that signal as WSTOPSIG. */

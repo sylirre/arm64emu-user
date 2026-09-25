@@ -704,6 +704,11 @@ void sig_raise_local(int sig);
  * one past its stop: delivered without being reported again, with the stop's
  * siginfo as the tracer left it (the guest's 128-byte layout). */
 void sig_inject_local(int sig, const u8 *si);
+/* PTRACE_ATTACH's SIGSTOP, queued on the calling thread as the kernel queues
+ * it (private, SI_KERNEL), and the rule for the call a tracer's INTERRUPT
+ * trap cut short (signal.c). */
+void sig_raise_attach_stop(void);
+void sig_after_trap(CPU *c);
 /* Does the kernel know the layout of this si_code for this signal
  * (known_siginfo_layout)? If not, a siginfo read from userspace must be zero
  * past kernel_siginfo's 48 bytes (sys_sig.c). */
