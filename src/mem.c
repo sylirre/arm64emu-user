@@ -2582,8 +2582,17 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     return true;
 }
 
+/* A pointer a syscall of this thread dereferences, with a tag in its top
+ * byte, from a thread that has not enabled the tagged-address ABI: the
+ * kernel's access_ok refuses it (EFAULT) where the CPU's own accesses ignore
+ * the tag (TBI0). Only while a handler runs (thread.h, uaccess). */
+static inline int uaddr_tag_refused(u64 va) {
+    return UNLIKELY(va >> 56) && g_tls.uaccess && !(g_tls.tagged_addr_ctrl & 1);
+}
+
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) return NULL;
+    if (uaddr_tag_refused(va)) return NULL;
     u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
     bool perm;
     return translate(c, va, need, &perm);
@@ -2599,6 +2608,7 @@ size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
     int base = *n;                   /* runs before ours are not extended */
     size_t done = 0;
     *why = LEND_ALL;
+    if (uaddr_tag_refused(va)) { *why = LEND_CUT; return 0; }
     /* Held across the walk, so the page table, the region list and each
      * run's pin agree: no mapping can change between a page being judged and
      * its allocation being pinned. translate() takes the lock again on a miss
@@ -2699,6 +2709,7 @@ copy_from_guest_walk(CPU *c, void *dst, u64 va, size_t len) {
 }
 
 long copy_from_guest(CPU *c, void *dst, u64 va, size_t len) {
+    if (len && uaddr_tag_refused(va)) return -EFAULT;
     BUS_GUARD_BEGIN(c, -EFAULT);
     long r = copy_from_guest_walk(c, dst, va, len);
     BUS_GUARD_END();
@@ -2721,6 +2732,7 @@ copy_to_guest_walk(CPU *c, u64 va, const void *src, size_t len) {
 }
 
 long copy_to_guest(CPU *c, u64 va, const void *src, size_t len) {
+    if (len && uaddr_tag_refused(va)) return -EFAULT;
     BUS_GUARD_BEGIN(c, -EFAULT);
     long r = copy_to_guest_walk(c, va, src, len);
     BUS_GUARD_END();
@@ -2752,6 +2764,7 @@ copy_from_guest_partial_walk(CPU *c, void *dst, u64 va, size_t len,
 }
 
 size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
+    if (uaddr_tag_refused(va)) return 0;
     volatile size_t done = 0;
     BUS_GUARD_BEGIN(c, done);
     copy_from_guest_partial_walk(c, dst, va, len, &done);
@@ -2777,6 +2790,7 @@ copy_to_guest_partial_walk(CPU *c, u64 va, const void *src, size_t len,
 }
 
 size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len) {
+    if (uaddr_tag_refused(va)) return 0;
     volatile size_t done = 0;
     BUS_GUARD_BEGIN(c, done);
     copy_to_guest_partial_walk(c, va, src, len, &done);
@@ -2852,6 +2866,7 @@ copy_str_from_guest_walk(CPU *c, char *dst, u64 va, size_t max) {
 }
 
 long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
+    if (uaddr_tag_refused(va)) return -EFAULT;
     BUS_GUARD_BEGIN(c, -EFAULT);
     long r = copy_str_from_guest_walk(c, dst, va, max);
     BUS_GUARD_END();

@@ -404,7 +404,9 @@ SYSDEF(sendto) {
      * own answers. */
     size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    /* ...and a buffer that is no user memory at all, import_single_range's
+     * EFAULT, before the protocol is asked anything (sys.h). */
+    XferCut cut = { len - room, 0, !guest_access_ok(a1, len) };
     /* A reconfiguring rtnetlink request from a guest with a faked network
      * namespace: note it, so the kernel's refusal becomes an ack on receive. */
     nlr_note_gvec(c, (int)a0, &g, 1);
@@ -454,7 +456,7 @@ SYSDEF(recvfrom) {
     size_t len = rw_count(a2);
     size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    XferCut cut = { len - room, 0, !guest_access_ok(a1, len) };   /* as in sendto */
     GuestXfer x;
     int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
@@ -1386,7 +1388,11 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
      * stream it would have sent part of. */
     size_t backed = 0;
     unsigned nseg = cnt;
-    XferCut cut = { 0, 0 };
+    XferCut cut = { 0, 0, 0 };
+    /* import_iovec's access_ok, per segment: one that is no user memory at
+     * all fails the call (sys.h, XferCut.denied). */
+    for (unsigned i = 0; i < cnt; i++)
+        if (!guest_access_ok(gi[i].iov_base, gi[i].iov_len)) cut.denied = 1;
     for (unsigned i = 0; i < cnt; i++) {
         size_t want = (size_t)gi[i].iov_len;
         size_t room = want ? rw_room(c, gi[i].iov_base, want,

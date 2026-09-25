@@ -176,6 +176,12 @@ void as_bus_disarm(void);
  * stores a tag there and dereferences the tagged pointer; the mask strips it. */
 #define A64_TBI_MASK    0x00ffffffffffffffULL
 
+/* The kernel's untagged_addr: the top byte gone, bit 55 carried up -- what an
+ * address-space syscall (munmap, mprotect, madvise, ...) takes a tagged
+ * address for, whatever the tagged-address ABI says; one with bit 55 set is
+ * no user address then, and fails the call's range check as it should. */
+static inline u64 a64_untag(u64 va) { return (u64)((s64)(va << 8) >> 8); }
+
 /* Guest page protection (software-enforced; PTE low bits). */
 #define PTE_R 1u
 #define PTE_W 2u

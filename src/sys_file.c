@@ -156,6 +156,7 @@ void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
 static int iov_import(CPU *c, u64 iov_va, unsigned cnt, GIovec *gout,
                       int writeback, XferCut *cut) {
     cut->seg = cut->after = 0;
+    cut->denied = 0;
     /* `cnt` is deliberately narrow. The guest passes iovcnt in a 64-bit
      * register and the kernel takes it as `unsigned long`, but it reaches
      * import_iovec's `unsigned nr_segs` and is truncated there -- so on a real
@@ -205,6 +206,11 @@ static int iov_import(CPU *c, u64 iov_va, unsigned cnt, GIovec *gout,
      * every pipe and socket, before the fd was touched) was wrong for most of
      * them: sys.h has the list. */
     AccType acc = writeback ? ACC_WRITE : ACC_READ;
+    /* import_iovec's access_ok, per segment as clamped above: one that fails
+     * it fails the whole call with EFAULT, before the file is asked
+     * anything (sys.h, XferCut.denied). */
+    for (unsigned i = 0; i < cnt; i++)
+        if (!guest_access_ok(gout[i].iov_base, gout[i].iov_len)) cut->denied = 1;
     unsigned nseg = 0;
     for (; nseg < cnt; nseg++) {
         size_t want = (size_t)gout[nseg].iov_len;
@@ -339,6 +345,31 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
     x->to_guest = to_guest;
     size_t want = 0;
     for (int i = 0; i < nseg; i++) want += (size_t)seg[i].iov_len;
+    /* A buffer that is no user memory at all (sys.h, XferCut.denied). */
+    if (cut && cut->denied) {
+#if UINTPTR_MAX > 0xffffffffu
+        /* One iovec at the top of the host's address space, which its
+         * access_ok refuses whatever the length, so the host answers in the
+         * kernel's own order -- nothing lent, nothing staged. */
+        x->iov = &x->iov1;
+        x->iov1.iov_base = (void *)(uintptr_t)-4096;
+        x->iov1.iov_len = want + cut->seg + cut->after;
+        x->n = 1;
+        return 0;
+#else
+        /* An ILP32 process on a 64-bit kernel -- the 32-bit build under
+         * x86-64, an armv7 build on an arm64 phone -- has no address the
+         * host's access_ok refuses, and one it does not map would be faulted
+         * on only after the file had been waited on. So the kernel's order is
+         * kept here: the descriptor's own EBADF (none, not open that way, an
+         * O_PATH one), then EFAULT. */
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0) return -EBADF;
+        int am = fl & O_ACCMODE;
+        if ((fl & O_PATH) || am == (to_guest ? O_WRONLY : O_RDONLY)) return -EBADF;
+        return -EFAULT;
+#endif
+    }
     size_t fault = cut ? cut->seg + cut->after : 0;
     int split = -1;
     int r;
@@ -1397,7 +1428,15 @@ SYSDEF(read) {
      * queued -- and the substitute socket answers the same 0 the same way.
      * recvfrom(fd, buf, 0) is the opposite case and goes straight to
      * sock_recvmsg, which really does take the datagram off the socket and
-     * report the zero; both measured against a kernel. */
+     * report the zero; both measured against a kernel.
+     *
+     * A buffer that is no user memory at all (guest_access_ok) is vfs_read's
+     * EFAULT before any of that -- before a fake netlink socket's reply or a
+     * signalfd's record is taken, and before any wait for one; a host file
+     * hears of it from the host (XferCut.denied). */
+    int denied = !guest_access_ok(a1, a2);
+    if (denied && (nl_is_fd(c->m, (int)a0) || sigfd_tracked(c->m, (int)a0)))
+        return (u64)(s64)-EFAULT;
     u64 nlret;
     if (a2 != 0 && nl_is_fd(c->m, (int)a0) &&
         nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
@@ -1408,7 +1447,7 @@ SYSDEF(read) {
     size_t len = rw_count(a2);
     size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    XferCut cut = { len - room, 0, denied };
     /* A signalfd's records are translated on the way out (sys_sig.c). */
     if (sigfd_tracked(c->m, (int)a0)) return sigfd_read_guest(c, (int)a0, &g, 1, len);
     GuestXfer x;
@@ -1424,13 +1463,16 @@ SYSDEF(write) {
      * `ip` sends its dump requests that way), and the AF_UNIX substitute has no
      * default destination to write to -- it would answer ENOTCONN. */
     if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
-    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    /* vfs_write's access_ok comes ahead of a seal's EPERM and of whatever a
+     * synthesized /proc file makes of the bytes (read, above). */
+    int denied = !guest_access_ok(a1, a2);
+    if (!denied && mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     size_t len = rw_count(a2);   /* as in read */
     size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    XferCut cut = { len - room, 0, denied };
     s64 pr;
-    if (procfs_write_hook(c, (int)a0, &g, 1, len, -1, &pr)) return (u64)pr;
+    if (!denied && procfs_write_hook(c, (int)a0, &g, 1, len, -1, &pr)) return (u64)pr;
     /* A netlink socket needs no destination address, so a reconfiguring
      * rtnetlink request arrives by write(2) as readily as by sendto -- which
      * is how busybox's `ip` sends its. Note it here too, or the kernel's
@@ -1507,7 +1549,7 @@ SYSDEF(pread64) {
     size_t len = rw_count(a2);   /* as in read */
     size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    XferCut cut = { len - room, 0, !guest_access_ok(a1, a2) };
     GuestXfer x;
     int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;
@@ -1517,13 +1559,14 @@ SYSDEF(pread64) {
 }
 
 SYSDEF(pwrite64) {
-    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    int denied = !guest_access_ok(a1, a2);   /* as in write */
+    if (!denied && mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
     size_t len = rw_count(a2);   /* as in read */
     size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
     GIovec g = { a1, room };
-    XferCut cut = { len - room, 0 };
+    XferCut cut = { len - room, 0, denied };
     s64 pr;
-    if (procfs_write_hook(c, (int)a0, &g, 1, len, (s64)a3, &pr)) return (u64)pr;
+    if (!denied && procfs_write_hook(c, (int)a0, &g, 1, len, (s64)a3, &pr)) return (u64)pr;
     GuestXfer x;
     int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, &cut, NULL, &x);
     if (r < 0) return (u64)(s64)r;

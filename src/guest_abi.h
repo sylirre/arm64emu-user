@@ -642,6 +642,11 @@ typedef struct {
 #define G_PTRACE_INTERRUPT     0x4207
 #define G_PTRACE_LISTEN        0x4208
 
+/* prctl: the arm64 tagged-address ABI. */
+#define G_PR_SET_TAGGED_ADDR_CTRL 55
+#define G_PR_GET_TAGGED_ADDR_CTRL 56
+#define G_PR_TAGGED_ADDR_ENABLE   1
+
 /* SETOPTIONS bits. */
 #define G_PTRACE_O_TRACESYSGOOD   0x00000001
 #define G_PTRACE_O_TRACEFORK      0x00000002

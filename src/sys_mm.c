@@ -479,7 +479,15 @@ SYSDEF(mmap) {
     return r;
 }
 
+/* The address-space calls below take their start untagged (a64_untag), as
+ * the kernel's do whatever the tagged-address ABI says -- tagged-address-
+ * abi.rst's first class: addresses not accessed, only managed. mmap, brk
+ * and mremap's new address are the exceptions, which may alias an existing
+ * mapping and so take no tag. A tagged munmap, mprotect, madvise, msync,
+ * mincore or mremap used to be refused (EINVAL, ENOMEM), the tag taken for
+ * part of the address. */
 SYSDEF(munmap) {
+    a0 = a64_untag(a0);
     if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
     int r = guest_unmap(&c->m->as, a0, PG_UP(a1));
     return r < 0 ? (u64)(s64)r : 0;
@@ -504,6 +512,7 @@ SYSDEF(munmap) {
  * PROT_GROWSUP has no mapping to name on arm64, which has no VM_GROWSUP:
  * EINVAL, or ENOMEM if the range's start is not mapped. */
 SYSDEF(mprotect) {
+    a0 = a64_untag(a0);
     u64 prot = a2, grows = prot & (G_PROT_GROWSDOWN | G_PROT_GROWSUP);
     prot &= ~grows;
     if (grows == (G_PROT_GROWSDOWN | G_PROT_GROWSUP)) return (u64)(s64)-EINVAL;
@@ -700,6 +709,7 @@ static u64 madv_populate(CPU *c, u64 start, u64 end, int write) {
 
 SYSDEF(madvise) {
     (void)a3; (void)a4; (void)a5;
+    a0 = a64_untag(a0);
     /* The kernel's third argument is an `int`, so the high half of the
      * register is no part of the advice: 0x1_0000_0004 is MADV_DONTNEED. */
     int adv = (int)(s32)a2;
@@ -1014,7 +1024,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
 
 SYSDEF(mremap) {
     as_lock();
-    u64 r = mremap_locked(c, a0, a1, a2, a3, a4);
+    u64 r = mremap_locked(c, a64_untag(a0), a1, a2, a3, a4);   /* not the new address */
     as_unlock();
     return r;
 }
@@ -1046,6 +1056,7 @@ SYSDEF(mremap) {
  * ENOMEM, which is the answer the guest's own race deserves. */
 SYSDEF(msync) {
     (void)a3; (void)a4; (void)a5;
+    a0 = a64_untag(a0);
     int flags = (int)a2;
     if (flags & ~(G_MS_ASYNC | G_MS_INVALIDATE | G_MS_SYNC)) return (u64)(s64)-EINVAL;
     if (a0 & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
@@ -1129,7 +1140,7 @@ static u64 mincore_locked(CPU *c, u64 a0, u64 a1, u64 a2) {
 
 SYSDEF(mincore) {
     as_lock();
-    u64 r = mincore_locked(c, a0, a1, a2);
+    u64 r = mincore_locked(c, a64_untag(a0), a1, a2);   /* the vector is a pointer */
     as_unlock();
     return r;
 }

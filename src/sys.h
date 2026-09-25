@@ -93,6 +93,23 @@ static inline u64 deadline_sat(u64 now, u64 span) {
 static inline size_t rw_count(u64 n) {
     return (size_t)(n > A64_MAX_RW_COUNT ? A64_MAX_RW_COUNT : n);
 }
+/* The kernel's access_ok, for a buffer a transfer names (vfs_read's and
+ * vfs_write's, import_single_range's, import_iovec's per segment): all of it
+ * below the top of the user address space -- the tag of a tagged pointer taken
+ * off first for a thread that enabled the tagged-address ABI, and left on,
+ * failing, for one that has not (thread.h). A kernel checks it before it looks
+ * at the file's data, so a buffer that fails it is EFAULT at once -- after the
+ * descriptor's own checks, and before any wait: a read into no user buffer
+ * from an empty pipe does not block. XferCut.denied hands such a buffer to the
+ * host the same way (xfer_begin). */
+static inline int guest_access_ok(u64 va, u64 len) {
+    if (va >> 56) {
+        if (!(g_tls.tagged_addr_ctrl & 1)) return 0;
+        va = a64_untag(va);
+    }
+    return len <= GUEST_TASK_SIZE && va <= GUEST_TASK_SIZE - len;
+}
+
 static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
     size_t done = 0;
     while (done < len) {
@@ -204,6 +221,10 @@ static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
 typedef struct XferCut {
     size_t seg;
     size_t after;
+    int denied;       /* the vector fails access_ok (guest_access_ok): the host
+                       * is handed it at an address its own access_ok refuses,
+                       * so it answers as the kernel does -- EFAULT, after the
+                       * descriptor's checks, before anything is moved */
 } XferCut;
 
 /* Host memory for a value the host kernel has to be handed in one piece --

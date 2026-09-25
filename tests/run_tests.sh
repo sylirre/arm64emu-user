@@ -2864,6 +2864,12 @@ check_fixture clonepidfd $'pidfd_open a thread: EINVAL\nclone pidfd: ok\nwaitid 
 # nothing (sig_taken_quietly). Self-checking: qemu-user forks for a clone child, which then signals with
 # SIGCHLD; the block is the kernel's.
 check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone'
+# The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
+# managed addresses untagged always, dereferenced ones EFAULT until the thread
+# enables it (before the file is asked anything, even an empty pipe), the
+# control per thread, inherited, cleared by execve. Self-checking: the block is
+# the kernel's, per Documentation/arch/arm64/tagged-address-abi.rst.
+check_fixture tagged $'initial: 0\nwrite tagged, off: EFAULT\nread tagged, off, empty pipe: EFAULT\nreadv tagged, off, empty pipe: EFAULT\nread kernel address, empty pipe: EFAULT\nread tagged, bad fd: EBADF\nmadvise tagged: ok, page now 0\nmprotect tagged: ok\nmincore tagged: ok\nmsync tagged: ok\nmunmap tagged: ok\nunmapped: ENOMEM\nmincore tagged vector, off: EFAULT\nset MTE bit: EINVAL\nset, arg3: EINVAL\nget, arg2: EINVAL\nenable: ok\nnow: 1\nwrite tagged, on: ok\nread tagged, on: ok hi\nmincore tagged vector, on: ok\nwrite bit 55, on: EFAULT\nthread: 1\nfork: 1\ndisable: ok, now 0\nafter exec: 0'
 # rt_sigqueueinfo / rt_tgsigqueueinfo read the sender's siginfo as the kernel
 # does -- kernel_siginfo's 48 bytes, the other 80 only for a layout it does not
 # know (and then they must be zero: E2BIG) -- and hand si_errno on. Self-checking

@@ -90,6 +90,41 @@ next access. `tlb_flush_all` also forces a re-sync for the calling thread.
 - `copy_from_guest` / `copy_to_guest` / `copy_str_from_guest`: page-wise loops,
   `-EFAULT` on a hole. The syscall layer's **only** route into guest memory.
 
+### Tagged addresses
+
+The CPU ignores the top byte of a data address (TBI0), and `translate()` strips
+it for every access but an instruction fetch, so a pointer may carry a tag
+there. What a *syscall* makes of one is the kernel's tagged-address ABI
+(`tagged-address-abi.rst`), per thread:
+
+- An address a syscall only *manages* — `munmap`, `mprotect`, `madvise`,
+  `msync`, `mincore`, `mremap`'s old address — is taken untagged, always
+  (`a64_untag`: the top byte gone, bit 55 carried up, so a kernel-half one
+  fails the range check). `mmap`, `brk` and `mremap`'s new address take none.
+- A pointer a syscall *dereferences* is refused with `EFAULT` unless the thread
+  has enabled the ABI (`PR_SET_TAGGED_ADDR_CTRL` with `PR_TAGGED_ADDR_ENABLE`,
+  the one control on a CPU without MTE; inherited by a thread and a fork,
+  cleared by execve). The copy helpers, `guest_lend` and `mem_host_ptr` apply
+  that while a syscall handler of the calling thread runs (`g_tls.uaccess`,
+  set by the dispatcher) — not to the emulator's own accesses, and not to a
+  tracer's `PEEK`/`POKE` or `process_vm_*`, which the kernel's GUP untags
+  whatever the tracee's setting.
+- A transfer checks it as `vfs_read`, `import_single_range` and `import_iovec`
+  do, before the file is asked anything (`guest_access_ok`, the kernel's
+  `access_ok`: the whole buffer below the top of the user address space): a
+  read into a buffer that fails it is `EFAULT` at once, even on an empty pipe,
+  after the descriptor's own checks. A 64-bit host is handed the buffer at an
+  address its own `access_ok` refuses and answers in the kernel's order; an
+  ILP32 process on a 64-bit kernel has no such address, and the emulator
+  answers `EBADF`/`EFAULT` itself (`XferCut.denied`).
+
+A tag used to be ignored where the kernel refuses it — a `write()` from a tagged
+buffer went through with the ABI off — and refused where the kernel ignores it,
+taken for part of an `munmap`'s address. And a read into no user memory at all
+— a kernel-half pointer — reached the host as a fault at address 0, which the
+host takes for a user address: it waited on an empty pipe before it failed
+(`tests/fixtures/tagged.c`).
+
 ## Mapping operations
 
 `mmap`'s arguments are validated in `do_mmap`'s order, which a native probe

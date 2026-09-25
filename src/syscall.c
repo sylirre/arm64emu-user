@@ -601,7 +601,11 @@ void syscall_dispatch(CPU *c) {
          * epochs). Handlers reach guest memory only through translate(), which
          * re-checks the generation itself, so the window is safe to disown. */
         as_tlb_block_begin();
+        /* Its pointers are this thread's, judged by its tagged-address ABI
+         * (mem.c, uaddr_tag_refused). */
+        g_tls.uaccess = 1;
         ret = fn(c, a0, a1, a2, a3, a4, a5);
+        g_tls.uaccess = 0;
         as_tlb_block_end();
     } else {
         int quiet = 0;

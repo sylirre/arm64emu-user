@@ -36,6 +36,15 @@ typedef struct {
     /* The group stop (Machine.jc_gseq) this thread has taken part in: one
      * later than this is still to be joined (signal.c, "group stop"). */
     u32 jc_seen;
+    /* The arm64 tagged-address ABI (PR_SET_TAGGED_ADDR_CTRL): a thread's own,
+     * inherited by a clone and a fork, cleared by execve. With it, a pointer
+     * a syscall dereferences may carry a tag in its top byte; without it,
+     * one that does is EFAULT, as the kernel's access_ok answers. The check
+     * applies while `uaccess` says a syscall handler of this thread is
+     * running (syscall_dispatch) -- not to the emulator's own accesses, nor
+     * to a tracer's, which the kernel's GUP untags whatever the setting. */
+    u32 tagged_addr_ctrl;
+    u8  uaccess;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
      * internal wakeups -- syscall_restart_internal, src/syscall.c). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;

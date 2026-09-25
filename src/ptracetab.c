@@ -547,7 +547,21 @@ static int pt_orphaned_sig(const PtLink *e) {
  * cmd_seq snapshot taken *before* the stop was published (see pt_stop): the
  * tracer can only post a command after observing STOPPED, so any command bumps
  * cmd_seq past `seen` and is never missed by this loop. */
+static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si);
+
 static int pt_service_loop(CPU *c, PtLink *e, u32 seen, u8 *si) {
+    /* A tracer's PEEK/POKE and process_vm access are the kernel's GUP, which
+     * untags an address whatever the tracee's tagged-address ABI says -- not
+     * the tracee's own syscall, whose stop (a fork's, an exec's) this may be
+     * inside of. */
+    u8 ua = g_tls.uaccess;
+    g_tls.uaccess = 0;
+    int r = pt_service_loop_run(c, e, seen, si);
+    g_tls.uaccess = ua;
+    return r;
+}
+
+static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si) {
     int inject = 0;
     for (;;) {
         while (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) == seen) {

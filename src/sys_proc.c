@@ -750,6 +750,7 @@ typedef struct {
     u32 jc_seen;              /* ...and its place in a group stop: a thread
                                * made while one is pending for its creator
                                * joins it (task_join_group_stop) */
+    u32 tagged_addr_ctrl;     /* ...and its tagged-address ABI (inherited) */
     u32 pers;                 /* creator's personality, inherited likewise */
     /* The creator's call-out counters, not the Machine's current ones: if the
      * creator was already out of date -- an execve called it out while it sat
@@ -799,6 +800,7 @@ static void *thread_entry(void *arg) {
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
     g_tls.jc_seen = t->jc_seen;
+    g_tls.tagged_addr_ctrl = t->tagged_addr_ctrl;
     g_tls.personality = t->pers;
     g_tls.pers_pub = 0;
     thr_reg_add(tid, t->pers);
@@ -1437,6 +1439,7 @@ SYSDEF(clone) {
         t->tls = tls;
         t->sigmask = g_tls.sigmask;
         t->jc_seen = g_tls.jc_seen;
+        t->tagged_addr_ctrl = g_tls.tagged_addr_ctrl;
         t->pers = g_tls.personality;
         t->stop_gen = g_tls.stop_gen;
         t->image_gen = g_tls.image_gen;
@@ -2437,6 +2440,7 @@ static void dethread_join(CPU *c) {
     __atomic_store_n(&m->leader_parked, 0, __ATOMIC_RELEASE);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
+    g_tls.tagged_addr_ctrl = 0;   /* the new image starts without the ABI */
     g_tls.robust_head = 0;
     robust_tab_set(g_tls.tid, 0);
     thr_reg_parked(g_tls.tid, 0);
@@ -2963,6 +2967,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     as_reinit_live(&m->as);
     memset(&g_tls.pend_exc, 0, sizeof g_tls.pend_exc);
     g_tls.clear_child_tid = 0;
+    g_tls.tagged_addr_ctrl = 0;   /* flush_tagged_addr_state: execve clears it */
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
 
     int r = load_elf(m, imgfd, ifd, canon, argv, envp);
@@ -3755,6 +3760,19 @@ SYSDEF(prctl) {
             return (u64)seccomp_prctl_set(c, a1, a2);
         case PR_GET_SECCOMP:
             return __atomic_load_n(&c->m->seccomp_mode, __ATOMIC_RELAXED);
+        /* The arm64 tagged-address ABI, per thread (thread.h): whether a
+         * pointer a syscall dereferences may carry a tag. PR_TAGGED_ADDR_ENABLE
+         * is the one control there is, MTE not being one of this CPU's
+         * features, and the unused arguments must be 0
+         * (set/get_tagged_addr_ctrl). */
+        case G_PR_SET_TAGGED_ADDR_CTRL:
+            if (a1 & ~(u64)G_PR_TAGGED_ADDR_ENABLE || a2 || a3 || a4)
+                return (u64)(s64)-EINVAL;
+            g_tls.tagged_addr_ctrl = (u32)a1;
+            return 0;
+        case G_PR_GET_TAGGED_ADDR_CTRL:
+            if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
+            return g_tls.tagged_addr_ctrl;
         default:
             return (u64)(s64)-EINVAL;
     }
