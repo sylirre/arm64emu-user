@@ -127,6 +127,23 @@ struct Machine {
                                * leader_parked) is not in as.nthreads, so the
                                * arrival count alone cannot say it arrived */
     s32 dethread_parked;      /* siblings currently waiting at the rendezvous */
+    /* ---- job control while traced (signal.c, "group stop") ----
+     *
+     * The kernel's signal_struct group-stop state, which the host cannot keep
+     * for a process a tracer holds threads of: a traced thread's stop is a
+     * ptrace trap in its own service loop, never a host stop, so a group stop
+     * among such threads is the emulator's to run -- the traced ones trap, the
+     * others park. Plain words: the capture handler reads and bumps them
+     * (SIGCONT's effects are the kernel's send-time ones). */
+    u32 jc_gseq;              /* generation of the latest group stop */
+    u32 jc_active;            /* one is in progress or complete (the kernel's
+                               * group_stop_count || SIGNAL_STOP_STOPPED) */
+    u32 jc_sig;               /* its stop signal (JOBCTL_STOP_SIGMASK) */
+    u32 jc_contgen;           /* bumped by each SIGCONT caught: a stop signal
+                               * queued before it is flushed, and a thread
+                               * parked in the group stop wakes */
+    u32 jc_stopgen;           /* bumped by each stop signal caught: a SIGCONT
+                               * queued before it is flushed */
     s32 dethread_state;       /* DT_PENDING / DT_COMMIT */
     s32 dethread_done;        /* 1 = the new image is loaded and the carrier may
                                * adopt it */
@@ -697,18 +714,33 @@ int  sig_sfd_requeued(GSignalfdSiginfo *r);
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* SECCOMP_RET_TRAP: SIGSYS carrying the blocked syscall (sys_seccomp.c). */
 void sig_deliver_seccomp_trap(CPU *c, int data, s32 nr);
-/* Queue a signal into this thread's capture ring for cooperative delivery
- * (routes a traced process's self-directed stop signal through ptrace). */
-void sig_raise_local(int sig);
 /* Queue the signal a ptrace signal-delivery stop hands on (ptracetab.c), as
  * one past its stop: delivered without being reported again, with the stop's
- * siginfo as the tracer left it (the guest's 128-byte layout). */
-void sig_inject_local(int sig, const u8 *si);
+ * siginfo as the tracer left it (the guest's 128-byte layout). `gen` is
+ * Machine.jc_contgen as it was before the stop: a stop signal is not acted
+ * on if a SIGCONT came since. */
+void sig_inject_local(int sig, const u8 *si, u32 gen);
 /* PTRACE_ATTACH's SIGSTOP, queued on the calling thread as the kernel queues
  * it (private, SI_KERNEL), and the rule for the call a tracer's INTERRUPT
  * trap cut short (signal.c). */
 void sig_raise_attach_stop(void);
 void sig_after_trap(CPU *c);
+/* A guest's job-control signal (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT)
+ * for a process a tracer holds threads of (ptrace.h, ptrace_group_traced):
+ * sent to thread group `tgid` (through `pidfd` if it is one, >= 0), or its
+ * thread `tid` when nonzero, as the siginfo `code` (SI_USER, SI_TKILL, or a
+ * queued one's), `pid`, `uid`, `err` and `value` say -- carried on the kick
+ * signal, in the order sent, never on its own number. 0 or -errno. */
+s64  sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 uid,
+                 s32 err, u64 value);
+/* The group stop (signal.c, "group stop"): an untraced thread's part in one
+ * (parked until SIGCONT), and its hand-over to the host when the last traced
+ * thread is gone. */
+void sig_jc_park(CPU *c);
+void sig_jc_untraced(struct Machine *m);
+/* sys_proc.c: bring every other guest thread of this process to its run-loop
+ * boundary (the ptrace kick), for what is due there -- a group stop. */
+void thr_kick_all(s32 self);
 /* Does the kernel know the layout of this si_code for this signal
  * (known_siginfo_layout)? If not, a siginfo read from userspace must be zero
  * past kernel_siginfo's 48 bytes (sys_sig.c). */

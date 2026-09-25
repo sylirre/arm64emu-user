@@ -200,27 +200,50 @@ SYSDEF(sigaltstack) {
     return 0;
 }
 
-/* One guest process, one signal: the ptrace routing every path below needs,
- * then the host send. Returns 0 or -errno.
- *
- * A traced process stopping itself (kill(getpid(), SIGSTOP), as strace's child
- * does to synchronize) must ptrace-stop cooperatively, not real-stop at the
- * host. The group fan-out (ptrace_signal_stop) stops every traced thread, as
- * the kernel's group-stop does; ptrace_selfstop backstops the calling thread
- * when the registry has no link for it. A stop signal to *another* process
- * that is a tracee likewise becomes a cooperative group-stop (a tracer
- * stopping its tracee with SIGSTOP before detaching, as strace does on ^C); a
- * real host SIGSTOP would freeze it. SIGCONT to a tracee a tracer has put into
- * a listening group-stop ends the group-stop cooperatively (reports
- * EVENT_STOP) instead of a real host signal. */
-static int kill_route(s32 pid, int sig) {
-    if (pid == (s32)getpid())
-        return ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig);
-    return ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig);
+/* The job-control signals -- SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT --
+ * to a process a tracer holds threads of, itself included (kill(getpid(),
+ * SIGSTOP), as strace's child does to synchronize) and a tracer's own tracee
+ * (strace stopping it before it detaches), are not the host's to send. Its
+ * SIGSTOP would stop every thread, the traced ones where their tracer cannot
+ * reach them; and the five go on one number, the kick signal, so that the
+ * target takes them in the order they were sent, which decides what each one
+ * flushes (signal.c, sig_send_jc). The siginfo is `gsi`, a queueing call's, or
+ * kill's SI_USER / tkill's SI_TKILL (`tid` nonzero) from the caller. Every
+ * other signal a traced process is sent the host delivers to its capture
+ * handler, which catches everything while it is traced. 1 = sent, with the
+ * result in *res. */
+static int jc_route(s32 tgid, s32 tid, int pidfd, int sig, const u8 *gsi, s64 *res) {
+    if (sig != SIGSTOP && sig != SIGTSTP && sig != SIGTTIN && sig != SIGTTOU &&
+        sig != SIGCONT)
+        return 0;
+    if (!ptrace_group_traced(tid ? tid : tgid)) return 0;
+    if (!tgid) tgid = tid == (s32)g_tls.tid ? (s32)getpid() : proctab_task_tgid(tid);
+    if (tgid <= 0) { *res = -ESRCH; return 1; }
+    /* ...and a SIGCONT to one the host has stopped (a SIGSTOP from outside
+     * the guest, which the emulator never sees) must continue it, as its own
+     * would: woken by the host, with nothing to show the guest. */
+    if (sig == SIGCONT && tgid != (s32)getpid() && ptrace_task_stopped(tgid))
+        ptrace_wake_stopped(tgid);
+    if (gsi) {
+        s32 err, code, pid;
+        u32 uid;
+        u64 value;
+        memcpy(&err, gsi + 4, 4);
+        memcpy(&code, gsi + 8, 4);
+        memcpy(&pid, gsi + 16, 4);
+        memcpy(&uid, gsi + 20, 4);
+        memcpy(&value, gsi + 24, 8);
+        *res = sig_send_jc(tgid, tid, pidfd, sig, code, pid, uid, err, value);
+    } else {
+        *res = sig_send_jc(tgid, tid, pidfd, sig, tid ? SI_TKILL : SI_USER,
+                           (s32)getpid(), (u32)getuid(), 0, 0);
+    }
+    return 1;
 }
 
 static s64 kill_one(s32 pid, int sig) {
-    if (kill_route(pid, sig)) return 0;
+    s64 r;
+    if (jc_route(pid, 0, -1, sig, NULL, &r)) return r;
     return kill((pid_t)pid, sig_send_host_nr(sig)) < 0 ? -errno : 0;
 }
 
@@ -286,15 +309,8 @@ SYSDEF(tkill) {
     s32 tid = (s32)a0;
     if (tid <= 0) return (u64)(s64)-EINVAL;
     if (!proctab_has_task(tid)) return (u64)(s64)-ESRCH;
-    if (tid == (s32)g_tls.tid) {
-        /* Self (the common raise() case): route a traced self-stop via ptrace. */
-        if (ptrace_selfstop((int)a1)) return 0;
-    } else {
-        /* Stop/cont signal to another traced task -> cooperative group-stop /
-         * listening group-stop end. */
-        if (ptrace_signal_stop(tid, (int)a1)) return 0;
-        if (ptrace_signal_cont(tid, (int)a1)) return 0;
-    }
+    s64 r;
+    if (jc_route(0, tid, -1, (int)a1, NULL, &r)) return (u64)r;
     return syscall(SYS_tkill, (pid_t)tid, sig_send_host_nr((int)a1)) < 0
                ? host_err() : 0;
 }
@@ -323,15 +339,8 @@ SYSDEF(tgkill) {
          * on every preemption) pays a compare against zero. */
         return (u64)(s64)-ESRCH;
     }
-    if (tid == (s32)g_tls.tid && tgid == getpid()) {
-        /* Self thread: route a traced self-stop through ptrace. */
-        if (ptrace_selfstop((int)a2)) return 0;
-    } else if (ptrace_signal_stop(tgid, (int)a2) ||
-               ptrace_signal_cont(tgid, (int)a2)) {
-        /* Stop signal to a traced process -> cooperative group-stop; SIGCONT
-         * to one it has put into a listening group-stop -> group-stop end. */
-        return 0;
-    }
+    s64 r;
+    if (jc_route(tgid, tid, -1, (int)a2, NULL, &r)) return (u64)r;
     return syscall(SYS_tgkill, (pid_t)tgid, (pid_t)tid, sig_send_host_nr((int)a2)) < 0
                ? host_err() : 0;
 }
@@ -615,9 +624,9 @@ SYSDEF(rt_sigqueueinfo) {
     if ((code >= 0 || code == SI_TKILL) && pid != (s32)g_tls.tid)
         return (u64)(s64)-EPERM;
     if (pid <= 0 || !proctab_has_task(pid)) return (u64)(s64)-ESRCH;
-    /* A stop signal to a traced process, or SIGCONT to a listening one: the
-     * same routing as kill(2). */
-    if (kill_route(pid, sig)) return 0;
+    /* A SIGSTOP for a traced process: kill(2)'s routing, with this siginfo. */
+    s64 sr;
+    if (jc_route(pid, 0, -1, sig, gsi, &sr)) return (u64)sr;
     int hs = sig_send_host_nr(sig);   /* 32/33 ride the carrier */
     siginfo_t si;
     sqi_host(&si, hs, gsi, 0);
@@ -649,11 +658,8 @@ SYSDEF(rt_tgsigqueueinfo) {
     } else if (proc_task_is_foreign(tid)) {
         return (u64)(s64)-ESRCH;   /* not a guest thread: see tgkill */
     }
-    if (tid == (s32)g_tls.tid && tgid == (s32)getpid()) {
-        if (ptrace_selfstop(sig)) return 0;
-    } else if (ptrace_signal_stop(tgid, sig) || ptrace_signal_cont(tgid, sig)) {
-        return 0;
-    }
+    s64 sr;
+    if (jc_route(tgid, tid, -1, sig, gsi, &sr)) return (u64)sr;
     int hs = sig_send_host_nr(sig);
     siginfo_t si;
     sqi_host(&si, hs, gsi, 1);
@@ -696,7 +702,8 @@ SYSDEF(pidfd_send_signal) {
             return (u64)(s64)-EPERM;
     }
     if (pid <= 0 || !proctab_has_task(pid)) return (u64)(s64)-ESRCH;
-    if (kill_route(pid, sig)) return 0;
+    s64 sr;
+    if (jc_route(pid, 0, fd, sig, uinfo ? gsi : NULL, &sr)) return (u64)sr;
     hs = sig_send_host_nr(sig);
     if (uinfo) sqi_host(&si, hs, gsi, 0);
     long r = -1;

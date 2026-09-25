@@ -33,6 +33,9 @@ typedef struct {
      * thread belongs to, and a stale one means an execve replaced it. */
     u32 stop_gen;
     u32 image_gen;
+    /* The group stop (Machine.jc_gseq) this thread has taken part in: one
+     * later than this is still to be joined (signal.c, "group stop"). */
+    u32 jc_seen;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
      * internal wakeups -- syscall_restart_internal, src/syscall.c). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;

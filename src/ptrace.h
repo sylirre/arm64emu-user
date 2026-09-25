@@ -25,7 +25,8 @@ extern __thread int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PT
 extern __thread int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
 extern __thread int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
 /* Set by the reserved-signal kick handler (a tracer's PTRACE_ATTACH/SEIZE/
- * INTERRUPT); serviced at the run-loop boundary by ptrace_service_kick. */
+ * INTERRUPT, a group stop calling a thread out, a SIGCONT's trap_notify);
+ * serviced at the run-loop boundary by ptrace_service_kick. */
 extern __thread volatile sig_atomic_t g_ptrace_kick;
 
 /* Host signal reserved for the attach stop-kick (a high RT signal the emulator
@@ -44,6 +45,12 @@ extern int g_sig_kicksig;
 #define PTRACE_KICKSIG   g_sig_kicksig
 #define PT_KICK_MAGIC    0x50544b21   /* "PTK!" */
 #define PT_WAKE_MAGIC    0x50545721   /* "PTW!" */
+/* The value of the SIGCONT a tracer wakes a host-stopped tracee with, so its
+ * capture can drop it (ptracetab.c, ptrace_wake_stopped). */
+#define PT_STOPWAKE_MAGIC 0x50545357  /* "PTSW" */
+/* The same number also carries a guest's job-control signals to a traced
+ * process -- SIGSTOP's own would freeze it -- marked in si_code instead
+ * (signal.c, sig_send_jc). */
 
 /* main(): create the shared link registry (before the first fork). */
 void ptrace_init(void);
@@ -120,32 +127,29 @@ int  ptrace_report_signal(CPU *c, int sig, u8 *si);
 int  ptrace_report_fault(CPU *c, int sig, u8 *si);
 /* PTRACE_SINGLESTEP: report the SIGTRAP stop after one stepped instruction. */
 void ptrace_report_singlestep(CPU *c);
-/* A traced thread taking a stop signal's default action: the kernel's
- * group-stop, which the tracer is told of (do_signal_stop -> do_jobctl_trap)
- * -- never a host stop, which would freeze the service loop the tracer drives
- * it with. Parks until the tracer resumes it, ignoring any signal it is
- * resumed with, and returns 0; or returns `sig` for the caller to stop the
- * host process with after all, the tracer having died (a group-stop outlives
- * its tracer), or the thread not being traced. */
-int  ptrace_group_stop(CPU *c, int sig);
-/* If this process is traced and `sig` is a stop signal (SIGSTOP/SIGTSTP/...),
- * queue it for a cooperative ptrace signal-delivery stop and return 1; else 0.
- * The caller (a signal-send syscall) uses this only when the target is self —
- * a real host stop would freeze the tracee's ptrace service loop. */
-int  ptrace_selfstop(int sig);
-/* As ptrace_selfstop, but for a stop signal sent to another task `id` (a pid or
- * any thread's tid): if its thread group has live tracees, record the stop
- * signal and kick every one of them to a cooperative group-stop (returns 1) --
- * the kernel group-stops all threads and each traced one reports its own stop.
- * A real host SIGSTOP would instead freeze the tracees' service loops and
- * deadlock the follow-up requests (e.g. the DETACH strace issues on ^C).
- * 0 = no tracee in that group. */
-int  ptrace_signal_stop(s32 id, int sig);
-/* SIGCONT sent to another task `id`: if its thread group has tracees a tracer
- * has put into a listening group-stop (PTRACE_LISTEN), end the group-stop and
- * notify each tracer with a PTRACE_EVENT_STOP, returning 1; else 0 (ordinary
- * SIGCONT). */
-int  ptrace_signal_cont(s32 id, int sig);
+/* Does thread group `id` (a pid or any thread's tid) have a traced thread?
+ * Then a job-control signal for it goes on the kick signal (signal.c,
+ * sig_send_jc) -- never SIGSTOP's own number, which would freeze the traced
+ * threads where their tracer cannot reach them. */
+int  ptrace_group_traced(s32 id);
+/* The group-stop state of thread group `tgid` changed (a group stop began, or
+ * a SIGCONT ended one): a trap_notify for each SEIZEd tracee of it, a listening
+ * one woken to trap again, a running one kicked if `kick`. Async-signal-safe. */
+void ptrace_jc_notify(s32 tgid, int kick);
+/* Bring thread `tid` of this process to its run-loop boundary (the kick). */
+void ptrace_kick_thread(s32 tid);
+/* Is process `tgid` stopped by the host (a stop the host carried out, which
+ * runs nothing of the emulator's)? And wake it with a SIGCONT of the host's
+ * that its capture drops (PT_STOPWAKE_MAGIC) -- what the kernel's attach to a
+ * stopped task, and a guest's SIGCONT, need of it. */
+int  ptrace_task_stopped(s32 tgid);
+void ptrace_wake_stopped(s32 tgid);
+/* What is due at a run-loop boundary: a pending attach to adopt, the
+ * job-control traps of a tracee (PTRACE_INTERRUPT, a group stop to take part
+ * in, a change of group-stop state), or an untraced thread's part in a group
+ * stop (parked until SIGCONT). Called for a kick, and by the thread that has
+ * just begun a group stop (signal.c). */
+void ptrace_jobctl_service(CPU *c);
 /* Exit of the calling thread: release its tracee link (or publish a synthetic
  * exit for the tracer to collect -- always for a secondary thread, whose death
  * is never host-waitable, and for a process whose tracer is not its host
@@ -162,9 +166,8 @@ void ptrace_report_exit_group(int wstatus);
  * pending exit-status word in GETEVENTMSG, before the process actually exits.
  * No-op unless traced with TRACEEXIT set. */
 void ptrace_report_exit_stop(CPU *c, int wstatus);
-/* Run-loop boundary: adopt a pending PTRACE_ATTACH/SEIZE (become a tracee and, for
- * ATTACH, stop with SIGSTOP) or service a pending PTRACE_INTERRUPT (EVENT_STOP).
- * Called when g_ptrace_kick is set. */
+/* Run-loop boundary: ptrace_jobctl_service, for the kick that set
+ * g_ptrace_kick. */
 void ptrace_service_kick(CPU *c);
 
 /* ---- Guest ptrace(2) entry (tracer side + TRACEME) ---- */

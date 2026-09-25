@@ -745,6 +745,9 @@ typedef struct {
     struct Machine *m;
     u64 flags, ptid, ctid, tls;
     u64 sigmask;              /* creator's blocked set, inherited (POSIX) */
+    u32 jc_seen;              /* ...and its place in a group stop: a thread
+                               * made while one is pending for its creator
+                               * joins it (task_join_group_stop) */
     u32 pers;                 /* creator's personality, inherited likewise */
     /* The creator's call-out counters, not the Machine's current ones: if the
      * creator was already out of date -- an execve called it out while it sat
@@ -793,6 +796,7 @@ static void *thread_entry(void *arg) {
     g_tls.image_gen = t->image_gen;
     g_tls.pend_exc.valid = false;
     g_tls.sigmask = t->sigmask;
+    g_tls.jc_seen = t->jc_seen;
     g_tls.personality = t->pers;
     g_tls.pers_pub = 0;
     thr_reg_add(tid, t->pers);
@@ -1430,6 +1434,7 @@ SYSDEF(clone) {
         t->ctid = ctid;
         t->tls = tls;
         t->sigmask = g_tls.sigmask;
+        t->jc_seen = g_tls.jc_seen;
         t->pers = g_tls.personality;
         t->stop_gen = g_tls.stop_gen;
         t->image_gen = g_tls.image_gen;
@@ -1634,6 +1639,9 @@ SYSDEF(clone) {
         m->dethread_req = m->dethread_parked = m->dethread_done = 0;
         m->dethread_carrier_here = 0;
         m->dethread_state = DT_PENDING;
+        /* ...and so does a group stop: a new process is in none. */
+        m->jc_active = 0;
+        g_tls.jc_seen = m->jc_gseq;
         g_tls.stop_gen = m->stop_gen;
         g_tls.image_gen = m->image_gen;
         /* fork(2) duplicates the calling thread alone, and in the child that
@@ -2277,6 +2285,13 @@ static void dethread_kick_all(s32 self) {
     EMU_LOCK(&thr_lock, EMU_LK_THR);
     for (int i = 0; i < thr_n; i++)
         if (thr_tab[i].tid != self) dethread_kick(thr_tab[i].tid);
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+}
+
+void thr_kick_all(s32 self) {
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    for (int i = 0; i < thr_n; i++)
+        if (thr_tab[i].tid != self) ptrace_kick_thread(thr_tab[i].tid);
     EMU_UNLOCK(&thr_lock, EMU_LK_THR);
 }
 

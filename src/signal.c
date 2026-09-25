@@ -15,6 +15,7 @@
  * `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel uses the vDSO
  * for this). rt_sigreturn restores everything from the frame at SP. */
 #include <dirent.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -28,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <linux/futex.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -132,6 +134,9 @@ typedef struct {
                   * never handed to another (sig_retarget) */
     int ptraced; /* past its signal-delivery stop (sig_inject_local): taken
                   * without being reported to a tracer again */
+    u32 gen;     /* a stop signal's: Machine.jc_contgen as it was sent; a
+                  * SIGCONT's: jc_stopgen -- which one sent after it has
+                  * flushed it (prepare_signal) if they moved on (jc_stamp) */
 } PendSig;
 
 #define SIGQ_MIN 32       /* the fixed ring this used to be; now the floor */
@@ -790,6 +795,7 @@ void sig_tls_prewarm(void) {
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx);
+static void sig_capture_push(PendSig *p, void *uctx);
 static int sig_chld_emulating(void);
 
 /* The capture handler, for the nets that own a number and forward what is a
@@ -832,6 +838,162 @@ int sig_thread_uncode(int *code) {
     return 1;
 }
 
+/* A guest's job-control signal for a traced process -- SIGSTOP, SIGTSTP,
+ * SIGTTIN, SIGTTOU, SIGCONT -- rides the kick signal instead. SIGSTOP's own
+ * would stop every thread where its tracer cannot reach it; and all five on
+ * one number reach the capture in the order they were sent (a number's
+ * instances queue first in, first out), which the kernel's send-time
+ * flushing -- a SIGCONT takes back every stop signal sent before it, a stop
+ * signal every SIGCONT (jc_stamp) -- depends on: sent on their own numbers, a
+ * SIGSTOP and the SIGCONT sent right after it reached a parked tracee
+ * together, and the host handed over the lower number first. The code is
+ * carried in a range of its own per signal and kind (aimed at the process,
+ * or at a thread), SIG_JC_BIAS and below -- ranges of codes nothing else
+ * sends, below the thread mark's, still negative so any process may send
+ * them -- with the sender's pid, uid, errno and payload as they are
+ * (sig_send_jc); the kick net queues the signal it stands for. */
+#define SIG_JC_BIAS  0x7ffff000
+#define SIG_JC_SPAN  255
+static const int sig_jc_nr[5] = { SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT };
+
+static int sig_jc_uncode(int *code, int *sig, int *thr) {
+    int c = *code;
+    if (c > -SIG_JC_BIAS || c < -(SIG_JC_BIAS + 10 * 0x100 - 1)) return 0;
+    int off = -c - SIG_JC_BIAS;            /* range * 0x100 + |code| */
+    int range = off >> 8, mag = off & 0xff;
+    *sig = sig_jc_nr[range >> 1];
+    *thr = range & 1;
+    *code = -mag;
+    return 1;
+}
+
+s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 uid,
+                s32 err, u64 value) {
+    int idx = -1;
+    for (int i = 0; i < 5; i++) if (sig_jc_nr[i] == sig) idx = i;
+    if (idx < 0) return -EINVAL;
+    if (code > 0) code = 0;
+    if (code < -SIG_JC_SPAN) code = -SIG_JC_SPAN;   /* no sender uses one */
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = PTRACE_KICKSIG;
+    si.si_errno = err;
+    si.si_code = code - (SIG_JC_BIAS + (idx * 2 + (tid != 0)) * 0x100);
+    si.si_pid = (pid_t)pid;
+    si.si_uid = (uid_t)uid;
+    si.si_value.sival_ptr = (void *)(uintptr_t)value;
+    long r = -1;
+    errno = ENOSYS;
+#ifdef SYS_pidfd_send_signal
+    if (pidfd >= 0) {   /* through the pidfd, as the guest sent it: no reuse */
+        sig_sigsys_expected(SYS_pidfd_send_signal);
+        r = syscall(SYS_pidfd_send_signal, pidfd, PTRACE_KICKSIG, &si, 0);
+    }
+#endif
+    if (r < 0 && errno == ENOSYS)
+        r = tid ? syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si)
+                : syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, PTRACE_KICKSIG, &si);
+    return r < 0 ? -errno : 0;
+}
+
+/* ---- group stop ----------------------------------------------------------
+ *
+ * The kernel's send-time rules for the job-control signals (prepare_signal):
+ * a stop signal flushes every pending SIGCONT, and a SIGCONT every pending
+ * stop signal, and ends a group stop -- waking the threads stopped in it and
+ * telling each SEIZEd tracee with a trap_notify. The host keeps all of this
+ * for an untraced process by itself; for one a tracer holds threads of, the
+ * signals come through the capture handler (sig_host_update catches them all
+ * then), and so the rules are kept here, as each one is caught: the two
+ * generations stamp what is queued (a flushed one is dropped when it comes to
+ * be taken, sig_jc_flushed), and SIGCONT's effects happen on the spot. */
+static int sig_is_stop(int sig);
+
+static void sig_jc_continue(void) {
+    struct Machine *m = &g_machine;
+    __atomic_add_fetch(&m->jc_contgen, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&m->jc_active, 0, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    ptrace_jc_notify((s32)getpid(), 1);
+}
+
+static void jc_stamp(PendSig *p) {
+    struct Machine *m = &g_machine;
+    if (sig_is_stop(p->signo)) {
+        p->gen = __atomic_load_n(&m->jc_contgen, __ATOMIC_ACQUIRE);
+        __atomic_add_fetch(&m->jc_stopgen, 1, __ATOMIC_SEQ_CST);
+    } else if (p->signo == SIGCONT) {
+        p->gen = __atomic_load_n(&m->jc_stopgen, __ATOMIC_ACQUIRE);
+        sig_jc_continue();
+    }
+}
+
+/* Flushed as it was sent: a stop signal a SIGCONT sent after it, a SIGCONT a
+ * stop signal sent after it. Never pending, as far as the kernel is
+ * concerned -- taken off the queue unseen. What a ptrace stop hands on is in
+ * hand, not pending. */
+static int sig_jc_flushed(const PendSig *p) {
+    if (p->ptraced) return 0;
+    if (sig_is_stop(p->signo))
+        return p->gen != __atomic_load_n(&g_machine.jc_contgen, __ATOMIC_ACQUIRE);
+    if (p->signo == SIGCONT)
+        return p->gen != __atomic_load_n(&g_machine.jc_stopgen, __ATOMIC_ACQUIRE);
+    return 0;
+}
+
+/* do_signal_stop, for a process a tracer holds threads of: a stop signal's
+ * default action begins a group stop -- unless this thread has one still to
+ * take part in, which this is then its part of -- and calls every other
+ * thread out to take part: a traced one traps (a SEIZEd one told with a
+ * trap_notify, which also wakes a listening one), the others park. Then this
+ * thread's own part, the same way (ptrace_jobctl_service). */
+static void sig_jc_stop(CPU *c, int sig) {
+    struct Machine *m = c->m;
+    if (!__atomic_load_n(&m->jc_active, __ATOMIC_ACQUIRE) ||
+        g_tls.jc_seen == __atomic_load_n(&m->jc_gseq, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&m->jc_sig, (u32)sig, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&m->jc_gseq, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&m->jc_active, 1, __ATOMIC_RELEASE);
+        ptrace_jc_notify((s32)getpid(), 0);
+        thr_kick_all((s32)g_tls.tid);
+    }
+    ptrace_jobctl_service(c);
+}
+
+/* An untraced thread's part in a group stop: the kernel's TASK_STOPPED, which
+ * a SIGCONT ends (sig_jc_continue bumps the generation this waits on and wakes
+ * it) -- or a SIGKILL, which is the host's. Left early for a kick, which may
+ * be a tracer's attach (the thread then traps into the stop, as an attach
+ * turns a stopped task into a traced one), with the thread's part to take
+ * again; and for execve's de_thread. */
+void sig_jc_park(CPU *c) {
+    struct Machine *m = c->m;
+    u32 g = __atomic_load_n(&m->jc_contgen, __ATOMIC_ACQUIRE);
+    while (__atomic_load_n(&m->jc_active, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&m->jc_contgen, __ATOMIC_ACQUIRE) == g) {
+        /* Untimed: any signal of ours -- a SIGCONT's capture, a kick --
+         * interrupts it, and the capture of SIGCONT wakes it besides. */
+        syscall(SYS_futex, &m->jc_contgen, FUTEX_WAIT_PRIVATE, g, NULL, NULL, 0);
+        if (g_ptrace_kick) {
+            g_tls.jc_seen = __atomic_load_n(&m->jc_gseq, __ATOMIC_ACQUIRE) - 1;
+            return;
+        }
+        if (guest_stop_pending(m)) return;
+    }
+}
+
+/* The last traced thread of the process is gone -- detached, or its tracer
+ * died -- with a group stop in force: the stop is the host's now, as the
+ * kernel's is after __ptrace_unlink re-arms it. That stops every thread,
+ * tells the real parent (CLD_STOPPED), and ends with any SIGCONT, from
+ * anyone; the threads parked in the emulator's are released into it. */
+void sig_jc_untraced(struct Machine *m) {
+    if (!__atomic_exchange_n(&m->jc_active, 0, __ATOMIC_SEQ_CST)) return;
+    kill(getpid(), SIGSTOP);
+    __atomic_add_fetch(&m->jc_contgen, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     if (rq_claim(sig, si, p)) {   /* one this process handed back */
         p->ptraced = 0;           /* ...arriving anew: no stop is behind it */
@@ -839,6 +1001,7 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     }
     p->ptraced = 0;   /* nor behind one that just arrived (host_catcher's
                        * PendSig is not zeroed: every field is set here) */
+    p->gen = 0;
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     int thr = sig_thread_uncode(&p->code);
@@ -868,9 +1031,18 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
             p->thr = thr;
         }
     }
+    jc_stamp(p);   /* as it is sent, as far as the guest can tell */
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
+    /* The host SIGCONT a tracer's attach woke a host-stopped tracee with
+     * (ptrace_wake_stopped): the host's continue was the whole point, and a
+     * kernel's attach sends no SIGCONT. */
+    if (sig == SIGCONT && si->si_code == SI_QUEUE &&
+        si->si_value.sival_int == PT_STOPWAKE_MAGIC) {
+        g_sig_selfintr = 1;
+        return;
+    }
     PendSig ps, *p = &ps;
     pendsig_from_host(p, sig, si);
     /* The death of a clone child -- one forked with an exit signal other than
@@ -902,6 +1074,11 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
         g_sig_selfintr = 1;   /* never sent: it interrupted nothing */
         return;
     }
+    sig_capture_push(p, uctx);
+}
+
+/* The capture's last step, for a signal the guest is to have. */
+static void sig_capture_push(PendSig *p, void *uctx) {
     /* A signal the guest has BLOCKED, caught all the same because its number
      * is held out of the mirrored mask (a sent SIGSEGV, a kill(SIGSYS) --
      * sig_set_to_host): it waits in the ring until the unblock, and the
@@ -1012,22 +1189,6 @@ int sig_send_host_nr(int guest_sig) {
                                                 : guest_sig;
 }
 
-/* Queue a signal into this thread's own capture ring as if the host had caught
- * it, for cooperative delivery at the next run-loop boundary. Routes a traced
- * process's self-directed stop signal (SIGSTOP/SIGTSTP/...) through ptrace's
- * signal-delivery stop instead of a real host job-control stop, which would
- * freeze the tracee so it could no longer serve its ptrace mailbox. */
-void sig_raise_local(int sig) {
-    sigq_sync();   /* ordinary context: this one can grow the queue itself */
-    PendSig p;
-    memset(&p, 0, sizeof p);
-    p.signo = sig;
-    p.pid = (int)getpid();
-    p.thr = 1;   /* a stop this thread raised for itself: never a host one */
-    if (!sigq_push_local(&p)) return;
-    jit_signal_interrupt();
-}
-
 /* PTRACE_ATTACH's SIGSTOP (ptrace_attach's send_sig_info(SEND_SIG_PRIV)): a
  * signal on the thread's own queue, SI_KERNEL from nobody, which the thread
  * takes in the kernel's order with the rest (sigq_pick) -- after a
@@ -1043,6 +1204,7 @@ void sig_raise_attach_stop(void) {
     p.signo = SIGSTOP;
     p.code = 0x80;   /* SI_KERNEL */
     p.thr = 1;
+    p.gen = __atomic_load_n(&g_machine.jc_contgen, __ATOMIC_ACQUIRE);
     g_sig_selfintr = 0;
     if (!sigq_push_local(&p)) return;
     jit_signal_interrupt();
@@ -1059,10 +1221,11 @@ void sig_raise_attach_stop(void) {
  * unblocked. */
 static void pendsig_from_guest(PendSig *p, int sig, const u8 *si);
 
-void sig_inject_local(int sig, const u8 *si) {
+void sig_inject_local(int sig, const u8 *si, u32 gen) {
     sigq_sync();   /* ordinary context: this one can grow the queue itself */
     PendSig p;
     pendsig_from_guest(&p, sig, si);
+    p.gen = gen;   /* a stop signal's: no SIGCONT since, or no stop (below) */
     p.thr = 1;
     p.ptraced = !(g_tls.sigmask & (1ULL << (sig - 1)));
     if (!sigq_push_local(&p)) return;
@@ -1132,11 +1295,11 @@ static int proc_stat_ids(int pid, char *state, int *ppid, int *pgrp, int *sid) {
  * no member, zombies and init's children aside, has a parent in another group
  * of the same session? get_signal discards a SIGTSTP, SIGTTIN or SIGTTOU in
  * one rather than stop it, which a host stop decides for itself and the
- * group-stop a traced thread reports instead (ptrace_group_stop) has to be
- * told. Guest processes are host processes, so the host's /proc knows; one it
- * will not show counts as a parent that keeps the group attached, erring
- * towards the stop. Rare: only a traced thread taking such a signal's default
- * action asks. */
+ * emulator's group stop, for a process a tracer holds threads of (sig_jc_stop),
+ * has to be told. Guest processes are host processes, so the host's /proc
+ * knows; one it will not show counts as a parent that keeps the group
+ * attached, erring towards the stop. Rare: only a thread of a traced process
+ * taking such a signal's default action asks. */
 static int pgrp_orphaned(void) {
     int pg = (int)getpgrp(), sid = (int)getsid(0), orphaned = 1;
     fdwin_enter();   /* descriptors of our own, briefly (machine.h) */
@@ -1279,6 +1442,24 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         g_sig_selfintr = 1;
         g_sig_npend = 1;
         jit_signal_interrupt();
+        return;
+    }
+    int code = si->si_code, jsig, thr;
+    if (sig_jc_uncode(&code, &jsig, &thr)) {
+        /* A guest's job-control signal (sig_send_jc): the one it stands for,
+         * sent as the sender's siginfo says. It interrupts what it lands on
+         * as that signal would. */
+        PendSig p;
+        memset(&p, 0, sizeof p);
+        p.signo = jsig;
+        p.code = code;
+        p.err = si->si_errno;
+        p.pid = (int)si->si_pid;
+        p.uid = (int)si->si_uid;
+        p.value = (s64)(uintptr_t)si->si_value.sival_ptr;
+        p.thr = thr;
+        jc_stamp(&p);
+        sig_capture_push(&p, uctx);
         return;
     }
     host_catcher(sig, si, uctx);    /* a guest-directed signal of this number */
@@ -1477,7 +1658,7 @@ static int rq_put(const PendSig *p) {
                  >> RQ_IDX_BITS) & 0xfffffu;
         tok = (nonce << RQ_IDX_BITS) | idx;
     } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
-             tok == DETHREAD_MAGIC);
+             tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC);
     slot->nonce = nonce;
     slot->p = *p;
     __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
@@ -2613,6 +2794,7 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
         if (t >= 0) {
             PendSig p = sigq[t];
             sigq_take(t);
+            if (sig_jc_flushed(&p)) continue;   /* never pending, to the kernel */
             if (info_va && pendsig_to_guest(c, &p, info_va) < 0) return -EFAULT;
             return p.signo;
         }
@@ -2723,6 +2905,10 @@ void sig_deliver_pending(CPU *c) {
     if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
     sigq_sync();
     while (sigq_tail != sigq_head) {
+        /* get_signal's loop takes a job-control trap before each dequeue: a
+         * trap_notify or an INTERRUPT that came during the last one's stop is
+         * reported before the next signal is (ptrace_service_kick). */
+        if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
         /* The kernel's next, of those not blocked -- none, and what is queued
          * waits for the unblock (the counts say so without a walk). */
         int pick = sigq_pick(~g_tls.sigmask);
@@ -2730,6 +2916,15 @@ void sig_deliver_pending(CPU *c) {
         PendSig p = sigq[pick];
         int sig = p.signo;
         sigq_take(pick);
+        if (sig_jc_flushed(&p)) {       /* never pending, to the kernel */
+            sig_taken_quietly(c, 0);
+            continue;
+        }
+        /* What do_signal_stop asks of a stop signal's default action: that
+         * a stop signal was the one taken (JOBCTL_STOP_DEQUEUED) and no
+         * SIGCONT has come since -- during its signal-delivery stop, say. */
+        int stop_taken = sig_is_stop(sig);
+        u32 stop_gen = p.gen;
 
         /* ptrace signal-delivery stop: the tracer sees WSTOPSIG==sig and may
          * suppress it (return 0) or substitute another signal before it is
@@ -2771,9 +2966,20 @@ void sig_deliver_pending(CPU *c) {
              * gone, when it is the host stop below after all. An orphaned
              * process group stops for SIGSTOP alone (get_signal), which the
              * host's own stop would decide by itself. */
-            if (UNLIKELY(g_ptrace_active) && sig_is_stop(sig)) {
-                if (sig != SIGSTOP && pgrp_orphaned()) { sig_taken_quietly(c, 1); continue; }
-                if (!ptrace_group_stop(c, sig)) { sig_taken_quietly(c, 1); continue; }
+            /* A process a tracer holds threads of stops as the emulator's
+             * group stop: the traced threads trap, the others park -- a host
+             * stop would freeze the traced ones where their tracer cannot
+             * reach them. An orphaned process group stops for SIGSTOP alone
+             * (get_signal), which the host's own stop would decide by
+             * itself. */
+            if (sig_is_stop(sig) && ptrace_traced()) {
+                if ((sig != SIGSTOP && pgrp_orphaned()) || !stop_taken ||
+                    stop_gen != __atomic_load_n(&m->jc_contgen, __ATOMIC_ACQUIRE)) {
+                    sig_taken_quietly(c, 1);
+                    continue;
+                }
+                sig_jc_stop(c, sig);
+                continue;
             }
             /* Default-ignore/continue disposition: let the host default apply. */
             struct sigaction sa;

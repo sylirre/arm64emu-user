@@ -76,9 +76,10 @@ static void pt_traced_inc(struct Machine *m) {
     __atomic_add_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST);
     sig_trace_update_all(m);
 }
-static void pt_traced_dec(struct Machine *m) {
-    if (__atomic_sub_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST) == 0)
-        sig_trace_update_all(m);
+static int pt_traced_dec(struct Machine *m) {
+    if (__atomic_sub_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST) != 0) return 0;
+    sig_trace_update_all(m);
+    return 1;   /* the last one */
 }
 
 /* ---- shared registry ---- */
@@ -118,12 +119,19 @@ typedef struct {
     u32 event;           /* PTRACE_EVENT_* of the current stop (0 = none) */
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
     u32 attach_pending;  /* tracer ATTACH/SEIZE'd us: adopt at the next boundary */
-    u32 interrupt_pending; /* tracer PTRACE_INTERRUPT'd us: stop at the next boundary */
-    u32 stopsig_pending; /* a stop signal (SIGSTOP/...) was sent to us as a tracee:
-                          * report it as a cooperative group-stop, not a host stop */
+    u32 attach_stopped;  /* ...while the host had the process stopped: adopt into
+                          * a group stop (the tracer woke it to adopt at all) */
+    u32 interrupt_pending; /* JOBCTL_TRAP_STOP: a PTRACE_INTERRUPT, or a SEIZEd
+                          * auto-attached child's first stop -- a
+                          * PTRACE_EVENT_STOP trap at the next boundary, or
+                          * after the stop the tracee is in */
+    u32 trap_notify;     /* JOBCTL_TRAP_NOTIFY: the group-stop state changed
+                          * under a SEIZEd tracee (a group stop began, or a
+                          * SIGCONT ended one) -- the same trap, to tell it */
     u32 seize;           /* attached via SEIZE (no initial SIGSTOP; group stops) */
-    u32 listening;       /* PTRACE_LISTEN: parked in a group/INTERRUPT stop, awaiting
-                          * SIGCONT (group-stop end); "running" to data ptrace ops */
+    u32 listening;       /* PTRACE_LISTEN: parked in an EVENT_STOP trap, not a
+                          * stop to ptrace(2) or wait(2), until a trap_notify or
+                          * an interrupt makes it trap again */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
     s32 pgid;            /* the tracee's process group as of its last stop or
                           * death (claimed with the one it had): what a wait
@@ -155,9 +163,20 @@ static PtTable *g_tab;            /* MAP_SHARED, or NULL if unavailable */
 /* The calling thread's own tracee entry, or NULL. Thread-local like the rest
  * of the tracee-self state: every traced thread has its own link. */
 static __thread PtLink *g_self_link;
-/* The stop this thread is parked in is a group-stop (ptrace_group_stop), and
- * the one it just left ended with its tracer's death (pt_service_loop). */
-static __thread int pt_in_group_stop, pt_orphaned;
+/* The stop this thread is parked in is a job-control trap (pt_jobctl_trap),
+ * and the one it just left ended with its tracer's death (pt_service_loop). */
+static __thread int pt_in_jobctl, pt_orphaned;
+
+/* pt_stop's answer for a listening trap a trap_notify or an interrupt ended:
+ * trap again (pt_jobctl_trap). Never a signal number. */
+#define PT_RETRAP (-1)
+
+/* A group stop this thread has not taken part in yet (signal.c, "group
+ * stop"). */
+static int pt_jc_due(void) {
+    return __atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE) &&
+           g_tls.jc_seen != __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+}
 
 /* ---- futex helpers (cross-process: no FUTEX_PRIVATE_FLAG) ---- */
 static void fx_wake(volatile u32 *a) {
@@ -247,7 +266,8 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
             e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
             e->eventmsg = 0; e->has_siginfo = 0;
             e->attach_pending = e->interrupt_pending = 0;
-            e->stopsig_pending = 0; e->seize = 0; e->listening = 0;
+            e->attach_stopped = 0;
+            e->trap_notify = 0; e->seize = 0; e->listening = 0;
             e->pgid = (s32)getpgid((pid_t)tracee);   /* ours or the target's */
             memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
             e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
@@ -440,7 +460,18 @@ static void pt_self_detach(void) {
     g_ptrace_syscall_armed = 0;
     g_ptrace_singlestep = 0;
     if (e) { __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE); pt_free(e); }
-    if (was) pt_traced_dec(&g_machine);   /* last one out re-mirrors dispositions */
+    /* __ptrace_unlink: a group stop in force stops the thread again, now
+     * untraced -- it parks at its next boundary (ptrace_jobctl_service), or,
+     * the last traced thread gone, the stop is the host's (sig_jc_untraced).
+     * A detach, or a tracer's death, of a live thread only: one that is
+     * exiting releases its link elsewhere, and does not stop. */
+    if (__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)) {
+        g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE) - 1;
+        g_ptrace_kick = 1;
+        g_sig_npend = 1;
+    }
+    /* Last one out re-mirrors dispositions, and hands a group stop over. */
+    if (was && pt_traced_dec(&g_machine)) sig_jc_untraced(&g_machine);
 }
 
 /* What a stop leaves its tracee when the tracer dies: the code the stop has
@@ -449,14 +480,11 @@ static void pt_self_detach(void) {
  * (wait_task_stopped clears it; `reported` is that), so a tracer dead before
  * then leaves the tracee its signal, as ptrace(2) has it: "If the tracee is
  * restarted from signal-delivery-stop, the pending signal is injected". A
- * group-stop outlives its tracer whether collected or not (__ptrace_unlink
- * re-arms JOBCTL_STOP_PENDING), so it leaves its stop signal; a syscall or
- * event stop leaves nothing to deliver. */
+ * trap leaves nothing -- a syscall or event stop, a job-control trap: a group
+ * stop outlives its tracer all the same, but by __ptrace_unlink's re-arming
+ * of JOBCTL_STOP_PENDING, which pt_jobctl_trap does. */
 static int pt_orphaned_sig(const PtLink *e) {
-    if (e->syscall_stop) return 0;
-    if (pt_in_group_stop || e->event == G_PTRACE_EVENT_STOP)
-        return pt_is_stopsig((int)e->stop_sig) ? (int)e->stop_sig : 0;
-    if (e->event) return 0;
+    if (e->syscall_stop || e->event || pt_in_jobctl) return 0;
     return __atomic_load_n(&e->reported, __ATOMIC_ACQUIRE) ? 0 : (int)e->stop_sig;
 }
 
@@ -474,6 +502,17 @@ static int pt_service_loop(CPU *c, PtLink *e, u32 seen, u8 *si) {
         while (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) == seen) {
             fx_wait(&e->cmd_seq, seen, 500);
             if (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) != seen) break;
+            /* Listening (PTRACE_LISTEN): no stop to its tracer any more, and
+             * one a trap_notify or an interrupt ends -- the tracee traps
+             * again (pt_jobctl_trap), as the kernel's ptrace_signal_wake_up
+             * of a listening task sends it back through do_jobctl_trap. */
+            if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE) &&
+                (__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) ||
+                 __atomic_load_n(&e->trap_notify, __ATOMIC_ACQUIRE))) {
+                __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE);
+                return PT_RETRAP;
+            }
             /* Tracer vanished while we were parked: auto-detach and run free, as
              * the kernel's exit_ptrace releases a dead tracer's tracees. kill(2)
              * alone does not see all of "vanished": it succeeds on a ZOMBIE
@@ -611,6 +650,11 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
      * so the service loop cannot miss it (the deadlock this closes was a flaky
      * hang when the tracer posted its first request very quickly). */
     u32 seen = __atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE);
+    /* ptrace_stop: "any trap clears pending STOP trap, STOP trap clears
+     * NOTIFY" -- an INTERRUPT asked for before this stop is answered by it,
+     * and one asked for during it is another trap after it. */
+    __atomic_store_n(&e->interrupt_pending, 0, __ATOMIC_RELEASE);
+    if (event == G_PTRACE_EVENT_STOP) __atomic_store_n(&e->trap_notify, 0, __ATOMIC_RELEASE);
     e->stop_sig = (u32)stop_sig;
     e->event = (u32)event;
     e->syscall_stop = (u32)syscall_stop;
@@ -627,6 +671,16 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
     fx_wake(&g_tab->global_gen);
     pt_wake_tracer(tracer);
     int ns = pt_service_loop(c, e, seen, si);
+    if (ns == PT_RETRAP) return ns;
+    /* What the stop did not answer -- an INTERRUPT or a trap_notify that
+     * came during it, a group stop begun meanwhile -- is taken at the next
+     * boundary (ptrace_service_kick). */
+    if (g_self_link && (__atomic_load_n(&g_self_link->interrupt_pending, __ATOMIC_ACQUIRE) ||
+                        __atomic_load_n(&g_self_link->trap_notify, __ATOMIC_ACQUIRE) ||
+                        pt_jc_due())) {
+        g_ptrace_kick = 1;
+        g_sig_npend = 1;
+    }
     if (ns && si) {
         if ((u32)ns != pt_r32(si, 0)) {
             memset(si, 0, 128);
@@ -652,8 +706,9 @@ static void pt_signal_stop(CPU *c, int sig, int event, int code, s32 pid, u64 ad
     u8 si[128];
     if (event) pt_si_notify(si, sig, sig | (event << 8));
     else       pt_si_signal(si, sig, code, pid, addr);
+    u32 gen = __atomic_load_n(&g_machine.jc_contgen, __ATOMIC_ACQUIRE);
     int ns = pt_stop(c, sig, event, 0, si);
-    if (ns) sig_inject_local(ns, si);
+    if (ns > 0) sig_inject_local(ns, si, gen);
 }
 
 void ptrace_report_syscall(CPU *c, int is_exit) {
@@ -747,11 +802,11 @@ void ptrace_leader_zombie(void) {
 
 int ptrace_report_signal(CPU *c, int sig, u8 *si) {
     if (!g_ptrace_active || !g_self_link || sig == SIGKILL) return sig;
-    /* A SEIZE'd tracee reports a stop signal as a group-stop (PTRACE_EVENT_STOP,
-     * WSTOPSIG == the stop signal); a PTRACE_ATTACH'd tracee sees it as a plain
-     * signal-delivery-stop (event 0), matching the kernel. */
-    int event = (g_self_link->seize && pt_is_stopsig(sig)) ? G_PTRACE_EVENT_STOP : 0;
-    return pt_stop(c, sig, event, 0, si);
+    /* A plain signal-delivery-stop, a stop signal's included: the group stop
+     * it may bring is a trap of its own, once the tracer resumes the tracee
+     * with the signal (do_signal_stop, pt_jobctl_trap). A SEIZEd tracee's
+     * stop signal used to be reported as the group stop straight away. */
+    return pt_stop(c, sig, 0, 0, si);
 }
 
 /* Synchronous-fault stop (software breakpoint BRK, SIGSEGV/SIGBUS/SIGILL/...):
@@ -781,76 +836,123 @@ void ptrace_report_exit_stop(CPU *c, int wstatus) {
     pt_event_stop(c, G_PTRACE_EVENT_EXIT);
 }
 
-/* Run-loop boundary: a tracer PTRACE_ATTACH/SEIZE/INTERRUPT'd us via the kick
- * signal. Adopt the pending attach (become a tracee; ATTACH also stops with
- * SIGSTOP, SEIZE just attaches) or service a pending interrupt (EVENT_STOP). */
-void ptrace_service_kick(CPU *c) {
-    g_ptrace_kick = 0;
-    if (!g_tab) return;
-    if (!g_ptrace_active) {
-        /* The kick was thread-targeted (rt_tgsigqueueinfo), so the pending
-         * attach to adopt is the one keyed by this thread's own tid. */
-        PtLink *e = pt_find((s32)g_tls.tid);
-        if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
-            !__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE))
+/* do_jobctl_trap, with get_signal's loop around it: while a job-control trap
+ * is due -- a group stop to take part in (pt_jc_due, or `participate` for
+ * the thread that began it), and for a SEIZEd tracee an INTERRUPT or a change
+ * of group-stop state (interrupt_pending, trap_notify) -- the tracee traps. A
+ * SEIZEd one with PTRACE_EVENT_STOP: the stop signal while a group stop is in
+ * progress or complete, SIGTRAP otherwise, with ptrace_do_notify's siginfo.
+ * An ATTACHed one has only the group stop: a plain stop of its signal with no
+ * siginfo at all (ptrace_stop's NULL). The signal a tracer resumes a trap
+ * with is ignored, as do_jobctl_trap ignores it; a listening trap that a
+ * notify or an interrupt ended traps again. A tracer gone during the trap
+ * leaves the group stop to be taken part in again, untraced (__ptrace_unlink
+ * re-arms JOBCTL_STOP_PENDING). */
+static void pt_jobctl_trap(CPU *c, int participate) {
+    for (;;) {
+        PtLink *e = g_self_link;
+        if (!e || !g_ptrace_active) return;
+        if (pt_jc_due()) {
+            participate = 1;
+            g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+        }
+        if (!participate &&
+            !(e->seize && (__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) ||
+                           __atomic_load_n(&e->trap_notify, __ATOMIC_ACQUIRE))))
             return;
-        __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
-        g_self_link = e;
-        g_ptrace_active = 1;
-        pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
-        /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV) -- queued
-         * on this thread, to be taken in the kernel's order with what else is
-         * pending (sig_raise_attach_stop), and reported as it is taken. */
-        if (!e->seize) { sig_raise_attach_stop(); return; }
-        /* SEIZE: attached without a stop; fall through in case an INTERRUPT
-         * kick coalesced with this attach kick into one g_ptrace_kick. */
-    }
-    if (g_self_link &&
-        __atomic_load_n(&g_self_link->interrupt_pending, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&g_self_link->interrupt_pending, 0, __ATOMIC_RELEASE);
-        pt_event_stop(c, G_PTRACE_EVENT_STOP);
-        sig_after_trap(c);
-    }
-    /* A stop signal (SIGSTOP/SIGTSTP/...) another process sent us as a tracee:
-     * report it as a cooperative group-stop with that signal as WSTOPSIG. */
-    if (g_self_link) {
-        u32 ss = __atomic_load_n(&g_self_link->stopsig_pending, __ATOMIC_ACQUIRE);
-        if (ss) {
-            __atomic_store_n(&g_self_link->stopsig_pending, 0, __ATOMIC_RELEASE);
-            /* SEIZE'd: a faithful group-stop (EVENT_STOP); ATTACH'd: a plain
-             * signal-delivery-stop, as the kernel reports it. */
-            int event = g_self_link->seize ? G_PTRACE_EVENT_STOP : 0;
-            pt_signal_stop(c, (int)ss, event, SI_USER, 0, 0);
+        participate = 0;
+        int active = (int)__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE);
+        int gsig = (int)__atomic_load_n(&g_machine.jc_sig, __ATOMIC_ACQUIRE);
+        pt_in_jobctl = 1;
+        pt_orphaned = 0;
+        if (e->seize) {
+            int signr = active ? gsig : SIGTRAP;
+            u8 si[128];
+            pt_si_notify(si, signr, signr | (G_PTRACE_EVENT_STOP << 8));
+            pt_stop(c, signr, G_PTRACE_EVENT_STOP, 0, si);
+        } else {
+            pt_stop(c, gsig, 0, 0, NULL);
+        }
+        pt_in_jobctl = 0;
+        if (pt_orphaned) {
+            if (__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE))
+                g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE) - 1;
+            return;
         }
     }
 }
 
-int ptrace_group_stop(CPU *c, int sig) {
-    if (!g_ptrace_active || !g_self_link) return sig;
-    /* do_signal_stop -> do_jobctl_trap: PTRACE_EVENT_STOP for a SEIZE'd
-     * tracee, a plain WSTOPSIG for an ATTACH'd one. The trap's return is
-     * ignored there, so is the signal the tracer resumes it with here. */
-    int event = g_self_link->seize ? G_PTRACE_EVENT_STOP : 0;
-    u8 si[128];
-    pt_si_notify(si, sig, sig | (event << 8));
-    pt_in_group_stop = 1;
-    pt_orphaned = 0;
-    /* An ATTACHed tracee's group-stop has no siginfo at all (ptrace_stop's
-     * NULL): GETSIGINFO's EINVAL is how its tracer tells it from a
-     * signal-delivery-stop of the same signal. */
-    pt_stop(c, sig, event, 0, event ? si : NULL);
-    pt_in_group_stop = 0;
-    return pt_orphaned ? sig : 0;
+/* What is due at the run-loop boundary once a kick flagged it (the tracer's
+ * ATTACH/SEIZE/INTERRUPT, or a group stop calling this thread out), taken in
+ * get_signal's order, ahead of any signal: a pending attach to adopt (SEIZE
+ * silently; ATTACH with its SIGSTOP queued, sig_raise_attach_stop), then the
+ * job-control traps of a tracee (pt_jobctl_trap) -- or, untraced, the part
+ * a thread takes in a group stop by parking until SIGCONT (sig_jc_park),
+ * which an attach ends: the thread then traps into the stop, as the kernel's
+ * attach turns a stopped task into a traced one. The call the kick cut short
+ * is the stop's, and resumes as one no handler ran for (sig_after_trap). */
+void ptrace_jobctl_service(CPU *c) {
+    for (;;) {
+        if (g_tab && !g_ptrace_active) {
+            /* The kick was thread-targeted (rt_tgsigqueueinfo), so the pending
+             * attach to adopt is the one keyed by this thread's own tid. */
+            PtLink *e = pt_find((s32)g_tls.tid);
+            if (e && __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) > 0 &&
+                __atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE)) {
+                g_self_link = e;
+                g_ptrace_active = 1;
+                pt_traced_inc(c->m);   /* catch every signal, to report it */
+                /* Stopped by the host when attached, and woken to adopt by
+                 * the tracer (ptrace_wake_stopped): the kernel's attach makes
+                 * a stopped task a traced one still in its group stop
+                 * (JOBCTL_TRAP_STOP), so this thread traps into one, and the
+                 * others -- continued by the wake -- stop again. Of which
+                 * stop signal is not to be read anywhere: SIGSTOP. */
+                if (__atomic_exchange_n(&e->attach_stopped, 0, __ATOMIC_ACQ_REL)) {
+                    __atomic_store_n(&g_machine.jc_sig, SIGSTOP, __ATOMIC_RELEASE);
+                    __atomic_add_fetch(&g_machine.jc_gseq, 1, __ATOMIC_SEQ_CST);
+                    __atomic_store_n(&g_machine.jc_active, 1, __ATOMIC_RELEASE);
+                    thr_kick_all((s32)g_tls.tid);
+                }
+                /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV) --
+                 * queued on this thread, to be taken in the kernel's order
+                 * with what else is pending, and reported as it is taken. */
+                if (!e->seize) sig_raise_attach_stop();
+                /* Adopted, catchers and all: the tracer's ptrace() may
+                 * return (it waits for this). */
+                __atomic_store_n(&e->attach_pending, 0, __ATOMIC_RELEASE);
+                fx_wake(&e->attach_pending);
+            }
+        }
+        if (g_ptrace_active && g_self_link) {
+            PtLink *e = g_self_link;
+            if (pt_jc_due() ||
+                (e->seize && (__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) ||
+                              __atomic_load_n(&e->trap_notify, __ATOMIC_ACQUIRE)))) {
+                pt_jobctl_trap(c, 0);
+                sig_after_trap(c);
+            } else if (!e->seize) {
+                /* Neither is an ATTACHed tracee's to have. */
+                __atomic_store_n(&e->interrupt_pending, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&e->trap_notify, 0, __ATOMIC_RELEASE);
+            }
+        }
+        if (!g_ptrace_active && pt_jc_due()) {
+            g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+            sig_jc_park(c);
+            sig_after_trap(c);
+            if (g_ptrace_kick) {   /* woken by a kick: an attach, maybe */
+                g_ptrace_kick = 0;
+                continue;
+            }
+        }
+        return;
+    }
 }
 
-int ptrace_selfstop(int sig) {
-    if (!g_ptrace_active) return 0;
-    if (!pt_is_stopsig(sig)) return 0;
-    /* Queue it for the cooperative signal-delivery stop instead of letting the
-     * host job-control-stop this process (which would freeze our service loop
-     * so the tracer's next request would deadlock). */
-    sig_raise_local(sig);
-    return 1;
+void ptrace_service_kick(CPU *c) {
+    g_ptrace_kick = 0;
+    ptrace_jobctl_service(c);
 }
 
 void ptrace_report_exit(CPU *c, int wstatus) {
@@ -1033,8 +1135,12 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
     /* Initial attach stop: an auto-attached child of a SEIZE'd tracee stops
      * with PTRACE_EVENT_STOP, of an ATTACH'd one with SIGSTOP (kernel
      * behavior). The tracer sees it, (re)sets options and resumes us. */
-    if (seize) pt_event_stop(c, G_PTRACE_EVENT_STOP);
-    else       pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);   /* sigaddset'd */
+    if (seize) {   /* ptrace_init_task's JOBCTL_TRAP_STOP: listenable */
+        __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
+        pt_jobctl_trap(c, 0);
+    } else {
+        pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);   /* sigaddset'd */
+    }
     /* On resume the tracer has typically armed PTRACE_SYSCALL; skip the spurious
      * syscall-exit of the clone we were born from (we never entered it). */
     if (g_ptrace_syscall_armed)
@@ -1067,8 +1173,12 @@ void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize) {
  * the clone syscall it was born from. */
 void ptrace_thread_child_stop(CPU *c) {
     if (!g_ptrace_active || !g_self_link) return;
-    if (g_self_link->seize) pt_event_stop(c, G_PTRACE_EVENT_STOP);
-    else                    pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);
+    if (g_self_link->seize) {   /* JOBCTL_TRAP_STOP, as for a fork child */
+        __atomic_store_n(&g_self_link->interrupt_pending, 1, __ATOMIC_RELEASE);
+        pt_jobctl_trap(c, 0);
+    } else {
+        pt_signal_stop(c, SIGSTOP, 0, SI_USER, 0, 0);
+    }
 }
 
 /* ---- tracee: PTRACE_TRACEME ---- */
@@ -1174,77 +1284,52 @@ static void pt_send_kick(s32 tgid, s32 tid) {
     syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si);
 }
 
-/* A stop signal aimed at a task whose thread group has ptrace tracees: route it
- * into cooperative group-stops instead of a real host stop. An uncatchable
- * SIGSTOP delivered to the host would freeze the tracees inside their ptrace
- * service loops, so the follow-up tracer requests (e.g. the DETACH strace
- * issues on ^C after it stops the tracee with SIGSTOP) would deadlock -- and
- * the emulator would never see the signal to report it. The kernel group-stops
- * *all* threads and each traced one reports its own group-stop, so the signal
- * is recorded and kicked on every live link of the group (`id` may be a pid or
- * any thread's tid). In a mixed traced/untraced group only the traced threads
- * stop -- a documented simplification; a full strace -f/-p traces every thread.
- * Returns 1 if routed (the caller must not also host-signal), 0 otherwise. */
-int ptrace_signal_stop(s32 id, int sig) {
-    if (!g_tab || id <= 0) return 0;
-    if (!pt_is_stopsig(sig)) return 0;
-    /* Resolve to a thread group: an exact link match maps a tid to its group;
-     * otherwise treat `id` as a tgid (its main thread may be untraced). */
+/* Does thread group `id` (a pid, or any thread's tid) have a traced thread?
+ * A job-control signal for it is not the host's to send: its SIGSTOP would
+ * freeze every traced thread where its tracer cannot reach it, and the five
+ * go on the kick signal, in the order sent (signal.c, sig_send_jc). */
+int ptrace_group_traced(s32 id) {
+    if (!g_tab || id <= 0 || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 0;
     PtLink *hit = pt_find(id);
-    s32 tgid = hit ? hit->tgid : id;
-    int routed = 0;
+    s32 tgid = hit ? hit->tgid : (proctab_has(id) ? id : proctab_task_tgid(id));
+    if (tgid <= 0) return 0;
     for (int i = 0; i < PTRACE_MAX; i++) {
         PtLink *e = &g_tab->links[i];
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
         if (t <= 0 || e->tgid != tgid) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) continue;
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
-        __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
-        pt_send_kick(e->tgid, t);
-        routed = 1;
+        return 1;
     }
-    return routed;
+    return 0;
 }
 
-/* SIGCONT aimed at a task whose thread group has tracees a tracer put into a
- * listening group-stop (PTRACE_LISTEN): end the group-stop and notify each
- * tracer with a fresh PTRACE_EVENT_STOP trap. The tracees stay parked in their
- * service loops (their CPUs are intact), so a follow-up GETREGSET/CONT
- * round-trips as usual; we only re-arm the stop fields on the shared links from
- * the sender side and wake the tracer(s). Returns 1 if consumed (the caller
- * must not also host-signal), else 0 -- an ordinary SIGCONT (no listening
- * tracee in the group) falls through to normal delivery. */
-int ptrace_signal_cont(s32 id, int sig) {
-    if (!g_tab || id <= 0 || sig != SIGCONT) return 0;
-    PtLink *hit = pt_find(id);
-    s32 tgid = hit ? hit->tgid : id;
-    int consumed = 0;
+/* The group-stop state of thread group `tgid` changed -- a group stop began,
+ * or a SIGCONT ended one: every SEIZEd tracee of it is told with a
+ * trap_notify (ptrace_trap_notify), which a listening one wakes to at once
+ * and a running one, kicked if `kick`, at its next boundary; one in another
+ * stop takes it after that stop. Async-signal-safe: SIGCONT's capture calls
+ * it (signal.c, sig_jc_continue). */
+void ptrace_jc_notify(s32 tgid, int kick) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
     for (int i = 0; i < PTRACE_MAX; i++) {
         PtLink *e = &g_tab->links[i];
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
-        if (t <= 0 || e->tgid != tgid) continue;
+        if (t <= 0 || e->tgid != tgid || !e->seize) continue;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) continue;
-        if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) continue;
-        __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
-        e->stop_sig = SIGTRAP;
-        e->event = G_PTRACE_EVENT_STOP;
-        e->syscall_stop = 0;
-        /* The trap the tracee takes, as if it notified it itself. */
-        memset(e->siginfo, 0, sizeof e->siginfo);
-        pt_w32(e->siginfo, 0, SIGTRAP);
-        pt_w32(e->siginfo, 8, (G_PTRACE_EVENT_STOP << 8) | SIGTRAP);
-        pt_w32(e->siginfo, 16, (u32)t);
-        pt_w32(e->siginfo, 20, (u32)getuid());
-        e->has_siginfo = 1;
-        /* state is already PT_ST_STOPPED (the tracee never left its service loop). */
-        __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
-        __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
-        fx_wake(&g_tab->global_gen);
-        { s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
-          if (tr > 0) kill(tr, SIGCHLD); }   /* wake an async tracer's event loop */
-        consumed = 1;
+        u32 st = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
+        if (st == PT_ST_EXITED) continue;
+        __atomic_store_n(&e->trap_notify, 1, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) fx_wake(&e->cmd_seq);
+        else if (kick && st == PT_ST_RUNNING) pt_send_kick(tgid, t);
     }
-    return consumed;
+}
+
+/* Bring thread `tid` of this process to its run-loop boundary, where
+ * ptrace_service_kick finds what is due (sys_proc.c, thr_kick_all). */
+void ptrace_kick_thread(s32 tid) {
+    pt_send_kick((s32)getpid(), tid);
 }
 
 /* process_vm_readv/writev remote side: transfer up to len bytes between the host
@@ -1312,7 +1397,29 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
                          __ATOMIC_RELAXED);
         __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);  /* our wait4 polls */
+        /* A task the host has stopped -- the whole process, as any group
+         * stop does -- runs nothing, so it cannot adopt the attach: strace's
+         * child stops itself before it is SEIZEd, and was left there with
+         * nobody to continue it. The kernel's attach makes a stopped task a
+         * traced one, still in its group stop; here it is told so on its link
+         * and woken to adopt, into a group stop of the emulator's. */
+        if (ptrace_task_stopped(tgid)) {
+            __atomic_store_n(&e->attach_stopped, 1, __ATOMIC_RELEASE);
+            ptrace_wake_stopped(tgid);
+        }
         pt_send_kick(tgid, pid);
+        /* The kernel's attach is done when ptrace() returns: whatever the
+         * caller sends next finds the tracee traced -- a stop signal, a
+         * SIGCONT, one it ignores -- and it is reported. Here the tracee
+         * becomes one at its next boundary, where it adopts the attach and
+         * catches every signal (ptrace_jobctl_service); a signal sent before
+         * that was the host's to act on, and a SIGTSTP stopped the process
+         * outright. So wait for the adoption -- a little: a tracee that
+         * cannot get there yet (stopped by the host, in a vfork parent's
+         * wait) adopts when it can, as it always did. */
+        for (int i = 0; i < 20 && __atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE) &&
+                        __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) == pid; i++)
+            fx_wait(&e->attach_pending, 1, 10);
         return 0;
     }
 
@@ -1327,13 +1434,17 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         return 0;
     }
     /* Stop a SEIZE'd tracee on demand -- only a SEIZEd one: an ATTACHed
-     * tracee has no such stop (EIO). */
+     * tracee has no such stop (EIO). JOBCTL_TRAP_STOP: at least one trap
+     * follows. A running tracee is kicked to it; one in a stop takes it after
+     * that stop, which is left alone; a listening one traps again at once
+     * (ptrace_signal_wake_up(child, LISTENING)). */
     if (req == G_PTRACE_INTERRUPT) {
         if (!e->seize) return -EIO;
-        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
-            return 0;                            /* already stopped */
         __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
-        pt_send_kick(e->tgid, pid);
+        if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
+            fx_wake(&e->cmd_seq);
+        else if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
+            pt_send_kick(e->tgid, pid);
         return 0;
     }
 
@@ -1432,14 +1543,19 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         /* Only on a SEIZE'd tracee whose stop is a PTRACE_EVENT_STOP trap (a
          * group-stop or an INTERRUPT), by its siginfo, as the kernel asks --
          * a signal-delivery-stop of a stop signal is not one (EIO). Keep it
-         * parked-but-listening: it does not resume; a later SIGCONT
-         * (ptrace_signal_cont) ends the group-stop with a fresh EVENT_STOP.
-         * No mailbox round-trip -- the tracee stays parked. */
+         * parked-but-listening: it does not resume, and is no stop to
+         * ptrace(2) or wait(2) until a trap_notify (the group-stop state
+         * changing: a SIGCONT, a new group stop) or an INTERRUPT has it trap
+         * again (pt_service_loop) -- at once if the notify came during this
+         * trap already. No mailbox round-trip. */
         if (!e->seize) return -EIO;
         if (!e->has_siginfo ||
             (pt_r32(e->siginfo, 8) >> 8) != G_PTRACE_EVENT_STOP)
             return -EIO;
         __atomic_store_n(&e->listening, 1, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&e->trap_notify, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE))
+            fx_wake(&e->cmd_seq);
         return 0;
     default:
         return -EIO;
@@ -1508,10 +1624,7 @@ int ptrace_collect(PtWaitSel sel, int flags, int *status, s32 *outpid, PtRusage 
                 sig |= 0x80;
             st = (sig << 8) | 0x7f;
         }
-        /* The snapshot the tracee stamped when it published this stop. A stop
-         * re-armed from the sender side (ptrace_signal_cont) carries the one
-         * from the tracee's last real stop, which is still the truth: it has
-         * been parked in its service loop ever since, running no guest code. */
+        /* The snapshot the tracee stamped when it published this stop. */
         if (ru) *ru = e->ru;
         /* Collected, unless this is a WNOWAIT look: the kernel's
          * wait_task_stopped clears the stop's code only then, and a stop
@@ -1591,6 +1704,21 @@ static char pt_task_state(s32 t) {
 }
 
 static int pt_state_is_dead(char st) { return st == 'Z' || st == 'X' || st == 'x'; }
+
+int ptrace_task_stopped(s32 tgid) {
+    return tgid > 0 && pt_task_state(tgid) == 'T';
+}
+
+void ptrace_wake_stopped(s32 tgid) {
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGCONT;
+    si.si_code = SI_QUEUE;
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    si.si_value.sival_int = PT_STOPWAKE_MAGIC;
+    syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, SIGCONT, &si);
+}
 
 /* Is host task `t` dead to a tracer -- its host process gone or a zombie? A tracee
  * killed by an uncatchable SIGKILL runs no guest code, so it publishes no exit and

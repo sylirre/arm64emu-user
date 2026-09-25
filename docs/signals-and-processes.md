@@ -1307,27 +1307,11 @@ thread-local `g_ptrace_*` int gates the hot paths):
   entry (including `-1` to cancel), or the return value at exit.
 - *signal-delivery* stop in `sig_deliver_pending` (`src/signal.c`): the tracer
   sees `WSTOPSIG == sig` and may suppress it (`data = 0`) or substitute another.
-  A traced process that stops *itself* with a stop signal —
-  `kill(getpid(), SIGSTOP)`, as strace's child does to synchronize before it
-  execs — is intercepted at the send site (`sys_sig.c`, `ptrace_selfstop`) and
-  routed through this cooperative stop instead of a real host job-control stop,
-  which would freeze the tracee so it could no longer serve its ptrace mailbox.
-  A stop signal sent to *another* task whose thread group has tracees is
-  intercepted the same way (`ptrace_signal_stop`): the send site records the
-  signal on **every** live link of the group — the kernel group-stops all
-  threads, and each traced one reports its own group-stop — and kicks each;
-  the tracees report cooperative group-stops at their next run-loop boundary.
-  (In a mixed traced/untraced group only the traced threads stop — a
-  simplification; a full `strace -f`/`-p` traces every thread.) The status is
-  encoded faithfully:
-  `WSTOPSIG == the stop signal`, and for a `SEIZE`'d tracee with
-  `PTRACE_EVENT_STOP` in the high bits (the group-stop encoding a tracer keys on
-  to decide to `PTRACE_LISTEN`); a `PTRACE_ATTACH`'d tracee sees a plain
-  signal-delivery-stop (no event), as the kernel reports it. This is also the path
-  a tracer takes to stop a running tracee with `SIGSTOP` before detaching — e.g.
-  `strace -p` on `^C`; a real (uncatchable) host `SIGSTOP` would both freeze the
-  tracee's service loop (deadlocking the follow-up `DETACH`) and never reach the
-  emulator to be reported.
+  A stop signal is one like any other here: a plain signal-delivery-stop,
+  whatever the attach — the group stop it may bring is a trap of its own,
+  once the tracer resumes the tracee with it (*Job control under ptrace*,
+  below). A `SEIZE`d tracee's stop signal used to be reported as the group
+  stop straight away.
 
   What such a stop hands on is what the kernel's `ptrace_signal` delivers: the
   signal the tracer resumed it with, or nothing for 0. Every stop that is a
@@ -1341,13 +1325,9 @@ thread-local `g_ptrace_*` int gates the hot paths):
   it, it is a fresh signal that stops again once unblocked. (A `SEIZE`d
   tracee is sent no legacy exec `SIGTRAP` at all, as the kernel's
   `ptrace_event` has it.) A stop signal that a traced thread then takes the
-  default action of is a **group-stop its tracer is told of**
-  (`ptrace_group_stop`: `PTRACE_EVENT_STOP` for a `SEIZE`d tracee, a plain
-  `WSTOPSIG` for an `ATTACH`ed one), which ends when the tracer resumes it,
-  whatever signal it is resumed with (the kernel's `do_jobctl_trap` ignores
-  it) — not a host stop, which froze the thread where its tracer's mailbox
-  could not reach it and was never reported (`tests/ptrace/tracer_death.c`,
-  `groupstop` and `selfstop`).
+  default action of is a **group stop**, below — not a host stop, which froze
+  the thread where its tracer's mailbox could not reach it and was never
+  reported (`tests/ptrace/tracer_death.c`, `groupstop` and `selfstop`).
 - *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
   `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
   dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the
@@ -1656,10 +1636,10 @@ signal-delivery-stop's code is its signal until a wait collects the stop
 (`wait_task_stopped` clears it; a `WNOWAIT` look does not), so a tracer that
 dies before collecting leaves the tracee its signal — ptrace(2): "If the
 tracee is restarted from signal-delivery-stop, the pending signal is
-injected" — and one that collected it leaves nothing. A group-stop outlives
-its tracer either way (`__ptrace_unlink` re-arms `JOBCTL_STOP_PENDING`), so it
-becomes the host stop an untraced process takes; a syscall or event stop
-leaves nothing to deliver. The emulator used to hand on nothing in every
+injected" — and one that collected it leaves nothing. A trap leaves nothing:
+a syscall or event stop, and a job-control one — a group stop outlives its
+tracer all the same, but by `__ptrace_unlink`'s re-arming of
+`JOBCTL_STOP_PENDING` (*Job control under ptrace*, below). The emulator used to hand on nothing in every
 case: a tracee whose tracer was killed by the same `SIGTERM` it had just been
 stopped for (a shell's `timeout` signals the whole group) ran on, parked in
 whatever it had been doing, with nobody left to end it
@@ -1720,23 +1700,72 @@ used to be answered from the registry link whatever the tracee was doing.
 one), and `LISTEN` wants a `PTRACE_EVENT_STOP` trap, told by the stop's siginfo:
 at a signal-delivery-stop it is `EIO` (`tests/ptrace/reqstate.c`).
 
-**Group-stop listening (`PTRACE_LISTEN`).** After a `SEIZE`'d tracee reports a
-group-stop (above), a tracer `LISTEN`s it to let the stop take effect while staying
-notified. The tracee simply stays parked in its service loop; `LISTEN` only sets a
-`listening` flag on the registry link (no resume, no mailbox round-trip). A
-listening tracee counts as *running* to `ptrace(2)` and `wait(2)` alike: every
-request but `KILL` and `INTERRUPT` is `ESRCH`, a resume request included (it
-used to cancel the listen), and no wait reports it. When `SIGCONT` is delivered to a
-listening tracee, the send site (`ptrace_signal_cont`, wired into
-`kill`/`tkill`/`tgkill`) ends the group-stop by re-arming the link as a fresh
-`PTRACE_EVENT_STOP` trap (`WSTOPSIG == SIGTRAP`) and waking the tracer; the tracee,
-still parked with its CPU intact, then services the tracer's follow-up
-`GETREGSET`/`CONT` as usual. `LISTEN` requires a `SEIZE`'d tracee in an
-`EVENT_STOP` (a group-stop or a `PTRACE_INTERRUPT` stop), else `-EIO`. (Niche
-simplifications: the ending `SIGCONT` is consumed into the notification rather than
-also delivered to the guest as a signal; `PTRACE_INTERRUPT` on a listening tracee
-stays a no-op; a `SIGCONT` racing *before* the `LISTEN` falls through to ordinary
-delivery.)
+**Job control under ptrace.** A process a tracer holds threads of cannot be
+stopped by the host: a traced thread's stops are ptrace traps it serves its
+tracer from, and a host stop would freeze it where the tracer cannot reach it.
+So the kernel's group stop is the emulator's to run for such a process, as the
+kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
+`pt_jobctl_trap`):
+
+- *The signals.* While a thread is traced every signal that can be caught is,
+  the stop signals and `SIGCONT` too (*Ignored signals are a tracer's too*,
+  above), so each arrives as a signal: reported as a plain
+  signal-delivery-stop, and its default action taken only once the tracer
+  resumes the tracee with it. A guest's `SIGSTOP`, which cannot be caught, and
+  with it the other four job-control signals, reach a traced process on the
+  kick signal instead, in the order sent (`sig_send_jc`; `jc_route` in
+  `sys_sig.c`): the kernel's `prepare_signal` has a `SIGCONT` take back every
+  stop signal sent before it, and a stop signal every `SIGCONT`, and on their
+  own numbers a `SIGSTOP` and the `SIGCONT` sent right after it reached a
+  parked tracee together, the lower number first. What is queued carries the
+  continue or stop generation it was sent under, and one a later signal has
+  flushed is dropped unseen when it comes to be taken (`jc_stamp`,
+  `sig_jc_flushed`). A `SIGCONT`'s other send-time effects happen as it is
+  caught: the group stop ends, the threads stopped in it wake, and every
+  `SEIZE`d tracee is told with a `trap_notify` (`sig_jc_continue`,
+  `ptrace_jc_notify`).
+- *The group stop.* A stop signal's default action — unless a `SIGCONT` came
+  since it was taken, during its own signal-delivery-stop, say, or its process
+  group is orphaned — begins a group stop (`sig_jc_stop`, the kernel's
+  `do_signal_stop`): every thread is called out to take part (`thr_kick_all`).
+  A traced one traps into it — a `SEIZE`d one with `PTRACE_EVENT_STOP`, the
+  stop signal and `ptrace_do_notify`'s siginfo, an `ATTACH`ed one with a plain
+  stop of the signal and no siginfo at all — and runs again when its tracer
+  resumes it, the group stop still in force. An untraced one stops as any
+  process does, parked until `SIGCONT` (`sig_jc_park`): a program `strace`
+  without `-f` runs has its other threads stop with the rest, where they used
+  to run straight through the stop. A detach, or a tracer's death, leaves the
+  thread to take part again untraced, and once no thread is traced at all the
+  stop is the host's (`sig_jc_untraced`): the process stays stopped, its real
+  parent is told, and any `SIGCONT` ends it (`tests/ptrace/mtjobctl.c`).
+- *The traps.* `PTRACE_INTERRUPT` asks for a `PTRACE_EVENT_STOP` trap: a
+  running tracee is kicked to it, one in a stop takes it after that stop, and
+  a listening one traps again at once. A change of group-stop state tells a
+  `SEIZE`d tracee the same way (`trap_notify`). Such a trap reports the stop
+  signal while a group stop is in progress or complete, `SIGTRAP` otherwise
+  (`do_jobctl_trap`), and a trap or notify due is taken ahead of the next
+  signal, as `get_signal` takes it. `PTRACE_LISTEN` leaves the tracee in its
+  trap, no stop to `ptrace(2)` or `wait(2)`, until a notify or an interrupt
+  has it trap again — at once if a notify came during the trap
+  (`tests/ptrace/listen.c`, `tests/ptrace/jobctl.c`).
+- *Attaching.* The kernel's attach is done when `ptrace()` returns, so the
+  tracer waits, briefly, for the tracee to adopt it and catch everything:
+  a `SIGTSTP` sent right after a `SEIZE` used to find the host's default still
+  in place and stop the process outright. A task the host has stopped cannot
+  adopt anything; the kernel's attach makes it a traced one, still in its group
+  stop, and so the tracer marks the link and wakes the process with a host
+  `SIGCONT` its capture drops (`ptrace_wake_stopped`), and the tracee adopts
+  into a group stop of the emulator's. strace's child stops itself before it
+  is `SEIZE`d; it used to be left there, nobody continuing it.
+
+What cannot be kept: a `SIGSTOP` from outside the guest — a shell's
+`kill -STOP` of a traced process — is the host's, and stops it where its
+tracer cannot reach it, until a `SIGCONT` (a guest's continues it again, by
+the same wake). The real parent of a traced process is not told of a group
+stop, which is the host's to tell and not the host's stop; nor is it spared the
+host's `CLD_CONTINUED` when an attach wakes a stopped process. And the stop
+signal of a stop the host carried out is not to be read anywhere, so a process
+attached while stopped is reported stopped by `SIGSTOP`.
 
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
 `gdb -p` surface, per-thread):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`
@@ -1768,6 +1797,5 @@ run is likewise not reported dead until the group is empty
 (`delay_group_leader`; `ptrace_leader_zombie`), and an exec that revives it
 releases that link unreported too (`tests/ptrace/execleader.c`, `mtexec.c`).
 
-Remaining simplifications: in a mixed traced/untraced thread group a group-stop
-stops only the traced threads; only the exiting thread reports the
+Remaining simplification: only the exiting thread reports the
 `PTRACE_EVENT_EXIT` pre-exit stop on a group exit.
