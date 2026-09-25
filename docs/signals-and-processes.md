@@ -1518,7 +1518,14 @@ ptrace trap before it dequeues one: `ptrace(SEIZE)` has attached by the time it
 returns, so a signal its caller sends next is one the tracer must see stopped
 for — and it arrives with the kick, a standard signal being taken ahead of the
 real-time one. Delivered first, it ran its handler untraced while the tracer
-waited for a stop that never came (`tests/ptrace/seize_signal.c`). The syscall
+waited for a stop that never came (`tests/ptrace/seize_signal.c`). A task can
+be claimed before it has run at all: `clone(2)` returns a fork child's pid to
+the parent while the child is still on its way out of the emulator's fork path,
+which clears the flag it inherited (a kick aimed at the parent's link) — so the
+child then looks for an attach already pending on its own and flags it again.
+Cleared with the rest, the kick of a `SEIZE` that won that race was lost: the
+attach succeeded, and the child ran untraced, a fault killing it that should
+have stopped it (`tests/ptrace/seize_newborn.c`). The syscall
 the kick interrupted is then **restarted**, so attaching does not perturb the
 tracee — see "The emulator's own interruptions are invisible to the guest"
 above. A

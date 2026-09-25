@@ -936,11 +936,21 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
     g_ptrace_skip_syscall_stop = 0;
     /* A kick the parent's handler had flagged but not yet serviced: it was aimed
      * at the parent's link, which is not ours. Everything else about a pending
-     * kick (the queued signal itself) is not inherited across fork anyway. */
+     * kick (the queued signal itself) is not inherited across fork anyway --
+     * though a kick of our own may have landed in this flag already (below). */
     g_ptrace_kick = 0;
     if (!event || tracer <= 0) {
         if (inherited) sig_trace_update_all(c->m);
-        return;                            /* not followed: a fresh untraced pid */
+        /* Not followed: a fresh untraced pid -- but one clone(2) has already
+         * returned to the parent, which may have SEIZEd it (or handed it to a
+         * tracer) before this thread got here, its kick landing in the flag
+         * just cleared. Re-flag it, or the attach waits for another kick. */
+        PtLink *e = pt_find(getpid());
+        if (e && __atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE)) {
+            g_ptrace_kick = 1;
+            g_sig_npend = 1;               /* out of the fast path to adopt it */
+        }
+        return;
     }
     PtLink *e = pt_claim(getpid(), getpid());
     if (!e) {
