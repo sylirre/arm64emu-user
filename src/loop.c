@@ -262,12 +262,20 @@ int emu_loop(CPU *c) {
                     break;
                 }
                 case EC_IABORT_LOWER:
-                case EC_IABORT_SAME:
-                    if ((esr & 0x3f) == FSC_EXTERNAL)
+                case EC_IABORT_SAME: {
+                    /* As a data abort: a permission fault -- the page is
+                     * mapped, just not executable -- is SEGV_ACCERR, and only
+                     * a page with no mapping at all SEGV_MAPERR (the kernel's
+                     * do_page_fault answers VM_FAULT_BADACCESS for the first). */
+                    unsigned fsc = esr & 0x3f;
+                    if (fsc == FSC_EXTERNAL)
                         sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
                     else
-                        sig_deliver_fault(c, SIGSEGV, 1, far);
+                        sig_deliver_fault(c, SIGSEGV,
+                                          (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
+                                          far);
                     break;
+                }
                 case EC_PC_ALIGN:
                 case EC_SP_ALIGN:
                     sig_deliver_fault(c, SIGBUS, 1, far);
