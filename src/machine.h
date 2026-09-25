@@ -151,6 +151,10 @@ struct Machine {
      * exit_group involved the parent sees the code of whichever thread exits
      * *last*, not the leader's. */
     int group_exit_code;
+    /* This process's children forked with an exit signal other than SIGCHLD
+     * (sys_proc.c, "clone children"): a shared page each such child enters
+     * itself into, made before the first is forked. NULL until then. */
+    struct CloneKids *clonekids;
 
     /* Rootfs containment */
     char rootfs[PATH_MAX];    /* realpath'd host prefix, no trailing slash */
@@ -658,6 +662,18 @@ int  sig_guest_nr(int host_sig);
  * it was one (signal.c, SIG_THR_BIAS). */
 int  sig_thread_code(int code);
 int  sig_thread_uncode(int *code);
+/* The exit signal a child of this process was cloned with, if it is one of
+ * its clone children (exit signal other than SIGCHLD; 0 = none), else -1 --
+ * what its death is reported to us with instead of the host's SIGCHLD.
+ * Async-signal-safe (sys_proc.c). */
+int  clonekid_exit_signal(s32 pid);
+/* Is a live clone child of this process to report its death with a signal
+ * other than none and SIGCHLD -- so SIGCHLD must be caught (signal.c)? */
+int  clonekids_signalling(void);
+/* A host syscall the emulator issues knowing a sandbox may refuse it, where
+ * the ENOSYS the SIGSYS net answers IS the guest's answer (the pidfd calls,
+ * which the Android app filter blocks): no notice when it is trapped. */
+void sig_sigsys_expected(int host_nr);
 
 /* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
  * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval

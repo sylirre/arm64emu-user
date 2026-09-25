@@ -71,7 +71,8 @@ SYSDEF(process_vm_readv); SYSDEF(process_vm_writev);
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
 SYSDEF(sigaltstack); SYSDEF(kill); SYSDEF(tkill); SYSDEF(tgkill);
 SYSDEF(rt_sigpending); SYSDEF(rt_sigsuspend); SYSDEF(rt_sigtimedwait);
-SYSDEF(rt_sigqueueinfo); SYSDEF(rt_tgsigqueueinfo); SYSDEF(signalfd4);
+SYSDEF(rt_sigqueueinfo); SYSDEF(rt_tgsigqueueinfo); SYSDEF(pidfd_send_signal);
+SYSDEF(pidfd_open); SYSDEF(signalfd4);
 
 /* sys_time.c */
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
@@ -281,6 +282,8 @@ static const struct {
     { G_NR_tgkill, sys_tgkill, "tgkill" },
     { G_NR_rt_sigqueueinfo, sys_rt_sigqueueinfo, "rt_sigqueueinfo" },
     { G_NR_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo, "rt_tgsigqueueinfo" },
+    { G_NR_pidfd_send_signal, sys_pidfd_send_signal, "pidfd_send_signal" },
+    { G_NR_pidfd_open, sys_pidfd_open, "pidfd_open" },
     { G_NR_signalfd4, sys_signalfd4, "signalfd4" },
 
     { G_NR_clock_gettime, sys_clock_gettime, "clock_gettime" },
@@ -351,7 +354,7 @@ static const u16 quiet_enosys[] = {
     G_NR_rseq, G_NR_clone3, G_NR_openat2, G_NR_close_range,
     G_NR_io_uring_setup, G_NR_io_uring_enter, G_NR_io_uring_register,
     G_NR_statmount, G_NR_listmount, G_NR_mseal, G_NR_cachestat,
-    G_NR_futex_waitv, G_NR_epoll_pwait2, G_NR_fchmodat2, G_NR_pidfd_open,
+    G_NR_futex_waitv, G_NR_epoll_pwait2, G_NR_fchmodat2,
     G_NR_process_madvise, G_NR_membarrier /* handled, listed for symmetry */,
     G_NR_futex_wake, G_NR_futex_wait, G_NR_futex_requeue,
     /* mount / namespaces (mount/umount2/chroot are emulated in sys_file.c —
@@ -367,7 +370,7 @@ static const u16 quiet_enosys[] = {
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
     G_NR_kcmp, G_NR_bpf, G_NR_pkey_mprotect,
-    G_NR_io_pgetevents, G_NR_pidfd_send_signal, G_NR_pidfd_getfd,
+    G_NR_io_pgetevents, G_NR_pidfd_getfd,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
     G_NR_lsm_list_modules,
@@ -408,7 +411,6 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_mseal, "mseal" },
     { G_NR_name_to_handle_at, "name_to_handle_at" }, { G_NR_openat2, "openat2" },
     { G_NR_open_tree, "open_tree" }, { G_NR_pidfd_getfd, "pidfd_getfd" },
-    { G_NR_pidfd_open, "pidfd_open" }, { G_NR_pidfd_send_signal, "pidfd_send_signal" },
     { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
     { G_NR_process_mrelease, "process_mrelease" },
     { G_NR_quotactl, "quotactl" }, { G_NR_reboot, "reboot" },

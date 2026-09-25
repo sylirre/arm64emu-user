@@ -243,7 +243,7 @@ test-seccomp: arm64chroot
 	$(CC) $(CFLAGS) -o tests/seccomp_wrap.bin tests/seccomp_wrap.c
 	printf '#!%s\nexec tests/seccomp_wrap.bin ./arm64chroot "$$@"\n' "$$(command -v sh)" > tests/seccomp_emu.sh
 	chmod +x tests/seccomp_emu.sh
-	bash tests/run_tests.sh tests/seccomp_emu.sh
+	A64_EMU_WRAP=tests/seccomp_wrap.bin bash tests/run_tests.sh tests/seccomp_emu.sh
 	rm -f tests/seccomp_emu.sh
 
 clean:

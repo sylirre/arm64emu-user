@@ -572,6 +572,15 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   holds pending signals in queues of its own, or a host
 #                   without that file, cannot say.
 #
+# And one names what the host lets the emulator do at all:
+#
+#   pidfd           pidfd_open works: a kernel since 5.3, and no sandbox that
+#                   refuses it -- the Android app sandbox's seccomp filter
+#                   does, and so does `make test-seccomp`'s, under which the
+#                   probes run too (A64_EMU_WRAP). Where it is refused the
+#                   emulator answers the guest's pidfd_open ENOSYS, and a test
+#                   of what a pidfd does has nothing to compare.
+#
 # A test that needs one says so with a marker line
 #
 #     NEEDS-HOST-SYSCALL: <name> [<name> ...]
@@ -579,9 +588,10 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # and is skipped, naming what is missing, where it cannot run. The probe is
 # BUILT AND RUN THE WAY THE EMULATOR IS -- same compiler, same ABI flags, so
 # the same interpreter picks it up -- because the question is what the
-# emulator's own process can do. On an ordinary host, and on real ARM32
-# silicon, every probe passes and every test runs; nothing is gated away on a
-# machine that can actually answer.
+# emulator's own process can do -- run under the same sandbox, when the run
+# puts the emulator in one (A64_EMU_WRAP). On an ordinary host, and on real
+# ARM32 silicon, every probe passes and every test runs; nothing is gated away
+# on a machine that can actually answer.
 A64_EMU_CC="${A64_EMU_CC:-${CC:-cc}}"
 A64_EMU_CFLAGS="${A64_EMU_CFLAGS:-}"
 
@@ -731,6 +741,18 @@ int main(void) {
 }
 EOF
         ;;
+    pidfd) cat <<'EOF'
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+#ifdef SYS_pidfd_open
+    return syscall(SYS_pidfd_open, getpid(), 0) < 0;
+#else
+    return 1;
+#endif
+}
+EOF
+        ;;
     thread-sigpnd) cat <<'EOF'
 #define _GNU_SOURCE
 #include <signal.h>
@@ -789,7 +811,10 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
             _t=$(mktemp -d) || return 0
             if printf '%s\n' "$_s" | $A64_EMU_CC $A64_EMU_CFLAGS -O1 -x c - \
                    -o "$_t/probe" 2>/dev/null; then
-                "$_t/probe" >/dev/null 2>&1 || _c=no
+                # Under the sandbox the emulator runs in, if the run puts it
+                # in one (make test-seccomp): what that refuses, the emulator
+                # cannot do either.
+                ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1 || _c=no
             fi   # cannot build the probe: do not gate on an unasked question
             rm -rf "$_t"
         fi

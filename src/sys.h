@@ -633,6 +633,10 @@ s64  cpu_us_to_ticks(s64 us);
  * parent is a guest process, 0 for one outside -- the kernel's answer for a
  * parent outside the caller's pid namespace. getppid, status PPid, stat. */
 s32  proc_ppid_view(s32 ppid);
+/* sys_proc.c: the process a pidfd names ("Pid:" in its fdinfo; -1 once it has
+ * been reaped), or with `procdir_ok` a /proc/<pid> directory too, which only
+ * pidfd_send_signal accepts. 0, or -EBADF for a descriptor that names none. */
+int  pidfd_target(int fd, s32 *pid, int procdir_ok);
 /* mmap of a synthesized /proc file: 0, or the errno the kernel's own file
  * answers, in do_mmap's order -- EACCES for a mode the mapping needs and the
  * descriptor lacks (write for a shared writable one, read for any), then

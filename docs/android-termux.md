@@ -35,7 +35,16 @@ unfiltered:
   seccomp trap on a forwarded host syscall into a plain `-ENOSYS` return, so
   the handler above it takes its ordinary fallback path instead of dying. The
   first trap of each syscall number prints a one-shot notice
-  (`arm64chroot: host syscall N blocked by seccomp filter, returning ENOSYS`).
+  (`arm64chroot: host syscall N blocked by seccomp filter, returning ENOSYS`)
+  -- except for a call where that `ENOSYS` is itself the guest's answer
+  (`sig_sigsys_expected`): the pidfd calls, which Oreo's filter refuses.
+* **pidfds**: a guest pidfd is the host's, so on a filtered device the
+  guest's `pidfd_open` answers `ENOSYS` (as it would on a pre-5.3 kernel),
+  which every user of it probes for -- Go, systemd, Python -- and falls back
+  from; `pidfd_send_signal` through a `/proc/<pid>` directory is sent by pid
+  instead, and `CLONE_PIDFD` is refused (`EINVAL`) rather than half-honoured.
+  `make test-seccomp` runs the suite's host-capability probes under the same
+  filter (`A64_EMU_WRAP`), so the pidfd tests skip there by name.
 * **`statx` fallback**: when host `statx` fails with `ENOSYS` (Android 8.0/8.1,
   old kernels), the result is synthesized from `fstatat` with `STATX_BTIME`
   cleared from the mask.

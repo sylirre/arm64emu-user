@@ -213,12 +213,14 @@ SYSDEF(sigaltstack) {
  * real host SIGSTOP would freeze it. SIGCONT to a tracee a tracer has put into
  * a listening group-stop ends the group-stop cooperatively (reports
  * EVENT_STOP) instead of a real host signal. */
+static int kill_route(s32 pid, int sig) {
+    if (pid == (s32)getpid())
+        return ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig);
+    return ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig);
+}
+
 static s64 kill_one(s32 pid, int sig) {
-    if (pid == (s32)getpid()) {
-        if (ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig)) return 0;
-    } else if (ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig)) {
-        return 0;
-    }
+    if (kill_route(pid, sig)) return 0;
     return kill((pid_t)pid, sig_send_host_nr(sig)) < 0 ? -errno : 0;
 }
 
@@ -537,16 +539,25 @@ static int sqi_layout_known(int sig, s32 code) {
     return code >= -7 /* SI_DETHREAD */ || code == -60 /* SI_ASYNCNL */;
 }
 
-/* The guest siginfo rt_sigqueueinfo and rt_tgsigqueueinfo take, read as
- * __copy_siginfo_from_user reads it: all of kernel_siginfo -- 48 bytes on
- * LP64, EFAULT if any is out of reach -- and, for an si_code whose layout the
- * kernel does not know, the remaining 80 as well, which must then be zero
- * (E2BIG), since nothing past kernel_siginfo is ever handed on. The first
- * check is the syscall's first; everything about the target comes after. */
+/* The guest siginfo rt_sigqueueinfo, rt_tgsigqueueinfo and pidfd_send_signal
+ * take, read as __copy_siginfo_from_user reads it: all of kernel_siginfo --
+ * 48 bytes on LP64, EFAULT if any is out of reach -- and, for an si_code whose
+ * layout the kernel does not know, the remaining 80 as well, which must then
+ * be zero (E2BIG), since nothing past kernel_siginfo is ever handed on. The
+ * layout is judged by `sig` -- the syscall's own for the two queueing calls,
+ * which overwrite si_signo with it; SQI_OWN_SIGNO, the struct's own, for
+ * pidfd_send_signal, which then requires the two to agree. The first check is
+ * the syscall's first; everything about the target comes after. */
+#define SQI_OWN_SIGNO (-1)
 static s64 sqi_read(CPU *c, u64 uinfo, int sig, u8 gsi[48]) {
     if (copy_from_guest(c, gsi, uinfo, 48) < 0) return -EFAULT;
     s32 code;
     memcpy(&code, gsi + 8, 4);
+    if (sig == SQI_OWN_SIGNO) {
+        s32 own;
+        memcpy(&own, gsi, 4);
+        sig = own;
+    }
     if (!sqi_layout_known(sig, code)) {
         u8 rest[80];
         if (copy_from_guest(c, rest, uinfo + 48, sizeof rest) < 0) return -EFAULT;
@@ -605,12 +616,8 @@ SYSDEF(rt_sigqueueinfo) {
         return (u64)(s64)-EPERM;
     if (pid <= 0 || !proctab_has_task(pid)) return (u64)(s64)-ESRCH;
     /* A stop signal to a traced process, or SIGCONT to a listening one: the
-     * same routing as kill(2) (kill_one). */
-    if (pid == (s32)getpid()) {
-        if (ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig)) return 0;
-    } else if (ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig)) {
-        return 0;
-    }
+     * same routing as kill(2). */
+    if (kill_route(pid, sig)) return 0;
     int hs = sig_send_host_nr(sig);   /* 32/33 ride the carrier */
     siginfo_t si;
     sqi_host(&si, hs, gsi, 0);
@@ -651,5 +658,55 @@ SYSDEF(rt_tgsigqueueinfo) {
     siginfo_t si;
     sqi_host(&si, hs, gsi, 1);
     long r = syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, hs, &si);
+    return r < 0 ? host_err() : 0;
+}
+
+SYSDEF(pidfd_send_signal) {
+    /* kill(2) through a pidfd, or through a /proc/<pid> directory, which the
+     * kernel accepts too (tgid_pidfd_to_pid); with a siginfo, rt_sigqueueinfo
+     * through one. In the kernel's order: the flags (6.1 has none), the
+     * descriptor (EBADF for one that names no process), the siginfo -- read
+     * as copy_siginfo_from_user reads it, whose si_signo must then be `sig`
+     * (EINVAL) -- the forge rule, which, as for the queueing calls, lets only
+     * the calling thread itself claim a code >= 0, and then the process: gone
+     * (a pidfd outlives its process) or outside the guest, ESRCH. The host's
+     * own pidfd_send_signal delivers, through the same descriptor, so a pid
+     * reused since cannot be hit; a host without it -- older than 5.1, or the
+     * Android app sandbox, whose seccomp filter refuses it -- is sent the
+     * signal by pid instead. */
+    (void)a4; (void)a5;
+    int fd = (int)a0;
+    int sig = (int)(s32)a1;
+    u64 uinfo = a2;
+    if ((u32)a3) return (u64)(s64)-EINVAL;
+    s32 pid;
+    int e = pidfd_target(fd, &pid, 1);
+    if (e < 0) return (u64)(s64)e;
+    u8 gsi[48];
+    siginfo_t si;
+    int hs = 0;
+    if (uinfo) {
+        s64 r = sqi_read(c, uinfo, SQI_OWN_SIGNO, gsi);
+        if (r < 0) return (u64)r;
+        s32 own, code;
+        memcpy(&own, gsi, 4);
+        memcpy(&code, gsi + 8, 4);
+        if (own != sig) return (u64)(s64)-EINVAL;
+        if ((code >= 0 || code == SI_TKILL) && pid != (s32)g_tls.tid)
+            return (u64)(s64)-EPERM;
+    }
+    if (pid <= 0 || !proctab_has_task(pid)) return (u64)(s64)-ESRCH;
+    if (kill_route(pid, sig)) return 0;
+    hs = sig_send_host_nr(sig);
+    if (uinfo) sqi_host(&si, hs, gsi, 0);
+    long r = -1;
+    errno = ENOSYS;
+#ifdef SYS_pidfd_send_signal
+    sig_sigsys_expected(SYS_pidfd_send_signal);
+    r = syscall(SYS_pidfd_send_signal, fd, hs, uinfo ? &si : NULL, 0);
+#endif
+    if (r < 0 && errno == ENOSYS)
+        r = uinfo ? syscall(SYS_rt_sigqueueinfo, (pid_t)pid, hs, &si)
+                  : kill((pid_t)pid, hs);
     return r < 0 ? host_err() : 0;
 }

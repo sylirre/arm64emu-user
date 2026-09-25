@@ -778,6 +778,17 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     PendSig ps, *p = &ps;
     pendsig_from_host(p, sig, si);
+    /* The death of a clone child -- one forked with an exit signal other than
+     * SIGCHLD (sys_proc.c) -- is reported with that signal, or with none; the
+     * host, whose child it is an ordinary fork of, said SIGCHLD. */
+    if (p->signo == SIGCHLD && (p->code == CLD_EXITED || p->code == CLD_KILLED ||
+                                p->code == CLD_DUMPED)) {
+        int es = clonekid_exit_signal(p->pid);
+        if (es >= 0) {
+            if (es == 0 || es > 64) return;
+            p->signo = es;
+        }
+    }
     /* A signal the guest has BLOCKED, caught all the same because its number
      * is held out of the mirrored mask (a sent SIGSEGV, a kill(SIGSYS) --
      * sig_set_to_host): it waits in the ring until the unblock, and the
@@ -1035,6 +1046,15 @@ static int pgrp_orphaned(void) {
 #define SYS_SECCOMP 1
 #endif
 
+/* Host syscall numbers the SIGSYS net has already told the user about -- or
+ * need never tell them about (sig_sigsys_expected). */
+static char sigsys_warned[1024];
+
+void sig_sigsys_expected(int host_nr) {
+    if (host_nr >= 0 && host_nr < (int)sizeof sigsys_warned)
+        __atomic_store_n(&sigsys_warned[host_nr], 1, __ATOMIC_RELAXED);
+}
+
 static void sigsys_net(int sig, siginfo_t *si, void *uctx) {
     if (si->si_code != SYS_SECCOMP) {   /* guest-directed kill(SIGSYS) etc. */
         host_catcher(sig, si, uctx);
@@ -1043,8 +1063,8 @@ static void sigsys_net(int sig, siginfo_t *si, void *uctx) {
     /* One-shot notice per host syscall number so gaps surface instead of
      * hiding. Async-signal-safe: composed by hand, write(2) only. */
     int nr = si->si_syscall;
-    static char warned[1024];
-    if (nr >= 0 && nr < (int)sizeof warned && !warned[nr]) {
+    char *warned = sigsys_warned;
+    if (nr >= 0 && nr < (int)sizeof sigsys_warned && !warned[nr]) {
         warned[nr] = 1;
         static const char pre[] = "arm64chroot: host syscall ";
         static const char post[] = " blocked by seccomp filter, returning ENOSYS\n";
@@ -1641,7 +1661,11 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
          * (sig_sync_host_mask), so the kernel holds it pending, shows it to
          * sigpending, hands it to sigwait or a signalfd, and discards it at
          * the unblock if nobody took it, as it would for any process. */
-        if (sig_default_terminates(sig)) {
+        if (sig_default_terminates(sig) ||
+            (sig == SIGCHLD && clonekids_signalling())) {
+            /* ...and SIGCHLD while a clone child is to report its death with
+             * a signal of its own: the host sends SIGCHLD, and only a catcher
+             * can turn it into that one (host_catcher). */
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);

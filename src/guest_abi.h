@@ -564,6 +564,7 @@ typedef struct {
 #define G_O_NOFOLLOW  0100000
 #define G_O_DIRECT     0200000
 #define G_O_LARGEFILE 0400000
+#define G_PIDFD_NONBLOCK 04000     /* pidfd_open: O_NONBLOCK, the same everywhere */
 
 #define G_AT_FDCWD             (-100)
 #define G_AT_SYMLINK_NOFOLLOW  0x100

@@ -979,13 +979,12 @@ host process and shares nothing, so the sharing flags make a copy where a
 kernel makes a share: bare `CLONE_VM` (without `CLONE_THREAD` or
 `CLONE_VFORK` — with `CLONE_VFORK` the parent waits and the child's writes are
 carried back, below), `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND` and
-`CLONE_PARENT` without `CLONE_THREAD`, and an exit signal other than `SIGCHLD`
-(the host child signals `SIGCHLD`, and a `wait4` without `__WCLONE` finds it
-where a kernel would not). The child proceeds as a fork and the process is
-told once, on stderr, which flags it did not get — the way an unimplemented
-syscall is reported — rather than refused (qemu-user's answer, which would
-break the `CLONE_FILES` child that only execs). LinuxThreads is the program
-that wanted these; nothing current does.
+`CLONE_PARENT` without `CLONE_THREAD`. The child proceeds as a fork and the
+process is told once, on stderr, which flags it did not get — the way an
+unimplemented syscall is reported — rather than refused (qemu-user's answer,
+which would break the `CLONE_FILES` child that only execs). LinuxThreads is the
+program that wanted these; nothing current does. An exit signal other than
+`SIGCHLD` is kept instead (*Clone children, and pidfds*, below).
 
 A guest thread and a vfork both set `CLONE_VM`, so `CLONE_VM` alone cannot decide
 between them. **Only `CLONE_THREAD` marks a real (pthread) thread.**
@@ -997,6 +996,63 @@ between them. **Only `CLONE_THREAD` marks a real (pthread) thread.**
   `execve` tear down the *shared* address space under the parent (a crash that
   presents as a jump to `pc=0`). A fork alone is not vfork, though, and the
   difference is what vfork is *used* for — see the next section.
+
+### Clone children, and pidfds
+
+`clone(2)` takes the signal a child is to report its death with (`CSIGNAL`),
+and a child whose signal is not `SIGCHLD` — `0`, none at all, included — is a
+*clone child*: its death sends that signal, or nothing, and a wait finds it
+only under `__WCLONE` (or `__WALL`), while a wait without either finds only the
+others (`eligible_child`). A guest process is a host fork, whose exit signal is
+always `SIGCHLD`, so the host knows none of it. The parent keeps a table of its
+clone children (`sys_proc.c`, "clone children"), in a shared page each child
+enters *itself* into before it runs a guest instruction — so its death, and
+its `SIGCHLD`, cannot come before its entry — and consults it where the
+difference shows: the capture handler turns the host's `SIGCHLD` for a clone
+child into the child's own signal, or drops it (`clonekid_exit_signal`, with
+`SIGCHLD` kept caught while such a child is to signal, since a `SIGCHLD` at its
+default is discarded as it is sent); and a wait that *names* the child —
+`wait4(pid)`, `waitid(P_PID)`, a pidfd — finds it only where the kernel's rule
+would, asking the host without `__WCLONE`. A reaped child's entry stays, marked,
+until its pid comes back, since its `SIGCHLD` may still be on its way to a
+thread when the wait reaps it. What is not kept: a wait for *any* child, or for
+a process group, still finds a clone child without `__WCLONE` and misses it with
+one — keeping that would take enumerating the other children — and it says so,
+once, if such a wait ever meets a live clone child. A `SIGCHLD` the guest
+ignores (`SIG_IGN`) still has the host reap a clone child, which a kernel does
+only for an ordinary one.
+
+That was mostly theory until pidfds: Go's probe for them is exactly a clone
+child — a `CLONE_PIDFD` vfork child with exit signal 0, waited for through its
+pidfd with `__WCLONE`. A guest's pidfd is the host's: guest pid **is** host
+pid, so the host's pidfd for it names the same process, and what a pidfd does —
+`POLLIN` at the process's death, `waitid(P_PIDFD)` for a child, `fdinfo`'s
+`Pid:`, `O_CLOEXEC` — is the host kernel's own. The emulator adds containment
+(only a guest process may be named, `ESRCH` otherwise, as for `kill(2)`) and the
+6.1 rules it advertises where a newer host differs: `pidfd_open` of a thread
+that leads no group is `EINVAL` (a 6.9+ host has `PIDFD_THREAD` and says
+`ENOENT`), and so is `CLONE_PIDFD` with `CLONE_THREAD`, with
+`CLONE_PARENT_SETTID` (the descriptor comes back through `parent_tid`) or with
+`CLONE_DETACHED`. `CLONE_PIDFD`, which was silently ignored — leaving garbage
+where the kernel writes the descriptor — settles the descriptor before the fork,
+as `copy_process` does: a pidfd to the parent holds its number (`EMFILE` if
+there is none to spare; `EINVAL` on a host that makes no pidfds), `parent_tid`'s
+writability is checked by writing back what is there (`EFAULT`, and no child),
+and a `CLONE_VM` child finds the number already in its copy of memory; after
+the fork the child's pidfd takes the placeholder's place. `pidfd_send_signal`
+accepts a pidfd or a `/proc/<pid>` directory (`tgid_pidfd_to_pid`), reads its
+siginfo as `copy_siginfo_from_user` does and insists its `si_signo` be the
+signal, keeps the forge rule of the queueing calls, routes a stop signal
+through ptrace like `kill(2)`, and delivers through the host's own
+`pidfd_send_signal` on the same descriptor, so a pid reused since cannot be
+hit. Where the host refuses the pidfd calls — a kernel before 5.3, the Android
+app sandbox's seccomp filter — the guest's `pidfd_open` answers `ENOSYS`, which
+every user of it probes for and falls back from (the SIGSYS net's notice is
+not wanted for it, `sig_sigsys_expected`), and `pidfd_send_signal` on a
+`/proc` directory is sent by pid instead. `pidfd_getfd` stays `ENOSYS`.
+`tests/c/pidfd.c` (differential) and `tests/fixtures/clonepidfd.c`
+(self-checking: qemu-user writes no descriptor for a vfork child and turns exit
+signals into its own).
 
 ### vfork: the parent waits, and the child's writes come back
 

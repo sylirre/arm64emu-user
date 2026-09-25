@@ -2849,6 +2849,13 @@ rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
 # main thread and on the threads de_thread killed -- the main thread carries on
 # here where the kernel renumbers, so the signals are handed over to it.
 check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndone'
+# clone(CLONE_PIDFD) and the clone child it brings in -- one forked with an exit
+# signal other than SIGCHLD, found only by a __WCLONE or __WALL wait that names
+# it, and reported with that signal or none (sys_proc.c, "clone children").
+# Self-checking: qemu-user writes no descriptor for a vfork child and turns
+# exit signals into its own. The block is the kernel's (6.17), but for the two
+# thread rows, which are the 6.1 the emulator advertises (see the fixture).
+check_fixture clonepidfd $'pidfd_open a thread: EINVAL\nclone pidfd: ok\nwaitid clone pidfd: ok\nclone child: pid_ok=1 status=3\nclone pidfd|parent_settid: EINVAL\nclone pidfd|thread: EINVAL\nclone pidfd|detached: EINVAL\nclone pidfd, null parent_tid: EFAULT\nvfork pidfd: ok\nwaitid exit-0 child without __WCLONE: ECHILD\nwait4 exit-0 child without __WCLONE: ECHILD\nwaitid exit-0 child with __WCLONE: ok\nexit-0 child: pid_ok=1 status=0\nSIGCHLD for the exit-0 child: 0\nwait4 SIGUSR2 child plain: ECHILD\nwait4 SIGUSR2 child with __WALL: ok\nSIGUSR2 child: status=0 SIGCHLD=0 SIGUSR2=1\nwait4 ordinary child with __WCLONE: ECHILD\nwait4 ordinary child: ok\nordinary child: status=5 SIGCHLD=1\ndone'
 # rt_sigqueueinfo / rt_tgsigqueueinfo read the sender's siginfo as the kernel
 # does -- kernel_siginfo's 48 bytes, the other 80 only for a layout it does not
 # know (and then they must be zero: E2BIG) -- and hand si_errno on. Self-checking
