@@ -2201,6 +2201,16 @@ had asked for and been granted. It now lands within one frame of the kernel at
 every limit (`tests/fixtures/stackrlimit.c`; `qemu-user` is no oracle here
 either, since it sizes the guest stack from its own `-s` option).
 
+It is executable when the executable's `PT_GNU_STACK` asks for it (`PF_X`, what
+GCC marks a program whose nested functions put trampolines on the stack), as
+`setup_arg_pages` makes it, and never otherwise: the interpreter's is not
+consulted, and arm64's default is executable only under `READ_IMPLIES_EXEC`,
+which every exec clears. The loader used to ignore the header, so a call
+through such a trampoline faulted (`tests/c/execstack.c`). The mapping is
+`VM_GROWSDOWN`, like the kernel's, which is what `mprotect(PROT_GROWSDOWN)`
+names when glibc makes the stack executable later, for a library that needs it
+(see [memory.md](memory.md)).
+
 Two things follow from laying the stack out whole rather than growing it:
 
 - **A limit past `STACK_MAX` (64 MB) is capped**, and an infinite one gets

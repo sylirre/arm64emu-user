@@ -39,6 +39,9 @@
  * auxv grows. */
 #define STACK_FIXED 1024ULL
 #define ET_DYN_BASE 0x5500000000ULL
+#ifndef PT_GNU_STACK
+#define PT_GNU_STACK 0x6474e551
+#endif
 
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK)
@@ -56,6 +59,7 @@ typedef struct {
      * deliberately not the first writable segment). /proc reports them, and
      * status splits VmExe from VmLib with the code span. */
     u64 start_code, end_code, start_data, end_data;
+    int exec_stack;  /* PT_GNU_STACK asks for an executable stack (PF_X) */
     char interp[PATH_MAX];
 } LoadInfo;
 
@@ -191,6 +195,9 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     }
     free(pageprot);
     as_set_region_path(&m->as, base + lo, base + hi, gpath);
+
+    for (int i = 0; i < eh.e_phnum; i++)
+        if (ph[i].p_type == PT_GNU_STACK) out->exec_stack = (ph[i].p_flags & PF_X) != 0;
 
     out->base = base;
     out->start_code = sc == ~0ULL ? 0 : base + sc;
@@ -478,9 +485,16 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
 
     /* Stack, sized from the guest's RLIMIT_STACK (stack_size_for). The
      * argument block was measured against this same size while there was
-     * still a caller to refuse (exec_arg_limit), so it fits. */
+     * still a caller to refuse (exec_arg_limit), so it fits. Executable when
+     * the executable's PT_GNU_STACK says PF_X (setup_arg_pages's
+     * EXSTACK_ENABLE_X) -- a program built with an executable stack, for GCC's
+     * nested-function trampolines, whose calls into them otherwise fault --
+     * and never otherwise: the arch default is VM_DATA_DEFAULT_FLAGS, which
+     * is executable only under READ_IMPLIES_EXEC, and arm64 clears that at
+     * every exec (the interpreter's own PT_GNU_STACK is not consulted). */
     u64 stack_size = stack_size_for(m);
-    r = guest_map_anon(&m->as, STACK_TOP - stack_size, stack_size, PTE_R | PTE_W);
+    r = guest_map_anon(&m->as, STACK_TOP - stack_size, stack_size,
+                       PTE_R | PTE_W | (exe.exec_stack ? PTE_X : 0));
     if (r < 0) return r;
     as_set_growsdown(&m->as, STACK_TOP - stack_size);   /* VM_STACK_FLAGS */
     m->as.stack_top = STACK_TOP;
