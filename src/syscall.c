@@ -71,7 +71,7 @@ SYSDEF(process_vm_readv); SYSDEF(process_vm_writev);
 SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
 SYSDEF(sigaltstack); SYSDEF(kill); SYSDEF(tkill); SYSDEF(tgkill);
 SYSDEF(rt_sigpending); SYSDEF(rt_sigsuspend); SYSDEF(rt_sigtimedwait);
-SYSDEF(rt_sigqueueinfo); SYSDEF(signalfd4);
+SYSDEF(rt_sigqueueinfo); SYSDEF(rt_tgsigqueueinfo); SYSDEF(signalfd4);
 
 /* sys_time.c */
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
@@ -280,6 +280,7 @@ static const struct {
     { G_NR_tkill, sys_tkill, "tkill" },
     { G_NR_tgkill, sys_tgkill, "tgkill" },
     { G_NR_rt_sigqueueinfo, sys_rt_sigqueueinfo, "rt_sigqueueinfo" },
+    { G_NR_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo, "rt_tgsigqueueinfo" },
     { G_NR_signalfd4, sys_signalfd4, "signalfd4" },
 
     { G_NR_clock_gettime, sys_clock_gettime, "clock_gettime" },

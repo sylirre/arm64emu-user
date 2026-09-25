@@ -707,6 +707,36 @@ void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, 
  * from the kernel. */
 static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
 
+/* rt_tgsigqueueinfo's mark on the host siginfo it sends (sys_sig.c). The
+ * kernel queues such a signal on the one thread's own list, and a signal on
+ * that list is that thread's alone -- it is not handed to a sibling when the
+ * thread blocks it or exits (sig_retarget) -- but nothing in the siginfo the
+ * capture handler is given says which list it came off. So the sender says
+ * it, and says it in si_code: the one field, with the signal number, the
+ * errno and the SI_QUEUE payload, that reaches the receiver whatever it is --
+ * a 64-bit kernel rebuilds a 32-bit process's siginfo field by field, and
+ * anything a layout does not name (a word past si_value, where the mark used
+ * to ride) never arrives. A code from -1 down to -SIG_THR_SPAN is carried
+ * SIG_THR_BIAS lower: still negative, which is what lets it be sent to
+ * another thread at all, and neither SI_TIMER nor SI_SIGIO, whose layouts
+ * differ. Every code a sender can use for a thread-directed queue that is
+ * not its own falls in that span (SI_QUEUE, SI_MESGQ, SI_ASYNCIO, ...);
+ * one that does not is carried as it is and taken for the process's. The
+ * guest never sees the carried value: its siginfo is rebuilt from PendSig. */
+#define SIG_THR_BIAS 0x7fffff00
+#define SIG_THR_SPAN 127
+
+int sig_thread_code(int code) {
+    return (code < 0 && code >= -SIG_THR_SPAN) ? code - SIG_THR_BIAS : code;
+}
+
+int sig_thread_uncode(int *code) {
+    if (*code > -(SIG_THR_BIAS + 1) || *code < -(SIG_THR_BIAS + SIG_THR_SPAN))
+        return 0;
+    *code += SIG_THR_BIAS;
+    return 1;
+}
+
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     if (rq_claim(sig, si, p)) {   /* one this process handed back */
         p->ptraced = 0;           /* ...arriving anew: no stop is behind it */
@@ -716,17 +746,19 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
                        * PendSig is not zeroed: every field is set here) */
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
+    int thr = sig_thread_uncode(&p->code);
     p->err = si->si_errno;
     p->pid = (int)si->si_pid;
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
     p->addr = (u64)(uintptr_t)si->si_addr;
     p->value = (s64)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
-    /* The one kind of thread-directed signal a siginfo names outright. The
-     * guest cannot send another (rt_tgsigqueueinfo is not one of its calls);
-     * the kernel's own per-thread signals -- a write's SIGPIPE, a fault --
-     * are taken at the boundary right after the call that raised them. */
-    p->thr = si->si_code == SI_TKILL;
+    /* Aimed at this thread alone: the one kind a siginfo names outright
+     * (tgkill's SI_TKILL), or one the guest's rt_tgsigqueueinfo sent, which
+     * says so in its code (sig_thread_code). The kernel's own per-thread
+     * signals -- a write's SIGPIPE, a fault -- are taken at the boundary
+     * right after the call that raised them. */
+    p->thr = si->si_code == SI_TKILL || thr;
     if (si->si_code == SI_TIMER) {
         /* A POSIX-timer signal: the host sigval carries only the emulator's
          * timer-slot index (the guest's 8-byte sigval cannot ride a 32-bit

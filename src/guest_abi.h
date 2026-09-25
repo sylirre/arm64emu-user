@@ -234,6 +234,7 @@
 #define G_NR_mbind             235
 #define G_NR_get_mempolicy     236
 #define G_NR_set_mempolicy     237
+#define G_NR_rt_tgsigqueueinfo 240
 #define G_NR_accept4           242
 #define G_NR_recvmmsg          243
 #define G_NR_wait4             260

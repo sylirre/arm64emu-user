@@ -451,7 +451,8 @@ they can never be raised as host signals. A timer armed with guest 32/33 is
 created with one of the emulator's two reserved host RT carriers instead
 (normally `SIGRTMAX-1`/`SIGRTMAX-2` — see *the three reserved numbers* below),
 translated back to the guest number when the capture handler queues it. The same carrier carries a guest signal 32/33 sent *directly* —
-`kill`/`tkill`/`tgkill`/`rt_sigqueueinfo` all route through `sig_send_host_nr`
+`kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`/`rt_tgsigqueueinfo` all route through
+`sig_send_host_nr`
 — which is what makes `pthread_cancel` (musl and glibc send `SIGCANCEL` = 32)
 and glibc's `setuid` broadcast (33 to every thread) work at all: raised raw,
 they hit the *host* libc's own handler for those numbers, and the emulator died
@@ -583,8 +584,19 @@ thread; from any other, an `si_code >= 0` (`SI_USER`, a child's `CLD_*`) is
 a per-process table, the slot's nonce), and every place the emulator reads a
 host siginfo — the capture handler, the `sigtimedwait` and hand-over dequeues, a
 `signalfd` read — trades it for the siginfo the slot kept. A thread-directed
-signal (`tkill`/`tgkill`, a `SIGEV_THREAD_ID` timer, whose slot says so) stays
-where the kernel keeps it, on the thread's own queue, and dies with the thread.
+signal (`tkill`/`tgkill`, a `SIGEV_THREAD_ID` timer, whose slot says so, or an
+`rt_tgsigqueueinfo` — `pthread_sigqueue` — which says so itself) stays where
+the kernel keeps it, on the thread's own queue, and dies with the thread. An
+`rt_tgsigqueueinfo`'s siginfo is an `SI_QUEUE` like any other, so the sending
+emulator marks it, in `si_code` (`sig_thread_code`): a code from -1 down to
+-127 travels `0x7fffff00` lower, still negative (so it may go to another
+thread at all) and neither `SI_TIMER` nor `SI_SIGIO`, and the receiving
+capture, `sigtimedwait` and `signalfd` read take it back. It has to be the
+code: a 64-bit kernel rebuilds a 32-bit process's siginfo field by field, so
+a word past `si_value` — where the mark first rode — never reached a 32-bit
+emulator on a 64-bit host, which is every 32-bit Termux on a current phone.
+The guest's own siginfo is rebuilt from the fields and never shows the
+carried code.
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked
 everything first. An exiting thread also no longer opens the pending-signal
@@ -593,7 +605,10 @@ into the ring of a thread about to drop it, where the kernel would have given
 it to another thread. `tests/c/sigretarget.c` has the handler that exits and
 the one that waits, a `SIGCHLD` whose siginfo must survive the trip, three
 instances of a real-time signal that must arrive in order, and the `tgkill`ed
-signal that must not.
+and `pthread_sigqueue`d signals that must not — each sent after a `SIGUSR1`
+aimed at the same thread, since the kernel empties a thread's own list before
+the process's and a thread-directed signal would otherwise simply be taken
+first.
 
 ### One disposition, four words
 
@@ -627,6 +642,29 @@ what makes the `oldact` a later call reads back the kernel's answer instead of
 the bits the caller passed in. `tests/fixtures/sigactorder.c` covers all of it
 against the raw syscall; qemu-user is not the oracle there (it locks both user
 structs up front, and keeps the two unblockable signals in the mask).
+
+### Queueing a siginfo: `rt_sigqueueinfo` and `rt_tgsigqueueinfo`
+
+Both re-send through the host kernel with the sender's siginfo, the second
+aimed at one thread (`pthread_sigqueue`'s call; it was `ENOSYS`). What is read
+of the guest's siginfo is what `__copy_siginfo_from_user` reads: all of
+`kernel_siginfo` — 48 bytes — and `EFAULT` if any of it is out of reach; for an
+`si_code` whose layout the kernel does not know (`known_siginfo_layout`) the
+other 80 as well, which must be zero (`E2BIG`), since nothing past
+`kernel_siginfo` is ever handed on. Only then come the id checks — `EINVAL` for
+a non-positive one (`rt_tgsigqueueinfo`), `EPERM` for an `si_code` the caller
+may not claim (`>= 0`, or `SI_TKILL`), `ESRCH` for a target outside the guest.
+The forge rule's subject is the calling **thread** (`task_pid_vnr(current)`),
+so a thread that is not main may not claim `SI_USER` even to its own process.
+`si_errno` travels as the sender gave it, with the `SI_QUEUE` payload (pid,
+uid, value). (One thing a 32-bit emulator on a 64-bit kernel cannot carry: for
+an `si_code` whose layout the kernel does not know, the compat conversion of
+its own host call keeps only `si_pid` and `si_uid`, so the rest of the union
+does not arrive; a native kernel of either width copies all of it.) A stop
+signal to a traced process, or `SIGCONT` to a listening one,
+takes the ptrace routing `kill(2)` and `tgkill(2)` take. `tests/c/tgsigqueue.c`
+(differential) and `tests/fixtures/sqiread.c` (self-checking: qemu-user locks
+all 128 bytes, copies only the fields it knows, and drops `si_errno`).
 
 ## Job control: where mirroring the block mask began
 
@@ -684,6 +722,7 @@ That identity cuts both ways: an id the guest supplies addresses **any** host
 task of the invoking user, guest or not. Every syscall that names another task
 by id therefore checks it against the PID registry first (`proctab_has_task`,
 `src/proctab.c`) — `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+`rt_tgsigqueueinfo`,
 `getpriority`/`setpriority`, the `sched_*setparam`/`*scheduler`/`*affinity`/
 `rr_get_interval` family, `getpgid`/`setpgid`/`getsid`, and `capget`'s header
 pid. A host task outside the guest answers **`ESRCH`**, the same non-existence

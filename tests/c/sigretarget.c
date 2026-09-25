@@ -10,7 +10,8 @@
  * thread, which has SIGUSR2 blocked, must find it pending and take it with
  * sigtimedwait -- where the emulator used to keep it in the exiting thread's
  * capture ring, blocked, and lose it. A SIGUSR2 aimed at the thread itself is
- * not the process's, and is gone once the thread is.
+ * not the process's, and is gone once the thread is -- a tgkill's, and a
+ * pthread_sigqueue's, whose siginfo (SI_QUEUE) does not say so.
  *
  * The same for a SIGCHLD, whose siginfo (CLD_EXITED, the child's pid and
  * status) must come through whole: the kernel will not let a thread other
@@ -90,6 +91,10 @@ static void one(const char *label, int handler_mode, int sig2, int to_thread) {
         siginfo_t ws;
         memset(&ws, 0, sizeof ws);
         waitid(P_PID, (id_t)kid, &ws, WEXITED | WNOWAIT);
+    } else if (to_thread == 2) {
+        union sigval v;
+        v.sival_int = 5;
+        pthread_sigqueue(t, sig2, v);   /* rt_tgsigqueueinfo */
     } else if (to_thread) {
         pthread_kill(t, sig2);
     } else if (sig2 >= SIGRTMIN) {
@@ -101,7 +106,13 @@ static void one(const char *label, int handler_mode, int sig2, int to_thread) {
     } else {
         kill(getpid(), sig2);
     }
-    kill(getpid(), SIGUSR1);
+    /* A signal aimed at a thread sits on that thread's own list, which the
+     * kernel empties before it looks at the process's: sent to the process,
+     * SIGUSR1 would come second there and the worker's handler would simply
+     * take SIGUSR2 first. Aimed at the thread as well, it is the lower number
+     * on the same list, and goes first. */
+    if (to_thread) pthread_kill(t, SIGUSR1);
+    else kill(getpid(), SIGUSR1);
     /* Both are pending now, and blocked in every thread (a thread starts with
      * its creator's mask): let the worker unblock them, and wait for its
      * SIGUSR1 handler. */
@@ -152,6 +163,7 @@ int main(void) {
     one("exit, process-directed", 0, SIGUSR2, 0);
     one("wait, process-directed", 1, SIGUSR2, 0);
     one("exit, thread-directed", 0, SIGUSR2, 1);
+    one("exit, thread-directed sigqueue", 0, SIGUSR2, 2);
     one("exit, SIGCHLD", 0, SIGCHLD, 0);
     one("wait, SIGCHLD", 1, SIGCHLD, 0);
     one("wait, rt x3", 1, SIGRTMIN + 1, 0);

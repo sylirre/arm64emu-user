@@ -273,6 +273,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_rt_sigsuspend,  { AT_PTR, AT_UINT }, 0 },
     { G_NR_rt_sigtimedwait,{ AT_PTR, AT_PTR, AT_TIMESPEC, AT_UINT }, 0 },
     { G_NR_rt_sigqueueinfo,{ AT_INT, AT_SIG, AT_PTR }, 0 },
+    { G_NR_rt_tgsigqueueinfo,{ AT_INT, AT_INT, AT_SIG, AT_PTR }, 0 },
     { G_NR_sigaltstack,    { AT_PTR, AT_PTR }, 0 },
     /* time */
     { G_NR_clock_gettime,  { AT_INT, AT_TIMESPEC_O }, 0 },

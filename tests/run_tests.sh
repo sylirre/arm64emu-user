@@ -2849,6 +2849,12 @@ rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
 # main thread and on the threads de_thread killed -- the main thread carries on
 # here where the kernel renumbers, so the signals are handed over to it.
 check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndone'
+# rt_sigqueueinfo / rt_tgsigqueueinfo read the sender's siginfo as the kernel
+# does -- kernel_siginfo's 48 bytes, the other 80 only for a layout it does not
+# know (and then they must be zero: E2BIG) -- and hand si_errno on. Self-checking
+# (the block is the native kernel's): qemu-user locks all 128 bytes, copies only
+# the fields it knows, and drops si_errno.
+check_fixture sqiread $'sigqueueinfo errno 7: 0\nsigqueueinfo errno 7: took 10 errno=7 val=1\ntgsigqueueinfo errno 11: 0\ntgsigqueueinfo errno 11: took 10 errno=11 val=2\n48 readable, SI_QUEUE: 0\n48 readable, SI_QUEUE: took 10 errno=0 val=3\n48 readable, unknown layout: EFAULT\n47 readable, SI_QUEUE: EFAULT\nunknown layout, zero tail: 0\nunknown layout, zero tail: took 10 errno=0\nunknown layout, byte 100 set: E2BIG\nunknown layout, byte 100 set, other pid: E2BIG\nSI_QUEUE, byte 100 set: 0\nSI_QUEUE, byte 100 set: took 10 errno=0 val=6\ndone'
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
 # EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands
 # on the limit itself, at_min), MREMAP_FIXED below it is EPERM after

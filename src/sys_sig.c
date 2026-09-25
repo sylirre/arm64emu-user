@@ -442,6 +442,8 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
         GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
         if (sig_sfd_requeued(r)) continue;   /* handed back: as it was sent */
         r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
+        int code = r->ssi_code;
+        if (sig_thread_uncode(&code)) r->ssi_code = code;   /* rt_tgsigqueueinfo */
         if (r->ssi_code == SI_TIMER) {
             u64 gv;
             int thr;
@@ -512,40 +514,142 @@ SYSDEF(signalfd4) {
     return (u64)(s32)nfd;
 }
 
-SYSDEF(rt_sigqueueinfo) {
-    /* (tgid, sig, siginfo*). Read the queueing fields from the guest LP64
-     * siginfo (code@8; SI_QUEUE union: pid@16, uid@20, value@24) and re-send
-     * through the host kernel, which enforces the same rules the guest
-     * expects (si_code >= 0 to another process -> EPERM, bad pid -> ESRCH).
-     * The receiving emulator instance queues it via host_catcher and frames
-     * the payload back into the guest handler's siginfo. glibc has no
-     * wrapper; the raw syscall is on the Android 8 seccomp allow-list. */
-    (void)a3; (void)a4; (void)a5;
-    u8 gsi[32];
-    if (copy_from_guest(c, gsi, a2, sizeof gsi) < 0) return (u64)(s64)-EFAULT;
-    s32 code, pid; u32 uid; u64 value;
+/* The kernel's own list of si_code values each signal defines
+ * (known_siginfo_layout): one of these, or any code <= 0 from SI_DETHREAD up,
+ * SI_ASYNCNL or SI_KERNEL, is a layout kernel_siginfo holds entirely. */
+static int sqi_layout_known(int sig, s32 code) {
+    if (code == 0x80 /* SI_KERNEL */) return 1;
+    if (code > 0) {
+        int limit;
+        switch (sig) {
+        case SIGILL:  limit = 11; break;
+        case SIGFPE:  limit = 15; break;
+        case SIGSEGV: limit = 10; break;
+        case SIGBUS:  limit = 5;  break;
+        case SIGTRAP: limit = 6;  break;
+        case SIGCHLD: limit = 6;  break;
+        case SIGPOLL: limit = 6;  break;
+        case SIGSYS:  limit = 2;  break;
+        default:      return code <= 6;   /* NSIGPOLL */
+        }
+        return code <= limit;
+    }
+    return code >= -7 /* SI_DETHREAD */ || code == -60 /* SI_ASYNCNL */;
+}
+
+/* The guest siginfo rt_sigqueueinfo and rt_tgsigqueueinfo take, read as
+ * __copy_siginfo_from_user reads it: all of kernel_siginfo -- 48 bytes on
+ * LP64, EFAULT if any is out of reach -- and, for an si_code whose layout the
+ * kernel does not know, the remaining 80 as well, which must then be zero
+ * (E2BIG), since nothing past kernel_siginfo is ever handed on. The first
+ * check is the syscall's first; everything about the target comes after. */
+static s64 sqi_read(CPU *c, u64 uinfo, int sig, u8 gsi[48]) {
+    if (copy_from_guest(c, gsi, uinfo, 48) < 0) return -EFAULT;
+    s32 code;
+    memcpy(&code, gsi + 8, 4);
+    if (!sqi_layout_known(sig, code)) {
+        u8 rest[80];
+        if (copy_from_guest(c, rest, uinfo + 48, sizeof rest) < 0) return -EFAULT;
+        for (size_t i = 0; i < sizeof rest; i++)
+            if (rest[i]) return -E2BIG;
+    }
+    return 0;
+}
+
+/* The host siginfo that carries it: si_errno and si_code as the sender gave
+ * them, and the SI_QUEUE payload -- pid@16, uid@20, value@24 -- which is what
+ * the receiving emulator's capture hands on to the guest (an ILP32 host keeps
+ * the low 32 bits of a pointer-sized value; the int payloads sigqueue sends
+ * survive everywhere). `thread`: aimed at one thread, which the code carries
+ * (sig_thread_code). */
+static void sqi_host(siginfo_t *si, int hs, const u8 gsi[48], int thread) {
+    s32 err, code, pid;
+    u32 uid;
+    u64 value;
+    memcpy(&err, gsi + 4, 4);
     memcpy(&code, gsi + 8, 4);
     memcpy(&pid, gsi + 16, 4);
     memcpy(&uid, gsi + 20, 4);
     memcpy(&value, gsi + 24, 8);
+    memset(si, 0, sizeof *si);
+    si->si_signo = hs;
+    si->si_errno = err;
+    si->si_code = thread ? sig_thread_code(code) : code;
+    si->si_pid = (pid_t)pid;
+    si->si_uid = (uid_t)uid;
+    si->si_value.sival_ptr = (void *)(uintptr_t)value;
+}
+
+SYSDEF(rt_sigqueueinfo) {
+    /* (tgid, sig, siginfo*), re-sent through the host kernel with the
+     * sender's siginfo; the receiving emulator instance queues it via
+     * host_catcher and frames the payload back into the guest handler's
+     * siginfo. glibc has no wrapper; the raw syscall is on the Android 8
+     * seccomp allow-list. */
+    (void)a3; (void)a4; (void)a5;
+    s32 pid = (s32)a0;
+    int sig = (int)(s32)a1;
+    u8 gsi[48];
+    s64 e = sqi_read(c, a2, sig, gsi);
+    if (e < 0) return (u64)e;
+    s32 code;
+    memcpy(&code, gsi + 8, 4);
     /* The forge rule comes before the pid lookup, as in the kernel: an si_code
      * the caller may not claim is EPERM even for a pid that does not exist
-     * (tests/c/sigqueue.c checks that order). Only then is the target
-     * contained -- a host PID outside the guest does not exist for it, the
-     * same answer kill(2) gives. */
-    if ((code >= 0 || code == SI_TKILL) && (s32)a0 != (s32)getpid())
+     * (tests/c/sigqueue.c checks that order). "The caller" is the calling
+     * THREAD (task_pid_vnr(current)), so only the main thread may claim one
+     * of those codes to its own process. Only then is the target contained
+     * -- a host PID outside the guest does not exist for it, the same answer
+     * kill(2) gives. */
+    if ((code >= 0 || code == SI_TKILL) && pid != (s32)g_tls.tid)
         return (u64)(s64)-EPERM;
-    if ((s32)a0 <= 0 || !proctab_has_task((s32)a0)) return (u64)(s64)-ESRCH;
-    int hs = sig_send_host_nr((int)(s32)a1);   /* 32/33 ride the carrier */
+    if (pid <= 0 || !proctab_has_task(pid)) return (u64)(s64)-ESRCH;
+    /* A stop signal to a traced process, or SIGCONT to a listening one: the
+     * same routing as kill(2) (kill_one). */
+    if (pid == (s32)getpid()) {
+        if (ptrace_signal_stop(pid, sig) || ptrace_selfstop(sig)) return 0;
+    } else if (ptrace_signal_stop(pid, sig) || ptrace_signal_cont(pid, sig)) {
+        return 0;
+    }
+    int hs = sig_send_host_nr(sig);   /* 32/33 ride the carrier */
     siginfo_t si;
-    memset(&si, 0, sizeof si);
-    si.si_signo = hs;
-    si.si_code = code;
-    si.si_pid = (pid_t)pid;
-    si.si_uid = (uid_t)uid;
-    /* An ILP32 host truncates a pointer-sized payload to its 32-bit sival;
-     * int payloads (the sigqueue API) are preserved everywhere. */
-    si.si_value.sival_ptr = (void *)(uintptr_t)value;
-    long r = syscall(SYS_rt_sigqueueinfo, (pid_t)(s32)a0, hs, &si);
+    sqi_host(&si, hs, gsi, 0);
+    long r = syscall(SYS_rt_sigqueueinfo, (pid_t)pid, hs, &si);
+    return r < 0 ? host_err() : 0;
+}
+
+SYSDEF(rt_tgsigqueueinfo) {
+    /* (tgid, tid, sig, siginfo*): rt_sigqueueinfo aimed at one thread, as
+     * tgkill is kill aimed at one -- pthread_sigqueue's call. The kernel's
+     * order: the siginfo is read first, then a non-positive id is EINVAL, the
+     * forge rule EPERM (the target must be the calling thread itself for a
+     * code the caller may not claim), and only then is the pair looked up.
+     * Contained like tgkill, and routed through ptrace like it; the host
+     * kernel enforces the tgid/tid pairing and the signal's validity. */
+    (void)a4; (void)a5;
+    s32 tgid = (s32)a0, tid = (s32)a1;
+    int sig = (int)(s32)a2;
+    u8 gsi[48];
+    s64 e = sqi_read(c, a3, sig, gsi);
+    if (e < 0) return (u64)e;
+    if (tgid <= 0 || tid <= 0) return (u64)(s64)-EINVAL;
+    s32 code;
+    memcpy(&code, gsi + 8, 4);
+    if ((code >= 0 || code == SI_TKILL) && tid != (s32)g_tls.tid)
+        return (u64)(s64)-EPERM;
+    if (tgid != (s32)getpid()) {
+        if (!proctab_has(tgid) || !proctab_has_task(tid)) return (u64)(s64)-ESRCH;
+    } else if (proc_task_is_foreign(tid)) {
+        return (u64)(s64)-ESRCH;   /* not a guest thread: see tgkill */
+    }
+    if (tid == (s32)g_tls.tid && tgid == (s32)getpid()) {
+        if (ptrace_selfstop(sig)) return 0;
+    } else if (ptrace_signal_stop(tgid, sig) || ptrace_signal_cont(tgid, sig)) {
+        return 0;
+    }
+    int hs = sig_send_host_nr(sig);
+    siginfo_t si;
+    sqi_host(&si, hs, gsi, 1);
+    long r = syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, hs, &si);
     return r < 0 ? host_err() : 0;
 }

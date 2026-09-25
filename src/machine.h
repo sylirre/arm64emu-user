@@ -653,6 +653,11 @@ int  sig_arm_rt_remap(int guest_sig);
 int  sig_send_host_nr(int guest_sig);
 /* Its inverse: the guest number an armed carrier stands for (fcntl F_GETSIG). */
 int  sig_guest_nr(int host_sig);
+/* The si_code a host siginfo aimed at one thread (rt_tgsigqueueinfo)
+ * carries, so the receiving capture keeps it that thread's; and back, 1 when
+ * it was one (signal.c, SIG_THR_BIAS). */
+int  sig_thread_code(int code);
+int  sig_thread_uncode(int *code);
 
 /* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
  * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval
