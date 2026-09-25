@@ -2753,10 +2753,10 @@ static int own_thread(s32 tid) {
  * Our own thread group answers yes whatever the registry holds: a process must
  * be able to signal itself even if it never got a slot (a full table), and
  * that is also the only case an unavailable table must not break. */
-int proctab_has_task(s32 tid) {
+s32 proctab_task_group(s32 tid) {
     if (tid <= 0) return 0;
     s32 self = (s32)getpid();
-    if (tid == self) return 1;
+    if (tid == self) return self;
     /* One of our own threads -- as the kernel's pairing rule reports it, which
      * says the task is in this thread group and nothing more. Our thread group
      * is not all guest threads either: an interposer keeps a thread of its own
@@ -2764,7 +2764,7 @@ int proctab_has_task(s32 tid) {
      * filter below never got to see it, so the guest could name it wherever a
      * tid is contained -- tkill, an fd owner, the scheduler calls. The set is
      * process-local and normally empty. */
-    if (own_thread(tid)) return !proc_task_is_foreign(tid);
+    if (own_thread(tid)) return proc_task_is_foreign(tid) ? 0 : self;
     s32 tgid = proctab_has(tid) ? tid : proctab_task_tgid(tid);
     if (tgid <= 0 || !proctab_has(tgid)) return 0;
     /* A guest process's host tasks are not all guest threads: an interposer
@@ -2773,7 +2773,11 @@ int proctab_has_task(s32 tid) {
     int n = proctab_foreign_tasks(tgid, foreign, PROCTAB_FOREIGN);
     for (int i = 0; i < n; i++)
         if (foreign[i] == tid) return 0;
-    return 1;
+    return tgid;
+}
+
+int proctab_has_task(s32 tid) {
+    return proctab_task_group(tid) != 0;
 }
 
 /* A task id in a field the KERNEL reports to the guest -- the owner of a

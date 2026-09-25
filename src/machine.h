@@ -1244,6 +1244,9 @@ int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap 
  *                      registered guest PID, or a thread of one -- minus the
  *                      non-guest tasks that process published (an interposer's
  *                      own threads, which the guest is never shown).
+ *   proctab_task_group ...and if it is, the guest process it belongs to (the
+ *                      pid for a process, its tgid for a thread), else 0:
+ *                      what /proc/<tid>/ is resolved by (path.c).
  *   proctab_slots      registry size, 0 when the table is unavailable, and
  *   proctab_pid_at     the live guest PID in one slot (0 = none, and 0 too for
  *                      a slot whose process is gone), so a caller
@@ -1252,6 +1255,7 @@ int  proctab_get(s32 pid, struct ProcSnap *out);           /* full payload snap 
  *                      4096-entry buffer of its own. */
 s32  proctab_task_tgid(s32 tid);
 int  proctab_has_task(s32 tid);
+s32  proctab_task_group(s32 tid);
 int  proctab_slots(void);
 s32  proctab_pid_at(int slot);
 /* And for the ids the kernel REPORTS to the guest (a lock owner, a socket

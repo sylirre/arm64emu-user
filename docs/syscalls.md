@@ -1664,9 +1664,15 @@ then make the consequences the caller depends on true:
   so a plain `cat /proc/$$/mountinfo` read by a child no longer leaks the host
   mount namespace); `path_proc_magic` likewise resolves another guest PID's
   `exe`/`cwd` from the registry. **Every one of those is answered from here or
-  denied, never passed through**: both spellings reach it (`proc_other_tail`
+  denied, never passed through**: every spelling reaches it (`proc_other_tail`
   folds `/proc/<pid>/task/<tid>/<name>` into `/proc/<pid>/<name>`, since these
-  are per-process files and the kernel offers both names), and a registry
+  are per-process files and the kernel offers both names — and resolves
+  `/proc/<tid>/` of a thread that is not a main one to its process as well:
+  the kernel looks any task id up under `/proc`, not only a process's, and
+  serves it the process directory's entries for that task; its per-task
+  files, `status`, `stat`, `comm`, `personality`, are that thread's host
+  file, rewritten like any other; `proc_self_tail` does the same for our own
+  threads; `tests/fixtures/proctid.c`), and a registry
   lookup that comes up dry — the entry is mid-rewrite, or its process raced
   away — yields an empty file, or `ENOENT` for `exe`/`cwd`, as the kernel does
   for a process whose data is gone. Falling through on either would hand the
@@ -1680,9 +1686,12 @@ then make the consequences the caller depends on true:
   whether or not the new ones can be recorded). The same registry
   powers a **hidden-process view**: the
   top-level `/proc` `getdents64` stream drops numeric entries that are not guest
-  PIDs, and `special_host_path` routes a non-guest `/proc/<pid>` to ENOENT, so
-  the guest sees only its own process tree — a pid namespace without the
-  namespace. The **address-space** files of another guest process
+  PIDs, and `special_host_path` routes a `/proc/<id>` that is neither a guest
+  PID nor a guest thread's tid to ENOENT (`proctab_task_group`, which also keeps
+  an interposer's own threads out), so the guest sees only its own process
+  tree — a pid namespace without the namespace. A guest thread's tid used to
+  be hidden like a stranger's: `/proc/<tid>` of any thread that was not a main
+  one was ENOENT, where a kernel serves it. The **address-space** files of another guest process
   (`maps`, `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`, `stack`, `mem`,
   `clear_refs`, `syscall`) have no registry answer to give, and the host's
   describes the emulator's own mappings at its own foreign-ISA addresses, so

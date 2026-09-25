@@ -250,8 +250,15 @@ int proc_zone_path(const char *host) {
 }
 
 /* Tail after the "this process" spellings of a /proc path: /proc/self/,
- * /proc/<own-pid>/, /proc/thread-self/, and the task/<tid>/ sub-path of any of
- * them for one of our own threads. NULL if canon names something else.
+ * /proc/<own-pid>/, /proc/thread-self/, /proc/<tid>/ of one of our own
+ * threads, and the task/<tid>/ sub-path of any of them for one of our own
+ * threads. NULL if canon names something else.
+ *
+ * /proc/<tid>/ is there because the kernel resolves any task id under /proc,
+ * not only a process's (proc_pid_lookup), and serves it the process
+ * directory's entries for that task: the per-process files through it are
+ * the process's own. Its per-task files -- status, stat, comm, personality --
+ * are read from the host file the path names, which is that thread's.
  *
  * The kernel offers every one of these names for the same files, and everything
  * served through here -- exe, cwd, root, cmdline, environ, auxv, maps, the mount
@@ -268,8 +275,20 @@ const char *proc_self_tail(const char *canon) {
     else {
         char own[32];
         int n = snprintf(own, sizeof own, "%d/", getpid());
-        if (n <= 0 || strncmp(rest, own, (size_t)n)) return NULL;
-        tail = rest + n;
+        if (n > 0 && !strncmp(rest, own, (size_t)n)) tail = rest + n;
+        else {
+            /* One of our own guest threads, by the kernel's pairing test
+             * (never an interposer's: proc_task_is_foreign). */
+            const char *p = rest;
+            u64 id = 0;
+            for (; *p >= '0' && *p <= '9'; p++)
+                if ((id = id * 10 + (u64)(*p - '0')) > 0x7fffffff) return NULL;
+            if (p == rest || *p != '/' || !id ||
+                syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)id, 0) != 0 ||
+                proc_task_is_foreign((s32)id))
+                return NULL;
+            tail = p + 1;
+        }
     }
     if (!strncmp(tail, "task/", 5)) {
         const char *t = tail + 5;
@@ -288,7 +307,9 @@ const char *proc_self_tail(const char *canon) {
 
 /* The same, for ANOTHER process: tail after "/proc/<pid>/", with that process's
  * own task/<tid>/ sub-path folded away, and *pid set. NULL if canon does not
- * name "/proc/<digits>/...".
+ * name "/proc/<digits>/...". A guest thread's /proc/<tid>/ sets *pid to its
+ * process, whose files the per-process leaves are (see proc_self_tail); every
+ * other number is left as it is, for the callers' own visibility test.
  *
  * The task spelling matters for exactly the reason it does above: the files
  * reached through it are per-process, so /proc/<pid>/task/<tid>/environ is
@@ -306,6 +327,10 @@ const char *proc_other_tail(const char *canon, s32 *pid) {
     }
     if (*p != '/') return NULL;
     *pid = (s32)n;
+    if (!proctab_has(*pid)) {
+        s32 g = proctab_task_group(*pid);
+        if (g > 0) *pid = g;
+    }
     const char *tail = p + 1;
     if (strncmp(tail, "task/", 5)) return tail;
     const char *t = tail + 5;
@@ -541,10 +566,14 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
     }
     if (!m->no_proc && !strncmp(canon, "/proc", 5) &&
         (canon[5] == 0 || canon[5] == '/')) {
-        /* Hidden-process view: a numeric /proc/<pid> that is not a guest PID
+        /* Hidden-process view: a numeric /proc/<pid> that is not a guest task
          * appears not to exist — fall through to rootfs prefixing (ENOENT).
-         * Guest PIDs and every non-numeric name (self, sys, net, version, …)
-         * pass through to the host as before. This one choke point covers
+         * Guest PIDs, the tids of guest threads (which the kernel resolves
+         * too, while listing only processes -- the host's listing already
+         * does neither more nor less) and every non-numeric name (self, sys,
+         * net, version, …) pass through to the host as before, where what
+         * describes the guest is served instead of the host file
+         * (proc_self_tail, proc_other_tail). This one choke point covers
          * open/stat/readlink/execve and the *at forms. */
         if (canon[5] == '/' && canon[6] >= '0' && canon[6] <= '9') {
             long pid = 0;
@@ -554,7 +583,7 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
                 pid = pid * 10 + (*p - '0');
                 if (pid > 0x7fffffff) { numeric = 0; break; }
             }
-            if (numeric && pid != (long)getpid() && !proctab_has((s32)pid))
+            if (numeric && pid != (long)getpid() && !proctab_has_task((s32)pid))
                 return 0;
         }
         strcpy(host_out, canon);   /* host /proc passthrough */

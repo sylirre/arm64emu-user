@@ -2042,8 +2042,12 @@ SYSDEF(getdents64) {
             int tp = 0, adv = 0;
             if (!c->m->no_proc &&
                 sscanf(hpath, "/proc/%d/task%n", &tp, &adv) == 1 &&
-                adv > 0 && hpath[adv] == 0 && tp > 0)
-                nforeign = proc_foreign_tasks((s32)tp, foreign, PROCTAB_FOREIGN);
+                adv > 0 && hpath[adv] == 0 && tp > 0) {
+                /* /proc/<tid>/task of a guest thread lists its process's. */
+                s32 g = proctab_task_group((s32)tp);
+                nforeign = proc_foreign_tasks(g > 0 ? g : (s32)tp, foreign,
+                                              PROCTAB_FOREIGN);
+            }
         }
     }
 

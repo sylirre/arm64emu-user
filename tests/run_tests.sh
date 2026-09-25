@@ -2888,6 +2888,24 @@ check_fixture idregs $'midr 0x411fd070\npfr0 0x110011 pfr1 0 pfr2 0\nzfr0 0 smfr
 # unwinding out of the handler of one could not step through that frame.
 # Self-checking: an emulator property (a kernel may deliver there, rarely).
 check_fixture sigtramp $'on_trampoline=0\ndone'
+# /proc/<tid> of a thread that is not a main one: the kernel resolves it and
+# serves it the process's files for that task (status, comm the thread's;
+# cmdline, environ, exe, maps, fd the process's), while listing only
+# processes. Self-checking: qemu-user answers from the host; the expectations
+# are a kernel's (the same program, built for the host, answers the same).
+# Twice: with "/" for a rootfs a path the guest may not see falls back to the
+# host's own file, and only a real rootfs shows that it is served, not hidden.
+proctid_expect=$'own_exists=1\nown_listed=0\nown_status_pid=1 tgid=1\nown_comm=worker\nown_cmdline_same=1\nown_environ_same=1\nown_exe_same=1\nown_task_lists=1 1\nown_maps_covers_main=1\nown_fd_same=1\nother_exists=1\nother_listed=0\nother_status_pid=1 tgid=1\nother_comm=worker\nother_cmdline_same=1\nother_environ_same=1\nother_exe_same=1\nother_task_lists=1 1\ngone=1\ndone'
+check_fixture proctid "$proctid_expect"
+if [ -d "$ALPINE/tmp" ] && [ -n "$AGCC" ] &&
+   "$AGCC" -static -O2 -o tests/fixtures/proctid.bin tests/fixtures/proctid.c \
+        $A64_TESTLIBS 2>/dev/null; then
+    cp tests/fixtures/proctid.bin "$ALPINE/tmp/ci_proctid"
+    fixture_verdict "proctid (rootfs)" "$proctid_expect" \
+        "$("$EMU" "$ALPINE" /tmp/ci_proctid 2>/dev/null)"
+    rm -f "$ALPINE/tmp/ci_proctid"
+    fx_rm tests/fixtures/proctid.bin
+fi
 # The prctl operations a guest process owns because it is a host process
 # (subreaper, timer slack, THP, MCE, timing, speculation, securebits), the
 # parent-death signal translated both ways (32/33 ride a carrier), the tid
