@@ -72,6 +72,9 @@ u64 mmap_min_addr(void) {
 #define G_MAP_ANONYMOUS 0x20
 #define G_MAP_FIXED_NOREPLACE 0x100000
 #define G_MAP_GROWSDOWN 0x0100
+/* The most room a MAP_GROWSDOWN mapping placed by the emulator is given below
+ * it to grow into (mmap_locked), whatever its RLIMIT_STACK. */
+#define GROWS_ROOM_MAX (64ULL << 20)
 
 /* ...and the protection bits beyond PROT_READ/WRITE/EXEC. */
 #define G_PROT_SEM       0x8
@@ -244,10 +247,34 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
         if (hint && hint < mmap_min_addr()) hint = mmap_min_addr();
         addr = 0;
         if (hint && hint <= GUEST_TASK_SIZE - len) {
+            /* Free means clear of every mapping and of the guard gap under
+             * a stack, too (vm_start_gap): a hint ending inside the gap is
+             * not taken, as the kernel's generic_get_unmapped_area does not
+             * take it. */
             int busy = 0;
-            for (u64 va = hint; va < hint + len; va += GUEST_PAGE_SIZE)
-                if (as_find_region(as, va)) { busy = 1; break; }
+            for (int i = 0; i < as->nregions && !busy; i++) {
+                const Region *r = &as->regions[i];
+                busy = as_gap_start(r) < hint + len && hint < r->end;
+            }
             if (!busy) addr = hint;
+        }
+        if (!addr && (flags & G_MAP_GROWSDOWN)) {
+            /* A stack goes at the top of a hole with room below it to grow
+             * into. A kernel's top-down layout gives it that for nothing --
+             * the next mapping goes under the last one, and a stack placed
+             * there has free space beneath it until something is mapped
+             * there too -- where this layout, which fills upward, would put
+             * it straight on top of the mapping before it, whose guard gap
+             * then refuses its first page of growth. The room is what its
+             * RLIMIT_STACK lets it grow by, at most GROWS_ROOM_MAX, and the
+             * guard gap under that. */
+            u64 stk = rlim_cur(c->m, G_RLIMIT_STACK);
+            u64 room = stk < GROWS_ROOM_MAX ? PG_UP(stk) : GROWS_ROOM_MAX;
+            room = (room > len ? room - len : 0) + STACK_GUARD_GAP;
+            if (len <= GUEST_TASK_SIZE - room) {
+                addr = as_find_free(as, len + room);
+                if (addr) addr += room;
+            }
         }
         if (!addr) addr = as_find_free(as, len);
         if (!addr) return (u64)(s64)-ENOMEM;
@@ -316,8 +343,11 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
      * on brk alone, which is what this did, is the pre-4.5 rule; the kernel
      * this emulator's uname claims to be has applied it to mmap for ten years,
      * and a guest that lowers RLIMIT_DATA to bound its own allocator got no
-     * bound at all as soon as malloc reached for mmap. */
-    if ((pte & PTE_W) && !(flags & G_MAP_SHARED) && !data_fits(c->m, add))
+     * bound at all as soon as malloc reached for mmap. Nor is a stack one --
+     * MAP_GROWSDOWN makes VM_STACK memory, which is_data_mapping leaves out
+     * and a native kernel maps over the limit. */
+    if ((pte & PTE_W) && !(flags & (G_MAP_SHARED | G_MAP_GROWSDOWN)) &&
+        !data_fits(c->m, add))
         return (u64)(s64)-ENOMEM;
 
     int r;
@@ -352,9 +382,12 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                 Region *reg = (Region *)as_find_region(as, addr);
                 if (reg) { reg->anon_shm = 1; reg->shm_size = len; }
             }
+        } else if (flags & G_MAP_GROWSDOWN) {
+            /* A stack, with host room below it to grow into (mem.c). */
+            r = guest_map_stack(as, addr, len, pte,
+                                rlim_cur(c->m, G_RLIMIT_STACK));
         } else {
             r = guest_map_anon(as, addr, len, pte);
-            if (r == 0 && (flags & G_MAP_GROWSDOWN)) as_set_growsdown(as, addr);
         }
     } else {
         if (off & GUEST_PAGE_MASK) return (u64)(s64)-EINVAL;
@@ -902,6 +935,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
                                                     : old_addr);
     u32 prot = tail ? tail->prot : (PTE_R | PTE_W);
     int shared = tail && tail->shared;
+    int stack = tail && tail->growsdown;   /* VM_STACK: no data mapping */
     /* Duplication is for a shareable mapping alone: a "duplicate" of a
      * private one would be a fresh mapping unrelated to the original, which
      * vma_to_resize refuses (before the destination is looked at -- the
@@ -917,7 +951,7 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
     if (new_len > old_len) {
         u64 add = new_len - old_len;
         if (!as_fits(c->m, add)) return (u64)(s64)-ENOMEM;
-        if ((prot & PTE_W) && !shared && !data_fits(c->m, add))
+        if ((prot & PTE_W) && !shared && !stack && !data_fits(c->m, add))
             return (u64)(s64)-ENOMEM;
     }
 

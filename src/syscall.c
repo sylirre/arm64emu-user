@@ -580,10 +580,16 @@ void syscall_dispatch(CPU *c) {
 
     /* --strace-full: snapshot string/array args before the handler runs, since
      * execve/execveat replace the address space on success. strace_pre fills in
-     * snap (left uninitialized here to keep the non-full path off the hook). */
+     * snap (left uninitialized here to keep the non-full path off the hook).
+     * The decoder only looks: an argument pointing under a stack must not grow
+     * it (nogrow), since the call itself may never touch that memory. */
     u64 av[6] = { a0, a1, a2, a3, a4, a5 };
     StraceSnap snap;
-    if (m->strace_full) strace_pre(c, nr, av, &snap);
+    if (m->strace_full) {
+        g_tls.nogrow = 1;
+        strace_pre(c, nr, av, &snap);
+        g_tls.nogrow = 0;
+    }
 
     /* seccomp-BPF, after the ptrace entry stop (a tracer may have rewritten the
      * number the filter is meant to judge) and before the handler, which is the
@@ -685,7 +691,9 @@ void syscall_dispatch(CPU *c) {
                     (unsigned long long)a4, (unsigned long long)a5,
                     (long long)(s64)ret);
         } else {
+            g_tls.nogrow = 1;
             strace_log(c, nr, name, av, ret, &snap);
+            g_tls.nogrow = 0;
         }
     }
     syscall_return(c, ret);

@@ -225,7 +225,11 @@ Bytes rather than pages, because the parent's other threads keep running and
 a stale page from the child must not undo what a sibling wrote beside the
 child's bytes. `mprotect` and the end-of-file fill keep the bit withheld on a
 private region while tracking (`vf_pte_prot`); a mapping the child makes
-itself is untracked and its own. A fork child of a tracked process starts
+itself is untracked and its own. A stack the child grows — it runs on the
+parent's — is carried as far as the child wrote into it: the grown pages are
+tracked like any other, and the parent's copy of their bytes
+(`copy_to_guest_code`) grows the parent's own stack over them, as the vma the
+two share would have grown. A fork child of a tracked process starts
 clean (`as_vfork_fork_child`) — the heal path still mends the PTEs it
 inherited, recording nothing — and a process applying its own vfork child's
 bytes while itself tracked records them first (`as_vfork_note_write`), so a
@@ -404,6 +408,95 @@ parked in a buffer that is unmapped and reserved away, none of the memory mapped
 afterwards receives its bytes, and a mapping grown with a transfer in flight
 has them.
 
+### Stacks grow down to meet a fault
+
+A kernel maps a stack small and grows it as the program reaches below it: the
+main stack starts as the argument pages plus 128 KB (`setup_arg_pages`), a
+`MAP_GROWSDOWN` mapping as long as it was made, and the page-fault handler
+extends a `VM_GROWSDOWN` vma down to a fault in the hole beneath it
+(`expand_downwards`). The emulator laid every stack out whole and grew none: a
+`MAP_GROWSDOWN` mapping stayed the length it was made, so the first touch below
+it was a `SIGSEGV`, and the main stack was `RLIMIT_STACK` at the exec — capped
+at 64 MB, 8 MB for an infinite limit — whatever the program did to the limit
+afterwards: a program that raised its own limit for a deep recursion got none
+of the room it had been granted.
+
+Both now start the size a kernel gives them and grow in `translate`'s miss path
+(`as_stack_grow`, after `as_fault_fill`), with the kernel's tests
+(`as_stack_grows_to`): the page not below `vm.mmap_min_addr`; the mapping below
+the hole — unless it is a stack itself or has no access at all — ending at least
+`stack_guard_gap` (1 MiB) under the page; the grown region within
+`RLIMIT_STACK` as it stands *at the fault*; the address space within
+`RLIMIT_AS`. A region grows to the faulting page in one step, as a vma does,
+and the new pages take its protection, so a write below a read-only stack or a
+jump below a non-executable one grows it and then faults on the permission
+(`SEGV_ACCERR`), as on a kernel.
+
+**Who grows it** is the kernel's list. Every access the guest makes and every
+copy a syscall makes for it (`copy_to_user` faults like an instruction does;
+a signal frame pushed below a stack is one), and a tracer's `PEEK`/`POKE`,
+whose `access_remote_vm` expands the stack itself. Not the kernel's GUP, which
+has grown no stack since 6.1.37: `process_vm_readv`/`writev`'s remote side and
+a shared futex's key lookup run under `g_tls.nogrow` (`thread.h`). Nor the
+emulator's own looks at guest memory — the `--strace-full` decoder, `mem_peek`
+— and nor `rw_room`, the bound a transfer is measured against before the host
+call: it asks `mem_reachable`, which answers "a stack would grow over this"
+without growing it, so the growth happens in the copy that moves bytes and not
+for a read that returned nothing. `mincore` of the hole is `ENOMEM`, as a
+kernel answers it, with nothing grown.
+
+**The backing has to be there to grow into.** A region's host backing is one
+contiguous run (`Region.host`), so a stack is made by `guest_map_stack` with
+room reserved below it: host address space `PROT_NONE` and `MAP_NORESERVE`,
+uncommitted and without page tables until the growth reaches it, when it is
+made accessible a host page at a time (`HostMap.rw_lo` marks how far;
+`region_grow_down`). An LP64 host reserves 1 GiB below every stack, whatever
+the limit says — address space it has 128 TiB of — so a limit raised later is
+room already there; an ILP32 host reserves what the limit allows, up to 64 MB.
+Past the room, the allocation is extended downward if the host addresses under
+it are free (`MAP_FIXED_NOREPLACE`, checked by where the mapping lands on a
+kernel older than 4.17, which ignores the flag); failing that, the region is
+moved to a larger reservation of its own, its bytes copied — but only with no
+other guest thread in the address space, no run of the backing lent to a host
+syscall, and not for `mem_host_ptr`, whose caller may still hold an earlier
+pointer (the core's LSE atomics and exclusives take theirs there, so on this
+tier such an access as the *first* touch of the hole faults where a plain load
+or store grows it). A stack that can do none of it stops growing: `SIGSEGV`,
+which is what a kernel out of address space answers too. Pages a `munmap` took
+off a stack's bottom keep their bytes in the allocation (backing is released
+whole), so growing back over them zeroes them first: a grown page is the zero
+page. `A64_STACKGROW_FORCE_MOVE` reserves no room and never extends, putting
+every growth on the moving tier; the suite runs `tests/fixtures/growsdown.c`
+over it too.
+
+**Where a stack is placed.** A kernel's top-down layout gives a
+`MAP_GROWSDOWN` mapping free space beneath it for nothing — the next mapping
+goes under the last one — until something is mapped there, and then keeps that
+mapping `stack_guard_gap` away (`vm_start_gap`). This layout fills upward, so
+`mmap(NULL, MAP_GROWSDOWN)` would land straight on the mapping before it, whose
+guard gap then refuses its first page of growth. `mmap_locked` places it at the
+top of a hole with room below it instead: what its `RLIMIT_STACK` lets it grow
+by, at most 64 MB, and the guard gap under that. (A small one on a kernel may
+land in a hole between two libraries, where the gap refuses it any growth at
+all; layout decides that there, and the fixture does not ask it.)
+
+**It is the stack in every size the guest reads.** `VM_STACK` is
+`VM_GROWSDOWN` on arm64, so every growsdown region is `VmStk` and not `VmData`
+(`region_is_stack`), and neither `mmap` nor `mremap` charges one to
+`RLIMIT_DATA` — a native kernel maps and grows one over that limit. The
+`[stack]` name in `/proc/<pid>/maps` stays the kernel's: the region holding the
+initial stack.
+
+`tests/fixtures/growsdown.c` takes every row from a native kernel: the initial
+size, a limit raised and lowered after the exec, the guard gap against an
+accessible, a `PROT_NONE` and a growsdown mapping below, `RLIMIT_STACK` and
+`RLIMIT_AS`, a `read` into the hole, a tracer's `PEEK` against
+`process_vm_readv`, `mincore`, a regrown page, the permission faults, a signal
+frame, a fork child's copy, and the accounting. `tests/fixtures/growsnomove.c`
+has the rows the moving tier cannot give: another thread growing a stack, and
+an atomic as its first touch. qemu-user is no oracle for any of it — it sizes
+the main stack from its own `-s` option.
+
 ### `mremap(MREMAP_DONTUNMAP)`
 
 The pages of the old range move to the new one and the old range **stays
@@ -535,8 +628,9 @@ rule, meant to keep a relocating guest from being refused — was a hole, becaus
 whole address space in `MAP_FIXED` steps and never be charged a byte of it.
 
 `RLIMIT_DATA` bounds a subset of the same total: what `is_data_mapping()`
-calls a data mapping — private, writable, and not the main stack — summed by
-`as_data_bytes()`. Every kernel since 4.5 charges `mmap`, `mremap` and `brk`
+calls a data mapping — private, writable, and not a stack (`VM_STACK`, which
+is every `VM_GROWSDOWN` region: the main stack and a `MAP_GROWSDOWN` mapping
+alike) — summed by `as_data_bytes()`. Every kernel since 4.5 charges `mmap`, `mremap` and `brk`
 against it in `may_expand_vm`, alongside the `RLIMIT_AS` test and out of the
 same page count, and the `uname` presented here is 6.1; enforcing it on `brk`
 alone left a guest that lowered the limit to bound its own allocator with no
@@ -566,8 +660,8 @@ read those two and never `status`.
 
 The classifications are the kernel's, from the same predicates —
 `is_data_mapping` for `VmData`, `is_exec_mapping` for `exec_vm` (split into
-`VmExe` and `VmLib` by the executable's own code span), the region holding the
-initial stack top for `VmStk`. `VmLck`/`VmPin`/`VmSwap` are structurally zero
+`VmExe` and `VmLib` by the executable's own code span), `is_stack_mapping` —
+every `VM_GROWSDOWN` region — for `VmStk`. `VmLck`/`VmPin`/`VmSwap` are structurally zero
 (`mlock` is a no-op, there is no guest swap). `VmPTE` is the emulator's
 second-level tables, which cost eight bytes per mapped guest page — exactly
 what a kernel's leaf page tables cost, so the figure means what a guest expects
@@ -738,7 +832,8 @@ must be one; that is how glibc makes the whole stack executable for a library
 marked for it. arm64 has no `VM_GROWSUP`, so `PROT_GROWSUP` is `EINVAL` (or
 `ENOMEM` where the range's start is unmapped), and so are the two together,
 before anything else. The flag travels with the region through splits and moves
-the way `vm_flags` do, and a region only merges with one that has it too.
+the way `vm_flags` do, and a region only merges with one that has it too. It is
+also what lets the region grow ([below](#stacks-grow-down-to-meet-a-fault)).
 (`tests/c/mprotectprot.c`, and `tests/fixtures/mprotectgrows.c` for the rows
 qemu-user gets wrong: it truncates the protection to an `int`, validates it
 ahead of the zero length, and knows no `VM_GROWSDOWN` but the main stack's.)
@@ -749,6 +844,10 @@ is honored, otherwise `as_find_free` bump-allocates a fresh range. Honoring the 
 is what keeps runtimes that reserve specific high addresses and munmap anything
 placed elsewhere — Go's heap-arena reservation is the motivating case — from
 thrashing at startup, and is why the guest VA space is 47 bits (`sys_mm.c`).
+"Free" includes the guard gap under a stack: a hint whose range ends within
+`stack_guard_gap` below a `VM_GROWSDOWN` region is not taken, and `as_find_free`
+never places a mapping there either (`as_gap_start`, the kernel's
+`vm_start_gap`) — see [Stacks grow](#stacks-grow-down-to-meet-a-fault).
 
 **Ranges that wrap** are asked about by subtraction from the top of the address
 space (`addr > GUEST_TASK_SIZE - len`), never by adding to the base — a sum that

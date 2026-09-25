@@ -203,6 +203,16 @@ typedef struct HostMap {
                                * is neither retired nor given new backing */
     struct HostMap *orphan_next;  /* on AddrSpace.orphans: no Region left, a
                                    * loan still out (see hmap_unref) */
+    u8    *rw_lo;             /* lowest byte the host lets us touch: `base`,
+                               * except under a stack (guest_map_stack), whose
+                               * allocation starts with room reserved for it
+                               * to grow into -- inaccessible and uncommitted
+                               * below here, handed over as the growth
+                               * reaches it (mem.c, as_stack_grow) */
+    u8    *fresh_hi;          /* ...and [rw_lo, fresh_hi) has never been any
+                               * region's: still the zeroes the host handed
+                               * out, where the rest may hold what a slice
+                               * unmapped off a stack's bottom left behind */
 } HostMap;
 
 typedef struct Region {
@@ -246,9 +256,13 @@ typedef struct Region {
                                * Travels with the region through splits, trims
                                * and moves, the way vm_flags travel with a vma */
     u32  growsdown;           /* VM_GROWSDOWN: the main stack, or anonymous
-                               * private memory mapped MAP_GROWSDOWN. What
-                               * mprotect(PROT_GROWSDOWN) reaches down through
-                               * to the region's start; travels like forkflags */
+                               * private memory mapped MAP_GROWSDOWN. A fault
+                               * in the hole below grows it down to meet the
+                               * fault (as_stack_grow); it is the stack in
+                               * every size a guest reads about itself, and
+                               * what mprotect(PROT_GROWSDOWN) reaches down
+                               * through to the region's start. Travels like
+                               * forkflags */
 } Region;
 
 /* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
@@ -349,6 +363,11 @@ void as_unlock(void);
 int  guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot);
 int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                     u64 off, int shared, const char *path);
+/* A VM_GROWSDOWN mapping -- the main stack, an mmap(MAP_GROWSDOWN) -- whose
+ * host backing has room below it to grow into: toward `limit` bytes in all,
+ * the guest's RLIMIT_STACK (G_RLIM_INFINITY for none), which an ILP32 host
+ * goes by and an LP64 one reserves past (mem.c, GROW_ROOM_MAX). */
+int  guest_map_stack(AddrSpace *as, u64 addr, u64 len, u32 prot, u64 limit);
 int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
 /* mremap(2) primitives. guest_remap_move re-points the guest VA of an existing
  * mapping without touching its backing (so MAP_SHARED, the file behind a file
@@ -444,6 +463,9 @@ void as_procmem(AddrSpace *as, ProcMem *out);
 void as_publish(AddrSpace *as);
 /* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
 u64  as_find_free(AddrSpace *as, u64 len);
+/* Where `r` begins for placing a mapping below it: its start, less
+ * STACK_GUARD_GAP for a VM_GROWSDOWN region (vm_start_gap). */
+u64  as_gap_start(const Region *r);
 /* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.
  * For /proc/self/maps synthesis. */
 u32  as_page_prot(AddrSpace *as, u64 va);
@@ -462,13 +484,21 @@ const Region *as_find_region(AddrSpace *as, u64 va);
  * instead of a page at a time -- a range the guest names can span the whole
  * address space, and the kernel walks it vma by vma. Same locking as above. */
 const Region *as_next_region(AddrSpace *as, u64 va);
-/* Mark the region starting at `va` VM_GROWSDOWN (the stack the ELF loader
- * builds, an mmap(MAP_GROWSDOWN)). Takes as_lock itself. */
-void as_set_growsdown(AddrSpace *as, u64 va);
+/* stack_guard_gap: how far below a VM_GROWSDOWN region the kernel keeps the
+ * next accessible mapping, when it grows the region and when it places a
+ * mapping (vm_start_gap) -- 256 pages, the default of its boot parameter. */
+#define STACK_GUARD_GAP (256ULL << 12)
 
 /* Stable host pointer for [va, va+size) if within one guest page and permitted
- * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths. */
+ * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths.
+ * It may grow a stack down to `va`, but never moves one to do it: the caller
+ * may still hold a pointer an earlier call handed out (mem.c). */
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
+/* Could an access of `acc` reach [va, va+size) (within one guest page)? A
+ * page mapped with the permission, or one under a stack that the access would
+ * grow the stack over -- without growing it: the copy that touches the page
+ * does that, as a kernel's does, and only if bytes move at all. */
+bool mem_reachable(CPU *c, u64 va, unsigned size, AccType acc);
 
 /* ---- lending guest memory to a host syscall (mem.c) ----
  * A large transfer is not staged through a bounce buffer: the host syscall is

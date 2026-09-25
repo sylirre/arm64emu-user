@@ -222,6 +222,7 @@ Behavior fallbacks:
 * `A64_MEMFD_CHMOD_FORCE_DENY`: refuses every mode change on a memfd — the tier Android's SELinux policy serves, where an app has no setattr on one, so a guest that takes the execute bit off a memfd it owns would otherwise be told EACCES by a call Linux allows and the exec check would go on judging the 0777 the kernel handed out; the guest-set mode is held in the broker registry beside the seals instead, and the suite's `(chmod-denied tier)` rows run over it.
 * `A64_SIGQ_MAX=N`: caps a thread's pending-signal queue at N entries — pinning it at its floor makes every signal flood go through the back-pressure gate (the queue blocks the signals in the mask its capture handler returns to, leaving the rest of the flood in the host kernel's own queue until it drains); the suite's `(gate-tier)` row runs over it.
 * `A64_TLBPUB_MAX=N`: caps the D-TLB published-epoch table at N slots — the tier a guest with more live threads than the table holds is served by: a thread the quarantine cannot account for stops it draining at all, so retired host backing is never released out from under a stale translation.
+* `A64_STACKGROW_FORCE_MOVE`: reserves no host room below a stack and never extends its backing downward, so a stack that grows is moved to new backing — the tier a host whose address space under a stack is taken is served by, where the move is refused while another guest thread runs (it could hold a pointer into the old backing); the suite's `growsdown (move-tier)` row runs over it.
 
 Tuning:
 

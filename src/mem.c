@@ -6,6 +6,7 @@
  * table, so the layout is independent of the host's pointer width. */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -21,6 +22,7 @@
 #include "machine.h"
 #include "esr.h"
 #include "jit.h"
+#include "sys.h"          /* mmap_min_addr */
 
 #define L1_BITS (GUEST_VA_BITS - 26)          /* 21 -> ~2M entries (~16 MiB L1) */
 #define L2_BITS 14                            /* 16384 entries, 64 MiB per L2 */
@@ -633,7 +635,11 @@ static void pte_prot_raw(AddrSpace *as, u64 addr, u64 len, u32 prot) {
  * out of reach, and are documented: a mapping the child makes or changes
  * itself (mmap, munmap, mremap, brk, mprotect) is its own and not carried,
  * and a sibling thread of the parent writing the very bytes the child writes
- * loses to the child, as in any race. A grandchild forked from a tracked
+ * loses to the child, as in any race. A stack the child grows -- it runs on
+ * the parent's -- is carried as far as the child wrote: the grown pages are
+ * tracked like any other, and the parent's copy of their bytes
+ * (copy_to_guest_code) grows its own stack over them, as the vma the two
+ * share would have grown. A grandchild forked from a tracked
  * child starts clean (as_vfork_fork_child): the heal path still mends the
  * PTEs it inherited, recording nothing. */
 typedef struct { u64 va; u8 *was; } VforkPage;
@@ -802,13 +808,6 @@ const Region *as_next_region(AddrSpace *as, u64 va) {
     return best;
 }
 
-void as_set_growsdown(AddrSpace *as, u64 va) {
-    as_lock();
-    for (int i = 0; i < as->nregions; i++)
-        if (as->regions[i].start == va) { as->regions[i].growsdown = 1; break; }
-    as_unlock();
-}
-
 /* Host page size handling: host backing is allocated with mmap and is at least
  * guest-page aligned. Each allocation is refcounted (HostMap) and retired whole
  * once no region references it — a punched slice is never released on its own,
@@ -935,6 +934,7 @@ static HostMap *hmap_new(u8 *base, size_t len) {
     hm->refs = 1;
     hm->pins = 0;
     hm->orphan_next = NULL;
+    hm->rw_lo = hm->fresh_hi = base;
     return hm;
 }
 
@@ -1100,6 +1100,63 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     return 0;
 }
 
+/* Host address space reserved below a stack for it to grow into. An LP64
+ * host reserves the most, whatever the guest's limit says now -- it is
+ * untouched, uncommitted address space, there are 128 TiB of it, and a limit
+ * the program raises after its exec is then room already there. An ILP32
+ * host has 3 GiB for everything the guest maps, so it reserves what the
+ * limit allows, up to the most the loader ever laid a stack out whole;
+ * growth past that is still tried (region_grow_down). */
+#define GROW_ROOM_MAX (sizeof(void *) >= 8 ? (1ULL << 30) : (64ULL << 20))
+
+/* A64_STACKGROW_FORCE_MOVE: no room below a stack and no extending its
+ * allocation, so every growth takes the last tier and moves the stack -- the
+ * tier a host whose address space under a stack is taken is served by. */
+static int stack_force_move(void) {
+    static int v = -1;
+    return PROBE_ONCE(v, getenv("A64_STACKGROW_FORCE_MOVE") != NULL);
+}
+
+int guest_map_stack_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, u64 limit) {
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    if ((addr | len) & GUEST_PAGE_MASK || !range_ok(addr, len) || !len)
+        return -EINVAL;
+    if (!host_len_ok(len)) return -ENOMEM;
+    u64 hpm = (u64)g_host_pagesz - 1;
+    u64 room = sizeof(void *) >= 8 || limit > GROW_ROOM_MAX ? GROW_ROOM_MAX : limit;
+    room = room > len && !stack_force_move() ? (room - len + hpm) & ~hpm : 0;
+    /* The room is PROT_NONE and MAP_NORESERVE: no commit charge and no page
+     * tables until the stack grows into it, which makes its pages accessible
+     * a host page at a time (region_grow_down). Halved until the host takes
+     * it -- a host RLIMIT_AS can refuse even address space -- down to none,
+     * which is only a stack whose growth has to find room elsewhere. */
+    u8 *base;
+    for (;;) {
+        void *p = MAP_FAILED;
+        if (host_len_ok(room + len))
+            p = mmap(NULL, (size_t)(room + len), PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) {
+            if (mprotect((u8 *)p + room, (size_t)len, PROT_READ | PROT_WRITE) == 0) {
+                base = p;
+                break;
+            }
+            munmap(p, (size_t)(room + len));
+        }
+        if (!room) return -ENOMEM;
+        room = (room / 2) & ~hpm;
+    }
+    region_punch(as, addr, addr + len);
+    HostMap *hm = hmap_new(base, (size_t)(room + len));
+    hm->rw_lo = hm->fresh_hi = base + room;
+    Region r = { .start = addr, .end = addr + len, .prot = prot,
+                 .shared = 0, .wr_ok = 1, .host = base + room, .hmap = hm,
+                 .path = NULL, .file_off = 0, .growsdown = 1 };
+    region_insert(as, r);
+    pte_set_range(as, addr, len, base + room, prot);
+    return 0;
+}
+
 int guest_map_file_impl(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
                    u64 off, int shared, const char *path) {
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
@@ -1252,9 +1309,13 @@ static int region_extend_backing(AddrSpace *as, Region *r, u64 extra,
      *     allocation where it stands. Nothing moves, so a host pointer another
      *     guest thread has already translated stays valid, and the pages that
      *     appear continue the same object -- the file's next pages for a file
-     *     mapping, fresh zeroes for anonymous memory. */
+     *     mapping, fresh zeroes for anonymous memory. From rw_lo, not from
+     *     base: a stack's allocation starts with the room it grows down into
+     *     (guest_map_stack), which is a host mapping of a protection of its
+     *     own, and mremap refuses a range that spans two. */
+    size_t hlen = (size_t)(hm->base + hm->len - hm->rw_lo);
     if (r->host + rlen == hm->base + hm->len &&
-        mremap(hm->base, hm->len, hm->len + (size_t)extra, 0) != MAP_FAILED) {
+        mremap(hm->rw_lo, hlen, hlen + (size_t)extra, 0) != MAP_FAILED) {
         hm->len += (size_t)extra;
         return 0;
     }
@@ -1714,9 +1775,11 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
  * also trims `start`/`end` in place, and region_split_at rewrites a pair without
  * changing the total. A counter would need every one of those to agree forever,
  * and a drifted one is silent -- it either refuses mappings a guest should get
- * or stops enforcing the limit at all. This walk runs on mmap/mremap/brk only,
- * never on a fault or an access, and nregions is small. Make it a counter if a
- * profile ever says so, not before. */
+ * or stops enforcing the limit at all. This walk runs on mmap/mremap/brk, and
+ * on the one fault that maps anything -- a stack growing, the first time it
+ * reaches each page below it (as_stack_grow) -- never on an access, and
+ * nregions is small. Make it a counter if a profile ever says so, not
+ * before. */
 u64 as_mapped_bytes(AddrSpace *as) {
     u64 total = 0;
     for (int i = 0; i < as->nregions; i++)
@@ -1728,12 +1791,12 @@ u64 as_mapped_bytes(AddrSpace *as) {
  * against, and what /proc/<pid>/status would call VmData.
  *
  * is_data_mapping() in the kernel is `(flags & (VM_WRITE|VM_SHARED|VM_STACK))
- * == VM_WRITE`: writable, private, and not the process's own stack. So the
- * heap counts, so do the executable's writable segments, a thread stack placed
- * by mmap and any private writable file mapping; a read-only or PROT_NONE
- * mapping does not, and neither does a shared one however writable. The main
- * stack is the single exclusion, and is found the way put_maps names it -- the
- * region holding the initial stack top.
+ * == VM_WRITE`: writable, private, and not a stack. So the heap counts, so do
+ * the executable's writable segments, a thread stack placed by an ordinary
+ * mmap and any private writable file mapping; a read-only or PROT_NONE
+ * mapping does not, and neither does a shared one however writable. A stack
+ * is VM_STACK, which on arm64 is VM_GROWSDOWN: the main stack, and a mapping
+ * made MAP_GROWSDOWN (region_is_stack).
  *
  * Region.prot is the truth after an mprotect, not just at creation:
  * guest_protect splits at the range's edges first, so every region it touches
@@ -1741,12 +1804,14 @@ u64 as_mapped_bytes(AddrSpace *as) {
  * the kernel's own accounting, which moves pages between data_vm and the rest
  * on mprotect without ever failing for it. Summed rather than counted for the
  * reasons above. */
-/* Is this the region the initial stack lives in? The kernel's VM_STACK, which
- * every accounting rule below either counts or excludes -- and the way
- * /proc/<pid>/maps names it. A thread stack placed by mmap is not one, there
- * as here. */
-static inline int region_is_stack(const AddrSpace *as, const Region *r) {
-    return r->start < as->stack_top && as->stack_top <= r->end;
+/* Is this a stack? The kernel's VM_STACK, which every accounting rule below
+ * either counts or excludes: VM_GROWSDOWN on arm64, so the main stack and any
+ * mapping made MAP_GROWSDOWN (VmStk, never VmData, and no RLIMIT_DATA: a
+ * native kernel agrees on all three). A thread stack placed by an ordinary
+ * mmap is not one, there as here. Not the test /proc/<pid>/maps names
+ * "[stack]" by, which is the one holding the initial stack. */
+static inline int region_is_stack(const Region *r) {
+    return r->growsdown != 0;
 }
 
 u64 as_data_bytes(AddrSpace *as) {
@@ -1754,7 +1819,7 @@ u64 as_data_bytes(AddrSpace *as) {
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
         if (!(r->prot & PTE_W) || r->shared) continue;
-        if (region_is_stack(as, r)) continue;
+        if (region_is_stack(r)) continue;
         total += r->end - r->start;
     }
     return total;
@@ -1772,7 +1837,7 @@ void as_procmem(AddrSpace *as, ProcMem *out) {
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
         u64 len = r->end - r->start;
-        int stk = region_is_stack(as, r);
+        int stk = region_is_stack(r);
         out->size += len;
         if (stk) out->stack += len;
         else if ((r->prot & PTE_W) && !r->shared) out->data += len;
@@ -1964,7 +2029,7 @@ void as_meminfo(AddrSpace *as, AsMem *out) {
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
         u64 len = r->end - r->start;
-        int stk = region_is_stack(as, r);
+        int stk = region_is_stack(r);
         out->size += len;
         if (stk) out->stack += len;
         else if ((r->prot & PTE_W) && !r->shared) out->data += len;
@@ -2007,6 +2072,15 @@ void as_meminfo(AddrSpace *as, AsMem *out) {
  * the address turns that class of guest bug into a fault instead of silent
  * stale data. The cost is that a very long-lived guest eventually wraps and
  * starts reusing anyway; the conflict scan below is what makes that safe. */
+/* Where a region begins as far as placing a new mapping below it goes: its
+ * start, less stack_guard_gap under a stack (the kernel's vm_start_gap), which
+ * keeps the gap a stack needs to grow at all free of anything the guest did
+ * not put there itself. */
+u64 as_gap_start(const Region *r) {
+    if (!r->growsdown) return r->start;
+    return r->start > STACK_GUARD_GAP ? r->start - STACK_GUARD_GAP : 0;
+}
+
 u64 as_find_free_impl(AddrSpace *as, u64 len) {
     len = PG_UP(len);
     u64 base = as->mmap_next;
@@ -2015,7 +2089,7 @@ u64 as_find_free_impl(AddrSpace *as, u64 len) {
             u64 conflict = 0;
             for (int i = 0; i < as->nregions; i++) {
                 const Region *r = &as->regions[i];
-                if (r->start < base + len && base < r->end) {
+                if (as_gap_start(r) < base + len && base < r->end) {
                     conflict = r->end;
                     break;
                 }
@@ -2180,6 +2254,209 @@ static uintptr_t __attribute__((cold)) as_fault_fill(CPU *c, u64 va) {
             pte = (uintptr_t)hp | prot;
         }
     }
+    as_unlock();
+    return pte;
+}
+
+/* ---- VM_GROWSDOWN: a stack grows down to meet a fault below it ----
+ *
+ * A kernel maps a stack small and grows it as the program reaches below it:
+ * the main stack starts as the argument pages plus 128 KB (setup_arg_pages),
+ * a MAP_GROWSDOWN mapping as long as it was made. The page-fault handler finds
+ * the hole under a VM_GROWSDOWN vma and extends the vma down to the faulting
+ * page (expand_downwards), provided
+ *  - the page is not below vm.mmap_min_addr;
+ *  - the mapping below the hole, unless it is growsdown itself or has no
+ *    access at all, ends at least stack_guard_gap under the page;
+ *  - the whole vma, grown, stays within RLIMIT_STACK as it stands NOW -- a
+ *    setrlimit after the exec counts -- and the address space within
+ *    RLIMIT_AS (acct_stack_growth).
+ * Anything else is the SIGSEGV any unmapped page is. The emulator laid every
+ * stack out whole and never grew one: a MAP_GROWSDOWN mapping was the length
+ * it was made and the first touch below it a SIGSEGV, and the main stack was
+ * RLIMIT_STACK at the exec -- capped at 64 MB, 8 MB for an infinite limit --
+ * whatever the program did to the limit afterwards: one that raised its own
+ * limit for a deep recursion got none of the room it had been granted.
+ *
+ * Who faults: every access of the guest's own and every copy a syscall makes
+ * for it (copy_to_user faults like an instruction does), and a tracer's PEEK
+ * and POKE (access_remote_vm expands the stack itself). Not what stands for
+ * the kernel's GUP, which grows no stack since 6.1.37, nor the emulator's own
+ * look at guest memory: thread.h, nogrow.
+ *
+ * Growing a region needs host backing directly below its slice, so a stack
+ * is made with room there (guest_map_stack). Beyond the room, the allocation
+ * is extended downward where the host addresses below it are free, and
+ * otherwise the region is moved to a larger reservation -- only while nothing
+ * can hold a pointer into the old backing: no other guest thread, no loan out
+ * (guest_lend), and not for a caller that may hold a second pointer
+ * (mem_host_ptr, g_grow_nomove). A stack that can do none of it stops
+ * growing, which is what a kernel out of address space answers too. */
+static __thread int g_grow_nomove;
+
+/* How much of a stack's room is made accessible at once, at least. */
+#define GROW_RW_STEP ((uintptr_t)64 << 10)
+
+/* Zero `n` bytes a stack grows back over: backing a munmap took off its
+ * bottom keeps its bytes, being released only whole (hmap_unref), and a
+ * grown page must be the zero page a kernel hands out. Whole host pages go
+ * back to the host, which refills them on the next touch. */
+static void host_zero(u8 *p, size_t n) {
+    uintptr_t hpm = (uintptr_t)g_host_pagesz - 1;
+    uintptr_t s = (uintptr_t)p, e = s + n;
+    uintptr_t a = (s + hpm) & ~hpm, b = e & ~hpm;
+    if (a >= b) { memset(p, 0, n); return; }
+    memset(p, 0, a - s);
+    if (madvise((void *)a, b - a, MADV_DONTNEED) != 0) memset((void *)a, 0, b - a);
+    memset((void *)b, 0, e - b);
+}
+
+/* Give growsdown region `r` `grow` more bytes of host backing directly below
+ * its slice -- r->host - grow onward is then its own, zeroed -- or fail (-1)
+ * with nothing changed. Caller holds as_lock. */
+static int region_grow_down(AddrSpace *as, Region *r, u64 grow) {
+    HostMap *hm = r->hmap;
+    uintptr_t hpm = (uintptr_t)g_host_pagesz - 1;
+    uintptr_t host = (uintptr_t)r->host;
+    if (!host_len_ok(grow) || (uintptr_t)grow > host) return -1;
+    uintptr_t want = host - (uintptr_t)grow;
+    /* Where the room under the slice ends: the allocation's start, or the
+     * top of another region's slice of it below this one. */
+    uintptr_t floor = (uintptr_t)hm->base;
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *q = &as->regions[i];
+        if (q == r || q->hmap != hm) continue;
+        uintptr_t qe = (uintptr_t)q->host + (uintptr_t)(q->end - q->start);
+        if (qe <= host && qe > floor) floor = qe;
+    }
+    /* Past the room, with nothing of the allocation's below the slice: take
+     * the host addresses under the allocation, if they are free, twice what
+     * is needed first so a stack still growing is not back here a page
+     * later. Without MAP_FIXED_NOREPLACE (before 4.17) the flag is ignored
+     * and the address is a hint, so where the mapping lands is checked. */
+    if (want < floor && floor == (uintptr_t)hm->base && !stack_force_move()) {
+        uintptr_t need = (floor - want + hpm) & ~hpm;
+        for (int t = 0; t < 2 && want < floor; t++) {
+            uintptr_t ext = t ? need : need * 2;
+            if (ext < need || ext > floor || !host_len_ok((u64)hm->len + ext))
+                continue;
+            void *hint = (void *)(floor - ext);
+            void *p = mmap(hint, (size_t)ext, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                           MAP_FIXED_NOREPLACE, -1, 0);
+            if (p == hint) {
+                hm->base = p;
+                hm->len += (size_t)ext;
+                floor = (uintptr_t)p;
+            } else if (p != MAP_FAILED) {
+                munmap(p, (size_t)ext);
+            }
+        }
+    }
+    if (want >= floor) {
+        /* In the allocation: make the host pages accessible down to the
+         * new start -- 64 KiB at a time at least, so a stack growing a page
+         * per fault is not an mprotect per page -- and clear whatever an
+         * earlier slice left above the pages that were never accessible. */
+        uintptr_t lo = want & ~hpm, rw = (uintptr_t)hm->rw_lo;
+        if (lo < rw) {
+            uintptr_t batch = rw - (uintptr_t)hm->base > GROW_RW_STEP
+                              ? rw - GROW_RW_STEP : (uintptr_t)hm->base;
+            if (batch < lo) lo = batch;
+            if (mprotect((void *)lo, rw - lo, PROT_READ | PROT_WRITE) != 0)
+                return -1;
+            hm->rw_lo = (u8 *)lo;
+        }
+        uintptr_t fresh = (uintptr_t)hm->fresh_hi;
+        uintptr_t stale = want > fresh ? want : fresh;
+        if (stale < host) host_zero((u8 *)stale, host - stale);
+        if (want < fresh) hm->fresh_hi = (u8 *)want;
+        return 0;
+    }
+    /* Move the region to a reservation of its own, with the room it needs
+     * and as much again as it already has (up to GROW_ROOM_MAX), copying
+     * its bytes across; the old backing is dropped like an unmap's. */
+    if (__atomic_load_n(&as->nthreads, __ATOMIC_ACQUIRE) > 1 || hm->pins ||
+        g_grow_nomove)
+        return -1;
+    u64 rlen = r->end - r->start;
+    u64 keep = (grow + rlen + hpm) & ~(u64)hpm;
+    u64 more = rlen + grow < GROW_ROOM_MAX ? rlen + grow : GROW_ROOM_MAX;
+    more = (more + hpm) & ~(u64)hpm;
+    if (!host_len_ok(keep + more)) return -1;
+    u8 *nb = mmap(NULL, (size_t)(keep + more), PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (nb == MAP_FAILED) return -1;
+    if (mprotect(nb + more, (size_t)keep, PROT_READ | PROT_WRITE) != 0) {
+        munmap(nb, (size_t)(keep + more));
+        return -1;
+    }
+    u8 *nh = nb + more + keep - rlen;
+    memcpy(nh, r->host, (size_t)rlen);
+    HostMap *nhm = hmap_new(nb, (size_t)(keep + more));
+    nhm->rw_lo = nb + more;
+    nhm->fresh_hi = nh - grow;       /* the caller takes [nh - grow, nh) */
+    pte_repoint_range(as, r->start, rlen, nh);
+    r->host = nh;
+    r->hmap = nhm;
+    hmap_unref(as, hm);
+    jit_dtlb_reset();     /* the JIT reads its entries without a gen check */
+    return 0;
+}
+
+/* The index of the VM_GROWSDOWN region the kernel would grow down to cover
+ * `va` -- expand_downwards' and acct_stack_growth's tests -- or -1, or
+ * INT_MAX when `va` is mapped after all (another thread grew it first).
+ * Caller holds as_lock. */
+static int as_stack_grows_to(CPU *c, u64 va) {
+    struct Machine *m = c->m;
+    AddrSpace *as = cpu_as(c);
+    int i = 0;
+    while (i < as->nregions && as->regions[i].end <= va) i++;
+    if (i == as->nregions || !as->regions[i].growsdown) return -1;
+    if (as->regions[i].start <= va) return INT_MAX;
+    u64 addr = va & ~(u64)GUEST_PAGE_MASK;
+    if (addr < mmap_min_addr()) return -1;
+    if (i > 0) {
+        const Region *prev = &as->regions[i - 1];
+        if (!prev->growsdown && (prev->prot & (PTE_R | PTE_W | PTE_X)) &&
+            addr - prev->end < STACK_GUARD_GAP)
+            return -1;
+    }
+    const Region *r = &as->regions[i];
+    u64 grow = r->start - addr, size = r->end - addr;
+    u64 stk = rlim_cur(m, G_RLIMIT_STACK);
+    if (stk != G_RLIM_INFINITY && size > stk) return -1;
+    u64 cap = rlim_cur(m, G_RLIMIT_AS);
+    if (cap != G_RLIM_INFINITY && (grow > cap || as_mapped_bytes(as) > cap - grow))
+        return -1;
+    return i;
+}
+
+/* Grow the VM_GROWSDOWN region above `va` down to it, if the kernel would
+ * (see above); the PTE of `va` then, or 0. */
+static uintptr_t __attribute__((cold)) as_stack_grow(CPU *c, u64 va) {
+    if (g_tls.nogrow) return 0;
+    AddrSpace *as = cpu_as(c);
+    uintptr_t pte = 0;
+    as_lock();
+    int i = as_stack_grows_to(c, va);
+    if (i == INT_MAX) pte = pte_get(as, va);
+    if (i < 0 || i == INT_MAX) goto out;
+    Region *r = &as->regions[i];
+    u64 addr = va & ~(u64)GUEST_PAGE_MASK;
+    u64 grow = r->start - addr;
+    if (region_grow_down(as, r, grow) < 0) goto out;
+    r->start = addr;
+    r->host -= grow;
+    u32 prot = vf_pte_prot(r, r->prot);
+    for (u64 off = 0; off < grow; off += GUEST_PAGE_SIZE)
+        pte_put_one(as, addr + off, r->host + off, prot);
+    /* Nothing to publish beyond the new sizes: pages that were not mapped
+     * are in no D-TLB (misses are never cached) and under no translation. */
+    as_account(as);
+    pte = pte_get(as, va);
+out:
     as_unlock();
     return pte;
 }
@@ -2455,6 +2732,8 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
         /* Missing may mean "past end-of-file when this was mapped"; the file
          * may have grown into it since. */
         if (UNLIKELY(!pte)) pte = as_fault_fill(c, va);
+        /* ...or be the hole under a stack, which grows down to meet it. */
+        if (UNLIKELY(!pte)) pte = as_stack_grow(c, va);
         if (!pte) return NULL;                 /* never cache misses */
         e->page = page;
         e->pte = pte;
@@ -2556,7 +2835,10 @@ bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out) {
         return true;
     }
     bool perm;
+    u8 saved = g_tls.nogrow;              /* a look, not an access */
+    g_tls.nogrow = 1;
     u8 *p = translate(c, va, PTE_R, &perm);
+    g_tls.nogrow = saved;
     if (!p) return false;
     *out = ld_le(p, size);
     return true;
@@ -2590,12 +2872,42 @@ static inline int uaddr_tag_refused(u64 va) {
     return UNLIKELY(va >> 56) && g_tls.uaccess && !(g_tls.tagged_addr_ctrl & 1);
 }
 
+bool mem_reachable(CPU *c, u64 va, unsigned size, AccType acc) {
+    if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) return false;
+    if (uaddr_tag_refused(va)) return false;
+    u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
+    bool perm;
+    u8 saved = g_tls.nogrow;
+    g_tls.nogrow = 1;
+    u8 *p = translate(c, va, need, &perm);
+    g_tls.nogrow = saved;
+    if (p) return true;
+    if (perm || saved) return false;
+    /* The hole under a stack: reachable if the stack would grow over it with
+     * the permission, which the copy that touches it then does. */
+    AddrSpace *as = cpu_as(c);
+    as_lock();
+    int i = as_stack_grows_to(c, va & A64_TBI_MASK);
+    bool ok = i == INT_MAX ||
+              (i >= 0 && (as->regions[i].prot & need) == need);
+    as_unlock();
+    return ok;
+}
+
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) return NULL;
     if (uaddr_tag_refused(va)) return NULL;
     u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
     bool perm;
-    return translate(c, va, need, &perm);
+    /* The caller may already hold a pointer from an earlier call (a futex's
+     * two words, a memory copy's two ends): a stack growing here must not
+     * move. A copy whose second pointer is refused falls back to single
+     * accesses, which may; so a host-atomic access is the one first touch of
+     * a stack's hole that cannot grow it on the tier that moves stacks. */
+    g_grow_nomove++;
+    u8 *p = translate(c, va, need, &perm);
+    g_grow_nomove--;
+    return p;
 }
 
 /* ---- lending guest memory to a host syscall (mmu.h) ---- */
@@ -2818,6 +3130,10 @@ copy_to_guest_code_walk(CPU *c, u64 va, const void *src, size_t len, u64 *last_o
         if (chunk > len) chunk = len;
         as_lock();
         const Region *r = as_find_region(cpu_as(c), a);
+        /* The hole under a stack grows to take the bytes, for a POKE (the
+         * kernel's access_remote_vm expands the stack itself) and for what a
+         * vfork child wrote there -- a store into the stack the two share. */
+        if (!r && as_stack_grow(c, a)) r = as_find_region(cpu_as(c), a);
         if (!r) { as_unlock(); return -EFAULT; }
         if (r->shared && !(r->prot & PTE_W)) { as_unlock(); return -EIO; }
         memcpy(r->host + (a - r->start), s, chunk);   /* host backing is RW */
@@ -2882,6 +3198,14 @@ long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max) {
 int guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     as_lock();
     int r = guest_map_anon_impl(as, addr, len, prot);
+    if (r == 0) as_account(as);
+    as_drain_retired(as);
+    as_unlock();
+    return r;
+}
+int guest_map_stack(AddrSpace *as, u64 addr, u64 len, u32 prot, u64 limit) {
+    as_lock();
+    int r = guest_map_stack_impl(as, addr, len, prot, limit);
     if (r == 0) as_account(as);
     as_drain_retired(as);
     as_unlock();

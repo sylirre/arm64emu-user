@@ -45,6 +45,15 @@ typedef struct {
      * to a tracer's, which the kernel's GUP untags whatever the setting. */
     u32 tagged_addr_ctrl;
     u8  uaccess;
+    /* The access this thread is making grows no stack (mem.c, as_stack_grow):
+     * it stands for the kernel's GUP -- process_vm_readv/writev, a shared
+     * futex's key -- which has not expanded a stack since 6.1.37, or it is
+     * the emulator looking at guest memory for itself (the --strace-full
+     * decoder), which no kernel does at all. Everything else faults a stack
+     * down as the kernel's page-fault handler does: the guest's own
+     * accesses, a syscall's copies, a tracer's PEEK and POKE
+     * (access_remote_vm expands the stack itself). */
+    u8  nogrow;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
      * internal wakeups -- syscall_restart_internal, src/syscall.c). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;

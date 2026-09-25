@@ -652,18 +652,25 @@ static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si) {
             break;
         case PT_CMD_READ: {
             /* process_vm_readv remote side: copy up to arg bytes of our own guest
-             * memory into the mailbox; result = bytes crossed (short on a fault). */
+             * memory into the mailbox; result = bytes crossed (short on a fault).
+             * GUP, unlike PEEK: the hole under a stack is a fault, not growth
+             * (thread.h, nogrow). */
             u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            g_tls.nogrow = 1;
             e->rlen = (u32)copy_from_guest_partial(c, e->data, e->addr, n);
+            g_tls.nogrow = 0;
             e->result = (s64)e->rlen;
             break;
         }
         case PT_CMD_WRITE: {
             /* process_vm_writev remote side: copy up to arg mailbox bytes into our
              * own guest memory (honoring write permission); result = bytes crossed.
-             * Unlike POKE this is an ordinary write, so a read-only page faults. */
+             * Unlike POKE this is an ordinary write, so a read-only page faults,
+             * and GUP, so the hole under a stack does too. */
             u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            g_tls.nogrow = 1;
             e->rlen = (u32)copy_to_guest_partial(c, e->addr, e->data, n);
+            g_tls.nogrow = 0;
             e->result = (s64)e->rlen;
             break;
         }

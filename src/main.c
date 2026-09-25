@@ -379,6 +379,12 @@ static void help(void) {
                         "(exercises the back-pressure gate: a queue with no "
                         "room leaves the rest of a flood in the host kernel's "
                         "own queue until it drains)."},
+        {"A64_STACKGROW_FORCE_MOVE", "Reserve no host room below a stack and "
+                        "never extend its backing downward, so a stack that "
+                        "grows is moved to new backing (the tier a host whose "
+                        "address space under a stack is taken is served by; "
+                        "with another guest thread running, the growth is "
+                        "refused)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",

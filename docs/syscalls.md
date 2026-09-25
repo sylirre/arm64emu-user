@@ -2192,43 +2192,40 @@ when the guest touches it.
 
 ### The stack the new image gets
 
-`RLIMIT_STACK`, and not a fixed size. A kernel's stack VMA grows on demand and
-`acct_stack_growth` refuses to take it past that limit, so the limit *is* the
-stack the program ends up with — which is why `ulimit -s N` before running
-something really does decide how deep it may recurse. `stack_size_for`
-(`elf.c`) reads the same limit and maps that much at exec time; it used to map
-a fixed 8 MB and ignore the limit in both directions. Measured against a kernel
-with the same recursion, before and after: at a 64 KB limit a kernel stops the
-program after 56 KB of frames and this let it run to 8124 KB — sixty-six times
-past what it had been told it could have — while at a 64 MB limit a kernel gave
-it 65020 KB and this killed it at that same 8124 KB, an eighth of the stack it
-had asked for and been granted. It now lands within one frame of the kernel at
-every limit (`tests/fixtures/stackrlimit.c`; `qemu-user` is no oracle here
-either, since it sizes the guest stack from its own `-s` option).
+`RLIMIT_STACK` is the most it can grow to. A kernel's stack VMA grows on demand
+and `acct_stack_growth` refuses to take it past that limit, so the limit *is*
+the stack the program ends up with — which is why `ulimit -s N` before running
+something really does decide how deep it may recurse. The loader used to map a
+fixed 8 MB and ignore the limit in both directions (measured against a kernel
+with the same recursion: at a 64 KB limit a kernel stopped the program after
+56 KB of frames and this let it run to 8124 KB; at a 64 MB limit a kernel gave
+it 65020 KB and this killed it at 8124 KB), and then mapped the limit whole,
+capped at 64 MB, with an infinite one given 8 MB.
+
+Now the stack starts as `setup_arg_pages` leaves it — the argument pages and
+128 KB below them, or the limit if that is less — marked `VM_GROWSDOWN`, and
+grows as the program reaches below it, against the limit *as it stands at the
+fault* ([memory.md](memory.md#stacks-grow-down-to-meet-a-fault)). So a
+`setrlimit` after the exec counts, as on a kernel: a program that raises its
+own limit can recurse into the room it was granted, and one that lowers it
+stops growing there. The vectors `create_elf_tables` writes below the
+strings grow it like any other store, and a stack that cannot grow to hold
+them — an `RLIMIT_AS` with no room left — is that function's `EFAULT`, which
+past the point of no return is death by `SIGSEGV`. `tests/fixtures/stackrlimit.c`
+checks the depth a new image reaches at every limit, within one frame of a
+kernel, and `tests/fixtures/growsdown.c` the size it starts at and a limit
+changed after the exec (`qemu-user` is no oracle here: it sizes the guest stack
+from its own `-s` option).
 
 It is executable when the executable's `PT_GNU_STACK` asks for it (`PF_X`, what
 GCC marks a program whose nested functions put trampolines on the stack), as
 `setup_arg_pages` makes it, and never otherwise: the interpreter's is not
 consulted, and arm64's default is executable only under `READ_IMPLIES_EXEC`,
 which every exec clears. The loader used to ignore the header, so a call
-through such a trampoline faulted (`tests/c/execstack.c`). The mapping is
-`VM_GROWSDOWN`, like the kernel's, which is what `mprotect(PROT_GROWSDOWN)`
-names when glibc makes the stack executable later, for a library that needs it
-(see [memory.md](memory.md)).
-
-Two things follow from laying the stack out whole rather than growing it:
-
-- **A limit past `STACK_MAX` (64 MB) is capped**, and an infinite one gets
-  `_STK_LIM`'s 8 MB. Nothing can lay out a stack that is genuinely unbounded,
-  and the mapping is not free even when it is never touched: the host memory
-  behind it is lazy, but its page-table entries are built up front and the
-  guest's own `VmSize` counts every byte — so a guest that also sets
-  `RLIMIT_AS` has that much less room under it than it would on a kernel.
-- **A `setrlimit` *after* the exec does not resize the stack.** A kernel grows
-  against the limit in force at the moment of the fault, so raising it
-  mid-flight gives the running program more room; here the size is settled when
-  the image is built. Lowering or raising it and *then* exec'ing — which is
-  what a shell's `ulimit -s` does, and the case that matters — is exact.
+through such a trampoline faulted (`tests/c/execstack.c`). Being
+`VM_GROWSDOWN` is also what `mprotect(PROT_GROWSDOWN)` names when glibc makes
+the stack executable later, for a library that needs it (see
+[memory.md](memory.md)).
 
 ### `de_thread`: exec from a thread group with more than one thread
 

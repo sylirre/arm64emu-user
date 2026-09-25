@@ -116,7 +116,7 @@ static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
         u64 p = va + done;
         size_t chunk = GUEST_PAGE_SIZE - (size_t)(p & GUEST_PAGE_MASK);
         if (chunk > len - done) chunk = len - done;
-        if (!mem_host_ptr(c, p, (unsigned)chunk, acc)) break;
+        if (!mem_reachable(c, p, (unsigned)chunk, acc)) break;
         done += chunk;
     }
     return done;

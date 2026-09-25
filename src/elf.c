@@ -20,18 +20,11 @@
 
 #define STACK_TOP   0x7ffffff000ULL
 /* The kernel's own _STK_LIM: the 8 MB reference stack its argument budget is
- * measured against (bprm_stack_limits), and the stack a guest whose
- * RLIMIT_STACK is infinite gets here -- a stack that really is unbounded is
- * not something a loader that lays one out in a single piece can give. */
+ * measured against (bprm_stack_limits). */
 #define STK_LIM     (8ULL << 20)
-/* ...and how far the guest's own limit is honoured. A kernel grows the stack a
- * page at a time and needs no such ceiling; this maps it whole, so a limit
- * past this one is capped. The mapping itself is lazy host memory -- nothing
- * is committed until the guest touches it -- but its page-table entries are
- * built up front and the guest's own VmSize counts every byte of it, which is
- * what the ceiling is for. 64 MB is the `ulimit -s 65536` a deeply recursive
- * workload asks for, and costs 16 K page-table entries when it does. */
-#define STACK_MAX   (64ULL << 20)
+/* What setup_arg_pages grows the new stack by past the argument pages
+ * (stack_expand); the rest comes as the program reaches for it. */
+#define STACK_EXPAND (128ULL << 10)
 /* What the initial stack holds besides the argument strings and the pointer
  * vectors: the auxv array, the AT_RANDOM and platform blocks it points at, and
  * the alignment between them. exec_arg_limit counts it against the stack the
@@ -363,24 +356,16 @@ int elf_probe(struct Machine *m, int fd, int *interp_fd) {
  * inside the load, past the point of no return -- the only thing the refusal
  * could do was kill the process (do_execve, sys_proc.c, calls this while
  * there is still a caller to refuse). */
-/* The stack the new image gets: the guest's RLIMIT_STACK. A kernel's stack VMA
- * grows on demand and can never pass that limit (acct_stack_growth), so the
- * limit *is* the size of the stack the program ends up with -- which is why
- * lowering it before an exec is how a shell bounds what the program may
- * recurse to, and raising it is how a deeply recursive one is given room.
- *
- * A fixed 8 MB was laid out here whatever the guest asked for, so both were
- * ignored. Measured against a kernel with the same recursion: at a 64 KB limit
- * a kernel stops the program after 124 KB of frames and this let it run to
- * 8124 KB -- sixty-six times past what it had been told it could have -- and
- * at a 64 MB limit a kernel gave it 65016 KB while this killed it at the same
- * 8124 KB, an eighth of the stack it had asked for and been granted. */
-static u64 stack_size_for(struct Machine *m) {
+/* The most the new image's stack can grow to: the guest's RLIMIT_STACK. A
+ * kernel's stack VMA grows on demand and can never pass that limit
+ * (acct_stack_growth), so the limit *is* the size of the stack the program
+ * ends up with -- which is why lowering it before an exec is how a shell
+ * bounds what the program may recurse to, and raising it is how a deeply
+ * recursive one is given room. G_RLIM_INFINITY for none. */
+static u64 stack_limit_for(struct Machine *m) {
     u64 rl = rlim_cur(m, G_RLIMIT_STACK);
 
-    if (rl == G_RLIM_INFINITY) return STK_LIM;
-    if (rl > STACK_MAX) return STACK_MAX;
-    return PG_UP(rl);
+    return rl == G_RLIM_INFINITY ? rl : PG_UP(rl);
 }
 
 static u64 exec_arg_budget(struct Machine *m) {
@@ -418,7 +403,7 @@ int exec_arg_room(struct Machine *m, u64 argc, u64 envc, u64 *room) {
     u64 ptrtab = ((argc > 1 ? argc : 1) + envc) * 8;   /* counts are < 2^32 */
 
     if (limit <= ptrtab) return -E2BIG;
-    u64 stk = stack_size_for(m);
+    u64 stk = stack_limit_for(m);   /* G_RLIM_INFINITY: no bound */
     u64 fit = stk > ptrtab + STACK_FIXED ? stk - ptrtab - STACK_FIXED : 0;
     *room = limit - ptrtab < fit ? limit - ptrtab : fit;
     return 0;
@@ -483,20 +468,36 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     m->as.start_data = exe.start_data;
     m->as.end_data = exe.end_data;
 
-    /* Stack, sized from the guest's RLIMIT_STACK (stack_size_for). The
-     * argument block was measured against this same size while there was
-     * still a caller to refuse (exec_arg_limit), so it fits. Executable when
-     * the executable's PT_GNU_STACK says PF_X (setup_arg_pages's
-     * EXSTACK_ENABLE_X) -- a program built with an executable stack, for GCC's
-     * nested-function trampolines, whose calls into them otherwise fault --
-     * and never otherwise: the arch default is VM_DATA_DEFAULT_FLAGS, which
-     * is executable only under READ_IMPLIES_EXEC, and arm64 clears that at
-     * every exec (the interpreter's own PT_GNU_STACK is not consulted). */
-    u64 stack_size = stack_size_for(m);
-    r = guest_map_anon(&m->as, STACK_TOP - stack_size, stack_size,
-                       PTE_R | PTE_W | (exe.exec_stack ? PTE_X : 0));
+    int argc = 0, envc = 0;
+    while (argv[argc]) argc++;
+    while (envp[envc]) envc++;
+    size_t strtab = strlen(canon) + 1;
+    for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
+
+    /* Stack: the argument pages and 128 KB below them, or the guest's
+     * RLIMIT_STACK if that is less -- the vma setup_arg_pages leaves -- and
+     * VM_GROWSDOWN, so it grows from there as the program reaches below it,
+     * to whatever the limit is at the time (mem.c, as_stack_grow). The
+     * argument block was measured against the limit while there was still a
+     * caller to refuse (exec_arg_limit), so it fits; the vectors under the
+     * strings grow the stack as create_elf_tables' own stores would.
+     * Executable when the executable's PT_GNU_STACK says PF_X
+     * (setup_arg_pages's EXSTACK_ENABLE_X) -- a program built with an
+     * executable stack, for GCC's nested-function trampolines, whose calls
+     * into them otherwise fault -- and never otherwise: the arch default is
+     * VM_DATA_DEFAULT_FLAGS, which is executable only under
+     * READ_IMPLIES_EXEC, and arm64 clears that at every exec (the
+     * interpreter's own PT_GNU_STACK is not consulted). */
+    u64 rl = rlim_cur(m, G_RLIMIT_STACK);
+    u64 args = PG_UP((u64)strtab);
+    u64 stack_size = args + STACK_EXPAND;
+    if (rl != G_RLIM_INFINITY && (rl & ~(u64)GUEST_PAGE_MASK) < stack_size)
+        stack_size = rl & ~(u64)GUEST_PAGE_MASK;
+    if (stack_size < args) stack_size = args;
+    r = guest_map_stack(&m->as, STACK_TOP - stack_size, stack_size,
+                        PTE_R | PTE_W | (exe.exec_stack ? PTE_X : 0), rl);
     if (r < 0) return r;
-    as_set_growsdown(&m->as, STACK_TOP - stack_size);   /* VM_STACK_FLAGS */
     m->as.stack_top = STACK_TOP;
 
     /* Strings at the top of the stack, in the kernel's layout: argv strings
@@ -506,16 +507,10 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
      * argv/envp pointers assuming exactly this order; with argv[0] placed
      * above argv[argc-1] the span underflows and the rewrite memsets off the
      * stack top. */
-    int argc = 0, envc = 0;
-    while (argv[argc]) argc++;
-    while (envp[envc]) envc++;
     u64 *argvp = malloc(sizeof(u64) * (size_t)(argc + 1));
     u64 *envpp = malloc(sizeof(u64) * (size_t)(envc + 1));
     if (!argvp || !envpp) { free(argvp); free(envpp); return -ENOMEM; }
 
-    size_t strtab = strlen(canon) + 1;
-    for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
-    for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
     u64 sp = STACK_TOP - strtab;
     u64 str = sp;
     /* The argv+envp string block starts here: setup_arg_pages records exactly
@@ -607,12 +602,20 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
 
     u64 va = sp;
     u64 argc64 = (u64)argc;
-    copy_to_guest(&m->cpu, va, &argc64, 8); va += 8;
-    copy_to_guest(&m->cpu, va, argvp, 8 * ((size_t)argc + 1)); va += 8 * ((u64)argc + 1);
-    copy_to_guest(&m->cpu, va, envpp, 8 * ((size_t)envc + 1)); va += 8 * ((u64)envc + 1);
-    copy_to_guest(&m->cpu, va, auxv, sizeof auxv);
+    int bad = copy_to_guest(&m->cpu, va, &argc64, 8) < 0;
+    va += 8;
+    bad |= copy_to_guest(&m->cpu, va, argvp, 8 * ((size_t)argc + 1)) < 0;
+    va += 8 * ((u64)argc + 1);
+    bad |= copy_to_guest(&m->cpu, va, envpp, 8 * ((size_t)envc + 1)) < 0;
+    va += 8 * ((u64)envc + 1);
+    bad |= copy_to_guest(&m->cpu, va, auxv, sizeof auxv) < 0;
     free(argvp);
     free(envpp);
+    /* The vectors grow the stack below the argument pages, and a stack that
+     * cannot grow -- an RLIMIT_AS with no room left for it -- fails
+     * create_elf_tables' stores: EFAULT, past the point of no return, which
+     * do_execve turns into death by SIGSEGV as a kernel does. */
+    if (bad || !rnd_va || !plat_va) return -EFAULT;
 
     /* /proc/self/auxv content: the guest auxv block just laid out (the host
      * file shows the emulator's own auxv — the wrong ISA's AT_HWCAP).

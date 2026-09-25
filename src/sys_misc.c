@@ -337,7 +337,14 @@ SYSDEF(sysinfo) {
  * forever (observed as node hanging at exit joining its V8 worker pool). */
 SYSDEF(futex) {
     int op = (int)a1 & 127;
+    /* A shared futex is keyed by the page behind it, which the kernel looks up
+     * with GUP -- and GUP grows no stack, so the hole under one is EFAULT
+     * there, where a private futex's word is read with get_user, which does
+     * (thread.h, nogrow). */
+    u8 gup = !(a1 & 128 /*FUTEX_PRIVATE_FLAG*/);
+    g_tls.nogrow = gup;
     void *uaddr = mem_host_ptr(c, a0, 4, ACC_READ);
+    g_tls.nogrow = 0;
     if (!uaddr) return (u64)(s64)-EFAULT;
     /* The kernel's own futex_cmd_has_timeout() list. LOCK_PI2 belongs here too:
      * left out, its timeout pointer took the val2 path below and reached the
@@ -358,7 +365,9 @@ SYSDEF(futex) {
     void *uaddr2 = NULL;
     if (takes_u2) {
         /* WAKE_OP writes through uaddr2; the requeue ops only key on it. */
+        g_tls.nogrow = gup;
         uaddr2 = mem_host_ptr(c, a4, 4, op == 5 ? ACC_WRITE : ACC_READ);
+        g_tls.nogrow = 0;
         if (!uaddr2) return (u64)(s64)-EFAULT;
     }
     long r;
