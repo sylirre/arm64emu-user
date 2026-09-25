@@ -1689,8 +1689,8 @@ static int sig_chld_emulating(void) {
  * SA_NOCLDWAIT (sending an ignoring one nothing). So the host gets the
  * guest's SIG_IGN or SIG_DFL with both flags, and does the same -- or, where
  * the emulator has to see the notices (a handler; a clone child's death to
- * turn into its own signal, clonekids_signalling), the capture handler with
- * both flags. Only the reaping cannot always go to the host: the kernel reaps
+ * turn into its own signal, clonekids_signalling; a tracer to report a sent
+ * SIGCHLD to, sig_host_update_locked), the capture handler with both flags. Only the reaping cannot always go to the host: the kernel reaps
  * a child whose death signal is SIGCHLD and never a clone child, while to the
  * host every child is the former. With a clone child about (clonekids_any),
  * a guest that has its children reaped has SIGCHLD caught instead, and the
@@ -1705,7 +1705,7 @@ static void sig_chld_host(struct Machine *m) {
     int any = clonekids_any();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    if (h > GSIG_IGN || clonekids_signalling() || (reap && any)) {
+    if (h > GSIG_IGN || clonekids_signalling() || (reap && any) || ptrace_traced()) {
         sa.sa_sigaction = host_catcher;
         sa.sa_flags = SA_SIGINFO;                 /* deliberately no SA_RESTART */
         sigfillset(&sa.sa_mask);
@@ -1764,15 +1764,24 @@ static void sig_host_update_locked(struct Machine *m, int sig) {
          * a BLOCKED one included -- the guest's mask is the host thread's
          * (sig_sync_host_mask), so the kernel holds it pending, shows it to
          * sigpending, hands it to sigwait or a signalfd, and discards it at
-         * the unblock if nobody took it, as it would for any process. */
-        if (sig_default_terminates(sig)) {
+         * the unblock if nobody took it, as it would for any process.
+         *
+         * Unless a thread of the process is traced: the kernel queues even
+         * an ignored signal for a tracee (sig_ignored: "Tracers may want to
+         * know about even ignored signal"), which stops for it and ignores
+         * it only once resumed with it -- so while one is, everything that
+         * can be caught is, SIG_IGN too, and the host ignores nothing a
+         * tracer is to see. A stop signal a terminal sends then stops the
+         * tracee for its tracer too, instead of freezing the process where
+         * nobody can serve the tracer's requests. */
+        if (sig_default_terminates(sig) || ptrace_traced()) {
             sa.sa_sigaction = host_catcher;
             sa.sa_flags = SA_SIGINFO;
             sigfillset(&sa.sa_mask);
         } else {
             sa.sa_handler = SIG_DFL;
         }
-    } else if (h == GSIG_IGN) {
+    } else if (h == GSIG_IGN && !ptrace_traced()) {
         sa.sa_handler = SIG_IGN;
     } else {
         sa.sa_sigaction = host_catcher;
@@ -1821,9 +1830,10 @@ void sig_action_swap(struct Machine *m, int sig, const GSigAction *act,
 }
 
 /* Re-mirror every disposition. Called when a thread of this process becomes a
- * ptrace tracee (so default-terminate signals gain a host catcher) or the last
- * traced one is detached (so they revert to SIG_DFL); sig_host_update reads
- * ptrace_traced() to pick the right disposition. */
+ * ptrace tracee (so every signal that can be caught is, the ignored ones too,
+ * for the tracer to see) or the last traced one is detached (so the host
+ * ignores again what the guest does); sig_host_update reads ptrace_traced() to
+ * pick the right disposition. */
 void sig_trace_update_all(struct Machine *m) {
     for (int s = 1; s <= 64; s++)
         sig_host_update(m, s);

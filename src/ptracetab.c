@@ -59,8 +59,10 @@ __thread int g_ptrace_skip_syscall_stop;
 __thread volatile sig_atomic_t g_ptrace_kick;
 
 /* Process-level count of traced threads. Signal dispositions are process-wide,
- * so the default-terminate host catchers (sig_host_update) must stay installed
- * while *any* thread must report its stops/death, not just the calling one. */
+ * so the host catchers a tracee needs -- every signal that can be caught, the
+ * ignored ones included, for the tracer to see (sig_host_update) -- must stay
+ * installed while *any* thread must report its stops/death, not just the
+ * calling one. */
 static int g_ptrace_traced;
 
 int ptrace_traced(void) {

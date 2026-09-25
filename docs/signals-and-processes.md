@@ -15,7 +15,9 @@ For each guest signal whose disposition is a real handler, one host catcher
 `sig_host_update`. It does the minimum an async-signal-safe context allows: push
 `{signo, translated siginfo}` onto a small ring queue and set a
 `volatile sig_atomic_t g_sig_npend`. `SIG_IGN` is mirrored straight to the host
-disposition. `SIG_DFL` is, for the default-ignore and default-continue signals;
+disposition. `SIG_DFL` is, for the default-ignore and default-continue signals
+(both only while no thread of the process is traced — see *Ignored signals are
+a tracer's too*);
 a **default-terminate** one at `SIG_DFL` is caught too, and the death performed
 by the run loop (`guest_terminate_by_signal`): a bare host kill runs no guest
 code, so the robust futexes the process held stayed locked for their waiters,
@@ -1597,7 +1599,7 @@ poll (above) would hang. Two mechanisms close this:
   catcher, traced or not (`sig_host_update`; it used to be installed only for a
   tracee, by `sig_trace_update_all`, and while any thread of the process is
   traced — `ptrace_traced()`, a process-level count, since dispositions are
-  process-wide). The signal is then mediated: the tracee reports the
+  process-wide — every other signal that can be caught has one too, below). The signal is then mediated: the tracee reports the
   signal-delivery-stop, the tracer injects it, and the tracee terminates through
   `guest_terminate_by_signal` (`src/signal.c`) — which marks the robust
   futexes every thread held (`robust_list_exit_group`), publishes the
@@ -1670,6 +1672,24 @@ queued again, to stop again once unblocked. The emulator used to answer
 address — no sender, no payload, nothing a tracer could tell a `kill` from a
 `sigqueue` by, and `strace` printed every signal as `si_code=SI_USER` from pid
 0 — and `SETSIGINFO` was `EIO` (`tests/ptrace/siginfo.c`).
+
+**Ignored signals are a tracer's too.** The kernel discards a signal its target
+ignores — `SIG_IGN`, or a default of ignore (`SIGWINCH`, `SIGURG`, `SIGCHLD`,
+`SIGCONT`) — as it is sent, unless the target is traced (`sig_ignored`:
+"Tracers may want to know about even ignored signal"): then it is queued, the
+tracee stops for it like any other, and ignores it only once resumed with it.
+So while any thread of a process is traced, every signal that can be caught
+has the host catcher, whatever the guest's disposition (`sig_host_update`,
+re-mirrored by `sig_trace_update_all` as the count of traced threads leaves or
+returns to zero), and the host ignores nothing a tracer is to see; a stop signal
+a terminal sends stops the tracee for its tracer, too, instead of freezing the
+process where nobody could serve the tracer's requests. The call such a signal
+cut short is restarted as the kernel restarts one when no handler runs — all
+but those that answer a plain `EINTR`, which a stop leaves with it
+(`sc_restart_nohandler`, above). What the kernel never sends stays unsent: a
+child's death notice to a parent ignoring `SIGCHLD` is dropped at capture, and
+the child is reaped. The emulator used to leave the host to ignore them all,
+and a tracer never saw them (`tests/ptrace/ignored.c`).
 
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
