@@ -1512,12 +1512,19 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
          * child stops itself before it is SEIZEd, and was left there with
          * nobody to continue it. The kernel's attach makes a stopped task a
          * traced one, still in its group stop; here it is told so on its link
-         * and woken to adopt, into a group stop of the emulator's. */
-        if (ptrace_task_stopped(tgid)) {
-            __atomic_store_n(&e->attach_stopped, 1, __ATOMIC_RELEASE);
-            ptrace_wake_stopped(tgid);
-        }
+         * and woken to adopt, into a group stop of the emulator's.
+         *
+         * The kick goes before the wake. To a stopped process it is only
+         * queued, and the host hands it over as the wake resumes the
+         * process, before that runs a thing -- where a kick sent after the
+         * wake raced the process it had just set running: out of its own
+         * raise(SIGSTOP), on through its next guest instructions, until the
+         * kick caught up. On a slow host that was whole system calls, and a
+         * child that was to stop for its tracer exited instead. */
+        int stopped = ptrace_task_stopped(tgid);
+        if (stopped) __atomic_store_n(&e->attach_stopped, 1, __ATOMIC_RELEASE);
         pt_send_kick(tgid, pid);
+        if (stopped) ptrace_wake_stopped(tgid);
         /* The kernel's attach is done when ptrace() returns: whatever the
          * caller sends next finds the tracee traced -- a stop signal, a
          * SIGCONT, one it ignores -- and it is reported. Here the tracee

@@ -1772,7 +1772,14 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   stop, and so the tracer marks the link and wakes the process with a host
   `SIGCONT` its capture drops (`ptrace_wake_stopped`), and the tracee adopts
   into a group stop of the emulator's. strace's child stops itself before it
-  is `SEIZE`d; it used to be left there, nobody continuing it.
+  is `SEIZE`d; it used to be left there, nobody continuing it. The kick that
+  tells it of the attach is sent *before* the wake: to a stopped process it is
+  only queued, and the host delivers it as the wake resumes the process, ahead
+  of anything the process runs. Sent after, it raced the process the wake had
+  just set going — on a slow host (qemu-user) a first attach lost one time in
+  ten, and the child ran on from its `raise(SIGSTOP)` to exit where it should
+  have stayed stopped (`tests/ptrace/seize_stopped.c`, which runs every round
+  as a process's first attach).
 
 What cannot be kept: a `SIGSTOP` from outside the guest — a shell's
 `kill -STOP` of a traced process — is the host's, and stops it where its
