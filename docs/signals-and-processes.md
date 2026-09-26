@@ -250,10 +250,16 @@ interruptible wait return at once); here it is closed by the **capture kick**
 (`signal.c`): while the loop is between the SVC check and the dispatcher's
 return, a capture arms a one-shot host timer aimed at the thread
 (`SIGEV_THREAD_ID`, the reserved kick signal, 200 µs and then every
-millisecond) that the loop disarms at its delivery point; a syscall entered
-meanwhile gets from the kick the `EINTR` the capture could not give it, marked
-as the emulator's own so the guest never sees it — the call is restarted
-around the delivery like any of the emulator's interruptions. The timer is per
+millisecond) that the loop disarms as it reaches its boundary; a syscall
+entered meanwhile gets from the kick the `EINTR` the capture could not give
+it, marked as the emulator's own so the guest never sees it — the call is
+restarted around the delivery like any of the emulator's interruptions. The
+disarm comes before anything at the boundary is serviced, and a timer signal
+the host had already queued is ignored: a stop taken there parks the thread,
+and a timer still firing through it marked the call it had interrupted as the
+emulator's to restart after the stop had settled that it answers `EINTR` —
+a traced thread's `epoll_wait`, interrupted by a signal its tracer then
+suppressed, ran on to its timeout every time (`tests/ptrace/suppressed_eintr.c`). The timer is per
 thread, made before the thread runs guest code and deleted as it ends, and a
 fork child makes its own (no POSIX timer is inherited).
 

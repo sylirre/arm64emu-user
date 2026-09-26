@@ -333,13 +333,18 @@ int emu_loop(CPU *c) {
          * its kill(2) sends the next signal, and a standard signal is taken
          * ahead of the real-time kick, so the two arrive together and the
          * signal must find the thread traced already. */
+        /* The boundary has been reached: a kick timer armed by a capture
+         * inside a syscall handler has done its job, or was never needed.
+         * Disarmed before anything is serviced: a stop taken below parks the
+         * thread, and a timer still firing through it re-flagged the call it
+         * had interrupted as ours to restart -- after the stop had settled
+         * that it answers EINTR. */
+        sig_kick_timer_disarm();
+
         if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
 
         /* Deliver any host-caught guest signal at this safe boundary. */
         if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
-        /* The boundary has been reached: a kick timer armed by a capture
-         * inside a syscall handler has done its job, or was never needed. */
-        sig_kick_timer_disarm();
 
         /* Our own control signal interrupted a host syscall to get this thread
          * here (the attach kick above, a tracee's wake of its tracer, execve's

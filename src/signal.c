@@ -1426,7 +1426,10 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         /* The capture kick timer (above): nothing to record, the queued
          * signal is already there -- this only has to bring the thread to
          * the loop boundary, out of whatever host syscall it entered after
-         * the capture, and invisibly. */
+         * the capture, and invisibly. One the host had already queued when
+         * the boundary disarmed the timer is late for all of that, and
+         * interrupts nothing of ours. */
+        if (!g_kick_armed) return;
         g_sig_selfintr = 1;
         g_sig_npend = 1;
         jit_signal_interrupt();
