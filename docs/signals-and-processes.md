@@ -259,7 +259,14 @@ the host had already queued is ignored: a stop taken there parks the thread,
 and a timer still firing through it marked the call it had interrupted as the
 emulator's to restart after the stop had settled that it answers `EINTR` —
 a traced thread's `epoll_wait`, interrupted by a signal its tracer then
-suppressed, ran on to its timeout every time (`tests/ptrace/suppressed_eintr.c`). The timer is per
+suppressed, ran on to its timeout every time (`tests/ptrace/suppressed_eintr.c`).
+The emulator's own call-outs arm the timer in that window too — a tracer's
+kick, a tracee's wake of its tracer, `execve`'s `de_thread` — since each exists
+to get the thread out of a host wait, and one that lands there interrupts
+nothing: a tracer's `INTERRUPT`, sent as its tracee's blocked `read` was being
+rewound after the `SEIZE`'s own kick, was never seen, and the tracer waited
+for a stop that never came (`tests/ptrace/interrupt_blocked.c`; about one run
+in three under the JIT, whose re-entry into the call is the quicker). The timer is per
 thread, made before the thread runs guest code and deleted as it ends, and a
 fork child makes its own (no POSIX timer is inherited).
 

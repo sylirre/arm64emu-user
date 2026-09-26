@@ -1408,15 +1408,25 @@ void sig_install_sigsys_net(void) {
  * capture queue, so the guest keeps full use of the signal. The net owns
  * PTRACE_KICKSIG for the process lifetime (sig_host_update skips it). */
 static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
+    /* Each of the emulator's own uses below exists to get this thread out of
+     * a host wait, and each can land where a capture can -- inside the
+     * dispatcher, after the run loop's SVC check and before the host syscall
+     * is entered -- where it interrupts nothing and the thread then sleeps
+     * in that syscall with the call-out unseen: a tracer's INTERRUPT, sent
+     * as a tracee blocked in read(2) was rewinding the SVC its SEIZE had cut
+     * short, left the tracer waiting for a stop that never came. So each
+     * arms the kick timer there, as a capture does ("the capture kick"). */
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_KICK_MAGIC) {
         g_ptrace_kick = 1;
         g_sig_selfintr = 1;         /* ours: the guest must not see this EINTR */
         g_sig_npend = 1;            /* make the run loop exit its fast path */
         jit_signal_interrupt();
+        if (g_sig_in_syscall) sig_kick_timer_arm();
         return;
     }
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_WAKE_MAGIC) {
         g_sig_selfintr = 1;
+        if (g_sig_in_syscall) sig_kick_timer_arm();
         return;   /* tracee->tracer wake: the EINTR on a blocked host
                      wait4/waitid is the whole effect; no other flags, and
                      invisible to the guest -- including the EINTR, which
@@ -1445,6 +1455,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         g_sig_selfintr = 1;
         g_sig_npend = 1;
         jit_signal_interrupt();
+        if (g_sig_in_syscall) sig_kick_timer_arm();
         return;
     }
     int code = si->si_code, jsig, thr;
