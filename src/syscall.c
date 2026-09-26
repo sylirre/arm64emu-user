@@ -483,6 +483,25 @@ void syscall_restart_internal(CPU *c) {
     g_tls.sc_restarted = 1;
 }
 
+/* A call syscall_restart_internal rewound is, as far as the guest can tell,
+ * still the call in progress until the SVC is dispatched again -- the rewind
+ * is the emulator's, invisible. A boundary reached in between (a signal, a
+ * tracer's INTERRUPT, landing after the rewind and before the SVC's re-entry)
+ * must find it as a moment later it would have, inside the host syscall:
+ * interrupted by us, EINTR in hand. The delivery that follows then decides it
+ * by the guest's rules -- EINTR for a call that answers one, a restart, a
+ * handler's frame -- and, left to itself, it is rewound again. Found at the
+ * SVC with the rewind not yet dispatched, a tracer's INTERRUPT trapped ahead
+ * of a call that no longer looked interrupted, which the SVC then made anew:
+ * an epoll_wait ran to its timeout where the kernel's returns EINTR. */
+void syscall_unrewind(CPU *c) {
+    if (!g_tls.sc_restarted || c->pc != g_tls.sc_svc_pc) return;
+    c->pc = g_tls.sc_svc_pc + 4;
+    c->x[0] = (u64)(s64)-EINTR;
+    g_tls.sc_ret_eintr = 1;
+    g_sig_selfintr = 1;
+}
+
 /* Called by a blocking handler once it has the host-form timeout in hand, just
  * before it sleeps. Shrinks a *relative* timeout by what earlier attempts at
  * this same call already waited, and starts this attempt's stopwatch. Pass NULL

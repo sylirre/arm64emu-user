@@ -560,6 +560,7 @@ void syscall_dispatch(CPU *c);
  * EINTR with the PC still just past that SVC, so it is safe to call at any
  * boundary that has just serviced one of those interruptions. */
 void syscall_restart_internal(CPU *c);
+void syscall_unrewind(CPU *c);
 /* For a blocking handler, called with the host-form *relative* timeout in hand
  * just before it sleeps: shrinks it by what earlier attempts at this same call
  * already waited, so restarting the call does not restart its timeout. NULL /

@@ -341,6 +341,12 @@ int emu_loop(CPU *c) {
          * to restart -- after the stop had settled that it answers EINTR. */
         sig_kick_timer_disarm();
 
+        /* Something is due, and the thread may be sitting at an SVC we
+         * rewound (syscall_restart_internal), not yet dispatched again: that
+         * call is still in progress to the guest, and what is due finds it
+         * interrupted, as it would inside the host syscall (syscall.c). */
+        if (UNLIKELY(g_sig_npend)) syscall_unrewind(c);
+
         if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
 
         /* Deliver any host-caught guest signal at this safe boundary. */

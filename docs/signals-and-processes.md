@@ -225,6 +225,19 @@ after signal delivery so a real guest signal's own disposition — a frame, or t
 `SA_RESTART` rewind above — decides first. The PC test distinguishes "just
 returned from that syscall" from a stale flag.
 
+The rewound call is still, as far as the guest can tell, the call in
+progress, until the `SVC` is dispatched again. A boundary reached in between
+— a signal, or a tracer's `INTERRUPT`, landing after the rewind and before the
+call is re-entered — finds it as the interruption left it, returned `EINTR`
+and the emulator's own (`syscall_unrewind`), so the delivery decides it by the
+guest's rules, exactly as when the same thing lands a moment later inside the
+host syscall; left to itself, it is rewound again. Found at the `SVC` instead,
+the call no longer looked interrupted: a `SEIZE` whose kick rewound a tracee's
+`epoll_wait`, followed at once by an `INTERRUPT`, trapped ahead of the call,
+which the `SVC` then made anew and ran to its timeout — where the kernel,
+whose `SEIZE` interrupts nothing, answers the `INTERRUPT`'s stop with `EINTR`
+(`tests/ptrace/interrupt_blocked.c`, `tests/ptrace/attachorder.c`).
+
 ##### A signal caught on the way into a syscall
 
 A guest signal reaches a thread as a host signal, and the host handler queues
