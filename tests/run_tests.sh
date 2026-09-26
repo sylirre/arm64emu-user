@@ -3305,7 +3305,21 @@ fi
 # ---- guest ptrace(2): tracer<->tracee syscall/signal stops, GETREGSET,
 # SETREGSET, PEEK/POKE round-trip and signal suppression/injection
 # (self-checking; qemu-user's ptrace emulation is too incomplete to be the
-# differential oracle). Each test prints "OK"; run under both engines. ----
+# differential oracle). Each test prints "OK"; run under both engines.
+#
+# The output goes through a file, not a command substitution: a test that
+# fails can leave a child behind -- a tracee whose tracer died, blocked on a
+# pipe it holds both ends of -- and one holding the harness's pipe kept the
+# substitution, and the suite, waiting for good. Whatever a failed run leaves
+# still running its binary is killed (reap_bin). ----
+reap_bin() {   # reap_bin <path>: kill every process whose command line holds it
+    local d cmd
+    for d in /proc/[0-9]*; do
+        cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
+        case "$cmd" in *"$1"*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac
+    done
+}
+ptout=$(mktemp)
 for pt in tests/ptrace/*.c; do
     [ -e "$pt" ] || continue
     ptbin="${pt%.c}.bin"
@@ -3326,15 +3340,21 @@ for pt in tests/ptrace/*.c; do
     fi
     for eng in "" "--jit"; do
         lbl="ptrace: $(basename "$pt" .c)${eng:+ (jit)}"
-        out=$(timeout -k 5 30 "$EMU" $eng / "$ptbin" 2>/dev/null); rc=$?
+        # By its absolute path, which is what names this run's processes
+        # and no other checkout's.
+        timeout -k 5 30 "$EMU" $eng / "$PWD/$ptbin" > "$ptout" 2>/dev/null
+        rc=$?
+        out=$(cat "$ptout")
         if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
             pass=$((pass+1)); echo "PASS $lbl"
         else
             fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$out')"
+            reap_bin "$PWD/$ptbin"
         fi
     done
     [ "$pt" = tests/ptrace/basic.c ] || fx_rm "$ptbin"
 done
+rm -f "$ptout"
 
 # ---- reserved host signals: the low-RT fallback tier ----
 # The emulator keeps three host signal numbers for itself -- the control-channel
