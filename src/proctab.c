@@ -69,6 +69,13 @@ struct ProcEnt {
     u32 seq;                     /* seqlock: odd = write in progress */
     s32 pid;                     /* 0 = free, claimed via __atomic CAS */
     u64 start;                   /* /proc/<pid>/stat starttime (stale guard) */
+    u8  exited;                  /* the owner has exited: a zombie, kept until
+                                  * it is reaped (proctab_reaped) -- a kernel's
+                                  * task is there for kill(2), getpgid(2) and
+                                  * /proc until then, and what it was for the
+                                  * siginfo it sent and the notice of its death
+                                  * (proctab_zombie). Its cmdline, environ, exe
+                                  * and the rest are no longer answers. */
     u32 len;                     /* cmdline byte length (<= PROCTAB_CMDLINE) */
     u32 env_len;                 /* environ byte length (<= PROCTAB_ENVIRON) */
     u32 auxv_len;                /* auxv byte length (<= PROCTAB_AUXV) */
@@ -274,8 +281,9 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * non-guest host tasks; v7 holds the id maps as extents, all 340 of the
      * kernel's ceiling, where v6 held 256 bytes of their text; v8 the owner's
      * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
-     * the state word; v11 the owner's locked memory, VmLck.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v11.%u.%08x",
+     * the state word; v11 the owner's locked memory, VmLck; v12 an exited
+     * owner's slot, kept until it is reaped.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v12.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -342,9 +350,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v11.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v12.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v11.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v12.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2581,12 +2589,25 @@ static struct ProcEnt *g_mem_ent;
  * index, or -1 when the table is full (callers fall back to searching). */
 int proctab_reserve(void) {
     if (!g_tab) return -1;
+    /* The first slot that is free -- or that an exited process left whose
+     * zombie is gone, reaped by someone who does not free it: the kernel at a
+     * SIG_IGN'd SIGCHLD, a host parent. Left for a full table to reclaim,
+     * those piled up below the free slots of every parent that ignores
+     * SIGCHLD, one per child, lengthening every scan of the table; and each
+     * still names a pid the host is free to hand out again. An exited slot
+     * costs a look at the host's /proc; there are only ever as many as there
+     * are zombies, and the gone ones are taken here. */
     for (int i = 0; i < g_tab_n; i++) {
-        s32 expect = 0;
+        s32 expect = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
+        if (expect != 0 &&
+            (expect < 0 || !__atomic_load_n(&g_tab[i].exited, __ATOMIC_ACQUIRE) ||
+             proc_starttime(expect) != 0))
+            continue;
         if (!__atomic_compare_exchange_n(&g_tab[i].pid, &expect, PT_RESERVED,
                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
         struct ProcEnt *e = &g_tab[i];
+        __atomic_store_n(&e->exited, 0, __ATOMIC_RELAXED);
         /* A previous owner SIGKILL'd mid-write may have left the seqlock odd,
          * which would invert its parity for the whole life of the new entry. */
         __atomic_store_n(&e->seq, 0, __ATOMIC_RELAXED);
@@ -2713,6 +2734,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     __atomic_fetch_add(&e->seq, 1, __ATOMIC_RELAXED);   /* odd: write begins */
     __atomic_thread_fence(__ATOMIC_RELEASE);
     e->start = start;
+    __atomic_store_n(&e->exited, 0, __ATOMIC_RELEASE);   /* a live process's */
     e->len = len;
     e->env_len = env_len;
     e->auxv_len = auxv_len;
@@ -2744,6 +2766,20 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
         __atomic_store_n(&e->pers_main, g_tls.personality, __ATOMIC_RELEASE);
         __atomic_store_n(&e->pers_base, g_tls.personality, __ATOMIC_RELEASE);
     }
+    /* A slot below this one that still names the pid is a previous process's
+     * -- one that died without a word (SIGKILL), or whose zombie someone who
+     * does not free it reaped -- and the number has come round again. Every
+     * lookup by pid takes the first slot that names it: left there, it would
+     * hide this process behind a stale entry (ESRCH, no /proc). The slots
+     * above need nothing: a lookup reaches this one first. And the scan is
+     * no longer than the one that found this slot: free slots are taken
+     * first-fit. */
+    if (claimed || reserved)
+        for (int i = 0; i < slot; i++) {
+            s32 old = pid;
+            __atomic_compare_exchange_n(&g_tab[i].pid, &old, 0, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        }
     /* Built: publish the slot under its real pid (see the claim above). */
     if (claimed || reserved) __atomic_store_n(&e->pid, pid, __ATOMIC_RELEASE);
     if (pid == (s32)getpid()) { g_own_slot = slot; g_mem_ent = NULL; }
@@ -2778,14 +2814,71 @@ void proctab_set_cwd(s32 pid, const char *cwd) {
     }
 }
 
+/* The owner is exiting: its slot stays, marked, for as long as its zombie
+ * does. A kernel's exited task is still a task until its parent reaps it --
+ * kill(pid, 0) finds it, getpgid answers for it, /proc/<pid> shows it -- and
+ * the signals it sent and the notice of its death still name it. Freeing the
+ * slot here made every guest process a host one the moment it exited: ESRCH,
+ * hidden, its si_pid a stranger's. The reaper frees it (proctab_reaped); one
+ * reaped by someone else -- the kernel at a SIG_IGN'd SIGCHLD, a host parent
+ * -- is gone from the host, which slot_current sees, and its slot is taken
+ * back by the full-table reclaim. */
 void proctab_unregister(s32 pid) {
     if (!g_tab || pid <= 0) return;
     if (pid == (s32)getpid()) { g_own_slot = -1; g_mem_ent = NULL; }
     for (int i = 0; i < g_tab_n; i++)
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) {
-            __atomic_store_n(&g_tab[i].pid, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tab[i].exited, 1, __ATOMIC_RELEASE);
             return;
         }
+}
+
+/* The reaper's half: the zombie is gone, and its slot with it -- marked
+ * exited, or not, for a process that died without a word (SIGKILL). The
+ * slot naming the pid is the reaped process's: a new one under the same
+ * number would have cleared it (proctab_register_at), and the number cannot
+ * have come round since the reap, a few instructions ago -- the kernel hands
+ * pids out cyclically. Memory alone: the capture handler reaps too. */
+void proctab_reaped(s32 pid) {
+    if (!g_tab || pid <= 0) return;
+    for (int i = 0; i < g_tab_n; i++) {
+        s32 p = pid;
+        if (__atomic_compare_exchange_n(&g_tab[i].pid, &p, 0, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+static int slot_current(struct ProcEnt *e, s32 pid);
+
+/* The single-letter state of host task `pid` (its /proc stat): 0 when it
+ * cannot be read. */
+static char task_state(s32 pid) {
+    char path[64], buf[256];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fdwin_leave(); return 0; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    fdwin_leave();
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    return rp && rp[1] == ' ' ? rp[2] : 0;
+}
+
+int proctab_zombie(s32 pid) {
+    if (!g_tab || pid <= 0) return 0;
+    for (int i = 0; i < g_tab_n; i++)
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) {
+            if (!slot_current(&g_tab[i], pid)) return 0;
+            if (__atomic_load_n(&g_tab[i].exited, __ATOMIC_ACQUIRE)) return 1;
+            /* Killed outright (SIGKILL): nothing of it ran to say so. */
+            char st = task_state(pid);
+            return st == 'Z' || st == 'X';
+        }
+    return 0;
 }
 
 /* Does the slot that matched `pid` still belong to the process that wrote it?
@@ -2976,6 +3069,7 @@ int proctab_get(s32 pid, struct ProcSnap *out) {
         if (s1 & 1) continue;                         /* writer active */
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->pid, __ATOMIC_RELAXED) != pid) return 0;   /* slot recycled */
+        if (__atomic_load_n(&e->exited, __ATOMIC_ACQUIRE)) return 0;   /* a zombie's */
         u64 start = e->start;
         u32 cl = e->len;      if (cl > PROCTAB_CMDLINE) cl = PROCTAB_CMDLINE;
         u32 el = e->env_len;  if (el > PROCTAB_ENVIRON) el = PROCTAB_ENVIRON;

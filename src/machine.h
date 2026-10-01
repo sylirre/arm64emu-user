@@ -1327,7 +1327,14 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
 int  proctab_reserve(void);         /* before fork; -1 when the table is full */
 void proctab_release(int slot);     /* the fork failed */
 void proctab_slot_adopt(int slot);  /* in the child: that slot is now ours */
-void proctab_unregister(s32 pid);                          /* exit */
+void proctab_unregister(s32 pid);   /* exit: the slot stays, a zombie's (proctab.c) */
+void proctab_reaped(s32 pid);       /* its reaper's wait: the slot goes */
+/* Is `pid` a guest process that has exited and not been reaped -- one that
+ * unregistered, or one killed outright, whose host task is a zombie? A
+ * member of the registry all the same (proctab_has) -- kill(2), getpgid(2),
+ * /proc/<pid> find it, as a kernel's do -- but no longer the cmdline,
+ * environ, exe and the rest it published (proctab_get answers nothing). */
+int  proctab_zombie(s32 pid);
 void proctab_set_cwd(s32 pid, const char *cwd);            /* chdir / fchdir */
 /* Is this a guest PID -- a slot whose stored starttime still matches the live
  * process, so that a number a killed process left in the table and the host

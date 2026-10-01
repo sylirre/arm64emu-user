@@ -919,6 +919,28 @@ and only a descendant in the same session can do that. Admitting a group because
 the shell pipeline that started it, and `SIGIO`/`SIGURG` went to host processes
 the guest cannot otherwise signal at all.
 
+A guest process that has **exited and not been reaped** is still a guest task:
+its slot stays in the registry, marked, until its reaper's wait takes it
+(`proctab_unregister`, `proctab_reaped`) — or, reaped by someone who does not
+free it (the kernel at an ignored `SIGCHLD`, a host parent), until the host
+task is gone and the next reservation that passes it takes the slot back. Such
+a slot, and one a process killed outright left, still names a pid the host may
+hand out again; a lookup by pid takes the first slot that names it, so a new
+process registering under that pid clears any older slot below its own, which
+would otherwise hide it (`ESRCH`) — `tests/fixtures/pidreuse.c`, run in a
+bubblewrap pid namespace whose `ns_last_pid` steers the number round. A kernel's zombie is
+there for `kill(pid, 0)`, `getpgid`, `getsid` and `/proc/<pid>` until it is
+reaped, and is what its own signals and the notice of its death name; the
+slot used to be freed at the exit, which made every guest process a host one
+the moment it ended — `ESRCH`, and hidden. Its `/proc` is a zombie's
+(`proctab_zombie`, which also knows one killed outright by its host state,
+nothing of it having run to say so): an empty `cmdline`, `maps`, `smaps` and
+`numa_maps`, no address space in `stat`, `statm` and `status`, `EACCES` for
+`environ`, `auxv`, `mem` and `pagemap`, `ESRCH` for `smaps_rollup`, `EINVAL`
+for `mounts`, `ENOENT` for `exe`, `cwd` and `root` — where one killed outright
+used to be shown alive, with the command line and sizes it had. `ptrace`
+refuses to attach one (`EPERM`). `tests/fixtures/zombieproc.c`.
+
 What counts as a guest task: our own thread group (a process must be able to
 signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`
 answers it without a `/proc` read, which is what keeps a Go runtime's per-

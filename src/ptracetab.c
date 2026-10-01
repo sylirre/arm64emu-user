@@ -1621,6 +1621,8 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
             if (r) return r;
         }
         if (tgid == (s32)getpid()) return -EPERM;   /* own thread group (kernel rule) */
+        /* An exited task, not yet reaped: ptrace_attach's exit_state test. */
+        if (proctab_zombie(tgid)) return -EPERM;
         PtLink *e = pt_claim(pid, tgid);
         if (!e) return -ENOMEM;
         s32 zero = 0;

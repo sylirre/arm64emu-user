@@ -474,9 +474,12 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *delete
     if (!ot) return 0;
     if (pid == (s32)getpid() || !proctab_has(pid)) return 0;
     if (proc_map_files_link(ot)) return -EACCES;
-    if (!strcmp(ot, "root")) { strcpy(tgt, "/"); return 1; }
     int want_exe = !strcmp(ot, "exe"), want_cwd = !strcmp(ot, "cwd");
-    if (!want_exe && !want_cwd) return 0;
+    int want_root = !strcmp(ot, "root");
+    if (!want_exe && !want_cwd && !want_root) return 0;
+    /* A zombie has no mm, no fs_struct: its three links are ENOENT. */
+    if (proctab_zombie(pid)) return -ENOENT;
+    if (want_root) { strcpy(tgt, "/"); return 1; }
     struct ProcSnap snap;
     /* No guest answer (the entry is mid-rewrite, or its process raced away):
      * ENOENT, which is what the kernel reports for these links once a process

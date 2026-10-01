@@ -1709,7 +1709,13 @@ then make the consequences the caller depends on true:
   `clear_refs`, `syscall`) have no registry answer to give, and the host's
   describes the emulator's own mappings at its own foreign-ISA addresses, so
   they are refused with `EACCES` — the same refusal a host running yama
-  `ptrace_scope=1` already gives between siblings. **This process's own are
+  `ptrace_scope=1` already gives between siblings. A guest **zombie** — exited,
+  not yet reaped, which the registry keeps until its reaper's wait
+  (`docs/signals-and-processes.md`, *Target containment*) — is listed and
+  answered as a kernel answers one: no `cmdline`, no address space (empty
+  `maps`/`smaps`/`numa_maps`, zero sizes, `smaps_rollup` `ESRCH`), `environ`
+  and `auxv` root's alone, `mounts` `EINVAL`, its `exe`/`cwd`/`root` `ENOENT`
+  (`proctab_zombie`). **This process's own are
   refused the same way**, `maps` excepted: that one is synthesized from the
   guest address space, and the rest have no guest answer either, so passing them
   through handed the guest `/proc/self/mem` — not a description of the

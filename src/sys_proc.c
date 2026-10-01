@@ -1514,6 +1514,7 @@ static pid_t ck_wait4_any(struct Machine *m, pid_t wpid, int *status, u32 opts,
 static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
     if (!sig_chld_reaps(m) || !sig_chld_reap_emulated() || clonekid_live(m, pid))
         return 0;
+    proctab_reaped(pid);   /* gone, as the kernel's reaping leaves it */
     if (looked) {
         siginfo_t x;
         KRusage kru;
@@ -3549,6 +3550,7 @@ SYSDEF(wait4) {
                 }
                 if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
+                proctab_reaped((s32)pid);   /* its zombie's slot goes with it */
                 children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
             }
             if (a1) {
@@ -3595,6 +3597,7 @@ SYSDEF(wait4) {
                 }
                 ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
+                proctab_reaped((s32)pid);   /* its zombie's slot goes with it */
                 children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
             }
             if (a1) {
@@ -3755,6 +3758,7 @@ SYSDEF(waitid) {
                  si.si_code == CLD_DUMPED)) {
                 if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
                 clonekid_reaped(c->m, (s32)si.si_pid);
+                proctab_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,
                                 (s64)ru.stime_sec * 1000000 + ru.stime_usec);
             }
@@ -3815,6 +3819,7 @@ SYSDEF(waitid) {
                  si.si_code == CLD_DUMPED)) {
                 ptrace_note_reaped((s32)si.si_pid);
                 clonekid_reaped(c->m, (s32)si.si_pid);
+                proctab_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,
                                 (s64)ru.stime_sec * 1000000 + ru.stime_usec);
             }

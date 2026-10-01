@@ -2957,6 +2957,46 @@ check_fixture waitany $'wait4(-1): ordinary child status=4\nwait4(-1) with only 
 # SIGCHLD; the block is the kernel's.
 check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone' \
     "A64_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
+# A guest zombie is a guest task until it is reaped -- kill(pid, 0),
+# getpgid, getsid and /proc/<pid> find it, ptrace refuses it -- with a
+# zombie's /proc: no mm, no fs context, no mount namespace (proctab.c,
+# proctab_zombie). Both endings, an exit and a SIGKILL. Self-checking: the
+# block is the kernel's.
+check_fixture zombieproc "$(printf '%s\n' exited: '  /proc/<pid>: listed' '  cmdline: 0 bytes' '  environ: open Permission denied' '  auxv: open Permission denied' $'  status: State:\tZ (zombie), Vm lines 0' '  stat: state Z, vsize 0, rss 0' '  statm: 0 0 0 0 0 0 0' '  maps: 0 bytes' '  smaps: 0 bytes' '  smaps_rollup: open No such process' '  numa_maps: 0 bytes' '  mem: open Permission denied' '  pagemap: open Permission denied' '  mounts: open Invalid argument' '  mountinfo: open Invalid argument' '  exe: readlink No such file or directory' '  cwd: readlink No such file or directory' '  root: readlink No such file or directory' '  kill(pid, 0): 0' '  getpgid: ours' '  getsid: ours' '  ptrace attach: Operation not permitted' '  reaped: 1, then kill: No such process' 'killed by SIGKILL:' '  /proc/<pid>: listed' '  cmdline: 0 bytes' '  environ: open Permission denied' '  auxv: open Permission denied' $'  status: State:\tZ (zombie), Vm lines 0' '  stat: state Z, vsize 0, rss 0' '  statm: 0 0 0 0 0 0 0' '  maps: 0 bytes' '  smaps: 0 bytes' '  smaps_rollup: open No such process' '  numa_maps: 0 bytes' '  mem: open Permission denied' '  pagemap: open Permission denied' '  mounts: open Invalid argument' '  mountinfo: open Invalid argument' '  exe: readlink No such file or directory' '  cwd: readlink No such file or directory' '  root: readlink No such file or directory' '  kill(pid, 0): 0' '  getpgid: ours' '  getsid: ours' '  ptrace attach: Operation not permitted' '  reaped: 1, then kill: No such process' done)"
+# ...and once it is reaped where the emulator does not see it -- by the
+# host, for a parent that ignores SIGCHLD -- or dies without a word (SIGKILL),
+# its registry entry outlives it, and a new guest process the host gives the
+# same pid must not be hidden behind it (proctab.c, proctab_register_at). The
+# pid is steered from outside the emulator, in a user and pid namespace of
+# bubblewrap's, through ns_last_pid (the fixture has the protocol).
+# Self-checking: the block is the kernel's, under the same helper.
+PR_HELPER='D=$1; shift; rm -f "$D"/*.pid "$D"/*.go "$D/tick"
+mkfifo "$D/tick"; exec 3<>"$D/tick"
+"$@" &
+for r in 1 2; do
+    n=0
+    while [ ! -s "$D/$r.pid" ]; do
+        kill -0 $! 2>/dev/null || break 2
+        read -t 0.02 -u 3; n=$((n+1)); [ $n -gt 1500 ] && break 2
+    done
+    w=$(<"$D/$r.pid"); echo $((w-1)) > /proc/sys/kernel/ns_last_pid; : > "$D/$r.go"
+done
+wait; rm -f "$D/tick"'
+PR_BWRAP="bwrap --dev-bind / / --unshare-user --unshare-pid --uid 0 --gid 0 --cap-add ALL --proc /proc"
+if ! "$AGCC" -static -O2 -o tests/fixtures/pidreuse.bin tests/fixtures/pidreuse.c 2>/dev/null; then
+    skip_build fixtures/pidreuse
+elif command -v bwrap >/dev/null 2>&1 &&
+     $PR_BWRAP bash -c 'echo 1 > /proc/sys/kernel/ns_last_pid' 2>/dev/null; then
+    rm -rf tests/.cache/pidreuse; mkdir -p tests/.cache/pidreuse
+    got=$(timeout -k 5 60 $PR_BWRAP bash -c "$PR_HELPER" _ "$PWD/tests/.cache/pidreuse" \
+              "$EMU" / "$PWD/tests/fixtures/pidreuse.bin" "$PWD/tests/.cache/pidreuse" 2>/dev/null)
+    fixture_verdict pidreuse $'round 1: kill 0, /proc/<pid> visible\nround 2: kill 0, /proc/<pid> visible\ndone' "$got"
+    rm -rf tests/.cache/pidreuse
+else
+    skip=$((skip+1))
+    echo "SKIP fixture: pidreuse (no bubblewrap user and pid namespace with a writable ns_last_pid)"
+fi
+fx_rm tests/fixtures/pidreuse.bin
 # What a child's notice carries -- code, pid, status and the child's user and
 # system time in clock ticks -- through a handler, sigwaitinfo and a signalfd,
 # and for a clone child that dies with another signal (signal.c,

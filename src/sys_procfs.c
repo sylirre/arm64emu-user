@@ -1305,6 +1305,8 @@ int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret) {
             as_procmem(&m->as, &pm);
             as_meminfo(&m->as, &lm);
             if (lm.rss_ok) mi = &lm;
+        } else if (proctab_zombie(m->pf_fds[i].pid)) {
+            memset(&pm, 0, sizeof pm);   /* exited since the open: no mm */
         } else if (!proctab_mem_get(m->pf_fds[i].pid, &pm)) {
             break;                       /* keep the snapshot we have */
         }
@@ -1701,7 +1703,9 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
         if (lm.rss_ok) mi = &lm;
         pm_ok = 1;
     } else {
-        pm_ok = tgid > 0 && proctab_mem_get(tgid, &pm);
+        /* A zombie has no address space: the host's file prints no Vm or Rss
+         * line for it, and none is added (proctab_zombie). */
+        pm_ok = tgid > 0 && !proctab_zombie(tgid) && proctab_mem_get(tgid, &pm);
     }
     u64 budget = pm_ok ? pm.size >> 10 : 0;
     u32 vseen = 0;
@@ -2017,7 +2021,8 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if (!proctab_has(opid)) return 0;
         char cbuf[PROCTAB_CMDLINE];
         u32 clen = 0;
-        if (!proctab_cmdline(opid, cbuf, &clen)) clen = 0;
+        /* A zombie's is empty: its mm is gone (proctab_zombie). */
+        if (proctab_zombie(opid) || !proctab_cmdline(opid, cbuf, &clen)) clen = 0;
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
@@ -2037,6 +2042,9 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         (!strcmp(mtail, "mounts") || !strcmp(mtail, "mountinfo") ||
          !strcmp(mtail, "mountstats"))) {
         if (!proctab_has(mpid)) return 0;
+        /* A zombie has left its mount namespace (exit_task_namespaces), and
+         * mounts_open_common answers EINVAL for a task without one. */
+        if (proctab_zombie(mpid)) { *ret = -EINVAL; return 1; }
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         int fd = synth_memfd();
@@ -2062,12 +2070,17 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     if (etail && epid != (s32)getpid() &&
         (!strcmp(etail, "environ") || !strcmp(etail, "auxv"))) {
         if (!proctab_has(epid)) return 0;
+        /* A zombie's: the files are 0400 and, with the task's mm gone,
+         * root's (task_dump_owner) -- EACCES but for root, who reads nothing
+         * from them. */
+        int zombie = proctab_zombie(epid);
+        if (zombie && !fake_root(m)) { *ret = -EACCES; return 1; }
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         struct ProcSnap snap;
         const char *buf = NULL;
         u32 blen = 0;
-        if (proctab_get(epid, &snap)) {
+        if (!zombie && proctab_get(epid, &snap)) {
             buf = etail[0] == 'a' ? snap.auxv : snap.env;
             blen = etail[0] == 'a' ? snap.auxv_len : snap.env_len;
         }
@@ -2088,6 +2101,21 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     const char *atail = proc_other_tail(canon, &apid);
     if (atail && apid != (s32)getpid() && proc_addrspace_leaf(atail) &&
         proctab_has(apid)) {
+        /* A zombie's address space is gone, and with it the ptrace check
+         * that refuses another's: its maps, smaps and numa_maps read
+         * nothing, its smaps_rollup is ESRCH (no mm to take), and the files
+         * that are its owner's alone stay refused. */
+        if (proctab_zombie(apid)) {
+            if (!strcmp(atail, "smaps_rollup")) { *ret = -ESRCH; return 1; }
+            if (!strcmp(atail, "maps") || !strcmp(atail, "smaps") ||
+                !strcmp(atail, "numa_maps")) {
+                if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
+                if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
+                int fd = synth_memfd();
+                if (fd < 0) { *ret = synth_denied(); return 1; }
+                return pf_hand(m, fd, PF_SNAPSHOT, apid, 0, gflags, ret);
+            }
+        }
         *ret = -EACCES;
         return 1;
     }
@@ -2191,9 +2219,12 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
         if ((gflags & O_ACCMODE) != O_RDONLY) { *ret = -EACCES; return 1; }
         if (gflags & G_O_DIRECTORY)           { *ret = -ENOTDIR; return 1; }
         if (szpid) {
+            /* A zombie has no address space: every size is 0, as the
+             * kernel's stat and statm print one's. */
+            if (proctab_zombie(szpid)) memset(&pm, 0, sizeof pm);
             /* Nothing published yet (the process is mid-registration): the
              * host file is wrong in places, not useless. */
-            if (!proctab_mem_get(szpid, &pm)) return 0;
+            else if (!proctab_mem_get(szpid, &pm)) return 0;
         } else {
             as_procmem(&m->as, &pm);
             as_meminfo(&m->as, &lm);

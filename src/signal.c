@@ -1448,8 +1448,10 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
             KRusage kru;
             memset(&x, 0, sizeof x);
             if (syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, &kru) == 0 &&
-                x.si_pid == p->pid)
+                x.si_pid == p->pid) {
                 proctab_helper_charge_k(&kru);
+                proctab_reaped(p->pid);
+            }
         }
     }
     /* A stop or continue notice is never sent to a parent that set
