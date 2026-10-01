@@ -54,6 +54,11 @@ typedef struct {
      * accesses, a syscall's copies, a tracer's PEEK and POKE
      * (access_remote_vm expands the stack itself). */
     u8  nogrow;
+    /* mem_reachable answered "reachable" for a page in a stack's hole since
+     * this syscall's handler began: the transfer being measured has bytes a
+     * stack is to grow over, which xfer_begin (sys_file.c) has to know before
+     * the host moves anything. */
+    u8  xfer_hole;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
      * internal wakeups -- syscall_restart_internal, src/syscall.c). */
     u64 sc_svc_pc, sc_orig_x0, sc_nr;

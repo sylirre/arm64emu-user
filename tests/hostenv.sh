@@ -519,7 +519,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
 # (docs/jit.md), and qemu-user is an interposer with defects of its own.
-# Twelve of them stop correct tests dead, each reproducible in a few lines that
+# Thirteen of them stop correct tests dead, each reproducible in a few lines that
 # never touch the emulator:
 #
 #   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
@@ -567,6 +567,12 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   the rest stay open where nobody is told their numbers.
 #   madv-remove     madvise(MADV_REMOVE) punches a hole in the object behind a
 #                   shared mapping; qemu-user answers 0 and does nothing.
+#   growsdown-copy  a system call's copy into the hole beneath a
+#                   MAP_GROWSDOWN mapping grows the mapping, as a fault there
+#                   does; qemu-user checks the buffer against a page table of
+#                   its own first and answers EFAULT. The emulator asks its
+#                   host exactly that to learn whether an O_DIRECT transfer is
+#                   copied or pinned (sys_file.c, xfer_scratch).
 #
 # One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -852,6 +858,27 @@ int main(void) {
     memset(a, 7, 8192);
     if (madvise(a, 4096, MADV_REMOVE)) return 1;
     return a[0] != 0 || a[4096] != 7;
+}
+EOF
+        ;;
+    growsdown-copy) cat <<'EOF'
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void) {
+    /* An inaccessible floor (it keeps no guard gap), four free pages, and the
+     * one-page growsdown mapping on top -- the emulator's own scratch. */
+    long pg = sysconf(_SC_PAGESIZE);
+    char *base = mmap(0, 6 * pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) return 1;
+    char *top = base + 5 * pg;
+    if (munmap(base + pg, 4 * pg) ||
+        mmap(top, pg, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0) != top)
+        return 1;
+    int p[2];
+    if (pipe(p) || write(p[1], "abcd", 4) != 4) return 1;
+    if (read(p[0], top - 8, 4) != 4) return 1;
+    return top[-8] != 'a';
 }
 EOF
         ;;

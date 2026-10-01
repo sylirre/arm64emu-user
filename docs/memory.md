@@ -441,9 +441,32 @@ a shared futex's key lookup run under `g_tls.nogrow` (`thread.h`). Nor the
 emulator's own looks at guest memory — the `--strace-full` decoder, `mem_peek`
 — and nor `rw_room`, the bound a transfer is measured against before the host
 call: it asks `mem_reachable`, which answers "a stack would grow over this"
-without growing it, so the growth happens in the copy that moves bytes and not
-for a read that returned nothing. `mincore` of the hole is `ENOMEM`, as a
-kernel answers it, with nothing grown.
+without growing it. `mincore` of the hole is `ENOMEM`, as a kernel answers it,
+with nothing grown.
+
+**A transfer grows it as far as the host got.** A kernel's copy grows the
+stack when it touches the hole — a read's when it puts a byte there, a write's
+when it takes one — and not a call that moves none there: a read at
+end-of-file, or one whose earlier segments took every byte; a write to a pipe
+with no reader, or to `/dev/null`, which never reads its buffer. The emulator
+grew it as it set the transfer up — the lend walk, the copy into a bounce
+buffer — so each of those left the stack grown. Now neither grows anything
+(`guest_lend` stops at the hole, `copy_from_guest_look` gathers a write's
+source with the hole as the zeroes its growth would map), a run in the hole
+goes to the host as memory of the emulator's, and `xfer_end` grows the stack
+over each run the host got as far as (`XferHole`, `sys_file.c`) — handing a
+read's bytes over, and leaving it be for a write to `/dev/null` or
+`/dev/zero`. An `O_DIRECT` transfer is the GUP exception: a filesystem that
+really does direct I/O pins the pages, which grows no stack — `EFAULT` — while
+one that falls back to the page cache (btrfs, tmpfs) copies, and grows it; and
+a direct read that comes up short falls back to a copy for the rest, which a
+readv that runs from a stack into its hole does. Which of those a descriptor
+does is the host's to know, so the host is asked by the deed itself: the run
+goes to it as the hole under a `MAP_GROWSDOWN` mapping of its own
+(`xfer_scratch`: an inaccessible floor that keeps no guard gap, the run's pages
+free, one page on top), which its kernel grows or refuses exactly as the
+guest's would grow the stack, and the stack grows if the scratch did
+(`tests/fixtures/odirect.c`, on a filesystem of each kind).
 
 **The backing has to be there to grow into.** A region's host backing is one
 contiguous run (`Region.host`), so a stack is made by `guest_map_stack` with
@@ -500,7 +523,8 @@ initial stack.
 `tests/fixtures/growsdown.c` takes every row from a native kernel: the initial
 size, a limit raised and lowered after the exec, the guard gap against an
 accessible, a `PROT_NONE` and a growsdown mapping below, `RLIMIT_STACK` and
-`RLIMIT_AS`, a `read` into the hole, a tracer's `PEEK` against
+`RLIMIT_AS`, a `read` into the hole and the transfers that move nothing there,
+a tracer's `PEEK` against
 `process_vm_readv`, `mincore`, a regrown page, the permission faults, a signal
 frame, a fork child's copy, and the accounting. `tests/fixtures/growsnomove.c`
 has the rows a stack moved to grow could not give: another thread growing it,

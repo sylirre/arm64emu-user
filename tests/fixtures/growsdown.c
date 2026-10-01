@@ -8,7 +8,9 @@
  * passes RLIMIT_STACK, never to within stack_guard_gap (1 MiB) of an
  * accessible mapping below (a PROT_NONE one or another stack keeps no gap),
  * never past RLIMIT_AS. A syscall's copy into the hole grows it like an
- * instruction does, and so do a signal frame, a tracer's PEEK and POKE
+ * instruction does -- the copy that moves bytes there, and not a call that
+ * moves none there, whatever it was handed -- and so do a signal frame, a
+ * tracer's PEEK and POKE
  * (access_remote_vm) and a vfork child's store into the stack it shares with
  * its parent; process_vm_readv and mincore do not. A write below a read-only
  * one, or a jump below a non-executable one, grows it and then faults on the
@@ -27,6 +29,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -35,6 +38,7 @@
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -273,6 +277,70 @@ int main(void) {
     ssize_t n = read(p[0], rd - 3 * PG, 3);
     ok = vma_start((unsigned long)rd) == (unsigned long)rd - 3 * PG;
     printf("read into the hole: %zd, start moved: %d\n", n, ok);
+
+    /* ...and only the copy that moves bytes there: a read at end-of-file, a
+     * write to a pipe with no reader and one to /dev/null, and a vector
+     * whose segment in the hole the transfer never reaches -- a short one and
+     * one past 64 KiB alike -- grow nothing; a write a pipe or a file takes
+     * from the hole grows it, with the zeroes it maps. */
+    signal(SIGPIPE, SIG_IGN);
+    int pq[2];
+    char *x1 = grows_at(base - 1664 * MB, 64);
+    if (!x1 || pipe(pq)) return 1;
+    close(pq[1]);
+    n = read(pq[0], x1 - 3 * PG, 3 * PG);
+    printf("read at end-of-file into the hole: %zd, start moved: %d\n", n,
+           vma_start((unsigned long)x1) != (unsigned long)x1);
+    close(pq[0]);
+    char *x2 = grows_at(base - 1792 * MB, 64);
+    if (!x2 || pipe(pq)) return 1;
+    close(pq[0]);
+    n = write(pq[1], x2 - 3 * PG, 3 * PG);
+    int pe = errno;
+    printf("write from the hole to a pipe with no reader: %s, start moved: %d\n",
+           n < 0 && pe == EPIPE ? "EPIPE" : "?", vma_start((unsigned long)x2) != (unsigned long)x2);
+    close(pq[1]);
+    char *x3 = grows_at(base - 1920 * MB, 64);
+    int nul = open("/dev/null", O_WRONLY);
+    if (!x3 || nul < 0) return 1;
+    n = write(nul, x3 - 3 * PG, 3 * PG);
+    printf("write from the hole to /dev/null: %zd, start moved: %d\n", n,
+           vma_start((unsigned long)x3) != (unsigned long)x3);
+    close(nul);
+    int mf = (int)syscall(SYS_memfd_create, "grows", 0);
+    static char fill[64 * PG];
+    memset(fill, 7, sizeof fill);
+    if (mf < 0 || write(mf, fill, sizeof fill) != (ssize_t)sizeof fill) return 1;
+    char *x4 = grows_at(base - 2048 * MB, 64);
+    if (!x4) return 1;
+    struct iovec two[2] = { { x4, 4 * PG }, { x4 - 2 * PG, 2 * PG } };
+    n = preadv(mf, two, 2, 60 * PG);
+    printf("readv, 4 pages to the end of the file before the hole: %zd, start moved: %d\n", n,
+           vma_start((unsigned long)x4) != (unsigned long)x4);
+    char *x5 = grows_at(base - 2176 * MB, 64);
+    if (!x5) return 1;
+    struct iovec big[2] = { { x5, 64 * PG }, { x5 - 2 * PG, 2 * PG } };
+    n = preadv(mf, big, 2, 0);
+    printf("readv, 64 pages to the end of the file before the hole: %zd, start moved: %d\n", n,
+           vma_start((unsigned long)x5) != (unsigned long)x5);
+    char *x6 = grows_at(base - 2304 * MB, 64);
+    if (!x6 || pipe(pq)) return 1;
+    n = write(pq[1], x6 - 3 * PG, 3 * PG);
+    printf("write from the hole to a pipe: %zd, start moved: %d\n", n,
+           vma_start((unsigned long)x6) == (unsigned long)x6 - 3 * PG);
+    close(pq[0]);
+    close(pq[1]);
+    char *x7 = grows_at(base - 2432 * MB, 64);
+    if (!x7) return 1;
+    memset(x7, 9, 64 * PG);
+    struct iovec wbig[2] = { { x7, 64 * PG }, { x7 - 2 * PG, 2 * PG } };
+    n = pwritev(mf, wbig, 2, 0);
+    char back[2 * PG];
+    int zero = pread(mf, back, sizeof back, 64 * PG) == (ssize_t)sizeof back;
+    for (unsigned long b = 0; b < sizeof back; b++) zero &= back[b] == 0;
+    printf("writev, 64 pages and the hole, to a file: %zd, start moved: %d, zeroes %d\n", n,
+           vma_start((unsigned long)x7) == (unsigned long)x7 - 2 * PG, zero);
+    close(mf);
 
     /* A tracer's PEEK grows it; process_vm_readv does not. */
     k = fork();

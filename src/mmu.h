@@ -541,8 +541,9 @@ bool mem_reachable(CPU *c, u64 va, unsigned size, AccType acc);
  * the way -- to iov[*n..cap), the allocation under each in pin[]. A run is one
  * allocation's contiguous host memory, extended only by this call, so every
  * guest segment keeps a run boundary of its own. Returns the bytes covered,
- * and *why says what stopped it short. guest_unlend releases the first `n`
- * entries of pin[] (NULL entries are skipped). */
+ * and *why says what stopped it short -- a stack's hole among the rest, which
+ * is never lent: the walk grows no stack (mem_stack_hole below). guest_unlend
+ * releases the first `n` entries of pin[] (NULL entries are skipped). */
 #define LEND_ALL  0   /* covered the whole range */
 #define LEND_CUT  1   /* a page not mapped for `acc`: where rw_room stops */
 #define LEND_FULL 2   /* `cap` runs are in use */
@@ -550,6 +551,25 @@ struct iovec;
 size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
                   HostMap **pin, int *n, int cap, int *why);
 void guest_unlend(CPU *c, HostMap **pin, int n);
+/* A transfer's bytes in a stack's hole. A kernel grows the stack over the
+ * hole when its copy touches it, which is when the copy moves a byte there
+ * or from there -- not before the call, and not for one that moves none (a
+ * read at end-of-file, a write to a pipe with no reader, to /dev/null) --
+ * and never for its GUP, which an O_DIRECT transfer pins its pages by. So
+ * the transfer is set up without growing anything (rw_room looks,
+ * guest_lend stops), and grows the stack after the host call as far as the
+ * host got (sys_file.c, xfer_end).
+ *   mem_stack_hole        the run of a stack's hole at `va`, up to `len`:
+ *                         unmapped pages a touch would grow the stack over,
+ *                         with `acc` permitted once it has; 0 when `va` is
+ *                         not in one. A look.
+ *   mem_stack_touch       grow the stack over `va` as an access with `acc`
+ *                         would: 1 when it is mapped now.
+ *   copy_from_guest_look  copy_from_guest_partial, growing nothing: the bytes
+ *                         before the first page it cannot read as it is. */
+size_t mem_stack_hole(CPU *c, u64 va, size_t len, AccType acc);
+int    mem_stack_touch(CPU *c, u64 va, AccType acc);
+size_t copy_from_guest_look(CPU *c, void *dst, u64 va, size_t len);
 /* fork(2) child: the loans of the threads that did not come across are gone. */
 void as_lend_fork_child(AddrSpace *as);
 

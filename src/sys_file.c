@@ -252,6 +252,172 @@ static int xfer_split_ok(int fd, int *cache) {
     return *cache;
 }
 
+/* ---- a transfer's runs in a stack's hole (sys.h, XferHole; mmu.h) ----
+ *
+ * A kernel grows a stack over the hole beneath it when its copy touches the
+ * hole -- when a read's copy puts a byte there, or a write's takes one from
+ * there -- and not before the call, and not for one that moves none there: a
+ * read at end-of-file or one whose earlier segments took every byte, a write
+ * to a pipe with no reader or to /dev/null. The emulator grew it as it set
+ * the transfer up -- the lend walk, the copy into a bounce buffer -- so every
+ * such call left the stack grown, as a VmStk and /proc/<pid>/maps showed. So
+ * a run in the hole goes to the host as memory of ours (zeroes, for a write:
+ * what the growth would map), and xfer_end grows the stack over it after the
+ * call, as far as the host got.
+ *
+ * And not for GUP, which has grown no stack since 6.1.37: a filesystem that
+ * really does direct I/O pins an O_DIRECT transfer's pages by it, and a run
+ * in a stack's hole is EFAULT there, while one that falls back to the page
+ * cache (btrfs, tmpfs) copies, and grows the stack. Which one a descriptor
+ * does is the host's to know, so the host is asked by the same deed: an
+ * O_DIRECT transfer's run goes to it as the hole under a growsdown mapping
+ * of its own (xfer_scratch), which its kernel grows or not exactly as the
+ * guest's would grow the stack, and the guest's stack grows if the
+ * scratch did. */
+
+static int xfer_hole_add(GuestXfer *x, const XferHole *h) {
+    if (x->nhole == x->caphole) {
+        int nc = x->caphole ? x->caphole * 2 : 4;
+        XferHole *nh = realloc(x->hole, sizeof *nh * (size_t)nc);
+        if (!nh) return -ENOMEM;
+        x->hole = nh;
+        x->caphole = nc;
+    }
+    x->hole[x->nhole++] = *h;
+    return 0;
+}
+
+/* Release what the runs hold -- their staging, a scratch -- and forget them. */
+static void xfer_holes_drop(GuestXfer *x) {
+    for (int i = 0; i < x->nhole; i++) {
+        if (x->hole[i].map) munmap(x->hole[i].map, x->hole[i].maplen);
+        free(x->hole[i].mem);
+    }
+    x->nhole = 0;
+}
+
+/* Gather `len` guest bytes from `va` -- what a host call that reads them is
+ * handed -- growing no stack: a run in a stack's hole is the zeroes its
+ * growth would map, recorded for xfer_end (`at`: va's offset into the
+ * transfer). -EFAULT at a page that is neither, as copy_from_guest. */
+static int xfer_gather(CPU *c, GuestXfer *x, u8 *dst, u64 va, size_t len, size_t at) {
+    size_t off = 0;
+    while (off < len) {
+        off += copy_from_guest_look(c, dst + off, va + off, len - off);
+        if (off == len) break;
+        size_t h = mem_stack_hole(c, va + off, len - off, ACC_READ);
+        if (!h) return -EFAULT;
+        memset(dst + off, 0, h);
+        XferHole e = { .va = va + off, .len = h, .at = at + off };
+        if (xfer_hole_add(x, &e) < 0) return -ENOMEM;
+        off += h;
+    }
+    return 0;
+}
+
+static int xfer_odirect(GuestXfer *x) {
+    if (x->odirect < 0) {
+        int fl = fcntl(x->fd, F_GETFL);
+        x->odirect = fl >= 0 && (fl & O_DIRECT);
+    }
+    return x->odirect;
+}
+
+/* How long a run of an O_DIRECT transfer one scratch takes: what the host's
+ * own RLIMIT_STACK lets a growsdown mapping grow to, two pages kept back --
+ * the emulator never changes it, the guest's being its own (sys_misc.c) --
+ * and a MiB at most. 0 when it lets none grow at all. */
+static size_t xfer_scratch_max(void) {
+    static size_t v = (size_t)-1;
+    size_t r = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (r == (size_t)-1) {
+        size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+        struct rlimit rl;
+        r = (size_t)1 << 20;
+        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+            r = rl.rlim_cur > 2 * hp + r ? r
+                : rl.rlim_cur > 2 * hp ? (size_t)(rl.rlim_cur - 2 * hp) & ~(size_t)GUEST_PAGE_MASK
+                : 0;
+        __atomic_store_n(&v, r, __ATOMIC_RELAXED);
+    }
+    return r;
+}
+
+/* The hole under a host growsdown mapping, for the run [va, va+len): a
+ * PROT_NONE floor (no access, so it keeps no guard gap), the run's pages
+ * unmapped above it, and one accessible page on top that grows down over
+ * them when the host's copy touches them -- the run lying in them at its own
+ * offset into a page, as the alignment of an O_DIRECT transfer is judged.
+ * Placed low where it can be, out of the way of the host's own top-down
+ * placement: a mapping made there meanwhile would refuse the growth. NULL
+ * when the host will not map it. */
+static u8 *xfer_scratch(u64 va, size_t len, void **mapp, size_t *maplenp) {
+    size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+    u64 g0 = va & ~(u64)GUEST_PAGE_MASK;
+    u64 g1 = (va + len + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK;
+    size_t span = ((size_t)(g1 - g0) + hp - 1) & ~(hp - 1);
+    size_t total = hp + span + hp;
+    void *hint = (void *)(uintptr_t)(sizeof(void *) >= 8 ? 0x10000000UL : 0);
+    u8 *base = mmap(hint, total, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) return NULL;
+    u8 *top = base + hp + span;
+    if (munmap(base + hp, span) != 0 ||
+        mmap(top, hp, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0) != top) {
+        munmap(base, total);
+        return NULL;
+    }
+    *mapp = base;
+    *maplenp = total;
+    return top - (size_t)(g1 - g0) + (size_t)(va - g0);
+}
+
+/* Did the host's copy grow the scratch under run `h` -- is the page its
+ * first byte lies in mapped now? */
+static int xfer_scratch_grew(const XferHole *h) {
+    size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char v;
+    return mincore((void *)((uintptr_t)h->buf & ~(uintptr_t)(hp - 1)), hp, &v) == 0;
+}
+
+/* A run [va, va+len) of a segment in a stack's hole, as the next host iovecs
+ * of the transfer (x->n onward, below `cap`): staging of ours, or for an
+ * O_DIRECT descriptor scratch holes a MiB at most each. 0, -ENOMEM, or 1
+ * when the iovecs ran out first (the rest of it is then the caller's to
+ * stage). */
+static int xfer_hole_run(GuestXfer *x, u64 va, size_t len, int cap) {
+    size_t step = len;
+    int scratch = xfer_odirect(x) && (step = xfer_scratch_max()) != 0;
+    if (!scratch) step = len;
+    for (size_t off = 0; off < len; ) {
+        if (x->n >= cap) return 1;
+        size_t piece = len - off < step ? len - off : step;
+        XferHole h = { .va = va + off, .len = piece, .at = x->total };
+        if (scratch) {
+            h.buf = xfer_scratch(h.va, piece, &h.map, &h.maplen);
+            if (!h.buf) return -ENOMEM;
+        } else {
+            size_t pg = (size_t)(h.va & GUEST_PAGE_MASK);
+            if (posix_memalign(&h.mem, GUEST_PAGE_SIZE, pg + piece) != 0) return -ENOMEM;
+            h.buf = (u8 *)h.mem + pg;
+            memset(h.buf, 0, piece);   /* a write's: what the growth maps */
+        }
+        if (xfer_hole_add(x, &h) < 0) {
+            if (h.map) munmap(h.map, h.maplen);
+            free(h.mem);
+            return -ENOMEM;
+        }
+        x->iov[x->n].iov_base = h.buf;
+        x->iov[x->n].iov_len = piece;
+        x->pin[x->n++] = NULL;
+        x->npin = x->n;
+        x->total += piece;
+        off += piece;
+    }
+    return 0;
+}
+
 /* Stage `len` bytes of the guest vector, from segment `sseg` at `soff`, as
  * the next part of the transfer: gathered now for a host call that reads
  * them, handed back by xfer_end for one that writes them. `per_seg` keeps the
@@ -291,9 +457,11 @@ static int xfer_stage(CPU *c, GuestXfer *x, int sseg, u64 soff, size_t len,
             x->iov[x->n].iov_len = piece;
             x->n++;
         }
-        if (!x->to_guest && piece &&
-            copy_from_guest(c, b + off, x->seg[i].iov_base + o, piece) < 0)
-            return -EFAULT;
+        if (!x->to_guest && piece) {
+            int r = xfer_gather(c, x, b + off, x->seg[i].iov_base + o, piece,
+                                x->stage_at + off);
+            if (r < 0) return r;
+        }
         off += piece;
     }
     if (!per_seg) {
@@ -334,8 +502,10 @@ static int xfer_guard(CPU *c, GuestXfer *x, size_t want, const XferCut *cut,
     size_t off = 0;
     for (int i = 0; i < x->nseg; i++) {
         size_t len = (size_t)x->seg[i].iov_len;
-        if (!x->to_guest && len && copy_from_guest(c, b + off, x->seg[i].iov_base, len) < 0)
-            return -EFAULT;
+        if (!x->to_guest && len) {
+            int r = xfer_gather(c, x, b + off, x->seg[i].iov_base, len, off);
+            if (r < 0) return r;
+        }
         x->iov[x->n].iov_base = b + off;
         x->iov[x->n].iov_len = len + (i == x->nseg - 1 ? g : 0);
         x->n++;
@@ -357,6 +527,15 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
     x->seg = seg;
     x->nseg = nseg;
     x->to_guest = to_guest;
+    x->fd = fd;
+    x->odirect = -1;
+    /* Bytes in a stack's hole, which the measure of the guest's memory
+     * (rw_room) crossed: an O_DIRECT descriptor's are the host's to judge
+     * (xfer_scratch), which only the lend walk below arranges for. */
+    if (g_tls.xfer_hole) {
+        g_tls.xfer_hole = 0;
+        if (xfer_odirect(x)) flags |= XFER_LEND;
+    }
     size_t want = 0;
     for (int i = 0; i < nseg; i++) want += (size_t)seg[i].iov_len;
     /* A buffer that is no user memory at all (sys.h, XferCut.denied). */
@@ -436,28 +615,44 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
             }
             continue;
         }
-        int before = x->n, why;
-        size_t got = guest_lend(c, seg[i].iov_base, len, acc, x->iov, x->pin,
-                                &x->n, cap, &why);
-        x->npin = x->n;
+        int before = x->n, why = LEND_ALL;
+        size_t off = 0;
+        while (off < len) {
+            size_t got = guest_lend(c, seg[i].iov_base + off, len - off, acc,
+                                    x->iov, x->pin, &x->n, cap, &why);
+            x->npin = x->n;
+            x->total += got;
+            off += got;
+            if (off == len || why != LEND_CUT) break;
+            /* A run in a stack's hole, which is not lent: memory of ours
+             * instead, and the stack grown over it after the call as far as
+             * the host got (xfer_hole_run, xfer_end). */
+            size_t h = mem_stack_hole(c, seg[i].iov_base + off, len - off, acc);
+            if (!h) break;   /* LEND_CUT proper: the memory went away */
+            size_t t0 = x->total;
+            int hr = xfer_hole_run(x, seg[i].iov_base + off, h, cap);
+            if (hr < 0) { xfer_end(c, x, 0); return hr; }
+            off += x->total - t0;
+            if (hr > 0) { why = LEND_FULL; break; }
+        }
         if (x->n - before > 1 && !xfer_split_ok(fd, &split)) {
             /* This segment is more than one run and the file may answer each
              * run on its own: stage the whole transfer after all, a segment to
              * an iovec as before, and capped (sys.h). */
             guest_unlend(c, x->pin, x->npin);
+            xfer_holes_drop(x);
             x->n = x->npin = 0;
             x->total = 0;
             size_t cap = want < XFER_STAGE_MAX ? want : XFER_STAGE_MAX;
             if ((r = xfer_stage(c, x, 0, 0, cap, 1)) < 0) { xfer_end(c, x, 0); return r; }
             return 0;
         }
-        x->total += got;
-        if (got == len) continue;
+        if (off == len) continue;
         if (why == LEND_FULL) {
             /* Out of host iovecs: the rest goes as one more, staged. */
             size_t rest = want - x->total;
             if (rest > XFER_STAGE_MAX) rest = XFER_STAGE_MAX;
-            if ((r = xfer_stage(c, x, i, got, rest, 0)) < 0) { xfer_end(c, x, 0); return r; }
+            if ((r = xfer_stage(c, x, i, off, rest, 0)) < 0) { xfer_end(c, x, 0); return r; }
         } else {
             /* LEND_CUT: the guest's memory went away since the caller
              * measured it, and the transfer ends there, as the kernel's copy
@@ -480,6 +675,47 @@ int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
     return 0;
 }
 
+/* Does `fd` discard what is written to it without reading it -- /dev/null
+ * and /dev/zero (write_null, write_zero) -- so that a write from a stack's
+ * hole to it touches nothing? */
+static int xfer_discards(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 &&
+           (minor(st.st_rdev) == 3 || minor(st.st_rdev) == 5);
+}
+
+/* The runs in a stack's hole, after the host call moved `done` bytes: each
+ * one the host got as far as is grown over, as the copy that touched it
+ * grows it on a kernel -- a read's bytes then handed over -- and an O_DIRECT
+ * descriptor's scratch says for itself whether the host's copy touched it. */
+static int xfer_holes_settle(CPU *c, GuestXfer *x, size_t done) {
+    int r = 0, discard = -1;
+    for (int i = 0; i < x->nhole && !r; i++) {
+        const XferHole *h = &x->hole[i];
+        size_t got = done > h->at ? done - h->at : 0;
+        if (got > h->len) got = h->len;
+        int grew;
+        if (h->map) {
+            grew = xfer_scratch_grew(h);
+        } else if (!got) {
+            grew = 0;
+        } else if (x->to_guest) {
+            grew = 1;
+        } else {
+            if (discard < 0) discard = xfer_discards(x->fd);
+            grew = !discard;
+        }
+        if (!grew) continue;
+        if (x->to_guest && !h->buf) continue;   /* in the stage: copied back above */
+        if (x->to_guest && got) {
+            if (copy_to_guest(c, h->va, h->buf, got) < 0) r = -EFAULT;
+        } else if (!mem_stack_touch(c, h->va, x->to_guest ? ACC_WRITE : ACC_READ)) {
+            r = -EFAULT;
+        }
+    }
+    return r;
+}
+
 int xfer_end(CPU *c, GuestXfer *x, size_t done) {
     int r = 0;
     if (x->stage && x->to_guest && done > x->stage_at) {
@@ -497,6 +733,11 @@ int xfer_end(CPU *c, GuestXfer *x, size_t done) {
             left -= piece;
         }
     }
+    if (x->nhole && !r) r = xfer_holes_settle(c, x, done);
+    xfer_holes_drop(x);
+    free(x->hole);
+    x->hole = NULL;
+    x->caphole = 0;
     guest_unlend(c, x->pin, x->npin);
     if (x->guarded) guardbuf_free(&x->guard);
     else free(x->stage_mem);

@@ -243,6 +243,21 @@ typedef struct { u8 *map; size_t maplen; } GuardBuf;
 u8  *guardbuf_map(GuardBuf *o, size_t head, size_t len);
 void guardbuf_free(GuardBuf *o);
 
+/* A run of a transfer in a stack's hole (mmu.h, mem_stack_hole): handed to
+ * the host as memory of ours -- staging, or for an O_DIRECT descriptor the
+ * hole under a growsdown mapping of the host's own (xfer_scratch) -- and
+ * grown over by xfer_end as far as the host got, as a kernel's copy grows it
+ * when it touches the run. */
+typedef struct XferHole {
+    u64 va;                       /* the run's first byte: what a copy touches first */
+    size_t len;
+    size_t at;                    /* its offset into the transfer */
+    u8 *buf;                      /* where the host has it; NULL: inside x->stage */
+    void *mem;                    /* ...in this staging of ours, or */
+    void *map;                    /* ...below this host growsdown mapping (O_DIRECT) */
+    size_t maplen;
+} XferHole;
+
 typedef struct GuestXfer {
     struct iovec *iov;            /* what the host call is handed */
     HostMap **pin;                /* the allocation under each lent run */
@@ -262,6 +277,10 @@ typedef struct GuestXfer {
     GuardBuf guard;               /* the staging, when it is guarded */
     int guarded;
     struct iovec iov1;            /* iov[] for a one-piece staged transfer */
+    int fd;                       /* the descriptor the transfer is for */
+    int odirect;                  /* ...opened O_DIRECT: -1 until asked */
+    XferHole *hole;               /* the runs in a stack's hole, in order */
+    int nhole, caphole;
 } GuestXfer;
 
 int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,

@@ -2936,14 +2936,44 @@ bool mem_reachable(CPU *c, u64 va, unsigned size, AccType acc) {
     if (p) return true;
     if (perm || saved) return false;
     /* The hole under a stack: reachable if the stack would grow over it with
-     * the permission, which the copy that touches it then does. */
+     * the permission, which the copy that touches it then does -- the one
+     * that moves bytes there, and no other (xfer_begin is told). */
     AddrSpace *as = cpu_as(c);
     as_lock();
     int i = as_stack_grows_to(c, va & A64_TBI_MASK);
     bool ok = i == INT_MAX ||
               (i >= 0 && (as->regions[i].prot & need) == need);
     as_unlock();
+    if (ok && i != INT_MAX) g_tls.xfer_hole = 1;
     return ok;
+}
+
+size_t mem_stack_hole(CPU *c, u64 va, size_t len, AccType acc) {
+    if (!len || uaddr_tag_refused(va)) return 0;
+    u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
+    u64 a = va & A64_TBI_MASK;
+    AddrSpace *as = cpu_as(c);
+    size_t n = 0;
+    as_lock();
+    if (!pte_get(as, a) && !as_find_region(as, a)) {
+        int i = as_stack_grows_to(c, a);
+        if (i >= 0 && i != INT_MAX && (as->regions[i].prot & need) == need) {
+            u64 run = as->regions[i].start - a;
+            n = run < len ? (size_t)run : len;
+        }
+    }
+    as_unlock();
+    return n;
+}
+
+int mem_stack_touch(CPU *c, u64 va, AccType acc) {
+    u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
+    bool perm;
+    u8 saved = g_tls.nogrow;
+    g_tls.nogrow = 0;
+    u8 *p = translate(c, va, need, &perm);
+    g_tls.nogrow = saved;
+    return p != NULL;
 }
 
 void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
@@ -2976,6 +3006,12 @@ size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
      * refills a file mapping's page the file has grown into, heals a vfork
      * child's tracked page, snapshotting it first, so the bytes the host is
      * about to write reach the parent. */
+    /* A page in a stack's hole is not lent: the growth over it belongs to
+     * the copy that moves bytes there, which is the caller's to make once it
+     * knows how far the host got (xfer_end). So the walk grows nothing, and
+     * stops there as it stops at any page it cannot lend. */
+    u8 saved = g_tls.nogrow;
+    g_tls.nogrow = 1;
     as_lock();
     while (done < len) {
         u64 p = va + done;
@@ -3002,6 +3038,7 @@ size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
         done += chunk;
     }
     as_unlock();
+    g_tls.nogrow = saved;
     return done;
 }
 
@@ -3130,6 +3167,14 @@ size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len) {
     copy_from_guest_partial_walk(c, dst, va, len, &done);
     BUS_GUARD_END();
     return done;
+}
+
+size_t copy_from_guest_look(CPU *c, void *dst, u64 va, size_t len) {
+    u8 saved = g_tls.nogrow;
+    g_tls.nogrow = 1;
+    size_t n = copy_from_guest_partial(c, dst, va, len);
+    g_tls.nogrow = saved;
+    return n;
 }
 
 static void __attribute__((noinline))

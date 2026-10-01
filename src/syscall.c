@@ -630,6 +630,7 @@ void syscall_dispatch(CPU *c) {
         /* Its pointers are this thread's, judged by its tagged-address ABI
          * (mem.c, uaddr_tag_refused). */
         g_tls.uaccess = 1;
+        g_tls.xfer_hole = 0;
         ret = fn(c, a0, a1, a2, a3, a4, a5);
         g_tls.uaccess = 0;
         as_tlb_block_end();
