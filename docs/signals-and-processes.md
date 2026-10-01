@@ -391,7 +391,13 @@ call, so `SIGEV_THREAD` timers depend on it. The 128-byte `siginfo` it hands
 back is the delivery frame's (`siginfo_to_guest`), laid out by `si_code` as
 `siginfo_layout` does — a kernel-raised instance by its signal, anything a
 process sent as sender pid/uid and payload, so a `kill(SIGSEGV)` carries the
-sender and not an address.
+sender and not an address. A child's notice is `_sigchld` whole: pid, uid,
+status, and the child's user and system time in clock ticks, which
+`do_notify_parent` puts there and which used to be left out (zeroes in a
+handler's siginfo and from `sigwaitinfo`, where a `signalfd` record, the
+host's own, had them) — for `SIGCHLD`, and for the other signal a clone child
+may die with, whose 48 bytes a 64-bit kernel hands over as they were built
+(`tests/fixtures/chldinfo.c`).
 
 ### `signalfd(2)`
 

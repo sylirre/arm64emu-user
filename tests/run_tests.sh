@@ -2884,6 +2884,12 @@ check_fixture waitany $'wait4(-1): ordinary child status=4\nwait4(-1) with only 
 # SIGCHLD; the block is the kernel's.
 check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone' \
     "A64_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
+# What a child's notice carries -- code, pid, status and the child's user and
+# system time in clock ticks -- through a handler, sigwaitinfo and a signalfd,
+# and for a clone child that dies with another signal (signal.c,
+# siginfo_to_guest). Self-checking: qemu-user forks a clone child with SIGCHLD;
+# the block is the kernel's.
+check_fixture chldinfo $'handler: code=1 status=7 pid=child times ok\nsigwaitinfo: code=1 status=8 pid=child times ok\nsignalfd: code=1 status=9 pid=child times ok\nclone child: sig=SIGUSR2 code=1 status=3 pid=child times ok\ndone'
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

@@ -126,6 +126,8 @@ typedef struct {
     int code;
     int err;     /* si_errno; only a seccomp trap's RET_DATA uses it */
     int pid, uid, status;
+    s64 utime, stime;   /* a child's notice (si_code > 0): its CPU time in
+                         * clock ticks, as do_notify_parent puts it there */
     u64 addr;
     s64 value;   /* full guest sigval width, even on a 32-bit host */
     int thr;     /* aimed at this thread alone (tkill/tgkill, a SIGEV_THREAD_ID
@@ -934,6 +936,7 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
     p->pid = c.pid;
     p->uid = (int)c.uid;
     p->status = (int)c.value;
+    p->utime = p->stime = 0;
     p->addr = (u64)(u32)c.pid | (u64)c.uid << 32;
     p->value = c.value;
     p->thr = c.tid != 0 || c.code == SI_TKILL;
@@ -1378,6 +1381,14 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     p->pid = (int)si->si_pid;
     p->uid = (int)si->si_uid;
     p->status = si->si_status;
+    /* A child's CPU time, where the layout has it: every kernel-raised
+     * siginfo that is neither a fault's nor a seccomp trap's (siginfo_to_guest
+     * below). Zero where the kernel put nothing there. */
+    p->utime = p->stime = 0;
+    if (p->code > 0 && !is_sync_sig(sig) && !(sig == SIGSYS && p->code == SIG_SECCOMP_CODE)) {
+        p->utime = (s64)si->si_utime;
+        p->stime = (s64)si->si_stime;
+    }
     p->addr = (u64)(uintptr_t)si->si_addr;
     p->value = (s64)(uintptr_t)si->si_value.sival_ptr;   /* full width on LP64 */
     /* Aimed at this thread alone: the one kind a siginfo names outright
@@ -2122,6 +2133,8 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
         n.ssi_pid = (u32)p.pid;
         n.ssi_uid = (u32)p.uid;
         n.ssi_status = p.status;
+        n.ssi_utime = (u64)p.utime;
+        n.ssi_stime = (u64)p.stime;
     } else if (p.code > 0 && is_sync_sig(p.signo)) {
         n.ssi_addr = p.addr;
     } else if (p.code == SI_TIMER) {
@@ -2747,20 +2760,33 @@ void sig_after_trap(CPU *c) {
 
 /* One PendSig as the guest's 128-byte siginfo, into `si` (zeroed here). The
  * layout is the one siginfo_layout picks: by the signal for a kernel-raised
- * instance (si_code > 0 -- a fault's address, a child's status, a seccomp
- * trap's call), and the _kill/_rt one, pid and uid and the payload, for
+ * instance (si_code > 0 -- a fault's address, a seccomp trap's call, a
+ * child's notice), and the _kill/_rt one, pid and uid and the payload, for
  * anything a process sent (SI_USER, SI_TKILL, SI_QUEUE are all <= 0) -- a
  * kill(SIGSEGV) carries the sender, not an address. The delivery frame and
- * rt_sigtimedwait both hand out this. */
+ * rt_sigtimedwait both hand out this.
+ *
+ * A child's notice is _sigchld -- pid, uid, status, and the child's user and
+ * system time in clock ticks -- for SIGCHLD, and for whatever other signal a
+ * clone child dies with: a 64-bit kernel copies the 48 bytes of its siginfo
+ * as they are, whichever layout the number would name, and do_notify_parent
+ * builds them as a child's. The two times used to be left out, zeroes where
+ * the kernel puts what the child cost. Any other kernel-raised siginfo of
+ * those signals (SIGIO's band and fd, SI_KERNEL's nothing) comes through the
+ * same words as the host laid it out. */
 static void siginfo_to_guest(u8 *si, int sig, const PendSig *info) {
     memset(si, 0, 128);
     wr32(si, 0, (u32)sig);
     wr32(si, 4, (u32)info->err);
     wr32(si, 8, (u32)info->code);
-    if (info->code > 0 && sig == SIGCHLD) {
+    if (info->code > 0 && !is_sync_sig(sig) &&
+        !(sig == SIGSYS && info->code == SIG_SECCOMP_CODE)) {
         wr32(si, 16, (u32)info->pid);
         wr32(si, 20, (u32)info->uid);
-        wr32(si, 24, (u32)info->status);
+        wr64(si, 24, (u64)info->value);    /* the word status shares... */
+        wr32(si, 24, (u32)info->status);   /* ...its low half, the same bytes */
+        wr64(si, 32, (u64)info->utime);
+        wr64(si, 40, (u64)info->stime);
     } else if (info->code > 0 && is_sync_sig(sig)) {
         wr64(si, 16, info->addr);
     } else if (sig == SIGSYS && info->code == SIG_SECCOMP_CODE) {
@@ -2790,10 +2816,14 @@ static void pendsig_from_guest(PendSig *p, int sig, const u8 *si) {
     p->signo = sig;
     memcpy(&w, si + 4, 4);  p->err = (int)w;
     memcpy(&w, si + 8, 4);  p->code = (int)w;
-    if (p->code > 0 && sig == SIGCHLD) {
+    if (p->code > 0 && !is_sync_sig(sig) &&
+        !(sig == SIGSYS && p->code == SIG_SECCOMP_CODE)) {
         memcpy(&w, si + 16, 4); p->pid = (int)w;
         memcpy(&w, si + 20, 4); p->uid = (int)w;
+        memcpy(&q, si + 24, 8); p->value = (s64)q;
         memcpy(&w, si + 24, 4); p->status = (int)w;
+        memcpy(&q, si + 32, 8); p->utime = (s64)q;
+        memcpy(&q, si + 40, 8); p->stime = (s64)q;
     } else if (p->code > 0 && is_sync_sig(sig)) {
         memcpy(&q, si + 16, 8); p->addr = q;
     } else if (sig == SIGSYS && p->code == SIG_SECCOMP_CODE) {
