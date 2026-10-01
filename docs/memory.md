@@ -455,19 +455,29 @@ the limit says — address space it has 128 TiB of — so a limit raised later i
 room already there; an ILP32 host reserves what the limit allows, up to 64 MB.
 Past the room, the allocation is extended downward if the host addresses under
 it are free (`MAP_FIXED_NOREPLACE`, checked by where the mapping lands on a
-kernel older than 4.17, which ignores the flag); failing that, the region is
-moved to a larger reservation of its own, its bytes copied — but only with no
-other guest thread in the address space, no run of the backing lent to a host
-syscall, and not for `mem_host_ptr`, whose caller may still hold an earlier
-pointer (the core's LSE atomics and exclusives take theirs there, so on this
-tier such an access as the *first* touch of the hole faults where a plain load
-or store grows it). A stack that can do none of it stops growing: `SIGSEGV`,
-which is what a kernel out of address space answers too. Pages a `munmap` took
-off a stack's bottom keep their bytes in the allocation (backing is released
-whole), so growing back over them zeroes them first: a grown page is the zero
-page. `A64_STACKGROW_FORCE_MOVE` reserves no room and never extends, putting
-every growth on the moving tier; the suite runs `tests/fixtures/growsdown.c`
-over it too.
+kernel older than 4.17, which ignores the flag); failing that, the stack goes
+on in a **piece** of backing of its own: a region below the one it grew from,
+alike in everything but where its backing lies — a fresh allocation, with room
+below it for the growth after this one (`region_grow_piece`). Nothing already
+mapped moves, so whatever holds a pointer into the stack keeps a good one:
+another guest thread's translation, the host pointer the core's LSE atomics and
+exclusives take (`mem_host_ptr`), a run of it lent to a host syscall. The stack
+used to be moved to a larger reservation instead, its bytes copied, which none
+of those could survive — so on that tier the growth was refused, a `SIGSEGV`,
+whenever another guest thread was in the address space, a run was lent, or
+the touch was an atomic's. The pieces are one mapping to the guest
+(`as_same_vma`, by the `stack_id` every growsdown mapping is given and its
+splits and pieces keep): one line in `/proc/<pid>/maps` — glibc's
+`pthread_getattr_np` measures the main thread's stack from that line and the
+end of the one before it — the whole of it held to `RLIMIT_STACK`, and the
+whole of it what `mprotect(PROT_GROWSDOWN)` reaches down through. A stack whose
+host can give it no backing at all stops growing: `SIGSEGV`, which is what a
+kernel out of memory answers too. Pages a `munmap` took off a stack's bottom
+keep their bytes in the allocation (backing is released whole), so growing back
+over them zeroes them first: a grown page is the zero page.
+`A64_STACKGROW_FORCE_PIECE` reserves no room and never extends, putting every
+growth on that last tier; the suite runs `tests/fixtures/growsdown.c` and
+`growsnomove.c` over it too.
 
 **Where a stack is placed.** A kernel's top-down layout gives a
 `MAP_GROWSDOWN` mapping free space beneath it for nothing — the next mapping
@@ -493,9 +503,11 @@ accessible, a `PROT_NONE` and a growsdown mapping below, `RLIMIT_STACK` and
 `RLIMIT_AS`, a `read` into the hole, a tracer's `PEEK` against
 `process_vm_readv`, `mincore`, a regrown page, the permission faults, a signal
 frame, a fork child's copy, and the accounting. `tests/fixtures/growsnomove.c`
-has the rows the moving tier cannot give: another thread growing a stack, and
-an atomic as its first touch. qemu-user is no oracle for any of it — it sizes
-the main stack from its own `-s` option.
+has the rows a stack moved to grow could not give: another thread growing it,
+an atomic as its first touch, and one transfer the host makes into its pages
+and the hole below at once — and `mprotect(PROT_GROWSDOWN)` reaching through
+every piece. qemu-user is no oracle for any of it — it sizes the main stack
+from its own `-s` option.
 
 ### `mremap(MREMAP_DONTUNMAP)`
 

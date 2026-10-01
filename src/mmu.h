@@ -263,6 +263,14 @@ typedef struct Region {
                                * what mprotect(PROT_GROWSDOWN) reaches down
                                * through to the region's start. Travels like
                                * forkflags */
+    u32  stack_id;            /* ...and which stack: every growsdown mapping
+                               * gets an id of its own, which its splits and
+                               * the pieces it grows keep (0: none). A stack
+                               * that grew past the host room under its
+                               * backing goes on in a region of its own below
+                               * -- another allocation, nothing moved -- and
+                               * the two are still ONE mapping to the guest
+                               * wherever they agree (as_same_vma) */
 } Region;
 
 /* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
@@ -327,6 +335,7 @@ typedef struct AddrSpace {
                                * see as_meminfo, which is where sampling
                                * happens */
     u32 npgtables;            /* live second-level tables (VmPTE) */
+    u32 stack_ids;            /* the last Region.stack_id handed out */
 } AddrSpace;
 
 /* The guest's memory footprint as its own /proc reports it. Bytes throughout;
@@ -484,6 +493,16 @@ const Region *as_find_region(AddrSpace *as, u64 va);
  * instead of a page at a time -- a range the guest names can span the whole
  * address space, and the kernel walks it vma by vma. Same locking as above. */
 const Region *as_next_region(AddrSpace *as, u64 va);
+/* Are `a` and `b` -- `a` immediately below `b` in the list -- parts of ONE
+ * mapping as the guest knows it: two pieces of a stack that grew past the
+ * host room under its backing (Region.stack_id), agreeing in everything else
+ * a vma carries. /proc/<pid>/maps prints them as one line, and a stack's
+ * size, its growth limit and mprotect(PROT_GROWSDOWN) take them together. */
+int  as_same_vma(const Region *a, const Region *b);
+/* The bounds of the mapping region `i` of as->regions is a part of
+ * (as_same_vma). Caller holds as_lock. */
+u64  as_vma_start(AddrSpace *as, int i);
+u64  as_vma_end(AddrSpace *as, int i);
 /* stack_guard_gap: how far below a VM_GROWSDOWN region the kernel keeps the
  * next accessible mapping, when it grows the region and when it places a
  * mapping (vm_start_gap) -- 256 pages, the default of its boot parameter. */

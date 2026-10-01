@@ -392,12 +392,11 @@ static void help(void) {
                         "notices in the emulator instead of leaving it to the "
                         "host (the tier a host that ignores the two flags, "
                         "qemu-user, is served by)."},
-        {"A64_STACKGROW_FORCE_MOVE", "Reserve no host room below a stack and "
-                        "never extend its backing downward, so a stack that "
-                        "grows is moved to new backing (the tier a host whose "
-                        "address space under a stack is taken is served by; "
-                        "with another guest thread running, the growth is "
-                        "refused)."},
+        {"A64_STACKGROW_FORCE_PIECE", "Reserve no host room below a stack "
+                        "and never extend its backing downward, so a stack "
+                        "that grows goes on in a new piece of backing of its "
+                        "own (the tier a host whose address space under a "
+                        "stack is taken is served by)."},
     };
     static const char *const examples[] = {
         "arm64chroot ./rootfs /bin/sh",

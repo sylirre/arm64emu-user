@@ -538,10 +538,11 @@ SYSDEF(munmap) {
  * such check and ignores bits it does not know, as the kernel's does.)
  *
  * PROT_GROWSDOWN names a VM_GROWSDOWN mapping -- the stack, one mapped
- * MAP_GROWSDOWN -- and moves the range's start down to that mapping's,
- * which is how glibc makes the whole stack executable for a library that
- * needs it (_dl_make_stack_executable). The first mapping the range touches
- * must be one (EINVAL otherwise; ENOMEM if the range touches none).
+ * MAP_GROWSDOWN -- and moves the range's start down to that mapping's (every
+ * piece of it, as_vma_start), which is how glibc makes the whole stack
+ * executable for a library that needs it (_dl_make_stack_executable). The
+ * first mapping the range touches must be one (EINVAL otherwise; ENOMEM if
+ * the range touches none).
  * PROT_GROWSUP has no mapping to name on arm64, which has no VM_GROWSUP:
  * EINVAL, or ENOMEM if the range's start is not mapped. */
 SYSDEF(mprotect) {
@@ -564,7 +565,7 @@ SYSDEF(mprotect) {
         if (!first || first->start >= end) r = -ENOMEM;
         else if (grows & G_PROT_GROWSUP) r = first->start > start ? -ENOMEM : -EINVAL;
         else if (!first->growsdown) r = -EINVAL;
-        else start = first->start;
+        else start = as_vma_start(as, (int)(first - as->regions));
     }
     if (!r) r = guest_protect(as, start, end - start, pte);
     as_unlock();

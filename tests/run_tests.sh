@@ -2761,12 +2761,16 @@ check_fixture stackrlimit $'tiny=1\nsmall=1\ndefault=1\nlarge=1\nscales=1\ndone'
 # tracer's PEEK and POKE and a vfork child's store, but not from
 # process_vm_readv or mincore. Self-checking: every line is what this same
 # fixture prints built for the host and run on a real kernel (qemu-user sizes
-# the main stack from its own -s option). Single-threaded, so it runs a second
-# time on the tier that has to move a stack to grow it; growsnomove has the
-# rows only the other tiers can give.
+# the main stack from its own -s option). Both run a second time on the tier
+# that gives a stack a new piece of backing at every growth (mem.c,
+# region_grow_piece); growsnomove has another thread growing a stack, an
+# atomic as the first touch and a transfer lent to the host as it grows one,
+# which a stack moved to grow could not give, and mprotect(PROT_GROWSDOWN)
+# reaching through every piece.
 check_fixture growsdown $'initial stack: [stack], 128..256 KiB: 1\nVmStk 128..256 kB: 1\nraised to 64 MiB after exec, 24 MiB deep: ok\nlowered to 512 KiB after exec: Segmentation fault, depth 64..128: 1\nplaced by the system, 1 and 64 pages below: 1 1, start moved: 1\nnext mapping clear of its guard gap: 1\nhint inside the guard gap taken: 0\n4 MiB growsdown: VmStk +4096 kB, VmData +0 kB\ngrown 16 pages: VmStk +4160 kB\nover RLIMIT_DATA: mmap ok, mremap ok\npage below: 1, start moved: 1\n10 pages below: 1, start moved: 1\npast RLIMIT_STACK: 0\nto RLIMIT_STACK: 1\nguard: 1.5 MiB above the mapping below: 1\nguard: 0.5 MiB above it: 0\nguard: 0.5 MiB above it, PROT_NONE: 1\ngrowsdown below, 1 page between: 1\nread into the hole: 3, start moved: 1\nprocess_vm_readv into the hole: EFAULT\npeek into the hole: read\nprocess_vm_readv, the hole grown into: EFAULT\npoke into the hole: ok, reads back 42\nmunmap\'d bottom page regrown: 1, reads 0\nwrite below a read-only one: 0 SEGV_ACCERR, start moved: 1\ncall below a non-executable one: 0 SEGV_ACCERR, start moved: 1\nmincore of the hole: Cannot allocate memory, start moved: 0\nRLIMIT_AS: 8 pages 1, 256 pages 0\nlimit raised past the one it was made under, 8 MiB below: 1, kept: 1, start moved: 1\nsignal delivered on it, frame below: 1, start moved: 1\nvfork child writes in the stack\'s hole: in the hole 1, parent reads 42, grown 1\nfork child grows its own: 1, parent\'s unmoved: 1\ndone' \
-    "A64_STACKGROW_FORCE_MOVE=1" "move-tier"
-check_fixture growsnomove $'thread grows it: 1, start moved: 1\nthe other thread sees the page: 1\natomic first touch: 1, value 5, start moved: 1\ndone'
+    "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
+check_fixture growsnomove $'thread grows it: 1, start moved: 1\nthe other thread sees the page: 1\natomic first touch: 1, value 5, start moved: 1\none transfer into it and below: 68 pages, start moved: 1, bytes 1 1\ngrown 300 pages: 1, PROT_GROWSDOWN from the top: 0, bottom page rwxp\ndone' \
+    "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
 # execve's argument-limit accounting (elf.c and the argv/envp import in
 # sys_proc.c). A kernel measures argv+envp
 # against a share of RLIMIT_STACK -- floored at ARG_MAX, capped at three

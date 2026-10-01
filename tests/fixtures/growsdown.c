@@ -20,9 +20,9 @@
  * main stack from its own -s option -- so every line below was taken from a
  * native kernel running this same program built for the host. The rows are
  * placed in 64 MiB holes of their own, a GiB below the first free mapping, so
- * nothing a libc maps meanwhile lands in them; and the run is single-threaded,
- * so it holds on the tier that has to move a stack to grow it (run_tests.sh
- * runs it there too). growsthread.c has the thread. */
+ * nothing a libc maps meanwhile lands in them. run_tests.sh runs it a second
+ * time on the tier that gives a stack a new piece of backing at every growth
+ * (A64_STACKGROW_FORCE_PIECE). growsnomove.c has the thread. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

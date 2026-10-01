@@ -241,7 +241,11 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
  * every file mapping for exactly this purpose). Region records keep their
  * creation prot; after mprotect the PTEs are the truth — the loader sets ELF
  * segment protections that way — so emit runs of equal page protection,
- * kernel-style. */
+ * kernel-style. The pieces of a stack that grew past the host room under its
+ * backing are regions of their own and one mapping to the guest
+ * (as_same_vma): one line, as the kernel's single vma is. glibc's
+ * pthread_getattr_np takes the main thread's stack size from that line and
+ * the end of the one before it. */
 static void put_maps(int fd, struct Machine *m) {
     char croot[PATH_MAX];
     croot_get(m, croot);   /* before as_lock: the task lock ranks outside it */
@@ -249,6 +253,11 @@ static void put_maps(int fd, struct Machine *m) {
     AddrSpace *as = &m->as;
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
+        int last = i;   /* the mapping's top piece */
+        while (last + 1 < as->nregions &&
+               as_same_vma(&as->regions[last], &as->regions[last + 1]))
+            last++;
+        u64 end = as->regions[last].end;
         /* Region paths are namespace-absolute guest paths; report them as the
          * guest sees them now (a sandbox that pivot_root'd would not recognize
          * its own mapped files otherwise). */
@@ -261,13 +270,13 @@ static void put_maps(int fd, struct Machine *m) {
         if (!name) {
             if (r->start >= as->brk_start && r->start < as->brk)
                 name = "[heap]";
-            else if (r->start < as->stack_top && as->stack_top <= r->end)
+            else if (r->start < as->stack_top && as->stack_top <= end)
                 name = "[stack]";
         }
         u64 run = r->start;
         u32 prot = as_page_prot(as, run);
         for (u64 pg = r->start + GUEST_PAGE_SIZE; ; pg += GUEST_PAGE_SIZE) {
-            u32 p = pg < r->end ? as_page_prot(as, pg) : ~0u;
+            u32 p = pg < end ? as_page_prot(as, pg) : ~0u;
             if (p != prot) {
                 dprintf(fd, "%08llx-%08llx %c%c%c%c %08llx 00:00 0%s%s\n",
                         (unsigned long long)run, (unsigned long long)pg,
@@ -281,8 +290,9 @@ static void put_maps(int fd, struct Machine *m) {
                 run = pg;
                 prot = p;
             }
-            if (pg >= r->end) break;
+            if (pg >= end) break;
         }
+        i = last;
     }
     as_unlock();
 }
