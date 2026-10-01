@@ -55,7 +55,8 @@ SYSDEF(shmat) {
     int readonly = (shmflg & G_SHM_RDONLY) ? 1 : 0;
 
     u64 size = 0;
-    int fd = shmbroker_at(c->m, shmid, readonly, &size);
+    int seglocked = 0;
+    int fd = shmbroker_at(c->m, shmid, readonly, &size, &seglocked);
     if (fd < 0) return (u64)(s64)fd;
 
     u64 len = (size + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK;
@@ -92,6 +93,10 @@ SYSDEF(shmat) {
         addr = as_find_free(as, len);
         if (!addr) err = -ENOMEM;
     }
+    /* do_shmat maps it through do_mmap, which locks it under mlockall
+     * (MCL_FUTURE) -- EAGAIN where RLIMIT_MEMLOCK has no room for it. */
+    u32 lock = as->def_lock;
+    if (!err && !as_mlock_future_ok(c->m, lock, len)) err = -EAGAIN;
     if (!err) {
         /* MAP_SHARED so stores are visible to every process attached to this
          * segment; the mapping keeps the segment memory alive after the fd
@@ -99,7 +104,11 @@ SYSDEF(shmat) {
          * punches the range first). */
         int r = guest_map_file(as, addr, len, pte, fd, 0, 1, NULL);
         if (r < 0) err = r;
-        else       shm_att_add_local(c->m, shmid, addr, len);
+        else {
+            shm_att_add_local(c->m, shmid, addr, len);
+            if (lock) as_lock_new(as, addr, len, lock);
+            if (seglocked) as_shm_lock_hint(as, addr, len, 1);
+        }
     }
     as_unlock();
     broker_fd_close(fd);             /* mapping now backs it; drop the host fd */
@@ -190,6 +199,18 @@ SYSDEF(shmctl) {
     if (cmd == G_IPC_STAT || cmd == G_SHM_STAT || cmd == G_SHM_STAT_ANY) {
         u64 e = shm_write_ds(c, buf_va, &st);
         if (e) return e;
+    }
+    /* SHM_LOCK / SHM_UNLOCK are the broker's to account (the segment's mode,
+     * the locker's user against its RLIMIT_MEMLOCK); the host's locks on the
+     * pages follow in this process's own attachments of it. */
+    if (cmd == G_SHM_LOCK || cmd == G_SHM_UNLOCK) {
+        as_lock();
+        for (int i = 0; i < m->shm_att_count; i++)
+            if (m->shm_att[i].shmid == shmid)
+                as_shm_lock_hint(&m->as, m->shm_att[i].va,
+                                 (m->shm_att[i].size + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK,
+                                 cmd == G_SHM_LOCK);
+        as_unlock();
     }
     return (u64)(s64)r;
 }

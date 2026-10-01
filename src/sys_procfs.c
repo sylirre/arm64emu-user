@@ -1445,9 +1445,10 @@ static const char *const vm_keys[VM_NKEYS] = {
     "VmData", "VmStk", "VmExe", "VmLib", "VmPTE", "VmSwap"
 };
 
-/* The value for one of the size lines, in kB. mlock is a no-op here and there
- * is no guest swap, so VmLck/VmPin/VmSwap are structurally zero rather than
- * unknown. VmPTE is the emulator's own second-level tables: eight bytes per
+/* The value for one of the size lines, in kB. VmLck is the locked_vm the
+ * mlock family keeps (mem.c); nothing pins guest pages and there is no guest
+ * swap, so VmPin/VmSwap are structurally zero rather than unknown. VmPTE is
+ * the emulator's own second-level tables: eight bytes per
  * mapped guest page, which is exactly what a kernel's leaf page tables cost,
  * so the figure means what the guest expects it to mean even though the shape
  * of the table is not a kernel's. The resident lines are not here: they need a
@@ -1457,6 +1458,7 @@ static u64 vm_value_kb(const ProcMem *pm, const AsMem *mi, int k) {
     switch (k) {
     case VM_PEAK:     return pm->peak >> 10;
     case VM_SIZE:     return pm->size >> 10;
+    case VM_LCK:      return pm->locked >> 10;
     case VM_HWM:      return mi->rss_peak >> 10;
     case VM_RSS:      return (mi->rss_anon + mi->rss_file + mi->rss_shmem) >> 10;
     case VM_RSSANON:  return mi->rss_anon >> 10;
@@ -1467,7 +1469,7 @@ static u64 vm_value_kb(const ProcMem *pm, const AsMem *mi, int k) {
     case VM_EXE:      pm_text_lib(pm, &text, &lib); return text >> 10;
     case VM_LIB:      pm_text_lib(pm, &text, &lib); return lib >> 10;
     case VM_PTE:      return pm->pgtables >> 10;
-    default:          return 0;   /* VmLck, VmPin, VmSwap */
+    default:          return 0;   /* VmPin, VmSwap */
     }
 }
 

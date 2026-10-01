@@ -1804,6 +1804,9 @@ Permission checks use the guest's effective creds carried in each request
 index (and aggregate page total), and `SHM_STAT` maps an index to a segment, so
 `ipcs -m` lists the guest's segments (not the host's). Note that with an isolated
 per-invocation namespace, the segment ids and totals are the guest's own.
+`SHM_LOCK`/`SHM_UNLOCK` are `shmctl_do_lock`'s, charged to the locker's user
+against its `RLIMIT_MEMLOCK` (`docs/memory.md`, *Locked memory*); they used to
+be `EINVAL`.
 
 Related: `mmap(MAP_SHARED | MAP_ANONYMOUS)` is backed the same way — an anonymous
 `memfd` mapped `MAP_SHARED` (`sys_mm.c`) — so a nameless shared region stays

@@ -274,8 +274,8 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * non-guest host tasks; v7 holds the id maps as extents, all 340 of the
      * kernel's ceiling, where v6 held 256 bytes of their text; v8 the owner's
      * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
-     * the state word.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v10.%u.%08x",
+     * the state word; v11 the owner's locked memory, VmLck.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v11.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -342,9 +342,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v10.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v11.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v10.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v11.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -538,6 +538,9 @@ struct BReq {
     s32 val;                  /* semctl SETVAL | msgctl IPC_SET msg_qbytes */
     s64 mtype;                /* msgsnd: message type | msgrcv: msgtyp */
     s64 timeout_ns;           /* semtimedop relative timeout; -1 = untimed */
+    u64 memlock;              /* caller's RLIMIT_MEMLOCK (SHM_LOCK) */
+    u32 ruid;                 /* caller's real uid: whose locked shm it is */
+    u32 caplock;              /* caller holds CAP_IPC_LOCK (a fake root) */
 };
 
 struct BResp {
@@ -578,9 +581,39 @@ struct Seg {
     int rmid;                 /* IPC_RMID pending: free at last detach */
     struct SegAtt att[SHM_ATT_TRACK];
     int natt;
+    int locked;               /* SHM_LOCK: SHM_LOCKED in its mode... */
+    u32 lock_uid;             /* ...charged to this user's locked shm */
 };
 
 static struct Seg g_seg[SHM_SEG_MAX];
+
+#define G_SHM_LOCKED 02000   /* ipc_perm.mode: the segment is SHM_LOCKed */
+
+/* What SHM_LOCK charges each user: the kernel's per-user locked-shm count
+ * (user_shm_lock, on the locker's ucounts), held to the locker's own
+ * RLIMIT_MEMLOCK, in pages. Kept with the segments, which outlive their
+ * lockers, and given back when a locked segment is unlocked or destroyed. */
+#define SHM_LOCK_USERS 64
+static struct { u32 uid; u64 pages; } g_shmlock[SHM_LOCK_USERS];
+
+static u64 *shmlock_count(u32 uid, int make) {
+    int free_ = -1;
+    for (int i = 0; i < SHM_LOCK_USERS; i++) {
+        if (g_shmlock[i].pages && g_shmlock[i].uid == uid) return &g_shmlock[i].pages;
+        if (!g_shmlock[i].pages && free_ < 0) free_ = i;
+    }
+    if (!make || free_ < 0) return NULL;
+    g_shmlock[free_].uid = uid;
+    return &g_shmlock[free_].pages;
+}
+
+static void shm_unlock_charge(struct Seg *s) {
+    if (!s->locked) return;
+    u64 *n = shmlock_count(s->lock_uid, 0);
+    u64 pages = (s->size + 4095) / 4096;
+    if (n) *n = *n > pages ? *n - pages : 0;
+    s->locked = 0;
+}
 static s32 g_next_shmid = 1;
 
 /* ---- guest memfd_create fallback tier: the seal registry ----------------
@@ -812,6 +845,7 @@ static struct Seg *shm_find(s32 shmid) {
 }
 
 static void shm_free(struct Seg *s) {
+    shm_unlock_charge(s);                 /* shm_destroy: shmem_lock(..., 0) */
     if (s->memfd >= 0) close(s->memfd);   /* the last reference: file tier or not */
     memset(s, 0, sizeof *s);   /* used = 0 */
 }
@@ -962,6 +996,7 @@ static s32 shm_do_at(struct BReq *q, struct BResp *r, int *outfd) {
     s->lpid = q->pid;
     s->atime = (s64)time(NULL);
     r->size = s->size;
+    r->mode = s->locked ? G_SHM_LOCKED : 0;   /* the attacher keeps it resident */
     return 0;
 }
 
@@ -986,7 +1021,8 @@ static s32 shm_do_fork(struct BReq *q) {
 
 static void shm_fill_stat(struct BResp *r, const struct Seg *s) {
     r->key = s->key;
-    r->size = s->size; r->nattch = s->nattch; r->mode = s->mode;
+    r->size = s->size; r->nattch = s->nattch;
+    r->mode = s->mode | (s->locked ? G_SHM_LOCKED : 0);
     r->uid = s->uid; r->gid = s->gid; r->cuid = s->cuid; r->cgid = s->cgid;
     r->cpid = s->cpid; r->lpid = s->lpid;
     r->atime = s->atime; r->dtime = s->dtime; r->ctime = s->ctime;
@@ -1039,6 +1075,31 @@ static s32 shm_do_ctl(struct BReq *q, struct BResp *r) {
         s->key = 0;                  /* unfindable by key henceforth */
         s->rmid = 1;
         if (s->nattch == 0) shm_free(s);
+        return 0;
+    case G_SHM_LOCK:
+    case G_SHM_UNLOCK:
+        /* shmctl_do_lock: without CAP_IPC_LOCK the caller must own or have
+         * made the segment, and lock it only with an RLIMIT_MEMLOCK at all;
+         * a lock is then charged to its user and refused past that limit
+         * (ENOMEM). Locking a locked one, or unlocking an unlocked one, is
+         * nothing. */
+        if (!q->caplock) {
+            if (q->uid != s->uid && q->uid != s->cuid) return -EPERM;
+            if (q->arg == G_SHM_LOCK && !q->memlock) return -EPERM;
+        }
+        if (q->arg == G_SHM_UNLOCK) { shm_unlock_charge(s); return 0; }
+        if (s->locked) return 0;
+        {
+            u64 pages = (s->size + 4095) / 4096;
+            u64 *n = shmlock_count(q->ruid, 1);
+            u64 have = n ? *n : 0;
+            if (!q->caplock && (!n || (q->memlock != ~0ULL &&
+                                       have + pages > q->memlock / 4096)))
+                return -ENOMEM;
+            if (n) *n = have + pages;
+            s->locked = 1;
+            s->lock_uid = q->ruid;
+        }
         return 0;
     default:
         return -EINVAL;
@@ -3454,6 +3515,10 @@ static void breq_stamp(struct Machine *m, struct BReq *q) {
                         : (u32)geteuid();
     q->gid = m->fake_id ? __atomic_load_n(&m->cred.egid, __ATOMIC_RELAXED)
                         : (u32)getegid();
+    q->ruid = m->fake_id ? __atomic_load_n(&m->cred.ruid, __ATOMIC_RELAXED)
+                         : (u32)getuid();
+    q->caplock = (u32)as_cap_ipc_lock(m);
+    q->memlock = rlim_cur(m, G_RLIMIT_MEMLOCK);
 }
 
 /* One request/response round-trip. Stamps the caller's pid and effective guest
@@ -3479,7 +3544,8 @@ s32 shmbroker_get(struct Machine *m, s32 key, u64 size, s32 shmflg) {
     return r.ret;
 }
 
-int shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out) {
+int shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out,
+                 int *locked_out) {
     struct BReq q; memset(&q, 0, sizeof q);
     q.op = REQ_SHMAT; q.id = shmid; q.arg = readonly ? 1 : 0;
     struct BResp r; int fd = -1;
@@ -3487,6 +3553,7 @@ int shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out) {
     if (r.ret < 0) { broker_fd_close(fd); return r.ret; }
     if (fd < 0) return -EINVAL;              /* success but no fd: treat as bad id */
     if (size_out) *size_out = r.size;
+    if (locked_out) *locked_out = (r.mode & G_SHM_LOCKED) != 0;
     return fd;
 }
 

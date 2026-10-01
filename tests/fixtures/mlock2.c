@@ -1,5 +1,5 @@
-/* mlock2 (nr 284): accept-and-ignore with kernel-faithful flag validation.
- * Self-checking: qemu-user returns ENOSYS for mlock2. */
+/* mlock2 (nr 284): the flag validation, and the lock (mlockvm.c has the rest
+ * of the family). Self-checking: qemu-user returns ENOSYS for mlock2. */
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>

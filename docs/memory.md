@@ -144,7 +144,8 @@ the *advice* is judged first, before anything about the range, so a value this
 kernel does not know is `EINVAL` even where the range alone would have been an
 empty-length success or a hole's `ENOMEM`. The accepted set is a 6.1 kernel's
 (`madv_valid`, `sys_mm.c`) — `MADV_DONTNEED`, `MADV_FREE` and
-`MADV_DONTNEED_LOCKED` discard the range, `MADV_DONTFORK` / `MADV_DOFORK` and
+`MADV_DONTNEED_LOCKED` discard the range (the first two, and `MADV_COLD` /
+`MADV_PAGEOUT`, refused on a locked mapping), `MADV_DONTFORK` / `MADV_DOFORK` and
 `MADV_WIPEONFORK` / `MADV_KEEPONFORK` decide what a fork child inherits
 (below), `MADV_REMOVE` punches a hole in the object behind a shared mapping
 (`madv_remove`: the host mapping *is* a mapping of that object, so the host's
@@ -253,8 +254,74 @@ the range, whose host backing *is* the file mapping — a host `msync(MS_SYNC)`
 there is the `vfs_fsync_range` the kernel would issue for the vma — with the
 address-space lock dropped for the duration, as the kernel drops `mmap_lock`
 during the fsync. `MS_ASYNC` has been nothing but the walk since 2.6.19 and
-`MS_INVALIDATE` only refuses a locked mapping, of which there are none here, so
-neither reaches the host (`tests/c/msync.c`).
+`MS_INVALIDATE` only refuses a locked mapping (`EBUSY`, the mappings before it
+synced), so neither reaches the host (`tests/c/msync.c`).
+
+### Locked memory: `mlock(2)` and its kin
+
+The mlock family used to be accept-and-ignore: `VmLck` stayed 0, no
+`RLIMIT_MEMLOCK` held, and nothing a lock makes a kernel refuse was refused.
+The kernel's model of it is kept now (`mem.c`, "locked memory"): each region's
+`VM_LOCKED` and `VM_LOCKONFAULT` (`Region.lock`, which travels with splits and
+merges like the fork flags), the mm's `locked_vm` counter that `VmLck` reports
+(published for other processes' `status`), and `mlockall(MCL_FUTURE)`'s default
+for every later mapping (`AddrSpace.def_lock`).
+
+- `mlock`/`mlock2` are `do_mlock`: `EINVAL` for an `mlock2` flag but
+  `MLOCK_ONFAULT`, `EPERM` with an `RLIMIT_MEMLOCK` of 0, the range widened to
+  whole pages, the limit judged with the pages already locked in the range
+  taken back out of the count (`ENOMEM`), the regions marked one by one —
+  `ENOMEM` at a hole, with what came before it marked — and then the populate,
+  whose fault on a page GUP cannot bring in (a `PROT_NONE` mapping's, a file's
+  past its end) is `ENOMEM` too, the lock standing. `munlock` has no limit to
+  meet and the same `ENOMEM` at a hole.
+- `mlockall` refuses no flag, an unknown one and `MCL_ONFAULT` alone
+  (`EINVAL`), then `EPERM` as `mlock`, then `MCL_CURRENT` over a limit the
+  whole address space does not fit in (`ENOMEM`). `MCL_CURRENT` gives every
+  mapping the lock asked for; `MCL_FUTURE` sets the default — and every
+  `mlockall` clears it unless it says `MCL_FUTURE` again — so that `mmap`,
+  `brk`, `shmat` and a stack's growth are born locked, each refused (`EAGAIN`,
+  `brk`'s unchanged break, the growth's `SIGSEGV`) where `RLIMIT_MEMLOCK` has
+  no room for it (`mlock_future_ok`); `MAP_LOCKED` does the same for one
+  mapping, `EPERM` without the right to lock.
+- What a lock refuses: `MADV_DONTNEED`, `MADV_FREE`, `MADV_COLD` and
+  `MADV_PAGEOUT` (`EINVAL` at the first locked region, the ones before it
+  advised; `MADV_DONTNEED_LOCKED` exists for a locked range), `MADV_REMOVE`,
+  and `msync(MS_INVALIDATE)` (`EBUSY`).
+- What moves `locked_vm`: a lock and an unlock, an unmap of a locked range, a
+  locked mapping's growth (`mremap`, and a stack's), its duplicate
+  (`mremap(old_size=0)`) — and a `MREMAP_DONTUNMAP` of one, which counts the
+  moved mapping and never takes back the range left behind, unlocked, as the
+  kernel's `move_vma` leaves the count that much above the locked mappings.
+  A fork child has no lock and no `MCL_FUTURE` (`dup_mmap`, `mm_init`); an
+  exec starts a new address space with neither. The sigreturn trampoline,
+  which stands for the vDSO, is never locked, as a kernel's `VM_SPECIAL`
+  mappings are not.
+- `CAP_IPC_LOCK` lifts the limit, and a fake root has it (`as_cap_ipc_lock`,
+  read without the task lock, which ranks outside the address-space lock the
+  checks run under).
+- System V `SHM_LOCK`/`SHM_UNLOCK` (`proctab.c`): without the capability the
+  caller must own or have made the segment, and lock it only with an
+  `RLIMIT_MEMLOCK` at all (`EPERM`); a lock is charged to the locker's user and
+  refused past its limit (`ENOMEM`), shows as `SHM_LOCKED` in the segment's
+  mode, and is given back when the segment is unlocked or destroyed. It used
+  to be `EINVAL`.
+
+The pages are the host's, and are locked there too, best effort
+(`host_lock_sync`): the host pages under a locked region's slice are
+`mlock`ed — populated — for `VM_LOCKED` and `mlock2(MLOCK_ONFAULT)`ed for
+`VM_LOCKONFAULT`, and unlocked where no locked slice lies on them any more,
+an allocation's whole when its last region goes rather than with its deferred
+`munmap`. A `PROT_NONE` region has nothing a kernel would keep resident and is
+not locked. A host that refuses — its `RLIMIT_MEMLOCK` is the guest's own, so
+only a fake root's lock past it, or the rounding of a host with pages larger
+than the guest's, can tip it over — gets the pages populated instead. A
+`SHM_LOCK`ed segment's pages are locked as they are faulted in, in the mappings
+of it this process holds when it locks it and attaches later
+(`Region.shm_lock`); another process's mapping of it made before the lock is
+that process's, and is not reached. `tests/fixtures/mlockvm.c` holds every
+row, with the change each makes to `VmLck`, against a native kernel, and the
+rows a fake root's capability changes.
 
 `guest_map_anon` and `guest_map_file` `mmap` host backing, then register each
 4 KB page in the table. **Host backing is always mapped `PROT_READ|PROT_WRITE`**
@@ -704,8 +771,9 @@ read those two and never `status`.
 The classifications are the kernel's, from the same predicates —
 `is_data_mapping` for `VmData`, `is_exec_mapping` for `exec_vm` (split into
 `VmExe` and `VmLib` by the executable's own code span), `is_stack_mapping` —
-every `VM_GROWSDOWN` region — for `VmStk`. `VmLck`/`VmPin`/`VmSwap` are structurally zero
-(`mlock` is a no-op, there is no guest swap). `VmPTE` is the emulator's
+every `VM_GROWSDOWN` region — for `VmStk`. `VmLck` is the `locked_vm` the mlock
+family keeps (above); `VmPin`/`VmSwap` are structurally zero (nothing pins a
+guest page, there is no guest swap). `VmPTE` is the emulator's
 second-level tables, which cost eight bytes per mapped guest page — exactly
 what a kernel's leaf page tables cost, so the figure means what a guest expects
 even though the table's shape is not a kernel's. The ELF loader records the

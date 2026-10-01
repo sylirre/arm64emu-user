@@ -886,7 +886,7 @@ PTDIRS="/dev/shm ${XDG_RUNTIME_DIR:-} ${TMPDIR:-} /data/local/tmp /tmp"
 pt_registry() {   # the registry file this host's shared_dir() picked, if any
     for d in $PTDIRS; do
         [ -n "$d" ] || continue
-        for f in "$d"/arm64chroot-proctab.v10."$(id -u)".*; do
+        for f in "$d"/arm64chroot-proctab.v*."$(id -u)".*; do
             [ -f "$f" ] && { echo "$f"; return 0; }
         done
     done
@@ -894,7 +894,7 @@ pt_registry() {   # the registry file this host's shared_dir() picked, if any
 }
 if [ -x "$ALPINE/bin/busybox" ]; then
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v10."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v*."$(id -u)".* 2>/dev/null
     done
     rm -f "$ALPINE/tmp/apid"
     A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
@@ -936,7 +936,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$reg" "$victim"
     fi
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v10."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v*."$(id -u)".* 2>/dev/null
     done
 fi
 
@@ -1067,7 +1067,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     kill $apid 2>/dev/null; wait $apid 2>/dev/null
     for d in /dev/shm "${XDG_RUNTIME_DIR:-}" "${TMPDIR:-}" \
              /data/local/tmp /tmp; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v1."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v*."$(id -u)".* 2>/dev/null
     done
 fi
 
@@ -2593,6 +2593,27 @@ check_fixture sockoptlen $'plain=0\nhi32=0\nhi32_zero=-22\nneg=-22\nneg_min=-22\
 # where a kernel answers EINVAL, and dies outright on the past-INT_MAX rows.
 check_fixture cmsgvalid $'short15 snd=-1 err=22 peer=-1 perr=11\nzerolen snd=-1 err=22 peer=-1 perr=11\nonelen  snd=-1 err=22 peer=-1 perr=11\nover17  snd=-1 err=22 peer=-1 perr=11\nover25  snd=-1 err=22 peer=-1 perr=11\nempty16 snd=1 err=0 peer=1 perr=0\nfd20/24 snd=1 err=0 peer=1 perr=0\nfd20/23 snd=1 err=0 peer=1 perr=0\nlvl16   snd=1 err=0 peer=1 perr=0\nnohdr8  snd=1 err=0 peer=1 perr=0\n2nd_bad snd=-1 err=22 peer=-1 perr=11\n2nd_ok  snd=1 err=0 peer=1 perr=0\nnullsnd=-1 err=14\nnullbig=-1 err=105\nnullrcv=1 err=0 ctrunc=1 ctl=0\nhugesnd=-1 err=105\nhugercv=1 err=0 ctl=0\npassfd snd=1 rcv=1 fd=1 ok=1\ndone'
 check_fixture mlock2 $'mlock2 rc=0\nmlock2_onfault rc=0\nmlock2_bad rc=-1 err=22'
+# Locked memory (mem.c, "locked memory"; sys_mm.c): the mlock family,
+# MAP_LOCKED and mlockall(MCL_FUTURE) against RLIMIT_MEMLOCK, what a lock
+# refuses, what unmap, mremap, fork and exec do to VmLck, and SHM_LOCK.
+# Self-checking: the block is a native kernel's, unprivileged; the fake-root
+# run's is the kernel's rules for CAP_IPC_LOCK (can_do_mlock,
+# mlock_future_ok, user_shm_lock), which no unprivileged run can show.
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/mlockvm.bin tests/fixtures/mlockvm.c 2>/dev/null; then
+        expect=$'mlock 4 pages                                0        VmLck +16\nmlock them again                             0        VmLck +0\nmlock unaligned start, 1 byte                0        VmLck +4\nmlock unaligned length crossing a page       0        VmLck +8\nmunlock 2 of them                            0        VmLck -8\nmlock zero length                            0        VmLck +0\nmlock2 bad flag                              EINVAL   VmLck +0\nmlock2 ONFAULT 2 pages                       0        VmLck +8\nmlock across a hole                          ENOMEM   VmLck +4\nmunlock across a hole                        ENOMEM   VmLck -4\nmlock unmapped                               ENOMEM   VmLck +0\nmunlock unmapped                             ENOMEM   VmLck +0\nmlock PROT_NONE                              ENOMEM   VmLck +8\nmlock PROT_READ                              0        VmLck +8\nmunmap a locked page                         0        VmLck -4\nmprotect a locked page RO                    0        VmLck +0\nmadvise DONTNEED locked                      EINVAL   VmLck +0\nmadvise DONTNEED_LOCKED                      0        VmLck +0\nmadvise FREE locked                          EINVAL   VmLck +0\nmadvise COLD locked                          EINVAL   VmLck +0\nmadvise PAGEOUT locked                       EINVAL   VmLck +0\nmadvise COLD unlocked                        0        VmLck +0\nmadvise WILLNEED locked                      0        VmLck +0\nmmap MAP_LOCKED                              ok      \nmunmap it                                    0        VmLck -8\nmlock shared anon                            0        VmLck +8\nmadvise REMOVE locked shared                 EINVAL   VmLck +0\nmsync INVALIDATE locked                      EBUSY    VmLck +0\nmsync SYNC locked                            0        VmLck +0\nmremap grow a locked one                     ok       VmLck +16\nmremap DONTUNMAP a locked one                ok       VmLck +24\nfork child VmLck 0\nRLIMIT_MEMLOCK 0: mlock                      EPERM    VmLck +0\nRLIMIT_MEMLOCK 0: munlock                    0        VmLck +0\nRLIMIT_MEMLOCK 0: mmap MAP_LOCKED            EPERM   \nRLIMIT_MEMLOCK 0: mlockall                   EPERM    VmLck +0\nlimit +8K: mlock 1 page                      0        VmLck +4\nlimit +8K: mlock 2 more                      ENOMEM   VmLck +0\nlimit +8K: mlock 1 locked + 1 new            0        VmLck +4\nlimit: mmap MAP_LOCKED 2 pages               EAGAIN  \nlimit: mlockall CURRENT                      ENOMEM   VmLck +0\nmlockall 0                                   EINVAL   VmLck +0\nmlockall ONFAULT alone                       EINVAL   VmLck +0\nmlockall bad flag                            EINVAL   VmLck +0\nmlockall FUTURE                              0        VmLck +0\nmmap after MCL_FUTURE                        ok       VmLck +12\nbrk after MCL_FUTURE                         ok       VmLck +12\nMCL_FUTURE, mmap over the limit              EAGAIN  \nMCL_FUTURE, brk over the limit               fail    \nfork child of MCL_FUTURE: mmap VmLck +0\nafter an exec under MCL_FUTURE: VmLck 0, mmap VmLck +0\nmunlockall                                   0        VmLck -104\nmmap after munlockall                        ok       VmLck +0\nmlockall CURRENT|ONFAULT: 0, VmLck rose: 1, an earlier mapping refuses DONTNEED: EINVAL\nanother process reads its VmLck: 1\nmunlockall: 0, VmLck 24\nshmctl SHM_LOCK                              0        VmLck +0\nSHM_LOCKED in mode: 1\nshmctl SHM_LOCK again                        0        VmLck +0\nshmctl SHM_UNLOCK                            0        VmLck +0\nSHM_LOCKED in mode: 0\nRLIMIT_MEMLOCK 0: SHM_LOCK                   EPERM    VmLck +0\nlimit 1 page: SHM_LOCK 4 pages               ENOMEM   VmLck +0\nSHM_LOCK bad id                              EINVAL   VmLck +0\ndone'
+        expect_fr=$'RLIMIT_MEMLOCK 0: mlock                      0        VmLck +4\nRLIMIT_MEMLOCK 0: mmap MAP_LOCKED            ok      \nlimit 1 page: mlock 4 pages                  0        VmLck +16\nlimit 1 page: mlockall CURRENT: 0\nRLIMIT_MEMLOCK 0: SHM_LOCK                   0        VmLck +0\ndone'
+        for eng in "" "--jit"; do
+            got=$(timeout -k 5 60 "$EMU" $eng / "$PWD/tests/fixtures/mlockvm.bin" 2>/dev/null)
+            fixture_verdict "mlockvm${eng:+ (jit)}" "$expect" "$got"
+        done
+        got=$(timeout -k 5 60 "$EMU" -u / "$PWD/tests/fixtures/mlockvm.bin" fakeroot 2>/dev/null)
+        fixture_verdict "mlockvm (fake root)" "$expect_fr" "$got"
+        fx_rm tests/fixtures/mlockvm.bin
+    else
+        skip_build "fixtures/mlockvm"
+    fi
+fi
 # SCM_RIGHTS into a control buffer with room for fewer descriptors than were
 # sent: the kernel installs only what the buffer can report and releases the
 # rest. The host had already installed them against ITS layout -- four bytes

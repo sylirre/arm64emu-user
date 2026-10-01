@@ -213,6 +213,10 @@ typedef struct HostMap {
                                * region's: still the zeroes the host handed
                                * out, where the rest may hold what a slice
                                * unmapped off a stack's bottom left behind */
+    u8     hostlocked;        /* some of it has been mlock'ed on the host
+                               * (host_lock_sync): unlocked whole at its
+                               * retirement, not when the deferred munmap
+                               * finally comes */
 } HostMap;
 
 typedef struct Region {
@@ -271,7 +275,26 @@ typedef struct Region {
                                * -- another allocation, nothing moved -- and
                                * the two are still ONE mapping to the guest
                                * wherever they agree (as_same_vma) */
+    u32  lock;                /* RL_*: what mlock(2) and its kin made of it,
+                               * the kernel's VM_LOCKED and VM_LOCKONFAULT.
+                               * Travels like forkflags; a fork child's are
+                               * cleared (dup_mmap), an exec's are gone */
+    u32  special;             /* never locked, nor counted: the sigreturn
+                               * trampoline, which stands for the vDSO a
+                               * kernel maps VM_DONTEXPAND (mlock_fixup skips
+                               * every VM_SPECIAL vma) */
+    u32  shm_lock;            /* a System V segment this process attached
+                               * and saw SHM_LOCKed (at its shmat, or its own
+                               * shmctl): the host keeps its pages as they are
+                               * faulted in, best effort -- the kernel's lock
+                               * is on the segment's pages, wherever mapped */
 } Region;
+
+/* Region.lock (and AddrSpace.def_lock, which mlockall(MCL_FUTURE) sets for
+ * every mapping made after it). */
+#define RL_LOCKED  1u         /* VM_LOCKED: its pages kept resident */
+#define RL_ONFAULT 2u         /* VM_LOCKONFAULT: ...as they are faulted in,
+                               * not populated up front */
 
 /* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
  * space altogether (the kernel's VM_DONTCOPY); RF_WIPEONFORK hands the child
@@ -336,6 +359,14 @@ typedef struct AddrSpace {
                                * happens */
     u32 npgtables;            /* live second-level tables (VmPTE) */
     u32 stack_ids;            /* the last Region.stack_id handed out */
+    u64 locked_vm;            /* pages, the kernel's mm->locked_vm (VmLck):
+                               * a counter, moved where the kernel moves it,
+                               * and so not always the sum of the locked
+                               * regions -- a MREMAP_DONTUNMAP of a locked
+                               * mapping counts the new one and never takes
+                               * the old one back, as the kernel does */
+    u32 def_lock;             /* RL_* every new mapping gets: mm->def_flags,
+                               * from mlockall(MCL_FUTURE [| MCL_ONFAULT]) */
 } AddrSpace;
 
 /* The guest's memory footprint as its own /proc reports it. Bytes throughout;
@@ -463,7 +494,7 @@ void as_meminfo(AddrSpace *as, AsMem *out);
  * sampling it costs a mincore walk over every region, far too much to run on
  * each mmap, so another process's RSS stays the host's approximation. */
 typedef struct ProcMem {
-    u64 size, data, stack, exec, peak, pgtables;
+    u64 size, data, stack, exec, peak, pgtables, locked;
     u64 start_code, end_code, start_data, end_data;
     u64 start_stack, start_brk;
     u64 arg_start, arg_end, env_start, env_end;
@@ -573,6 +604,36 @@ void guest_unlend(CPU *c, HostMap **pin, int n);
  *                         would: 1 when it is mapped now.
  *   copy_from_guest_look  copy_from_guest_partial, growing nothing: the bytes
  *                         before the first page it cannot read as it is. */
+/* Locked memory (mem.c, "locked memory"). Caller holds as_lock but for
+ * as_mlock_populate, which takes it.
+ *   as_lock_range       apply_vma_lock_flags: [start, start+len) given RL_*
+ *                       `flags` (0 unlocks) region by region; -ENOMEM at a
+ *                       hole, what came before it done; -EINVAL for a range
+ *                       that wraps.
+ *   as_locked_pages     pages of [start, start+len) already locked
+ *                       (count_mm_mlocked_page_nr).
+ *   as_lock_all         mlockall: `def` for later mappings, and every region
+ *                       given `flags` when `current`.
+ *   as_lock_new         a mapping just made, given the lock it is born with
+ *                       (MAP_LOCKED, mlockall(MCL_FUTURE)).
+ *   as_mlock_populate   mlock's populate: -ENOMEM where GUP cannot fault a
+ *                       locked page in (PROT_NONE, a file's end).
+ *   as_mlock_future_ok  mlock_future_ok: may `bytes` more of a mapping locked
+ *                       as `lock` be locked under RLIMIT_MEMLOCK?
+ *   as_cap_ipc_lock     CAP_IPC_LOCK, which lifts that limit: a fake root's.
+ *   as_set_special      the region at `va` is never locked (the trampoline). */
+int  as_lock_range(AddrSpace *as, u64 start, u64 len, u32 flags);
+u64  as_locked_pages(AddrSpace *as, u64 start, u64 len);
+void as_lock_all(AddrSpace *as, u32 def, int current, u32 flags);
+void as_lock_new(AddrSpace *as, u64 start, u64 len, u32 flags);
+int  as_mlock_populate(CPU *c, u64 start, u64 len);
+struct Machine;
+int  as_mlock_future_ok(struct Machine *m, u32 lock, u64 bytes);
+int  as_cap_ipc_lock(struct Machine *m);
+void as_set_special(AddrSpace *as, u64 va);
+/* A SHM_LOCKed segment attached at [va, va+len), or no longer locked: the
+ * host's locks on its pages follow (Region.shm_lock). */
+void as_shm_lock_hint(AddrSpace *as, u64 va, u64 len, int on);
 size_t mem_stack_hole(CPU *c, u64 va, size_t len, AccType acc);
 int    mem_stack_touch(CPU *c, u64 va, AccType acc);
 size_t copy_from_guest_look(CPU *c, void *dst, u64 va, size_t len);

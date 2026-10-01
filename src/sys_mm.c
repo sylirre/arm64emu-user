@@ -72,6 +72,7 @@ u64 mmap_min_addr(void) {
 #define G_MAP_ANONYMOUS 0x20
 #define G_MAP_FIXED_NOREPLACE 0x100000
 #define G_MAP_GROWSDOWN 0x0100
+#define G_MAP_LOCKED    0x2000
 /* The most room a MAP_GROWSDOWN mapping placed by the emulator is given below
  * it to grow into (mmap_locked), whatever its RLIMIT_STACK. */
 #define GROWS_ROOM_MAX (64ULL << 20)
@@ -185,9 +186,13 @@ static u64 brk_locked(CPU *c, u64 a0) {
          * above (which is the one brk(2) has always had) and this one inside
          * do_brk_flags -- and they are not the same test. */
         if (!data_fits(c->m, new_end - old_end)) return as->brk;
+        /* ...and, under mlockall(MCL_FUTURE), RLIMIT_MEMLOCK
+         * (check_brk_limits), the growth being locked like any mapping. */
+        if (!as_mlock_future_ok(c->m, as->def_lock, new_end - old_end)) return as->brk;
         if (guest_map_anon(as, old_end, new_end - old_end,
                            PTE_R | PTE_W | prot_rie(PROT_READ)) < 0)
             return as->brk;
+        if (as->def_lock) as_lock_new(as, old_end, new_end - old_end, as->def_lock);
     } else if (new_end < old_end) {
         guest_unmap(as, new_end, old_end - new_end);
     }
@@ -294,6 +299,15 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
      * private pages the kernel may discard. It is refused here as it is on
      * every kernel before it, and as the 6.1 this emulator's uname claims
      * does.) */
+    /* The lock it is born with: MAP_LOCKED's, and mlockall(MCL_FUTURE)'s for
+     * every mapping. do_mmap judges it here, after the address and before
+     * the type: MAP_LOCKED without the right to lock is EPERM, and a locked
+     * mapping RLIMIT_MEMLOCK has no room for is EAGAIN (mlock_future_ok). */
+    u32 lock = ((flags & G_MAP_LOCKED) ? RL_LOCKED : 0) | as->def_lock;
+    if ((flags & G_MAP_LOCKED) && !rlim_cur(c->m, G_RLIMIT_MEMLOCK) &&
+        !as_cap_ipc_lock(c->m))
+        return (u64)(s64)-EPERM;
+    if (!as_mlock_future_ok(c->m, lock, len)) return (u64)(s64)-EAGAIN;
     u64 mtype = flags & G_MAP_TYPE;
     if (mtype != G_MAP_SHARED && mtype != G_MAP_PRIVATE &&
         !(mtype == G_MAP_SHARED_VALIDATE && !(flags & G_MAP_ANONYMOUS)))
@@ -499,7 +513,11 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
             }
         }
     }
-    return r < 0 ? (u64)(s64)r : addr;
+    if (r < 0) return (u64)(s64)r;
+    /* ...and locked once it is there (mmap_region: locked_vm counts it, and
+     * the pages are brought in). */
+    if (lock) as_lock_new(as, addr, len, lock);
+    return addr;
 }
 
 SYSDEF(mmap) {
@@ -673,6 +691,7 @@ static u64 madv_remove(CPU *c, u64 start, u64 end) {
             va = nx->start;
             continue;
         }
+        if (r->lock & RL_LOCKED)    { err = -EINVAL; break; }   /* mlocked */
         if (!r->file && !r->shared) { err = -EINVAL; break; }   /* no object */
         if (!r->shared || !r->wr_ok)  { err = -EACCES; break; }   /* not maywrite */
         u64 stop = r->end < end ? r->end : end;
@@ -804,6 +823,14 @@ SYSDEF(madvise) {
     if (adv == G_MADV_POPULATE_READ || adv == G_MADV_POPULATE_WRITE)
         return madv_populate(c, a0, end, adv == G_MADV_POPULATE_WRITE);
 
+    /* A locked mapping refuses the advice that would take its pages away:
+     * MADV_DONTNEED and MADV_FREE (madvise_dontneed_free_valid_vma -- not
+     * MADV_DONTNEED_LOCKED, which exists for it), MADV_COLD and MADV_PAGEOUT
+     * (can_madv_lru_vma). EINVAL at the first locked region the walk meets,
+     * the regions before it advised. */
+    int lockrefuse = adv == G_MADV_DONTNEED || adv == G_MADV_FREE ||
+                     adv == G_MADV_COLD || adv == G_MADV_PAGEOUT;
+    s64 lockerr = 0;
     /* MADV_DONTNEED / MADV_FREE return the pages to the kernel; on Linux the
      * next access to an anonymous page then faults in a fresh zero page. Go's
      * page allocator depends on this: after scavenging a range it treats those
@@ -815,9 +842,9 @@ SYSDEF(madvise) {
      * the range by zeroing its backing to match the kernel's zero-on-reuse
      * guarantee. Only whole guest pages inside the range are cleared.
      *
-     * MADV_DONTNEED_LOCKED is MADV_DONTNEED for a range that is mlocked, which
-     * a kernel refuses the plain advice on; nothing is ever locked here (the
-     * mlock family is accept-and-ignore below), so it discards. */
+     * MADV_DONTNEED_LOCKED is MADV_DONTNEED for a range that is mlocked,
+     * which a kernel refuses the plain advice on (above); it discards locked
+     * and unlocked pages alike, the lock standing. */
     int discard = (adv == G_MADV_DONTNEED || adv == G_MADV_FREE ||
                    adv == G_MADV_DONTNEED_LOCKED);
     long hps = sysconf(_SC_PAGESIZE);
@@ -842,6 +869,7 @@ SYSDEF(madvise) {
             continue;
         }
         u64 stop = r->end < end ? r->end : end;
+        if (lockrefuse && (r->lock & RL_LOCKED)) { lockerr = -EINVAL; break; }
         if (discard) {
             /* Only anonymous mappings get the kernel's zero-on-reuse
              * behavior. MADV_DONTNEED on a file mapping re-faults from the
@@ -885,6 +913,7 @@ SYSDEF(madvise) {
      * whole range, holes included: a hole holds no translation, and the
      * codemap makes a page that was never code free to ask about. */
     if (discard) jit_invalidate_range(a0, len);
+    if (lockerr) return (u64)lockerr;
     /* The hint advice values: accepted and ignored, but not before the range
      * they name has been judged. */
     return hole ? (u64)(s64)-ENOMEM : 0;
@@ -951,6 +980,9 @@ static u64 mremap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4) {
      * grown: RLIMIT_DATA too when it is a data mapping. */
     if (new_len > old_len) {
         u64 add = new_len - old_len;
+        /* A locked mapping's growth is locked memory: RLIMIT_MEMLOCK first
+         * (EAGAIN), then the address-space limits (vma_to_resize). */
+        if (tail && !as_mlock_future_ok(c->m, tail->lock, add)) return (u64)(s64)-EAGAIN;
         if (!as_fits(c->m, add)) return (u64)(s64)-ENOMEM;
         if ((prot & PTE_W) && !shared && !stack && !data_fits(c->m, add))
             return (u64)(s64)-ENOMEM;
@@ -1083,8 +1115,7 @@ SYSDEF(mremap) {
  * there is the vfs_fsync_range the kernel would issue for the vma. MS_ASYNC
  * has done nothing but the walk since 2.6.19 (dirty pages are written back on
  * the usual schedule), and MS_INVALIDATE only refuses a locked mapping with
- * EBUSY, of which there are none here (mlock is accept-and-ignore) -- so
- * neither reaches the host. The host calls are made with the address-space
+ * EBUSY -- so neither reaches the host. The host calls are made with the address-space
  * lock dropped, like the kernel's mmap_lock during the fsync: a sync can take
  * as long as the storage takes, and the other threads' translations must not
  * wait on it. A region unmapped meanwhile makes its host call fail with
@@ -1102,7 +1133,7 @@ SYSDEF(msync) {
 
     struct sync_span { u8 *p; size_t n; } stack[16], *v = stack;
     int nv = 0, cap = (int)(sizeof stack / sizeof stack[0]);
-    int hole = 0, err = 0;
+    int hole = 0, err = 0, busy = 0;
     long hps = sysconf(_SC_PAGESIZE);
     AddrSpace *as = &c->m->as;
     as_lock();
@@ -1117,6 +1148,9 @@ SYSDEF(msync) {
             continue;
         }
         u64 stop = r->end < end ? r->end : end;
+        /* MS_INVALIDATE refuses a locked mapping (EBUSY), the walk ending
+         * there with the mappings before it synced. */
+        if ((flags & G_MS_INVALIDATE) && (r->lock & RL_LOCKED)) { busy = 1; break; }
         if ((flags & G_MS_SYNC) && r->shared) {
             if (nv == cap) {
                 int ncap = cap * 2;
@@ -1144,6 +1178,7 @@ SYSDEF(msync) {
         if (msync(v[i].p, v[i].n, MS_SYNC) < 0) err = -errno;
     if (v != stack) free(v);
     if (err) return (u64)(s64)err;
+    if (busy) return (u64)(s64)-EBUSY;
     return hole ? (u64)(s64)-ENOMEM : 0;
 }
 
@@ -1180,14 +1215,119 @@ SYSDEF(mincore) {
     return r;
 }
 
-SYSDEF(mlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
-SYSDEF(mlock2) {
-    /* Accept-and-ignore like the rest of the mlock family, but keep the
-     * kernel's flag validation: only MLOCK_ONFAULT (1) is defined. The flags
-     * are an int, so the register's high half is not part of them. */
-    (void)c; (void)a0; (void)a1; (void)a3; (void)a4; (void)a5;
-    return ((unsigned)a2 & ~1u) ? (u64)(s64)-EINVAL : 0;
+/* ---- the mlock family (mm/mlock.c), over the guest's own model of locked
+ * memory (mem.c, "locked memory"): which regions are VM_LOCKED and
+ * VM_LOCKONFAULT, the locked_vm counter VmLck reports, mlockall's
+ * MCL_FUTURE default for later mappings, and RLIMIT_MEMLOCK against them --
+ * lifted by CAP_IPC_LOCK, which a fake root has. The host locks the pages
+ * too, best effort. All five used to be accept-and-ignore. */
+
+/* can_do_mlock: a lock is allowed at all with a nonzero RLIMIT_MEMLOCK, or
+ * the capability. */
+static int can_do_mlock(struct Machine *m) {
+    return rlim_cur(m, G_RLIMIT_MEMLOCK) != 0 || as_cap_ipc_lock(m);
 }
-SYSDEF(munlock) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
-SYSDEF(mlockall) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
-SYSDEF(munlockall) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return 0; }
+
+static u64 memlock_pages(struct Machine *m) {
+    u64 lim = rlim_cur(m, G_RLIMIT_MEMLOCK);
+    return lim == G_RLIM_INFINITY ? ~0ULL : lim >> 12;
+}
+
+/* do_mlock, in its order: the range untagged, EPERM without the right to
+ * lock at all, the range widened to whole pages, the limit judged with the
+ * pages already locked in the range taken back out of the count, the regions
+ * marked (ENOMEM at a hole, with what came before it marked), and then the
+ * populate, whose fault on a page GUP cannot bring in -- a PROT_NONE
+ * mapping's, a file's past its end -- is ENOMEM too, the lock standing. */
+static u64 do_mlock(CPU *c, u64 start, u64 len, u32 flags) {
+    struct Machine *m = c->m;
+    AddrSpace *as = &m->as;
+    start = a64_untag(start);
+    if (!can_do_mlock(m)) return (u64)(s64)-EPERM;
+    len = PG_UP(len + (start & GUEST_PAGE_MASK));
+    start &= ~(u64)GUEST_PAGE_MASK;
+    u64 lim = memlock_pages(m);
+    int cap = as_cap_ipc_lock(m);
+    as_lock();
+    u64 locked = (len >> 12) + as->locked_vm;
+    if (locked > lim && !cap) locked -= as_locked_pages(as, start, len);
+    int err = locked <= lim || cap ? as_lock_range(as, start, len, flags) : -ENOMEM;
+    as_publish(as);
+    as_unlock();
+    if (err) return (u64)(s64)err;
+    return (u64)(s64)as_mlock_populate(c, start, len);
+}
+
+SYSDEF(mlock) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    return do_mlock(c, a0, a1, RL_LOCKED);
+}
+
+SYSDEF(mlock2) {
+    /* Only MLOCK_ONFAULT (1) is defined, and it is judged before anything
+     * else. The flags are an int: the register's high half is no part of
+     * them. */
+    (void)a3; (void)a4; (void)a5;
+    if ((unsigned)a2 & ~1u) return (u64)(s64)-EINVAL;
+    return do_mlock(c, a0, a1, RL_LOCKED | (((unsigned)a2 & 1u) ? RL_ONFAULT : 0));
+}
+
+/* munlock: no permission to be had -- an RLIMIT_MEMLOCK of zero unlocks
+ * all the same -- and ENOMEM at a hole, as mlock. */
+SYSDEF(munlock) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    u64 start = a64_untag(a0);
+    u64 len = PG_UP(a1 + (start & GUEST_PAGE_MASK));
+    start &= ~(u64)GUEST_PAGE_MASK;
+    AddrSpace *as = &c->m->as;
+    as_lock();
+    int err = as_lock_range(as, start, len, 0);
+    as_publish(as);
+    as_unlock();
+    return (u64)(s64)err;
+}
+
+#define G_MCL_CURRENT 1
+#define G_MCL_FUTURE  2
+#define G_MCL_ONFAULT 4
+
+/* mlockall: no flag, an unknown one, or MCL_ONFAULT alone is EINVAL; then
+ * EPERM as mlock; then MCL_CURRENT over a limit the whole address space
+ * does not fit in is ENOMEM. MCL_FUTURE sets the lock every later mapping
+ * gets -- and clears it, absent -- and MCL_CURRENT gives every mapping the
+ * lock asked for, VM_LOCKONFAULT or not; MCL_FUTURE alone leaves the
+ * mappings there are as they are. The populate after it ignores what it
+ * cannot fault in. */
+SYSDEF(mlockall) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    struct Machine *m = c->m;
+    int flags = (int)a0;
+    if (!flags || (flags & ~(G_MCL_CURRENT | G_MCL_FUTURE | G_MCL_ONFAULT)) ||
+        flags == G_MCL_ONFAULT)
+        return (u64)(s64)-EINVAL;
+    if (!can_do_mlock(m)) return (u64)(s64)-EPERM;
+    u64 lim = memlock_pages(m);
+    int cap = as_cap_ipc_lock(m);
+    AddrSpace *as = &m->as;
+    u32 lock = RL_LOCKED | ((flags & G_MCL_ONFAULT) ? RL_ONFAULT : 0);
+    int err = -ENOMEM;
+    as_lock();
+    if (!(flags & G_MCL_CURRENT) || (as_mapped_bytes(as) >> 12) <= lim || cap) {
+        as_lock_all(as, (flags & G_MCL_FUTURE) ? lock : 0, (flags & G_MCL_CURRENT) != 0,
+                    lock);
+        err = 0;
+    }
+    as_publish(as);
+    as_unlock();
+    return (u64)(s64)err;
+}
+
+SYSDEF(munlockall) {
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    AddrSpace *as = &c->m->as;
+    as_lock();
+    as_lock_all(as, 0, 1, 0);
+    as_publish(as);
+    as_unlock();
+    return 0;
+}

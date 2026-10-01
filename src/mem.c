@@ -485,6 +485,8 @@ static void as_fields_init(AddrSpace *as) {
     as->peak = as->peak_rss = 0;
     as->npgtables = 0;
     as->stack_ids = 0;
+    as->locked_vm = 0;
+    as->def_lock = 0;
 }
 
 void as_init(AddrSpace *as) {
@@ -963,6 +965,7 @@ static HostMap *hmap_new(u8 *base, size_t len) {
     hm->pins = 0;
     hm->orphan_next = NULL;
     hm->rw_lo = hm->fresh_hi = base;
+    hm->hostlocked = 0;
     return hm;
 }
 
@@ -974,6 +977,12 @@ static HostMap *hmap_new(u8 *base, size_t len) {
  * the orphan list, and the loan's end retires it (guest_unlend). */
 static void hmap_unref(AddrSpace *as, HostMap *hm) {
     if (--hm->refs == 0) {
+        /* Its host locks go now, not with the deferred munmap: they count
+         * against the host's RLIMIT_MEMLOCK, which is the guest's own. */
+        if (hm->hostlocked) {
+            munlock(hm->base, hm->len);
+            hm->hostlocked = 0;
+        }
         if (hm->pins) {
             hm->orphan_next = as->orphans;
             as->orphans = hm;
@@ -1040,7 +1049,8 @@ static int region_mergeable(const Region *a, const Region *b) {
         a->anon_shm != b->anon_shm || a->shm_size != b->shm_size ||
         a->mfdcnt != b->mfdcnt ||
         a->forkflags != b->forkflags || a->growsdown != b->growsdown ||
-        a->stack_id != b->stack_id)
+        a->stack_id != b->stack_id || a->lock != b->lock || a->special != b->special ||
+        a->shm_lock != b->shm_lock)
         return 0;
     if (a->file && (a->file_off + (a->end - a->start) != b->file_off ||
                     a->dev != b->dev || a->ino != b->ino))
@@ -1057,7 +1067,8 @@ static int region_mergeable(const Region *a, const Region *b) {
 int as_same_vma(const Region *a, const Region *b) {
     return a->stack_id && a->stack_id == b->stack_id && a->end == b->start &&
            a->prot == b->prot && a->wr_ok == b->wr_ok &&
-           a->forkflags == b->forkflags && a->growsdown == b->growsdown;
+           a->forkflags == b->forkflags && a->growsdown == b->growsdown &&
+           a->lock == b->lock;
 }
 
 u64 as_vma_start(AddrSpace *as, int i) {
@@ -1092,6 +1103,215 @@ static void region_merge_range(AddrSpace *as, u64 lo, u64 hi) {
     }
 }
 
+/* ---- locked memory: mlock(2) and its kin (Region.lock, mmu.h) ----
+ *
+ * What the guest sees of a lock is the kernel's model, kept here: each
+ * region's VM_LOCKED / VM_LOCKONFAULT, the mm's locked_vm counter (VmLck),
+ * mlockall(MCL_FUTURE)'s default for later mappings (def_lock), and the
+ * refusals that follow from them -- RLIMIT_MEMLOCK, madvise's and msync's
+ * (sys_mm.c). The pages themselves are the host's, and are locked there too,
+ * best effort: host_lock_sync locks the host pages under a locked region's
+ * slice -- populated for VM_LOCKED, as they are faulted in for
+ * VM_LOCKONFAULT -- and unlocks those no locked slice lies on any more. A
+ * host that refuses (its RLIMIT_MEMLOCK is the guest's, so only a fake
+ * root's lock past it, or a host page larger than the guest's, can tip it
+ * over) gets the pages populated instead; a PROT_NONE region has none to
+ * keep. It used to be accept-and-ignore: no VmLck, no limit, no refusal --
+ * and nothing kept resident that a guest locked for its secrets' sake. */
+
+/* The host lock a page of `hm` at host address [p, p + host page) wants:
+ * 2 populated and locked, 1 locked on fault, 0 none. */
+static int host_lock_want(AddrSpace *as, HostMap *hm, uintptr_t p, uintptr_t hp) {
+    int want = 0;
+    for (int i = 0; i < as->nregions && want < 2; i++) {
+        const Region *r = &as->regions[i];
+        if (r->hmap != hm || !((r->lock & RL_LOCKED) || r->shm_lock) ||
+            !(r->prot & (PTE_R | PTE_W | PTE_X)))
+            continue;
+        uintptr_t lo = (uintptr_t)r->host, hi = lo + (uintptr_t)(r->end - r->start);
+        if (hi <= p || lo >= p + hp) continue;
+        int w = (r->lock & RL_LOCKED) && !(r->lock & RL_ONFAULT) ? 2 : 1;
+        if (w > want) want = w;
+    }
+    return want;
+}
+
+/* Make the host's locks on the host pages under [lo, hi) of `hm` what the
+ * locked regions on them want. */
+static void host_lock_sync(AddrSpace *as, HostMap *hm, uintptr_t lo, uintptr_t hi) {
+    uintptr_t hp = (uintptr_t)g_host_pagesz;
+    /* Best effort: a sandbox's refusal (its SIGSYS net's ENOSYS) is no news
+     * to report, the lock being the host's favour and not the guest's. */
+    sig_sigsys_expected(SYS_mlock);
+    sig_sigsys_expected(SYS_munlock);
+#ifdef SYS_mlock2
+    sig_sigsys_expected(SYS_mlock2);
+#endif
+    lo &= ~(hp - 1);
+    hi = (hi + hp - 1) & ~(hp - 1);
+    while (lo < hi) {
+        int want = host_lock_want(as, hm, lo, hp);
+        uintptr_t run = lo + hp;
+        while (run < hi && host_lock_want(as, hm, run, hp) == want) run += hp;
+        size_t n = (size_t)(run - lo);
+        if (want == 2) {
+            hm->hostlocked = 1;
+            if (mlock((void *)lo, n) != 0) {
+                /* Not lockable here: resident at least, as a lock leaves it. */
+#ifdef MADV_POPULATE_READ
+                if (madvise((void *)lo, n, MADV_POPULATE_READ) != 0)
+#endif
+                    for (uintptr_t q = lo; q < run; q += hp)
+                        (void)*(volatile const u8 *)q;
+            }
+        } else if (want == 1) {
+#ifdef SYS_mlock2
+            hm->hostlocked = 1;
+            syscall(SYS_mlock2, (void *)lo, n, 1 /* MLOCK_ONFAULT */);
+#endif
+        } else if (hm->hostlocked) {
+            munlock((void *)lo, n);
+        }
+        lo = run;
+    }
+}
+
+/* A locked slice `gone` is leaving its allocation (an unmap, the old range of
+ * a move): what of the host pages under it no locked slice still lies on is
+ * unlocked. The region is still in the table, so it is left out by hand. */
+static void host_lock_unpunch(AddrSpace *as, const Region *gone) {
+    HostMap *hm = gone->hmap;
+    if (!hm->hostlocked) return;
+    uintptr_t hp = (uintptr_t)g_host_pagesz;
+    uintptr_t lo = (uintptr_t)gone->host & ~(hp - 1);
+    uintptr_t hi = ((uintptr_t)gone->host + (uintptr_t)(gone->end - gone->start) + hp - 1) & ~(hp - 1);
+    uintptr_t ga = (uintptr_t)gone->host, gb = ga + (uintptr_t)(gone->end - gone->start);
+    uintptr_t run = 0;   /* the start of a run of pages to unlock, or 0 */
+    for (uintptr_t p = lo; p <= hi; p += hp) {
+        if (p == hi) {
+            if (run) munlock((void *)run, (size_t)(p - run));
+            break;
+        }
+        int want = 0;
+        for (int i = 0; i < as->nregions && !want; i++) {
+            const Region *r = &as->regions[i];
+            if (r->hmap != hm || !((r->lock & RL_LOCKED) || r->shm_lock) ||
+                !(r->prot & (PTE_R | PTE_W | PTE_X)))
+                continue;
+            /* The slice less `gone` (which is a part of one of these): what
+             * lies below it and what lies above. */
+            uintptr_t a = (uintptr_t)r->host, b = a + (uintptr_t)(r->end - r->start);
+            uintptr_t b1 = b < ga ? b : ga, a2 = a > gb ? a : gb;
+            if ((a < b1 && b1 > p && a < p + hp) || (a2 < b && b > p && a2 < p + hp))
+                want = 1;
+        }
+        if (!want && !run) run = p;
+        else if (want && run) { munlock((void *)run, (size_t)(p - run)); run = 0; }
+    }
+}
+
+/* Sync the host's locks with region `r`'s slice. */
+static void region_host_lock(AddrSpace *as, const Region *r) {
+    host_lock_sync(as, r->hmap, (uintptr_t)r->host,
+                   (uintptr_t)r->host + (uintptr_t)(r->end - r->start));
+}
+
+/* mlock_fixup over [lo, hi), which lies inside one region: the region given
+ * `flags` -- split to the range first, merged back after -- and locked_vm
+ * moved as the kernel moves it. A special region is never locked. */
+static void lock_fixup(AddrSpace *as, u64 lo, u64 hi, u32 flags) {
+    const Region *c = as_find_region(as, lo);
+    if (!c || c->special || c->lock == flags) return;
+    region_split_at(as, lo);
+    region_split_at(as, hi);
+    Region *r = (Region *)as_find_region(as, lo);
+    u64 pages = (hi - lo) >> 12;
+    if (!(flags & RL_LOCKED)) as->locked_vm -= pages;
+    else if (!(r->lock & RL_LOCKED)) as->locked_vm += pages;
+    r->lock = flags;
+    region_host_lock(as, r);
+    region_merge_range(as, lo, hi);
+}
+
+int as_lock_range(AddrSpace *as, u64 start, u64 len, u32 flags) {
+    u64 end = start + len;
+    if (end < start) return -EINVAL;
+    if (end == start) return 0;
+    if (!as_find_region(as, start)) return -ENOMEM;
+    for (u64 va = start; va < end; ) {
+        const Region *r = as_find_region(as, va);
+        if (!r) return -ENOMEM;   /* a hole: what came before it stays done */
+        u64 stop = r->end < end ? r->end : end;
+        lock_fixup(as, va, stop, flags);
+        va = stop;
+    }
+    return 0;
+}
+
+u64 as_locked_pages(AddrSpace *as, u64 start, u64 len) {
+    u64 end = start + len < start ? ~0ULL : start + len, n = 0;
+    for (int i = 0; i < as->nregions; i++) {
+        const Region *r = &as->regions[i];
+        if (r->end <= start || r->start >= end || !(r->lock & RL_LOCKED)) continue;
+        u64 lo = r->start > start ? r->start : start;
+        u64 hi = r->end < end ? r->end : end;
+        n += (hi - lo) >> 12;
+    }
+    return n;
+}
+
+void as_lock_all(AddrSpace *as, u32 def, int current, u32 flags) {
+    as->def_lock = def;
+    if (!current) return;
+    for (u64 va = 0; ; ) {
+        const Region *r = as_next_region(as, va);
+        if (!r) break;
+        u64 lo = r->start, hi = r->end;
+        lock_fixup(as, lo, hi, flags);
+        va = hi;
+    }
+}
+
+void as_lock_new(AddrSpace *as, u64 start, u64 len, u32 flags) {
+    for (u64 va = start; va < start + len; ) {
+        const Region *r = as_find_region(as, va);
+        if (!r) break;
+        u64 stop = r->end < start + len ? r->end : start + len;
+        lock_fixup(as, va, stop, flags);
+        va = stop;
+    }
+}
+
+/* CAP_IPC_LOCK: a fake root's, as capget reports it (sys_misc.c). Read
+ * without the task lock, which ranks outside the address-space lock this is
+ * asked under -- an euid a racing setuid has just changed is the answer an
+ * instant earlier. */
+int as_cap_ipc_lock(struct Machine *m) {
+    return m->fake_id && __atomic_load_n(&m->cred.euid, __ATOMIC_RELAXED) == 0;
+}
+
+int as_mlock_future_ok(struct Machine *m, u32 lock, u64 bytes) {
+    if (!(lock & RL_LOCKED) || as_cap_ipc_lock(m)) return 1;
+    u64 lim = rlim_cur(m, G_RLIMIT_MEMLOCK);
+    if (lim == G_RLIM_INFINITY) return 1;
+    return (bytes >> 12) + m->as.locked_vm <= lim >> 12;
+}
+
+void as_set_special(AddrSpace *as, u64 va) {
+    Region *r = (Region *)as_find_region(as, va);
+    if (r) r->special = 1;
+}
+
+void as_shm_lock_hint(AddrSpace *as, u64 va, u64 len, int on) {
+    for (u64 p = va; p < va + len; ) {
+        Region *r = (Region *)as_find_region(as, p);
+        if (!r) break;
+        r->shm_lock = on != 0;
+        region_host_lock(as, r);
+        p = r->end;
+    }
+}
+
 /* Remove the guest range [addr, addr+len) from every overlapping region,
  * splitting as needed. Backing is never released here slice-wise: fragments
  * keep a reference to their HostMap, and the last one to go retires the whole
@@ -1102,6 +1322,17 @@ static void region_punch(AddrSpace *as, u64 addr, u64 end) {
         if (r->end <= addr || r->start >= end) continue;
         u64 cut_lo = addr > r->start ? addr : r->start;
         u64 cut_hi = end < r->end ? end : r->end;
+        if ((r->lock & RL_LOCKED) || r->shm_lock) {
+            /* An unmap takes a locked range's pages off locked_vm (the
+             * kernel's do_vmi_align_munmap), and its host locks go with it
+             * where nothing locked of the allocation is left on them. */
+            if (r->lock & RL_LOCKED) as->locked_vm -= (cut_hi - cut_lo) >> 12;
+            Region gone = *r;
+            gone.start = cut_lo;
+            gone.end = cut_hi;
+            gone.host = r->host + (cut_lo - r->start);
+            host_lock_unpunch(as, &gone);
+        }
         if (cut_lo == r->start && cut_hi == r->end) {   /* whole region */
             hmap_unref(as, r->hmap);
             region_delete(as, i);
@@ -1575,6 +1806,10 @@ int guest_remap_dup_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     n.path = as_path_dup(r->path);
     n.file_off = r->file_off + (addr - r->start);
     region_insert(as, n);          /* r is stale from here: the table moved */
+    if (n.lock & RL_LOCKED) {      /* a locked mapping's duplicate is one too */
+        as->locked_vm += len >> 12;
+        region_host_lock(as, as_find_region(as, dst));
+    }
     for (u64 off = 0; off < len; off += GUEST_PAGE_SIZE)
         if (addr + off < src_end && pte_get(as, addr + off))
             pte_put_one(as, dst + off, n.host + off, (u32)prot);
@@ -1671,6 +1906,19 @@ int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
         for (u64 off = 0; off < slen; off += GUEST_PAGE_SIZE)
             if (pte_get(as, pos + off))
                 pte_put_one(as, ndst + off, n.host + off, prot);
+        if (n.lock & RL_LOCKED) {
+            /* The moved mapping is locked, and counted as a new one; the
+             * range left behind is a fresh mapping, unlocked, and never
+             * taken off locked_vm -- the kernel's move_vma, which leaves the
+             * count that much above the locked mappings. */
+            as->locked_vm += slen >> 12;
+            region_host_lock(as, as_find_region(as, ndst));
+            region_split_at(as, pos);
+            region_split_at(as, hi);
+            Region *o = (Region *)as_find_region(as, pos);
+            o->lock = 0;
+            region_host_lock(as, o);
+        }
         pos = hi;
     }
     pte_sync_range(as, dst, len);
@@ -1714,6 +1962,10 @@ int guest_remap_grow_impl(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
     int rc = region_extend_backing(as, r, extra, in_place);
     if (rc < 0) return rc;
     r->end += extra;
+    if (r->lock & RL_LOCKED) {     /* what a locked mapping grows by is locked */
+        as->locked_vm += extra >> 12;
+        region_host_lock(as, r);
+    }
     /* A real host mapping of a file gets no page-table entries for the new
      * pages: they may lie past end-of-file, and the fault path probes the
      * backing and either fills the page in or raises the guest's bus error,
@@ -1911,6 +2163,7 @@ void as_procmem(AddrSpace *as, ProcMem *out) {
     }
     if (out->size > as->peak) as->peak = out->size;
     out->peak        = as->peak;
+    out->locked      = as->locked_vm << 12;
     out->pgtables    = (u64)as->npgtables * sizeof(struct L2Table);
     out->start_code  = as->start_code;   out->end_code   = as->end_code;
     out->start_data  = as->start_data;   out->end_data   = as->end_data;
@@ -1998,6 +2251,20 @@ static void host_zero_backing(u8 *p, size_t len) {
 
 void as_fork_child(AddrSpace *as) {
     as_lock();
+    /* A child inherits no memory lock and no mlockall(MCL_FUTURE) (dup_mmap
+     * clears VM_LOCKED_MASK, mm_init keeps no def_flags of it); the host
+     * fork has dropped the host's locks already. */
+    for (int i = 0; i < as->nregions; i++) {
+        as->regions[i].lock = 0;
+        as->regions[i].hmap->hostlocked = 0;
+    }
+    as->locked_vm = 0;
+    as->def_lock = 0;
+    region_merge_range(as, 0, ~0ULL);
+    /* A SHM_LOCKed segment's pages stay locked, the child's mapping of them
+     * as much as the parent's: the hint is the segment's, not the mm's. */
+    for (int i = 0; i < as->nregions; i++)
+        if (as->regions[i].shm_lock) region_host_lock(as, &as->regions[i]);
     /* Wipe first, drop second: an unmap moves the table under a walk. */
     for (int i = 0; i < as->nregions; i++) {
         Region *r = &as->regions[i];
@@ -2506,6 +2773,8 @@ static int as_stack_grows_to(CPU *c, u64 va) {
     u64 cap = rlim_cur(m, G_RLIMIT_AS);
     if (cap != G_RLIM_INFINITY && (grow > cap || as_mapped_bytes(as) > cap - grow))
         return -1;
+    /* A locked stack's growth is locked memory too (acct_stack_growth). */
+    if (!as_mlock_future_ok(m, r->lock, grow)) return -1;
     return i;
 }
 
@@ -2524,6 +2793,12 @@ static int as_stack_extend(CPU *c, int i, u64 addr) {
             pte_put_one(as, addr + off, r->host + off, prot);
     } else if (region_grow_piece(c->m, as, i, addr) != 0) {
         return -1;
+    }
+    /* What a locked stack grows over is locked (acct_stack_growth). */
+    const Region *n = as_find_region(as, addr);
+    if (n && (n->lock & RL_LOCKED)) {
+        as->locked_vm += grow >> 12;
+        region_host_lock(as, n);
     }
     /* Nothing to publish beyond the new sizes: pages that were not mapped
      * are in no D-TLB (misses are never cached) and under no translation. */
@@ -3017,6 +3292,34 @@ size_t mem_stack_hole(CPU *c, u64 va, size_t len, AccType acc) {
     }
     as_unlock();
     return n;
+}
+
+int as_mlock_populate(CPU *c, u64 start, u64 len) {
+    AddrSpace *as = &c->m->as;
+    u64 end = start + len;
+    int err = 0;
+    as_lock();
+    for (u64 va = start; va < end && !err; ) {
+        const Region *r = as_next_region(as, va);
+        if (!r || r->start >= end) break;
+        if (r->start > va) va = r->start;
+        u64 stop = r->end < end ? r->end : end;
+        if ((r->lock & (RL_LOCKED | RL_ONFAULT)) == RL_LOCKED && !r->special) {
+            if (!(r->prot & (PTE_R | PTE_W | PTE_X))) {
+                err = -ENOMEM;   /* GUP's EFAULT on PROT_NONE, mlock's ENOMEM */
+            } else if (r->hostmap) {
+                /* A file mapping's pages, faulted in as GUP faults them: one
+                 * past end-of-file cannot be, and that is the ENOMEM too. */
+                for (u64 p = va; p < stop && !err; p += GUEST_PAGE_SIZE) {
+                    bool perm;
+                    if (!translate(c, p, 0, &perm)) err = -ENOMEM;
+                }
+            }
+        }
+        va = stop;
+    }
+    as_unlock();
+    return err;
 }
 
 int mem_stack_touch(CPU *c, u64 va, AccType acc) {

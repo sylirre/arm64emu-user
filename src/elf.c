@@ -711,6 +711,10 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
         u32 code[2] = { 0xd2801168 /* mov x8,#139 */, 0xd4000001 /* svc #0 */ };
         copy_to_guest(&m->cpu, tramp, code, sizeof code);
         guest_protect(&m->as, tramp, GUEST_PAGE_SIZE, PTE_R | PTE_X);
+        /* ...which mlock leaves alone, as it does the vDSO (VM_SPECIAL). */
+        as_lock();
+        as_set_special(&m->as, tramp);
+        as_unlock();
         m->sigtramp_va = tramp;
     }
 

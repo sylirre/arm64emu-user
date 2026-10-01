@@ -1526,7 +1526,8 @@ s32  shmbroker_get(struct Machine *m, s32 key, u64 size, s32 shmflg);
 /* shmat: hand back a mappable host fd for shmid (caller mmaps then closes it
  * with broker_fd_close: it is held against fork until then) and increment
  * nattch; fills *size_out. Returns the fd (>=0) or -errno. */
-int  shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out);
+int  shmbroker_at(struct Machine *m, s32 shmid, int readonly, u64 *size_out,
+                  int *locked_out);
 void broker_fd_close(int fd);
 /* Decrement nattch for one attachment of shmid (shmdt / detach on exec+exit). */
 void shmbroker_dt(struct Machine *m, s32 shmid);
