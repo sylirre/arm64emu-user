@@ -447,6 +447,38 @@ int main(void) {
     waitpid(k, &st, 0);
     printf("vfork child writes in the stack's hole: in the hole %d, parent reads %d, grown %d\n",
            (unsigned long)vp < vs0, *vp, vma_start((unsigned long)&here2) <= (unsigned long)vp);
+    /* ...grows it by the child's own rules, whether it stored anything there
+     * or not: a read below it, a zero written there (what a fresh page holds
+     * already), and a store past the parent's RLIMIT_STACK, which the child
+     * raised for itself, all grow it. */
+    char *v1 = grows_at(base - 2560 * MB, 4);
+    char *v2 = grows_at(base - 2688 * MB, 4);
+    char *v3 = grows_at(base - 2816 * MB, 4);
+    if (!v1 || !v2 || !v3) return 1;
+    k = vfork();
+    if (k == 0) { volatile char c = v1[-6 * (long)PG]; (void)c; _exit(0); }
+    waitpid(k, &st, 0);
+    printf("vfork child reads the hole: grown %d\n",
+           vma_start((unsigned long)v1) == (unsigned long)v1 - 6 * PG);
+    k = vfork();
+    if (k == 0) { v2[-6 * (long)PG] = 0; _exit(0); }
+    waitpid(k, &st, 0);
+    printf("vfork child writes a zero in the hole: grown %d\n",
+           vma_start((unsigned long)v2) == (unsigned long)v2 - 6 * PG);
+    struct rlimit old_stk;
+    getrlimit(RLIMIT_STACK, &old_stk);
+    set_stack(64 * PG);
+    k = vfork();
+    if (k == 0) {
+        if (setrlimit(RLIMIT_STACK, &old_stk)) _exit(9);
+        v3[-100 * (long)PG] = 5;
+        _exit(0);
+    }
+    waitpid(k, &st, 0);
+    int g3 = vma_start((unsigned long)v3) == (unsigned long)v3 - 100 * PG;
+    printf("vfork child grows it past the parent's RLIMIT_STACK: grown %d, parent reads %d\n",
+           g3, g3 ? v3[-100 * (long)PG] : -1);
+    setrlimit(RLIMIT_STACK, &old_stk);
 
     /* A fork child grows its own copy. */
     k = fork();

@@ -226,10 +226,16 @@ a stale page from the child must not undo what a sibling wrote beside the
 child's bytes. `mprotect` and the end-of-file fill keep the bit withheld on a
 private region while tracking (`vf_pte_prot`); a mapping the child makes
 itself is untracked and its own. A stack the child grows — it runs on the
-parent's — is carried as far as the child wrote into it: the grown pages are
-tracked like any other, and the parent's copy of their bytes
-(`copy_to_guest_code`) grows the parent's own stack over them, as the vma the
-two share would have grown. A fork child of a tracked process starts
+parent's — grows the vma the two share, by the child's rules (its own
+`RLIMIT_STACK`, which a vfork child may change for itself), whether it stored
+anything there or only read: each stack's start is noted as tracking begins,
+and one the child has grown below it goes to the parent ahead of the bytes,
+which grows its own to match without its own limits, over free ground
+(`as_stack_grow_shared`). It used to be carried only as far as the child
+wrote, by the parent's copy of the bytes growing the parent's stack by the
+parent's rules: a child that only read below the stack, or wrote what a fresh
+page holds, grew the parent's nothing, and one that raised its limit to reach
+further lost what it wrote there. A fork child of a tracked process starts
 clean (`as_vfork_fork_child`) — the heal path still mends the PTEs it
 inherited, recording nothing — and a process applying its own vfork child's
 bytes while itself tracked records them first (`as_vfork_note_write`), so a

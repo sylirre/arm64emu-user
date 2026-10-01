@@ -637,16 +637,24 @@ static void pte_prot_raw(AddrSpace *as, u64 addr, u64 len, u32 prot) {
  * itself (mmap, munmap, mremap, brk, mprotect) is its own and not carried,
  * and a sibling thread of the parent writing the very bytes the child writes
  * loses to the child, as in any race. A stack the child grows -- it runs on
- * the parent's -- is carried as far as the child wrote: the grown pages are
- * tracked like any other, and the parent's copy of their bytes
- * (copy_to_guest_code) grows its own stack over them, as the vma the two
- * share would have grown. A grandchild forked from a tracked
+ * the parent's -- grows the vma the two share, by the child's own rules (its
+ * RLIMIT_STACK, which a vfork child may change for itself), whether it
+ * stored anything there or only read: so each stack's start is noted when
+ * the tracking begins, and one the child has grown below it goes to the
+ * parent first (`grow`), which grows its own to match (as_stack_grow_shared),
+ * the bytes after it. It used to be carried as far as the child wrote, the
+ * parent's own copy of the bytes growing its stack by the parent's rules: a
+ * child that only read below the stack, or wrote what a fresh page already
+ * holds, grew the parent's nothing, and one that raised its limit to grow
+ * further lost what it wrote there. A grandchild forked from a tracked
  * child starts clean (as_vfork_fork_child): the heal path still mends the
  * PTEs it inherited, recording nothing. */
 typedef struct { u64 va; u8 *was; } VforkPage;
 static int g_vf_track;                  /* this process's stores are tracked */
 static VforkPage *g_vf_pages;           /* sorted by va; under as_lock */
 static int g_vf_n, g_vf_cap;
+static u64 *g_vf_stacks;                /* each stack's start, as tracking began */
+static int g_vf_nstacks;
 
 static int vf_find(u64 va) {            /* index of va, or -(insertion+1) */
     int lo = 0, hi = g_vf_n - 1;
@@ -687,6 +695,9 @@ static void vf_drop(void) {
     free(g_vf_pages);
     g_vf_pages = NULL;
     g_vf_n = g_vf_cap = 0;
+    free(g_vf_stacks);
+    g_vf_stacks = NULL;
+    g_vf_nstacks = 0;
     g_vf_track = 0;
 }
 
@@ -702,6 +713,11 @@ void as_vfork_track_begin(AddrSpace *as) {
     g_vf_track = 1;
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
+        /* The bottom of each stack (a growsdown mapping's lowest piece). */
+        if (r->growsdown && (i == 0 || !as_same_vma(&as->regions[i - 1], r))) {
+            u64 *t = realloc(g_vf_stacks, (size_t)(g_vf_nstacks + 1) * sizeof *t);
+            if (t) { g_vf_stacks = t; g_vf_stacks[g_vf_nstacks++] = r->start; }
+        }
         if (r->shared || !(r->prot & PTE_W)) continue;
         pte_prot_raw(as, r->start, r->end - r->start, r->prot & ~PTE_W);
     }
@@ -734,10 +750,21 @@ void as_vfork_fork_child(void) {
 }
 
 int as_vfork_flush(AddrSpace *as, int (*emit)(void *ctx, u64 va, const u8 *data, u32 len),
-                   void *ctx) {
+                   int (*grow)(void *ctx, u64 was, u64 start), void *ctx) {
     int rc = 0;
     as_lock();
     g_vf_track = 0;
+    /* The stacks first: the bytes may lie in what they grew. */
+    for (int k = 0; k < g_vf_nstacks && rc == 0; k++) {
+        u64 was = g_vf_stacks[k];
+        for (int i = 0; i < as->nregions; i++) {
+            if (as->regions[i].start > was) break;
+            if (as->regions[i].end <= was) continue;
+            u64 start = as_vma_start(as, i);
+            if (as->regions[i].growsdown && start < was) rc = grow(ctx, was, start);
+            break;
+        }
+    }
     for (int i = 0; i < g_vf_n && rc == 0; i++) {
         u64 va = g_vf_pages[i].va;
         uintptr_t pte = pte_get(as, va);
@@ -2482,6 +2509,28 @@ static int as_stack_grows_to(CPU *c, u64 va) {
     return i;
 }
 
+/* Grow the stack whose lowest piece is as->regions[i] down to page `addr`:
+ * the room under its backing, or a piece of its own. 0, or -1 when the host
+ * has no backing to give. Caller holds as_lock. */
+static int as_stack_extend(CPU *c, int i, u64 addr) {
+    AddrSpace *as = cpu_as(c);
+    Region *r = &as->regions[i];
+    u64 grow = r->start - addr;
+    if (region_grow_down(as, r, grow) == 0) {
+        r->start = addr;
+        r->host -= grow;
+        u32 prot = vf_pte_prot(r, r->prot);
+        for (u64 off = 0; off < grow; off += GUEST_PAGE_SIZE)
+            pte_put_one(as, addr + off, r->host + off, prot);
+    } else if (region_grow_piece(c->m, as, i, addr) != 0) {
+        return -1;
+    }
+    /* Nothing to publish beyond the new sizes: pages that were not mapped
+     * are in no D-TLB (misses are never cached) and under no translation. */
+    as_account(as);
+    return 0;
+}
+
 /* Grow the VM_GROWSDOWN region above `va` down to it, if the kernel would
  * (see above); the PTE of `va` then, or 0. */
 static uintptr_t __attribute__((cold)) as_stack_grow(CPU *c, u64 va) {
@@ -2492,25 +2541,29 @@ static uintptr_t __attribute__((cold)) as_stack_grow(CPU *c, u64 va) {
     int i = as_stack_grows_to(c, va);
     if (i == INT_MAX) pte = pte_get(as, va);
     if (i < 0 || i == INT_MAX) goto out;
-    Region *r = &as->regions[i];
-    u64 addr = va & ~(u64)GUEST_PAGE_MASK;
-    u64 grow = r->start - addr;
-    if (region_grow_down(as, r, grow) == 0) {
-        r->start = addr;
-        r->host -= grow;
-        u32 prot = vf_pte_prot(r, r->prot);
-        for (u64 off = 0; off < grow; off += GUEST_PAGE_SIZE)
-            pte_put_one(as, addr + off, r->host + off, prot);
-    } else if (region_grow_piece(c->m, as, i, addr) != 0) {
-        goto out;
-    }
-    /* Nothing to publish beyond the new sizes: pages that were not mapped
-     * are in no D-TLB (misses are never cached) and under no translation. */
-    as_account(as);
-    pte = pte_get(as, va);
+    if (as_stack_extend(c, i, va & ~(u64)GUEST_PAGE_MASK) == 0) pte = pte_get(as, va);
 out:
     as_unlock();
     return pte;
+}
+
+int as_stack_grow_shared(CPU *c, u64 was, u64 start) {
+    AddrSpace *as = cpu_as(c);
+    int r = -1;
+    start &= ~(u64)GUEST_PAGE_MASK;
+    as_lock();
+    int i = 0;
+    while (i < as->nregions && as->regions[i].end <= was) i++;
+    if (i < as->nregions && as->regions[i].start <= was && as->regions[i].growsdown) {
+        while (i > 0 && as_same_vma(&as->regions[i - 1], &as->regions[i])) i--;
+        /* Only into free ground: what was the hole when the child grew into
+         * it, unless a sibling thread of ours has mapped there since. */
+        if (as->regions[i].start <= start ||
+            (start >= mmap_min_addr() && (i == 0 || as->regions[i - 1].end <= start)))
+            r = as->regions[i].start <= start ? 0 : as_stack_extend(c, i, start);
+    }
+    as_unlock();
+    return r;
 }
 
 /* Raise the guest-visible abort for a failed data access. The DFSC encodes

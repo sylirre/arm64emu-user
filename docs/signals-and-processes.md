@@ -1278,8 +1278,9 @@ byte: the child's stores were tracked page by page from its first instruction
 (`docs/memory.md`, *A vfork child's writes are tracked*), and at its exec
 (`do_execve`'s point of no return, where `exec_mmap` releases the parent), its
 exit (`process_exit`) or its death by a signal (`guest_terminate_by_signal`) it
-compares each page it touched with the copy it took and sends the bytes that
-changed. They travel through one `MAP_SHARED` anonymous page made before the
+sends each stack it grew below where it started (`VF_GROW`: the vma the two
+share grew, by the child's rules), then compares each page it touched with the
+copy it took and sends the bytes that changed. They travel through one `MAP_SHARED` anonymous page made before the
 fork — no descriptor, so nothing for the guest's fd table or the CLOEXEC walk to
 see — with a futex word at its head; the child waits for each run to be
 acknowledged, the parent applies it with the ptrace-poke path

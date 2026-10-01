@@ -923,8 +923,8 @@ static void *thread_entry(void *arg) {
  * carried back, byte for byte, through a page the two share -- the child's
  * stores were tracked page by page from its first instruction (mem.c,
  * "the child's writes, tracked for the parent"), and at its exec / exit /
- * death it compares each page it touched with the copy it took and sends the
- * bytes that changed. The parent applies them to its own space with the
+ * death it sends each stack it grew (VF_GROW), then compares each page it
+ * touched with the copy it took and sends the bytes that changed. The parent applies them to its own space with the
  * ptrace-poke path (copy_to_guest_code: past the software write bit, since
  * the child may have mprotected what it wrote to, and dropping any JIT block
  * over them), then reports PTRACE_EVENT_VFORK_DONE if asked to and returns
@@ -949,12 +949,12 @@ static void *thread_entry(void *arg) {
  * wins as it would on a kernel. */
 #define VF_BOX_SIZE (64u << 10)
 #define VF_DATA_MAX (VF_BOX_SIZE - 16)
-enum { VF_IDLE = 0, VF_DATA, VF_ACK, VF_DONE, VF_GONE };
+enum { VF_IDLE = 0, VF_DATA, VF_ACK, VF_DONE, VF_GONE, VF_GROW };
 struct VforkBox {
     u32 state;              /* the futex word: who moves next */
     u32 len;                /* VF_DATA: bytes in data[] */
-    u64 va;                 /* VF_DATA: where they go */
-    u8  data[VF_DATA_MAX];
+    u64 va;                 /* VF_DATA: where they go; VF_GROW: the stack's start */
+    u8  data[VF_DATA_MAX];  /* VF_GROW: an address that was its start (a u64) */
 };
 static struct VforkBox *g_vf_box;   /* the child's end; NULL in any other process */
 static pid_t g_vf_parent;
@@ -988,11 +988,29 @@ static int vf_emit(void *ctx, u64 va, const u8 *data, u32 len) {
     return 0;
 }
 
+/* Child: a stack it grew -- from `was` down to `start` -- for the parent to
+ * grow its own to match, ahead of the bytes that may lie in it. */
+static int vf_grow(void *ctx, u64 was, u64 start) {
+    struct VforkBox *b = ctx;
+    memcpy(b->data, &was, sizeof was);
+    b->va = start;
+    b->len = sizeof was;
+    __atomic_store_n(&b->state, VF_GROW, __ATOMIC_RELEASE);
+    vf_wake(&b->state);
+    for (;;) {
+        u32 st = __atomic_load_n(&b->state, __ATOMIC_ACQUIRE);
+        if (st == VF_ACK) return 0;
+        if (st != VF_GROW) return -1;
+        vf_wait(&b->state, VF_GROW, 100);
+        if (getppid() != g_vf_parent) return -1;
+    }
+}
+
 void vfork_child_flush(CPU *c) {
     struct VforkBox *b = g_vf_box;
     if (!b) return;
     g_vf_box = NULL;
-    if (as_vfork_tracking()) as_vfork_flush(&c->m->as, vf_emit, b);
+    if (as_vfork_tracking()) as_vfork_flush(&c->m->as, vf_emit, vf_grow, b);
     __atomic_store_n(&b->state, VF_DONE, __ATOMIC_RELEASE);   /* release the parent */
     vf_wake(&b->state);
     munmap(b, VF_BOX_SIZE);
@@ -1020,6 +1038,14 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
              * has nowhere to go. */
             as_vfork_note_write(&m->as, b->va, len);
             copy_to_guest_code(c, b->va, b->data, len);
+            __atomic_store_n(&b->state, VF_ACK, __ATOMIC_RELEASE);
+            vf_wake(&b->state);
+            continue;
+        }
+        if (st == VF_GROW) {
+            u64 was;
+            memcpy(&was, b->data, sizeof was);
+            as_stack_grow_shared(c, was, b->va);
             __atomic_store_n(&b->state, VF_ACK, __ATOMIC_RELEASE);
             vf_wake(&b->state);
             continue;
