@@ -2771,6 +2771,35 @@ check_fixture growsdown $'initial stack: [stack], 128..256 KiB: 1\nVmStk 128..25
     "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
 check_fixture growsnomove $'thread grows it: 1, start moved: 1\nthe other thread sees the page: 1\natomic first touch: 1, value 5, start moved: 1\none transfer into it and below: 68 pages, start moved: 1, bytes 1 1\ngrown 300 pages: 1, PROT_GROWSDOWN from the top: 0, bottom page rwxp\ndone' \
     "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
+# O_DIRECT where the host really does direct I/O (ext4, xfs, f2fs, exfat; not
+# btrfs or tmpfs, which fall back to the page cache): the guest's buffers are
+# the host's to judge, and a transfer staged rather than lent keeps the guest
+# buffer's offset into its page (sys_file.c, xfer_stage). The fixture is
+# handed every directory here it could use -- this checkout, the temporary
+# directories, $HOME and the writable mount points of the filesystems that
+# can do it -- and takes the first where a misaligned read is refused, or
+# skips. Self-checking: the block is the kernel's, on exfat. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/odirect.bin tests/fixtures/odirect.c 2>/dev/null; then
+        dio_dirs=("$PWD" "${TMPDIR:-/tmp}" /var/tmp "$HOME")
+        while read -r _ dio_m dio_t _; do
+            case "$dio_t" in
+            ext2|ext3|ext4|xfs|f2fs|exfat|vfat|msdos|jfs|nilfs2|fuseblk) ;;
+            *) continue ;;
+            esac
+            dio_m=$(printf '%b' "$dio_m")   # /proc/mounts escapes a space as \040
+            [ -d "$dio_m" ] && [ -w "$dio_m" ] && dio_dirs+=("$dio_m")
+        done < /proc/self/mounts
+        expect=$'aligned read 4096: 4096\naligned read 8192: 8192\naligned read 32768: 32768\naligned read 65536: 65536\naligned read 131072: 131072\naligned write 4096: 4096\naligned write 8192: 8192\naligned write 32768: 32768\naligned write 65536: 65536\naligned write 131072: 131072\naligned readv 1+2 pages: 12288\naligned writev 1+2 pages: 12288\nmisaligned read: EINVAL\nmisaligned length: EINVAL\ndone'
+        for eng in "" "--jit"; do
+            got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/odirect.bin "${dio_dirs[@]}" 2>/dev/null)
+            fixture_verdict "odirect${eng:+ (jit)}" "$expect" "$got"
+        done
+        fx_rm tests/fixtures/odirect.bin
+    else
+        skip_build "fixtures/odirect"
+    fi
+fi
 # execve's argument-limit accounting (elf.c and the argv/envp import in
 # sys_proc.c). A kernel measures argv+envp
 # against a share of RLIMIT_STACK -- floored at ARG_MAX, capped at three

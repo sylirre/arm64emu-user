@@ -256,11 +256,25 @@ static int xfer_split_ok(int fd, int *cache) {
  * the next part of the transfer: gathered now for a host call that reads
  * them, handed back by xfer_end for one that writes them. `per_seg` keeps the
  * guest's segment boundaries in the host iovecs (the whole transfer staged,
- * possibly for a file that answers per segment); otherwise it is one iovec. */
+ * possibly for a file that answers per segment); otherwise it is one iovec.
+ *
+ * The staging lies at the same offset into a host page as the guest's bytes
+ * lie into theirs. An O_DIRECT descriptor on a filesystem that really does
+ * direct I/O -- ext4, xfs, f2fs, exfat, a block device; not btrfs or tmpfs,
+ * which fall back to the page cache -- refuses with EINVAL a buffer, or an
+ * iovec, that is not aligned to its logical block, and malloc's sixteen
+ * bytes are not that: every O_DIRECT transfer of 64 KiB or less, the ones
+ * staged rather than lent (sys.h), was refused there however the guest had
+ * aligned it. A vector whose segments are each aligned to a block of up to a
+ * page and as long as whole blocks stays aligned laid out end to end from
+ * the first one's offset. */
 static int xfer_stage(CPU *c, GuestXfer *x, int sseg, u64 soff, size_t len,
                       int per_seg) {
-    u8 *b = malloc(len ? len : 1);
-    if (!b) return -ENOMEM;
+    size_t at = sseg < x->nseg ? (size_t)((x->seg[sseg].iov_base + soff) & GUEST_PAGE_MASK) : 0;
+    void *mem = NULL;
+    if (posix_memalign(&mem, GUEST_PAGE_SIZE, at + (len ? len : 1)) != 0) return -ENOMEM;
+    u8 *b = (u8 *)mem + at;
+    x->stage_mem = mem;
     x->stage = b;
     x->stage_len = len;
     x->stage_seg = sseg;
@@ -485,9 +499,10 @@ int xfer_end(CPU *c, GuestXfer *x, size_t done) {
     }
     guest_unlend(c, x->pin, x->npin);
     if (x->guarded) guardbuf_free(&x->guard);
-    else free(x->stage);
+    else free(x->stage_mem);
     free(x->heap);
     x->stage = NULL;
+    x->stage_mem = NULL;
     x->heap = NULL;
     x->guarded = 0;
     x->npin = x->n = 0;

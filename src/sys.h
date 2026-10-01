@@ -132,7 +132,8 @@ static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
  * straight between the file and the caller's pages, ever needs.
  *
  * Now the bounce is only for small transfers (XFER_BOUNCE_MAX and under),
- * where it is the cheapest thing to do. A larger one LENDS the guest's own
+ * where it is the cheapest thing to do -- at the guest's own offset into a
+ * page, which an O_DIRECT descriptor's alignment rule judges (xfer_stage). A larger one LENDS the guest's own
  * backing to the host call (guest_lend, mem.c): the runs of host memory under
  * the guest's buffer become the host call's iovecs, pinned for the duration,
  * and the host kernel moves the bytes exactly as the guest's kernel would --
@@ -251,6 +252,7 @@ typedef struct GuestXfer {
     const GIovec *seg;            /* the guest vector the bytes belong to */
     int nseg;
     u8 *stage;                    /* the bytes staged rather than lent... */
+    void *stage_mem;              /* (the allocation they lie in) */
     size_t stage_len;
     int stage_seg;                /* ...from here in the guest vector... */
     u64 stage_off;
