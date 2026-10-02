@@ -736,16 +736,19 @@ reproducible in a few lines that never touch the emulator:
 | a system call's copy into the hole beneath a `MAP_GROWSDOWN` mapping | `EFAULT`: its own page table has no such page | grows the mapping |
 | an `F_SETSIG` real-time signal of an `O_ASYNC` descriptor | lays it out as a sigqueue's: no `si_fd` | `si_band` and `si_fd` |
 | `pselect6` with a bitmap naming a descriptor past 1023 | `FD_ISSET` on its own `fd_set` on the way back: a fortified build aborts | answers for it |
+| starting a program where `vm.mmap_min_addr` reads 0 (a sandbox's bind mount) | "Unable to find a guest_base": it reserves its guest's space from address 0 | starts it |
 
 `tests/c/mremapsem.c`, `tests/fixtures/mremapdup.c` (the guest's own
 `mremap(old_size=0)`, which the emulator serves by duplicating the host
 mapping the same way), `tests/fixtures/dontunmap.c` (whose shared rows are
 served the same way), `tests/c/socktimeo.c`, `tests/ptrace/wait_rusage.c`,
 `timers_many`, `sockfilter_get`, `prctlset`, `scmfit`, `madvremove`, `sigpoll`, `pselectwide` and the
-real-socket tier of `netns_ack` (its bad-tail send) declare what they need with a `NEEDS-HOST-SYSCALL:` marker, and `odirect`'s
+real-socket tier of `netns_ack` (its bad-tail send) declare what they need with a `NEEDS-HOST-SYSCALL:` marker; `personality`'s
+`mmap_min_addr` 0 row starts a program built the way the emulator is in its
+sandbox first, and skips where even that cannot start; and `odirect`'s
 stack-hole rows — an O_DIRECT transfer's run in the hole goes to the host as
 the hole under a growsdown mapping of the emulator's own, which the host is
-to grow or refuse — are skipped by the same probe (`growsdown-copy`), its
+to grow or refuse — are skipped by a probe of that kind (`growsdown-copy`), its
 direct-I/O rows running alone. `hostenv.sh`
 answers it by **building and running a probe the way the emulator itself was
 built** — same compiler, same ABI flags, so the same interpreter picks it up.

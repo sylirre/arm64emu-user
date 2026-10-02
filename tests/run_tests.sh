@@ -2920,19 +2920,36 @@ PERS_EXPECT=$'refuse 0x8: r=-1 errno=22 now=00040000\nrefuse 0x20008: r=-1 errno
 A64_KEEP_TESTBINS=1 check_fixture personality "$PERS_EXPECT"
 # ...and on a host whose vm.mmap_min_addr is 0, where MMAP_PAGE_ZERO does map
 # page zero: no stock kernel ships that, so the sysctl is replaced for the
-# emulator and the guest alike by a bind mount in a bubblewrap sandbox.
-if [ -x tests/fixtures/personality.bin ] && command -v bwrap >/dev/null 2>&1 &&
-   printf '0\n' > tests/.cache/mmap_min_addr0 &&
-   bwrap --ro-bind / / --dev /dev --proc /proc \
-         --ro-bind tests/.cache/mmap_min_addr0 /proc/sys/vm/mmap_min_addr \
-         cat /proc/sys/vm/mmap_min_addr 2>/dev/null | grep -qx 0; then
-    got=$(bwrap --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp \
-                --ro-bind tests/.cache/mmap_min_addr0 /proc/sys/vm/mmap_min_addr \
-                "$EMU" / tests/fixtures/personality.bin 2>/dev/null)
+# emulator and the guest alike by a bind mount in a bubblewrap sandbox --
+# where the emulator's own process can start at all: qemu-user, the ARM32
+# tier's host, reads the sysctl to place its guest and, told 0, asks for an
+# address space from 0 that the kernel refuses ("Unable to find a guest_base
+# to satisfy all guest address mapping requirements"). A program built the
+# way the emulator is, started in the same sandbox, says which.
+pers_sandbox() {   # pers_sandbox <cmd...>: run it where the sysctl reads 0
+    bwrap --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp \
+          --ro-bind tests/.cache/mmap_min_addr0 /proc/sys/vm/mmap_min_addr "$@"
+}
+pers_why=
+if [ ! -x tests/fixtures/personality.bin ] || ! command -v bwrap >/dev/null 2>&1 ||
+   ! printf '0\n' > tests/.cache/mmap_min_addr0 ||
+   ! pers_sandbox cat /proc/sys/vm/mmap_min_addr 2>/dev/null | grep -qx 0; then
+    pers_why="no bubblewrap sandbox here to set the sysctl in"
+else
+    pers_t=$(mktemp -d)
+    if printf 'int main(void) { return 0; }\n' |
+           $A64_EMU_CC $A64_EMU_CFLAGS -x c - -o "$pers_t/start" 2>/dev/null &&
+       ! pers_sandbox "$pers_t/start" >/dev/null 2>&1; then
+        pers_why="the emulator's host cannot start where vm.mmap_min_addr reads 0"
+    fi
+    rm -rf "$pers_t"
+fi
+if [ -z "$pers_why" ]; then
+    got=$(pers_sandbox "$EMU" / tests/fixtures/personality.bin 2>/dev/null)
     fixture_verdict "personality (mmap_min_addr 0)" "$PERS_EXPECT" "$got"
 else
     skip=$((skip+1))
-    echo "SKIP fixture: personality (mmap_min_addr 0) (no bubblewrap sandbox here to set the sysctl in)"
+    echo "SKIP fixture: personality (mmap_min_addr 0) ($pers_why)"
 fi
 rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
 # An execve from a secondary thread: the new image keeps what was pending on
