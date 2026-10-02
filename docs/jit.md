@@ -771,3 +771,12 @@ kernel cannot tell apart. And `PR_GET_SPECULATION_CTRL` is `EINVAL` from any
 host whose architecture has no speculation controls (real ARM32 as well as
 `qemu-arm`), where an arm64 kernel never answers that for valid arguments; the
 emulator now answers such a host's refusal with the arm64 kernel's `ENODEV`.
+
+One more was worse than a wrong answer. `qemu-arm` writes past the control
+buffer a receive hands it: the data of an `SCM_CREDENTIALS` element whose
+header fitted goes out whole — twelve bytes past the end — where every other
+kind is truncated. The emulator's buffer is exactly the guest's length, so
+those bytes landed on the heap's own bookkeeping, and `c/scmrights`' "too small
+for the reply" row aborted the emulator once the allocation pattern around it
+changed. The buffer now has a credential's worth of room past the length the
+host is told, which a kernel never writes into.

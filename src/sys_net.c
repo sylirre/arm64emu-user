@@ -1355,7 +1355,15 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
             if (cl > room) cl = room;
             if (cl > XFER_STAGE_MAX) cl = XFER_STAGE_MAX;
             if (cl) {
-                u8 *hctrl = calloc(1, cl);
+                /* ...with a credential's worth of room past the length the
+                 * host is told, which a kernel never writes into. qemu-user,
+                 * the host of the ARM32 tier, does: the data of an
+                 * SCM_CREDENTIALS element whose header fitted goes out whole
+                 * (host_to_target_cmsg truncates every other kind), up to
+                 * twelve bytes past the buffer's end -- onto the heap's own
+                 * bookkeeping, which the next free then found corrupt and
+                 * aborted the process for. */
+                u8 *hctrl = calloc(1, cl + sizeof(struct ucred));
                 if (!hctrl) return -ENOMEM;
                 mi->ctrl = hctrl;
                 mi->ctrl_cap = cl;
