@@ -2874,7 +2874,12 @@ check_fixture readlinksz $'neg=-22 guard=1\nzero=-22 guard=1\nintmin=-22\nhi32_z
 # qemu-user updates the timespec only on a successful return and never on
 # EINTR, which is the case a caller looping with the time it has left needs.
 # Also the clamp of a select nfds past the fd table's size, never a refusal.
-check_fixture pwaittmo $'ppoll_eintr r=-4 band=1\npselect_eintr r=-4 band=1\nppoll_timeout r=0 zero=1\npselect_timeout r=0 zero=1\nppoll_ready r=1 updated=1\npselect_ready r=1 updated=1 isset=1\nppoll_nfds r=-22 updated=1\nppoll_fault r=-14 updated=1\npselect_nfds r=-22 updated=1\npselect_fault r=-14 updated=1\nppoll_badts r=-22 kept=1\nppoll_badsize r=-22 kept=1\nppoll_badmask r=-14 kept=1\nppoll_badts_badmask r=-22\npselect_badsize r=-22 kept=1\npselect_badts_badnfds r=-22 kept=1\npselect_badmask_badnfds r=-14 kept=1\npselect_badpair r=-14\nppoll_zero r=1 zero=1\npselect_intmax r=1 isset=1\npselect_wide r=1 isset=1 updated=1\ndone'
+check_fixture pwaittmo $'ppoll_eintr r=-4 band=1\npselect_eintr r=-4 band=1\nppoll_timeout r=0 zero=1\npselect_timeout r=0 zero=1\nppoll_ready r=1 updated=1\npselect_ready r=1 updated=1 isset=1\nppoll_nfds r=-22 updated=1\nppoll_fault r=-14 updated=1\npselect_nfds r=-22 updated=1\npselect_fault r=-14 updated=1\nppoll_badts r=-22 kept=1\nppoll_badsize r=-22 kept=1\nppoll_badmask r=-14 kept=1\nppoll_badts_badmask r=-22\npselect_badsize r=-22 kept=1\npselect_badts_badnfds r=-22 kept=1\npselect_badmask_badnfds r=-14 kept=1\npselect_badpair r=-14\nppoll_zero r=1 zero=1\npselect_intmax r=1 isset=1\ndone'
+# ...and a bitmap that really is wider than a libc fd_set, naming descriptor
+# 3000: read, answered and written back as nfds says. Self-checking for the
+# same reason; skipped where the emulator's host cannot ask it (qemu-user
+# aborts on such a set: hostenv.sh, select-wide).
+check_fixture pselectwide $'pselect_wide r=1 isset=1 updated=1\ndone'
 # How a #! line is read (load_script): a newline anywhere in the 256-byte
 # buffer ends it, without one the line is cut at the buffer's end and refused
 # only where the cut could have truncated the interpreter -- so "#!/bin/sh"

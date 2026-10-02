@@ -519,7 +519,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
 # (docs/jit.md), and qemu-user is an interposer with defects of its own.
-# Fourteen of them stop correct tests dead, each reproducible in a few lines that
+# Fifteen of them stop correct tests dead, each reproducible in a few lines that
 # never touch the emulator:
 #
 #   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
@@ -577,6 +577,10 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   descriptor in si_fd; qemu-user guesses a siginfo's layout
 #                   by the signal number, takes a real-time one's for a
 #                   sigqueue's, and hands over no fd.
+#   select-wide     a select whose bitmap is wider than a libc fd_set names
+#                   descriptors past FD_SETSIZE, which the kernel answers for;
+#                   qemu-user copies the sets back through FD_ISSET on an
+#                   fd_set of its own, which a fortified build aborts on.
 #
 # One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -883,6 +887,22 @@ int main(void) {
     if (pipe(p) || write(p[1], "abcd", 4) != 4) return 1;
     if (read(p[0], top - 8, 4) != 4) return 1;
     return top[-8] != 'a';
+}
+EOF
+        ;;
+    select-wide) cat <<'EOF'
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    int p[2];
+    if (pipe(p) || write(p[1], "x", 1) != 1) return 1;
+    /* No room for descriptor 3000: nothing anyone here can ask of it. */
+    if (dup2(p[0], 3000) != 3000) return 0;
+    unsigned long wide[3072 / (8 * sizeof(unsigned long))] = { 0 };
+    int bits = 8 * sizeof(unsigned long);
+    wide[3000 / bits] |= 1UL << (3000 % bits);
+    long r = syscall(SYS_pselect6, 3001, wide, (void *)0, (void *)0, (void *)0, (void *)0);
+    return !(r == 1 && ((wide[3000 / bits] >> (3000 % bits)) & 1));
 }
 EOF
         ;;

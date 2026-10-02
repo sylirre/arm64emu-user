@@ -131,23 +131,11 @@ int main(void) {
     printf("ppoll_zero r=%ld zero=%d\n", r, zeroed(&ts));
 
     /* nfds past a libc fd_set: clamped to the fd table, never refused -- a
-     * 128-byte set is all the kernel reads even for INT_MAX, and a wider
-     * bitmap names descriptors past 1024. */
+     * 128-byte set is all the kernel reads even for INT_MAX. */
     ts = (struct timespec){ 1, 0 }; FD_ZERO(&set); FD_SET(pfd[0], &set);
     r = xpselect(INT_MAX, &set, NULL, NULL, &ts, NULL, 8);
     printf("pselect_intmax r=%ld isset=%d\n", r, FD_ISSET(pfd[0], &set));
-    int big = dup2(pfd[0], 3000);
-    if (big == 3000) {
-        unsigned long wide[64] = { 0 };
-        wide[3000 / 64] |= 1UL << (3000 % 64);
-        ts = (struct timespec){ 1, 0 };
-        r = xpselect(3001, wide, NULL, NULL, &ts, NULL, 8);
-        printf("pselect_wide r=%ld isset=%d updated=%d\n", r,
-               (int)((wide[3000 / 64] >> (3000 % 64)) & 1), updated(&ts));
-        close(3000);
-    } else {
-        printf("pselect_wide r=1 isset=1 updated=1\n");   /* no room to try */
-    }
+    /* (A bitmap that really is wider: tests/fixtures/pselectwide.c.) */
     printf("done\n");
     return 0;
 }
