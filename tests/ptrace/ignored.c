@@ -58,11 +58,17 @@ int main(void) {
         struct epoll_event ev;
         int e = epoll_wait(ep, &ev, 1, 3000);
         char r2 = e < 0 && errno == EINTR ? 'e' : 'x';
-        /* 3: a child of ours dies: no notice, and it is reaped. */
+        /* 3: a child of ours dies: no notice, and it is reaped. Asked until
+         * it is gone (5 s at most): how long a fork child takes to get as
+         * far as its exit is the host's business -- an emulator under
+         * qemu-user builds a whole code cache first -- and a child still
+         * running is no answer yet. One that is found dead and unreaped,
+         * by a wait that reaps it, is the failure. */
         pid_t g = fork();
         if (g == 0) _exit(0);
-        nap(200);
-        char r3 = waitpid(g, NULL, WNOHANG) < 0 && errno == ECHILD ? 'c' : 'x';
+        pid_t w = 0;
+        for (int i = 0; i < 500 && (w = waitpid(g, NULL, WNOHANG)) == 0; i++) nap(10);
+        char r3 = w < 0 && errno == ECHILD ? 'c' : 'x';
         char out[3] = { r1, r2, r3 };
         if (write(from[1], out, 3) != 3) _exit(2);
         for (;;) nap(10);
