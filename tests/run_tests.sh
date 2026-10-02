@@ -2984,6 +2984,12 @@ check_fixture waitany $'wait4(-1): ordinary child status=4\nwait4(-1) with only 
 # SIGCHLD; the block is the kernel's.
 check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone' \
     "A64_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
+# What a clone child's death is reported with (sys_proc.c, "clone
+# children"): once its parent has run execve, SIGCHLD and not the signal it
+# was cloned with -- and a reaping at its death for a parent that ignores
+# SIGCHLD -- while the waits still take it for a clone child. Self-checking:
+# qemu-user gives a clone child SIGCHLD; the block is the kernel's.
+check_fixture clonenotice $'after exec: SIGCHLD=1 code=2 from the child=1, SIGUSR2=0\nafter exec, plain wait: ECHILD\nafter exec, __WCLONE wait: found, killed by 15\nafter exec, SIGCHLD ignored: usr2=0, __WCLONE wait: ECHILD\ndone'
 # A guest zombie is a guest task until it is reaped -- kill(pid, 0),
 # getpgid, getsid and /proc/<pid> find it, ptrace refuses it -- with a
 # zombie's /proc: no mm, no fs context, no mount namespace (proctab.c,

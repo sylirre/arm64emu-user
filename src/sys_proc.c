@@ -1124,6 +1124,13 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
  *     is about (clonekids_any), the host is not let do it, and the ordinary
  *     children are reaped by the capture and passed by by the waits instead
  *     (signal.c sig_chld_host, chld_autoreaped below).
+ * A clone child's own signal is its parent's only while the parent runs the
+ * program that forked it: once the parent has called execve, the kernel
+ * reports the child's death with SIGCHLD after all (do_notify_parent, its
+ * parent_exec_id against the parent's self_exec_id), and reaps it at its
+ * death like an ordinary child where the parent asks for that, though the
+ * waits still take it for the clone child it is (ck_notice_sig).
+ *
  * The table is a shared page, made at the process's first fork, so that each
  * child enters ITSELF before it runs a guest instruction: its death, and so
  * its SIGCHLD, cannot come before its entry, however the parent's threads are
@@ -1143,8 +1150,9 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
  * signal 0, waited for through its pidfd with __WCLONE. */
 #define CK_MAX 256
 enum { CK_FREE = 0, CK_CLAIMING, CK_LIVE, CK_REAPED };
-/* `sig` SIGCHLD is an ordinary child, anything else a clone child. */
-struct CloneKid { s32 pid; s32 sig; u32 state; u32 age; };
+/* `sig` SIGCHLD is an ordinary child, anything else a clone child; `pgen`
+ * the parent's image_gen when it was forked (ck_notice_sig). */
+struct CloneKid { s32 pid; s32 sig; u32 state; u32 age; u32 pgen; };
 struct CloneKids {
     u32 age;                     /* reap counter: the oldest reaped slot goes first */
     u32 nlive;                   /* clone children in CK_LIVE, for the fast paths */
@@ -1167,6 +1175,16 @@ struct CloneKids {
  * valid_signal); SIGCHLD is the ordinary child. */
 static int ck_signals(int exitsig) {
     return exitsig != 0 && exitsig != SIGCHLD && exitsig <= 64;
+}
+
+/* The signal child `k`'s death is reported with: the one it was cloned with,
+ * or SIGCHLD once its parent has run an execve since (the kernel's
+ * parent_exec_id rule). Async-signal-safe. */
+static int ck_notice_sig(const struct CloneKid *k) {
+    if (k->sig != SIGCHLD &&
+        k->pgen != __atomic_load_n(&g_machine.image_gen, __ATOMIC_ACQUIRE))
+        return SIGCHLD;
+    return k->sig;
 }
 
 /* This process's table, made before its first child is forked (the child
@@ -1261,6 +1279,7 @@ static void clonekid_enter(struct Machine *m, int exitsig) {
     }
     t->e[slot].pid = (s32)getpid();
     t->e[slot].sig = exitsig;
+    t->e[slot].pgen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);   /* the parent's */
     if (exitsig != SIGCHLD) __atomic_add_fetch(&t->nlive, 1, __ATOMIC_ACQ_REL);
     __atomic_store_n(&t->e[slot].state, CK_LIVE, __ATOMIC_RELEASE);
 }
@@ -1341,7 +1360,7 @@ int clonekids_signalling(void) {
     if (!__atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE)) return 0;
     for (int i = 0; i < CK_MAX; i++)
         if (__atomic_load_n(&t->e[i].state, __ATOMIC_ACQUIRE) == CK_LIVE &&
-            ck_signals(t->e[i].sig))
+            ck_signals(ck_notice_sig(&t->e[i])))
             return 1;
     return 0;
 }
@@ -1358,8 +1377,10 @@ int clonekid_exit_signal(s32 pid) {
     for (int i = 0; i < CK_MAX; i++) {
         u32 st = __atomic_load_n(&t->e[i].state, __ATOMIC_ACQUIRE);
         if ((st == CK_LIVE || st == CK_REAPED) && t->e[i].pid == pid &&
-            t->e[i].sig != SIGCHLD)
-            return t->e[i].sig;
+            t->e[i].sig != SIGCHLD) {
+            int es = ck_notice_sig(&t->e[i]);
+            return es == SIGCHLD ? -1 : es;   /* reported as an ordinary child's */
+        }
     }
     return -1;
 }
@@ -1530,8 +1551,10 @@ static pid_t ck_wait4_any(struct Machine *m, pid_t wpid, int *status, u32 opts,
  * in is charged back out -- here for the reap this does, by the caller for
  * the one its wait did. */
 static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
-    if (!sig_chld_reaps(m) || !sig_chld_reap_emulated() || clonekid_live(m, pid))
+    if (!sig_chld_reaps(m) || !sig_chld_reap_emulated())
         return 0;
+    struct CloneKid *ck = clonekid_live(m, pid);
+    if (ck && ck_notice_sig(ck) != SIGCHLD) return 0;   /* never at its death */
     proctab_reaped(pid);   /* gone, as the kernel's reaping leaves it */
     if (looked) {
         siginfo_t x;

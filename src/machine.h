@@ -711,9 +711,9 @@ void sig_ident(int sig, int code, int own, s32 *pid, u32 *uid);
  * own where the registry has nothing to say. */
 u32  sig_ruid_of(s32 pid);
 /* The exit signal a child of this process was cloned with, if it is one of
- * its clone children (exit signal other than SIGCHLD; 0 = none), else -1 --
- * what its death is reported to us with instead of the host's SIGCHLD.
- * Async-signal-safe (sys_proc.c). */
+ * its clone children (exit signal other than SIGCHLD; 0 = none) and this
+ * process has run no execve since, else -1 -- what its death is reported to
+ * us with instead of the host's SIGCHLD. Async-signal-safe (sys_proc.c). */
 int  clonekid_exit_signal(s32 pid);
 /* The tid of the parent's thread that forked this process (its real_parent,
  * the tracer a PTRACE_TRACEME names), 0 when not known (sys_proc.c). */

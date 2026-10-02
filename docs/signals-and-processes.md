@@ -1305,6 +1305,17 @@ children itself, and a wait that gets to one first passes it by
 be reaped by the host with the rest: its signal never came, and its wait was
 `ECHILD` (`tests/fixtures/sigchldflags.c`).
 
+A clone child's signal is its parent's only while the parent runs the program
+that forked it. Once the parent has called `execve`, `do_notify_parent` sends
+`SIGCHLD` after all (the child's `parent_exec_id` no longer matches the parent's
+`self_exec_id`), and a parent that ignores `SIGCHLD` has such a child reaped at
+its death like an ordinary one — though its waits still take it for the clone
+child it is. So each entry keeps the parent's `image_gen` from the fork, and
+`ck_notice_sig` answers `SIGCHLD` once the two differ: the capture reports the
+death as an ordinary child's, `clonekids_signalling` no longer counts it, and
+the emulated reaping takes it (`chld_autoreaped`). The emulator sent the signal
+the child was cloned with, and kept the child (`tests/fixtures/clonenotice.c`).
+
 A notice caught only to be dropped — an ordinary child's, to a parent that
 ignores `SIGCHLD` or keeps it at its default — is one the kernel discards as it
 is sent, and it must interrupt nothing: the catcher has no `SA_RESTART`, so the
