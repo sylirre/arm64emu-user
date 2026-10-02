@@ -1350,8 +1350,10 @@ guest's — reading again, so a blocking read blocks and an `O_NONBLOCK` one
 answers `EAGAIN` — and lays a clone child's notice out as the kernel does for
 any signal but `SIGCHLD` with such a code: `_sigpoll`'s, the band over the pid
 and the fd over the status. The watcher is a foreign task (`proc_foreign_add`),
-shown to the guest nowhere, and ends once no clone child is left and nothing it
-handed back is waiting.
+shown to the guest nowhere, and goes dormant once no clone child is left and
+nothing it handed back is waiting, giving `SIGCHLD` back the host disposition
+the guest's alone makes it, until it is woken for the next one: like the tracer
+watchdog, it never ends (*ptrace(2)*, *Death of a tracer*, below).
 
 A notice caught only to be dropped — an ordinary child's, to a parent that
 ignores `SIGCHLD` or keeps it at its default — is one the kernel discards as it
@@ -2009,10 +2011,22 @@ own — 32 up to its `SIGRTMIN` (`sig_helper_mask`): glibc's set*id broadcast
 and wait for each to answer, and a thread that blocks it never does, so a
 traced process's `setgid` never returned (`strace` of busybox, which drops its
 ids as it starts, hung there once the tracee was forked from a tracer that ran a
-watchdog of its own: `tests/ptrace/setxid.c`). It holds no descriptor,
-and is in the process's foreign-task set, so the guest never sees it (not in
+watchdog of its own: `tests/ptrace/setxid.c`). It never ends: once no thread is
+traced it goes dormant, asleep on a futex until it is wanted again
+(`helper_dormant`), and whoever wants it wakes it rather than make another. And
+across a fork it is asleep: the atfork prepare asks the emulator's own threads
+to park on a futex between two pieces of work, waits (300 ms at most) for them
+to say so before it takes any lock — a dormant one is parked already, one just
+made is once it runs the emulator's code, its start done — and the parent lets
+them go (`sig_helpers_park`, `helper_nap`). qemu-user, the ARM32 tier's host,
+takes a lock of its own as a thread starts and as one exits (`clone_lock`) and
+forks without it: a process that forked as one of these threads was ending —
+the SIGCHLD watcher, its clone child just reaped — handed the child that lock
+held, and the child's first thread waited for it forever
+(`tests/fixtures/helperfork.c`). The thread holds no descriptor, and is in the
+process's foreign-task set, so the guest never sees it (not in
 `/proc/<pid>/task` or `Threads:`, not waited for by `de_thread`, not a `tgkill`
-target); it ends once no thread is traced. The liveness test also compares the
+target). The liveness test also compares the
 tracer's start time, recorded as it attached, against the process now under its
 number, which may be a later one (`pt_tracer_gone`). A link nobody will collect
 — a tracee killed by `SIGKILL` with its tracer gone — is freed when its real

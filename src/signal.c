@@ -2689,6 +2689,93 @@ static void host_futex_wait(u32 *w, u32 val, int ms) {
 #endif
 }
 
+/* ---- the emulator's own threads, and fork -------------------------------
+ *
+ * The emulator runs host threads of its own (the tracer watchdog, the
+ * SIGCHLD watcher). Every lock they take is one the atfork triple takes
+ * (main.c), so a fork never hands a child a lock one of them held. But a
+ * fork is not safe against every host's own bookkeeping of a thread that is
+ * starting, ending or at work. qemu-user -- the ARM32 tier's host -- takes a
+ * lock of its own (clone_lock) as a thread starts and as one exits, and
+ * forks without it: a process that forks as one of its threads is ending
+ * hands the child that lock held, and the child's first thread waits for it
+ * forever. A helper that ended when it was no longer needed did so just as
+ * a process was likely to fork again -- its clone child reaped, and the next
+ * one made -- and such a child never got past its first pthread_create
+ * (tests/fixtures/helperfork.c; every native host, never).
+ *
+ * So a helper, once started, never ends: when it is not needed it goes
+ * dormant, asleep on a futex until it is wanted again (helper_dormant),
+ * and the one who wants it wakes it rather than make another. And a fork's
+ * prepare asks each to park -- asleep on a futex, between two pieces of
+ * work -- and waits for them to say so (300 ms at most: one that cannot
+ * answer is not held up for), a dormant one counting as parked; one just
+ * made is parked only once it runs our code, which it reaches with its
+ * start done. The parent lets them go; the child has none. A helper sleeps
+ * on the request word itself (helper_nap), or is woken from what it sleeps
+ * in otherwise. */
+static u32 hp_req;       /* a fork is coming: park (a futex) */
+static u32 hp_parked;    /* helpers parked (a futex) */
+static u32 hp_running;   /* helpers alive */
+static s32 cw_tid;       /* the SIGCHLD watcher's tid once made (it never
+                          * ends), -1 while it is being made */
+
+void helper_enter(void) { __atomic_add_fetch(&hp_running, 1, __ATOMIC_ACQ_REL); }
+
+void helper_leave(void) {   /* a helper that could not be started */
+    __atomic_sub_fetch(&hp_running, 1, __ATOMIC_ACQ_REL);
+    syscall(SYS_futex, &hp_parked, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+void helper_park_point(void) {
+    if (!__atomic_load_n(&hp_req, __ATOMIC_ACQUIRE)) return;
+    __atomic_add_fetch(&hp_parked, 1, __ATOMIC_ACQ_REL);
+    syscall(SYS_futex, &hp_parked, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    while (__atomic_load_n(&hp_req, __ATOMIC_ACQUIRE)) host_futex_wait(&hp_req, 1, 100);
+    __atomic_sub_fetch(&hp_parked, 1, __ATOMIC_ACQ_REL);
+}
+
+void helper_nap(int ms) {
+    host_futex_wait(&hp_req, 0, ms);
+    helper_park_point();
+}
+
+void helper_dormant(u32 *word) {
+    __atomic_add_fetch(&hp_parked, 1, __ATOMIC_ACQ_REL);   /* as good as parked */
+    syscall(SYS_futex, &hp_parked, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    while (!__atomic_load_n(word, __ATOMIC_ACQUIRE)) host_futex_wait(word, 0, 1000);
+    __atomic_sub_fetch(&hp_parked, 1, __ATOMIC_ACQ_REL);
+    helper_park_point();   /* woken as a fork asks */
+}
+
+void sig_helpers_park(void) {
+    if (!__atomic_load_n(&hp_running, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&hp_req, 1, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &hp_req, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    s32 w = __atomic_load_n(&cw_tid, __ATOMIC_ACQUIRE);
+    if (w > 0) {   /* in rt_sigtimedwait, or on cw_tok */
+        syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)w, SIGCHLD);
+        syscall(SYS_futex, &cw_tok, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    }
+    for (int i = 0; i < 30; i++) {
+        u32 p = __atomic_load_n(&hp_parked, __ATOMIC_ACQUIRE);
+        if (p >= __atomic_load_n(&hp_running, __ATOMIC_ACQUIRE)) break;
+        host_futex_wait(&hp_parked, p, 10);
+    }
+}
+
+void sig_helpers_release(void) {
+    if (!__atomic_exchange_n(&hp_req, 0, __ATOMIC_ACQ_REL)) return;
+    syscall(SYS_futex, &hp_req, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+void sig_helpers_fork_child(void) {
+    __atomic_store_n(&hp_req, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&hp_parked, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&hp_running, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&cw_tid, 0, __ATOMIC_RELAXED);
+}
+
 /* ---- the SIGCHLD watcher ------------------------------------------------
  *
  * sig_chld_notice decides what a host SIGCHLD is to the guest, but only
@@ -2728,8 +2815,10 @@ static void host_futex_wait(u32 *w, u32 val, int ms) {
  *
  * The thread blocks every signal, takes no emulator lock but thr_lock to join
  * the foreign-task set (it is no guest thread, and shown as none), holds no
- * descriptor but /proc's for a moment, and ends once no clone child is left
- * and nothing it handed back is waiting. */
+ * descriptor but /proc's for a moment, and goes dormant once no clone child is
+ * left and nothing it handed back is waiting -- giving SIGCHLD back the host
+ * disposition the guest's alone makes it -- to be woken when one is made
+ * again ("the emulator's own threads, and fork"). */
 static int host_take_pending(u64 set, siginfo_t *si);
 static long host_sigtimedwait(u64 set, siginfo_t *si, s64 ns);
 static u32 cw_on;    /* the watcher runs: 0 -> 1 by whoever starts it */
@@ -2805,8 +2894,10 @@ static void *sig_chld_watcher(void *arg) {
     (void)arg;
     s32 self = (s32)syscall(SYS_gettid);
     proc_foreign_add(self);
+    __atomic_store_n(&cw_tid, self, __ATOMIC_RELEASE);
     u64 chld = 1ULL << (SIGCHLD - 1);
     for (;;) {
+        helper_park_point();   /* a fork is coming: asleep for it */
         u32 tok = __atomic_load_n(&cw_tok, __ATOMIC_ACQUIRE);
         if (tok) {
             host_futex_wait(&cw_tok, tok, 10);
@@ -2820,6 +2911,7 @@ static void *sig_chld_watcher(void *arg) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             if (host_take_pending(chld, &si) == SIGCHLD) {
+                if (si.si_code == SI_TKILL && si.si_pid == getpid()) continue;
                 PendSig p;
                 pendsig_from_host(&p, SIGCHLD, &si);
                 if (sig_chld_notice(&p, &si)) cw_deliver(&p);
@@ -2829,19 +2921,26 @@ static void *sig_chld_watcher(void *arg) {
             /* A clone child forked meanwhile, and its forker saw us still
              * on (sig_chld_watch): carry on. */
             u32 z = 0;
-            if (!cw_due() || !__atomic_compare_exchange_n(&cw_on, &z, 1, false,
-                                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
-                break;
+            if (cw_due() && __atomic_compare_exchange_n(&cw_on, &z, 1, false,
+                                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+                continue;
+            /* No child about that the host's notices misreport: SIGCHLD back
+             * to what the guest's disposition alone makes it (sig_chld_host),
+             * and asleep until wanted again. */
+            sig_host_update(&g_machine, SIGCHLD);
+            helper_dormant(&cw_on);
             continue;
         }
         siginfo_t si;
         memset(&si, 0, sizeof si);
         if (host_sigtimedwait(chld, &si, 100 * 1000000LL) != SIGCHLD) continue;
+        /* A fork's call to park (sig_helpers_park): the one SIGCHLD ever sent
+         * to this thread itself -- no guest can name it. */
+        if (si.si_code == SI_TKILL && si.si_pid == getpid()) continue;
         PendSig p;
         pendsig_from_host(&p, SIGCHLD, &si);
         if (sig_chld_notice(&p, &si)) cw_deliver(&p);
     }
-    proc_foreign_del(self);
     return NULL;
 }
 
@@ -2851,6 +2950,10 @@ void sig_chld_watch(void) {
     if (!__atomic_compare_exchange_n(&cw_on, &z, 1, false,
                                      __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
         return;
+    if (__atomic_load_n(&cw_tid, __ATOMIC_ACQUIRE) > 0) {   /* dormant: woken */
+        syscall(SYS_futex, &cw_on, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        return;
+    }
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
@@ -2860,7 +2963,11 @@ void sig_chld_watch(void) {
     u64 all = sig_helper_mask(), prev = 0;
     syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8);
     pthread_t th;
+    helper_enter();
+    __atomic_store_n(&cw_tid, -1, __ATOMIC_RELEASE);   /* being made */
     if (pthread_create(&th, &a, sig_chld_watcher, NULL) != 0) {
+        helper_leave();
+        __atomic_store_n(&cw_tid, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&cw_on, 0, __ATOMIC_SEQ_CST);
         static char warned;
         if (!__atomic_test_and_set(&warned, __ATOMIC_RELAXED))

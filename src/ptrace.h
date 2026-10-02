@@ -296,5 +296,8 @@ void ptrace_tracer_wait(u32 gen, int ms);
 void ptrace_wake_waiters(void);
 /* A child pid was reaped by the host wait: drop its tracee link if any. */
 void ptrace_note_reaped(s32 pid);
+/* A fork child has no watchdog of its parent's, dormant or not (the atfork
+ * child handler, main.c). */
+void ptrace_helpers_fork_child(void);
 
 #endif /* A64_PTRACE_H */

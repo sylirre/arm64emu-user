@@ -76,6 +76,8 @@ int ptrace_traced(void) {
  * traced state (the drop only re-mirrors when the last traced thread is gone). */
 static void pt_wd_start(void);
 static u32 pt_wd_on;   /* the tracer watchdog of this process runs */
+static u32 pt_wd_made; /* ...and exists, dormant or not: it never ends
+                        * (signal.c, "the emulator's own threads, and fork") */
 
 static void pt_traced_inc(struct Machine *m) {
     __atomic_add_fetch(&g_ptrace_traced, 1, __ATOMIC_SEQ_CST);
@@ -1358,6 +1360,7 @@ void ptrace_fork_child(CPU *c, void *slot) {
     /* ...and the watchdog is the parent's: fork(2) brought no thread but
      * this one. */
     __atomic_store_n(&pt_wd_on, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&pt_wd_made, 0, __ATOMIC_SEQ_CST);
     g_self_link = NULL;
     g_ptrace_active = 0;
     g_ptrace_syscall_armed = 0;
@@ -2241,8 +2244,9 @@ static int pt_tracer_gone(const PtLink *e) {
  * its next boundary (ptrace_jobctl_service) -- or the process killed, under
  * EXITKILL, as the kernel's SIGKILL kills it. The thread blocks every signal,
  * takes no emulator lock but thr_lock to join the foreign-task set (it is no
- * guest thread, and shown as none), holds no descriptor, and ends once no
- * thread is traced.
+ * guest thread, and shown as none), holds no descriptor, and goes dormant
+ * once no thread is traced, to be woken when one is again: it never ends
+ * (signal.c, "the emulator's own threads, and fork").
  *
  * The same thread watches, while this process traces anything, what the host
  * does to its tracees that no guest code of theirs can say
@@ -2261,8 +2265,7 @@ static void *pt_watchdog(void *arg) {
     s32 tgid = (s32)getpid();
     proc_foreign_add(self);
     for (;;) {
-        struct timespec ts = { 0, 100 * 1000000L };
-        nanosleep(&ts, NULL);
+        helper_nap(100);   /* and asleep across a fork (signal.c) */
         if (!ptrace_traced() && !pt_tracing()) {
             __atomic_store_n(&pt_wd_on, 0, __ATOMIC_SEQ_CST);
             /* Traced or tracing again meanwhile, and nobody started one
@@ -2270,8 +2273,10 @@ static void *pt_watchdog(void *arg) {
             u32 z = 0;
             if ((!ptrace_traced() && !pt_tracing()) ||
                 !__atomic_compare_exchange_n(&pt_wd_on, &z, 1, false,
-                                             __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
-                break;
+                                             __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+                helper_dormant(&pt_wd_on);   /* asleep until wanted again */
+                continue;
+            }
         }
         ptrace_watch_tracees();   /* as a tracer */
         for (int i = 0; g_tab && i < PTRACE_MAX; i++) {
@@ -2293,7 +2298,6 @@ static void *pt_watchdog(void *arg) {
             }
         }
     }
-    proc_foreign_del(self);
     return NULL;
 }
 
@@ -2410,11 +2414,20 @@ void ptrace_watch_tracees(void) {
     if (any) pt_wd_start();
 }
 
+void ptrace_helpers_fork_child(void) {
+    __atomic_store_n(&pt_wd_on, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&pt_wd_made, 0, __ATOMIC_RELAXED);
+}
+
 static void pt_wd_start(void) {
     u32 z = 0;
     if (!__atomic_compare_exchange_n(&pt_wd_on, &z, 1, false,
                                      __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
         return;
+    if (__atomic_load_n(&pt_wd_made, __ATOMIC_ACQUIRE)) {   /* dormant: woken */
+        syscall(SYS_futex, &pt_wd_on, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        return;
+    }
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
@@ -2426,7 +2439,11 @@ static void pt_wd_start(void) {
     u64 all = sig_helper_mask(), prev = 0;
     syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8);
     pthread_t th;
+    helper_enter();
+    __atomic_store_n(&pt_wd_made, 1, __ATOMIC_RELEASE);
     if (pthread_create(&th, &a, pt_watchdog, NULL) != 0) {
+        helper_leave();
+        __atomic_store_n(&pt_wd_made, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&pt_wd_on, 0, __ATOMIC_SEQ_CST);
         static char warned;
         if (!__atomic_test_and_set(&warned, __ATOMIC_RELAXED))

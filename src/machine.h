@@ -745,6 +745,20 @@ void sig_chld_watch(void);
  * hung on its watchdog. A pthread inherits its creator's mask but for
  * SIGCANCEL, so the creator blocks this around pthread_create (signal.c). */
 u64  sig_helper_mask(void);
+/* ...which never end and park across a fork (signal.c, "the emulator's own
+ * threads, and fork"): a helper is counted in as it is made (out again only
+ * if it could not be), sleeps in helper_nap (or parks at helper_park_point
+ * between pieces of work), and when it is not needed sleeps in
+ * helper_dormant until `*word` is set and woken; the atfork triple parks them
+ * before its locks, lets them go after, and the child has none. */
+void helper_enter(void);
+void helper_leave(void);
+void helper_park_point(void);
+void helper_nap(int ms);
+void helper_dormant(u32 *word);
+void sig_helpers_park(void);
+void sig_helpers_release(void);
+void sig_helpers_fork_child(void);
 /* The tid of the parent's thread that forked this process (its real_parent,
  * the tracer a PTRACE_TRACEME names), 0 when not known (sys_proc.c). */
 s32  proc_fork_parent_tid(void);

@@ -2992,6 +2992,13 @@ check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nno
 # still take it for a clone child. Self-checking: qemu-user gives a clone
 # child SIGCHLD; the block is the kernel's.
 check_fixture clonenotice $'blocked, sigtimedwait: SIGUSR2 code=1 from the child=1 status=3\n  then: pending SIGCHLD=0 SIGUSR2=0\nblocked, handler: runs=1 code=1 from the child=1 status=4\nordinary first: handler runs=1 from the clone child=1 status=5\n  then: pending SIGCHLD=1 SIGUSR2=0\n  SIGCHLD: taken from the ordinary child=1 status=1\nclone child first: pending SIGCHLD=1 SIGUSR2=1\n  SIGCHLD: taken from the ordinary child=1 status=2\n  SIGUSR2: taken from the clone child=1 status=6\nexit-0 child: pending SIGCHLD=0 SIGUSR2=0\n  SIGCHLD: nothing\nsigtimedwait for SIGCHLD: nothing\n  then: pending SIGCHLD=0 SIGUSR2=1\nsignalfd for SIGUSR2: read code=1 pid=0 status=0 band is the pid=1 fd=9\nsignalfd for SIGCHLD: nothing\nreaped first: reaped status=10\n  SIGUSR2: taken from the child=1 status=10\n  then: pending SIGCHLD=0 SIGUSR2=0\nafter exec: SIGCHLD=1 code=2 from the child=1, SIGUSR2=0\nafter exec, plain wait: ECHILD\nafter exec, __WCLONE wait: found, killed by 15\nafter exec, SIGCHLD ignored: usr2=0, __WCLONE wait: ECHILD\ndone'
+# The emulator's own threads never end, going dormant when not needed, and
+# sleep across a fork (signal.c, "the emulator's own threads, and fork"): a
+# clone child's notice each round, with SIGCHLD blocked, needs the SIGCHLD
+# watcher woken again; and forks every 5 ms after it, each child starting a
+# thread -- which under qemu-user a fork met by a helper's end left waiting
+# forever. Self-checking: the block is the kernel's.
+check_fixture helperfork $'clone children\'s notices: 12 of 12\nforks done: 240 of 240'
 # A guest zombie is a guest task until it is reaped -- kill(pid, 0),
 # getpgid, getsid and /proc/<pid> find it, ptrace refuses it -- with a
 # zombie's /proc: no mm, no fs context, no mount namespace (proctab.c,

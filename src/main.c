@@ -582,6 +582,8 @@ static void add_bind(struct Machine *m, const char *spec) {
  * same hierarchy in the *reverse* order of five adjacent calls — sorting them
  * was enough to deadlock every fork. tests/fixtures/forklock.c is the guard. */
 static void emu_atfork_prepare(void) {
+    sig_helpers_park();      /* the emulator's own threads asleep (signal.c),
+                              * before any lock one of them may still want */
     jit_locks_take();        /* jit stats  — outermost */
     procfs_locks_take();     /* pf_lock, then est_lock */
     netlink_locks_take();    /* nl_lock    — taken above as_lock by real code */
@@ -604,8 +606,11 @@ static void emu_atfork_parent(void) {
     netlink_locks_drop();
     procfs_locks_drop();
     jit_locks_drop();
+    sig_helpers_release();
 }
 static void emu_atfork_child(void) {
+    sig_helpers_fork_child(); /* none came across */
+    ptrace_helpers_fork_child();
     /* Not a lock: the shared registry's publisher caches a pointer to this
      * process's own slot, and a fork child inherits one that names its
      * parent's. Cleared here rather than where the child adopts its own slot,
