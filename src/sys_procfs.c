@@ -1562,6 +1562,20 @@ static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
     return 0;
 }
 
+/* The scheduling state of guest task `tid` of process `tgid` as a kernel
+ * would show it, where the host shows the thread asleep in a wait of the
+ * emulator's: in a ptrace stop, the kernel's TASK_TRACED ('t'); parked in a
+ * group stop the emulator runs (signal.c, "group stop"), TASK_STOPPED ('T').
+ * Anything else -- running, asleep, a host stop, a zombie -- the host's
+ * letter says as it is. */
+static char task_state_view(s32 tid, s32 tgid, char host) {
+    if (host == 'Z' || host == 'X' || host == 'x' || host == 'T' || host == 't')
+        return host;
+    if (ptrace_task_trapped(tid)) return 't';
+    if (tgid > 0 && proctab_jc_live(tgid)) return 'T';
+    return host;
+}
+
 #define STATUS_MAX 16384    /* a status file is ~2 KB; Groups: is the long line */
 #define STATUS_CAP (1u << 20)   /* refuse to rewrite anything past this */
 
@@ -1746,6 +1760,15 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
         if (is_key(p, "TracerPid")) {
             dprintf(fd, "TracerPid:\t%d\n", (int)ptrace_tracer_of(tid));
             goto next_line;
+        }
+        if (is_key(p, "State")) {
+            const char *v = p + 6;
+            while (*v == ' ' || *v == '\t') v++;
+            char st = task_state_view(tid, tgid, *v);
+            if (st != *v) {
+                dprintf(fd, "State:\t%s\n", st == 't' ? "t (tracing stop)" : "T (stopped)");
+                goto next_line;
+            }
         }
         /* The parent as the guest may see it (sys_proc.c proc_ppid_view): a
          * kernel prints 0 for a parent outside the reader's pid namespace,
@@ -1963,9 +1986,15 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
     dprintf(fd, "%s)", buf);       /* pid and comm stand as the host has them */
     int f = 2;
     int shorth = procfs_old_host();
+    s32 stid = (s32)strtol(buf, NULL, 10);
     for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
         u64 v;
         if (shorth && f >= 44) break;      /* stand in for a pre-3.3 kernel */
+        if (f == 2) {                      /* field 3: the state */
+            f++;
+            dprintf(fd, " %c", task_state_view(stid, self ? (s32)getpid() : opid, tok[0]));
+            continue;
+        }
         if (pidstat_field(m, pm, mi, self, opid, tok, ++f, &v))
             dprintf(fd, " %llu", (unsigned long long)v);
         else

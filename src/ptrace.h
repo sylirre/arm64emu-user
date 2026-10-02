@@ -84,6 +84,7 @@ u32  ptrace_self_seize(void);
  * tracing thread's tid, as the kernel's, or its process's pid where that
  * thread is not known. */
 s32  ptrace_tracer_of(s32 tid);
+int  ptrace_task_trapped(s32 tid);   /* in a ptrace stop: /proc's 't' */
 /* Is any thread of this process currently a tracee? Gates the process-wide
  * signal-disposition mirroring (sig_host_update): default-terminate catchers
  * must stay installed while any thread must report its stops/death. */
@@ -148,6 +149,13 @@ int  ptrace_group_traced(s32 id);
  * a SIGCONT ended one): a trap_notify for each SEIZEd tracee of it, a listening
  * one woken to trap again, a running one kicked if `kick`. Async-signal-safe. */
 void ptrace_jc_notify(s32 tgid, int kick);
+/* For the real parent's view of a group stop (signal.c): the tracer process
+ * of this process's leader (0 for none); whether any thread of `tgid` is
+ * traced, from the links alone (async-signal-safe); and the wake kick that
+ * gets a wait of `pid`'s to look again. */
+s32  ptrace_leader_tracer(void);
+int  ptrace_tgid_traced(s32 tgid);
+void ptrace_wake_waiter(s32 pid);
 /* Bring thread `tid` of this process to its run-loop boundary (the kick). */
 void ptrace_kick_thread(s32 tid);
 /* Is process `tgid` stopped by the host (a stop the host carried out, which

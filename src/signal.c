@@ -1453,12 +1453,125 @@ static void sig_probe_host(void) {
  * be taken, sig_jc_flushed), and SIGCONT's effects happen on the spot. */
 static int sig_is_stop(int sig);
 
+/* ---- the real parent's view ----------------------------------------------
+ *
+ * A group stop the emulator runs -- a process a tracer holds threads of stops
+ * with its traced threads trapped and the rest parked -- is no host stop: the
+ * real parent's host wait never sees it, and the host sends it no notice.
+ * What the kernel does for the parent, this does for a guest one, through the
+ * registry (proctab.c, ProcEnt.jc):
+ *
+ *   - when the last thread takes its part (task_participate_group_stop) the
+ *     stop is complete: SIGNAL_STOP_STOPPED, with the stop signal as the
+ *     group_exit_code a WUNTRACED wait reports once, and a CLD_STOPPED notice
+ *     -- unless the thread that completed it is traced by the parent itself,
+ *     which tells it as its tracer (ptrace_stop's ptrace_reparented);
+ *   - a SIGCONT ends it: SIGNAL_STOP_CONTINUED, which a WCONTINUED wait
+ *     reports once, at once; the CLD_CONTINUED notice waits for the next
+ *     thread to take a signal (get_signal's SIGNAL_CLD_MASK), and goes to the
+ *     leader's tracer too where that is not the parent. A SIGCONT before the
+ *     stop was complete leaves a CLD_STOPPED notice, status 0, instead.
+ *
+ * The parent's waits look in the registry (sys_proc.c, jc_wait_model), woken
+ * to look by the wake kick. A host parent -- the shell the first guest process
+ * was started from -- is told nothing: none of this can reach a host wait.
+ *
+ * And what the host does report of such a process to a guest parent is the
+ * emulator's own doing, not a kernel's: the host stop an outside SIGSTOP
+ * makes of a traced process and the host continue that wakes it, the host
+ * continue that wakes a stopped process a tracer attached to, the host stop
+ * the group stop is handed over as when the last tracer goes
+ * (sig_jc_untraced). The parent is not shown those (sys_proc.c,
+ * jc_host_artefact; host_catcher). */
+static int jc_rp_guest(s32 parent) {
+    u32 r;
+    return parent > 0 && proctab_ident(parent, &r);
+}
+
+static void jc_complete(u32 g) {
+    struct Machine *m = &g_machine;
+    u32 done = __atomic_load_n(&m->jc_done, __ATOMIC_ACQUIRE);
+    do {
+        if (done == g) return;   /* told already, or ended before it was */
+    } while (!__atomic_compare_exchange_n(&m->jc_done, &done, g, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    s32 parent = (s32)getppid();
+    if (!jc_rp_guest(parent)) return;
+    int sig = (int)__atomic_load_n(&m->jc_sig, __ATOMIC_ACQUIRE);
+    proctab_jc_set(JCW_STOPPED | JCW_MODEL | ((u32)sig & JCW_CODE), parent);
+    if (ptrace_self_tracer() != parent && !(proctab_chldact(parent) & 3))
+        sig_send_cld(parent, CLD_STOPPED, sig, (s32)getpid(), sig_own_ruid(),
+                     sig_cld_times(1));
+    ptrace_wake_waiter(parent);
+}
+
+void sig_jc_took_part(void) {
+    u32 g = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+    if (thr_jc_part((s32)g_tls.tid, g)) jc_complete(g);
+}
+
+void sig_jc_left(void) {
+    if (!__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)) return;
+    u32 g = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+    if (thr_jc_part(0, g)) jc_complete(g);
+}
+
+void sig_jc_adopted(u32 g, int code) {
+    __atomic_store_n(&g_machine.jc_done, g, __ATOMIC_RELEASE);
+    proctab_jc_live_set(1);
+    s32 parent = (s32)getppid();
+    if (jc_rp_guest(parent))
+        proctab_jc_set(JCW_STOPPED | JCW_MODEL | ((u32)code & JCW_CODE), parent);
+}
+
+/* A SIGCONT ended a group stop of the emulator's (sig_jc_continue, in the
+ * capture handler): the parent's wait may report it at once, and the notice
+ * is the next signal-taking thread's to send. */
+static void jc_rp_continue(void) {
+    struct Machine *m = &g_machine;
+    s32 parent = (s32)getppid();
+    if (!jc_rp_guest(parent)) return;
+    u32 g = __atomic_load_n(&m->jc_gseq, __ATOMIC_ACQUIRE);
+    if (proctab_jc_continued(parent)) {
+        __atomic_store_n(&m->jc_rp_notify, CLD_CONTINUED, __ATOMIC_RELEASE);
+        ptrace_wake_waiter(parent);
+    } else if (__atomic_load_n(&m->jc_done, __ATOMIC_ACQUIRE) != g) {
+        __atomic_store_n(&m->jc_done, g, __ATOMIC_RELEASE);   /* never complete now */
+        __atomic_store_n(&m->jc_rp_notify, CLD_STOPPED, __ATOMIC_RELEASE);
+    } else {
+        return;
+    }
+    g_sig_npend = 1;   /* this thread takes signals next */
+}
+
+/* The notice a SIGCONT left (get_signal's SIGNAL_CLD_MASK): to the parent,
+ * and to the leader's tracer where that is another process, unless SIGCHLD
+ * spares them a stop or continue notice. */
+static void jc_rp_notify(void) {
+    int why = (int)__atomic_exchange_n(&g_machine.jc_rp_notify, 0, __ATOMIC_ACQ_REL);
+    if (!why) return;
+    int status = why == CLD_CONTINUED ? SIGCONT : 0;   /* the SIGCONT cleared the code */
+    s32 parent = (s32)getppid();
+    u64 t = sig_cld_times(1);
+    if (jc_rp_guest(parent) && !(proctab_chldact(parent) & 3))
+        sig_send_cld(parent, why, status, (s32)getpid(), sig_own_ruid(), t);
+    s32 tr = ptrace_leader_tracer();
+    if (tr > 0 && tr != parent && !(proctab_chldact(tr) & 3))
+        sig_send_cld(tr, why, status, (s32)getpid(), sig_own_ruid(), t);
+}
+
+void sig_jc_notify_due(void) {
+    if (UNLIKELY(__atomic_load_n(&g_machine.jc_rp_notify, __ATOMIC_RELAXED))) jc_rp_notify();
+}
+
 static void sig_jc_continue(void) {
     struct Machine *m = &g_machine;
     __atomic_add_fetch(&m->jc_contgen, 1, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&m->jc_active, 0, __ATOMIC_RELEASE);
+    int was = (int)__atomic_exchange_n(&m->jc_active, 0, __ATOMIC_ACQ_REL);
+    if (was) proctab_jc_live_set(0);
     syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
     ptrace_jc_notify((s32)getpid(), 1);
+    if (was) jc_rp_continue();
 }
 
 static void jc_stamp(PendSig *p) {
@@ -1498,6 +1611,7 @@ static void sig_jc_stop(CPU *c, int sig) {
         __atomic_store_n(&m->jc_sig, (u32)sig, __ATOMIC_RELEASE);
         __atomic_add_fetch(&m->jc_gseq, 1, __ATOMIC_SEQ_CST);
         __atomic_store_n(&m->jc_active, 1, __ATOMIC_RELEASE);
+        proctab_jc_live_set(1);
         ptrace_jc_notify((s32)getpid(), 0);
         thr_kick_all((s32)g_tls.tid);
     }
@@ -1524,6 +1638,8 @@ void sig_jc_park(CPU *c) {
         }
         if (guest_stop_pending(m)) return;
     }
+    /* Running again: a SIGCONT's notice may be ours to send. */
+    if (__atomic_load_n(&m->jc_rp_notify, __ATOMIC_ACQUIRE)) g_sig_npend = 1;
 }
 
 /* The last traced thread of the process is gone -- detached, or its tracer
@@ -1533,7 +1649,19 @@ void sig_jc_park(CPU *c) {
  * anyone; the threads parked in the emulator's are released into it. */
 void sig_jc_untraced(struct Machine *m) {
     if (!__atomic_exchange_n(&m->jc_active, 0, __ATOMIC_SEQ_CST)) return;
+    proctab_jc_live_set(0);   /* the host's stop from here: its own 'T' */
+    /* A guest parent was told of the stop as it completed, and a kernel tells
+     * it nothing more as the stop goes on untraced; nor does its wait report
+     * the stop again, but as the registry has it -- the host's own reports of
+     * the stop it is handed over as are the emulator's (JCA_*), until the
+     * stop is over. */
+    int model = (proctab_jc_word((s32)getpid()) & JCW_MODEL) != 0;
+    if (model) proctab_jc_art_set(JCA_STOP_CHLD | JCA_STOP_WAIT);
     kill(getpid(), SIGSTOP);
+    if (model) {
+        proctab_jc_art_set(0);
+        proctab_jc_set(0, (s32)getppid());   /* continued: the host told it so */
+    }
     __atomic_add_fetch(&m->jc_contgen, 1, __ATOMIC_SEQ_CST);
     syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
 }
@@ -1620,6 +1748,17 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     }
     PendSig ps, *p = &ps;
     pendsig_from_host(p, sig, si);
+    /* The host's own notice of a guest child's stop or continue that the
+     * emulator made, which a kernel never sends (the real parent's view,
+     * above): of a process a tracer holds threads of, or of the stop a group
+     * stop is handed over as. */
+    if (sig == SIGCHLD && (si->si_code == CLD_STOPPED || si->si_code == CLD_CONTINUED) &&
+        (ptrace_tgid_traced((s32)si->si_pid) ||
+         (si->si_code == CLD_STOPPED &&
+          (proctab_jc_art((s32)si->si_pid) & JCA_STOP_CHLD)))) {
+        sig_selfintr();   /* never sent: it interrupted nothing */
+        return;
+    }
     /* The death of a clone child -- one forked with an exit signal other than
      * SIGCHLD (sys_proc.c) -- is reported with that signal, or with none; the
      * host, whose child it is an ordinary fork of, said SIGCHLD. */
@@ -3575,12 +3714,18 @@ int sig_on_trampoline(struct Machine *m, u64 pc) {
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
     if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
+    /* get_signal's first business: a SIGCONT's notice (the real parent's
+     * view, above). */
+    if (UNLIKELY(__atomic_load_n(&m->jc_rp_notify, __ATOMIC_RELAXED))) jc_rp_notify();
     sigq_sync();
     while (sigq_tail != sigq_head) {
         /* get_signal's loop takes a job-control trap before each dequeue: a
          * trap_notify or an INTERRUPT that came during the last one's stop is
-         * reported before the next signal is (ptrace_service_kick). */
+         * reported before the next signal is (ptrace_service_kick) -- and
+         * before that, a SIGCONT's notice, which may have come during it. */
+        if (UNLIKELY(__atomic_load_n(&m->jc_rp_notify, __ATOMIC_RELAXED))) jc_rp_notify();
         if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
+        if (UNLIKELY(__atomic_load_n(&m->jc_rp_notify, __ATOMIC_RELAXED))) jc_rp_notify();
         /* The kernel's next, of those not blocked -- none, and what is queued
          * waits for the unblock (the counts say so without a walk). */
         int pick = sigq_pick(~g_tls.sigmask);

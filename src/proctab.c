@@ -167,6 +167,29 @@ struct ProcEnt {
      * the owner's to write. */
     u8  chldact;
 
+    /* The real parent's view of the owner's job control, where the group stop
+     * is the emulator's to run -- a process a tracer holds threads of stops
+     * with its traced threads trapped and the rest parked, never a host stop
+     * its parent's host wait could see (signal.c, "the real parent's view").
+     * `jc` is the kernel's SIGNAL_STOP_STOPPED / _CONTINUED and the
+     * group_exit_code a WUNTRACED wait takes (JCW_*): written by the owner,
+     * taken by the parent's wait with a CAS. `jc_parent` is the real parent
+     * the latest event was posted for, and that parent's own `jc_seq` is
+     * bumped as it is -- the parent's waits look here only once a child ever
+     * posted. `jc_art` marks host stop reports that are the emulator's own
+     * (JCA_*), which a guest parent does not see; `jc_hcons` is the leader's
+     * context-switch count at which the parent took the host's report of the
+     * owner's current host stop -- the same while it lasts, so an attach can
+     * tell whether that stop was reported (proctab_jc_hcons). */
+    u32 jc;
+    u8  jc_live;                 /* a group stop of the emulator's is in force:
+                                  * its untraced threads are parked, the
+                                  * kernel's TASK_STOPPED, /proc's 'T' */
+    s32 jc_parent;
+    u32 jc_seq;
+    u32 jc_art;
+    u64 jc_hcons;
+
     /* The owner's siginfo inbox (signal.c, "the siginfo carrier"): written by
      * whoever signals the owner on a host that cannot carry the siginfo
      * itself, taken by the owner as the signal naming a slot comes off its
@@ -179,6 +202,16 @@ struct ProcEnt {
      * Cleared with the rest of the entry for a new process. */
     SigCarry carry[PROCTAB_CARRY];
 };
+
+/* A new process's job-control record: nothing stopped, no child's event. */
+static void jc_clear(struct ProcEnt *e) {
+    __atomic_store_n(&e->jc, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_live, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_parent, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_seq, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_art, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_hcons, 0, __ATOMIC_RELAXED);
+}
 
 static void carry_clear(struct ProcEnt *e) {
     for (int i = 0; i < PROCTAB_CARRY; i++) {
@@ -220,6 +253,10 @@ static int g_tab_n;              /* PROCTAB_MAX, or 0 */
 struct ProcGrave {
     u32 head;                          /* entries ever written */
     struct { s32 pid; u32 ruid; } e[PROCTAB_GRAVE];
+    u32 hw;                            /* slots below this were ever used:
+                                        * free ones are taken first-fit, so a
+                                        * scan that needs no stale-slot care
+                                        * stops here (slots_used) */
 };
 static struct ProcGrave *g_grave;
 #define PROCTAB_SIZE (sizeof(struct ProcEnt) * PROCTAB_MAX + sizeof(struct ProcGrave))
@@ -228,6 +265,22 @@ static void tab_adopt(void *p) {
     g_tab = p;
     g_tab_n = PROCTAB_MAX;
     g_grave = (struct ProcGrave *)(g_tab + PROCTAB_MAX);
+}
+
+/* How many slots a scan has to look at: all ever used. */
+static int slots_used(void) {
+    if (!g_grave) return g_tab_n;
+    u32 h = __atomic_load_n(&g_grave->hw, __ATOMIC_ACQUIRE);
+    return h > (u32)g_tab_n ? g_tab_n : (int)h;
+}
+
+static void slot_used(int i) {
+    if (!g_grave) return;
+    u32 want = (u32)i + 1, cur = __atomic_load_n(&g_grave->hw, __ATOMIC_RELAXED);
+    while (cur < want &&
+           !__atomic_compare_exchange_n(&g_grave->hw, &cur, want, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        ;
 }
 
 static void grave_push(s32 pid, u32 ruid) {
@@ -339,8 +392,9 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
      * the state word; v11 the owner's locked memory, VmLck; v12 an exited
      * owner's slot, kept until it is reaped; v13 the owner's real uid, and
-     * the reaped ones past the slots; v14 its SIGCHLD disposition.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v14.%u.%08x",
+     * the reaped ones past the slots; v14 its SIGCHLD disposition; v15
+     * the real parent's view of its job control, and the slots ever used.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v15.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -406,9 +460,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v14.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v15.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v14.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v15.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2682,7 +2736,9 @@ int proctab_reserve(void) {
         __atomic_store_n(&e->pers_main, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->pers_base, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->pers_npub, 0, __ATOMIC_RELAXED);
+        jc_clear(e);
         carry_clear(e);
+        slot_used(i);
         return i;
     }
     return -1;
@@ -2781,6 +2837,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
             }
         }
     if (slot < 0) return;   /* table full: falls back to host cmdline / hidden */
+    slot_used(slot);
     struct ProcEnt *e = &g_tab[slot];
     /* A slot we just claimed starts from a clean seqlock. Its previous owner
      * may have been SIGKILL'd inside the critical section below (which copies
@@ -2807,6 +2864,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     }
     if (claimed || (!reserved && e->start != start)) {
         carry_clear(e);
+        jc_clear(e);
         __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
         e->sg_deny = e->uid_claim = e->gid_claim = 0;
         __atomic_store_n(&e->uid_n, 0, __ATOMIC_RELAXED);
@@ -2954,7 +3012,7 @@ void proctab_reaped(s32 pid) {
  * slot as soon as a guest process takes the number (proctab_register_at). */
 int proctab_ident(s32 pid, u32 *ruid) {
     if (!g_tab || pid <= 0) return 0;
-    for (int i = 0; i < g_tab_n; i++) {
+    for (int i = 0, n = slots_used(); i < n; i++) {
         s32 p = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
         if (p == pid ||
             (p == PT_RESERVED && __atomic_load_n(&g_tab[i].kid, __ATOMIC_ACQUIRE) == pid)) {
@@ -3280,9 +3338,164 @@ void proctab_chldact_set(u8 bits) {
 
 u8 proctab_chldact(s32 pid) {
     if (!g_tab || pid <= 0) return 0;
-    for (int i = 0; i < g_tab_n; i++)
+    for (int i = 0, n = slots_used(); i < n; i++)
         if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid)
             return __atomic_load_n(&g_tab[i].chldact, __ATOMIC_ACQUIRE);
+    return 0;
+}
+
+/* ---- the real parent's view of a group stop the emulator runs ----------
+ * (ProcEnt.jc; signal.c has the story). All memory: the capture handler
+ * posts a SIGCONT's continue. */
+static struct ProcEnt *pid_entry(s32 pid) {
+    if (!g_tab || pid <= 0) return NULL;
+    for (int i = 0, n = slots_used(); i < n; i++)
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid) return &g_tab[i];
+    return NULL;
+}
+
+static void jc_bump_parent(s32 parent) {
+    struct ProcEnt *pe = pid_entry(parent);
+    if (pe) __atomic_add_fetch(&pe->jc_seq, 1, __ATOMIC_RELEASE);
+}
+
+void proctab_jc_set(u32 word, s32 parent) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (!e) return;
+    __atomic_store_n(&e->jc_parent, parent, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->jc, word, __ATOMIC_RELEASE);
+    jc_bump_parent(parent);
+}
+
+int proctab_jc_continued(s32 parent) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (!e) return 0;
+    u32 w = __atomic_load_n(&e->jc, __ATOMIC_ACQUIRE);
+    do {
+        if (!(w & JCW_STOPPED)) return 0;
+    } while (!__atomic_compare_exchange_n(&e->jc, &w, JCW_CONTINUED, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&e->jc_parent, parent, __ATOMIC_RELEASE);
+    jc_bump_parent(parent);
+    return 1;
+}
+
+u32 proctab_jc_word(s32 pid) {
+    struct ProcEnt *e = pid == (s32)getpid() && g_tab ? own_entry() : pid_entry(pid);
+    return e ? __atomic_load_n(&e->jc, __ATOMIC_ACQUIRE) : 0;
+}
+
+void proctab_jc_live_set(int live) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (e) __atomic_store_n(&e->jc_live, (u8)live, __ATOMIC_RELEASE);
+}
+
+int proctab_jc_live(s32 pid) {
+    struct ProcEnt *e = pid == (s32)getpid() && g_tab ? own_entry() : pid_entry(pid);
+    return e && __atomic_load_n(&e->jc_live, __ATOMIC_ACQUIRE);
+}
+
+int proctab_jc_any(void) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    return e && __atomic_load_n(&e->jc_seq, __ATOMIC_ACQUIRE) != 0;
+}
+
+void proctab_jc_art_set(u32 bits) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (e) __atomic_store_n(&e->jc_art, bits, __ATOMIC_RELEASE);
+}
+
+u32 proctab_jc_art(s32 pid) {
+    struct ProcEnt *e = pid_entry(pid);
+    return e ? __atomic_load_n(&e->jc_art, __ATOMIC_ACQUIRE) : 0;
+}
+
+void proctab_jc_art_clear(s32 pid, u32 bits) {
+    struct ProcEnt *e = pid_entry(pid);
+    if (e) __atomic_and_fetch(&e->jc_art, ~bits, __ATOMIC_ACQ_REL);
+}
+
+void proctab_jc_hcons_set(s32 pid, u64 sw) {
+    struct ProcEnt *e = pid_entry(pid);
+    if (e) __atomic_store_n(&e->jc_hcons, sw, __ATOMIC_RELEASE);
+}
+
+u64 proctab_jc_hcons(s32 pid) {
+    struct ProcEnt *e = pid_entry(pid);
+    return e ? __atomic_load_n(&e->jc_hcons, __ATOMIC_ACQUIRE) : 0;
+}
+
+/* How often `pid`'s main thread was switched out, voluntarily or not
+ * (/proc/<pid>/status): a count a stopped task does not move, so the same
+ * while one host stop lasts -- and what tells one stop from the next
+ * (ProcEnt.jc_hcons). 0 when it cannot be read. */
+u64 proctab_ctxsw(s32 pid) {
+    char path[64], buf[2048];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fdwin_leave(); return 0; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    fdwin_leave();
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    u64 sum = 0;
+    int seen = 0;
+    for (char *l = buf; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : NULL) {
+        if (!strncmp(l, "voluntary_ctxt_switches:", 24))
+            sum += strtoull(l + 24, NULL, 10), seen++;
+        else if (!strncmp(l, "nonvoluntary_ctxt_switches:", 27))
+            sum += strtoull(l + 27, NULL, 10), seen++;
+    }
+    return seen == 2 ? sum + 1 : 0;   /* never 0 for a count read */
+}
+
+/* The host parent of `pid` (/proc/<pid>/stat), -1 when it cannot be read. */
+static s32 host_ppid(s32 pid) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fdwin_leave(); return -1; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    fdwin_leave();
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    int pp;
+    char st;
+    if (!rp || sscanf(rp + 1, " %c %d", &st, &pp) != 2) return -1;
+    return (s32)pp;
+}
+
+int proctab_jc_take(int seltype, s32 selid, int stops, int conts, int keep,
+                    s32 *pid, int *kind, int *code) {
+    if (!g_tab || !proctab_jc_any()) return 0;
+    s32 me = (s32)getpid();
+    for (int i = 0, n = slots_used(); i < n; i++) {
+        struct ProcEnt *e = &g_tab[i];
+        s32 p = __atomic_load_n(&e->pid, __ATOMIC_ACQUIRE);
+        if (p <= 0 || __atomic_load_n(&e->exited, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_load_n(&e->jc_parent, __ATOMIC_ACQUIRE) != me) continue;
+        u32 w = __atomic_load_n(&e->jc, __ATOMIC_ACQUIRE);
+        int is_stop = stops && (w & JCW_STOPPED) && (w & JCW_CODE);
+        int is_cont = conts && (w & JCW_CONTINUED);
+        if (!is_stop && !is_cont) continue;
+        if (seltype == 1 && p != selid) continue;
+        if (seltype == 2 && getpgid((pid_t)p) != (pid_t)selid) continue;
+        if (host_ppid(p) != me) continue;   /* reparented, or not ours after all */
+        *pid = p;
+        *kind = is_stop ? JCW_STOPPED : JCW_CONTINUED;
+        *code = (int)(w & JCW_CODE);
+        if (keep) return 1;
+        u32 nw = is_stop ? (w & ~JCW_CODE) : (w & ~JCW_CONTINUED);
+        if (__atomic_compare_exchange_n(&e->jc, &w, nw, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 1;
+        i--;   /* changed under us: look at it again */
+    }
     return 0;
 }
 

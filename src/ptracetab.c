@@ -133,7 +133,9 @@ typedef struct {
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
     u32 attach_pending;  /* tracer ATTACH/SEIZE'd us: adopt at the next boundary */
     u32 attach_stopped;  /* ...while the host had the process stopped: adopt into
-                          * a group stop (the tracer woke it to adopt at all) */
+                          * a group stop (the tracer woke it to adopt at all);
+                          * 3 when the real parent had taken the host's report
+                          * of that stop already (proctab_jc_hcons) */
     u32 interrupt_pending; /* JOBCTL_TRAP_STOP: a PTRACE_INTERRUPT, or a SEIZEd
                           * auto-attached child's first stop -- a
                           * PTRACE_EVENT_STOP trap at the next boundary, or
@@ -812,14 +814,20 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
      * host wait or a gdb-style SIGCHLD event loop. */
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
-    /* A group stop's trap is CLD_STOPPED, with the group's stop signal (or
-     * none, an INTERRUPT with no group stop in force); every other stop
-     * CLD_TRAPPED, with its own. */
-    if (pt_in_jobctl)
-        pt_notify_stop(tracer, CLD_STOPPED,
-                       __atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)
-                           ? (int)__atomic_load_n(&g_machine.jc_sig, __ATOMIC_ACQUIRE) : 0);
-    else
+    /* A group stop's trap is CLD_STOPPED, with the group's group_exit_code:
+     * its stop signal -- 0 once the real parent's WUNTRACED wait took it, as
+     * the registry has it for a guest parent (signal.c, "the real parent's
+     * view"), and 0 for an INTERRUPT with no group stop in force. Every
+     * other stop is CLD_TRAPPED, with its own. */
+    if (pt_in_jobctl) {
+        int code = 0;
+        if (__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)) {
+            u32 w = proctab_jc_word((s32)getpid());
+            code = (w & JCW_MODEL) ? (int)(w & JCW_CODE)
+                                   : (int)__atomic_load_n(&g_machine.jc_sig, __ATOMIC_ACQUIRE);
+        }
+        pt_notify_stop(tracer, CLD_STOPPED, code);
+    } else
         pt_notify_stop(tracer, CLD_TRAPPED, stop_sig);
     int ns = pt_service_loop(c, e, seen, si);
     if (ns == PT_RETRAP) return ns;
@@ -1003,9 +1011,13 @@ static void pt_jobctl_trap(CPU *c, int participate) {
     for (;;) {
         PtLink *e = g_self_link;
         if (!e || !g_ptrace_active) return;
+        /* get_signal's order: a SIGCONT's notice before the trap -- one that
+         * came while the last trap lasted included. */
+        sig_jc_notify_due();
         if (pt_jc_due()) {
             participate = 1;
             g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+            sig_jc_took_part();   /* the last one in completes the group stop */
         }
         if (!participate &&
             !(e->seize && (__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) ||
@@ -1066,10 +1078,16 @@ void ptrace_jobctl_service(CPU *c) {
                  * (JOBCTL_TRAP_STOP), so this thread traps into one, and the
                  * others -- continued by the wake -- stop again. Of which
                  * stop signal is not to be read anywhere: SIGSTOP. */
-                if (__atomic_exchange_n(&e->attach_stopped, 0, __ATOMIC_ACQ_REL)) {
+                u32 as = __atomic_exchange_n(&e->attach_stopped, 0, __ATOMIC_ACQ_REL);
+                if (as) {
                     __atomic_store_n(&g_machine.jc_sig, SIGSTOP, __ATOMIC_RELEASE);
-                    __atomic_add_fetch(&g_machine.jc_gseq, 1, __ATOMIC_SEQ_CST);
+                    u32 g = __atomic_add_fetch(&g_machine.jc_gseq, 1, __ATOMIC_SEQ_CST);
                     __atomic_store_n(&g_machine.jc_active, 1, __ATOMIC_RELEASE);
+                    /* A stop the real parent was told of when the host made it,
+                     * not one to tell it of again; the emulator's to run now,
+                     * and its report to the parent's wait still the host's
+                     * report, if that was not taken. */
+                    sig_jc_adopted(g, (as & 2) ? 0 : SIGSTOP);
                     thr_kick_all((s32)g_tls.tid);
                 }
                 /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV) --
@@ -1097,6 +1115,7 @@ void ptrace_jobctl_service(CPU *c) {
         }
         if (!g_ptrace_active && pt_jc_due()) {
             g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE);
+            sig_jc_took_part();   /* the last one in completes the group stop */
             sig_jc_park(c);
             sig_after_trap(c);
             if (g_ptrace_kick) {   /* woken by a kick: an attach, maybe */
@@ -1216,6 +1235,16 @@ u32 ptrace_self_seize(void) {
  * about any thread, hence the registry scan rather than g_self_link. Guest tid
  * == host tid, so `tid` is both what a link is keyed by and what the caller
  * read out of the status file's Pid: line. */
+/* Is thread `tid` in a ptrace stop -- the kernel's TASK_TRACED, which /proc
+ * shows as 't' where the host shows a thread asleep in our service loop? */
+int ptrace_task_trapped(s32 tid) {
+    if (!g_tab || tid <= 0 || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 0;
+    PtLink *e = pt_find(tid);
+    return e && __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) > 0 &&
+           __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED;
+}
+
 s32 ptrace_tracer_of(s32 tid) {
     if (!g_tab || tid <= 0) return 0;
     /* Links exist only once someone traces; skip the scan otherwise. */
@@ -1574,6 +1603,35 @@ void ptrace_jc_notify(s32 tgid, int kick) {
     }
 }
 
+/* The real parent's view of a group stop (signal.c): who traces this
+ * process's leader -- the tracer's process, or 0 -- and whether any thread
+ * of `tgid` is traced, from the links alone (the capture handler asks). And
+ * a wait of `pid`'s to wake, whatever its SIGCHLD disposition: the wake kick
+ * (pt_wake_tracer). */
+s32 ptrace_leader_tracer(void) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return 0;
+    PtLink *e = pt_find((s32)getpid());
+    if (!e || __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) return 0;
+    s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    return tr > 0 ? tr : 0;
+}
+
+int ptrace_tgid_traced(s32 tgid) {
+    if (!g_tab || tgid <= 0 || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != tgid) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
+        return 1;
+    }
+    return 0;
+}
+
+void ptrace_wake_waiter(s32 pid) { pt_wake_tracer(pid); }
+
 /* Bring thread `tid` of this process to its run-loop boundary, where
  * ptrace_service_kick finds what is due (sys_proc.c, thr_kick_all). */
 void ptrace_kick_thread(s32 tid) {
@@ -1691,7 +1749,14 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
          * kick caught up. On a slow host that was whole system calls, and a
          * child that was to stop for its tracer exited instead. */
         int stopped = ptrace_task_stopped(tgid);
-        if (stopped) __atomic_store_n(&e->attach_stopped, 1, __ATOMIC_RELEASE);
+        /* ...and whether its real parent has already taken the host's report
+         * of that stop: its group_exit_code, a kernel's attach keeps as it
+         * is -- 0 once a WUNTRACED wait took it (proctab_jc_hcons). */
+        if (stopped) {
+            u64 hc = proctab_jc_hcons(tgid);
+            int taken = hc && hc == proctab_ctxsw(tgid);
+            __atomic_store_n(&e->attach_stopped, taken ? 3 : 1, __ATOMIC_RELEASE);
+        }
         pt_send_kick(tgid, pid);
         if (stopped) ptrace_wake_stopped(tgid);
         /* The kernel's attach is done when ptrace() returns: whatever the

@@ -2085,14 +2085,42 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   have stayed stopped (`tests/ptrace/seize_stopped.c`, which runs every round
   as a process's first attach).
 
+- *The real parent.* Such a group stop is no host stop, so the real parent's
+  host wait never sees it and the host sends it no notice; for a guest parent
+  the emulator does what the kernel does, through the registry (`signal.c`,
+  "the real parent's view"; `ProcEnt.jc`). The thread that takes its part last
+  completes the stop (`thr_jc_part`, the kernel's
+  `task_participate_group_stop`): `SIGNAL_STOP_STOPPED` with the stop signal as
+  the `group_exit_code` a `WUNTRACED` wait reports once, and a `CLD_STOPPED`
+  notice — unless that thread's tracer is the parent, which hears of it as its
+  tracer. A `SIGCONT` ends it: `WCONTINUED` reports it at once, and the
+  `CLD_CONTINUED` notice goes, to the parent and to the leader's tracer, when a
+  thread next takes a signal or a job-control trap (`get_signal`'s
+  `SIGNAL_CLD_MASK`; `jc_rp_notify`); before the stop was complete, a
+  `CLD_STOPPED` with status 0 instead. A tracer's own `CLD_STOPPED` reports the
+  `group_exit_code` as the parent left it — 0 once its wait took it. Every wait
+  looks in the registry first (`jc_wait_model`), woken to look by the wake
+  kick, once a child ever posted to it. What the host does report of such a
+  process is the emulator's own doing and is not shown (`jc_host_artefact`,
+  and `host_catcher` for the notices): the host continue that wakes a stopped
+  process an attach adopts, the host stop the group stop is handed over as when
+  the last tracer goes (marked `JCA_*` for the time it lasts), any host stop or
+  continue of a process a tracer holds threads of. An attach to a process the
+  host stopped leaves its `group_exit_code` as the parent's wait left it: the
+  host's report of that stop, when the parent took it, is marked with the
+  leader's context-switch count, which does not move while it stays stopped
+  (`proctab_jc_hcons`). `/proc` shows a tracee in a stop as `t (tracing
+  stop)` and a thread parked in such a group stop as `T (stopped)`, where the
+  host shows them asleep (`task_state_view`; `tests/fixtures/rpjobctl.c`). A
+  host parent — the shell the first guest process was started from — is told
+  nothing of it.
+
 What cannot be kept: a `SIGSTOP` from outside the guest — a shell's
 `kill -STOP` of a traced process — is the host's, and stops it where its
 tracer cannot reach it, until a `SIGCONT` (a guest's continues it again, by
-the same wake). The real parent of a traced process is not told of a group
-stop, which is the host's to tell and not the host's stop; nor is it spared the
-host's `CLD_CONTINUED` when an attach wakes a stopped process. And the stop
-signal of a stop the host carried out is not to be read anywhere, so a process
-attached while stopped is reported stopped by `SIGSTOP`.
+the same wake). And the stop signal of a stop the host carried out is not to be
+read anywhere, so a process attached while stopped is reported stopped by
+`SIGSTOP`.
 
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
 `gdb -p` surface, per-thread):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`

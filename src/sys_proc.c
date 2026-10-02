@@ -386,7 +386,7 @@ SYSDEF(set_tid_address) {
  * thread parked after its own exit(2) stays, as the kernel's zombie leader
  * stays a task -- and a fork child keeps only itself. */
 static pthread_mutex_t thr_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct ThrEnt { s32 tid; u32 pers; u64 head; u8 parked; } *thr_tab;
+static struct ThrEnt { s32 tid; u32 pers; u64 head; u8 parked; u32 jcpart; } *thr_tab;
 static int thr_n, thr_cap;
 
 void thr_locks_take(void)   { pthread_mutex_lock(&thr_lock); }
@@ -404,7 +404,7 @@ static struct ThrEnt *thr_ent(s32 tid) {
         thr_cap = nc;
     }
     struct ThrEnt *e = &thr_tab[thr_n++];
-    e->tid = tid; e->pers = 0; e->head = 0; e->parked = 0;
+    e->tid = tid; e->pers = 0; e->head = 0; e->parked = 0; e->jcpart = 0;
     return e;
 }
 
@@ -436,6 +436,23 @@ int thr_reg_pers(s32 tid, u32 *pers) {
         if (thr_tab[i].tid == tid) { *pers = thr_tab[i].pers; found = 1; break; }
     EMU_UNLOCK(&thr_lock, EMU_LK_THR);
     return found;
+}
+
+/* Group stop `gseq` and who has taken part in it (signal.c, "the real
+ * parent's view"): `self`, now, if nonzero -- and then is every thread of the
+ * group in? A main thread parked after its own exit(2) is the kernel's
+ * zombie leader, which takes part in nothing. The last one in completes the
+ * group stop (task_participate_group_stop). */
+int thr_jc_part(s32 self, u32 gseq) {
+    s32 leader = __atomic_load_n(&g_machine.leader_parked, __ATOMIC_ACQUIRE)
+                     ? (s32)getpid() : 0;
+    int all = 1;
+    EMU_LOCK(&thr_lock, EMU_LK_THR);
+    if (self) thr_ent(self)->jcpart = gseq;
+    for (int i = 0; i < thr_n; i++)
+        if (thr_tab[i].tid != leader && thr_tab[i].jcpart != gseq) { all = 0; break; }
+    EMU_UNLOCK(&thr_lock, EMU_LK_THR);
+    return all;
 }
 
 /* A thread at execve's rendezvous says so, for the notice that names the
@@ -884,6 +901,7 @@ static void *thread_entry(void *arg) {
     robust_list_exit_self(c);   /* its robust futexes, before the tid clear */
     as_thread_exit(&m->as);
     thr_reg_del(g_tls.tid);
+    sig_jc_left();              /* a group stop it had yet to take part in */
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
     /* Last thread of a group whose main thread has already parked: nobody else
      * is left to tear the process down or carry its status out. The count can
@@ -3471,6 +3489,89 @@ static int rusage_pt_to_guest(CPU *c, u64 addr, const PtRusage *p) {
     return copy_to_guest(c, addr, &g, sizeof g) < 0 ? -EFAULT : 0;
 }
 
+/* ---- a guest child's group stops the emulator runs ------------------------
+ *
+ * (signal.c, "the real parent's view".) A child a tracer holds threads of
+ * stops and continues where the host does not see it, and posts what a
+ * kernel's wait would report of it in the registry (proctab.c, ProcEnt.jc):
+ * every wait looks there first, as wait_task_stopped and wait_task_continued
+ * look at the signal flags -- once a child ever posted to it. */
+static int jc_wait_model(PtWaitSel sel, u32 options, int keep, s32 *pid, int *kind,
+                         int *code) {
+    if (!(options & (G_WUNTRACED | G_WCONTINUED))) return 0;
+    if ((options & G_WCLONE) && !(options & G_WALL)) return 0;   /* processes' */
+    return proctab_jc_take(sel.type, sel.id, (options & G_WUNTRACED) != 0,
+                           (options & G_WCONTINUED) != 0, keep, pid, kind, code);
+}
+
+/* A wait's rusage for such a report (wait_task_stopped's getrusage of the
+ * child, RUSAGE_BOTH): from its /proc stat, the child's and its children's. */
+static void jc_rusage(s32 pid, GRusage *g) {
+    memset(g, 0, sizeof *g);
+    char path[64], buf[1024];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fdwin_leave(); return; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    fdwin_leave();
+    if (n <= 0) return;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    unsigned long long f[20] = { 0 };
+    char st;
+    if (!rp || sscanf(rp + 1, " %c %*d %*d %*d %*d %*d %*u %llu %llu %llu %llu %llu %llu %llu %llu",
+                      &st, &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7]) != 9)
+        return;
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    u64 ut = f[4] + f[6], stm = f[5] + f[7];   /* utime+cutime, stime+cstime */
+    g->ru_utime.tv_sec = (s64)(ut / (u64)hz);
+    g->ru_utime.tv_usec = (s64)(ut % (u64)hz * 1000000 / (u64)hz);
+    g->ru_stime.tv_sec = (s64)(stm / (u64)hz);
+    g->ru_stime.tv_usec = (s64)(stm % (u64)hz * 1000000 / (u64)hz);
+    g->ru_minflt = (s64)(f[0] + f[1]);
+    g->ru_majflt = (s64)(f[2] + f[3]);
+}
+
+/* Is the host's report of guest child `pid` stopping -- or continuing -- the
+ * emulator's own doing, which a kernel's wait would never give: a process a
+ * tracer holds threads of is never host-stopped or host-continued by a
+ * kernel's doing (an outside SIGSTOP, the wake an attach or the watchdog
+ * sends), and the stop a group stop is handed over as is reported as the
+ * registry has it (JCA_STOP_WAIT). */
+static int jc_host_artefact(s32 pid, int stopped) {
+    if (pid <= 0 || !proctab_has(pid)) return 0;
+    if (ptrace_tgid_traced(pid)) return 1;
+    return stopped && (proctab_jc_art(pid) & JCA_STOP_WAIT);
+}
+
+/* ...and one given to the guest: which stop it was, for an attach that finds
+ * the child still in it (ptracetab.c, attach_stopped). */
+static void jc_host_taken(s32 pid) {
+    if (proctab_has(pid)) proctab_jc_hcons_set(pid, proctab_ctxsw(pid));
+}
+
+/* waitid's side of both: 1 when the host's report in `si` is not to be
+ * given -- taken off the host as it goes, where WNOWAIT left it there, or
+ * the next look would find it again. */
+static int jc_waitid_artefact(const siginfo_t *si, u32 options) {
+    if (si->si_pid <= 0 || (si->si_code != CLD_STOPPED && si->si_code != CLD_CONTINUED))
+        return 0;
+    int stopped = si->si_code == CLD_STOPPED;
+    if (!jc_host_artefact((s32)si->si_pid, stopped)) {
+        if (stopped && !(options & G_WNOWAIT)) jc_host_taken((s32)si->si_pid);
+        return 0;
+    }
+    if (options & G_WNOWAIT) {
+        siginfo_t x;
+        syscall(SYS_waitid, P_PID, (id_t)si->si_pid, &x,
+                (stopped ? WSTOPPED : WCONTINUED) | WNOHANG, NULL);
+    }
+    return 1;
+}
+
 SYSDEF(wait4) {
     pid_t wpid = (pid_t)(s32)a0;
     int options = (int)a2;
@@ -3509,6 +3610,24 @@ SYSDEF(wait4) {
      * timeout covers uncooperative deaths (a host SIGKILL runs no guest code
      * to bump the generation). */
     for (;;) {
+        /* A group stop or continue the emulator ran, which the host cannot
+         * report (jc_wait_model). */
+        {
+            s32 jp;
+            int jk, jcode;
+            if (jc_wait_model(sel, (u32)options, 0, &jp, &jk, &jcode)) {
+                if (a1) {
+                    s32 gs = jk == JCW_STOPPED ? (jcode << 8) | 0x7f : 0xffff;
+                    if (copy_to_guest(c, a1, &gs, 4) < 0) return (u64)(s64)-EFAULT;
+                }
+                if (a3) {
+                    GRusage g;
+                    jc_rusage(jp, &g);
+                    if (copy_to_guest(c, a3, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+                }
+                return (u64)(u32)jp;
+            }
+        }
         /* A clone child is found only where the kernel's rule would find it,
          * and the host is never asked with __WCLONE (clonekid_wait_ok). */
         u32 hopts = (u32)options;
@@ -3539,6 +3658,11 @@ SYSDEF(wait4) {
                     continue;   /* wake kick / undeliverable: re-evaluate mode */
                 }
                 return host_err();
+            }
+            /* A stop or continue the emulator made, not the child's own. */
+            if (pid > 0 && (WIFSTOPPED(status) || WIFCONTINUED(status))) {
+                if (jc_host_artefact((s32)pid, WIFSTOPPED(status))) continue;
+                if (WIFSTOPPED(status)) jc_host_taken((s32)pid);
             }
             /* Defensive: a link keyed to this pid with us as tracer can only
              * appear in a race window (TRACEME after the gate check); drop it
@@ -3587,6 +3711,10 @@ SYSDEF(wait4) {
                                           (u32)options | G_WNOHANG, &ru)
                            : wait4(wpid, &status, (int)hopts | WNOHANG, &ru);
         int werr = errno;
+        if (pid > 0 && (WIFSTOPPED(status) || WIFCONTINUED(status))) {
+            if (jc_host_artefact((s32)pid, WIFSTOPPED(status))) continue;
+            if (WIFSTOPPED(status)) jc_host_taken((s32)pid);
+        }
         if (pid > 0) {
             /* A reaped child's link goes with it; a stop or a continue
              * reported leaves the child, and its link, where they are. */
@@ -3725,6 +3853,28 @@ SYSDEF(waitid) {
                  ((u32)options & G_WNOWAIT ? PT_WAIT_KEEP : 0);
     int dead_too = ((u32)options & (G_WEXITED | G_WCONTINUED)) != 0;
     for (;;) {
+        /* A group stop or continue the emulator ran, which the host cannot
+         * report (jc_wait_model; WSTOPPED is WUNTRACED's bit). */
+        {
+            s32 jp;
+            int jk, jcode;
+            if (jc_wait_model(sel, (u32)options, ((u32)options & G_WNOWAIT) != 0,
+                              &jp, &jk, &jcode)) {
+                siginfo_t ji;
+                memset(&ji, 0, sizeof ji);
+                ji.si_signo = SIGCHLD;
+                ji.si_pid = (pid_t)jp;
+                ji.si_code = jk == JCW_STOPPED ? CLD_STOPPED : CLD_CONTINUED;
+                ji.si_status = jk == JCW_STOPPED ? jcode : SIGCONT;
+                if (a4) {
+                    GRusage g;
+                    jc_rusage(jp, &g);
+                    if (copy_to_guest(c, a4, &g, sizeof g) < 0) return (u64)(s64)-EFAULT;
+                }
+                int e = waitid_out(c, infop, &ji);
+                return e ? (u64)(s64)e : 0;
+            }
+        }
         if (!ptrace_available() || !ptrace_any_trace() ||
             !ptrace_have_tracee(sel, dead_too)) {
             siginfo_t si;
@@ -3752,6 +3902,7 @@ SYSDEF(waitid) {
                 }
                 return host_err();
             }
+            if (jc_waitid_artefact(&si, (u32)options)) continue;
             if (si.si_pid != 0 &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
                  si.si_code == CLD_DUMPED) &&
@@ -3812,6 +3963,7 @@ SYSDEF(waitid) {
                        : (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
                                       (int)hopts | WNOHANG, &ru);
         int werr = errno;
+        if (r == 0 && jc_waitid_artefact(&si, (u32)options)) continue;
         if (r == 0 && si.si_pid != 0 &&
             (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
              si.si_code == CLD_DUMPED) &&

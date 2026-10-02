@@ -144,6 +144,12 @@ struct Machine {
                                * parked in the group stop wakes */
     u32 jc_stopgen;           /* bumped by each stop signal caught: a SIGCONT
                                * queued before it is flushed */
+    u32 jc_done;              /* the latest group stop completed (its jc_gseq):
+                               * the real parent is told once (signal.c, "the
+                               * real parent's view") */
+    u32 jc_rp_notify;         /* CLD_CONTINUED or CLD_STOPPED: a SIGCONT's notice,
+                               * which the next thread to take a signal sends
+                               * (get_signal's SIGNAL_CLD_MASK) */
     s32 dethread_state;       /* DT_PENDING / DT_COMMIT */
     s32 dethread_done;        /* 1 = the new image is loaded and the carrier may
                                * adopt it */
@@ -799,6 +805,16 @@ int  sig_procpnd_trusted(int hs);
  * thread is gone. */
 void sig_jc_park(CPU *c);
 void sig_jc_untraced(struct Machine *m);
+/* The real parent's view of a group stop (signal.c): this thread took its
+ * part in the current one (sig_jc_took_part), or left the group with one in
+ * force (sig_jc_left); an attach adopted a stop the host had made
+ * (sig_jc_adopted, its group_exit_code `code`). sys_proc.c: the threads'
+ * part, thr_jc_part. */
+void sig_jc_took_part(void);
+void sig_jc_notify_due(void);   /* a SIGCONT's notice, ahead of a jobctl trap */
+void sig_jc_left(void);
+void sig_jc_adopted(u32 gseq, int code);
+int  thr_jc_part(s32 self, u32 gseq);
 /* sys_proc.c: bring every other guest thread of this process to its run-loop
  * boundary (the ptrace kick), for what is due there -- a group stop. */
 void thr_kick_all(s32 self);
@@ -1368,6 +1384,30 @@ void proctab_ruid_set(u32 ruid);     /* our real uid moved (setuid & co.) */
  * one the registry does not know. Async-signal-safe. */
 u8   proctab_chldact(s32 pid);
 void proctab_chldact_set(u8 bits);
+/* The real parent's view of a group stop the emulator runs (signal.c, "the
+ * real parent's view"; proctab.c, ProcEnt.jc), the kernel's signal flags and
+ * group_exit_code: */
+#define JCW_CODE      0xffu    /* the stop signal, until a WUNTRACED wait takes it */
+#define JCW_STOPPED   0x100u   /* SIGNAL_STOP_STOPPED: the group stop is complete */
+#define JCW_CONTINUED 0x200u   /* SIGNAL_STOP_CONTINUED: not yet waited for */
+#define JCW_MODEL     0x400u   /* the stop is the emulator's, not a host stop */
+/* ...and the host reports that are the emulator's own (ProcEnt.jc_art): */
+#define JCA_STOP_CHLD 1u       /* the host's CLD_STOPPED of our hand-over stop */
+#define JCA_STOP_WAIT 2u       /* ...and its wait report, already given */
+void proctab_jc_set(u32 word, s32 parent);       /* ours, posted for `parent` */
+int  proctab_jc_continued(s32 parent);           /* SIGCONT: 1 if it was stopped */
+u32  proctab_jc_word(s32 pid);
+int  proctab_jc_any(void);                       /* a child ever posted to us */
+void proctab_jc_live_set(int live);              /* our emulated stop is in force */
+int  proctab_jc_live(s32 pid);
+int  proctab_jc_take(int seltype, s32 selid, int stops, int conts, int keep,
+                     s32 *pid, int *kind, int *code);
+void proctab_jc_art_set(u32 bits);
+u32  proctab_jc_art(s32 pid);
+void proctab_jc_art_clear(s32 pid, u32 bits);
+void proctab_jc_hcons_set(s32 pid, u64 sw);
+u64  proctab_jc_hcons(s32 pid);
+u64  proctab_ctxsw(s32 pid);                     /* moves only while it runs */
 /* Is `pid` a guest process that has exited and not been reaped -- one that
  * unregistered, or one killed outright, whose host task is a zombie? A
  * member of the registry all the same (proctab_has) -- kill(2), getpgid(2),
