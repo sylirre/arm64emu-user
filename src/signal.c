@@ -3617,6 +3617,29 @@ static int host_take_pending(u64 set, siginfo_t *si) {
     return (int)syscall(SYS_rt_sigtimedwait, &set, si, zero, (size_t)8);
 }
 
+/* ...or wait for one, up to `ns` nanoseconds (< 0: for as long as it takes).
+ * A 32-bit host's plain SYS_rt_sigtimedwait takes its timeout as a pair of
+ * 32-bit words, which a struct timespec with a 64-bit tv_sec (-D_TIME_BITS=64,
+ * the Makefile's) is not: it read the two halves of tv_sec, which are 0 and 0
+ * for anything under a second, and the wait returned EAGAIN at once. The
+ * time64 call takes the 64-bit pair; a kernel older than 5.1 has none, and
+ * the 32-bit pair it does take is built for it instead. */
+static long host_sigtimedwait(u64 set, siginfo_t *si, s64 ns) {
+#if defined(SYS_rt_sigtimedwait_time64) && __SIZEOF_LONG__ == 4
+    struct { s64 tv_sec, tv_nsec; } ts = { ns / 1000000000, ns % 1000000000 };
+    long r = syscall(SYS_rt_sigtimedwait_time64, &set, si, ns < 0 ? NULL : (void *)&ts,
+                     (size_t)8);
+    if (r >= 0 || errno != ENOSYS) return r;
+    s64 sec = ns / 1000000000;
+    struct { s32 tv_sec, tv_nsec; } t32 = { sec > INT32_MAX ? INT32_MAX : (s32)sec,
+                                            (s32)(ns % 1000000000) };
+    return syscall(SYS_rt_sigtimedwait, &set, si, ns < 0 ? NULL : (void *)&t32, (size_t)8);
+#else
+    struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+    return syscall(SYS_rt_sigtimedwait, &set, si, ns < 0 ? NULL : &ts, (size_t)8);
+#endif
+}
+
 void sig_handover_give(int all) {
     u64 prev = host_block_all();   /* the ring's producer */
     sigq_sync();
@@ -3758,16 +3781,12 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
          * never came. */
         if (g_ptrace_kick) return -EINTR;
         /* What is left of the timeout. */
-        struct timespec rem, *remp = NULL;
-        if (timeout_ns == 0) { rem.tv_sec = 0; rem.tv_nsec = 0; remp = &rem; }
-        else if (timeout_ns > 0) {
+        s64 left = timeout_ns;
+        if (timeout_ns > 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            s64 left = ((s64)dl.tv_sec - now.tv_sec) * 1000000000LL + (dl.tv_nsec - now.tv_nsec);
+            left = ((s64)dl.tv_sec - now.tv_sec) * 1000000000LL + (dl.tv_nsec - now.tv_nsec);
             if (left <= 0) return -EAGAIN;
-            rem.tv_sec = (time_t)(left / 1000000000LL);
-            rem.tv_nsec = (long)(left % 1000000000LL);
-            remp = &rem;
         }
         if (!hset) {
             /* Only numbers the ring serves: poll it. */
@@ -3778,7 +3797,7 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
         }
         siginfo_t hsi;
         memset(&hsi, 0, sizeof hsi);
-        long r = syscall(SYS_rt_sigtimedwait, &hset, &hsi, remp, (size_t)8);
+        long r = host_sigtimedwait(hset, &hsi, left);
         if (r > 0) {
             PendSig p;
             pendsig_from_host(&p, (int)r, &hsi);

@@ -978,9 +978,22 @@ static struct VforkBox *g_vf_box;   /* the child's end; NULL in any other proces
 static pid_t g_vf_parent;
 
 static void vf_wake(u32 *w) { syscall(SYS_futex, w, 1 /*FUTEX_WAKE*/, 1, NULL, NULL, 0); }
+/* As ptracetab.c's fx_wait: a 32-bit host's plain SYS_futex takes its
+ * timeout as a pair of 32-bit words, which a timespec with a 64-bit tv_sec
+ * (-D_TIME_BITS=64) is not -- every wait under a second was no wait at all,
+ * and a vfork parent spun on the child's mailbox instead of sleeping. */
 static void vf_wait(u32 *w, u32 val, long ms) {
+#if defined(SYS_futex_time64) && __SIZEOF_LONG__ == 4
+    struct { s64 tv_sec, tv_nsec; } ts = { ms / 1000, (s64)(ms % 1000) * 1000000 };
+    if (syscall(SYS_futex_time64, w, 0 /*FUTEX_WAIT*/, val, &ts, NULL, 0) < 0 &&
+        errno == ENOSYS) {
+        struct { s32 tv_sec, tv_nsec; } t32 = { (s32)(ms / 1000), (s32)(ms % 1000) * 1000000 };
+        syscall(SYS_futex, w, 0 /*FUTEX_WAIT*/, val, &t32, NULL, 0);
+    }
+#else
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     syscall(SYS_futex, w, 0 /*FUTEX_WAIT*/, val, &ts, NULL, 0);
+#endif
 }
 
 /* Child: one run of changed bytes to the parent, in box-sized pieces. -1 once

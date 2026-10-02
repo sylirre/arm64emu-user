@@ -42,6 +42,17 @@ all four targets.
   says "all ones if negative" should say so.
 - **`_FILE_OFFSET_BITS=64` and `_TIME_BITS=64`** are set so a 32-bit host's libc
   presents 64-bit `off_t`/`time_t`, matching the guest's LP64 widths.
+- **…which a raw `syscall(SYS_*)` taking a timeout does not get.** The libc
+  wrappers switch to the `*_time64` calls; a raw `SYS_futex` or
+  `SYS_rt_sigtimedwait` on a 32-bit host reads its `struct timespec` as two
+  32-bit words — the two halves of the 64-bit `tv_sec`, `0` and `0` for anything
+  under a second — and does not wait at all. Such calls go through the time64
+  number where the headers have one, with a 32-bit pair built by hand for a
+  kernel older than 5.1 (`ENOSYS`): `fx_wait` (`ptracetab.c`), `vf_wait`
+  (`sys_proc.c`) and `host_sigtimedwait` (`signal.c`). A
+  guest `sigtimedwait` with a timeout under a second used to return `EAGAIN` at
+  once on such a host, and a vfork parent spun on its child's mailbox
+  (`tests/c/sigtimedwait_tmo.c`). A zero timeout is zero either way.
 - **`make m32`** builds the i386 binary natively on the x86-64 dev host, so ILP32
   correctness is on every test run.
 - **Raw `syscall(SYS_*)` calls must be audited against the Android seccomp
