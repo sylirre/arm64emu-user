@@ -829,6 +829,52 @@ takes the ptrace routing `kill(2)` and `tgkill(2)` take. `tests/c/tgsigqueue.c`
 (differential) and `tests/fixtures/sqiread.c` (self-checking: qemu-user locks
 all 128 bytes, copies only the fields it knows, and drops `si_errno`).
 
+### Whose a signal is: `si_pid` and `si_uid`
+
+A kernel fills in `si_pid` and `si_uid` of the signals it sends — `kill`,
+`tkill`/`tgkill`, a child's notice, a message queue's, the `SIGPIPE` of a write
+— as the receiver sees the sender (`send_signal_locked`, `do_notify_parent`):
+its pid in the receiver's pid namespace, **0** for one outside it, and its
+**real** uid mapped into the receiver's user namespace; `waitid` reports the
+child's real uid the same way. The host filled them in as the host sees
+things: the pid of a host process the guest cannot otherwise see (it is
+`ESRCH` to `kill` and hidden in `/proc`), and the uid the emulator runs as —
+never the fake one under `--fake-id`, nor the one a `setuid` moved the sender
+to. So every host siginfo is filled in again on its way to the guest
+(`sig_ident`: the capture handler, every dequeue, a `signalfd` record), from
+the registry (`proctab_ident`): each guest process publishes its real uid as
+the guest knows it in its entry (`ProcEnt.ruid` — seeded into a fork child's
+reservation by its parent, rewritten by the credential setters), and a guest
+sender's pid stays, with that uid; anyone else's pid becomes 0, its uid mapped
+the way file owners are (`remap_uid`). A child's notice names our own child,
+always the guest's. The layouts with no pid or uid in them — a fault's, a
+timer's, a poll's, `SI_KERNEL`'s — are left alone.
+
+A signal can outlive its sender — blocked, then taken after the parent reaped
+the child that sent it — and still names it. The registry keeps the newest 256
+reaped processes' pids and uids past its slots (`ProcGrave`), written by whoever
+frees a slot; a fork child, before it runs a guest instruction, writes its pid
+into the reservation its parent made (`ProcEnt.kid`), so a signal it sends
+before its parent has published the slot is known as well. The lookup is
+memory alone, with no lock and no system call — the capture handler makes it.
+
+A **queued** siginfo is what its sender wrote, pid and uid included, and a
+guest's goes to the receiver as written: the sending emulator marks its code
+(`sig_origin_code`, `0x7ffffe00` lower, in the span the thread mark uses
+`0x7fffff00` lower for — which says the same), so the receiver does not take
+it for one from outside, whose pid a kernel would zero. On a host that cannot
+carry a private code (the known-layout tier above), a guest's queued siginfo
+goes through the receiver's inbox instead (`SIG_CARRY_QUEUED`), which only a
+guest posts to; one that found no room there, and so came as the host carries
+it, is taken for a guest's if it names a guest process. Kept as is
+everywhere: the siginfo
+the inbox and the job-control carriers bring, which only a guest sends, with
+the sender's real uid in it for a `kill`. And the siginfos a ptrace stop
+makes up — a trap's, the tracee's own uid; a substituted signal's, the
+tracer's; an attach's `SIGSTOP`'s, its sender's. `tests/fixtures/sigident.c`
+runs every kind as the invoking user and as a fake root whose children each
+take another real uid first, and a `SIGUSR1` from outside the guest.
+
 ## Job control: where mirroring the block mask began
 
 The mirror above started as a three-signal special case, and the bug that

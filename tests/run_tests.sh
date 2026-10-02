@@ -3003,6 +3003,40 @@ fx_rm tests/fixtures/pidreuse.bin
 # siginfo_to_guest). Self-checking: qemu-user forks a clone child with SIGCHLD;
 # the block is the kernel's.
 check_fixture chldinfo $'handler: code=1 status=7 pid=child times ok\nsigwaitinfo: code=1 status=8 pid=child times ok\nsignalfd: code=1 status=9 pid=child times ok\nclone child: sig=SIGUSR2 code=1 status=3 pid=child times ok\ndone'
+# Whose a signal is: the si_pid and si_uid of kill, tgkill, a child's notice,
+# a signalfd record, waitid, a queued siginfo and SIGPIPE -- the sender as the
+# guest sees it, its pid and its real uid (signal.c, sig_ident; proctab.c,
+# proctab_ident), where the host said the uid the emulator runs as. Run as the
+# invoking user and as a fake root (-u), whose children each take another
+# real uid first; one sender is reaped before its signal is taken. And a
+# SIGUSR1 from outside the guest, which a kernel reports from pid 0 with the
+# outside uid mapped. Self-checking: the block is the kernel's, the outside
+# row in a bubblewrap user and pid namespace.
+SIGID_EXPECT=$'kill from a child: code=0 pid ok, uid ok\ntgkill from a child: code=-6 pid ok, uid ok\nsender reaped first, sigwaitinfo: code=0 pid ok, uid ok\nsignalfd: code=0 pid ok, uid ok\nsigqueue, made up: code=-1 pid ok, uid ok\nsigqueue, its own: code=-1 pid ok, uid ok\nSIGCHLD: code=1 pid ok, uid ok\nwaitid: code=1 pid ok, uid ok\nSIGPIPE: code=0 pid ok, uid ok\ndone'
+if "$AGCC" -static -O2 -o tests/fixtures/sigident.bin tests/fixtures/sigident.c 2>/dev/null; then
+    for fid in "" -u; do
+        got=$(timeout -k 5 60 "$EMU" $fid / "$PWD/tests/fixtures/sigident.bin" 2>/dev/null)
+        fixture_verdict "sigident${fid:+ (fake root)}" "$SIGID_EXPECT" "$got"
+        rm -f tests/.cache/sigident.pid
+        timeout -k 5 30 "$EMU" $fid / "$PWD/tests/fixtures/sigident.bin" outside \
+            "$PWD/tests/.cache/sigident.pid" > tests/.cache/sigident.out 2>/dev/null &
+        sb=$!
+        n=0
+        while [ ! -s tests/.cache/sigident.pid ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done
+        [ -s tests/.cache/sigident.pid ] && kill -USR1 "$(cat tests/.cache/sigident.pid)" 2>/dev/null
+        wait $sb
+        fixture_verdict "sigident: outside sender${fid:+ (fake root)}" \
+            "outside sender: code=0 pid=0, uid the outside user's, mapped" "$(cat tests/.cache/sigident.out)"
+        rm -f tests/.cache/sigident.pid tests/.cache/sigident.out
+    done
+    # ...and on the tier where a guest's queued siginfo cannot bear the mark
+    # that says a guest wrote it, and goes through the receiver's inbox.
+    got=$(A64_SICODE_FORCE_KNOWN=1 timeout -k 5 60 "$EMU" -u / "$PWD/tests/fixtures/sigident.bin" 2>/dev/null)
+    fixture_verdict "sigident (known-layout tier)" "$SIGID_EXPECT" "$got"
+    fx_rm tests/fixtures/sigident.bin
+else
+    skip_build fixtures/sigident
+fi
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

@@ -236,7 +236,7 @@ static int jc_route(s32 tgid, s32 tid, int pidfd, int sig, const u8 *gsi, s64 *r
         *res = sig_send_jc(tgid, tid, pidfd, sig, code, pid, uid, err, value);
     } else {
         *res = sig_send_jc(tgid, tid, pidfd, sig, tid ? SI_TKILL : SI_USER,
-                           (s32)getpid(), (u32)getuid(), 0, 0);
+                           (s32)getpid(), sig_ruid_of((s32)getpid()), 0, 0);
     }
     return 1;
 }
@@ -441,10 +441,10 @@ int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
  * returned -- whole struct signalfd_siginfo records, ssi_signo back from a
  * carrier to the guest number, a timer's slot index back to its guest sigval
  * and timer id, a signal a thread handed back to the process back to the
- * signal it was (signal.c, sig_retarget), and one whose siginfo came
- * through this process's inbox back to that siginfo (sig_carry_send). The
- * blocking, O_NONBLOCK and EINTR
- * behaviour are the file's own (a read interrupted by a signal the guest
+ * signal it was (signal.c, sig_retarget), one whose siginfo came through
+ * this process's inbox back to that siginfo (sig_carry_send), and the
+ * sender's pid and uid as the guest knows them (sig_ident). The blocking,
+ * O_NONBLOCK and EINTR behaviour are the file's own (a read interrupted by a signal the guest
  * handles is restartable, as signalfd_read's ERESTARTSYS makes it). */
 s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
     (void)c;
@@ -455,8 +455,12 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
         GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
         if (sig_sfd_requeued(r)) continue;   /* handed back or carried: as sent */
         r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
-        int code = r->ssi_code;
-        if (sig_thread_uncode(&code)) r->ssi_code = code;   /* rt_tgsigqueueinfo */
+        int code = r->ssi_code, thr;
+        int own = sig_queue_uncode(&code, &thr);   /* a guest's queued one */
+        r->ssi_code = code;
+        s32 pid = (s32)r->ssi_pid;
+        sig_ident((int)r->ssi_signo, code, own, &pid, &r->ssi_uid);   /* whose */
+        r->ssi_pid = (u32)pid;
         if (r->ssi_code == SI_TIMER) {
             u64 gv;
             int thr;
@@ -581,7 +585,9 @@ static s64 sqi_read(CPU *c, u64 uinfo, int sig, u8 gsi[48]) {
 /* The host siginfo that carries it: si_errno and si_code as the sender gave
  * them, and the SI_QUEUE payload -- pid@16, uid@20, value@24 -- which is what
  * the receiving emulator's capture hands on to the guest. `thread`: aimed at
- * one thread, which the code carries (sig_thread_code). A host that can carry
+ * one thread, which the code carries (sig_thread_code); or at the process,
+ * and the code says a guest wrote it all the same (sig_origin_code), so its
+ * pid and uid are not taken for a host's. A host that can carry
  * none of this past its own layouts, and an ILP32 host a value wider than its
  * 4-byte sigval, is sent it through the receiver's inbox instead (sqi_carry). */
 static void sqi_host(siginfo_t *si, int hs, const u8 gsi[48], int thread) {
@@ -596,7 +602,7 @@ static void sqi_host(siginfo_t *si, int hs, const u8 gsi[48], int thread) {
     memset(si, 0, sizeof *si);
     si->si_signo = hs;
     si->si_errno = err;
-    si->si_code = thread ? sig_thread_code(code) : code;
+    si->si_code = thread ? sig_thread_code(code) : sig_origin_code(code);
     si->si_pid = (pid_t)pid;
     si->si_uid = (uid_t)uid;
     si->si_value.sival_ptr = (void *)(uintptr_t)value;
@@ -616,7 +622,8 @@ static int sqi_carry(s32 tgid, s32 tid, int pidfd, int sig, int hs, const u8 gsi
     memcpy(&uid, gsi + 20, 4);
     memcpy(&value, gsi + 24, 8);
     s64 r;
-    if (!sig_carry_send(tgid, tid, pidfd, hs, sig, 0, code, err, pid, uid, value, &r))
+    if (!sig_carry_send(tgid, tid, pidfd, hs, sig, SIG_CARRY_QUEUED, code, err, pid, uid,
+                        value, &r))
         return 0;
     *res = (u64)r;
     return 1;

@@ -146,6 +146,19 @@ struct ProcEnt {
      * rewritten by the owner's own registration at every execve. */
     u32 pers_main, pers_base, pers_npub;
 
+    /* Whose signals the owner sends (proctab_ident): its real uid as the
+     * guest knows it -- the fake one under --fake-id, which a setuid moves --
+     * since the siginfo of a signal it sends, and the notice of its death,
+     * name the sender's real uid. Seeded into a fork child's reservation by
+     * its parent (the child's are its parent's at the fork), then the
+     * owner's to write: one word, stored and loaded atomically. */
+    u32 ruid;
+    /* A reservation's child, once it runs: its pid, stored by the child
+     * before its first guest instruction, while the parent may not have
+     * published the slot under it yet -- a signal the child sends at once
+     * is still known for a guest's. Cleared with the reservation. */
+    s32 kid;
+
     /* The owner's siginfo inbox (signal.c, "the siginfo carrier"): written by
      * whoever signals the owner on a host that cannot carry the siginfo
      * itself, taken by the owner as the signal naming a slot comes off its
@@ -187,6 +200,41 @@ static void foreign_write(struct ProcEnt *e, const s32 *tids, int n) {
 
 static struct ProcEnt *g_tab;    /* MAP_SHARED, or NULL if unavailable */
 static int g_tab_n;              /* PROCTAB_MAX, or 0 */
+
+/* The processes reaped lately: the pid and real uid each had, the newest
+ * PROCTAB_GRAVE of them, in the same mapping right past the slots. A signal
+ * outlives its sender -- one blocked, then taken after the parent reaped the
+ * child that sent it -- and its siginfo still names that sender, which the
+ * registry no longer holds (proctab_ident). Written lock-free by whoever
+ * frees a slot: an entry is cleared, filled, then given its pid (release),
+ * so a reader that matched a pid re-reads it after the uid. */
+#define PROCTAB_GRAVE 256
+struct ProcGrave {
+    u32 head;                          /* entries ever written */
+    struct { s32 pid; u32 ruid; } e[PROCTAB_GRAVE];
+};
+static struct ProcGrave *g_grave;
+#define PROCTAB_SIZE (sizeof(struct ProcEnt) * PROCTAB_MAX + sizeof(struct ProcGrave))
+
+static void tab_adopt(void *p) {
+    g_tab = p;
+    g_tab_n = PROCTAB_MAX;
+    g_grave = (struct ProcGrave *)(g_tab + PROCTAB_MAX);
+}
+
+static void grave_push(s32 pid, u32 ruid) {
+    if (!g_grave || pid <= 0) return;
+    u32 i = __atomic_fetch_add(&g_grave->head, 1, __ATOMIC_RELAXED) % PROCTAB_GRAVE;
+    __atomic_store_n(&g_grave->e[i].pid, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_grave->e[i].ruid, ruid, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_grave->e[i].pid, pid, __ATOMIC_RELEASE);
+}
+
+/* This process's real uid as the guest knows it: what it publishes. */
+static u32 own_ruid(void) {
+    return g_machine.fake_id ? __atomic_load_n(&g_machine.cred.ruid, __ATOMIC_RELAXED)
+                             : (u32)getuid();
+}
 
 /* starttime (field 22 of a /proc stat file): the token after the last ')' skips
  * the comm (which may contain spaces/parens), then starttime is the 20th
@@ -282,8 +330,9 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * kernel's ceiling, where v6 held 256 bytes of their text; v8 the owner's
      * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
      * the state word; v11 the owner's locked memory, VmLck; v12 an exited
-     * owner's slot, kept until it is reaped.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v12.%u.%08x",
+     * owner's slot, kept until it is reaped; v13 the owner's real uid, and
+     * the reaped ones past the slots.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v13.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -311,8 +360,7 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) return 0;
-    g_tab = p;
-    g_tab_n = PROCTAB_MAX;
+    tab_adopt(p);
     return 1;
 }
 
@@ -350,9 +398,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v12.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v13.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v12.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v13.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2520,8 +2568,7 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
                                MAP_SHARED, memfd, 0);
                 broker_fd_close(memfd);   /* broker_recv registered it */
                 if (p != MAP_FAILED) {
-                    g_tab = p;
-                    g_tab_n = PROCTAB_MAX;
+                    tab_adopt(p);
                     return 1;
                 }
                 return 0;                 /* mmap failed: don't spin */
@@ -2545,7 +2592,7 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
 }
 
 void proctab_init(const char *rootfs_key) {
-    size_t size = sizeof(struct ProcEnt) * PROCTAB_MAX;
+    size_t size = PROCTAB_SIZE;
     if (rootfs_key) {
         /* A64_PROCTAB_FORCE_FILE skips the diskless broker for the named-file
          * tier below -- what a host with neither memfd_create nor abstract
@@ -2559,8 +2606,7 @@ void proctab_init(const char *rootfs_key) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { g_tab = NULL; g_tab_n = 0; return; }   /* degrade off */
-    g_tab = p;
-    g_tab_n = PROCTAB_MAX;
+    tab_adopt(p);
 }
 
 /* Our own slot, when we know it: set when we register ourselves, adopted from
@@ -2603,10 +2649,16 @@ int proctab_reserve(void) {
             (expect < 0 || !__atomic_load_n(&g_tab[i].exited, __ATOMIC_ACQUIRE) ||
              proc_starttime(expect) != 0))
             continue;
+        u32 was = __atomic_load_n(&g_tab[i].ruid, __ATOMIC_ACQUIRE);
         if (!__atomic_compare_exchange_n(&g_tab[i].pid, &expect, PT_RESERVED,
                                          false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
+        if (expect) grave_push(expect, was);   /* reaped unseen: remembered */
         struct ProcEnt *e = &g_tab[i];
+        /* The child's ids are ours at the fork; the child itself says when
+         * it runs (proctab_slot_adopt). */
+        __atomic_store_n(&e->ruid, own_ruid(), __ATOMIC_RELEASE);
+        __atomic_store_n(&e->kid, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&e->exited, 0, __ATOMIC_RELAXED);
         /* A previous owner SIGKILL'd mid-write may have left the seqlock odd,
          * which would invert its parity for the whole life of the new entry. */
@@ -2635,8 +2687,16 @@ void proctab_release(int slot) {
                                 __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 
-/* In the fork child: the slot our parent reserved for us is ours. */
-void proctab_slot_adopt(int slot) { g_own_slot = slot; g_mem_ent = NULL; }
+/* In the fork child: the slot our parent reserved for us is ours -- and,
+ * before we run a guest instruction, it names us, for the signals we send
+ * before our parent has published it (proctab_ident). */
+void proctab_slot_adopt(int slot) {
+    g_own_slot = slot;
+    g_mem_ent = NULL;
+    if (g_tab && slot >= 0 && slot < g_tab_n &&
+        __atomic_load_n(&g_tab[slot].pid, __ATOMIC_ACQUIRE) == PT_RESERVED)
+        __atomic_store_n(&g_tab[slot].kid, (s32)getpid(), __ATOMIC_RELEASE);
+}
 
 /* Register/refresh this process's entry: use the slot reserved for it, reuse
  * its own (execve), or CAS-claim a free one. `start` is sampled before the
@@ -2653,6 +2713,13 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     if (exe_len > PROCTAB_PATH) exe_len = PROCTAB_PATH;
     u32 cwd_len = cwd ? (u32)strlen(cwd) : 0;
     if (cwd_len > PROCTAB_PATH) cwd_len = PROCTAB_PATH;
+    /* Our child's, by its reservation, which the child has already built and
+     * published itself -- an execve quick enough to beat us here: its entry
+     * is newer than the fork-time one we were about to write over it, the
+     * command line it runs and the ids it may have changed first. */
+    if (rsv >= 0 && rsv < g_tab_n && pid != (s32)getpid() &&
+        __atomic_load_n(&g_tab[rsv].pid, __ATOMIC_ACQUIRE) == pid)
+        return;
     u64 start = proc_starttime(pid);
     int slot = -1, claimed = 0, reserved = 0;
     /* The slot reserved for this pid before it was forked, if there is one:
@@ -2697,8 +2764,10 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
             s32 dead = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
             if (dead == 0 || dead == PT_RESERVED) continue;
             if (proc_starttime(dead < 0 ? -dead : dead) != 0) continue;
+            u32 was = __atomic_load_n(&g_tab[i].ruid, __ATOMIC_ACQUIRE);
             if (__atomic_compare_exchange_n(&g_tab[i].pid, &dead, -pid, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                grave_push(dead, was);
                 slot = i; claimed = 1; break;
             }
         }
@@ -2719,6 +2788,13 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
      * slot left by a dead process (a missed unregister, then PID reuse) is as
      * fresh as one just claimed. So is the siginfo inbox, which an execve
      * keeps, as the kernel keeps what is pending across one. */
+    /* Whose signals it sends: ours, registering ourselves; registering a
+     * child, the ids it forked with -- which a reservation already holds,
+     * and which the child may have changed since it began to run. */
+    if (pid == (s32)getpid() || !reserved) {
+        __atomic_store_n(&e->ruid, own_ruid(), __ATOMIC_RELEASE);
+        __atomic_store_n(&e->kid, 0, __ATOMIC_RELEASE);
+    }
     if (claimed || (!reserved && e->start != start)) {
         carry_clear(e);
         __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
@@ -2843,10 +2919,50 @@ void proctab_reaped(s32 pid) {
     if (!g_tab || pid <= 0) return;
     for (int i = 0; i < g_tab_n; i++) {
         s32 p = pid;
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) != pid) continue;
+        u32 was = __atomic_load_n(&g_tab[i].ruid, __ATOMIC_ACQUIRE);
         if (__atomic_compare_exchange_n(&g_tab[i].pid, &p, 0, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            grave_push(pid, was);   /* what its signals still in flight name */
             return;
+        }
     }
+}
+
+/* Is `pid` a guest process, as the siginfo of a signal it sent or the
+ * notice of its death names it -- one running, a zombie, a fork child its
+ * parent has yet to publish, or one reaped lately -- and its real uid as the
+ * guest knows it (*ruid)? A kernel fills both in when the signal is sent:
+ * si_pid as the receiver's pid namespace numbers the sender, 0 for one
+ * outside it, and si_uid its real uid. The host filled them in as the host
+ * knows them -- a pid outside the guest's namespace, and the uid the
+ * emulator runs as rather than the fake one the sender had. Memory alone,
+ * no lock and no system call: the capture handler asks. A slot is taken as
+ * it stands, with no look at the host (slot_current): a stale one is a
+ * process gone without a word whose number the host has handed to one of
+ * its own, which then signals the guest -- and the registry clears such a
+ * slot as soon as a guest process takes the number (proctab_register_at). */
+int proctab_ident(s32 pid, u32 *ruid) {
+    if (!g_tab || pid <= 0) return 0;
+    for (int i = 0; i < g_tab_n; i++) {
+        s32 p = __atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE);
+        if (p == pid ||
+            (p == PT_RESERVED && __atomic_load_n(&g_tab[i].kid, __ATOMIC_ACQUIRE) == pid)) {
+            *ruid = __atomic_load_n(&g_tab[i].ruid, __ATOMIC_ACQUIRE);
+            return 1;
+        }
+    }
+    if (!g_grave) return 0;
+    u32 h = __atomic_load_n(&g_grave->head, __ATOMIC_ACQUIRE);
+    for (u32 n = 0; n < PROCTAB_GRAVE; n++) {   /* newest first */
+        u32 i = (h - 1 - n) % PROCTAB_GRAVE;
+        if (__atomic_load_n(&g_grave->e[i].pid, __ATOMIC_ACQUIRE) != pid) continue;
+        u32 r = __atomic_load_n(&g_grave->e[i].ruid, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_grave->e[i].pid, __ATOMIC_ACQUIRE) != pid) continue;
+        *ruid = r;
+        return 1;
+    }
+    return 0;
 }
 
 static int slot_current(struct ProcEnt *e, s32 pid);
@@ -3138,6 +3254,12 @@ static struct ProcEnt *own_entry(void) {
         if (cur == me || cur == PT_RESERVED) return &g_tab[g_own_slot];
     }
     return entry_of(me);
+}
+
+/* A setuid, setreuid or setresuid moved our real uid (sys_proc.c). */
+void proctab_ruid_set(u32 ruid) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (e) __atomic_store_n(&e->ruid, ruid, __ATOMIC_RELEASE);
 }
 
 /* Our own entry via own_entry (it may still be a reservation), anyone else's by

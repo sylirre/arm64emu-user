@@ -885,6 +885,81 @@ int sig_thread_uncode(int *code) {
     return 1;
 }
 
+/* ...and the mark of the rest of a guest's queued siginfos -- rt_sigqueueinfo
+ * and pidfd_send_signal's, aimed at the process -- in a span of its own: the
+ * siginfo a guest queues is the guest's to fill, and goes to the receiver as
+ * the sender wrote it, si_pid and si_uid included, where one a process outside
+ * the guest queued has them in the host's terms (sig_ident). The thread mark
+ * says it as well. Not on a host that cannot carry it, as above: there a
+ * guest's queued siginfo goes through the receiver's inbox instead
+ * (sig_carry_send, SIG_CARRY_QUEUED), which only a guest posts to, and one
+ * that found no room there is told by whom it names (sig_ident). */
+#define SIG_ORG_BIAS 0x7ffffe00
+
+int sig_origin_code(int code) {
+    if (!g_sig_sicode_ok) return code;
+    return (code < 0 && code >= -SIG_THR_SPAN) ? code - SIG_ORG_BIAS : code;
+}
+
+int sig_queue_uncode(int *code, int *thr) {
+    *thr = sig_thread_uncode(code);
+    if (*thr) return 1;
+    if (*code > -(SIG_ORG_BIAS + 1) || *code < -(SIG_ORG_BIAS + SIG_THR_SPAN))
+        return 0;
+    *code += SIG_ORG_BIAS;
+    return 1;
+}
+
+/* ---- whose a signal is -----------------------------------------------------
+ *
+ * A kernel fills in si_pid and si_uid of the signals it sends (kill, tkill, a
+ * child's notice, a message queue's) as the receiver sees the sender: its pid
+ * in the receiver's pid namespace -- 0 for one outside it -- and its real uid
+ * mapped into the receiver's user namespace (send_signal_locked). The host
+ * filled them in as the host sees it: the pid of a process the guest cannot
+ * see, and the uid the emulator runs as, never the fake one the sender had
+ * under --fake-id, nor the one a setuid moved it to. So they are filled in
+ * again here, from the registry (proctab_ident): a guest sender's pid as it
+ * is, with its real uid; anyone else 0, with the host uid seen as the guest
+ * sees file owners (remap_uid). A child's notice names our own child, which
+ * is always the guest's, whatever the registry still knows of it. A siginfo
+ * someone queued says what its sender wrote, and a guest's goes as written
+ * (`own`: it bore the mark); one from outside the guest has a kernel's
+ * treatment, its pid 0 and its uid mapped -- and where the mark could not be
+ * carried, a queued siginfo naming a guest process is taken for a guest's.
+ * The layouts with no pid or uid in them are left alone: a fault's, a
+ * timer's, a poll's, SI_KERNEL's. Async-signal-safe: the capture handler and
+ * a signalfd read both ask. */
+static u32 sig_own_ruid(void) {
+    return g_machine.fake_id ? __atomic_load_n(&g_machine.cred.ruid, __ATOMIC_RELAXED)
+                             : (u32)getuid();
+}
+
+u32 sig_ruid_of(s32 pid) {
+    u32 r;
+    if (pid == (s32)getpid() || !proctab_ident(pid, &r)) return sig_own_ruid();
+    return r;
+}
+
+void sig_ident(int sig, int code, int own, s32 *pid, u32 *uid) {
+    int chld = sig == SIGCHLD && code >= CLD_EXITED && code <= CLD_CONTINUED;
+    if (own || code == SI_KERNEL || code == SI_TIMER || code == SI_SIGIO ||
+        (code > 0 && !chld))
+        return;
+    u32 r = 0;
+    int guest = *pid == (s32)getpid() ? (r = sig_own_ruid(), 1)
+                                       : proctab_ident(*pid, &r);
+    if (!guest && chld) { guest = 1; r = sig_own_ruid(); }
+    if (!guest) {
+        *pid = 0;
+        if (g_machine.fake_id) *uid = remap_uid(&g_machine, *uid);
+        return;
+    }
+    if (g_machine.fake_id && (chld || code == SI_USER || code == SI_TKILL ||
+                              code == SI_MESGQ))
+        *uid = r;
+}
+
 /* ---- the siginfo carrier ------------------------------------------------
  *
  * What the known-layout host (sig_probe_host) cannot carry from one process
@@ -947,20 +1022,23 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
 
 /* Send guest signal `gsig`, on host number `hs`, to `tgid` -- through `pidfd`
  * if it is one (>= 0), or to its thread `tid` when nonzero -- with the siginfo
- * the other arguments say, through the receiver's inbox (`jc`: as a
- * job-control carrier, sig_send_jc). Only when the host would not carry it as
- * it is: on the known-layout tier, anything but a plain SI_QUEUE with no
- * si_errno and a value the host's sigval holds, to the process; on every
- * tier, a value the host's sigval does not hold -- an ILP32 host's is 4
- * bytes, the guest's 8, and a real 32-bit device, whose kernel carries
- * everything else, would hand on the low half alone. 1 when it went that way
- * (*ret the send's 0 or -errno), 0 when the caller is to send what the host
- * can carry. */
+ * the other arguments say, through the receiver's inbox (`jc`: SIG_CARRY_JC,
+ * as a job-control carrier, sig_send_jc). Only when the host would not carry
+ * it as it is: on the known-layout tier, anything but a plain SI_QUEUE with
+ * no si_errno and a value the host's sigval holds, to the process -- and a
+ * guest's queued siginfo (SIG_CARRY_QUEUED) even then, since what the host
+ * would hand on could not say a guest wrote it (sig_origin_code), whose pid
+ * and uid are then not the host's to translate (sig_ident); on every tier, a
+ * value the host's sigval does not hold -- an ILP32 host's is 4 bytes, the
+ * guest's 8, and a real 32-bit device, whose kernel carries everything else,
+ * would hand on the low half alone. 1 when it went that way (*ret the send's
+ * 0 or -errno), 0 when the caller is to send what the host can carry. */
 int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
                    int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret) {
     if (hs <= 0) return 0;   /* a null signal carries nothing */
     if ((u64)(uintptr_t)value == value &&
-        (g_sig_sicode_ok || (!jc && !tid && code == SI_QUEUE && !err)))
+        (g_sig_sicode_ok ||
+         (jc == SIG_CARRY_PLAIN && !tid && code == SI_QUEUE && !err)))
         return 0;
     SigCarry c;
     memset(&c, 0, sizeof c);
@@ -972,7 +1050,7 @@ int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
     c.err = err;
     c.pid = pid;
     c.uid = uid;
-    c.jc = jc;
+    c.jc = jc == SIG_CARRY_JC;
     u32 slot, nonce;
     if (proctab_carry_post(tgid, &c, &slot, &nonce) < 0) return 0;
     u32 tok = SIG_CARRY_TAG << 24 | nonce << 6 | slot;
@@ -1072,7 +1150,7 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
     if (code > 0) code = 0;
     s64 cr;
     if ((err || value || code < -SIG_JC_SPAN) &&
-        sig_carry_send(tgid, tid, pidfd, PTRACE_KICKSIG, sig, 1, code, err, pid, uid,
+        sig_carry_send(tgid, tid, pidfd, PTRACE_KICKSIG, sig, SIG_CARRY_JC, code, err, pid, uid,
                        value, &cr))
         return cr;
     if (code < -SIG_JC_SPAN) code = -SIG_JC_SPAN;   /* no sender uses one */
@@ -1376,10 +1454,13 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     p->gen = 0;
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
-    int thr = sig_thread_uncode(&p->code);
+    int thr, own = sig_queue_uncode(&p->code, &thr);
     p->err = si->si_errno;
-    p->pid = (int)si->si_pid;
-    p->uid = (int)si->si_uid;
+    s32 spid = (s32)si->si_pid;
+    u32 suid = (u32)si->si_uid;
+    sig_ident(p->signo, p->code, own, &spid, &suid);
+    p->pid = (int)spid;
+    p->uid = (int)suid;
     p->status = si->si_status;
     /* A child's CPU time, where the layout has it: every kernel-raised
      * siginfo that is neither a fault's nor a seccomp trap's (siginfo_to_guest
@@ -2066,7 +2147,7 @@ static int rq_put(const PendSig *p) {
         if (p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
         s64 cr;
         if (p->code != SI_TIMER &&
-            sig_carry_send(rq_pid, 0, -1, hs, p->signo, 0, p->code, p->err, p->pid,
+            sig_carry_send(rq_pid, 0, -1, hs, p->signo, SIG_CARRY_PLAIN, p->code, p->err, p->pid,
                            (u32)p->uid, (u64)p->value, &cr))
             return (int)cr;
         siginfo_t si;

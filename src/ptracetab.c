@@ -515,7 +515,7 @@ static void pt_si_notify(u8 *si, int signr, int code) {
     pt_w32(si, 0, (u32)signr);
     pt_w32(si, 8, (u32)code);
     pt_w32(si, 16, (u32)g_tls.tid);
-    pt_w32(si, 20, (u32)getuid());
+    pt_w32(si, 20, sig_ruid_of((s32)getpid()));   /* our real uid, as the guest's */
 }
 
 /* A signal of the tracee's own that no queue carried (pt_signal_stop): the
@@ -529,7 +529,7 @@ static void pt_si_signal(u8 *si, int sig, int code, s32 pid, u64 addr) {
         memcpy(si + 16, &addr, 8);
     } else {
         pt_w32(si, 16, (u32)pid);
-        pt_w32(si, 20, pid ? (u32)getuid() : 0);
+        pt_w32(si, 20, pid ? sig_ruid_of(pid) : 0);   /* the sender's real uid */
     }
 }
 
@@ -803,7 +803,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
             pt_w32(si, 0, (u32)ns);
             pt_w32(si, 8, (u32)SI_USER);
             pt_w32(si, 16, (u32)tracer_task);   /* task_pid_vnr(parent) */
-            pt_w32(si, 20, (u32)getuid());
+            pt_w32(si, 20, sig_ruid_of(tracer));   /* task_uid(parent) */
         }
     }
     return ns;

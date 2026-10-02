@@ -690,6 +690,19 @@ int  sig_guest_nr(int host_sig);
  * it was one (signal.c, SIG_THR_BIAS). */
 int  sig_thread_code(int code);
 int  sig_thread_uncode(int *code);
+/* The same for the rest of a guest's queued siginfos (rt_sigqueueinfo and
+ * pidfd_send_signal's, to the process): the mark that says a guest wrote it;
+ * and back -- 1 when the code bore either mark, *thr which. */
+int  sig_origin_code(int code);
+int  sig_queue_uncode(int *code, int *thr);
+/* A host siginfo's si_pid and si_uid as the guest's kernel would have filled
+ * them in: a guest sender's pid with its real uid as the guest knows it, 0
+ * and the mapped host uid for anyone else (`own`: the code bore a guest's
+ * mark, and both are as its sender wrote them). Async-signal-safe. */
+void sig_ident(int sig, int code, int own, s32 *pid, u32 *uid);
+/* The real uid, as the guest knows it, of guest process `pid` -- this one's
+ * own where the registry has nothing to say. */
+u32  sig_ruid_of(s32 pid);
 /* The exit signal a child of this process was cloned with, if it is one of
  * its clone children (exit signal other than SIGCHLD; 0 = none), else -1 --
  * what its death is reported to us with instead of the host's SIGCHLD.
@@ -756,7 +769,10 @@ s64  sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 u
  * (signal.c, "the siginfo carrier"): send guest signal `gsig` on host number
  * `hs` with that siginfo through the receiver's registry inbox, when the host
  * would lose some of it. 1 = sent that way (*ret 0 or -errno), 0 = the caller
- * sends it itself. */
+ * sends it itself. `jc` says what it is: */
+#define SIG_CARRY_PLAIN  0   /* the emulator's own */
+#define SIG_CARRY_JC     1   /* a job-control carrier (sig_send_jc) */
+#define SIG_CARRY_QUEUED 2   /* a guest's queued siginfo, as the guest wrote it */
 int  sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
                     int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret);
 /* Does /proc's SigPnd/ShdPnd name host signal `hs` at its own bit? Measured
@@ -1329,6 +1345,11 @@ void proctab_release(int slot);     /* the fork failed */
 void proctab_slot_adopt(int slot);  /* in the child: that slot is now ours */
 void proctab_unregister(s32 pid);   /* exit: the slot stays, a zombie's (proctab.c) */
 void proctab_reaped(s32 pid);       /* its reaper's wait: the slot goes */
+/* Is `pid` a guest process as a siginfo names one -- running, a zombie, a
+ * fork child not yet published, or one reaped lately -- and its real uid as
+ * the guest knows it? Async-signal-safe (proctab.c). */
+int  proctab_ident(s32 pid, u32 *ruid);
+void proctab_ruid_set(u32 ruid);     /* our real uid moved (setuid & co.) */
 /* Is `pid` a guest process that has exited and not been reaped -- one that
  * unregistered, or one killed outright, whose host task is a zombie? A
  * member of the registry all the same (proctab_has) -- kill(2), getpgid(2),

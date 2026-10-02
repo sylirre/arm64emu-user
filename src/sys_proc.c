@@ -3638,16 +3638,23 @@ SYSDEF(wait4) {
     }
 }
 
-/* Fill a 128-byte guest siginfo (LP64 _sigchld layout) from a host siginfo. */
+/* Fill a 128-byte guest siginfo (LP64 _sigchld layout) from a host siginfo.
+ * Its si_uid is the child's real uid as the guest knows it (wait_task_zombie
+ * and the rest report task_uid): under --fake-id the host's is the uid the
+ * emulator runs as, never the child's fake one; and a siginfo made up here
+ * (a tracee's stop or death the host knows nothing of) has none at all. The
+ * child is reaped by now, which the registry remembers (proctab_ident). */
 static int waitid_out(CPU *c, u64 infop, const siginfo_t *si) {
     if (!infop) return 0;
     u8 gsi[128];
     memset(gsi, 0, sizeof gsi);
     s32 *w = (s32 *)gsi;
+    u32 uid = (u32)si->si_uid;
+    if (si->si_pid && (c->m->fake_id || !uid)) uid = sig_ruid_of((s32)si->si_pid);
     w[0] = si->si_signo;                 /* si_signo @0 */
     w[2] = si->si_code;                  /* si_code   @8 */
     w[4] = (s32)si->si_pid;              /* si_pid    @16 */
-    w[5] = (s32)si->si_uid;              /* si_uid    @20 */
+    w[5] = (s32)uid;                     /* si_uid    @20 */
     w[6] = si->si_status;                /* si_status @24 */
     return copy_to_guest(c, infop, gsi, sizeof gsi) < 0 ? -EFAULT : 0;
 }
@@ -4192,14 +4199,15 @@ SYSDEF(setgroups) {
 SYSDEF(umask) { (void)c;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)umask((mode_t)a0); }
 
 /* The setters: decide against a copy, write the copy back, all under the
- * lock. `r` is what the guest is told. */
+ * lock. `r` is what the guest is told. The real uid is published as well:
+ * it is what the signals this process sends name (proctab_ident). */
 #define CRED_UPDATE(m, body) \
     do { \
         task_lock(); \
         Cred nc = (m)->cred; \
         s64 r = 0; \
         { body } \
-        if (r == 0) (m)->cred = nc; \
+        if (r == 0) { (m)->cred = nc; proctab_ruid_set(nc.ruid); } \
         task_unlock(); \
         return (u64)r; \
     } while (0)
