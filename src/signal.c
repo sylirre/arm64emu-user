@@ -401,10 +401,14 @@ void sig_tls_release(void) { sigq_reset(); }
  * next unblock. Also lifts anything the gate had blocked host-side, since the
  * child holds nothing back for the kernel. */
 static void rq_fork_child(void);
+static u32 cw_on, cw_tok;   /* (the SIGCHLD watcher's, below) */
 
 void sig_fork_child(void) {
     sigq_reset();
     rq_fork_child();
+    /* No watcher came across (no thread does), and nothing of its is ours. */
+    __atomic_store_n(&cw_on, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&cw_tok, 0, __ATOMIC_RELAXED);
     /* The kick timer is the forking thread's and did not come across (no
      * POSIX timer does): this thread, the child's only one, makes its own
      * (the inherited handle is not deleted -- it is not ours to delete). */
@@ -854,6 +858,11 @@ void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, 
  * loads): host_catcher runs it, and so does a sigtimedwait that dequeued
  * from the kernel. */
 static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
+static pid_t rq_pid;   /* (rq_tab's, below) */
+static int rq_put(const PendSig *p);
+static int rq_put_quick(const PendSig *p);
+static void cw_taken(void);
+static int rq_stale(const siginfo_t *si);
 
 /* What the host can carry of a siginfo and do with SIGCHLD's flags, as
  * measured once at startup (sig_probe_host). 1 on every kernel; qemu-user,
@@ -1800,6 +1809,94 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     jc_stamp(p);   /* as it is sent, as far as the guest can tell */
 }
 
+/* ---- what the host's SIGCHLD is to the guest ----------------------------
+ *
+ * The host sends SIGCHLD for every child of a guest process, and to the
+ * guest it is not always that: the death of a clone child is reported with
+ * the signal the child was cloned with, or with none (sys_proc.c, "clone
+ * children"), a stop or continue the emulator ran is never reported at all,
+ * and a parent that ignores SIGCHLD or set SA_NOCLDSTOP is spared notices the
+ * host may send it all the same. Every place a host SIGCHLD reaches the
+ * emulator asks here what it is: the capture handler, the SIGCHLD watcher
+ * below, rt_sigtimedwait, a signalfd read, and a thread handing its signals
+ * on. `p` is the host siginfo `si` as pendsig_from_host made it; 1 when it is
+ * a signal for the guest -- `p` itself, which may now be another signal than
+ * SIGCHLD -- 0 when it is none. What only a notice the host kernel made can
+ * be is asked only of one (si_code > 0): the emulator's own, the notices it
+ * sends and the signals handed back through rq_tab, were asked as they were
+ * made. Async-signal-safe (the capture's). */
+static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
+    if (p->signo != SIGCHLD) return 1;
+    /* One of ours handed back whose slot is gone (rq_claim found nothing):
+     * the watcher's, given up because another SIGCHLD took its turn
+     * (cw_taken). */
+    if (si->si_signo == SIGCHLD && p->code == SI_QUEUE && rq_stale(si)) return 0;
+    int raw = si->si_signo == SIGCHLD && si->si_code > 0;
+    /* The host's own notice of a guest child's stop or continue that the
+     * emulator made, which a kernel never sends (the real parent's view,
+     * above): of a process a tracer holds threads of, or of the stop a group
+     * stop is handed over as. */
+    if (raw && (si->si_code == CLD_STOPPED || si->si_code == CLD_CONTINUED)) {
+        s32 kid = (s32)si->si_pid;
+        u32 art = proctab_jc_art(kid);
+        int ours;
+        if (si->si_code == CLD_CONTINUED) {
+            ours = ptrace_tgid_traced(kid) || (art & JCA_CONT_CHLD);
+            if (ours && (art & JCA_CONT_CHLD)) proctab_jc_art_clear(kid, JCA_CONT_CHLD);
+        } else {
+            ours = ptrace_tgid_traced(kid) || (art & JCA_STOP_CHLD);
+            if (!ours && (art & (JCA_CONT_CHLD | JCA_CONT_WAIT)))
+                proctab_jc_art_clear(kid, JCA_CONT_CHLD | JCA_CONT_WAIT);
+        }
+        if (ours) return 0;
+    }
+    /* The death of a clone child -- one forked with an exit signal other than
+     * SIGCHLD (sys_proc.c) -- is reported with that signal, or with none; the
+     * host, whose child it is an ordinary fork of, said SIGCHLD. Once: the
+     * watcher may have sent it already, its host SIGCHLD having gone behind
+     * another, or a wait that reaped the child first (clonekid_tell). */
+    if (raw && (p->code == CLD_EXITED || p->code == CLD_KILLED || p->code == CLD_DUMPED)) {
+        int es = clonekid_exit_signal(p->pid);
+        if (es >= 0) {
+            if (es == 0 || es > 64) return 0;   /* dies with no signal at all */
+            if (!clonekid_tell(p->pid)) return 0;
+            p->signo = es;
+            return 1;
+        }
+        if (sig_chld_emulating()) {
+            /* An ordinary child the kernel would have reaped at its death
+             * (sig_chld_host): reaped now, and never waited for. Raw, and
+             * WNOHANG: a signal handler, and a wait may have beaten us. The
+             * kernel's own reaping folds nothing into RUSAGE_CHILDREN, where
+             * this reap folded the child in whole: charged back out, as the
+             * emulator's own children are (proctab.c). */
+            siginfo_t x;
+            KRusage kru;
+            memset(&x, 0, sizeof x);
+            if (syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, &kru) == 0 &&
+                x.si_pid == p->pid) {
+                proctab_helper_charge_k(&kru);
+                proctab_reaped(p->pid);
+            }
+        }
+    }
+    /* A stop or continue notice is never sent to a parent that set
+     * SA_NOCLDSTOP (do_notify_parent_cldstop): a host that ignores the flag
+     * sends it all the same, and it goes no further. */
+    if ((p->code == CLD_STOPPED || p->code == CLD_CONTINUED) && !g_sig_nocld_ok &&
+        (*(volatile u64 *)&g_machine.sigact[SIGCHLD].flags & G_SA_NOCLDSTOP))
+        return 0;
+    /* A child's notice (do_notify_parent and _cldstop) is never sent to a
+     * parent that ignores SIGCHLD: caught all the same when the host may not
+     * reap for it, it goes no further. A SIGCHLD someone sent is another
+     * matter -- delivered, and discarded there, as the kernel's would be. */
+    if (p->code >= CLD_EXITED && p->code <= CLD_CONTINUED &&
+        *(volatile u64 *)&g_machine.sigact[SIGCHLD].handler == GSIG_IGN)
+        return 0;
+    cw_taken();   /* a SIGCHLD the guest takes: the watcher's turn with it */
+    return 1;
+}
+
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     /* The host SIGCONT a tracer's attach woke a host-stopped tracee with
      * (ptrace_wake_stopped): the host's continue was the whole point, and a
@@ -1827,72 +1924,17 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     }
     PendSig ps, *p = &ps;
     pendsig_from_host(p, sig, si);
-    /* The host's own notice of a guest child's stop or continue that the
-     * emulator made, which a kernel never sends (the real parent's view,
-     * above): of a process a tracer holds threads of, or of the stop a group
-     * stop is handed over as. */
-    if (sig == SIGCHLD && (si->si_code == CLD_STOPPED || si->si_code == CLD_CONTINUED)) {
-        s32 kid = (s32)si->si_pid;
-        u32 art = proctab_jc_art(kid);
-        int ours;
-        if (si->si_code == CLD_CONTINUED) {
-            ours = ptrace_tgid_traced(kid) || (art & JCA_CONT_CHLD);
-            if (ours && (art & JCA_CONT_CHLD)) proctab_jc_art_clear(kid, JCA_CONT_CHLD);
-        } else {
-            ours = ptrace_tgid_traced(kid) || (art & JCA_STOP_CHLD);
-            if (!ours && (art & (JCA_CONT_CHLD | JCA_CONT_WAIT)))
-                proctab_jc_art_clear(kid, JCA_CONT_CHLD | JCA_CONT_WAIT);
-        }
-        if (ours) {
-            sig_selfintr();   /* never sent: it interrupted nothing */
-            return;
-        }
-    }
-    /* The death of a clone child -- one forked with an exit signal other than
-     * SIGCHLD (sys_proc.c) -- is reported with that signal, or with none; the
-     * host, whose child it is an ordinary fork of, said SIGCHLD. */
-    if (p->signo == SIGCHLD && (p->code == CLD_EXITED || p->code == CLD_KILLED ||
-                                p->code == CLD_DUMPED)) {
-        int es = clonekid_exit_signal(p->pid);
-        if (es >= 0) {
-            if (es == 0 || es > 64) {   /* dies with no signal at all */
-                sig_selfintr();     /* ...so it interrupted nothing */
-                return;
-            }
-            p->signo = es;
-        } else if (sig_chld_emulating()) {
-            /* An ordinary child the kernel would have reaped at its death
-             * (sig_chld_host): reaped now, and never waited for. Raw, and
-             * WNOHANG: a signal handler, and a wait may have beaten us. The
-             * kernel's own reaping folds nothing into RUSAGE_CHILDREN, where
-             * this reap folded the child in whole: charged back out, as the
-             * emulator's own children are (proctab.c). */
-            siginfo_t x;
-            KRusage kru;
-            memset(&x, 0, sizeof x);
-            if (syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, &kru) == 0 &&
-                x.si_pid == p->pid) {
-                proctab_helper_charge_k(&kru);
-                proctab_reaped(p->pid);
-            }
-        }
-    }
-    /* A stop or continue notice is never sent to a parent that set
-     * SA_NOCLDSTOP (do_notify_parent_cldstop): a host that ignores the flag
-     * sends it all the same, and it goes no further. */
-    if (p->signo == SIGCHLD && (p->code == CLD_STOPPED || p->code == CLD_CONTINUED) &&
-        !g_sig_nocld_ok &&
-        (*(volatile u64 *)&g_machine.sigact[SIGCHLD].flags & G_SA_NOCLDSTOP)) {
+    if (sig == SIGCHLD && !sig_chld_notice(p, si)) {
         sig_selfintr();   /* never sent: it interrupted nothing */
         return;
     }
-    /* A child's notice (do_notify_parent and _cldstop) is never sent to a
-     * parent that ignores SIGCHLD: caught all the same when the host may not
-     * reap for it, it goes no further. A SIGCHLD someone sent is another
-     * matter -- delivered, and discarded there, as the kernel's would be. */
-    if (p->signo == SIGCHLD && p->code >= CLD_EXITED && p->code <= CLD_CONTINUED &&
-        *(volatile u64 *)&g_machine.sigact[SIGCHLD].handler == GSIG_IGN) {
-        sig_selfintr();   /* never sent: it interrupted nothing */
+    /* A clone child's notice by a signal of its own that this thread blocks:
+     * the process's, as the kernel sends it -- routed to a thread that has
+     * it unblocked, or kept in the process's pending set, where a signalfd
+     * and a sigwait find it -- not this thread's ring. */
+    if (p->signo != SIGCHLD && sig == SIGCHLD &&
+        (g_tls.sigmask & (1ULL << (p->signo - 1))) && rq_put_quick(p) == 0) {
+        sig_selfintr();
         return;
     }
     sig_capture_push(p, uctx);
@@ -2432,11 +2474,16 @@ static int rq_claim(int sig, const siginfo_t *si, PendSig *out) {
     if (si->si_code != SI_QUEUE) return 0;
     RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
     if (!tab || si->si_pid != rq_pid) return 0;
-    uintptr_t v = (uintptr_t)si->si_value.sival_ptr;
+    u32 tok;
+    if (sig == SIGCHLD) {
+        tok = (u32)si->si_uid;   /* its value may not have come through (rq_queue) */
+    } else {
+        uintptr_t v = (uintptr_t)si->si_value.sival_ptr;
 #if UINTPTR_MAX > 0xffffffffu
-    if ((u32)((u64)v >> 32) != RQ_HI) return 0;
+        if ((u32)((u64)v >> 32) != RQ_HI) return 0;
 #endif
-    u32 tok = (u32)v;
+        tok = (u32)v;
+    }
     RqSlot *slot = &tab[tok & (RQ_SLOTS - 1)];
     if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 2 ||
         slot->nonce != tok >> RQ_IDX_BITS || slot->p.signo != sig_remap_to_guest(sig))
@@ -2447,7 +2494,23 @@ static int rq_claim(int sig, const siginfo_t *si, PendSig *out) {
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return 0;
     *out = p;
+    if (sig == SIGCHLD) cw_taken();   /* maybe the watcher's: it may take again */
     return 1;
+}
+
+/* ...or one of ours whose slot was given up since: a SIGCHLD's token (si_uid,
+ * rq_queue) naming a slot that last held that very nonce, and holds nothing
+ * now. A guest's own queued SIGCHLD -- its mark lost on a host that cannot
+ * carry it (sig_origin_code) -- names one only by a 1-in-2^20 accident: its
+ * uid's high bits would have to be the nonce, and a nonce is never 0.
+ * Async-signal-safe. */
+static int rq_stale(const siginfo_t *si) {
+    RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
+    if (!tab || si->si_code != SI_QUEUE || si->si_pid != rq_pid) return 0;
+    u32 tok = (u32)si->si_uid, nonce = tok >> RQ_IDX_BITS;
+    RqSlot *slot = &tab[tok & (RQ_SLOTS - 1)];
+    return nonce && nonce <= 0xfffffu && slot->nonce == nonce &&
+           __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 2;
 }
 
 /* The host's pending set for the process as a whole: /proc's ShdPnd, the one
@@ -2468,30 +2531,57 @@ static u64 host_shared_pending(void) {
     return v;
 }
 
-/* Hand one captured signal back to the process. Ordinary context, with the
- * calling thread's host signals blocked (a sibling may be doing the same).
- * 0 when the kernel has it -- or already had one: a standard signal pending
- * for the process is one instance however many are sent, so a second goes
- * nowhere -- or -errno when it could not be queued (a full table, the
- * kernel's RLIMIT_SIGPENDING). */
-static int rq_put(const PendSig *p) {
-    int hs = sig_send_host_nr(p->signo);
-    if (p->signo < 32 && (host_shared_pending() & (1ULL << (hs - 1)))) return 0;
+/* The table, made on first use: ordinary context (rq_put, and whoever is
+ * about to need rq_put_quick). */
+static RqSlot *rq_ensure(void) {
     RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
-    if (!tab) {
-        RqSlot *fresh = calloc(RQ_SLOTS, sizeof *fresh);
-        if (!fresh) return -ENOMEM;
-        u32 seed = 0;
-        if (syscall(SYS_getrandom, &seed, sizeof seed, 0) != (long)sizeof seed)
-            seed = (u32)time(NULL) ^ ((u32)getpid() << 12);
-        rq_seed = seed;
-        rq_pid = getpid();
-        RqSlot *expect = NULL;
-        if (__atomic_compare_exchange_n(&rq_tab, &expect, fresh, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            tab = fresh;
-        else { free(fresh); tab = expect; }   /* a sibling made it first */
+    if (tab) return tab;
+    RqSlot *fresh = calloc(RQ_SLOTS, sizeof *fresh);
+    if (!fresh) return NULL;
+    u32 seed = 0;
+    if (syscall(SYS_getrandom, &seed, sizeof seed, 0) != (long)sizeof seed)
+        seed = (u32)time(NULL) ^ ((u32)getpid() << 12);
+    rq_seed = seed;
+    rq_pid = getpid();
+    RqSlot *expect = NULL;
+    if (__atomic_compare_exchange_n(&rq_tab, &expect, fresh, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return fresh;
+    free(fresh);   /* a sibling made it first */
+    return expect;
+}
+
+/* What a hand-back takes for "one of that standard signal is pending for the
+ * process already": the process's set as /proc has it (RQ_SHARED), nothing
+ * (RQ_ANY: the caller knows there is none), or -- in a signal handler, where
+ * /proc cannot be read -- the thread's own view of it, its own pending set
+ * and the process's (RQ_QUICK), which also never makes the table. */
+enum { RQ_SHARED, RQ_ANY, RQ_QUICK };
+
+/* Hand one signal back to the process as host signal `hs`, under a token for
+ * its slot: in si_value, and for a SIGCHLD in si_uid too -- a host that lays
+ * a siginfo out by its signal's number (qemu-user) takes a SIGCHLD's value
+ * for a child's status and translates its low bits as a signal number, and
+ * passes pid and uid through. `*tok_out`, when given, gets the token (0 for
+ * one sent without). 0 when the kernel has it -- or already had one: a
+ * standard signal pending for the process is one instance however many are
+ * sent, so a second goes nowhere -- or -errno when it could not be queued (a
+ * full table, the kernel's RLIMIT_SIGPENDING). */
+static int rq_queue(const PendSig *p, int hs, int how, u32 *tok_out) {
+    if (tok_out) __atomic_store_n(tok_out, 0, __ATOMIC_RELEASE);
+    if (p->signo < 32 && how != RQ_ANY) {
+        u64 pend = 0;
+        if (how == RQ_QUICK) {
+#ifdef SYS_rt_sigpending
+            if (syscall(SYS_rt_sigpending, &pend, (size_t)8) != 0) pend = 0;
+#endif
+        } else {
+            pend = host_shared_pending();
+        }
+        if (pend & (1ULL << (hs - 1))) return 0;
     }
+    RqSlot *tab = how == RQ_QUICK ? __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE) : rq_ensure();
+    if (!tab) return how == RQ_QUICK ? -EAGAIN : -ENOMEM;
     u32 start = __atomic_fetch_add(&rq_hint, 1, __ATOMIC_RELAXED), idx = 0;
     RqSlot *slot = NULL;
     for (u32 i = 0; i < RQ_SLOTS && !slot; i++) {
@@ -2506,7 +2596,7 @@ static int rq_put(const PendSig *p) {
          * payload and all (a timer's through its slot, as the timer itself
          * sends it; one the host would not carry whole, through our own
          * inbox); anything else has no way back. */
-        if (p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
+        if (how == RQ_QUICK || p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
         s64 cr;
         int poll = p->poll;
         if (p->code != SI_TIMER && !poll &&
@@ -2547,18 +2637,254 @@ static int rq_put(const PendSig *p) {
     si.si_signo = hs;
     si.si_code = SI_QUEUE;
     si.si_pid = rq_pid;
-    si.si_uid = getuid();
+    si.si_uid = hs == SIGCHLD ? (uid_t)tok : getuid();
 #if UINTPTR_MAX > 0xffffffffu
     si.si_value.sival_ptr = (void *)(uintptr_t)(((u64)RQ_HI << 32) | tok);
 #else
     si.si_value.sival_int = (int)tok;
 #endif
+    /* Before it is sent: a thread can take it the moment it is. */
+    if (tok_out) __atomic_store_n(tok_out, tok, __ATOMIC_RELEASE);
     if (syscall(SYS_rt_sigqueueinfo, rq_pid, hs, &si) != 0) {
         int e = errno;
         __atomic_store_n(&slot->state, 0, __ATOMIC_RELEASE);
+        if (tok_out) __atomic_store_n(tok_out, 0, __ATOMIC_RELEASE);
         return -e;
     }
     return 0;
+}
+
+/* Hand one captured signal back to the process. Ordinary context, with the
+ * calling thread's host signals blocked (a sibling may be doing the same). */
+static int rq_put(const PendSig *p) {
+    return rq_queue(p, sig_send_host_nr(p->signo), RQ_SHARED, NULL);
+}
+
+/* ...from a signal handler: only once the table has been made (rq_ensure,
+ * which whoever expects one makes in ordinary context), and -EAGAIN when it
+ * has not, or is full -- the caller then keeps the signal in its ring. */
+static int rq_put_quick(const PendSig *p) {
+    return rq_queue(p, sig_send_host_nr(p->signo), RQ_QUICK, NULL);
+}
+
+/* Wait up to `ms` for futex word `w` to move off `val` (this process's). A
+ * 32-bit host's plain SYS_futex takes its timeout as a pair of 32-bit words,
+ * which a timespec with a 64-bit tv_sec (-D_TIME_BITS=64) is not. */
+static void host_futex_wait(u32 *w, u32 val, int ms) {
+#if defined(SYS_futex_time64) && __SIZEOF_LONG__ == 4
+    struct { s64 tv_sec, tv_nsec; } ts = { ms / 1000, (s64)(ms % 1000) * 1000000 };
+    if (syscall(SYS_futex_time64, w, FUTEX_WAIT_PRIVATE, val, &ts, NULL, 0) < 0 &&
+        errno == ENOSYS) {
+        struct { s32 tv_sec, tv_nsec; } t32 = { ms / 1000, (ms % 1000) * 1000000 };
+        syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, val, &t32, NULL, 0);
+    }
+#else
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, val, &ts, NULL, 0);
+#endif
+}
+
+/* ---- the SIGCHLD watcher ------------------------------------------------
+ *
+ * sig_chld_notice decides what a host SIGCHLD is to the guest, but only
+ * where it is taken, and a guest that blocks SIGCHLD takes none: the host
+ * holds it pending. That is right for a SIGCHLD that is the guest's, and wrong
+ * for one that is not -- a clone child's death, whose notice is its own
+ * signal or nothing (sys_proc.c, "clone children"). It sat in the pending set
+ * as SIGCHLD, where sigpending showed it and a sigwait or a signalfd for
+ * SIGCHLD took it, while the signal it stood for never came: a parent waiting
+ * for a clone child's SIGUSR2 with SIGCHLD blocked waited forever. And a
+ * standard signal pending is one instance however many are sent: every
+ * SIGCHLD after it -- an ordinary child's death included -- was lost behind
+ * one that was never the guest's to have.
+ *
+ * So while this process has a clone child (clonekids_any: forked and not yet
+ * reaped), one host thread of the emulator's own takes the host's SIGCHLDs
+ * that no thread of the guest's does: blocking every signal, it waits for
+ * SIGCHLD in rt_sigtimedwait, which the kernel hands one to whenever no thread
+ * with it unblocked is there to take it (the forking thread is asked first,
+ * complete_signal). What it takes it asks sig_chld_notice about, and hands
+ * on through rq_tab: a clone child's own signal to the process, which the
+ * kernel then routes or holds pending as it does any signal, and a SIGCHLD
+ * that is the guest's -- under its own token in si_uid, see rq_queue -- back
+ * to the process's pending set, where sigpending, a sigwait, a signalfd and
+ * the next thread to unblock it find it, exactly as the kernel had kept it.
+ *
+ * While that SIGCHLD is pending it may not take again -- it would only take
+ * its own one back -- so it waits for it to be taken (cw_tok, cw_taken), and
+ * what the host's SIGCHLDs say meanwhile goes behind it, as the kernel's
+ * coalescing has it go: the watcher looks at the clone children itself, every
+ * 10 ms, and sends the notice of each one found dead (clonekids_tell_dead).
+ * A SIGCHLD of the host's that came between its take and its hand-back takes
+ * the hand-back's place in the pending set -- the kernel drops the second of
+ * a standard signal -- and whatever takes that one takes the hand-back's turn
+ * with it (cw_taken); one that was not the guest's leaves the hand-back
+ * nowhere, and the watcher finds the process's set empty and sends it again.
+ *
+ * The thread blocks every signal, takes no emulator lock but thr_lock to join
+ * the foreign-task set (it is no guest thread, and shown as none), holds no
+ * descriptor but /proc's for a moment, and ends once no clone child is left
+ * and nothing it handed back is waiting. */
+static int host_take_pending(u64 set, siginfo_t *si);
+static long host_sigtimedwait(u64 set, siginfo_t *si, s64 ns);
+static u32 cw_on;    /* the watcher runs: 0 -> 1 by whoever starts it */
+static u32 cw_tok;   /* the token of the SIGCHLD it handed back, while that is
+                      * waiting to be taken: 0 none; a futex */
+
+/* A SIGCHLD reached the guest: the one the watcher handed back, or one that
+ * took its place. Either way the watcher's is pending no longer, or it is a
+ * second instance a kernel would never have queued: its slot is given up
+ * (a later take of the token finds it stale, sig_chld_notice) and the
+ * watcher may take again. Async-signal-safe. */
+static void cw_taken(void) {
+    u32 tok = __atomic_exchange_n(&cw_tok, 0, __ATOMIC_ACQ_REL);
+    if (!tok) return;
+    RqSlot *tab = __atomic_load_n(&rq_tab, __ATOMIC_ACQUIRE);
+    if (tab) {
+        RqSlot *sl = &tab[tok & (RQ_SLOTS - 1)];
+        int queued = 2;
+        if (sl->nonce == tok >> RQ_IDX_BITS)
+            __atomic_compare_exchange_n(&sl->state, &queued, 0, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    syscall(SYS_futex, &cw_tok, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+static int cw_due(void) { return clonekids_any(); }
+
+/* One signal for the guest, as the watcher hands it on: a SIGCHLD with its
+ * token in cw_tok from before it is sent (rq_queue). */
+static void cw_deliver(PendSig *p) {
+    if (p->signo != SIGCHLD) {
+        rq_put(p);
+        return;
+    }
+    rq_queue(p, SIGCHLD, RQ_ANY, &cw_tok);
+}
+
+/* The hand-back is still waiting to be taken -- or was taken (by a thread
+ * quicker than cw_tok, even), or, its slot unclaimed and the process's
+ * pending set without a SIGCHLD, was dropped as it was sent behind one of
+ * the host's that was then not the guest's: sent again. */
+static void cw_check(void) {
+    u32 tok = __atomic_load_n(&cw_tok, __ATOMIC_ACQUIRE);
+    if (!tok) return;
+    RqSlot *sl = &rq_tab[tok & (RQ_SLOTS - 1)];
+    int queued = 2;
+    /* The watcher's own pending set is the process's: nothing is ever sent
+     * to the thread itself. */
+    u64 pend = 0;
+#ifdef SYS_rt_sigpending
+    if (syscall(SYS_rt_sigpending, &pend, (size_t)8) != 0)
+#endif
+        pend = 1ULL << (SIGCHLD - 1);   /* cannot tell: taken for still waiting */
+    if (sl->nonce != tok >> RQ_IDX_BITS ||
+        __atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) != 2 ||
+        (!(pend & (1ULL << (SIGCHLD - 1))) &&
+         !__atomic_compare_exchange_n(&sl->state, &queued, 1, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))) {
+        __atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        return;   /* taken */
+    }
+    if (__atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) == 2) return;   /* waiting */
+    PendSig p = sl->p;   /* ours again (state 1): lost as it was sent */
+    __atomic_store_n(&sl->state, 0, __ATOMIC_RELEASE);
+    if (!__atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;   /* a SIGCHLD reached the guest meanwhile: this one went with it */
+    cw_deliver(&p);
+}
+
+static void *sig_chld_watcher(void *arg) {
+    (void)arg;
+    s32 self = (s32)syscall(SYS_gettid);
+    proc_foreign_add(self);
+    u64 chld = 1ULL << (SIGCHLD - 1);
+    for (;;) {
+        u32 tok = __atomic_load_n(&cw_tok, __ATOMIC_ACQUIRE);
+        if (tok) {
+            host_futex_wait(&cw_tok, tok, 10);
+            clonekids_tell_dead();
+            cw_check();
+            continue;
+        }
+        if (!cw_due()) {
+            /* What the host still holds is looked at first: nothing may be
+             * left pending behind us that is not the guest's. */
+            siginfo_t si;
+            memset(&si, 0, sizeof si);
+            if (host_take_pending(chld, &si) == SIGCHLD) {
+                PendSig p;
+                pendsig_from_host(&p, SIGCHLD, &si);
+                if (sig_chld_notice(&p, &si)) cw_deliver(&p);
+                continue;
+            }
+            __atomic_store_n(&cw_on, 0, __ATOMIC_SEQ_CST);
+            /* A clone child forked meanwhile, and its forker saw us still
+             * on (sig_chld_watch): carry on. */
+            u32 z = 0;
+            if (!cw_due() || !__atomic_compare_exchange_n(&cw_on, &z, 1, false,
+                                                          __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+                break;
+            continue;
+        }
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        if (host_sigtimedwait(chld, &si, 100 * 1000000LL) != SIGCHLD) continue;
+        PendSig p;
+        pendsig_from_host(&p, SIGCHLD, &si);
+        if (sig_chld_notice(&p, &si)) cw_deliver(&p);
+    }
+    proc_foreign_del(self);
+    return NULL;
+}
+
+void sig_chld_watch(void) {
+    if (!rq_ensure()) return;   /* nothing to hand back with: as before */
+    u32 z = 0;
+    if (!__atomic_compare_exchange_n(&cw_on, &z, 1, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+        return;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    /* Created with every signal blocked, which it keeps: it takes SIGCHLD
+     * only by asking for it, and no other signal is ever its to take. */
+    u64 all = ~0ULL, prev = 0;
+    syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8);
+    pthread_t th;
+    if (pthread_create(&th, &a, sig_chld_watcher, NULL) != 0) {
+        __atomic_store_n(&cw_on, 0, __ATOMIC_SEQ_CST);
+        static char warned;
+        if (!__atomic_test_and_set(&warned, __ATOMIC_RELAXED))
+            fprintf(stderr, "arm64chroot: no thread to watch SIGCHLD with: a clone "
+                            "child's death goes unreported while the guest blocks "
+                            "SIGCHLD\n");
+    }
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &prev, NULL, (size_t)8);
+    pthread_attr_destroy(&a);
+}
+
+/* A clone child's notice, from whoever learned of the death outside a host
+ * SIGCHLD -- the watcher's look, a wait that reaped the child first. */
+void sig_send_clone_notice(int es, int code, int status, s32 pid, u64 times) {
+    PendSig p;
+    memset(&p, 0, sizeof p);
+    p.signo = es;
+    p.code = code;
+    p.pid = (int)pid;
+    p.uid = (int)sig_ruid_of(pid);
+    p.status = status;
+    p.utime = (s64)(times >> 32);
+    p.stime = (s64)(u32)times;
+    u64 prev = host_block_all();
+    rq_put(&p);
+    host_set_mask(prev);
+}
+
+u64 sig_cld_times_tv(const struct timeval *ut, const struct timeval *st) {
+    return (u64)tv_ticks(ut) << 32 | tv_ticks(st);
 }
 
 /* A signalfd record of a handed-back signal, or of one whose siginfo came
@@ -2571,6 +2897,7 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
     memset(&si, 0, sizeof si);
     si.si_code = SI_QUEUE;
     si.si_pid = (pid_t)r->ssi_pid;
+    si.si_uid = (uid_t)r->ssi_uid;   /* a SIGCHLD's token (rq_queue) */
     si.si_value.sival_ptr = (void *)(uintptr_t)r->ssi_ptr;
     PendSig p;
     if (!rq_claim((int)r->ssi_signo, &si, &p) &&
@@ -2590,6 +2917,14 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
         n.ssi_status = p.status;
         n.ssi_utime = (u64)p.utime;
         n.ssi_stime = (u64)p.stime;
+    } else if (p.code > 0 && !is_sync_sig(p.signo) && sig_poll_layout(p.signo, p.code)) {
+        /* A clone child's notice by a signal of its own: its siginfo is a
+         * child's, but signalfd_copyinfo lays the record out by the signal
+         * and the code, and for any signal but SIGCHLD a code of 1..6 is
+         * _sigpoll's -- the band over the pid and uid (the low half, ssi_band
+         * being 32 bits), the fd over the status. */
+        n.ssi_band = (u32)p.pid;
+        n.ssi_fd = p.status;
     } else if (p.code > 0 && is_sync_sig(p.signo)) {
         n.ssi_addr = p.addr;
     } else if (p.code == SI_TIMER) {
@@ -2604,6 +2939,36 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
     }
     *r = n;
     return 1;
+}
+
+int sig_sfd_chld(const GSignalfdSiginfo *r) {
+    if (r->ssi_signo != SIGCHLD) return 1;
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    /* An SI_QUEUE of our own that sig_sfd_requeued did not claim: the
+     * watcher's hand-back, given up (sig_chld_notice). */
+    if (r->ssi_code == SI_QUEUE) {
+        si.si_code = SI_QUEUE;
+        si.si_pid = (pid_t)r->ssi_pid;
+        si.si_uid = (uid_t)r->ssi_uid;
+        return !rq_stale(&si);
+    }
+    if (r->ssi_code <= 0) return 1;
+    si.si_signo = SIGCHLD;
+    si.si_code = r->ssi_code;
+    si.si_pid = (pid_t)r->ssi_pid;
+    si.si_uid = (uid_t)r->ssi_uid;
+    si.si_status = r->ssi_status;
+    si.si_utime = (clock_t)r->ssi_utime;
+    si.si_stime = (clock_t)r->ssi_stime;
+    PendSig p;
+    pendsig_from_host(&p, SIGCHLD, &si);
+    if (!sig_chld_notice(&p, &si)) return 0;
+    if (p.signo == SIGCHLD) return 1;
+    u64 prev = host_block_all();
+    rq_put(&p);
+    host_set_mask(prev);
+    return 0;
 }
 
 static int host_take_pending(u64 set, siginfo_t *si);
@@ -2655,6 +3020,15 @@ static void sig_retarget(int exiting) {
         if ((shd & hbit) && !(priv & hbit)) {
             siginfo_t si;
             while (host_take_pending(hbit, &si) > 0) {
+                if (sig == SIGCHLD) {
+                    /* ...unless the host's SIGCHLD was no guest's to coalesce
+                     * (sig_chld_notice): a clone child's own signal goes on
+                     * as that. */
+                    PendSig q;
+                    pendsig_from_host(&q, hs, &si);
+                    if (sig_chld_notice(&q, &si) && q.signo != SIGCHLD) rq_put(&q);
+                    continue;
+                }
                 if (sig < 32) continue;   /* coalesced into the ring's */
                 if (nafter == cap) {
                     int nc = cap ? cap * 2 : 16;
@@ -3662,6 +4036,7 @@ void sig_handover_give(int all) {
         while ((hs = host_take_pending(sig_set_to_host(~0ULL), &si)) > 0) {
             PendSig p;
             pendsig_from_host(&p, hs, &si);
+            if (hs == SIGCHLD && !sig_chld_notice(&p, &si)) continue;   /* no guest's */
             dt_hand_add(&p);
         }
     }
@@ -3801,6 +4176,17 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
         if (r > 0) {
             PendSig p;
             pendsig_from_host(&p, (int)r, &hsi);
+            /* What the host's SIGCHLD is to the guest (sig_chld_notice): none
+             * at all, and the wait goes on, or a clone child's own signal --
+             * this wait's, or the process's, where the kernel would have
+             * sent it. */
+            if (r == SIGCHLD && !sig_chld_notice(&p, &hsi)) continue;
+            if (p.signo != (int)r && r == SIGCHLD && !(set & (1ULL << (p.signo - 1)))) {
+                u64 prev = host_block_all();
+                rq_put(&p);
+                host_set_mask(prev);
+                continue;
+            }
             if (info_va && pendsig_to_guest(c, &p, info_va) < 0) return -EFAULT;
             return p.signo;
         }

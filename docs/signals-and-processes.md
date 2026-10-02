@@ -1316,6 +1316,42 @@ death as an ordinary child's, `clonekids_signalling` no longer counts it, and
 the emulated reaping takes it (`chld_autoreaped`). The emulator sent the signal
 the child was cloned with, and kept the child (`tests/fixtures/clonenotice.c`).
 
+All of that is decided where the host's `SIGCHLD` is *taken*, and a guest that
+blocks `SIGCHLD` takes none: the host holds it pending. That is right for a
+`SIGCHLD` that is the guest's and wrong for a clone child's: it sat in the
+pending set *as* `SIGCHLD` — `sigpending` showed it, a `sigwait` or a `signalfd`
+for `SIGCHLD` took it — while the signal it stood for never came (a parent
+waiting in `sigwaitinfo` for a clone child's `SIGUSR2` with `SIGCHLD` blocked
+waited forever), and every `SIGCHLD` after it, an ordinary child's included,
+was lost behind it, a standard signal being one pending instance. So every
+place a host `SIGCHLD` reaches the emulator — the capture, `rt_sigtimedwait`, a
+`signalfd` read, a thread handing its signals on — asks one function what it
+is to the guest (`sig_chld_notice`), and while the process has a clone child
+(`clonekids_any`) a host thread of the emulator's own, the **SIGCHLD watcher**,
+takes the ones no guest thread does: blocking every signal, it waits for
+`SIGCHLD` in `rt_sigtimedwait`, which the kernel hands it whenever no thread
+with it unblocked is there to take it. A clone child's notice goes on through
+the hand-back table (`rq_tab`) as the child's own signal, process-directed, so
+the kernel routes it to a thread that has it unblocked or holds it pending where
+`sigpending`, a `sigwait` and a `signalfd` find it; a `SIGCHLD` that is the
+guest's goes back to the process's pending set the same way — its token in
+`si_uid`, which qemu-user passes through where it rewrites a `SIGCHLD`'s value —
+and the watcher then takes nothing until a thread has taken that one
+(`cw_tok`, `cw_taken`), looking at the clone children itself every 10 ms
+instead and sending the notice of each one found dead (`clonekids_tell_dead`):
+whatever the host says meanwhile goes behind the pending one, as the kernel's
+coalescing has it go. A wait that reaps a clone child before anything took its
+notice sends it as it reaps (`clonekid_reaped`): the kernel's went at the
+death, before any wait could see it. Each notice goes once (`clonekid_tell`).
+The capture hands a clone child's signal that its own thread blocks to the
+process too (`rq_put_quick`), and a `signalfd` read drops a record that is no
+guest's — reading again, so a blocking read blocks and an `O_NONBLOCK` one
+answers `EAGAIN` — and lays a clone child's notice out as the kernel does for
+any signal but `SIGCHLD` with such a code: `_sigpoll`'s, the band over the pid
+and the fd over the status. The watcher is a foreign task (`proc_foreign_add`),
+shown to the guest nowhere, and ends once no clone child is left and nothing it
+handed back is waiting.
+
 A notice caught only to be dropped — an ordinary child's, to a parent that
 ignores `SIGCHLD` or keeps it at its default — is one the kernel discards as it
 is sent, and it must interrupt nothing: the catcher has no `SA_RESTART`, so the

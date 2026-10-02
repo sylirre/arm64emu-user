@@ -715,6 +715,28 @@ u32  sig_ruid_of(s32 pid);
  * process has run no execve since, else -1 -- what its death is reported to
  * us with instead of the host's SIGCHLD. Async-signal-safe (sys_proc.c). */
 int  clonekid_exit_signal(s32 pid);
+/* ...and the notice of that child's death is ours to send: 1 to the first
+ * to ask, which sends it, 0 to everyone after (the notice went). The capture
+ * and the SIGCHLD watcher ask as they take the host's SIGCHLD for it, a wait
+ * as it reaps it. Async-signal-safe (sys_proc.c). */
+int  clonekid_tell(s32 pid);
+/* The SIGCHLD watcher's look at the clone children whose host SIGCHLD went
+ * behind another one pending: each dead one's notice that has not gone is
+ * sent now (sys_proc.c). */
+void clonekids_tell_dead(void);
+/* A clone child's notice, sent to this process as the kernel's
+ * do_notify_parent sends it: signal `es`, `code` CLD_EXITED/KILLED/DUMPED
+ * with `status`, from `pid`, with its CPU time packed as sig_cld_times
+ * packs it. Handed to the host process-directed, so it is routed to a thread
+ * that has it unblocked, or waits in the process's pending set (signal.c). */
+void sig_send_clone_notice(int es, int code, int status, s32 pid, u64 times);
+/* The packing sig_cld_times makes, of a user and a system time. */
+struct timeval;
+u64  sig_cld_times_tv(const struct timeval *ut, const struct timeval *st);
+/* The SIGCHLD watcher (signal.c): started, if it is not running, by whoever
+ * makes a child whose death the host's SIGCHLD does not report as the
+ * guest's -- before the child is forked. */
+void sig_chld_watch(void);
 /* The tid of the parent's thread that forked this process (its real_parent,
  * the tracer a PTRACE_TRACEME names), 0 when not known (sys_proc.c). */
 s32  proc_fork_parent_tid(void);
@@ -749,6 +771,12 @@ int  ptimer_siginfo(s32 slot, u64 *val, int *thread);
  * (sig_carry_send), rewritten as the signal it stands for. Called before the
  * record's signal number is translated; 1 = rewritten, guest number and all. */
 int  sig_sfd_requeued(GSignalfdSiginfo *r);
+/* ...and of a SIGCHLD the host queued, what it is to the guest
+ * (sig_chld_notice): 1 a record for it, translated on as any; 0 none -- no
+ * guest's at all, or a clone child's notice by its own signal, which goes on
+ * to the process as that. Called with the record's host number in
+ * ssi_signo, after sig_sfd_requeued (signal.c). */
+int  sig_sfd_chld(const GSignalfdSiginfo *r);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* SECCOMP_RET_TRAP: SIGSYS carrying the blocked syscall (sys_seccomp.c). */
@@ -1348,7 +1376,8 @@ int bind_slot_of_canon(const char *canon);
 #define PROCTAB_AUXV      512    /* per-entry auxv cap (elf.c emits 320 bytes) */
 #define PROCTAB_FOREIGN     5    /* per-entry non-guest host tasks: an interposer's
                                   * (proc_foreign_sample), and the emulator's own
-                                  * tracer watchdog (ptracetab.c) */
+                                  * tracer watchdog (ptracetab.c) and SIGCHLD
+                                  * watcher (signal.c) */
 
 /* One seqlock-consistent read of a registry entry's mutable payload. Byte
  * counts, not NUL-terminated (callers append a terminator where needed). */

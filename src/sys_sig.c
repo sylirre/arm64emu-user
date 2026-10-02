@@ -459,43 +459,61 @@ int sigfd_track_dup(struct Machine *m, int oldfd, int newfd) {
  * sender's pid and uid as the guest knows them (sig_ident). The blocking,
  * O_NONBLOCK and EINTR behaviour are the file's own (a read interrupted by a signal the guest
  * handles is restartable, as signalfd_read's ERESTARTSYS makes it). */
-s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
-    (void)c;
-    ssize_t n = read(fd, out, len);
-    if (n < 0) return -errno;
-    for (size_t off = 0; off + sizeof(GSignalfdSiginfo) <= (size_t)n;
-         off += sizeof(GSignalfdSiginfo)) {
-        GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
-        if (sig_sfd_requeued(r)) continue;   /* handed back or carried: as sent */
-        if (sig_sfd_cld(r)) continue;        /* a notice no host sends */
-        r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
-        int code = r->ssi_code, thr;
-        int own = sig_queue_uncode(&code, &thr);   /* a guest's queued one */
-        r->ssi_code = code;
-        if (own && sig_poll_layout((int)r->ssi_signo, code)) {
-            /* A guest's queued _sigpoll, which rode as an SI_QUEUE's pid,
-             * uid and value: the band and fd it laid there. */
-            r->ssi_band = r->ssi_pid;
-            r->ssi_fd = r->ssi_int;
-            r->ssi_pid = r->ssi_uid = 0;
-            r->ssi_int = 0;
-            r->ssi_ptr = 0;
-            continue;
-        }
-        s32 pid = (s32)r->ssi_pid;
-        sig_ident((int)r->ssi_signo, code, own, &pid, &r->ssi_uid);   /* whose */
-        r->ssi_pid = (u32)pid;
-        if (r->ssi_code == SI_TIMER) {
-            u64 gv;
-            int thr;
-            if (ptimer_siginfo((s32)r->ssi_int, &gv, &thr)) {
-                r->ssi_tid = (u32)r->ssi_int;    /* the guest timer id (slot) */
-                r->ssi_int = (s32)gv;
-                r->ssi_ptr = gv;
-            }
+/* One record, translated in place: 1 to hand it to the guest, 0 when it is
+ * none of the guest's (sig_sfd_chld). */
+static int sigfd_record(GSignalfdSiginfo *r) {
+    if (sig_sfd_requeued(r)) return 1;   /* handed back or carried: as sent */
+    if (!sig_sfd_chld(r)) return 0;      /* a host SIGCHLD that is no guest's */
+    if (sig_sfd_cld(r)) return 1;        /* a notice no host sends */
+    r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
+    int code = r->ssi_code, thr;
+    int own = sig_queue_uncode(&code, &thr);   /* a guest's queued one */
+    r->ssi_code = code;
+    if (own && sig_poll_layout((int)r->ssi_signo, code)) {
+        /* A guest's queued _sigpoll, which rode as an SI_QUEUE's pid,
+         * uid and value: the band and fd it laid there. */
+        r->ssi_band = r->ssi_pid;
+        r->ssi_fd = r->ssi_int;
+        r->ssi_pid = r->ssi_uid = 0;
+        r->ssi_int = 0;
+        r->ssi_ptr = 0;
+        return 1;
+    }
+    s32 pid = (s32)r->ssi_pid;
+    sig_ident((int)r->ssi_signo, code, own, &pid, &r->ssi_uid);   /* whose */
+    r->ssi_pid = (u32)pid;
+    if (r->ssi_code == SI_TIMER) {
+        u64 gv;
+        int thr;
+        if (ptimer_siginfo((s32)r->ssi_int, &gv, &thr)) {
+            r->ssi_tid = (u32)r->ssi_int;    /* the guest timer id (slot) */
+            r->ssi_int = (s32)gv;
+            r->ssi_ptr = gv;
         }
     }
-    return (s64)n;
+    return 1;
+}
+
+/* A record that is none of the guest's -- the host's SIGCHLD for a clone
+ * child's death, say, which is that child's own signal or nothing -- is taken
+ * out of what the read returns. A read left with none goes on: the kernel's
+ * would have found nothing pending, and blocked, or answered EAGAIN on an
+ * O_NONBLOCK descriptor, which the read again does. */
+s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
+    (void)c;
+    const size_t rec = sizeof(GSignalfdSiginfo);
+    for (;;) {
+        ssize_t n = read(fd, out, len);
+        if (n < 0) return -errno;
+        size_t keep = 0, off = 0;
+        for (; off + rec <= (size_t)n; off += rec) {
+            GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
+            if (!sigfd_record(r)) continue;
+            if (keep != off) memmove(out + keep, r, rec);
+            keep += rec;
+        }
+        if (keep || off == 0) return (s64)(keep + ((size_t)n - off));
+    }
 }
 
 SYSDEF(signalfd4) {
