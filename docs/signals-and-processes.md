@@ -1557,7 +1557,11 @@ thread-local `g_ptrace_*` int gates the hot paths):
   whatever the attach — the group stop it may bring is a trap of its own,
   once the tracer resumes the tracee with it (*Job control under ptrace*,
   below). A `SEIZE`d tracee's stop signal used to be reported as the group
-  stop straight away.
+  stop straight away. Whichever signal it hands back, the stop marks a stop
+  signal dequeued (`ptrace_signal`'s `JOBCTL_STOP_DEQUEUED`), so a `SIGSTOP`
+  the tracer puts in place of a `SIGUSR1` begins a group stop, unless a
+  `SIGCONT` came while the stop lasted — the emulator used to judge by the
+  signal first taken and drop the substitute (`tests/ptrace/substop.c`).
 
   What such a stop hands on is what the kernel's `ptrace_signal` delivers: the
   signal the tracer resumed it with, or nothing for 0. Every stop that is a

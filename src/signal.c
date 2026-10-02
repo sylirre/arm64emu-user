@@ -3490,11 +3490,20 @@ void sig_deliver_pending(CPU *c) {
         if (UNLIKELY(g_ptrace_active) && !p.ptraced) {
             u8 si[128];
             siginfo_to_guest(si, sig, &p);
+            u32 pre_stop = __atomic_load_n(&m->jc_contgen, __ATOMIC_ACQUIRE);
             int ns = ptrace_report_signal(c, sig, si);
             if (ns == 0) {                      /* suppressed by the tracer */
                 sig_taken_quietly(c, 1);
                 continue;
             }
+            /* ptrace_signal marks a stop signal dequeued whatever the tracer
+             * hands back (JOBCTL_STOP_DEQUEUED), so a stop signal it puts in
+             * place of another stops all the same -- unless a SIGCONT came
+             * while the stop lasted, which clears the mark. Judged by the
+             * signal first taken, a SIGSTOP a tracer substituted for a
+             * SIGUSR1 was dropped unseen. */
+            stop_taken = 1;
+            stop_gen = pre_stop;
             /* What the tracer left: its SETSIGINFO, or SI_USER from it for a
              * substitute (ptrace_signal). A signal the thread now blocks is
              * queued again, a fresh one that stops again once unblocked. */
