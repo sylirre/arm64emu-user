@@ -57,7 +57,11 @@ static void on_usr1(int s, siginfo_t *si, void *u) {
     usr1_val = si->si_value.sival_int;
 }
 
-/* A child that says it is ready, then waits for SIGUSR1s and reports each. */
+/* A child that says it is ready, then waits for SIGUSR1s and reports each.
+ * SIGUSR1 stays blocked but for sigsuspend's sleep: one that came between
+ * the look at the count and a pause() would have been taken there, and the
+ * listener left asleep with it unreported -- its parent waiting for the
+ * report forever. */
 static pid_t listener(int *rd) {
     int p[2];
     if (pipe(p)) return -1;
@@ -68,17 +72,22 @@ static pid_t listener(int *rd) {
         sa.sa_sigaction = on_usr1;
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGUSR1, &sa, NULL);
+        sigset_t blk, open_;
+        sigemptyset(&blk);
+        sigaddset(&blk, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &blk, &open_);
+        sigdelset(&open_, SIGUSR1);
         close(p[0]);
         char b = 'r';
         if (write(p[1], &b, 1) != 1) _exit(1);
         int seen = 0;
         for (;;) {
-            pause();
             while (seen < usr1) {
                 b = (char)('0' + usr1_val);
                 if (write(p[1], &b, 1) != 1) _exit(1);
                 seen++;
             }
+            sigsuspend(&open_);
         }
     }
     close(p[1]);
