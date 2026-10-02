@@ -737,6 +737,14 @@ u64  sig_cld_times_tv(const struct timeval *ut, const struct timeval *st);
  * makes a child whose death the host's SIGCHLD does not report as the
  * guest's -- before the child is forked. */
 void sig_chld_watch(void);
+/* The host mask of a thread the emulator runs of its own (the tracer
+ * watchdog, the SIGCHLD watcher): every signal but the host libc's own, 32 up
+ * to its SIGRTMIN -- glibc's set*id broadcast (SIGSETXID) and musl's
+ * __synccall send one to every thread and wait for each to answer, and a
+ * thread that blocks it never does: the guest's setgid in a traced process
+ * hung on its watchdog. A pthread inherits its creator's mask but for
+ * SIGCANCEL, so the creator blocks this around pthread_create (signal.c). */
+u64  sig_helper_mask(void);
 /* The tid of the parent's thread that forked this process (its real_parent,
  * the tracer a PTRACE_TRACEME names), 0 when not known (sys_proc.c). */
 s32  proc_fork_parent_tid(void);

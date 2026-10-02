@@ -2420,9 +2420,10 @@ static void pt_wd_start(void) {
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     /* The default stack: a small one is refused outright (EINVAL), the
      * emulator's static TLS being larger than it. */
-    /* Created with every signal blocked, which it keeps: no signal of the
-     * guest's, or of ours, is ever this thread's to take. */
-    u64 all = ~0ULL, prev = 0;
+    /* Created with every signal blocked, which it keeps -- no signal of the
+     * guest's, or of ours, is ever this thread's to take -- but the host
+     * libc's own (sig_helper_mask). */
+    u64 all = sig_helper_mask(), prev = 0;
     syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8);
     pthread_t th;
     if (pthread_create(&th, &a, pt_watchdog, NULL) != 0) {

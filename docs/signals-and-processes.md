@@ -1328,7 +1328,8 @@ place a host `SIGCHLD` reaches the emulator — the capture, `rt_sigtimedwait`, 
 `signalfd` read, a thread handing its signals on — asks one function what it
 is to the guest (`sig_chld_notice`), and while the process has a clone child
 (`clonekids_any`) a host thread of the emulator's own, the **SIGCHLD watcher**,
-takes the ones no guest thread does: blocking every signal, it waits for
+takes the ones no guest thread does: blocking every signal but the host libc's
+own (`sig_helper_mask`, as the tracer watchdog), it waits for
 `SIGCHLD` in `rt_sigtimedwait`, which the kernel hands it whenever no thread
 with it unblocked is there to take it. A clone child's notice goes on through
 the hand-back table (`rq_tab`) as the child's own signal, process-directed, so
@@ -2002,7 +2003,13 @@ themselves. Each parked tracee checks, once per service-loop slice, and
 traced one host thread of the emulator's own watches its tracers every 100 ms
 (`pt_watchdog`): a thread whose tracer is gone has the tracer cleared on its link
 and is kicked to leave the trace at its next boundary, or the process is
-killed, under `EXITKILL`. The thread blocks every signal, holds no descriptor,
+killed, under `EXITKILL`. The thread blocks every signal but the host libc's
+own — 32 up to its `SIGRTMIN` (`sig_helper_mask`): glibc's set*id broadcast
+(`SIGSETXID`) and musl's `__synccall` send one to every thread of the process
+and wait for each to answer, and a thread that blocks it never does, so a
+traced process's `setgid` never returned (`strace` of busybox, which drops its
+ids as it starts, hung there once the tracee was forked from a tracer that ran a
+watchdog of its own: `tests/ptrace/setxid.c`). It holds no descriptor,
 and is in the process's foreign-task set, so the guest never sees it (not in
 `/proc/<pid>/task` or `Threads:`, not waited for by `de_thread`, not a `tgkill`
 target); it ends once no thread is traced. The liveness test also compares the

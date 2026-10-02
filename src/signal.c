@@ -216,9 +216,14 @@ static int sigq_next(int t) { return t + 1 == sigq_cap ? 0 : t + 1; }
  * the mask before, to put back. By the raw syscall with the kernel's 64-bit
  * set: a sigfillset'd sigset_t is four bytes on 32-bit Bionic and blocked
  * nothing above 32 there -- none of the RT signals a flood is made of. */
-static u64 host_block_all(void) {
-    u64 all = ~0ULL, prev = 0;
+u64 sig_helper_mask(void) {
+    u64 all = ~0ULL;
     for (int s = 32; s < SIGRTMIN && s <= 64; s++) all &= ~(1ULL << (s - 1));
+    return all;
+}
+
+static u64 host_block_all(void) {
+    u64 all = sig_helper_mask(), prev = 0;
 #ifdef SYS_rt_sigprocmask
     if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8) == 0)
         return prev;
@@ -2849,9 +2854,10 @@ void sig_chld_watch(void) {
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-    /* Created with every signal blocked, which it keeps: it takes SIGCHLD
-     * only by asking for it, and no other signal is ever its to take. */
-    u64 all = ~0ULL, prev = 0;
+    /* Created with every signal blocked, which it keeps -- it takes SIGCHLD
+     * only by asking for it, and no other signal is ever its to take -- but
+     * the host libc's own (sig_helper_mask). */
+    u64 all = sig_helper_mask(), prev = 0;
     syscall(SYS_rt_sigprocmask, SIG_BLOCK, &all, &prev, (size_t)8);
     pthread_t th;
     if (pthread_create(&th, &a, sig_chld_watcher, NULL) != 0) {
