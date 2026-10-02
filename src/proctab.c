@@ -3431,6 +3431,11 @@ void proctab_jc_art_mark(s32 pid, u32 bits) {
     if (e) __atomic_or_fetch(&e->jc_art, bits, __ATOMIC_ACQ_REL);
 }
 
+u32 proctab_jc_art_or(s32 pid, u32 bits) {
+    struct ProcEnt *e = pid_entry(pid);
+    return e ? __atomic_fetch_or(&e->jc_art, bits, __ATOMIC_ACQ_REL) : bits;
+}
+
 void proctab_jc_art_clear(s32 pid, u32 bits) {
     struct ProcEnt *e = pid_entry(pid);
     if (e) __atomic_and_fetch(&e->jc_art, ~bits, __ATOMIC_ACQ_REL);

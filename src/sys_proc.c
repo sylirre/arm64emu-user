@@ -1507,23 +1507,35 @@ static int ck_not_child(s32 pid) {
            errno == ECHILD;
 }
 
-/* waitid(P_ALL or P_PGID `id`) as the kernel answers it with a clone child
- * live (ck_wait_any_here): of the children of the kind `opts` selects --
- * clone children under __WCLONE, the others without it -- and in the group
- * for P_PGID, the first with something to report, asked of the host one pid
- * at a time; -1 and ECHILD when there is none of that kind at all. Returns as
- * the raw syscall does: 0, with `si` zeroed when WNOHANG found nothing ready,
- * or -1 and errno.
+/* Is table entry `k` a child of the kind a wait with `opts` selects
+ * (eligible_child)? __WALL: either; __WCLONE: a clone child; neither: any
+ * other. */
+static int ck_kind_ok(const struct CloneKid *k, u32 opts) {
+    if (opts & G_WALL) return 1;
+    return (k->sig != SIGCHLD) == ((opts & G_WCLONE) != 0);
+}
+
+/* waitid(P_ALL or P_PGID `id`) answered a child at a time, from the table of
+ * children: as the kernel answers it with a clone child live
+ * (ck_wait_any_here) -- of the children of the kind `opts` selects, clone
+ * children under __WCLONE, the others without it -- and, `held`, past the
+ * deaths held back from us until a tracer has collected them
+ * (ptrace_death_held), which a wait here passes by: each child is looked at
+ * (WNOWAIT) before it is taken. In the group for P_PGID, the first with
+ * something to report, asked of the host one pid at a time; -1 and ECHILD
+ * when there is none of that kind at all -- a child whose death is held is
+ * one. Returns as the raw syscall does: 0, with `si` zeroed when WNOHANG
+ * found nothing ready, or -1 and errno.
  *
  * To block, it asks the host for ANY child's state change without taking it
  * (WNOWAIT) -- the wait sleeps in the kernel as it would, and a signal ends
  * it with EINTR as it would -- and goes round again. A child of the other
  * kind that has something to report makes that return at once, and goes on
- * making it; the wait then naps between rounds (10 ms, growing to 50) rather
- * than spin on it, which is the latency a wait here can see. */
+ * making it, as does a death held back; the wait then naps between rounds
+ * (10 ms, growing to 50) rather than spin on it, which is the latency a wait
+ * here can see. */
 static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
-                         u32 opts, KRusage *ru) {
-    int want_clone = (opts & G_WCLONE) != 0;
+                         u32 opts, KRusage *ru, int held) {
     int hopts = (int)(opts & ~(G_WCLONE | G_WALL));
     int nap_ms = 10;
     for (;;) {
@@ -1532,7 +1544,7 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
         for (int i = 0; t && i < CK_MAX; i++) {
             struct CloneKid *k = &t->e[i];
             if (__atomic_load_n(&k->state, __ATOMIC_ACQUIRE) != CK_LIVE) continue;
-            if ((k->sig != SIGCHLD) != want_clone) continue;
+            if (!ck_kind_ok(k, opts)) continue;
             s32 x = k->pid;
             if (idtype == P_PGID) {
                 pid_t g = getpgid((pid_t)x);   /* a zombie still has one */
@@ -1543,7 +1555,18 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
                 if ((s32)g != id) continue;
             }
             memset(si, 0, sizeof *si);
-            int r = (int)syscall(SYS_waitid, P_PID, (id_t)x, si, hopts | WNOHANG, ru);
+            int r = (int)syscall(SYS_waitid, P_PID, (id_t)x, si,
+                                 hopts | WNOHANG | (held ? WNOWAIT : 0), ru);
+            if (r == 0 && si->si_pid != 0 && held) {
+                if ((si->si_code == CLD_EXITED || si->si_code == CLD_KILLED ||
+                     si->si_code == CLD_DUMPED) && ptrace_death_held(x, 1)) {
+                    any = 1;   /* a child, with nothing to report to us yet */
+                    continue;
+                }
+                if (opts & G_WNOWAIT) return 0;
+                memset(si, 0, sizeof *si);
+                r = (int)syscall(SYS_waitid, P_PID, (id_t)x, si, hopts | WNOHANG, ru);
+            }
             if (r == 0 && si->si_pid != 0) return 0;
             if (r == 0) { any = 1; continue; }
             if (errno != ECHILD) return -1;
@@ -1556,8 +1579,10 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
         }
         /* A child forked and not yet entered is one all the same: the
          * kernel's wait finds it the moment fork returns. */
-        if (!any && t && __atomic_load_n(want_clone ? &t->nborn : &t->nordborn,
-                                         __ATOMIC_ACQUIRE))
+        if (!any && t &&
+            (((opts & (G_WALL | G_WCLONE)) && __atomic_load_n(&t->nborn, __ATOMIC_ACQUIRE)) ||
+             ((opts & G_WALL || !(opts & G_WCLONE)) &&
+              __atomic_load_n(&t->nordborn, __ATOMIC_ACQUIRE))))
             any = 1;
         if (!any) { errno = ECHILD; return -1; }
         memset(si, 0, sizeof *si);
@@ -1565,13 +1590,15 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
         siginfo_t w;
         memset(&w, 0, sizeof w);
         int kinds = hopts & (WEXITED | WSTOPPED | WCONTINUED | (int)G_WNOTHREAD);
-        if (syscall(SYS_waitid, P_ALL, 0, &w, kinds | WNOWAIT, NULL) < 0) {
+        if (syscall(SYS_waitid, P_ALL, 0, &w, kinds | WNOWAIT | __WALL, NULL) < 0) {
             if (errno == ECHILD) continue;     /* gone meanwhile: look again */
             return -1;                         /* EINTR: the caller's to handle */
         }
         struct CloneKid *k = ck_entry(m, (s32)w.si_pid);
-        if (k && (k->sig != SIGCHLD) == want_clone &&
-            (idtype != P_PGID || getpgid(w.si_pid) == (pid_t)id)) {
+        if (k && ck_kind_ok(k, opts) &&
+            (idtype != P_PGID || getpgid(w.si_pid) == (pid_t)id) &&
+            !(held && (w.si_code == CLD_EXITED || w.si_code == CLD_KILLED ||
+                       w.si_code == CLD_DUMPED) && ptrace_death_held((s32)w.si_pid, 1))) {
             nap_ms = 10;
             continue;                          /* one of ours: take it */
         }
@@ -1581,18 +1608,71 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
     }
 }
 
-/* The same wait in wait4's terms: `wpid` -1 or a group (0, -pgid), its
- * options, its status word and its rusage. */
-static pid_t ck_wait4_any(struct Machine *m, pid_t wpid, int *status, u32 opts,
-                          struct rusage *ru) {
-    int idtype = wpid == -1 ? P_ALL : P_PGID;
-    s32 id = wpid == 0 ? (s32)getpgid(0) : (s32)-wpid;
+/* A wait in a session where something is traced: the host's, but one that
+ * never reaps a child whose death is held back from us until its tracer has
+ * collected it (ptracetab.c, "a traced child's death"), and so never a
+ * blocking host wait that takes what it finds -- the child it would take
+ * might be traced by the time it dies. It looks first (WNOWAIT, the
+ * caller's own WNOHANG or not), then takes the child it found, by its pid,
+ * WNOHANG. A death held back is a child with nothing to report: past it,
+ * the other children are asked one at a time (ck_waitid_any); with none of
+ * them ready a WNOHANG wait answers 0, and a blocking one sleeps until a
+ * release or 50 ms and answers EINTR -- the caller's cue to look at its
+ * signals and come back. `hopts` is what to ask the host with
+ * (clonekid_wait_ok); `ck_any`, a wait the host cannot answer at all
+ * (ck_wait_any_here), goes to the table from the start. Returns as the raw
+ * syscall does. */
+static int held_waitid(struct Machine *m, int idtype, s32 id, siginfo_t *si, u32 opts,
+                       u32 hopts, KRusage *ru, int ck_any) {
+    if (ck_any) return ck_waitid_any(m, idtype, id, si, opts, ru, 1);
+    for (;;) {
+        u32 gen = ptrace_wait_gen();   /* before the look: no release missed */
+        memset(si, 0, sizeof *si);
+        if (syscall(SYS_waitid, idtype, (id_t)id, si, (int)hopts | WNOWAIT, ru) < 0) return -1;
+        if (si->si_pid == 0) return 0;          /* WNOHANG: nothing ready */
+        s32 x = (s32)si->si_pid;
+        if ((si->si_code == CLD_EXITED || si->si_code == CLD_KILLED ||
+             si->si_code == CLD_DUMPED) && ptrace_death_held(x, 1)) {
+            if (idtype == P_ALL || idtype == P_PGID) {
+                int r = ck_waitid_any(m, idtype, id, si, opts | G_WNOHANG, ru, 1);
+                if (r < 0 && errno != ECHILD) return -1;
+                if (r == 0 && si->si_pid != 0) return 0;
+            }
+            memset(si, 0, sizeof *si);
+            if (opts & G_WNOHANG) return 0;
+            ptrace_tracer_wait(gen, 50);
+            errno = EINTR;
+            return -1;
+        }
+        if (opts & G_WNOWAIT) return 0;         /* a look: as it was */
+        memset(si, 0, sizeof *si);
+        if (syscall(SYS_waitid, P_PID, (id_t)x, si, ((int)hopts & ~WNOWAIT) | WNOHANG, ru) < 0) {
+            if (errno == ECHILD) continue;      /* taken by another thread meanwhile */
+            return -1;
+        }
+        if (si->si_pid == x) return 0;
+        /* ...or its state moved on before the take: look again. */
+    }
+}
+
+/* The same waits in wait4's terms: `wpid` a child, -1 or a group (0, -pgid),
+ * its options as given and as the host is to be asked (`hopts`), its status
+ * word and its rusage; `held`, a wait in a traced session (held_waitid),
+ * else one the host cannot answer (ck_waitid_any). */
+static pid_t wait4_via(struct Machine *m, pid_t wpid, int *status, u32 opts, u32 hopts,
+                       struct rusage *ru, int ck_any, int held) {
+    int idtype = wpid > 0 ? P_PID : wpid == -1 ? P_ALL : P_PGID;
+    s32 id = wpid > 0 ? (s32)wpid : wpid == 0 ? (s32)getpgid(0) : wpid == -1 ? 0 : (s32)-wpid;
     u32 wo = WEXITED | ((opts & G_WUNTRACED) ? WSTOPPED : 0) |
-             (opts & (G_WCONTINUED | G_WNOHANG | G_WNOTHREAD | G_WCLONE));
+             (opts & (G_WCONTINUED | G_WNOHANG | G_WNOTHREAD | G_WCLONE | G_WALL));
+    u32 hwo = WEXITED | ((hopts & G_WUNTRACED) ? WSTOPPED : 0) |
+              (hopts & (G_WCONTINUED | G_WNOHANG | G_WNOTHREAD | G_WCLONE | G_WALL));
     siginfo_t si;
     KRusage k;
     memset(&k, 0, sizeof k);
-    if (ck_waitid_any(m, idtype, id, &si, wo, &k) < 0) return -1;
+    int r = held ? held_waitid(m, idtype, id, &si, wo, hwo, &k, ck_any)
+                 : ck_waitid_any(m, idtype, id, &si, wo & ~G_WALL, &k, 0);
+    if (r < 0) return -1;
     if (!si.si_pid) return 0;
     int st = si.si_status;
     switch (si.si_code) {
@@ -1640,7 +1720,10 @@ static void ck_waitid_reaped(struct Machine *m, const siginfo_t *si, const KRusa
  * in is charged back out -- here for the reap this does, by the caller for
  * the one its wait did. */
 static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
-    if (!sig_chld_reaps(m) || !sig_chld_reap_emulated())
+    if (!sig_chld_reaps(m)) return 0;
+    /* A traced child's death released to us (ptracetab.c, "a traced child's
+     * death") is one the kernel reaps at the release, whoever else would. */
+    if (!sig_chld_reap_emulated() && !(proctab_jc_art(pid) & JCA_DEATH_HELD))
         return 0;
     struct CloneKid *ck = clonekid_live(m, pid);
     if (ck && ck_notice_sig(ck) != SIGCHLD) return 0;   /* never at its death */
@@ -2171,6 +2254,13 @@ SYSDEF(clone) {
      * event stop below hands the tracer its pid, and a wait for it must find
      * it (ptrace_fork_reserve). */
     ptrace_fork_publish(pt_slot, (s32)pid);
+    /* ...and, its tracer not us, a child whose death is that tracer's to
+     * collect before we may see it (ptracetab.c, "a traced child's death"):
+     * SIGCHLD caught, and watched, while it lives. */
+    if (pt_slot) {
+        sig_chld_watch();
+        sig_host_update(m, SIGCHLD);
+    }
     /* A plain fork does not re-run load_elf, so the child needs publishing (with
      * the inherited cmdline/exe/cwd/environ/auxv and its own fresh starttime) or
      * it stays invisible in the hidden /proc view until it execve's. The PARENT
@@ -3777,8 +3867,12 @@ SYSDEF(wait4) {
             !ptrace_have_tracee(sel, 1)) {
             int status;
             struct rusage ru;   /* always taken: children_reaped needs it */
-            pid_t pid = ck_any ? ck_wait4_any(c->m, wpid, &status, (u32)options, &ru)
-                               : wait4(wpid, &status, (int)hopts, &ru);
+            /* In a traced session, a child's death may be its tracer's to
+             * collect first: looked at before it is taken (held_waitid). */
+            int held = ptrace_any_trace();
+            pid_t pid = ck_any || held
+                ? wait4_via(c->m, wpid, &status, (u32)options, hopts, &ru, ck_any, held)
+                : wait4(wpid, &status, (int)hopts, &ru);
             if (pid < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -3805,7 +3899,8 @@ SYSDEF(wait4) {
                     proctab_helper_charge(&ru);
                     continue;
                 }
-                if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
+                if (ptrace_any_trace() && ptrace_note_reaped((s32)pid))
+                    sig_host_update(c->m, SIGCHLD);   /* maybe its last traced child */
                 ck_wait4_reaped(c->m, (s32)pid, status, &ru);
                 proctab_reaped((s32)pid);   /* its zombie's slot goes with it */
                 children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
@@ -3840,9 +3935,8 @@ SYSDEF(wait4) {
         }
         int status;
         struct rusage ru;
-        pid_t pid = ck_any ? ck_wait4_any(c->m, wpid, &status,
-                                          (u32)options | G_WNOHANG, &ru)
-                           : wait4(wpid, &status, (int)hopts | WNOHANG, &ru);
+        pid_t pid = wait4_via(c->m, wpid, &status, (u32)options | G_WNOHANG,
+                              hopts | G_WNOHANG, &ru, ck_any, 1);
         int werr = errno;
         if (pid > 0 && (WIFSTOPPED(status) || WIFCONTINUED(status))) {
             if (jc_host_artefact((s32)pid, WIFSTOPPED(status))) continue;
@@ -3856,7 +3950,7 @@ SYSDEF(wait4) {
                     proctab_helper_charge(&ru);
                     continue;
                 }
-                ptrace_note_reaped((s32)pid);
+                if (ptrace_note_reaped((s32)pid)) sig_host_update(c->m, SIGCHLD);
                 ck_wait4_reaped(c->m, (s32)pid, status, &ru);
                 proctab_reaped((s32)pid);   /* its zombie's slot goes with it */
                 children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
@@ -4020,8 +4114,12 @@ SYSDEF(waitid) {
              * NULL), and a guest that supplies one expects it filled -- this is
              * the wait4-less way to get a child's accounting. Kernel layout, so
              * see KRusage. */
-            int r = ck_any ? ck_waitid_any(c->m, (int)idtype, sel.id, &si,
-                                           (u32)options, &ru)
+            int held = ptrace_any_trace();   /* see wait4 */
+            int r = held ? held_waitid(c->m, (int)idtype,
+                                       idtype == P_PGID ? sel.id : (s32)id, &si,
+                                       (u32)options, hopts, &ru, ck_any)
+                  : ck_any ? ck_waitid_any(c->m, (int)idtype, sel.id, &si,
+                                           (u32)options, &ru, 0)
                            : (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
                                           (int)hopts, &ru);   /* always taken:
                                                                * children_reaped */
@@ -4048,7 +4146,8 @@ SYSDEF(waitid) {
             if (si.si_pid != 0 && !(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
                  si.si_code == CLD_DUMPED)) {
-                if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
+                if (ptrace_any_trace() && ptrace_note_reaped((s32)si.si_pid))
+                    sig_host_update(c->m, SIGCHLD);   /* see wait4 */
                 ck_waitid_reaped(c->m, &si, &ru);
                 proctab_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,
@@ -4092,10 +4191,8 @@ SYSDEF(waitid) {
         KRusage ru;
         memset(&si, 0, sizeof si);
         memset(&ru, 0, sizeof ru);
-        int r = ck_any ? ck_waitid_any(c->m, (int)idtype, sel.id, &si,
-                                       (u32)options | G_WNOHANG, &ru)
-                       : (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
-                                      (int)hopts | WNOHANG, &ru);
+        int r = held_waitid(c->m, (int)idtype, idtype == P_PGID ? sel.id : (s32)id, &si,
+                            (u32)options | G_WNOHANG, hopts | G_WNOHANG, &ru, ck_any);
         int werr = errno;
         if (r == 0 && jc_waitid_artefact(&si, (u32)options)) continue;
         if (r == 0 && si.si_pid != 0 &&
@@ -4110,7 +4207,7 @@ SYSDEF(waitid) {
             if (!(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
                  si.si_code == CLD_DUMPED)) {
-                ptrace_note_reaped((s32)si.si_pid);
+                if (ptrace_note_reaped((s32)si.si_pid)) sig_host_update(c->m, SIGCHLD);
                 ck_waitid_reaped(c->m, &si, &ru);
                 proctab_reaped((s32)si.si_pid);
                 children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,

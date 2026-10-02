@@ -153,6 +153,13 @@ typedef struct {
                           * stop to ptrace(2) or wait(2), until a trap_notify or
                           * an interrupt makes it trap again */
     s32 exit_status;     /* PT_ST_EXITED: wait-status word for the tracer */
+    s32 rparent;         /* the tracee's real parent, a guest process outside
+                          * the tracer's (ptrace_death_held), or 0 */
+    u32 rparent_ack;     /* ...which has seen that its child is traced: its
+                          * waits no longer reap it unasked (the attach waits
+                          * for this before it kicks the tracee) */
+    u32 released;        /* the death held back from it has been released to
+                          * it, once (pt_release_held) */
     s32 pgid;            /* the tracee's process group as of its last stop or
                           * death (claimed with the one it had): what a wait
                           * for a group asks once the task itself is gone */
@@ -376,6 +383,7 @@ static void pt_link_fill(PtLink *e, s32 tgid) {
     e->attach_pending = e->interrupt_pending = 0;
     e->attach_stopped = 0;
     e->death_told = 0;
+    e->rparent = 0; e->rparent_ack = 0; e->released = 0;
     e->trap_notify = 0; e->seize = 0; e->listening = 0;
     memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
     e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
@@ -426,6 +434,10 @@ static void pt_free(PtLink *e) {
     __atomic_store_n(&e->tracer, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);   /* slot free */
 }
+
+static void pt_release_held(PtLink *e);
+static void pt_rparent_service(void);
+static s32 pt_guest_parent(s32 t);
 
 /* Is the calling thread link `e`'s tracer? The kernel's tracer is the task
  * that attached (ptrace_check_attach: child->parent == current), so a request
@@ -1062,6 +1074,7 @@ static void pt_jobctl_trap(CPU *c, int participate) {
  * attach turns a stopped task into a traced one. The call the kick cut short
  * is the stop's, and resumes as one no handler ran for (sig_after_trap). */
 void ptrace_jobctl_service(CPU *c) {
+    pt_rparent_service();   /* a child of ours traced now (the attach's kick) */
     for (;;) {
         /* A running tracee whose tracer is gone (the watchdog, or the
          * tracer's own exit, cleared it and kicked us): the kernel's
@@ -1162,6 +1175,11 @@ void ptrace_report_exit(CPU *c, int wstatus) {
     if (tr > 0 && ((s32)g_tls.tid != (s32)getpid() || tr != (s32)getppid())) {
         e->exit_status = wstatus;
         pt_ru_stamp(e);            /* the tracer's wait4 rusage for this death */
+        /* The process's own death, its tracer's to collect before the real
+         * parent may see it: the host's notice to the parent is none of its
+         * ("a traced child's death"). */
+        if ((s32)g_tls.tid == (s32)getpid())
+            proctab_jc_art_mark((s32)getpid(), JCA_DEATH_HELD);
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
@@ -1202,6 +1220,7 @@ void ptrace_report_exit_group(int wstatus) {
         s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
         if (tr <= 0) { pt_free(e); continue; }
         if (t == me && tr == ppid) continue;   /* host wait reaps this death */
+        if (t == me) proctab_jc_art_mark(me, JCA_DEATH_HELD);   /* as above */
         e->exit_status = wstatus;
         /* Group-wide accounting, so the dying thread's own sample is equally
          * true of the siblings it is publishing on behalf of. */
@@ -1310,6 +1329,10 @@ void *ptrace_fork_reserve(s32 tracer, s32 tracer_tid, u32 options, u32 seize) {
      * reads it to tell whether the parent it is waiting on is still there. */
     pt_link_fill(e, (s32)getpid());
     e->pgid = (s32)getpgid(0);               /* the child is born into ours */
+    /* ...and is ours, its tracer another's: its death is held back from us
+     * ("a traced child's death"), which we know already. */
+    e->rparent = (s32)getpid();
+    e->rparent_ack = 1;
     __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);
     e->seize = seize;
     e->tracer_start = proctab_starttime(tracer);
@@ -1759,6 +1782,29 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
          * kick caught up. On a slow host that was whole system calls, and a
          * child that was to stop for its tracer exited instead. */
         pt_wd_start();   /* a tracer now: what the host does to it is ours to see */
+        /* Its real parent, if a guest process other than us, is to see its
+         * death only once we have collected it ("a traced child's death"):
+         * told so now, and given a moment to say it has seen it, so that no
+         * wait of its is still blocked in a host wait that would reap the
+         * child before we could. One that cannot answer (stopped by the
+         * host) finds out at its next kick, as it resumes. */
+        if (pid == tgid) {
+            s32 rp = pt_guest_parent(tgid);
+            if (rp > 0) {
+                __atomic_store_n(&e->rparent, rp, __ATOMIC_RELEASE);
+                siginfo_t si;
+                memset(&si, 0, sizeof si);
+                si.si_signo = PTRACE_KICKSIG;
+                si.si_code = SI_QUEUE;
+                si.si_pid = getpid();
+                si.si_uid = getuid();
+                si.si_value.sival_int = PT_KICK_MAGIC;
+                if (syscall(SYS_rt_sigqueueinfo, (pid_t)rp, PTRACE_KICKSIG, &si) == 0)
+                    for (int i = 0; i < 20 && !__atomic_load_n(&e->rparent_ack, __ATOMIC_ACQUIRE);
+                         i++)
+                        fx_wait(&e->rparent_ack, 0, 10);
+            }
+        }
         int stopped = ptrace_task_stopped(tgid);
         /* ...and whether its real parent has already taken the host's report
          * of that stop: its group_exit_code, a kernel's attach keeps as it
@@ -1940,6 +1986,170 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     }
 }
 
+/* ---- a traced child's death ----------------------------------------------
+ *
+ * A process whose leader is traced by a tracer outside its real parent's
+ * thread group dies to its tracer first: the kernel sends the tracer the
+ * notice (do_notify_parent, to the ptrace parent), lets only the tracer's
+ * wait see the zombie (wait_consider_task: "a zombie ptracee is only visible
+ * to its ptracer"), and hands it to the real parent once the tracer has
+ * reaped it -- the parent's notice going then, with the death's own siginfo
+ * -- or once the tracer is gone (exit_ptrace, __ptrace_detach). Until then
+ * the real parent's wait for it blocks, or answers 0 under WNOHANG: a child
+ * it has, with nothing to report.
+ *
+ * The host knows none of it: to it the tracee is the real parent's ordinary
+ * child, the tracer is nobody, and the parent was sent SIGCHLD at the death
+ * and could reap the child at once -- under strace -f, a shell's wait returned
+ * before strace had heard of its child's exit. So the link keeps the real
+ * parent (rparent, a guest process outside the tracer's, set by the attach or
+ * the following fork), and:
+ *   - the parent's waits, in a session where anything is traced, look before
+ *     they reap and never reap a death held back (ptrace_death_held;
+ *     sys_proc.c, held_waitid);
+ *   - the parent's capture drops the host's notice of a held death
+ *     (signal.c, sig_chld_notice), the dead process marking itself as it
+ *     publishes its exit, and whoever first sees it otherwise marking it
+ *     (JCA_DEATH_HELD), so that a notice taken late is still known for one;
+ *   - the release -- the tracer's collection of the exit, its own exit, or
+ *     its death found by the parent -- sends the parent a SIGCHLD that names
+ *     the child (PT_RELEASE_MAGIC), which the parent's capture turns into the
+ *     death's notice, read off the zombie; once (released);
+ *   - the parent learns its child is traced as the attach is made (a kick,
+ *     pt_rparent_service, which the attach waits for, so that no wait of the
+ *     parent's is still blocked in a host wait that would reap the child),
+ *     and then catches SIGCHLD and runs the SIGCHLD watcher (signal.c) while
+ *     such a child lives, since a notice held back that sits pending under a
+ *     blocked SIGCHLD swallows the ones after it. */
+
+/* The real parent of `t`'s process, when that is a guest process other than
+ * this one (the tracer's), else 0. */
+static s32 pt_task_ppid(s32 t);
+static s32 pt_guest_parent(s32 t) {
+    s32 pp = pt_task_ppid(t);
+    return pp > 0 && pp != (s32)getpid() && proctab_has(pp) ? pp : 0;
+}
+
+/* The death on link `e` is the real parent's now: marked, and its notice
+ * sent, once. Ordinary context. */
+static void pt_release_held(PtLink *e) {
+    s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+    if (t <= 0 || t != e->tgid) return;
+    /* Its parent now, which a reparenting may have changed since the attach
+     * -- the attach's where the task cannot be read -- and only a guest
+     * process other than its tracer: to the tracer, as to any other parent,
+     * the death was never held back. */
+    s32 rp = pt_task_ppid(t);
+    if (rp <= 0) rp = __atomic_load_n(&e->rparent, __ATOMIC_ACQUIRE);
+    if (rp <= 0 || rp == __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) || !proctab_has(rp) ||
+        __atomic_exchange_n(&e->released, 1, __ATOMIC_ACQ_REL))
+        return;
+    proctab_jc_art_mark(t, JCA_DEATH_HELD | JCA_DEATH_FREE);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGCHLD;
+    si.si_code = SI_QUEUE;
+    si.si_pid = (pid_t)t;
+    si.si_uid = (uid_t)PT_RELEASE_MAGIC;
+    syscall(SYS_rt_sigqueueinfo, (pid_t)rp, SIGCHLD, &si);
+    ptrace_wake_waiters();   /* a wait of the parent's looks again */
+}
+
+int ptrace_death_held(s32 pid, int sure) {
+    if (!g_tab || pid <= 0 || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 0;
+    s32 me = (s32)getpid();
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) != pid || e->tgid != pid) continue;
+        s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+        if (tr <= 0 || tr == me || __atomic_load_n(&e->released, __ATOMIC_ACQUIRE))
+            return 0;
+        if (sure && pt_tracer_gone(e)) {
+            pt_release_held(e);
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int ptrace_held_kids(int sweep) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return 0;
+    s32 me = (s32)getpid();
+    int any = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || t != e->tgid || __atomic_load_n(&e->rparent, __ATOMIC_ACQUIRE) != me)
+            continue;
+        s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+        if (tr <= 0 || tr == me) {
+            /* Detached alive, or its tracer gone after its death: held no
+             * more -- the latter released (pt_tracer_release, or below). */
+            continue;
+        }
+        if (sweep && !__atomic_load_n(&e->released, __ATOMIC_ACQUIRE) && pt_tracer_gone(e) &&
+            (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED || pt_task_dead(t))) {
+            pt_release_held(e);
+            continue;
+        }
+        any = 1;
+    }
+    return any;
+}
+
+s32 ptrace_tracer_died(s32 r) {
+    if (!g_tab || r <= 0 || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return 0;
+    s32 me = (s32)getpid(), first = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || t != e->tgid || __atomic_load_n(&e->rparent, __ATOMIC_ACQUIRE) != me ||
+            __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != r)
+            continue;
+        /* Alive, it is only detached by the death -- nothing was held back. */
+        siginfo_t x;
+        memset(&x, 0, sizeof x);
+        if (syscall(SYS_waitid, P_PID, (id_t)t, &x, WEXITED | WNOHANG | WNOWAIT | __WALL,
+                    NULL) != 0 || x.si_pid != t)
+            continue;
+        /* Released already -- a look of ours found the tracer gone first
+         * (ptrace_held_kids) -- and not yet told of: still this notice's to
+         * stand for, as the kernel's order has it. */
+        int was = __atomic_exchange_n(&e->released, 1, __ATOMIC_ACQ_REL);
+        u32 art = proctab_jc_art_or(t, JCA_DEATH_HELD | JCA_DEATH_FREE);
+        if (was && (art & JCA_DEATH_TOLD)) continue;
+        if (!first) first = t;
+    }
+    if (first) ptrace_wake_waiters();
+    return first;
+}
+
+/* A tracer told us a child of ours is now traced (the attach's kick): say we
+ * have seen it -- our waits look before they reap from here -- and catch
+ * SIGCHLD and watch it while such a child lives. Ordinary context: the kick's
+ * boundary (ptrace_jobctl_service). */
+static void pt_rparent_service(void) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
+    s32 me = (s32)getpid();
+    int any = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || __atomic_load_n(&e->rparent, __ATOMIC_ACQUIRE) != me ||
+            __atomic_load_n(&e->rparent_ack, __ATOMIC_ACQUIRE))
+            continue;
+        any = 1;
+        __atomic_store_n(&e->rparent_ack, 1, __ATOMIC_RELEASE);
+        fx_wake(&e->rparent_ack);
+    }
+    if (any) {
+        sig_chld_watch();
+        sig_host_update(&g_machine, SIGCHLD);
+    }
+}
+
 /* ---- tracer: wait4/waitid integration ---- */
 /* Is tracee link `e` (task `t`) one the wait selects (the kernel's
  * eligible_pid)? A group is asked of the task itself while it is there --
@@ -1985,7 +2195,10 @@ int ptrace_collect(PtWaitSel sel, int flags, int *status, s32 *outpid, PtRusage 
             *status = e->exit_status;
             *outpid = t;
             if (ru) *ru = e->ru;   /* before pt_free: the slot is reusable after */
-            if (!(flags & PT_WAIT_KEEP)) pt_free(e);
+            if (!(flags & PT_WAIT_KEEP)) {
+                pt_release_held(e);   /* the real parent's turn now */
+                pt_free(e);
+            }
             return 1;
         }
         if (st_state != PT_ST_STOPPED) continue;
@@ -2034,9 +2247,10 @@ void ptrace_tracer_wait(u32 gen, int ms) {
     fx_wait(&g_tab->global_gen, gen, ms);
 }
 
-void ptrace_note_reaped(s32 pid) {
-    if (!g_tab) return;
+int ptrace_note_reaped(s32 pid) {
+    if (!g_tab) return 0;
     s32 me = (s32)getpid();
+    int held = 0;
     /* Its links: one we are the tracer of, collected with the reap -- and,
      * for every thread of it, one nobody will ever collect, its tracer gone
      * (a tracee SIGKILLed with its tracer, PTRACE_O_EXITKILL's, leaves them
@@ -2050,11 +2264,13 @@ void ptrace_note_reaped(s32 pid) {
             s32 x = t;
             if (__atomic_compare_exchange_n(&e->tracee, &x, -1, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                held |= e->rparent == me && tr != me;
                 __atomic_store_n(&e->tracer, 0, __ATOMIC_RELEASE);
                 __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
             }
         }
     }
+    return held;
 }
 
 /* The calling process, a tracer, is exiting (exit_group, or a fatal signal):
@@ -2079,9 +2295,12 @@ static void pt_tracer_release(s32 thread) {
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
         if (thread && __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE) != thread)
             continue;
-        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
-            /* A death nobody will collect now: the real parent's reap frees
-             * it (ptrace_note_reaped). */
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED ||
+            pt_task_dead(t)) {
+            /* A death nobody will collect now: the real parent's, released
+             * to it as the kernel's exit_ptrace releases it, and its reap
+             * frees the link (ptrace_note_reaped). */
+            pt_release_held(e);
             __atomic_compare_exchange_n(&e->tracer, &tr, 0, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
             continue;
@@ -2486,7 +2705,10 @@ int ptrace_reap_dead(PtWaitSel sel, int keep, int *status, s32 *outpid, PtRusage
          * is the one from its last stop (nothing better exists -- the accounting
          * died with the task). */
         if (ru) *ru = e->ru;
-        if (!keep) pt_free(e);
+        if (!keep) {
+            pt_release_held(e);
+            pt_free(e);
+        }
         return 1;
     }
     return 0;

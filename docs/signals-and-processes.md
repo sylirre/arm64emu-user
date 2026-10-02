@@ -1327,7 +1327,9 @@ was lost behind it, a standard signal being one pending instance. So every
 place a host `SIGCHLD` reaches the emulator — the capture, `rt_sigtimedwait`, a
 `signalfd` read, a thread handing its signals on — asks one function what it
 is to the guest (`sig_chld_notice`), and while the process has a clone child
-(`clonekids_any`) a host thread of the emulator's own, the **SIGCHLD watcher**,
+(`clonekids_any`) — or a child traced by another process, whose death is held
+back from it (`ptrace_held_kids`; *A traced child's death, to its real parent*,
+below) — a host thread of the emulator's own, the **SIGCHLD watcher**,
 takes the ones no guest thread does: blocking every signal but the host libc's
 own (`sig_helper_mask`, as the tracer watchdog), it waits for
 `SIGCHLD` in `rt_sigtimedwait`, which the kernel hands it whenever no thread
@@ -1350,7 +1352,7 @@ guest's — reading again, so a blocking read blocks and an `O_NONBLOCK` one
 answers `EAGAIN` — and lays a clone child's notice out as the kernel does for
 any signal but `SIGCHLD` with such a code: `_sigpoll`'s, the band over the pid
 and the fd over the status. The watcher is a foreign task (`proc_foreign_add`),
-shown to the guest nowhere, and goes dormant once no clone child is left and
+shown to the guest nowhere, and goes dormant once no such child is left and
 nothing it handed back is waiting, giving `SIGCHLD` back the host disposition
 the guest's alone makes it, until it is woken for the next one: like the tracer
 watchdog, it never ends (*ptrace(2)*, *Death of a tracer*, below).
@@ -2058,6 +2060,64 @@ case: a tracee whose tracer was killed by the same `SIGTERM` it had just been
 stopped for (a shell's `timeout` signals the whole group) ran on, parked in
 whatever it had been doing, with nobody left to end it
 (`tests/ptrace/tracer_death.c`).
+
+**A traced child's death, to its real parent.** A process whose leader is
+traced by another process dies to its tracer first: the kernel sends the tracer
+the notice, lets only the tracer's wait see the zombie (`wait_consider_task`:
+"a zombie ptracee is only visible to its ptracer"), and hands it to the real
+parent once the tracer has reaped it — the parent's `SIGCHLD` going then,
+with the death's own siginfo — or once the tracer is gone (`exit_ptrace`,
+`__ptrace_detach`). Until then the parent's wait for it blocks, or answers 0
+under `WNOHANG`: a child with nothing to report. The host knows the tracee
+for the real parent's ordinary child, and the parent was sent `SIGCHLD` at the
+death and reaped the child at once — under `strace -f`, a shell's wait
+returned before `strace` had heard of its child's exit. So
+(`src/ptracetab.c`, "a traced child's death"):
+
+- *The link knows the real parent* (`rparent`): a guest process other than
+  the tracer's, set by the attach (whose kick tells the parent at once, and
+  which waits a moment for it to say it has seen it — `rparent_ack`, served by
+  `pt_rparent_service` at the parent's next boundary — so no wait of its is
+  still blocked in a host wait that would reap the child) and by a followed
+  fork (the forker is the parent, and knows).
+- *The parent's waits look before they reap.* In a session where anything is
+  traced, every wait goes through `held_waitid` (`sys_proc.c`): the host is
+  asked without taking anything (`WNOWAIT`), a death held back
+  (`ptrace_death_held`: the leader's link names a tracer outside the parent's
+  thread group, alive, that has not let go of it) is a child with nothing to
+  report — the other children are then asked one at a time
+  (`ck_waitid_any`), and a blocking wait sleeps until a release, 50 ms at most
+  — and anything else is taken by its pid. No blocking host wait that takes
+  what it finds is made in such a session: the child it would take might be
+  traced by the time it dies.
+- *The host's notice of a held death is dropped* (`sig_chld_notice`), and
+  marked on the child's registry entry (`JCA_DEATH_HELD`), as the dying
+  process marks itself when it publishes its exit for its tracer.
+- *The release sends the parent a `SIGCHLD`* naming the child
+  (`PT_RELEASE_MAGIC` in `si_uid`, which qemu-user passes through where it
+  rewrites a `SIGCHLD`'s value): from the tracer's collection of the exit
+  (`ptrace_collect`, `ptrace_reap_dead`), from its orderly exit
+  (`pt_tracer_release`), or — the tracer killed outright — from the parent's
+  own finding (a wait, or the SIGCHLD watcher's look every 100 ms). The
+  parent's capture reads the notice off the zombie (`chld_released`: a look
+  that takes nothing gives its code, status and accounting), reaping it there
+  for a parent that ignores `SIGCHLD` (`do_notify_parent`'s autoreap, which a
+  wait then passes by too: `chld_autoreaped`). A tracer may collect an exit as
+  it is published, before the child is a zombie to read; the host's own notice,
+  which comes once it is, is then the one told. Either goes once
+  (`JCA_DEATH_FREE`, `JCA_DEATH_TOLD`). The death of a tracer that is the
+  parent's own child releases its held children first, as `exit_ptrace` does
+  before the tracer's own notice — which then finds `SIGCHLD` pending already
+  (`ptrace_tracer_died`).
+- *A parent with such a child catches `SIGCHLD`* and runs the SIGCHLD watcher
+  (*Clone children*, above) while it lives: a held notice sitting pending under
+  a blocked `SIGCHLD` would swallow the ones after it, and a parent that
+  ignores `SIGCHLD` must keep the zombie for the release rather than have the
+  host reap it (`sig_chld_reap_emulated`).
+
+`tests/fixtures/heldzombie.c` has the parent catching `SIGCHLD`, blocked in
+its wait, blocking `SIGCHLD` (sigpending, a `signalfd`), and ignoring it; the
+tracer reaping, leaving, and killed; a death by `SIGKILL`; and a followed fork.
 
 **A stop's siginfo (`GETSIGINFO`/`SETSIGINFO`).** Every stop publishes the
 siginfo the kernel's `last_siginfo` would hold, in the guest's layout, on its

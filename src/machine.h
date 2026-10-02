@@ -794,11 +794,12 @@ int  ptimer_siginfo(s32 slot, u64 *val, int *thread);
  * record's signal number is translated; 1 = rewritten, guest number and all. */
 int  sig_sfd_requeued(GSignalfdSiginfo *r);
 /* ...and of a SIGCHLD the host queued, what it is to the guest
- * (sig_chld_notice): 1 a record for it, translated on as any; 0 none -- no
- * guest's at all, or a clone child's notice by its own signal, which goes on
- * to the process as that. Called with the record's host number in
- * ssi_signo, after sig_sfd_requeued (signal.c). */
-int  sig_sfd_chld(const GSignalfdSiginfo *r);
+ * (sig_chld_notice): 1 a record for it, translated on as any -- rewritten,
+ * for a traced child's death released to us, as that death's record; 0
+ * none -- no guest's at all, or a clone child's notice by its own signal,
+ * which goes on to the process as that. Called with the record's host
+ * number in ssi_signo, after sig_sfd_requeued (signal.c). */
+int  sig_sfd_chld(GSignalfdSiginfo *r);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
 void sig_deliver_fault(CPU *c, int sig, int code, u64 addr);
 /* SECCOMP_RET_TRAP: SIGSYS carrying the blocked syscall (sys_seccomp.c). */
@@ -1450,6 +1451,13 @@ void proctab_chldact_set(u8 bits);
 #define JCA_STOP_WAIT 2u       /* ...and its wait report, already given */
 #define JCA_CONT_CHLD 4u       /* the host's CLD_CONTINUED of a wake of ours, */
 #define JCA_CONT_WAIT 8u       /* ...and its wait report: never a kernel's */
+#define JCA_DEATH_HELD 16u     /* the host's death notice of it is not its
+                                * real parent's: its tracer had the death to
+                                * collect first, and the notice the parent is
+                                * owed comes as that is done (ptracetab.c, "a
+                                * traced child's death") */
+#define JCA_DEATH_FREE 32u     /* ...and is done: the death is the parent's */
+#define JCA_DEATH_TOLD 64u     /* ...whose notice of it has gone, once */
 void proctab_jc_set(u32 word, s32 parent);       /* ours, posted for `parent` */
 int  proctab_jc_continued(s32 parent);           /* SIGCONT: 1 if it was stopped */
 u32  proctab_jc_word(s32 pid);
@@ -1462,6 +1470,7 @@ void proctab_jc_art_set(u32 bits);
 u32  proctab_jc_art(s32 pid);
 void proctab_jc_art_clear(s32 pid, u32 bits);
 void proctab_jc_art_mark(s32 pid, u32 bits);     /* a waker's, before its wake */
+u32  proctab_jc_art_or(s32 pid, u32 bits);       /* ...the bits it had before */
 void proctab_jc_hseen(s32 pid, int sig, int taken);  /* the parent's report */
 int  proctab_jc_hstop(s32 pid, int *sig, int *taken); /* ...of this stop */
 u32 *proctab_jc_peek_word(s32 pid);              /* the parent's answer, a futex */

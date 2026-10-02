@@ -3131,6 +3131,14 @@ if "$AGCC" -static -O2 -o tests/fixtures/tracerwatch.bin tests/fixtures/tracerwa
 else
     skip_build fixtures/tracerwatch
 fi
+# A traced child's death, to its real parent when the tracer is another
+# process: only once the tracer has reaped it, or is gone -- the parent's
+# waits see nothing of it before, and its notice comes then (ptracetab.c, "a
+# traced child's death"). The parent catching SIGCHLD, blocked in its wait,
+# blocking SIGCHLD (signalfd), ignoring it; the tracer reaping, leaving,
+# killed; a death by SIGKILL; a followed fork. Self-checking: the block is
+# the kernel's.
+check_fixture heldzombie $'tracer reaps it:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, exited 5\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer leaves:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: left it\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer killed:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: killed\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\nkilled by SIGKILL:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, killed\n  after: notice code=2 status=9 from the child=1\n  wait(child)=the child, killed by 9\nblocked in its wait:\n  wait(child)=the child, exited 5, after the tracer\'s reap\n  tracer: reaped it, exited 5\nSIGCHLD blocked:\n  before: pending=0, signalfd empty\n  tracer: reaped it, exited 5\n  after: signalfd read the child=1 code=1 status=5\n  wait(child)=the child, exited 5\nSIGCHLD ignored:\n  wait(child)=ECHILD, after the tracer\'s reap\n  tracer: reaped it, exited 5\na followed fork\'s child:\n  parent before the tracer: nothing yet\n  parent: the child, exited 6, after the tracer\'s reap\ndone'
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

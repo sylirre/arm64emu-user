@@ -58,6 +58,13 @@ extern int g_sig_kicksig;
  * signal the host stopped it (ptracetab.c, pt_peek_stop; signal.c,
  * sig_kick_net). si_pid names the child. */
 #define PT_PEEKSTOP_MAGIC 0x50545053  /* "PTPS" */
+/* The si_uid of the SIGCHLD a traced child's real parent is sent when the
+ * child's death, held back from it until then, is released to it -- its
+ * tracer collected it, or is gone (ptracetab.c, pt_release_held). An
+ * SI_QUEUE whose si_pid names the child; the parent's capture rebuilds the
+ * notice from the zombie itself (signal.c, sig_chld_notice). In si_uid:
+ * qemu-user rewrites a SIGCHLD's value, and passes pid and uid through. */
+#define PT_RELEASE_MAGIC 0x524c5345   /* "RLSE" */
 /* The same number also carries a guest's job-control signals to a traced
  * process -- SIGSTOP's own would freeze it -- marked in si_code instead
  * (signal.c, sig_send_jc). */
@@ -294,8 +301,27 @@ void ptrace_tracer_wait(u32 gen, int ms);
 /* Wake every process blocked in the wait4 polling loop (a guest exit, so a
  * parent waiting on a child that isn't a host-visible stop re-checks). */
 void ptrace_wake_waiters(void);
-/* A child pid was reaped by the host wait: drop its tracee link if any. */
-void ptrace_note_reaped(s32 pid);
+/* A child pid was reaped by the host wait: drop its tracee link if any. 1
+ * when that link was one of a child of ours traced by another (the caller
+ * looks at SIGCHLD's host disposition again: ptrace_held_kids). */
+int  ptrace_note_reaped(s32 pid);
+/* The real parent's view of a traced child's death (ptracetab.c, "a traced
+ * child's death"): is the death of `pid`, a child of ours, held back from us
+ * -- its leader traced by a tracer outside our thread group that has not
+ * collected it? `sure`: in ordinary context, and a tracer found gone releases
+ * it here (sending us the notice its exit would have); 0 asks the links
+ * alone, async-signal-safe. */
+int  ptrace_death_held(s32 pid, int sure);
+/* Has this process a child traced by a tracer outside it -- one whose death
+ * would be held back? `sweep`, ordinary context: release the deaths of the
+ * ones whose tracer is gone. 0: the links alone, async-signal-safe. */
+int  ptrace_held_kids(int sweep);
+/* Child `r` of ours died: the deaths it held back as the tracer of our
+ * children are ours now, as exit_ptrace releases them at a tracer's death --
+ * before its own notice, which then finds SIGCHLD pending already. Returns
+ * the first such child, whose notice stands for them all, or 0.
+ * Async-signal-safe (the capture's). */
+s32  ptrace_tracer_died(s32 r);
 /* A fork child has no watchdog of its parent's, dormant or not (the atfork
  * child handler, main.c). */
 void ptrace_helpers_fork_child(void);

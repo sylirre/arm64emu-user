@@ -1830,8 +1830,66 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
  * be is asked only of one (si_code > 0): the emulator's own, the notices it
  * sends and the signals handed back through rq_tab, were asked as they were
  * made. Async-signal-safe (the capture's). */
+/* The release of child `kid`'s death, held back from us until its tracer
+ * collected it (ptracetab.c, "a traced child's death"): the notice the
+ * kernel sends then, do_notify_parent's own -- read off the zombie, which a
+ * look that takes nothing finds with its status and accounting -- or, for a
+ * parent that has its children reaped at their death, that reaping. 0 when
+ * there is nothing to tell: the child is not ours, or not there any more. */
+static int chld_released(PendSig *p, s32 kid) {
+    siginfo_t x;
+    KRusage kru;
+    memset(&x, 0, sizeof x);
+    memset(&kru, 0, sizeof kru);
+    if (syscall(SYS_waitid, P_PID, (id_t)kid, &x, WEXITED | WNOHANG | WNOWAIT | __WALL,
+                &kru) != 0 || x.si_pid != kid)
+        return 0;
+    u64 ut = (u64)kru.utime_sec * 100 + (u64)kru.utime_usec / 10000;
+    u64 st = (u64)kru.stime_sec * 100 + (u64)kru.stime_usec / 10000;
+    p->signo = SIGCHLD;
+    p->code = x.si_code;
+    p->err = 0;
+    p->pid = (int)kid;
+    p->uid = (int)sig_ruid_of(kid);
+    p->status = x.si_status;
+    p->utime = (s64)(ut > 0xffffffffu ? 0xffffffffu : ut);
+    p->stime = (s64)(st > 0xffffffffu ? 0xffffffffu : st);
+    p->addr = 0;
+    p->value = 0;
+    p->thr = 0;
+    p->poll = 0;
+    int es = clonekid_exit_signal(kid);   /* a traced clone child: its own */
+    if (es >= 0) {
+        if (es == 0 || es > 64 || !clonekid_tell(kid)) return 0;
+        p->signo = es;
+        return 1;
+    }
+    /* A parent that has its children reaped at their death has this one
+     * reaped now, at its release (do_notify_parent's autoreap): the host
+     * cannot have, the zombie having been kept for the tracer. */
+    if (sig_chld_reaps(&g_machine) &&
+        syscall(SYS_waitid, P_PID, (id_t)kid, &x, WEXITED | WNOHANG | __WALL, &kru) == 0 &&
+        x.si_pid == kid) {
+        proctab_helper_charge_k(&kru);   /* as below */
+        proctab_reaped(kid);
+    }
+    return 1;
+}
+
 static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
     if (p->signo != SIGCHLD) return 1;
+    /* A traced child's death released to us (chld_released). Its tracer may
+     * have collected it as the child published it, before the child was a
+     * zombie: then the host's own notice, which comes once it is, is the one
+     * to tell (below). Either way once (JCA_DEATH_TOLD). */
+    if (si->si_signo == SIGCHLD && si->si_code == SI_QUEUE && p->code == SI_QUEUE &&
+        (u32)si->si_uid == PT_RELEASE_MAGIC) {
+        s32 kid = (s32)si->si_pid;
+        if ((proctab_jc_art(kid) & JCA_DEATH_TOLD) || !chld_released(p, kid) ||
+            (proctab_jc_art_or(kid, JCA_DEATH_TOLD) & JCA_DEATH_TOLD))
+            return 0;
+        if (p->signo != SIGCHLD) return 1;   /* a clone child's own signal */
+    }
     /* One of ours handed back whose slot is gone (rq_claim found nothing):
      * the watcher's, given up because another SIGCHLD took its turn
      * (cw_taken). */
@@ -1861,6 +1919,41 @@ static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
      * watcher may have sent it already, its host SIGCHLD having gone behind
      * another, or a wait that reaped the child first (clonekid_tell). */
     if (raw && (p->code == CLD_EXITED || p->code == CLD_KILLED || p->code == CLD_DUMPED)) {
+        /* A traced child's death, its tracer's to collect first: none of
+         * ours yet, and its notice comes with the release (chld_released) --
+         * marked, for a notice taken after the tracer has let go of it. */
+        if (ptrace_death_held(p->pid, 0)) {
+            proctab_jc_art_mark(p->pid, JCA_DEATH_HELD);
+            return 0;
+        }
+        u32 art = proctab_jc_art(p->pid);
+        if (art & JCA_DEATH_HELD) {
+            /* Released already, before it was a zombie to tell of: this is
+             * the notice (above). Not yet -- its tracer gone outright and
+             * nobody has said so -- the release brings it. */
+            PendSig q;
+            if (!(art & JCA_DEATH_FREE) || !chld_released(&q, p->pid) ||
+                (proctab_jc_art_or(p->pid, JCA_DEATH_TOLD) & JCA_DEATH_TOLD))
+                return 0;
+            *p = q;
+            if (p->signo != SIGCHLD) return 1;
+            goto notice;
+        }
+        /* ...and the death of the tracer of such a child of ours, which
+         * releases its death to us first (ptrace_tracer_died): that child's
+         * notice is the one we are sent, its SIGCHLD taking this one's
+         * place as a second instance would -- unless it is a clone child's
+         * own signal, which goes to the process beside this. */
+        s32 kid = ptrace_tracer_died(p->pid);
+        PendSig q;
+        if (kid && chld_released(&q, kid) &&
+            !(proctab_jc_art_or(kid, JCA_DEATH_TOLD) & JCA_DEATH_TOLD)) {
+            if (q.signo == SIGCHLD) {
+                *p = q;
+                goto notice;
+            }
+            rq_put_quick(&q);
+        }
         int es = clonekid_exit_signal(p->pid);
         if (es >= 0) {
             if (es == 0 || es > 64) return 0;   /* dies with no signal at all */
@@ -1885,6 +1978,7 @@ static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
             }
         }
     }
+notice:
     /* A stop or continue notice is never sent to a parent that set
      * SA_NOCLDSTOP (do_notify_parent_cldstop): a host that ignores the flag
      * sends it all the same, and it goes no further. */
@@ -2791,7 +2885,10 @@ void sig_helpers_fork_child(void) {
  * one that was never the guest's to have.
  *
  * So while this process has a clone child (clonekids_any: forked and not yet
- * reaped), one host thread of the emulator's own takes the host's SIGCHLDs
+ * reaped), or a child traced by another process, whose death is held back
+ * from us until its tracer has it (ptrace_held_kids; ptracetab.c, "a traced
+ * child's death"), one host thread of the emulator's own takes the host's
+ * SIGCHLDs
  * that no thread of the guest's does: blocking every signal, it waits for
  * SIGCHLD in rt_sigtimedwait, which the kernel hands one to whenever no thread
  * with it unblocked is there to take it (the forking thread is asked first,
@@ -2815,10 +2912,11 @@ void sig_helpers_fork_child(void) {
  *
  * The thread blocks every signal, takes no emulator lock but thr_lock to join
  * the foreign-task set (it is no guest thread, and shown as none), holds no
- * descriptor but /proc's for a moment, and goes dormant once no clone child is
+ * descriptor but /proc's for a moment, and goes dormant once no such child is
  * left and nothing it handed back is waiting -- giving SIGCHLD back the host
  * disposition the guest's alone makes it -- to be woken when one is made
- * again ("the emulator's own threads, and fork"). */
+ * again ("the emulator's own threads, and fork"). Every 100 ms it also
+ * releases the held deaths whose tracer is gone (ptrace_held_kids(1)). */
 static int host_take_pending(u64 set, siginfo_t *si);
 static long host_sigtimedwait(u64 set, siginfo_t *si, s64 ns);
 static u32 cw_on;    /* the watcher runs: 0 -> 1 by whoever starts it */
@@ -2844,7 +2942,7 @@ static void cw_taken(void) {
     syscall(SYS_futex, &cw_tok, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
 }
 
-static int cw_due(void) { return clonekids_any(); }
+static int cw_due(void) { return clonekids_any() || ptrace_held_kids(1); }
 
 /* One signal for the guest, as the watcher hands it on: a SIGCHLD with its
  * token in cw_tok from before it is sent (rq_queue). */
@@ -3054,34 +3152,48 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
     return 1;
 }
 
-int sig_sfd_chld(const GSignalfdSiginfo *r) {
+int sig_sfd_chld(GSignalfdSiginfo *r) {
     if (r->ssi_signo != SIGCHLD) return 1;
     siginfo_t si;
     memset(&si, 0, sizeof si);
-    /* An SI_QUEUE of our own that sig_sfd_requeued did not claim: the
-     * watcher's hand-back, given up (sig_chld_notice). */
-    if (r->ssi_code == SI_QUEUE) {
-        si.si_code = SI_QUEUE;
-        si.si_pid = (pid_t)r->ssi_pid;
-        si.si_uid = (uid_t)r->ssi_uid;
-        return !rq_stale(&si);
-    }
-    if (r->ssi_code <= 0) return 1;
     si.si_signo = SIGCHLD;
     si.si_code = r->ssi_code;
     si.si_pid = (pid_t)r->ssi_pid;
     si.si_uid = (uid_t)r->ssi_uid;
-    si.si_status = r->ssi_status;
-    si.si_utime = (clock_t)r->ssi_utime;
-    si.si_stime = (clock_t)r->ssi_stime;
+    if (r->ssi_code == SI_QUEUE) {
+        /* An SI_QUEUE of our own that sig_sfd_requeued did not claim: the
+         * watcher's hand-back, given up (sig_chld_notice). And a traced
+         * child's death released to us, which is that death's record. */
+        if (r->ssi_uid != PT_RELEASE_MAGIC) return !rq_stale(&si);
+    } else if (r->ssi_code <= 0) {
+        return 1;
+    } else {
+        si.si_status = r->ssi_status;
+        si.si_utime = (clock_t)r->ssi_utime;
+        si.si_stime = (clock_t)r->ssi_stime;
+    }
     PendSig p;
     pendsig_from_host(&p, SIGCHLD, &si);
     if (!sig_chld_notice(&p, &si)) return 0;
-    if (p.signo == SIGCHLD) return 1;
-    u64 prev = host_block_all();
-    rq_put(&p);
-    host_set_mask(prev);
-    return 0;
+    if (p.signo != SIGCHLD) {
+        u64 prev = host_block_all();
+        rq_put(&p);
+        host_set_mask(prev);
+        return 0;
+    }
+    if (r->ssi_code == SI_QUEUE) {
+        GSignalfdSiginfo n;
+        memset(&n, 0, sizeof n);
+        n.ssi_signo = SIGCHLD;
+        n.ssi_code = p.code;
+        n.ssi_pid = (u32)p.pid;
+        n.ssi_uid = (u32)p.uid;
+        n.ssi_status = p.status;
+        n.ssi_utime = (u64)p.utime;
+        n.ssi_stime = (u64)p.stime;
+        *r = n;
+    }
+    return 1;
 }
 
 static int host_take_pending(u64 set, siginfo_t *si);
@@ -3314,7 +3426,7 @@ int sig_chld_reaps(struct Machine *m) {
  * from it by a clone child (sig_chld_host), or not doing it at all
  * (sig_probe_host)? Async-signal-safe. */
 int sig_chld_reap_emulated(void) {
-    return clonekids_any() || !g_sig_nocld_ok;
+    return clonekids_any() || ptrace_held_kids(0) || !g_sig_nocld_ok;
 }
 
 static int sig_chld_emulating(void) {
