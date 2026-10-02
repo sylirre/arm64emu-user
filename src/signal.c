@@ -3120,6 +3120,16 @@ static int sc_restart_nohandler(CPU *c) {
     case G_NR_splice:
         return !sock_timeo_set(fd, SO_RCVTIMEO) &&
                !sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO);
+    case G_NR_ppoll:
+    case G_NR_pselect6:
+        /* poll_select_finish: a timeout left as it was given -- under
+         * personality(STICKY_TIMEOUTS) -- cannot be restarted from, so the
+         * restart a stop would give the call is EINTR. A stop of the host's
+         * makes it so itself, on the host thread whose personality carries
+         * the bit (sys_proc.c); a stop of the emulator's -- a tracee's --
+         * comes here. */
+        return !((g_tls.personality & G_STICKY_TIMEOUTS) &&
+                 c->x[g_tls.sc_nr == G_NR_ppoll ? 2 : 4]);
     default:
         return 1;
     }

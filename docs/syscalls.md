@@ -2002,7 +2002,7 @@ on a system with no AArch32 at EL0 — and this one runs A64 alone.
 |---|---|
 | `UNAME26` | `uname`'s release reads `2.6.61-arm64chroot` (`override_release`: `2.6.<60 + patchlevel>` and the rest of the real string) |
 | `READ_IMPLIES_EXEC` | a readable mapping is executable: `mmap`, `mprotect`, the heap `brk` grows (`VM_DATA_DEFAULT_FLAGS`), `shmat`. There is no noexec mount here to be the kernel's exception |
-| `STICKY_TIMEOUTS` | `ppoll`/`pselect6` leave the caller's timeout as given, and a stop and continue during the wait is `EINTR` rather than a restart (`poll_select_finish`). The write-back is the emulator's; the restart is the host kernel's to refuse, so this one bit is carried on the host thread's own personality — none of the rest could be: `READ_IMPLIES_EXEC` there would make the emulator's own mappings executable, which Android's SELinux denies |
+| `STICKY_TIMEOUTS` | `ppoll`/`pselect6` leave the caller's timeout as given, and a stop and continue during the wait is `EINTR` rather than a restart (`poll_select_finish`). The write-back is the emulator's; the restart is the host kernel's to refuse across a host stop, so this one bit is carried on the host thread's own personality — none of the rest could be: `READ_IMPLIES_EXEC` there would make the emulator's own mappings executable, which Android's SELinux denies — and the emulator's to refuse across a stop of its own, a tracee's (`sc_restart_nohandler`; `tests/ptrace/stickystop.c`) |
 | `MMAP_PAGE_ZERO` | the next exec maps page zero read+exec, where `vm.mmap_min_addr` allows a mapping there at all (it never does on a stock kernel) |
 | `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` | nothing to change: the guest layout is never randomized, and mappings are placed bottom-up |
 
