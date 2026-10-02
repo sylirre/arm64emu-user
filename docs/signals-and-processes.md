@@ -2030,7 +2030,14 @@ but those that answer a plain `EINTR`, which a stop leaves with it
 (`sc_restart_nohandler`, above). What the kernel never sends stays unsent: a
 child's death notice to a parent ignoring `SIGCHLD` is dropped at capture, and
 the child is reaped. The emulator used to leave the host to ignore them all,
-and a tracer never saw them (`tests/ptrace/ignored.c`).
+and a tracer never saw them (`tests/ptrace/ignored.c`). And a queued one is
+due wherever the emulator asks whether a signal is (`sig_pending_deliverable`
+— every wait it serves itself, the JIT's re-check before a block, the SVC
+check): an ignored signal ends no wait, unless the thread is traced and no
+stop has been through it yet (`PendSig.ptraced`). Taken for one nobody would
+act on, it left `sigsuspend`, `wait4` and `sigtimedwait` asleep with it queued,
+and the JIT running on into the next blocking call — a stop its tracer waited
+for in vain (`tests/ptrace/ignoredwait.c`).
 
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,

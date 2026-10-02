@@ -515,6 +515,17 @@ static void sigq_take(int t) {
 
 static int is_sync_sig(int sig);
 
+/* Is an instance of `sig` queued that has not been through its
+ * signal-delivery stop (PendSig.ptraced)? A walk of what the ring holds
+ * now, as sigq_pick's: the handler only ever adds past the head. */
+static int sigq_unstopped(int sig) {
+    if (!sigq_pend(sig)) return 0;
+    if (!__atomic_load_n(&sigq_ninj, __ATOMIC_RELAXED)) return 1;
+    for (int t = sigq_tail; t != sigq_head; t = sigq_next(t))
+        if (sigq[t].signo == sig && !sigq[t].ptraced) return 1;
+    return 0;
+}
+
 /* The kernel's SYNCHRONOUS_MASK: taken ahead of any other pending signal of
  * the same queue, whatever its number (next_signal). */
 static int sig_sync_prio(int sig) {
@@ -3512,10 +3523,15 @@ int sig_pending_deliverable(struct Machine *m) {
         if (!sigq_pend(sig)) continue;
         if (g_tls.sigmask & (1ULL << (sig - 1))) continue;
         u64 h = sig_action_handler(m, sig);
-        if (h == GSIG_IGN) continue;
-        if (h == GSIG_DFL && (sig == SIGCHLD || sig == SIGWINCH ||
-                              sig == SIGURG || sig == SIGCONT))
-            continue;
+        int ign = h == GSIG_IGN ||
+                  (h == GSIG_DFL && (sig == SIGCHLD || sig == SIGWINCH ||
+                                     sig == SIGURG || sig == SIGCONT));
+        /* An ignored signal ends no wait -- unless this thread is traced
+         * and no stop has been through it yet: the kernel queues it for a
+         * tracee (sig_ignored), the wait it lands in returns to get_signal,
+         * and the tracee stops for it there. Waited through instead, it
+         * stopped nobody: a tracer's wait for that stop never ended. */
+        if (ign && !(g_ptrace_active && sigq_unstopped(sig))) continue;
         return 1;
     }
     return 0;
