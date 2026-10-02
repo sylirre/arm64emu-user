@@ -3543,8 +3543,20 @@ static void jc_rusage(s32 pid, GRusage *g) {
  * registry has it (JCA_STOP_WAIT). */
 static int jc_host_artefact(s32 pid, int stopped) {
     if (pid <= 0 || !proctab_has(pid)) return 0;
-    if (ptrace_tgid_traced(pid)) return 1;
-    return stopped && (proctab_jc_art(pid) & JCA_STOP_WAIT);
+    u32 art = proctab_jc_art(pid);
+    if (!stopped) {
+        /* A continue of the host's by a wake of ours (JCA_CONT_WAIT): taken
+         * now, as the report it is. */
+        int ours = ptrace_tgid_traced(pid) || (art & JCA_CONT_WAIT);
+        if (ours && (art & JCA_CONT_WAIT)) proctab_jc_art_clear(pid, JCA_CONT_WAIT);
+        return ours;
+    }
+    if (ptrace_tgid_traced(pid) || (art & JCA_STOP_WAIT)) return 1;
+    /* A stop of its own: whatever continue of ours was still to be reported
+     * is no longer reportable -- the stop took its place. */
+    if (art & (JCA_CONT_CHLD | JCA_CONT_WAIT))
+        proctab_jc_art_clear(pid, JCA_CONT_CHLD | JCA_CONT_WAIT);
+    return 0;
 }
 
 /* ...and one given to the guest: which stop it was, for an attach that finds
@@ -3758,6 +3770,7 @@ SYSDEF(wait4) {
             return (u64)(u32)rp;
         }
         if (options & WNOHANG) return 0;     /* nothing ready yet */
+        ptrace_watch_tracees();              /* what the host did to them */
         ptrace_tracer_wait(gen, 100);        /* sleep until an event or backstop */
         if (g_ptrace_kick) ptrace_service_kick(c);
         if (g_sig_npend && sig_pending_deliverable(c->m))
@@ -4015,6 +4028,7 @@ SYSDEF(waitid) {
             int e = waitid_out(c, infop, &si);
             return e ? (u64)(s64)e : 0;
         }
+        ptrace_watch_tracees();   /* what the host did to them */
         ptrace_tracer_wait(gen, 100);
         if (g_ptrace_kick) ptrace_service_kick(c);
         if (g_sig_npend && sig_pending_deliverable(c->m))

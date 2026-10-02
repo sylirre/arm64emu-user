@@ -1746,18 +1746,44 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
         sig_selfintr();
         return;
     }
+    /* ...and the one it woke a tracee with that a SIGSTOP from outside the
+     * guest had stopped (ptrace_watch_tracees): that SIGSTOP, taken as a
+     * signal of the tracee's, a signal-delivery-stop to report. From outside:
+     * nobody the guest can see, and the host user as the guest sees it. */
+    if (sig == SIGCONT && si->si_code == SI_QUEUE &&
+        si->si_value.sival_int == PT_FOREIGN_MAGIC) {
+        PendSig s;
+        memset(&s, 0, sizeof s);
+        s.signo = SIGSTOP;
+        s.code = SI_USER;
+        s.uid = (int)(g_machine.fake_id ? remap_uid(&g_machine, g_machine.host_uid)
+                                        : g_machine.host_uid);
+        jc_stamp(&s);
+        sig_capture_push(&s, uctx);
+        return;
+    }
     PendSig ps, *p = &ps;
     pendsig_from_host(p, sig, si);
     /* The host's own notice of a guest child's stop or continue that the
      * emulator made, which a kernel never sends (the real parent's view,
      * above): of a process a tracer holds threads of, or of the stop a group
      * stop is handed over as. */
-    if (sig == SIGCHLD && (si->si_code == CLD_STOPPED || si->si_code == CLD_CONTINUED) &&
-        (ptrace_tgid_traced((s32)si->si_pid) ||
-         (si->si_code == CLD_STOPPED &&
-          (proctab_jc_art((s32)si->si_pid) & JCA_STOP_CHLD)))) {
-        sig_selfintr();   /* never sent: it interrupted nothing */
-        return;
+    if (sig == SIGCHLD && (si->si_code == CLD_STOPPED || si->si_code == CLD_CONTINUED)) {
+        s32 kid = (s32)si->si_pid;
+        u32 art = proctab_jc_art(kid);
+        int ours;
+        if (si->si_code == CLD_CONTINUED) {
+            ours = ptrace_tgid_traced(kid) || (art & JCA_CONT_CHLD);
+            if (ours && (art & JCA_CONT_CHLD)) proctab_jc_art_clear(kid, JCA_CONT_CHLD);
+        } else {
+            ours = ptrace_tgid_traced(kid) || (art & JCA_STOP_CHLD);
+            if (!ours && (art & (JCA_CONT_CHLD | JCA_CONT_WAIT)))
+                proctab_jc_art_clear(kid, JCA_CONT_CHLD | JCA_CONT_WAIT);
+        }
+        if (ours) {
+            sig_selfintr();   /* never sent: it interrupted nothing */
+            return;
+        }
     }
     /* The death of a clone child -- one forked with an exit signal other than
      * SIGCHLD (sys_proc.c) -- is reported with that signal, or with none; the
@@ -2421,6 +2447,7 @@ static int rq_put(const PendSig *p) {
         tok = (nonce << RQ_IDX_BITS) | idx;
     } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
              tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC ||
+             tok == PT_FOREIGN_MAGIC ||
              tok >> 16 == SIG_JC_TAG ||   /* a job-control descriptor's shape */
              tok >> 24 == SIG_CARRY_TAG);   /* ...or a carrier token's */
     slot->nonce = nonce;

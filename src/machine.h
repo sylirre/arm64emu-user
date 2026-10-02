@@ -1394,6 +1394,8 @@ void proctab_chldact_set(u8 bits);
 /* ...and the host reports that are the emulator's own (ProcEnt.jc_art): */
 #define JCA_STOP_CHLD 1u       /* the host's CLD_STOPPED of our hand-over stop */
 #define JCA_STOP_WAIT 2u       /* ...and its wait report, already given */
+#define JCA_CONT_CHLD 4u       /* the host's CLD_CONTINUED of a wake of ours, */
+#define JCA_CONT_WAIT 8u       /* ...and its wait report: never a kernel's */
 void proctab_jc_set(u32 word, s32 parent);       /* ours, posted for `parent` */
 int  proctab_jc_continued(s32 parent);           /* SIGCONT: 1 if it was stopped */
 u32  proctab_jc_word(s32 pid);
@@ -1405,6 +1407,7 @@ int  proctab_jc_take(int seltype, s32 selid, int stops, int conts, int keep,
 void proctab_jc_art_set(u32 bits);
 u32  proctab_jc_art(s32 pid);
 void proctab_jc_art_clear(s32 pid, u32 bits);
+void proctab_jc_art_mark(s32 pid, u32 bits);     /* a waker's, before its wake */
 void proctab_jc_hcons_set(s32 pid, u64 sw);
 u64  proctab_jc_hcons(s32 pid);
 u64  proctab_ctxsw(s32 pid);                     /* moves only while it runs */

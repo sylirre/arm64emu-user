@@ -48,6 +48,11 @@ extern int g_sig_kicksig;
 /* The value of the SIGCONT a tracer wakes a host-stopped tracee with, so its
  * capture can drop it (ptracetab.c, ptrace_wake_stopped). */
 #define PT_STOPWAKE_MAGIC 0x50545357  /* "PTSW" */
+/* ...and the one a tracer wakes a tracee with that a SIGSTOP from outside the
+ * guest stopped where the tracer cannot reach it: its capture takes the
+ * SIGSTOP that stopped it as one of its own signals instead
+ * (ptrace_watch_tracees). */
+#define PT_FOREIGN_MAGIC 0x50544653   /* "PTFS" */
 /* The same number also carries a guest's job-control signals to a traced
  * process -- SIGSTOP's own would freeze it -- marked in si_code instead
  * (signal.c, sig_send_jc). */
@@ -156,6 +161,12 @@ void ptrace_jc_notify(s32 tgid, int kick);
 s32  ptrace_leader_tracer(void);
 int  ptrace_tgid_traced(s32 tgid);
 void ptrace_wake_waiter(s32 pid);
+/* A tracer's look at its tracees for what the host did to them that no
+ * guest code of theirs can say (ptracetab.c, "the ptrace watchdog"): a death
+ * by SIGKILL, told as the kernel's notice; a SIGSTOP from outside, turned
+ * into the signal it is to the tracee. The watchdog makes it every 100 ms,
+ * a tracer's wait as it goes round. */
+void ptrace_watch_tracees(void);
 /* Bring thread `tid` of this process to its run-loop boundary (the kick). */
 void ptrace_kick_thread(s32 tid);
 /* Is process `tgid` stopped by the host (a stop the host carried out, which

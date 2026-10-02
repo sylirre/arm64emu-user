@@ -132,6 +132,8 @@ typedef struct {
     u32 event;           /* PTRACE_EVENT_* of the current stop (0 = none) */
     u32 syscall_stop;    /* current stop is a syscall-entry/exit stop */
     u32 attach_pending;  /* tracer ATTACH/SEIZE'd us: adopt at the next boundary */
+    u32 death_told;      /* the tracer has been sent its notice of a death no
+                          * guest code published (ptrace_watch_tracees) */
     u32 attach_stopped;  /* ...while the host had the process stopped: adopt into
                           * a group stop (the tracer woke it to adopt at all);
                           * 3 when the real parent had taken the host's report
@@ -369,6 +371,7 @@ static void pt_link_fill(PtLink *e, s32 tgid) {
     e->eventmsg = 0; e->has_siginfo = 0;
     e->attach_pending = e->interrupt_pending = 0;
     e->attach_stopped = 0;
+    e->death_told = 0;
     e->trap_notify = 0; e->seize = 0; e->listening = 0;
     memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
     e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
@@ -1748,6 +1751,7 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
          * raise(SIGSTOP), on through its next guest instructions, until the
          * kick caught up. On a slow host that was whole system calls, and a
          * child that was to stop for its tracer exited instead. */
+        pt_wd_start();   /* a tracer now: what the host does to it is ours to see */
         int stopped = ptrace_task_stopped(tgid);
         /* ...and whether its real parent has already taken the host's report
          * of that stop: its group_exit_code, a kernel's attach keeps as it
@@ -2159,6 +2163,10 @@ int ptrace_task_stopped(s32 tgid) {
 }
 
 void ptrace_wake_stopped(s32 tgid) {
+    /* The host's continue -- a CLD_CONTINUED, a WCONTINUED report -- is our
+     * doing, not a kernel's: marked before it is made, for the real parent
+     * not to be shown it (sys_proc.c, jc_host_artefact). */
+    proctab_jc_art_mark(tgid, JCA_CONT_CHLD | JCA_CONT_WAIT);
     siginfo_t si;
     memset(&si, 0, sizeof si);
     si.si_signo = SIGCONT;
@@ -2208,7 +2216,7 @@ static int pt_tracer_gone(const PtLink *e) {
     return 0;
 }
 
-/* ---- the tracer watchdog -------------------------------------------------
+/* ---- the ptrace watchdog ------------------------------------------------
  *
  * The kernel's exit_ptrace, when a tracer exits: each tracee is detached --
  * running on, or taking what its stop leaves it -- or, with
@@ -2223,7 +2231,19 @@ static int pt_tracer_gone(const PtLink *e) {
  * EXITKILL, as the kernel's SIGKILL kills it. The thread blocks every signal,
  * takes no emulator lock but thr_lock to join the foreign-task set (it is no
  * guest thread, and shown as none), holds no descriptor, and ends once no
- * thread is traced. */
+ * thread is traced.
+ *
+ * The same thread watches, while this process traces anything, what the host
+ * does to its tracees that no guest code of theirs can say
+ * (ptrace_watch_tracees): a death by SIGKILL, which the kernel tells a tracer
+ * with a CLD_KILLED notice, and a SIGSTOP from outside the guest -- a shell's
+ * kill -STOP -- which stops a tracee where its tracer cannot reach it, and
+ * which is a signal like any other to a kernel's tracee: reported as a
+ * signal-delivery-stop. The tracee is woken with a SIGCONT of the host's
+ * (PT_FOREIGN_MAGIC) that its capture turns into that SIGSTOP. A tracer's
+ * wait makes the same look as it goes round, for a tracer that sleeps in it
+ * (the 100 ms are the tracer's latency otherwise). */
+static int pt_tracing(void);
 static void *pt_watchdog(void *arg) {
     (void)arg;
     s32 self = (s32)syscall(SYS_gettid);
@@ -2232,16 +2252,17 @@ static void *pt_watchdog(void *arg) {
     for (;;) {
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
-        if (!ptrace_traced()) {
+        if (!ptrace_traced() && !pt_tracing()) {
             __atomic_store_n(&pt_wd_on, 0, __ATOMIC_SEQ_CST);
-            /* Traced again meanwhile, and nobody started one (pt_wd_start
-             * saw this one still on): carry on. */
+            /* Traced or tracing again meanwhile, and nobody started one
+             * (pt_wd_start saw this one still on): carry on. */
             u32 z = 0;
-            if (!ptrace_traced() ||
+            if ((!ptrace_traced() && !pt_tracing()) ||
                 !__atomic_compare_exchange_n(&pt_wd_on, &z, 1, false,
                                              __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
                 break;
         }
+        ptrace_watch_tracees();   /* as a tracer */
         for (int i = 0; g_tab && i < PTRACE_MAX; i++) {
             PtLink *e = &g_tab->links[i];
             s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
@@ -2263,6 +2284,92 @@ static void *pt_watchdog(void *arg) {
     }
     proc_foreign_del(self);
     return NULL;
+}
+
+/* Does this process trace anything still? */
+static int pt_tracing(void) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return 0;
+    s32 me = (s32)getpid();
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) > 0 &&
+            __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) == me)
+            return 1;
+    }
+    return 0;
+}
+
+/* The host parent of task `t` (/proc/<t>/stat), 0 when it cannot be read. */
+static s32 pt_task_ppid(s32 t) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)t);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fdwin_leave(); return 0; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    fdwin_leave();
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')');
+    char st;
+    int pp;
+    return rp && sscanf(rp + 1, " %c %d", &st, &pp) == 2 ? (s32)pp : 0;
+}
+
+static void pt_wd_start(void);
+void ptrace_watch_tracees(void) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
+    s32 me = (s32)getpid();
+    s32 woken[8];
+    int nwoken = 0, any = 0;
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
+        any = 1;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
+        s32 tg = e->tgid;
+        char st = pt_task_state(t);
+        if (!st || pt_state_is_dead(st)) {
+            /* Killed outright: it published nothing (an exit it did publish
+             * is collected, and told, as its own). Its host parent hears of
+             * the death from the host; a tracer that is not -- or of a
+             * thread, which no host parent hears of -- from this, once. */
+            if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
+            if (__atomic_exchange_n(&e->death_told, 1, __ATOMIC_ACQ_REL)) continue;
+            if (t == tg && pt_task_ppid(tg) == me) continue;
+            u64 ut = (u64)(e->ru.utime_sec * 100 + e->ru.utime_usec / 10000);
+            u64 stt = (u64)(e->ru.stime_sec * 100 + e->ru.stime_usec / 10000);
+            sig_send_cld(me, CLD_KILLED, SIGKILL, t, sig_ruid_of(tg),
+                         (ut > 0xffffffffu ? 0xffffffffu : ut) << 32 |
+                         (stt > 0xffffffffu ? 0xffffffffu : stt));
+            ptrace_wake_waiters();
+            continue;
+        }
+        /* Stopped by the host: a SIGSTOP from outside, the one stop a traced
+         * process does not catch -- unless it is the stop an attach is about
+         * to wake it from (attach_pending, attach_stopped). Once a process. */
+        if (__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&e->attach_stopped, __ATOMIC_ACQUIRE))
+            continue;
+        int seen = 0;
+        for (int k = 0; k < nwoken; k++) seen |= woken[k] == tg;
+        if (seen || pt_task_state(tg) != 'T') continue;
+        if (nwoken < (int)(sizeof woken / sizeof woken[0])) woken[nwoken++] = tg;
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        si.si_signo = SIGCONT;
+        si.si_code = SI_QUEUE;
+        si.si_pid = getpid();
+        si.si_uid = getuid();
+        si.si_value.sival_int = PT_FOREIGN_MAGIC;
+        proctab_jc_art_mark(tg, JCA_CONT_CHLD | JCA_CONT_WAIT);   /* see ptrace_wake_stopped */
+        syscall(SYS_rt_sigqueueinfo, (pid_t)tg, SIGCONT, &si);
+    }
+    /* A tracer since a child's TRACEME, which ran nothing of ours: from
+     * here the watchdog looks too. */
+    if (any) pt_wd_start();
 }
 
 static void pt_wd_start(void) {

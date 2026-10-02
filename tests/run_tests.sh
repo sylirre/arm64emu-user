@@ -3059,6 +3059,29 @@ check_fixture tracerchld $'tracer:\n  attach stop: [4 19 tracee]\n  syscall stop
 # Self-checking: the block is the kernel's.
 check_fixture rpjobctl $'== group stop (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld wait 0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer sigchld\n== group stop (seize)\n  tracer attach 0\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  parent: sigchld wait 0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer sigchld\n== attach stopped (attach)\n  parent after SIGSTOP: sigchld [5 19 T] wait stopped 19\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld wait 0\n  tracer sigchld [5 0]\n  state t\n== attach stopped (seize)\n  parent after SIGSTOP: sigchld [5 19 T] wait stopped 19\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld wait 0\n  tracer sigchld [5 0]\n  state t\n== foreign stop (seize)\n  tracer attach 0\n  tracer cont -1\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  parent: sigchld wait 0\n  state t\n== continue notice (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer cont 0\n  tracer sigchld [6 18]\n  parent: sigchld [6 18 T] wait 0\n  state t\n== continue notice (seize)\n  tracer attach 0\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer cont 0\n  tracer sigchld [6 18]\n  tracer wait tracee stopped=1 sig=5 ev=128\n  tracer sigchld\n  parent: sigchld [6 18 T] wait 0\n  state t\n== parent SA_NOCLDSTOP (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent waitid WNOWAIT: 0 code=5 status=19 pid=T\n  parent waitid: 0 code=5 status=19 pid=T\n  parent: sigchld wait 0\n  parent after SIGCONT: sigchld wait continued 0\n  parent waitid WNOWAIT: 0 code=0 status=0 pid=0\n  parent waitid: 0 code=0 status=0 pid=0\n  parent: sigchld wait 0\ndone' \
     "A64_SICODE_FORCE_KNOWN=1" "known-layout-tier"
+# ...and what the host does to a tracee that its tracer is still to hear of: a
+# death by SIGKILL (a CLD_KILLED notice, for a tracer that waits only once its
+# handler says so), and -- sent from out here -- a SIGSTOP, the one stop a
+# traced process cannot catch, which is to be a signal-delivery-stop the
+# tracer resumes it from (ptracetab.c, "the ptrace watchdog"). Self-checking:
+# the block is the kernel's.
+check_fixture tracerwatch $'tracer notice: code=2 status=9 from the tracee\ntracer wait: the tracee, killed by 9\ndone'
+if "$AGCC" -static -O2 -o tests/fixtures/tracerwatch.bin tests/fixtures/tracerwatch.c 2>/dev/null; then
+    rm -f tests/.cache/tracerwatch.pid
+    timeout -k 5 30 "$EMU" / "$PWD/tests/fixtures/tracerwatch.bin" outside \
+        "$PWD/tests/.cache/tracerwatch.pid" > tests/.cache/tracerwatch.out 2>/dev/null &
+    tw=$!
+    n=0
+    while [ ! -s tests/.cache/tracerwatch.pid ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done
+    sleep 0.2
+    [ -s tests/.cache/tracerwatch.pid ] && kill -STOP "$(cat tests/.cache/tracerwatch.pid)" 2>/dev/null
+    wait $tw
+    fixture_verdict "tracerwatch: SIGSTOP from outside" $'tracer wait: the tracee, stopped=1 sig=19 event=0\ntracer notice: code=4 status=19 from the tracee\nsiginfo: signo=19 code=0 from nobody we know\nstate while in the stop: t\nonce resumed: running\nparent wait: nothing\ndone' "$(cat tests/.cache/tracerwatch.out)"
+    rm -f tests/.cache/tracerwatch.pid tests/.cache/tracerwatch.out
+    fx_rm tests/fixtures/tracerwatch.bin
+else
+    skip_build fixtures/tracerwatch
+fi
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

@@ -2115,11 +2115,26 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   host parent — the shell the first guest process was started from — is told
   nothing of it.
 
-What cannot be kept: a `SIGSTOP` from outside the guest — a shell's
-`kill -STOP` of a traced process — is the host's, and stops it where its
-tracer cannot reach it, until a `SIGCONT` (a guest's continues it again, by
-the same wake). And the stop signal of a stop the host carried out is not to be
-read anywhere, so a process attached while stopped is reported stopped by
+- *What the host does to a tracee.* A `SIGSTOP` from outside the guest — a
+  shell's `kill -STOP` of a traced process — is the one stop a traced process
+  cannot catch: the host's, freezing it where its tracer cannot reach it. A
+  kernel's tracee takes it as any signal, a signal-delivery-stop its tracer
+  resumes it from. And a tracee killed outright (`SIGKILL`) publishes no
+  death, where a kernel's tracer is sent a `CLD_KILLED` notice. So while a
+  process traces anything, the ptrace watchdog thread — the one that watches a
+  traced process's tracers — looks at its tracees every 100 ms, and a tracer's
+  wait makes the same look as it goes round (`ptrace_watch_tracees`): a dead
+  tracee's notice is sent, once, unless the host sends it (the tracer is its
+  parent); a host-stopped one is woken with a `SIGCONT` of the host's
+  (`PT_FOREIGN_MAGIC`) its capture turns into that `SIGSTOP` — from nobody the
+  guest can see — to be reported (`tests/fixtures/tracerwatch.c`, whose
+  `SIGSTOP` the suite sends from outside). The host's stop and continue are not
+  shown to the real parent (above); a host continue of the emulator's making is
+  marked before it is made (`JCA_CONT_*`), for when the parent asks after the
+  tracee is no longer traced.
+
+What cannot be kept: the stop signal of a stop the host carried out is not to
+be read anywhere, so a process attached while stopped is reported stopped by
 `SIGSTOP`.
 
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
