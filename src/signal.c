@@ -136,6 +136,9 @@ typedef struct {
                   * never handed to another (sig_retarget) */
     int ptraced; /* past its signal-delivery stop (sig_inject_local): taken
                   * without being reported to a tracer again */
+    int poll;    /* a _sigpoll's (sig_poll_layout): si_band in pid and uid,
+                  * si_fd in status -- the bytes the guest's own layout puts
+                  * them in -- for a signalfd record to name them */
     u32 gen;     /* a stop signal's: Machine.jc_contgen as it was sent; a
                   * SIGCONT's: jc_stopgen -- which one sent after it has
                   * flushed it (prepare_signal) if they moved on (jc_stamp) */
@@ -1020,6 +1023,7 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
     }
     p->addr = (u64)(u32)c.pid | (u64)c.uid << 32;
     p->value = c.value;
+    p->poll = c.code == SI_SIGIO;   /* a guest's queued _sigpoll, as it laid it */
     p->thr = c.tid != 0 || c.code == SI_TKILL;
     p->ptraced = 0;
     p->gen = 0;
@@ -1666,6 +1670,32 @@ void sig_jc_untraced(struct Machine *m) {
     syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
 }
 
+/* Is a siginfo of guest signal `sig` with code `code` the kernel's _sigpoll
+ * layout (siginfo_layout's SIL_POLL) -- si_band, a long, and si_fd? SI_SIGIO
+ * is, for any signal; and a code from 1 to NSIGPOLL is, for SIGPOLL within its
+ * codes and for any signal past the codes it has of its own (an F_SETSIG'd
+ * real-time signal's POLL_IN, say). A PendSig of one keeps si_band in `addr`
+ * and si_fd in `status`. An LP64 host's layout has them where a child's
+ * notice has pid and uid, and status -- an ILP32 host's does not: its long
+ * is 4 bytes. */
+int sig_poll_layout(int sig, int code) {
+    if (code == SI_SIGIO) return 1;
+    if (code <= 0 || code > 6 /* NSIGPOLL */) return 0;
+    int limit;
+    switch (sig) {
+    case SIGILL:  limit = 11; break;
+    case SIGFPE:  limit = 15; break;
+    case SIGSEGV: limit = 10; break;
+    case SIGBUS:  limit = 5;  break;
+    case SIGTRAP: limit = 6;  break;
+    case SIGCHLD: limit = 6;  break;
+    case SIGPOLL: return 1;
+    case SIGSYS:  limit = 2;  break;
+    default:      return 1;
+    }
+    return code > limit;
+}
+
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     if (rq_claim(sig, si, p)) {   /* one this process handed back */
         p->ptraced = 0;           /* ...arriving anew: no stop is behind it */
@@ -1692,6 +1722,7 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
         p->addr = 0;
         p->value = 0;
         p->thr = 0;
+        p->poll = 0;
         return;
     }
     p->signo = sig_remap_to_guest(sig);
@@ -1733,6 +1764,27 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
             p->pid = si->si_value.sival_int;   /* si_timerid slot */
             p->thr = thr;
         }
+    }
+    /* _sigpoll -- si_band, a long, and si_fd -- as the host's own layout has
+     * them, laid where the guest's has them: the band over pid and uid, the
+     * fd over the word after (status, and value's low half). An LP64 host's
+     * layout is the guest's, and that is what the fields above already hold;
+     * an ILP32 host's long is 4 bytes, and its fd sits where the band ends.
+     * Judged by the HOST's number and code: a clone child's death the host
+     * reports as a SIGCHLD keeps its notice whatever signal it becomes. A
+     * guest's queued SI_SIGIO (own) rode as an SI_QUEUE's pid, uid and value,
+     * which are the guest's bytes as it laid them. */
+    p->poll = 0;
+    if (sig_poll_layout(sig, p->code)) {
+        p->poll = 1;
+        if (!own) {
+            u64 band = (u64)(s64)si->si_band;
+            p->pid = (int)(u32)band;
+            p->uid = (int)(u32)(band >> 32);
+            p->value = (s64)(u32)si->si_fd;
+        }
+        p->status = (int)p->value;
+        p->utime = p->stime = 0;
     }
     jc_stamp(p);   /* as it is sent, as far as the guest can tell */
 }
@@ -2445,7 +2497,8 @@ static int rq_put(const PendSig *p) {
          * inbox); anything else has no way back. */
         if (p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
         s64 cr;
-        if (p->code != SI_TIMER &&
+        int poll = p->poll;
+        if (p->code != SI_TIMER && !poll &&
             sig_carry_send(rq_pid, 0, -1, hs, p->signo, SIG_CARRY_PLAIN, p->code, p->err, p->pid,
                            (u32)p->uid, (u64)p->value, &cr))
             return (int)cr;
@@ -2454,10 +2507,15 @@ static int rq_put(const PendSig *p) {
         si.si_signo = hs;
         si.si_errno = p->err;
         si.si_code = p->code;
-        si.si_pid = (pid_t)p->pid;
-        si.si_uid = (uid_t)p->uid;
-        if (p->code == SI_TIMER) si.si_value.sival_int = p->pid;
-        else si.si_value.sival_ptr = (void *)(uintptr_t)p->value;
+        if (poll) {   /* SI_SIGIO: the host's own _sigpoll, its long and all */
+            si.si_band = (long)((u64)(u32)p->pid | (u64)(u32)p->uid << 32);
+            si.si_fd = p->status;
+        } else {
+            si.si_pid = (pid_t)p->pid;
+            si.si_uid = (uid_t)p->uid;
+            if (p->code == SI_TIMER) si.si_value.sival_int = p->pid;
+            else si.si_value.sival_ptr = (void *)(uintptr_t)p->value;
+        }
         return syscall(SYS_rt_sigqueueinfo, rq_pid, hs, &si) != 0 ? -errno : 0;
     }
     u32 nonce, tok;
@@ -2512,7 +2570,10 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
     n.ssi_signo = (u32)p.signo;
     n.ssi_errno = p.err;
     n.ssi_code = p.code;
-    if (p.code > 0 && p.signo == SIGCHLD) {
+    if (p.poll) {
+        n.ssi_band = (u32)p.pid;   /* the band's low half: ssi_band is 32-bit */
+        n.ssi_fd = p.status;
+    } else if (p.code > 0 && p.signo == SIGCHLD) {
         n.ssi_pid = (u32)p.pid;
         n.ssi_uid = (u32)p.uid;
         n.ssi_status = p.status;
@@ -3217,6 +3278,7 @@ static void pendsig_from_guest(PendSig *p, int sig, const u8 *si) {
     p->signo = sig;
     memcpy(&w, si + 4, 4);  p->err = (int)w;
     memcpy(&w, si + 8, 4);  p->code = (int)w;
+    p->poll = sig_poll_layout(sig, p->code);   /* for a signalfd record */
     if (p->code > 0 && !is_sync_sig(sig) &&
         !(sig == SIGSYS && p->code == SIG_SECCOMP_CODE)) {
         memcpy(&w, si + 16, 4); p->pid = (int)w;

@@ -54,8 +54,9 @@ emulator's own use of it, and the guest's), writes nothing for
 `getsockopt(SO_RCVTIMEO)`, ignores `waitid`'s rusage argument, drops an iovec
 segment it cannot lock, caps POSIX timers at 32, mistakes `SO_GET_FILTER` for
 an int option, refuses the subreaper/THP prctls, installs every SCM_RIGHTS
-descriptor into a short control buffer, ignores `MADV_REMOVE`, and grows no
-stack from a system call's copy (the full list is in tests/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
+descriptor into a short control buffer, ignores `MADV_REMOVE`, grows no stack
+from a system call's copy, and hands an `F_SETSIG` signal no descriptor (the
+full list is in tests/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
 test or a fixture alike) and skip there, naming what is missing; they run in
 full on real armv7 silicon.
 

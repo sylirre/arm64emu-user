@@ -833,6 +833,19 @@ takes the ptrace routing `kill(2)` and `tgkill(2)` take. `tests/c/tgsigqueue.c`
 (differential) and `tests/fixtures/sqiread.c` (self-checking: qemu-user locks
 all 128 bytes, copies only the fields it knows, and drops `si_errno`).
 
+### `_sigpoll`: `si_band` and `si_fd`
+
+The siginfo of a signal an `O_ASYNC` descriptor raises (`F_SETSIG`'s
+`POLL_IN` and the rest) and of an `SI_SIGIO` one is the kernel's `_sigpoll`:
+`si_band`, a `long`, and `si_fd` (`siginfo_layout`'s `SIL_POLL`, which
+`sig_poll_layout` mirrors). A captured one keeps the band and the fd as the
+host's own layout has them, and they are laid out again as the guest's — on an
+LP64 host they lie over a child's notice's pid, uid and status, which is how
+they used to be handed on, and on an ILP32 host, whose `long` is 4 bytes, the
+guest read the fd in the band's high half and an fd of 0. A guest's queued
+`SI_SIGIO` rides as an `SI_QUEUE`'s pid, uid and value under the origin mark
+(below), and is laid out from those (`tests/fixtures/sigpoll.c`).
+
 ### Whose a signal is: `si_pid` and `si_uid`
 
 A kernel fills in `si_pid` and `si_uid` of the signals it sends — `kill`,

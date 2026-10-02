@@ -519,7 +519,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
 # (docs/jit.md), and qemu-user is an interposer with defects of its own.
-# Thirteen of them stop correct tests dead, each reproducible in a few lines that
+# Fourteen of them stop correct tests dead, each reproducible in a few lines that
 # never touch the emulator:
 #
 #   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
@@ -573,6 +573,10 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   its own first and answers EFAULT. The emulator asks its
 #                   host exactly that to learn whether an O_DIRECT transfer is
 #                   copied or pinned (sys_file.c, xfer_scratch).
+#   sigpoll-fd      an O_ASYNC descriptor's F_SETSIG signal carries the
+#                   descriptor in si_fd; qemu-user guesses a siginfo's layout
+#                   by the signal number, takes a real-time one's for a
+#                   sigqueue's, and hands over no fd.
 #
 # One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -914,6 +918,30 @@ int main(void) {
     while (f && fgets(l, sizeof l, f))
         if (!strncmp(l, "SigPnd:", 7)) v = strtoull(l + 7, NULL, 16);
     return (v >> (SIGUSR1 - 1)) & 1 ? 0 : 1;
+}
+EOF
+        ;;
+    sigpoll-fd) cat <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+static volatile int got = -1;
+static void h(int s, siginfo_t *si, void *u) { (void)s; (void)u; got = si->si_fd; }
+int main(void) {
+    int rt = SIGRTMIN + 2, p[2];
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = h;
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(rt, &sa, NULL) || pipe(p)) return 1;
+    if (fcntl(p[0], F_SETOWN, getpid()) || fcntl(p[0], F_SETSIG, rt) ||
+        fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_ASYNC))
+        return 1;
+    if (write(p[1], "x", 1) != 1) return 1;
+    for (int i = 0; i < 1000 && got < 0; i++) usleep(1000);
+    return got != p[0];
 }
 EOF
         ;;

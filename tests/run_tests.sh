@@ -3008,6 +3008,12 @@ fx_rm tests/fixtures/pidreuse.bin
 # siginfo_to_guest). Self-checking: qemu-user forks a clone child with SIGCHLD;
 # the block is the kernel's.
 check_fixture chldinfo $'handler: code=1 status=7 pid=child times ok\nsigwaitinfo: code=1 status=8 pid=child times ok\nsignalfd: code=1 status=9 pid=child times ok\nclone child: sig=SIGUSR2 code=1 status=3 pid=child times ok\ndone'
+# The _sigpoll siginfo -- si_band and si_fd -- of an O_ASYNC descriptor's
+# signal and of a queued SI_SIGIO, through a handler, sigwaitinfo and a
+# signalfd: an ILP32 host's long is 4 bytes, and the layout it hands over is
+# not the guest's (signal.c, sig_poll_layout). Self-checking: the block is
+# the kernel's.
+check_fixture sigpoll $'O_ASYNC, handler: code=1 band=0x41 fd the right one\nO_ASYNC, sigwaitinfo: code=1 band=0x41 fd the right one\nO_ASYNC, signalfd: code=1 band=0x41 fd the right one\nSI_SIGIO, handler: code=-5 band=0x1234567 fd=42\nSI_SIGIO, sigwaitinfo: code=-5 band=0x1234567 fd=42\nSI_SIGIO, signalfd: code=-5 band=0x1234567 fd=42\ndone'
 # Whose a signal is: the si_pid and si_uid of kill, tgkill, a child's notice,
 # a signalfd record, waitid, a queued siginfo and SIGPIPE -- the sender as the
 # guest sees it, its pid and its real uid (signal.c, sig_ident; proctab.c,

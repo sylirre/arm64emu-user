@@ -459,6 +459,16 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
         int code = r->ssi_code, thr;
         int own = sig_queue_uncode(&code, &thr);   /* a guest's queued one */
         r->ssi_code = code;
+        if (own && sig_poll_layout((int)r->ssi_signo, code)) {
+            /* A guest's queued _sigpoll, which rode as an SI_QUEUE's pid,
+             * uid and value: the band and fd it laid there. */
+            r->ssi_band = r->ssi_pid;
+            r->ssi_fd = r->ssi_int;
+            r->ssi_pid = r->ssi_uid = 0;
+            r->ssi_int = 0;
+            r->ssi_ptr = 0;
+            continue;
+        }
         s32 pid = (s32)r->ssi_pid;
         sig_ident((int)r->ssi_signo, code, own, &pid, &r->ssi_uid);   /* whose */
         r->ssi_pid = (u32)pid;

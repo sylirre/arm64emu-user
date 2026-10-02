@@ -784,6 +784,8 @@ u64  sig_cld_times(int group);
 int  sig_cld_carried(int sig, int code);
 int  sig_sfd_cld(GSignalfdSiginfo *r);
 u8   sig_chldact_bits(void);
+/* Is a siginfo of `sig` with `code` the _sigpoll layout (si_band, si_fd)? */
+int  sig_poll_layout(int sig, int code);
 /* On a host that cannot carry a siginfo between processes as it was given
  * (signal.c, "the siginfo carrier"): send guest signal `gsig` on host number
  * `hs` with that siginfo through the receiver's registry inbox, when the host
