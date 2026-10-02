@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -220,18 +221,18 @@ static int pt_is_stopsig(int sig) {
     return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
 }
 
-/* Wake tracer `tr` after publishing an event (a stop or a synthetic exit).
- * Two channels, because the tracer may be waiting either way:
- *  - SIGCHLD, exactly as the kernel raises on a tracee state change: an async
- *    tracer (gdb) waits in an event loop driven by its own SIGCHLD handler.
- *  - The reserved kick signal carrying PT_WAKE_MAGIC: its handler (sig_kick_net,
- *    installed in every emulator process, no SA_RESTART) is a pure no-op whose
- *    EINTR knocks a tracer out of a *blocking* host wait4/waitid so it re-checks
- *    the registry. This works regardless of the tracer's SIGCHLD disposition
- *    (SIG_DFL SIGCHLD is discarded by the host without interrupting anything). */
+/* Wake tracer `tr` after publishing an event (a stop or a synthetic exit):
+ * the reserved kick signal carrying PT_WAKE_MAGIC, whose handler (sig_kick_net,
+ * installed in every emulator process, no SA_RESTART) is a pure no-op whose
+ * EINTR knocks a tracer out of a *blocking* host wait4/waitid so it re-checks
+ * the registry. This works regardless of the tracer's SIGCHLD disposition
+ * (SIG_DFL SIGCHLD is discarded by the host without interrupting anything).
+ * An async tracer (gdb), which waits in an event loop driven by its SIGCHLD
+ * handler, is told by the notice that goes with it (pt_notify_stop,
+ * pt_notify_exit); a wake by itself tells nothing -- a re-kick of a stop
+ * still unreaped, a leader's silent release. */
 static void pt_wake_tracer(s32 tr) {
     if (tr <= 0) return;
-    kill(tr, SIGCHLD);
     siginfo_t si;
     memset(&si, 0, sizeof si);
     si.si_signo = PTRACE_KICKSIG;
@@ -240,6 +241,32 @@ static void pt_wake_tracer(s32 tr) {
     si.si_uid = getuid();
     si.si_value.sival_int = PT_WAKE_MAGIC;
     syscall(SYS_rt_sigqueueinfo, (pid_t)tr, PTRACE_KICKSIG, &si);
+}
+
+/* ...telling it of a stop, as do_notify_parent_cldstop tells a ptracer: a
+ * SIGCHLD from this thread, CLD_TRAPPED for a ptrace stop with its exit code
+ * as status, CLD_STOPPED for a group stop's trap with the group's stop
+ * signal, this thread's real uid and CPU time -- unless the tracer ignores
+ * SIGCHLD or set SA_NOCLDSTOP, which spare it a stop notice. It used to be a
+ * bare kill(2): SI_USER, with no code, status or times. */
+static void pt_notify_stop(s32 tr, int why, int status) {
+    if (tr <= 0) return;
+    if (!(proctab_chldact(tr) & 3))
+        sig_send_cld(tr, why, status & 0x7f, (s32)g_tls.tid,
+                     sig_ruid_of((s32)getpid()), sig_cld_times(0));
+    pt_wake_tracer(tr);
+}
+
+/* ...or of a death of thread `tid` (do_notify_parent): CLD_EXITED with the
+ * exit code, CLD_KILLED or CLD_DUMPED with the signal, and the CPU time of
+ * the thread -- or, `group`, of the process. An ignored SIGCHLD discards it
+ * at the receiver, as the kernel's sig_ignored does. */
+static void pt_notify_exit(s32 tr, int wstatus, s32 tid, int group) {
+    if (tr <= 0) return;
+    int why = WIFEXITED(wstatus) ? CLD_EXITED : WCOREDUMP(wstatus) ? CLD_DUMPED : CLD_KILLED;
+    int st = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : WTERMSIG(wstatus);
+    sig_send_cld(tr, why, st, tid, sig_ruid_of((s32)getpid()), sig_cld_times(group));
+    pt_wake_tracer(tr);
 }
 
 void ptrace_init(void) {
@@ -785,7 +812,15 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
      * host wait or a gdb-style SIGCHLD event loop. */
     __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
     fx_wake(&g_tab->global_gen);
-    pt_wake_tracer(tracer);
+    /* A group stop's trap is CLD_STOPPED, with the group's stop signal (or
+     * none, an INTERRUPT with no group stop in force); every other stop
+     * CLD_TRAPPED, with its own. */
+    if (pt_in_jobctl)
+        pt_notify_stop(tracer, CLD_STOPPED,
+                       __atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)
+                           ? (int)__atomic_load_n(&g_machine.jc_sig, __ATOMIC_ACQUIRE) : 0);
+    else
+        pt_notify_stop(tracer, CLD_TRAPPED, stop_sig);
     int ns = pt_service_loop(c, e, seen, si);
     if (ns == PT_RETRAP) return ns;
     /* What the stop did not answer -- an INTERRUPT or a trap_notify that
@@ -1102,7 +1137,8 @@ void ptrace_report_exit(CPU *c, int wstatus) {
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
         __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
         fx_wake(&g_tab->global_gen);
-        pt_wake_tracer(tr);   /* SIGCHLD event loop + blocked-wait kick */
+        /* SIGCHLD event loop + blocked-wait kick */
+        pt_notify_exit(tr, wstatus, (s32)g_tls.tid, (s32)g_tls.tid == (s32)getpid());
         return;   /* keep the link; the tracer frees it on collect */
     }
     pt_free(e);
@@ -1143,7 +1179,7 @@ void ptrace_report_exit_group(int wstatus) {
          * true of the siblings it is publishing on behalf of. */
         pt_ru_stamp(e);
         __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
-        pt_wake_tracer(tr);                 /* SIGCHLD loop + blocked-wait kick */
+        pt_notify_exit(tr, wstatus, t, t == me);   /* SIGCHLD loop + wait kick */
         published = 1;
     }
     if (published) {

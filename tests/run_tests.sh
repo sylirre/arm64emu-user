@@ -3042,6 +3042,14 @@ if "$AGCC" -static -O2 -o tests/fixtures/sigident.bin tests/fixtures/sigident.c 
 else
     skip_build fixtures/sigident
 fi
+# What a tracer that is not the tracee's parent is told by SIGCHLD: CLD_TRAPPED
+# with the exit code for every ptrace stop, CLD_STOPPED with the stop signal
+# for a group stop's trap, CLD_EXITED at the death -- and, with SA_NOCLDSTOP,
+# the death alone (ptracetab.c, pt_notify_stop; signal.c, sig_send_cld), on
+# both tiers of what the host carries. Self-checking: the block is the
+# kernel's.
+check_fixture tracerchld $'tracer:\n  attach stop: [4 19 tracee]\n  syscall stop: [4 5 tracee]\n  signal stop: [4 10 tracee]\n  group stop: [5 19 tracee]\n  death: [1 7 tracee] times ok\ntracer with SA_NOCLDSTOP:\n  attach stop: none\n  syscall stop: none\n  signal stop: none\n  group stop: none\n  death: [1 7 tracee] times ok\ndone' \
+    "A64_SICODE_FORCE_KNOWN=1" "known-layout-tier"
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

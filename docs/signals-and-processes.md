@@ -1775,21 +1775,37 @@ may call `TRACEME` and enter its first cooperative stop while the parent is
 already inside the blocking host wait, which cannot see it.
 
 That is why a tracee entering a stop (and publishing a synthetic exit) wakes
-its tracer through `pt_wake_tracer`, on two channels at once:
+its tracer on two channels at once:
 
-- a host `SIGCHLD`, exactly as the kernel raises on a tracee state change — an
-  *asynchronous* tracer (`gdb`, whose event loop sleeps in `ppoll`/`pselect`
-  and only calls `waitpid(WNOHANG)` after a `SIGCHLD` handler pokes its
-  self-pipe) would never learn of a cooperative stop without it;
-- the reserved kick signal carrying `PT_WAKE_MAGIC` — its permanent handler
+- the **notice** a kernel sends a tracer on a tracee's state change
+  (`pt_notify_stop`, `pt_notify_exit`) — an *asynchronous* tracer (`gdb`, whose
+  event loop sleeps in `ppoll`/`pselect` and only calls `waitpid(WNOHANG)`
+  after a `SIGCHLD` handler pokes its self-pipe) would never learn of a
+  cooperative stop without it. It is the kernel's notice whole:
+  `do_notify_parent_cldstop`'s `CLD_TRAPPED` for every ptrace stop with the
+  stop's exit code as `si_status`, `CLD_STOPPED` for a group stop's trap with
+  the group's stop signal, `do_notify_parent`'s `CLD_EXITED`/`KILLED`/`DUMPED`
+  at a death the host does not report itself (a thread's, or one whose
+  tracer is not its parent), each from the stopping thread with its real uid
+  and its CPU time — and none for a stop to a tracer that ignores `SIGCHLD` or
+  set `SA_NOCLDSTOP`, which every process publishes in its registry entry
+  (`sig_chldact_bits`, `proctab_chldact`). A code above zero cannot be sent to
+  another process, so it travels as `SIGCHLD` with a code of its own and the
+  status and times in `si_errno` and `si_value` (`sig_send_cld`, or the
+  receiver's inbox where the host cannot carry that), which every receiver
+  makes the kernel's notice again. It used to be a bare `kill(SIGCHLD)`:
+  `SI_USER`, no status, no times (`tests/fixtures/tracerchld.c`);
+- the reserved kick signal carrying `PT_WAKE_MAGIC` (`pt_wake_tracer`) — its
+  permanent handler
   (`sig_kick_net`, no `SA_RESTART`) is a deliberate no-op whose `EINTR` knocks
   a tracer out of a *blocking* host wait regardless of its `SIGCHLD`
   disposition (a `SIG_DFL` `SIGCHLD` is discarded by the host kernel without
   interrupting anything); the woken wait re-evaluates its mode, finds the new
   tracee, and collects the stop from the registry. Since the kick could race
   the tracer right before it blocks (or land on the wrong thread of a
-  multithreaded tracer), the parked tracee re-sends it on each 500 ms pass of
-  its service loop until the stop is collected.
+  multithreaded tracer), the parked tracee re-sends it — the kick, not the
+  notice, which a kernel sends once — on each 500 ms pass of its service loop
+  until the stop is collected.
 
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
@@ -1859,8 +1875,8 @@ tracee at all — see "The emulator's own interruptions are invisible to the
 guest" above — and the stop an `ATTACH` or an `INTERRUPT` brings only as a
 kernel's does (above). A guest-directed signal of the same number is forwarded
 to the normal capture queue, so the guest keeps full use of it. `wait4` collects the stop from the registry (the tracee is not
-the tracer's host child), and the tracee's stop already sends the tracer a
-`SIGCHLD` (so gdb's async loop wakes).
+the tracer's host child), and the tracee's stop already sends the tracer its
+`SIGCHLD` notice (so gdb's async loop wakes).
 
 Because such a tracee is *not* the tracer's host child, the tracer's own host
 `wait4`/`waitid` returns `ECHILD`. The poll loop must not treat that as terminal:

@@ -765,6 +765,19 @@ void sig_after_trap(CPU *c);
  * signal, in the order sent, never on its own number. 0 or -errno. */
 s64  sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 uid,
                  s32 err, u64 value);
+/* A child's notice no host sends (signal.c, "a child's notice that no host
+ * sends"): SIGCHLD with code `why` (CLD_*), si_status `status`, from `pid`
+ * with real uid `uid`, and the CPU time `times` (user ticks << 32 | system
+ * ticks, sig_cld_times: this thread's, or the process's) -- to thread group
+ * `tgid`. 0 or -errno. sig_cld_carried says whether a siginfo the inbox
+ * brought is one; sig_sfd_cld turns a signalfd record of one into the
+ * kernel's (1 = it was one); sig_chldact_bits is what this process's own
+ * SIGCHLD disposition spares it (1 ignored, 2 SA_NOCLDSTOP), as published. */
+s64  sig_send_cld(s32 tgid, int why, int status, s32 pid, u32 uid, u64 times);
+u64  sig_cld_times(int group);
+int  sig_cld_carried(int sig, int code);
+int  sig_sfd_cld(GSignalfdSiginfo *r);
+u8   sig_chldact_bits(void);
 /* On a host that cannot carry a siginfo between processes as it was given
  * (signal.c, "the siginfo carrier"): send guest signal `gsig` on host number
  * `hs` with that siginfo through the receiver's registry inbox, when the host
@@ -1350,6 +1363,11 @@ void proctab_reaped(s32 pid);       /* its reaper's wait: the slot goes */
  * the guest knows it? Async-signal-safe (proctab.c). */
 int  proctab_ident(s32 pid, u32 *ruid);
 void proctab_ruid_set(u32 ruid);     /* our real uid moved (setuid & co.) */
+/* What `pid`'s SIGCHLD disposition spares it of a child's notice, as it
+ * published it (signal.c, sig_chldact_bits): 1 ignored, 2 SA_NOCLDSTOP; 0 for
+ * one the registry does not know. Async-signal-safe. */
+u8   proctab_chldact(s32 pid);
+void proctab_chldact_set(u8 bits);
 /* Is `pid` a guest process that has exited and not been reaped -- one that
  * unregistered, or one killed outright, whose host task is a zombie? A
  * member of the registry all the same (proctab_has) -- kill(2), getpgid(2),

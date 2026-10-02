@@ -158,6 +158,14 @@ struct ProcEnt {
      * published the slot under it yet -- a signal the child sends at once
      * is still known for a guest's. Cleared with the reservation. */
     s32 kid;
+    /* What the owner's SIGCHLD disposition spares it (signal.c,
+     * sig_chldact_bits): a stop or continue notice is not sent to a parent
+     * or tracer that ignores SIGCHLD or set SA_NOCLDSTOP
+     * (do_notify_parent_cldstop), and the notices the emulator sends itself
+     * are sent by another process, which reads it here. Seeded into a fork
+     * child's reservation (the child's dispositions are its parent's), then
+     * the owner's to write. */
+    u8  chldact;
 
     /* The owner's siginfo inbox (signal.c, "the siginfo carrier"): written by
      * whoever signals the owner on a host that cannot carry the siginfo
@@ -331,8 +339,8 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
      * the state word; v11 the owner's locked memory, VmLck; v12 an exited
      * owner's slot, kept until it is reaped; v13 the owner's real uid, and
-     * the reaped ones past the slots.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v13.%u.%08x",
+     * the reaped ones past the slots; v14 its SIGCHLD disposition.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v14.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -398,9 +406,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v13.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v14.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v13.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v14.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2659,6 +2667,7 @@ int proctab_reserve(void) {
          * it runs (proctab_slot_adopt). */
         __atomic_store_n(&e->ruid, own_ruid(), __ATOMIC_RELEASE);
         __atomic_store_n(&e->kid, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->chldact, sig_chldact_bits(), __ATOMIC_RELEASE);
         __atomic_store_n(&e->exited, 0, __ATOMIC_RELAXED);
         /* A previous owner SIGKILL'd mid-write may have left the seqlock odd,
          * which would invert its parity for the whole life of the new entry. */
@@ -2794,6 +2803,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     if (pid == (s32)getpid() || !reserved) {
         __atomic_store_n(&e->ruid, own_ruid(), __ATOMIC_RELEASE);
         __atomic_store_n(&e->kid, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->chldact, sig_chldact_bits(), __ATOMIC_RELEASE);
     }
     if (claimed || (!reserved && e->start != start)) {
         carry_clear(e);
@@ -3260,6 +3270,20 @@ static struct ProcEnt *own_entry(void) {
 void proctab_ruid_set(u32 ruid) {
     struct ProcEnt *e = g_tab ? own_entry() : NULL;
     if (e) __atomic_store_n(&e->ruid, ruid, __ATOMIC_RELEASE);
+}
+
+/* Our SIGCHLD disposition changed (signal.c, sig_chld_host). */
+void proctab_chldact_set(u8 bits) {
+    struct ProcEnt *e = g_tab ? own_entry() : NULL;
+    if (e) __atomic_store_n(&e->chldact, bits, __ATOMIC_RELEASE);
+}
+
+u8 proctab_chldact(s32 pid) {
+    if (!g_tab || pid <= 0) return 0;
+    for (int i = 0; i < g_tab_n; i++)
+        if (__atomic_load_n(&g_tab[i].pid, __ATOMIC_ACQUIRE) == pid)
+            return __atomic_load_n(&g_tab[i].chldact, __ATOMIC_ACQUIRE);
+    return 0;
 }
 
 /* Our own entry via own_entry (it may still be a reservation), anyone else's by

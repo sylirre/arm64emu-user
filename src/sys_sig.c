@@ -454,6 +454,7 @@ s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len) {
          off += sizeof(GSignalfdSiginfo)) {
         GSignalfdSiginfo *r = (GSignalfdSiginfo *)(out + off);
         if (sig_sfd_requeued(r)) continue;   /* handed back or carried: as sent */
+        if (sig_sfd_cld(r)) continue;        /* a notice no host sends */
         r->ssi_signo = (u32)sig_guest_nr((int)r->ssi_signo);
         int code = r->ssi_code, thr;
         int own = sig_queue_uncode(&code, &thr);   /* a guest's queued one */

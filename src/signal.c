@@ -1012,6 +1012,12 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
     p->uid = (int)c.uid;
     p->status = (int)c.value;
     p->utime = p->stime = 0;
+    if (sig_cld_carried(c.signo, c.code)) {   /* a tracee's notice (sig_send_cld) */
+        p->status = c.err;
+        p->err = 0;
+        p->utime = (s64)((u64)c.value >> 32);
+        p->stime = (s64)(u32)c.value;
+    }
     p->addr = (u64)(u32)c.pid | (u64)c.uid << 32;
     p->value = c.value;
     p->thr = c.tid != 0 || c.code == SI_TKILL;
@@ -1178,6 +1184,98 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
         r = tid ? syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si)
                 : syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, PTRACE_KICKSIG, &si);
     return r < 0 ? -errno : 0;
+}
+
+/* ---- a child's notice that no host sends ---------------------------------
+ *
+ * The stops a tracer's tracee makes -- every ptrace stop, a group stop's trap
+ * -- and the group stops and continues of a traced process are the
+ * emulator's, never the host's, and so are the notices they send
+ * (do_notify_parent_cldstop): CLD_TRAPPED or CLD_STOPPED to the tracer,
+ * CLD_STOPPED or CLD_CONTINUED to the real parent; and the death of a tracee
+ * whose tracer is not its parent (do_notify_parent's CLD_EXITED, KILLED,
+ * DUMPED to the tracer). A siginfo with a code above zero is refused to any
+ * process but the sender's own, so the notice travels as SIGCHLD with a code
+ * of its own, SIG_CLD_BIAS + why below zero, si_errno the status and si_value
+ * the child's user and system time in clock ticks (each half of it); and
+ * where the host cannot carry that -- a private code on the known-layout tier,
+ * the 8-byte value on an ILP32 host -- through the receiver's inbox
+ * (sig_carry_send). Every receiver -- pendsig_from_host, a signalfd read --
+ * makes it the kernel's notice again. A standard signal, it coalesces with
+ * any SIGCHLD already pending, as a kernel's notice does. */
+#define SIG_CLD_BIAS 0x7ffffd00
+
+int sig_cld_carried(int sig, int code) {
+    return sig == SIGCHLD && code >= CLD_EXITED && code <= CLD_CONTINUED;
+}
+
+static int sig_cld_uncode(int sig, int code) {
+    if (sig != SIGCHLD || code > -(SIG_CLD_BIAS + CLD_EXITED) ||
+        code < -(SIG_CLD_BIAS + CLD_CONTINUED))
+        return 0;
+    return -code - SIG_CLD_BIAS;
+}
+
+/* Clock ticks (USER_HZ, 100) of a timeval, as nsec_to_clock_t rounds. */
+static u32 tv_ticks(const struct timeval *tv) {
+    u64 t = (u64)tv->tv_sec * 100 + (u64)tv->tv_usec / 10000;
+    return t > 0xffffffffu ? 0xffffffffu : (u32)t;
+}
+
+/* The CPU time a notice carries: this thread's (task_cputime of the thread
+ * that stopped), or, `group`, the whole process's (a death's: the thread's
+ * own and its dead siblings'). */
+u64 sig_cld_times(int group) {
+    struct rusage ru;
+    if (getrusage(group ? RUSAGE_SELF : RUSAGE_THREAD, &ru) != 0) return 0;
+    return (u64)tv_ticks(&ru.ru_utime) << 32 | tv_ticks(&ru.ru_stime);
+}
+
+s64 sig_send_cld(s32 tgid, int why, int status, s32 pid, u32 uid, u64 times) {
+    s64 cr;
+    /* Through the inbox on the kick signal, not on SIGCHLD: a host that
+     * cannot carry the private code is one that may lay a siginfo out by its
+     * signal's number -- qemu-user takes any SIGCHLD's for a child's notice
+     * and translates the low bits of its status as a signal number, which
+     * is where the token is. The kick's capture hands the carried notice on
+     * as the SIGCHLD it stands for (sig_kick_net, host_catcher). */
+    if (sig_carry_send(tgid, 0, -1, PTRACE_KICKSIG, SIGCHLD, SIG_CARRY_PLAIN, why, status,
+                       pid, uid, times, &cr))
+        return cr;
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGCHLD;
+    si.si_errno = status;
+    si.si_code = -(SIG_CLD_BIAS + why);
+    si.si_pid = (pid_t)pid;
+    si.si_uid = (uid_t)uid;
+    si.si_value.sival_ptr = (void *)(uintptr_t)times;
+    return syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, SIGCHLD, &si) < 0 ? -errno : 0;
+}
+
+/* A signalfd record of one (sigfd_fill): the kernel's, as signalfd_copyinfo
+ * fills a child's notice. 1 = rewritten. */
+int sig_sfd_cld(GSignalfdSiginfo *r) {
+    int why = sig_cld_uncode((int)r->ssi_signo, r->ssi_code);
+    if (!why) return 0;
+    r->ssi_code = why;
+    r->ssi_status = r->ssi_errno;
+    r->ssi_errno = 0;
+    r->ssi_utime = r->ssi_ptr >> 32;
+    r->ssi_stime = (u32)r->ssi_ptr;
+    r->ssi_int = 0;
+    r->ssi_ptr = 0;
+    return 1;
+}
+
+/* What a child's notice to us may be: 1 SIGCHLD is ignored, 2 SA_NOCLDSTOP
+ * -- the two that spare a parent, or a tracer, a stop or continue notice
+ * (do_notify_parent_cldstop). Published in our registry entry for whoever is
+ * to send one (proctab_chldact). */
+u8 sig_chldact_bits(void) {
+    u64 h = __atomic_load_n(&g_machine.sigact[SIGCHLD].handler, __ATOMIC_RELAXED);
+    u64 f = __atomic_load_n(&g_machine.sigact[SIGCHLD].flags, __ATOMIC_RELAXED);
+    return (u8)((h == GSIG_IGN ? 1 : 0) | ((f & G_SA_NOCLDSTOP) ? 2 : 0));
 }
 
 /* ---- what the host carries: the siginfo tier -----------------------------
@@ -1452,6 +1550,22 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     p->ptraced = 0;   /* nor behind one that just arrived (host_catcher's
                        * PendSig is not zeroed: every field is set here) */
     p->gen = 0;
+    int why = sig_cld_uncode(sig, si->si_code);
+    if (why) {   /* a notice the emulator sent (sig_send_cld): the kernel's */
+        u64 t = (u64)(uintptr_t)si->si_value.sival_ptr;
+        p->signo = SIGCHLD;
+        p->code = why;
+        p->err = 0;
+        p->pid = (int)si->si_pid;
+        p->uid = (int)si->si_uid;
+        p->status = si->si_errno;
+        p->utime = (s64)(t >> 32);
+        p->stime = (s64)(u32)t;
+        p->addr = 0;
+        p->value = 0;
+        p->thr = 0;
+        return;
+    }
     p->signo = sig_remap_to_guest(sig);
     p->code = si->si_code;
     int thr, own = sig_queue_uncode(&p->code, &thr);
@@ -2496,6 +2610,7 @@ static void sig_chld_host(struct Machine *m) {
     if (h == GSIG_IGN || (f & G_SA_NOCLDSTOP)) sa.sa_flags |= SA_NOCLDSTOP;
     if (reap && !any) sa.sa_flags |= SA_NOCLDWAIT;
     sigaction(SIGCHLD, &sa, NULL);
+    proctab_chldact_set(sig_chldact_bits());   /* for the notices we are sent */
 }
 
 /* sig_host_update's body, for callers that already hold sigact_lock. */
