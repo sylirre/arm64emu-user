@@ -2649,11 +2649,18 @@ void sig_inherit_host_dispositions(struct Machine *m) {
 void sig_reset_for_exec(struct Machine *m) {
     EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
     for (int s = 1; s <= 64; s++) {
-        if (m->sigact[s].handler > GSIG_IGN) {   /* handlers do not survive exec */
-            m->sigact[s].handler = GSIG_DFL;
-            m->sigact[s].flags = 0;
-            sig_host_update_locked(m, s);
-        }
+        /* flush_signal_handlers: a handler does not survive exec, an ignored
+         * signal stays ignored -- and every disposition, default and ignored
+         * ones too, loses its flags and its mask. SA_NOCLDSTOP or
+         * SA_NOCLDWAIT on a SIGCHLD left at its default used to outlive the
+         * exec, sparing the new image notices it never asked to be spared. */
+        GSigAction *a = &m->sigact[s];
+        int was_handler = a->handler > GSIG_IGN, had_flags = a->flags != 0;
+        if (was_handler) a->handler = GSIG_DFL;
+        a->flags = 0;
+        a->mask = 0;
+        a->restorer = 0;
+        if (was_handler || had_flags) sig_host_update_locked(m, s);
     }
     EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
     sigq_reset();   /* this thread's queue; post-exec is single-threaded */

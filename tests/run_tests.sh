@@ -2935,6 +2935,11 @@ rm -f tests/.cache/mmap_min_addr0; fx_rm tests/fixtures/personality.bin
 # main thread and on the threads de_thread killed -- the main thread carries on
 # here where the kernel renumbers, so the signals are handed over to it.
 check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndone'
+# ...and what it leaves of the dispositions: handlers back to the default,
+# ignored signals still ignored, and every one's flags and mask gone -- a
+# SIGCHLD left at its default kept SA_NOCLDSTOP (signal.c,
+# sig_reset_for_exec). Self-checking: the block is the kernel's.
+check_fixture execsigflags $'sig 17: default, flags 0x0, mask empty\nsig 10: ignored, flags 0x0, mask empty\nsig 12: default, flags 0x0, mask empty\nsig 15: default, flags 0x0, mask empty\ndone'
 # clone(CLONE_PIDFD) and the clone child it brings in -- one forked with an exit
 # signal other than SIGCHLD, found only by a __WCLONE or __WALL wait that names
 # it, and reported with that signal or none (sys_proc.c, "clone children").

@@ -31,7 +31,11 @@ with none of that performed (`tests/fixtures/robustdeath.c`, the `child_sigterm`
 row). The same pass takes the dispositions the emulator was started with —
 `execve` keeps `SIG_IGN` and resets the rest — so a guest launched under `nohup`
 reads `SIGHUP` back as `SIG_IGN`, as it would from a kernel, instead of `SIG_DFL`
-while the host went on ignoring it.
+while the host went on ignoring it. A guest's own `execve` does what
+`flush_signal_handlers` does (`sig_reset_for_exec`): a handler goes back to the
+default, an ignored signal stays ignored, and every disposition loses its flags
+and its mask — a default `SIGCHLD`'s `SA_NOCLDSTOP` used to outlive the exec
+(`tests/fixtures/execsigflags.c`).
 
 `SIGCHLD` carries two flags the kernel acts on as it sends a child's notice,
 and the host gets them with the rest of the disposition (`sig_chld_host`):
