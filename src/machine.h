@@ -1408,8 +1408,9 @@ void proctab_jc_art_set(u32 bits);
 u32  proctab_jc_art(s32 pid);
 void proctab_jc_art_clear(s32 pid, u32 bits);
 void proctab_jc_art_mark(s32 pid, u32 bits);     /* a waker's, before its wake */
-void proctab_jc_hcons_set(s32 pid, u64 sw);
-u64  proctab_jc_hcons(s32 pid);
+void proctab_jc_hseen(s32 pid, int sig, int taken);  /* the parent's report */
+int  proctab_jc_hstop(s32 pid, int *sig, int *taken); /* ...of this stop */
+u32 *proctab_jc_peek_word(s32 pid);              /* the parent's answer, a futex */
 u64  proctab_ctxsw(s32 pid);                     /* moves only while it runs */
 /* Is `pid` a guest process that has exited and not been reaped -- one that
  * unregistered, or one killed outright, whose host task is a zombie? A

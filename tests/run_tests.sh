@@ -3065,6 +3065,12 @@ check_fixture rpjobctl $'== group stop (attach)\n  tracer attach 0\n  tracer wai
 # traced process cannot catch, which is to be a signal-delivery-stop the
 # tracer resumes it from (ptracetab.c, "the ptrace watchdog"). Self-checking:
 # the block is the kernel's.
+# An attach to a process the host has stopped reports the stop signal it
+# stopped by, and the group_exit_code as the real parent's wait left it
+# -- the parent's wait, as it was told or as it is asked (ptracetab.c,
+# pt_peek_stop; proctab.c, proctab_jc_hstop). Self-checking: the block is the
+# kernel's.
+check_fixture attachstopped $'SIGTSTP, attach: wait the tracee sig=20 event=0, notice [5 20]\nSIGTSTP, attach, the parent took it: wait the tracee sig=20 event=0, notice [5 0]\nSIGTSTP, seize: wait the tracee sig=20 event=128, notice [5 20]\nSIGTSTP, seize, the parent took it: wait the tracee sig=20 event=128, notice [5 0]\nSIGSTOP, attach: wait the tracee sig=19 event=0, notice [5 19]\nSIGSTOP, attach, the parent took it: wait the tracee sig=19 event=0, notice [5 0]\nSIGSTOP, seize: wait the tracee sig=19 event=128, notice [5 19]\nSIGSTOP, seize, the parent took it: wait the tracee sig=19 event=128, notice [5 0]\ndone'
 check_fixture tracerwatch $'tracer notice: code=2 status=9 from the tracee\ntracer wait: the tracee, killed by 9\ndone'
 if "$AGCC" -static -O2 -o tests/fixtures/tracerwatch.bin tests/fixtures/tracerwatch.c 2>/dev/null; then
     rm -f tests/.cache/tracerwatch.pid

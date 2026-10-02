@@ -178,13 +178,23 @@ struct ProcEnt {
      * bumped as it is -- the parent's waits look here only once a child ever
      * posted. `jc_art` marks host stop reports that are the emulator's own
      * (JCA_*), which a guest parent does not see; `jc_hcons` is the leader's
-     * context-switch count at which the parent took the host's report of the
-     * owner's current host stop -- the same while it lasts, so an attach can
-     * tell whether that stop was reported (proctab_jc_hcons). */
+     * context-switch count at which the parent's wait was given the host's
+     * report of the owner's current host stop -- the same while it lasts, so
+     * an attach can tell that stop's signal and whether the report was taken
+     * (proctab_jc_hstop). */
     u32 jc;
     u8  jc_live;                 /* a group stop of the emulator's is in force:
                                   * its untraced threads are parked, the
                                   * kernel's TASK_STOPPED, /proc's 'T' */
+    u8  jc_hostsig;              /* the stop signal of the owner's host stop as
+                                  * its real parent's wait reported it, and */
+    u8  jc_htaken;               /* ...whether that wait took the report: both
+                                  * the stop's for as long as the leader's
+                                  * context-switch count is jc_hcons */
+    u32 jc_peek;                 /* the parent's answer to an attach's question
+                                  * (ptracetab.c, pt_peek_stop): 0x100 | the
+                                  * stop signal its wait would report, 0 while
+                                  * unanswered; a futex word */
     s32 jc_parent;
     u32 jc_seq;
     u32 jc_art;
@@ -207,6 +217,9 @@ struct ProcEnt {
 static void jc_clear(struct ProcEnt *e) {
     __atomic_store_n(&e->jc, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->jc_live, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_hostsig, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_htaken, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->jc_peek, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->jc_parent, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->jc_seq, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->jc_art, 0, __ATOMIC_RELAXED);
@@ -393,8 +406,9 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * the state word; v11 the owner's locked memory, VmLck; v12 an exited
      * owner's slot, kept until it is reaped; v13 the owner's real uid, and
      * the reaped ones past the slots; v14 its SIGCHLD disposition; v15
-     * the real parent's view of its job control, and the slots ever used.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v15.%u.%08x",
+     * the real parent's view of its job control, and the slots ever used;
+     * v16 the signal of its host stop.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v16.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -460,9 +474,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v15.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v16.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v15.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v16.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -3390,6 +3404,7 @@ void proctab_jc_live_set(int live) {
     if (e) __atomic_store_n(&e->jc_live, (u8)live, __ATOMIC_RELEASE);
 }
 
+
 int proctab_jc_live(s32 pid) {
     struct ProcEnt *e = pid == (s32)getpid() && g_tab ? own_entry() : pid_entry(pid);
     return e && __atomic_load_n(&e->jc_live, __ATOMIC_ACQUIRE);
@@ -3420,14 +3435,40 @@ void proctab_jc_art_clear(s32 pid, u32 bits) {
     if (e) __atomic_and_fetch(&e->jc_art, ~bits, __ATOMIC_ACQ_REL);
 }
 
-void proctab_jc_hcons_set(s32 pid, u64 sw) {
+/* The real parent's wait reported `pid` stopped by `sig` (and `taken`, took
+ * the report): written down against the stop itself -- the leader's
+ * context-switch count, which a stopped task does not move -- for an attach
+ * that finds the process still in it. The stop signal of a host stop is to
+ * be read nowhere else: the parent's wait and the stopped task alone know it. */
+void proctab_jc_hseen(s32 pid, int sig, int taken) {
     struct ProcEnt *e = pid_entry(pid);
-    if (e) __atomic_store_n(&e->jc_hcons, sw, __ATOMIC_RELEASE);
+    u64 sw = e ? proctab_ctxsw(pid) : 0;
+    if (!sw) return;
+    int was = __atomic_load_n(&e->jc_hcons, __ATOMIC_ACQUIRE) == sw &&
+              __atomic_load_n(&e->jc_htaken, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&e->jc_hcons, 0, __ATOMIC_RELEASE);   /* rewriting */
+    __atomic_store_n(&e->jc_hostsig, (u8)sig, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->jc_htaken, (u8)(taken || was), __ATOMIC_RELEASE);
+    __atomic_store_n(&e->jc_hcons, sw, __ATOMIC_RELEASE);
 }
 
-u64 proctab_jc_hcons(s32 pid) {
+u32 *proctab_jc_peek_word(s32 pid) {
     struct ProcEnt *e = pid_entry(pid);
-    return e ? __atomic_load_n(&e->jc_hcons, __ATOMIC_ACQUIRE) : 0;
+    return e ? &e->jc_peek : NULL;
+}
+
+int proctab_jc_hstop(s32 pid, int *sig, int *taken) {
+    struct ProcEnt *e = pid_entry(pid);
+    if (!e) return 0;
+    u64 hc = __atomic_load_n(&e->jc_hcons, __ATOMIC_ACQUIRE);
+    int s = __atomic_load_n(&e->jc_hostsig, __ATOMIC_ACQUIRE);
+    int t = __atomic_load_n(&e->jc_htaken, __ATOMIC_ACQUIRE);
+    if (!hc || __atomic_load_n(&e->jc_hcons, __ATOMIC_ACQUIRE) != hc ||
+        hc != proctab_ctxsw(pid))
+        return 0;   /* not this stop's */
+    *sig = s;
+    *taken = t;
+    return 1;
 }
 
 /* How often `pid`'s main thread was switched out, voluntarily or not

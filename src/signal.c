@@ -2203,6 +2203,26 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         jit_signal_interrupt();
         return;
     }
+    if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_PEEKSTOP_MAGIC) {
+        /* An attach to a child of ours the host has stopped asks by which
+         * signal (ptracetab.c, pt_peek_stop): our wait's answer, without
+         * taking the report. Nothing else, and invisible. */
+        s32 kid = (s32)si->si_pid;
+        u32 *w = proctab_jc_peek_word(kid);
+        if (w) {
+            siginfo_t x;
+            memset(&x, 0, sizeof x);
+            u32 ans = 0x100;
+            if (syscall(SYS_waitid, P_PID, (id_t)kid, &x, WSTOPPED | WNOHANG | WNOWAIT,
+                        NULL) == 0 && x.si_pid == kid && x.si_code == CLD_STOPPED)
+                ans |= (u32)x.si_status & 0xff;
+            __atomic_store_n(w, ans, __ATOMIC_RELEASE);
+            syscall(SYS_futex, w, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+        }
+        sig_selfintr();
+        if (g_sig_in_syscall) sig_kick_timer_arm();
+        return;
+    }
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == DETHREAD_MAGIC) {
         /* execve's de_thread call-out. Nothing else to record: the run loop's
          * stop_gen check already knows what to do, and the EINTR this inflicts
@@ -2447,7 +2467,7 @@ static int rq_put(const PendSig *p) {
         tok = (nonce << RQ_IDX_BITS) | idx;
     } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
              tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC ||
-             tok == PT_FOREIGN_MAGIC ||
+             tok == PT_FOREIGN_MAGIC || tok == PT_PEEKSTOP_MAGIC ||
              tok >> 16 == SIG_JC_TAG ||   /* a job-control descriptor's shape */
              tok >> 24 == SIG_CARRY_TAG);   /* ...or a carrier token's */
     slot->nonce = nonce;

@@ -53,6 +53,11 @@ extern int g_sig_kicksig;
  * SIGSTOP that stopped it as one of its own signals instead
  * (ptrace_watch_tracees). */
 #define PT_FOREIGN_MAGIC 0x50544653   /* "PTFS" */
+/* ...and the kick an attach sends a stopped process's real parent, to ask
+ * its wait -- the one place outside the stopped task that knows -- by which
+ * signal the host stopped it (ptracetab.c, pt_peek_stop; signal.c,
+ * sig_kick_net). si_pid names the child. */
+#define PT_PEEKSTOP_MAGIC 0x50545053  /* "PTPS" */
 /* The same number also carries a guest's job-control signals to a traced
  * process -- SIGSTOP's own would freeze it -- marked in si_code instead
  * (signal.c, sig_send_jc). */

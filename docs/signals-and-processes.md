@@ -2132,10 +2132,25 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   shown to the real parent (above); a host continue of the emulator's making is
   marked before it is made (`JCA_CONT_*`), for when the parent asks after the
   tracee is no longer traced.
-
-What cannot be kept: the stop signal of a stop the host carried out is not to
-be read anywhere, so a process attached while stopped is reported stopped by
-`SIGSTOP`.
+- *The stop signal of a host stop.* An untraced process stops as the host
+  stops it, so that a host parent sees the stop — and the stop signal of a
+  stop the host carried out is known to two parties alone: the stopped task,
+  which runs nothing while stopped, and the real parent's wait. A kernel's
+  attach to such a process reports it (`JOBCTL_TRAP_STOP`, the tracer's wait),
+  and the `group_exit_code` as the parent's wait left it. So a guest parent's
+  wait writes down every stop it is told of in the child's registry entry, its
+  signal and whether it took the report, against the stop itself: the
+  leader's context-switch count, which a stopped task does not move
+  (`proctab_jc_hseen`, `proctab_jc_hstop`). An attach finding the process in
+  a stop its parent has not been told of asks the parent's wait — a kick its
+  capture answers from `waitid(WNOWAIT)`, the report left as it was
+  (`pt_peek_stop`, `PT_PEEKSTOP_MAGIC`). A host parent — the shell the first
+  guest process was started from — cannot be asked, and such an attach
+  reports `SIGSTOP` (`tests/fixtures/attachstopped.c`). The stop signal could
+  have been written down by the process itself, its default-stop signals
+  caught for it and the stop raised again; but a signal taken off the host's
+  queue is one a `SIGCONT` sent meanwhile no longer flushes, and only a caught
+  `SIGCONT` could — which ends the calls a stop would have restarted.
 
 **Implemented (the `strace` / `strace -f` / `strace -p` + `gdb` /
 `gdb -p` surface, per-thread):** `TRACEME`, `ATTACH`, `SEIZE`, `INTERRUPT`

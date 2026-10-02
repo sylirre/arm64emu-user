@@ -3559,10 +3559,11 @@ static int jc_host_artefact(s32 pid, int stopped) {
     return 0;
 }
 
-/* ...and one given to the guest: which stop it was, for an attach that finds
- * the child still in it (ptracetab.c, attach_stopped). */
-static void jc_host_taken(s32 pid) {
-    if (proctab_has(pid)) proctab_jc_hcons_set(pid, proctab_ctxsw(pid));
+/* ...and one given to the guest: which stop it was and by which signal --
+ * and whether the report was taken -- for an attach that finds the child still
+ * in it (ptracetab.c, attach_stopped). */
+static void jc_host_seen(s32 pid, int sig, int taken) {
+    if (proctab_has(pid)) proctab_jc_hseen(pid, sig, taken);
 }
 
 /* waitid's side of both: 1 when the host's report in `si` is not to be
@@ -3573,7 +3574,8 @@ static int jc_waitid_artefact(const siginfo_t *si, u32 options) {
         return 0;
     int stopped = si->si_code == CLD_STOPPED;
     if (!jc_host_artefact((s32)si->si_pid, stopped)) {
-        if (stopped && !(options & G_WNOWAIT)) jc_host_taken((s32)si->si_pid);
+        if (stopped)
+            jc_host_seen((s32)si->si_pid, si->si_status, !(options & G_WNOWAIT));
         return 0;
     }
     if (options & G_WNOWAIT) {
@@ -3674,7 +3676,7 @@ SYSDEF(wait4) {
             /* A stop or continue the emulator made, not the child's own. */
             if (pid > 0 && (WIFSTOPPED(status) || WIFCONTINUED(status))) {
                 if (jc_host_artefact((s32)pid, WIFSTOPPED(status))) continue;
-                if (WIFSTOPPED(status)) jc_host_taken((s32)pid);
+                if (WIFSTOPPED(status)) jc_host_seen((s32)pid, WSTOPSIG(status), 1);
             }
             /* Defensive: a link keyed to this pid with us as tracer can only
              * appear in a race window (TRACEME after the gate check); drop it
@@ -3725,7 +3727,7 @@ SYSDEF(wait4) {
         int werr = errno;
         if (pid > 0 && (WIFSTOPPED(status) || WIFCONTINUED(status))) {
             if (jc_host_artefact((s32)pid, WIFSTOPPED(status))) continue;
-            if (WIFSTOPPED(status)) jc_host_taken((s32)pid);
+            if (WIFSTOPPED(status)) jc_host_seen((s32)pid, WSTOPSIG(status), 1);
         }
         if (pid > 0) {
             /* A reaped child's link goes with it; a stop or a continue

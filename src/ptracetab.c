@@ -136,8 +136,9 @@ typedef struct {
                           * guest code published (ptrace_watch_tracees) */
     u32 attach_stopped;  /* ...while the host had the process stopped: adopt into
                           * a group stop (the tracer woke it to adopt at all);
-                          * 3 when the real parent had taken the host's report
-                          * of that stop already (proctab_jc_hcons) */
+                          * bit 1 when the real parent had taken the host's
+                          * report of that stop already (proctab_jc_hstop),
+                          * and its stop signal from bit 8 (proctab_jc_hstop) */
     u32 interrupt_pending; /* JOBCTL_TRAP_STOP: a PTRACE_INTERRUPT, or a SEIZEd
                           * auto-attached child's first stop -- a
                           * PTRACE_EVENT_STOP trap at the next boundary, or
@@ -289,6 +290,7 @@ static PtLink *pt_find(s32 tracee) {
 }
 
 static int pt_tracer_gone(const PtLink *e);
+static int pt_peek_stop(s32 tgid);
 static void pt_link_init(PtLink *e, s32 tgid, s32 tracee);
 static void pt_sweep(void);
 
@@ -1079,18 +1081,20 @@ void ptrace_jobctl_service(CPU *c) {
                  * the tracer (ptrace_wake_stopped): the kernel's attach makes
                  * a stopped task a traced one still in its group stop
                  * (JOBCTL_TRAP_STOP), so this thread traps into one, and the
-                 * others -- continued by the wake -- stop again. Of which
-                 * stop signal is not to be read anywhere: SIGSTOP. */
+                 * others -- continued by the wake -- stop again. By the stop
+                 * signal the host stopped it with, as its parent's wait was
+                 * told of it (proctab_jc_hstop), else SIGSTOP. */
                 u32 as = __atomic_exchange_n(&e->attach_stopped, 0, __ATOMIC_ACQ_REL);
                 if (as) {
-                    __atomic_store_n(&g_machine.jc_sig, SIGSTOP, __ATOMIC_RELEASE);
+                    int ssig = (int)(as >> 8) ? (int)(as >> 8) : SIGSTOP;
+                    __atomic_store_n(&g_machine.jc_sig, (u32)ssig, __ATOMIC_RELEASE);
                     u32 g = __atomic_add_fetch(&g_machine.jc_gseq, 1, __ATOMIC_SEQ_CST);
                     __atomic_store_n(&g_machine.jc_active, 1, __ATOMIC_RELEASE);
                     /* A stop the real parent was told of when the host made it,
                      * not one to tell it of again; the emulator's to run now,
                      * and its report to the parent's wait still the host's
                      * report, if that was not taken. */
-                    sig_jc_adopted(g, (as & 2) ? 0 : SIGSTOP);
+                    sig_jc_adopted(g, (as & 2) ? 0 : ssig);
                     thr_kick_all((s32)g_tls.tid);
                 }
                 /* ATTACH: the SIGSTOP ptrace_attach sends (SEND_SIG_PRIV) --
@@ -1755,11 +1759,18 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         int stopped = ptrace_task_stopped(tgid);
         /* ...and whether its real parent has already taken the host's report
          * of that stop: its group_exit_code, a kernel's attach keeps as it
-         * is -- 0 once a WUNTRACED wait took it (proctab_jc_hcons). */
+         * is -- 0 once a WUNTRACED wait took it (proctab_jc_hstop). */
         if (stopped) {
-            u64 hc = proctab_jc_hcons(tgid);
-            int taken = hc && hc == proctab_ctxsw(tgid);
-            __atomic_store_n(&e->attach_stopped, taken ? 3 : 1, __ATOMIC_RELEASE);
+            /* ...and by which signal: as the parent's wait was told of it,
+             * or would be, asked now -- the one place outside the stopped task
+             * that knows -- or, a host parent, SIGSTOP. */
+            int sig = SIGSTOP, taken = 0;
+            if (!proctab_jc_hstop(tgid, &sig, &taken) || sig <= 0 || sig > 64) {
+                sig = pt_peek_stop(tgid);
+                taken = 0;
+            }
+            __atomic_store_n(&e->attach_stopped, (u32)sig << 8 | (taken ? 3u : 1u),
+                             __ATOMIC_RELEASE);
         }
         pt_send_kick(tgid, pid);
         if (stopped) ptrace_wake_stopped(tgid);
@@ -2315,6 +2326,33 @@ static s32 pt_task_ppid(s32 t) {
     char st;
     int pp;
     return rp && sscanf(rp + 1, " %c %d", &st, &pp) == 2 ? (s32)pp : 0;
+}
+
+/* Ask the real parent of host-stopped process `tgid`, if it is a guest
+ * process, by which signal the host stopped it: its kick handler asks its
+ * own wait, without taking the report (WNOWAIT), and answers in the child's
+ * registry entry. SIGSTOP when nobody can say -- a host parent, or none
+ * answering in 200 ms. */
+static s32 pt_task_ppid(s32 t);
+static int pt_peek_stop(s32 tgid) {
+    s32 parent = pt_task_ppid(tgid);
+    u32 r, *w = proctab_jc_peek_word(tgid);
+    if (!w || parent <= 0 || !proctab_ident(parent, &r)) return SIGSTOP;
+    __atomic_store_n(w, 0, __ATOMIC_RELEASE);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = PTRACE_KICKSIG;
+    si.si_code = SI_QUEUE;
+    si.si_pid = (pid_t)tgid;   /* the child it is asked about */
+    si.si_uid = getuid();
+    si.si_value.sival_int = PT_PEEKSTOP_MAGIC;
+    if (syscall(SYS_rt_sigqueueinfo, (pid_t)parent, PTRACE_KICKSIG, &si) != 0) return SIGSTOP;
+    for (int i = 0; i < 20; i++) {
+        u32 a = __atomic_load_n(w, __ATOMIC_ACQUIRE);
+        if (a & 0x100) return (a & 0xff) ? (int)(a & 0xff) : SIGSTOP;
+        fx_wait(w, 0, 10);
+    }
+    return SIGSTOP;
 }
 
 static void pt_wd_start(void);
