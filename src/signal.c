@@ -3837,6 +3837,20 @@ int sig_on_trampoline(struct Machine *m, u64 pc) {
     return m->sigtramp_va && pc - m->sigtramp_va < 8;
 }
 
+/* get_signal found no handler to run: the mask a sigsuspend or a p-variant
+ * wait installed for its sleep goes back (the kernel's restore_saved_sigmask)
+ * before the call is restarted -- which installs it again -- or answers
+ * EINTR. Only a handler's frame used to give it back: a stop that ended with
+ * the signal suppressed, or ignored after all, left the wait's mask in place,
+ * the restarted call took it for the caller's own, and the caller's mask was
+ * gone for good. */
+static void sig_saved_mask_back(struct Machine *m) {
+    if (!g_tls.have_saved_sigmask) return;
+    g_tls.sigmask = g_tls.saved_sigmask;
+    g_tls.have_saved_sigmask = 0;
+    sig_sync_host_mask(m);
+}
+
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
     if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
@@ -3855,7 +3869,10 @@ void sig_deliver_pending(CPU *c) {
         /* The kernel's next, of those not blocked -- none, and what is queued
          * waits for the unblock (the counts say so without a walk). */
         int pick = sigq_pick(~g_tls.sigmask);
-        if (pick < 0) return;
+        if (pick < 0) {
+            sig_saved_mask_back(m);
+            return;
+        }
         PendSig p = sigq[pick];
         int sig = p.signo;
         sigq_take(pick);
@@ -3948,6 +3965,7 @@ void sig_deliver_pending(CPU *c) {
         deliver_to_handler(c, sig, &p);
         return;   /* one at a time; the next check happens after sigreturn */
     }
+    sig_saved_mask_back(m);
     sigq_lower_npend();
 }
 

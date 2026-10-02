@@ -491,7 +491,13 @@ them, so a guest that `sigfillset`s cannot make a thread parked here
 unreachable to `de_thread`), and the guest mask is swapped too and held across
 delivery exactly as `rt_sigsuspend` does (the frame records the caller's via
 `have_saved_sigmask`; `sigreturn` restores it); a wait that ends with nothing
-to deliver restores it directly. Handing the mask to the host alone used to
+to deliver restores it directly, and so does a delivery that ends with no
+handler to run (`sig_saved_mask_back`, the kernel's `restore_saved_sigmask`) —
+a signal its tracer suppressed at the stop, or one ignored after it — before
+the call is restarted, which installs the temporary mask anew. Given back by a
+frame only, it outlived such a stop: the restarted call took the temporary mask
+for the caller's, and the caller's own was gone once the wait was over
+(`tests/ptrace/stopmask.c`). Handing the mask to the host alone used to
 leave `g_tls.sigmask` gating delivery: the wait was interrupted and the run
 loop then declined to run the handler, leaving the guest with a bare `EINTR`
 and no signal. The enter path also
