@@ -340,10 +340,18 @@ restarted by a tracer's attach was handed a span of 0 and returned at once
 (`tests/ptrace/attach_hugesleep.c`). Absolute deadlines —
 `clock_nanosleep(TIMER_ABSTIME)`, `FUTEX_WAIT_BITSET` and the PI futex ops — are
 exact under a plain restart and declare nothing. `rt_sigsuspend` and
-`rt_sigtimedwait` sleep in their host namesakes and loop over the kick's
-`EINTR` themselves (a handler of ours ran, nothing for the guest: sleep on);
-a `signalfd` read is the host's read and rewinds like any other call; the IPC
-broker wait polls and never sees the kick at all. The `de_thread` call-out
+`rt_sigtimedwait` sleep in their host namesakes and loop over the `EINTR` of
+a handler of ours that left the guest nothing; a `signalfd` read is the host's
+read and rewinds like any other call. A tracer's kick is not slept through:
+`rt_sigsuspend` serves it where it sleeps, as `wait4` does — an attach's
+`SIGSTOP` or an `INTERRUPT` traps or stops it there, under its temporary mask,
+and it sleeps on, the kernel's `ERESTARTNOHAND` — while `rt_sigtimedwait`
+(which declares its timeout, `syscall_wait_begin_ns`) and the IPC broker wait
+(which cancels its request, as for `de_thread`) leave for the boundary, which
+serves it and restarts them unless the stop it made ends them with `EINTR`,
+as the kernel's do (neither is ever restarted). Slept through, the attach stop
+never came: `strace -p` on a shell waiting for its children in `sigsuspend`
+waited for it forever (`tests/ptrace/attachwait.c`). The `de_thread` call-out
 they *do* report is never cancelled — the thread goes on to its death at the
 safepoint, or (the main thread) to the new image. Covered by
 `tests/ptrace/attach_no_eintr.c`, which asserts both halves: the sleep returns

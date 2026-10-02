@@ -2272,7 +2272,8 @@ run-loop safepoint, and two things get a thread there:
   `rt_sigtimedwait`, `signalfd` reads, parked SysV IPC waiters — poll
   `guest_stop_pending` for the same reason: an interrupted host call there is
   retried, not returned, so without the check the thread would go straight back
-  to sleep. The kick can only ever *interrupt* something; it cannot make a wait
+  to sleep. (A tracer's kick likewise: served in place by `wait4`/`waitid` and
+  `rt_sigsuspend`, at the boundary for the rest.) The kick can only ever *interrupt* something; it cannot make a wait
   whose exit condition is "a signal the guest can see" give up, because the kick
   is precisely the signal the guest must never see.
 

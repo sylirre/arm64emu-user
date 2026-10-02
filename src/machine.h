@@ -575,6 +575,7 @@ void syscall_unrewind(CPU *c);
  * under a restart and need neither. */
 void syscall_wait_begin(struct timespec *ts);
 void syscall_wait_begin_ms(int *ms);
+s64 syscall_wait_begin_ns(s64 ns);
 
 /* sys_proc.c: resolve+load a program (shebang-aware); returns 0 or -errno.
  * Does not take ownership of argv/envp. */

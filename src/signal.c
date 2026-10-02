@@ -3734,6 +3734,13 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
          * and go there. This is the loop that made a libc SIGEV_THREAD timer
          * helper look permanently parked. */
         if (guest_stop_pending(m)) return -EINTR;
+        /* ...and for a tracer's kick, which the boundary serves: an attach's
+         * SIGSTOP ends the kernel's wait with EINTR once its stop is over (a
+         * sigtimedwait is never restarted), a seize ends none -- the kick's
+         * EINTR is ours, and the call is restarted with what is left of its
+         * timeout (syscall_wait_begin_ns). Waited through, the attach stop
+         * never came. */
+        if (g_ptrace_kick) return -EINTR;
         /* What is left of the timeout. */
         struct timespec rem, *remp = NULL;
         if (timeout_ns == 0) { rem.tv_sec = 0; rem.tv_nsec = 0; remp = &rem; }

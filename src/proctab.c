@@ -64,6 +64,7 @@
 
 #include "machine.h"
 #include "guest_abi.h"        /* G_IPC_ and G_SHM_ constants for the shm broker */
+#include "ptrace.h"           /* g_ptrace_kick, for the blocking IPC waits */
 
 struct ProcEnt {
     u32 seq;                     /* seqlock: odd = write in progress */
@@ -4288,11 +4289,15 @@ static s32 ipc_wait_rpc(struct Machine *m, struct BReq *q,
     }
     for (;;) {
         /* Interrupted either by a signal the guest can take, or by a call-out
-         * to a run-loop safepoint (execve's de_thread) -- which this thread
-         * must reach, and cannot while parked here. The cancel exchange is the
-         * same either way, and so is the EINTR the guest is told. */
+         * to a run-loop safepoint (execve's de_thread) or a tracer's kick (an
+         * attach, a PTRACE_INTERRUPT) -- which this thread must reach, and
+         * cannot while parked here. The cancel exchange is the same either
+         * way, and so is the EINTR the guest is told -- after the stop an
+         * attach makes, as the kernel's semop and msgrcv answer it; a seize's
+         * kick is an EINTR of ours, which the boundary restarts the call
+         * from. */
         if ((g_sig_npend && sig_pending_deliverable(m)) ||
-            guest_stop_pending(m)) {
+            guest_stop_pending(m) || g_ptrace_kick) {
             struct BReq cq;
             memset(&cq, 0, sizeof cq);
             cq.op = REQ_CANCEL;

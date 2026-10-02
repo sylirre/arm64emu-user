@@ -257,6 +257,8 @@ SYSDEF(semtimedop) {
         else
             timeout_ns = ts.tv_sec * 1000000000 + ts.tv_nsec;
     }
+    /* A restart of ours -- after a tracer's seize -- keeps the deadline. */
+    timeout_ns = syscall_wait_begin_ns(timeout_ns);
     return do_semop(c, a0, a1, a2, timeout_ns);
 }
 

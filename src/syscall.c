@@ -541,6 +541,15 @@ void syscall_wait_begin_ms(int *ms) {
     *ms = (int)left;
 }
 
+/* ...and for one held in nanoseconds, which no host time_t has to carry: a
+ * negative one is "wait forever" and a zero one "do not wait", neither of
+ * them shrunk. Returns what is left of it. */
+s64 syscall_wait_begin_ns(s64 ns) {
+    syscall_wait_begin(NULL);
+    if (ns <= 0 || !g_tls.sc_waited_ns) return ns;
+    return (u64)ns > g_tls.sc_waited_ns ? ns - (s64)g_tls.sc_waited_ns : 0;
+}
+
 void syscall_dispatch(CPU *c) {
     static int initialized;
     if (!initialized) { table_init(); initialized = 1; }

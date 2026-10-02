@@ -147,6 +147,18 @@ SYSDEF(rt_sigsuspend) {
             sig_sync_host_mask(c->m);
             return (u64)(s64)-EINTR;
         }
+        /* A tracer's kick -- an attach, a PTRACE_INTERRUPT -- is served here,
+         * as a wait4 serves it, under the temporary mask: the kernel's
+         * sigsuspend leaves for get_signal, traps or stops there, and is
+         * restarted (ERESTARTNOHAND) unless a handler is to run -- one a
+         * tracer put in place of the attach's SIGSTOP included, which the
+         * loop then finds. Slept through, the attach stop never came: a
+         * tracer of a shell waiting for its children in sigsuspend waited
+         * for it forever. */
+        if (g_ptrace_kick) {
+            ptrace_service_kick(c);
+            continue;
+        }
         sig_host_suspend();
     }
     return (u64)(s64)-EINTR;
@@ -172,6 +184,7 @@ SYSDEF(rt_sigtimedwait) {
                   ? 4000000000LL * 1000000000LL
                   : g.tv_sec * 1000000000LL + g.tv_nsec;
     }
+    tmo = syscall_wait_begin_ns(tmo);   /* a restart keeps the deadline (syscall.c) */
     return (u64)sig_timedwait(c, set, a1, tmo);
 }
 
