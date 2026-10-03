@@ -1607,6 +1607,34 @@ then make the consequences the caller depends on true:
   `A64_PROCSYNTH_FORCE_FAIL` forces the no-backing tier so the suite can check
   all of that (`tests/fixtures/procsynth_tier.c`).
 
+  **`stat`, `statx`, `access` and `statfs` of a synthesized name** are the
+  host's to answer, until it refuses. Android's SELinux policy denies an app
+  getattr and access on exactly the files whose open it denies (`version`,
+  `stat`, `loadavg`, `/proc/sys/kernel/overflow{u,g}id`, ...), and since the
+  open is served from a view the guest could `cat /proc/version` but not
+  `stat` it: `ls -l /proc` printed an error per entry, `test -r` was false and
+  every tool that stats before it opens gave up. A host refusal (`EACCES` or
+  `EPERM`) of one of these names is therefore answered from the view
+  (`procfs_stat_fallback`), with the attributes a kernel's procfs gives the
+  file: a regular file of size 0 — proc files have none — with one link, on the
+  proc filesystem's own device, 1 KiB blocks, mode 0444 (0400 for `environ`,
+  `auxv`, `mountstats` and `personality`, 0644 for the id maps and the
+  sysctls), root's if it belongs to the system and the emulator's user's (the
+  guest's fake id under `--fake-id`) if it belongs to a process; `/proc/mounts`
+  is a link to `self/mounts` under `lstat`, as it is. A name is recognized by
+  asking `procfs_open` whether it would serve it — the view is built and
+  dropped, never handed over — so "stat-able" and "readable" cannot drift
+  apart; the three try-host-first names (`stat`, `overflowuid`, `overflowgid`)
+  that a readable host file keeps are recognized by name, since a host can
+  allow the read and refuse the stat. `access` is then the mode rule applied to
+  the guest's identity, `statfs` is the `/proc` filesystem's, and a name that
+  is not synthesized, or whose open a guest would be refused, keeps the host's
+  own answer — nothing is invented. `A64_PROCSYNTH_FORCE_STAT_DENY` makes any
+  host refuse these, so the suite runs `tests/fixtures/procsynth_stat.c` over
+  it, with and without the synthesized-open tiers and `--fake-id`. (A
+  descriptor on a view reports the memfd behind it, as it always did; only
+  the path forms are answered as procfs files.)
+
   The exact signal state and credentials exist only in the process's own
   `Machine`, so for **another** guest process only what the shared tables can
   answer is rewritten (`TracerPid` from the ptrace link registry, `Seccomp` from

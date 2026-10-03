@@ -38,7 +38,11 @@
  * smaps, pagemap, mem, ...) have no guest answer to synthesize and the host's
  * describes the emulator, so those are refused with EACCES rather than passed
  * through. Everything else under /proc
- * stays host-passthrough — including stat() of these paths (readers open+read). */
+ * stays host-passthrough. So does stat() of a synthesized name, until the host
+ * refuses it: Android's SELinux denies an app getattr and access on the very
+ * files it denies the open of (version, stat, loadavg, ...), and a file the
+ * guest can cat but not stat is a file `ls -l`, `test -r` and every stat-first
+ * tool trips over. procfs_stat_fallback answers from the view then. */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -1025,15 +1029,26 @@ static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self, int 
     return r;
 }
 
+/* Set (to a kind slot) by synth_stat_fill around its procfs_open call, on this
+ * thread alone: the view is then built and classified, and pf_hand reports its
+ * kind instead of handing a descriptor over. */
+static __thread int *pf_probe;
+
 /* Hand a built view to the guest: rewound, CLOEXEC as asked, and tracked --
  * every one of them, since the tracking is what enforces the access mode the
  * guest opened it in (the memfd is O_RDWR). A view the table cannot take is
  * withheld with ENOMEM rather than handed out unenforced: a read-only file
  * that takes writes, or a written-through one whose writes land in the memfd,
  * would be a silent lie either way. Sets *ret and returns 1, as procfs_open's
- * callers expect. */
+ * callers expect. (Under pf_probe, *ret is 0 and the view is dropped.) */
 static int pf_hand(struct Machine *m, int fd, int kind, s32 pid, int self,
                    int gflags, s64 *ret) {
+    if (pf_probe) {   /* procfs_stat_fallback: classified, nothing handed over */
+        *pf_probe = kind;
+        fdheld_close(fd);
+        *ret = 0;
+        return 1;
+    }
     lseek(fd, 0, SEEK_SET);
     if (!(gflags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);   /* guest didn't ask */
     if (pf_track(m, fd, kind, pid, self, gflags) < 0) {
@@ -2380,4 +2395,116 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
     /* Time-varying (refreshed on a rewind), written through, or a snapshot:
      * tracked alike, for the access mode. */
     return pf_hand(m, fd, kind, 0, 1, gflags, ret);
+}
+
+/* ---- stat / statx / access of a synthesized name ----
+ *
+ * The host answers these for the names above only as long as its policy lets
+ * an app look at the real file, and where it does not (Android's SELinux:
+ * version, stat, loadavg, sys/kernel/overflow{u,g}id, ...) the guest could cat
+ * a file and not stat it -- `ls -l /proc` printed an error per entry, `test -r
+ * /proc/version` failed, and so did every tool that stats before it opens.
+ * A host refusal of one of these names is therefore answered from the view
+ * itself, with the attributes a kernel's procfs gives such a file. Nothing
+ * here widens what the open serves: a name is stat'able exactly when
+ * procfs_open would serve it for reading, since that is how it is recognized
+ * -- plus the names it leaves to a readable host file (stat, overflow{u,g}id),
+ * which a host that will not stat them has made no less readable.
+ *
+ * A64_PROCSYNTH_FORCE_STAT_DENY makes the host refuse them all (EACCES), the
+ * tier an Android host is on, so the fallback is reachable anywhere. */
+
+/* What a kernel's procfs reports as the mode of each kind of file. */
+static mode_t synth_mode(int kind) {
+    switch (kind) {
+    case PF_ENVIRON: case PF_AUXV: case PF_PERS: case PF_MOUNTSTATS:
+        return 0400;
+    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS: case PF_OVERFLOWID:
+        return 0644;
+    default:
+        return 0444;
+    }
+}
+
+/* The files that belong to the system and not to a process: root's, where a
+ * process's own files are its owner's (task_dump_owner). */
+static int synth_global(int kind, const char *canon) {
+    switch (kind) {
+    case PF_LOADAVG: case PF_UPTIME: case PF_VERSION: case PF_STAT:
+    case PF_CPUINFO: case PF_OVERFLOWID: case PF_LOCKS:
+        return 1;
+    case PF_MOUNTS:
+        return !strcmp(canon, "/proc/mounts");   /* the link, not self/mounts */
+    default:
+        return 0;
+    }
+}
+
+/* Is the open of `canon` served from a synthesized view? Fills *st with what
+ * the kernel's own file would report -- a regular file of size 0 (proc files
+ * have no size), 1 KiB blocks, one link, on the proc filesystem's own device,
+ * owned by root or, for a process's files, by the user the emulator runs as
+ * (every guest process is one; the stat reply remaps it under --fake-id) -- and
+ * returns 1; 0 for a name that is not synthesized, or one whose open a guest
+ * would be refused. */
+static int synth_stat_fill(CPU *c, const char *canon, int nofollow, struct stat *st) {
+    int kind = -1;
+    s64 r = 0;
+    pf_probe = &kind;
+    int hit = procfs_open(c, canon, O_RDONLY, &r);
+    pf_probe = NULL;
+    if (hit) {
+        if (r < 0 || kind < 0) return 0;
+    } else if (c->m->no_proc) {
+        return 0;
+    } else if (!strcmp(canon, "/proc/stat")) {
+        /* The try-host-first names are not served while the host's own file
+         * is readable, and the open then reads the real thing. A host that
+         * lets an app read it but not stat it (the permissions are separate)
+         * has still made it a file the guest can read, and these are the
+         * attributes of every kernel's. */
+        kind = PF_STAT;
+    } else if (!strcmp(canon, "/proc/sys/kernel/overflowuid") ||
+               !strcmp(canon, "/proc/sys/kernel/overflowgid")) {
+        kind = PF_OVERFLOWID;
+    } else {
+        return 0;
+    }
+
+    /* The kernel's /proc/mounts is a link to self/mounts, and lstat says so. */
+    int link = nofollow && !strcmp(canon, "/proc/mounts");
+    struct stat pd;
+    memset(st, 0, sizeof *st);
+    st->st_dev = stat("/proc", &pd) == 0 ? pd.st_dev : 0;
+    /* procfs numbers its entries from 0xF0000000 up, in the order they were
+     * registered; the spelling is a stable stand-in for that order. */
+    st->st_ino = 0xF0000000u + fnv1a32(canon) % 0x0FFFFFFFu;
+    st->st_mode = link ? (mode_t)(S_IFLNK | 0777) : (mode_t)(S_IFREG | synth_mode(kind));
+    st->st_nlink = 1;
+    if (!synth_global(kind, canon)) {
+        st->st_uid = geteuid();
+        st->st_gid = getegid();
+    }
+    st->st_size = link ? (off_t)strlen("self/mounts") : 0;
+    st->st_blksize = 1024;
+    /* An inode's times are those of its instantiation and stay put after. */
+    static struct timespec born;
+    if (!born.tv_sec) clock_gettime(CLOCK_REALTIME, &born);
+    st->st_atim = st->st_mtim = st->st_ctim = born;
+    return 1;
+}
+
+static int stat_forced_deny(void) {
+    static int on = -1;
+    return PROBE_ONCE(on, getenv("A64_PROCSYNTH_FORCE_STAT_DENY") != NULL);
+}
+
+int procfs_stat_fallback(CPU *c, const char *canon, int nofollow, int host_rc,
+                         struct stat *st) {
+    int e = errno;
+    if (!canon) return 0;
+    int refused = host_rc < 0 ? (e == EACCES || e == EPERM) : stat_forced_deny();
+    if (refused && synth_stat_fill(c, canon, nofollow, st)) return 1;
+    errno = e;
+    return 0;
 }

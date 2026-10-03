@@ -2606,6 +2606,38 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     done
     fx_rm "tests/fixtures/$name.bin"
 }
+# ---- a synthesized /proc file is as stat-able as it is readable. Self-checking:
+# qemu-user has no synthesized /proc. Android's SELinux policy denies an app
+# getattr and access on the files whose open the emulator serves itself
+# (version, stat, loadavg, ...), and a guest could `cat /proc/version` but
+# neither `stat` nor `test -r` it. A64_PROCSYNTH_FORCE_STAT_DENY makes any host
+# refuse those (EACCES) -- the third row is that tier with the open of the
+# try-host-first names synthesized too, as the device has it; the fake-root rows
+# run the same relations through the guest's own credentials (a host root has
+# no fake identity to tell apart from its own, so they are for the rest). ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o tests/fixtures/procsynth_stat.bin \
+            tests/fixtures/procsynth_stat.c 2>/dev/null; then
+        pss_want=$'fails=0\ndone'
+        pss_deny="A64_PROCSYNTH_FORCE_STAT_DENY=1"
+        pss_both="$pss_deny A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1"
+        got=$("$EMU" / tests/fixtures/procsynth_stat.bin 2>/dev/null)
+        fixture_verdict "procsynth_stat" "$pss_want" "$got"
+        got=$(env $pss_deny "$EMU" / tests/fixtures/procsynth_stat.bin 2>/dev/null)
+        fixture_verdict "procsynth_stat (stat-denied tier)" "$pss_want" "$got"
+        got=$(env $pss_both "$EMU" / tests/fixtures/procsynth_stat.bin 2>/dev/null)
+        fixture_verdict "procsynth_stat (stat-denied synthesized tier)" "$pss_want" "$got"
+        if [ "$(id -u)" != 0 ]; then
+            got=$(env $pss_deny "$EMU" --fake-id / tests/fixtures/procsynth_stat.bin 2>/dev/null)
+            fixture_verdict "procsynth_stat (stat-denied tier, fake root)" "$pss_want" "$got"
+            got=$(env $pss_both "$EMU" --fake-id 1000:1000 / tests/fixtures/procsynth_stat.bin 2>/dev/null)
+            fixture_verdict "procsynth_stat (stat-denied synthesized tier, fake user)" "$pss_want" "$got"
+        fi
+        fx_rm tests/fixtures/procsynth_stat.bin
+    else
+        skip_build "fixtures/procsynth_stat"
+    fi
+fi
 # ---- mount(2)'s arguments, imported in the kernel's order: type, source, the
 # options page (EFAULT only when none of it is readable, otherwise as far as it
 # goes), then the target, then privilege and the kind of mount. Self-checking:

@@ -1498,6 +1498,15 @@ static int fd_relower(int fd, int cloexec) {
     return nf;
 }
 
+/* The spelling under which procfs_open knows a resolved path, when it is in the
+ * /proc zone: the canonical guest path, or -- a sandbox reaches /proc under
+ * another name (/newroot/proc/...) -- the host path such a lookup resolves to,
+ * which is the canonical spelling. NULL outside it. */
+static const char *proc_zone_canon(const char *canon, const char *host) {
+    return !strncmp(canon, "/proc/", 6) ? canon
+         : (proc_zone_path(host) ? host : NULL);
+}
+
 SYSDEF(openat) {
     PathPin pin;
     char canon[PATH_MAX];
@@ -1557,11 +1566,8 @@ SYSDEF(openat) {
             hflags &= ~(O_CREAT | O_EXCL);
         }
     }
-    /* maps/cmdline/mounts: the guest view. A sandbox reaches /proc under
-     * another name (/newroot/proc/...), and the host path such a lookup
-     * resolves to is the canonical spelling, so that covers both. */
-    const char *pcanon = !strncmp(canon, "/proc/", 6) ? canon
-                       : (proc_zone_path(host) ? host : NULL);
+    /* maps/cmdline/mounts: the guest view. */
+    const char *pcanon = proc_zone_canon(canon, host);
     if (pcanon) {
         s64 pf;
         if (procfs_open(c, pcanon, gflags, &pf)) {
@@ -1969,8 +1975,9 @@ SYSDEF(newfstatat) {
     }
     {
         PathPin pin;
+        char canon[PATH_MAX];
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-        int rr = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
+        int rr = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
         if (rr < 0) return (u64)(s64)rr;
 #ifdef L2S_ENABLED
         if (c->m->link2symlink) {
@@ -1989,6 +1996,12 @@ SYSDEF(newfstatat) {
          * stat: a memfd whose mode the registry holds reads the same either
          * way. (The host answers this stat even where it refuses the open.) */
         if (r == 0) mfd_stat_fixup(c->m, proc_own_fd_path(pin.host), &st);
+        /* A synthesized /proc file the host will not stat (Android denies an
+         * app getattr on the files whose open the emulator serves) is stat'able
+         * all the same: the guest can read it, so it can be asked about. */
+        if (procfs_stat_fallback(c, proc_zone_canon(canon, pin.host),
+                                 (gf & G_AT_SYMLINK_NOFOLLOW) != 0, r, &st))
+            r = 0;
         u64 e = r < 0 ? host_err() : 0;
         path_unpin(&pin);
         if (r < 0) return e;
@@ -2043,12 +2056,44 @@ static u64 access_host(const PathPin *p, int mode) {
     return access_pinned(p, mode) == 0 ? 0 : host_err();
 }
 
+/* access(2) of a synthesized /proc file the host would not judge (see
+ * procfs_stat_fallback): `hret` is what the host path answered. The file is
+ * the kernel's own shape of one -- root's, 0444 or 0400 -- so the answer is the
+ * mode rule applied to the guest's identity: its fake credentials under
+ * --fake-id, the emulator's own otherwise (the host's access(2) would have
+ * asked about the same ones). Returns `hret` when the host's answer stands. */
+static u64 access_synth(CPU *c, const char *pcanon, int nofollow, int mode,
+                        int eff, u64 hret) {
+    struct stat st;
+    errno = hret ? (int)-(s64)hret : 0;
+    if (!procfs_stat_fallback(c, pcanon, nofollow, hret ? -1 : 0, &st))
+        return hret;
+    struct Machine *m = c->m;
+    Cred cr = { .ngroups = 0 };
+    u32 uid, gid;
+    if (m->fake_id) {
+        cred_get(m, &cr);
+        uid = eff ? cr.euid : cr.ruid;
+        gid = eff ? cr.egid : cr.rgid;
+    } else {
+        uid = eff ? geteuid() : getuid();
+        gid = eff ? getegid() : getgid();
+    }
+    return (u64)(s64)mode_access_ok(uid, gid, cr.groups, cr.ngroups,
+                                    remap_uid(m, (u32)st.st_uid),
+                                    remap_gid(m, (u32)st.st_gid),
+                                    (u32)st.st_mode, mode);
+}
+
 SYSDEF(faccessat) {
     PathPin pin;
-    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, canon);
     if (r < 0) return (u64)(s64)r;
     u64 ret = c->m->fake_id ? access_faked(c->m, &pin, (int)a2, 0)
                             : access_host(&pin, (int)a2);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
+    if (pcanon) ret = access_synth(c, pcanon, 0, (int)a2, 0, ret);
     path_unpin(&pin);
     return ret;
 }
@@ -2068,8 +2113,9 @@ SYSDEF(faccessat2) {
     if (gf & ~(unsigned)(G_AT_SYMLINK_NOFOLLOW | G_AT_EACCESS))
         return (u64)(s64)-EINVAL;
     PathPin pin;
+    char canon[PATH_MAX];
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
-    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
     if (r < 0) return (u64)(s64)r;
     /* AT_SYMLINK_NOFOLLOW on a real hardlink is a no-op -- the kernel judges
      * the file -- so an emulated one must be judged by its backing and not by
@@ -2079,6 +2125,10 @@ SYSDEF(faccessat2) {
     u64 ret = c->m->fake_id
                   ? access_faked(c->m, &pin, (int)a2, (gf & G_AT_EACCESS) != 0)
                   : access_host(&pin, (int)a2);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
+    if (pcanon)
+        ret = access_synth(c, pcanon, (gf & G_AT_SYMLINK_NOFOLLOW) != 0, (int)a2,
+                           (gf & G_AT_EACCESS) != 0, ret);
     path_unpin(&pin);
     return ret;
 }
@@ -4096,20 +4146,34 @@ SYSDEF(statfs) {
      * name. fstatfs on an O_PATH fd wants Linux >= 3.12; where it is refused,
      * the descriptor's own /proc spelling still names that exact inode. */
     PathPin pin;
-    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, NULL);
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
     if (r < 0) return (u64)(s64)r;
     int ffd = path_pin_final(&pin);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
     path_unpin(&pin);
-    if (ffd < 0) return (u64)(s64)ffd;
     struct statfs h;
-    int sr = fstatfs(ffd, &h);
-    if (sr < 0 && (errno == EBADF || errno == EINVAL)) {
-        char spell[PATH_MAX];
-        path_fd_spell(ffd, spell);
-        sr = statfs(spell, &h);
+    int sr;
+    if (ffd < 0) {
+        if (!pcanon) return (u64)(s64)ffd;
+        errno = -ffd;
+        sr = -1;
+    } else {
+        sr = fstatfs(ffd, &h);
+        if (sr < 0 && (errno == EBADF || errno == EINVAL)) {
+            char spell[PATH_MAX];
+            path_fd_spell(ffd, spell);
+            sr = statfs(spell, &h);
+        }
     }
+    /* A synthesized /proc file the host refuses to describe: it lives on the
+     * proc filesystem like every other file under /proc, so that is the
+     * answer (procfs_stat_fallback; the attributes it fills are not needed). */
+    struct stat ps;
+    if (procfs_stat_fallback(c, pcanon, 0, sr, &ps) && statfs("/proc", &h) == 0)
+        sr = 0;
     u64 e = sr < 0 ? host_err() : 0;
-    path_unpin_final(ffd);
+    if (ffd >= 0) path_unpin_final(ffd);
     return sr < 0 ? e : statfs_out(c, a1, &h);
 }
 
@@ -4231,6 +4295,15 @@ SYSDEF(statx) {
                 if (r == 0) statx_from_stat(buf, &st);
             }
             if (r == 0) mfd_statx_fixup(c->m, proc_own_fd_path(host), buf);
+        }
+        /* As newfstatat: a synthesized /proc file the host refuses is still
+         * one the guest may ask about. */
+        struct stat ps;
+        if (procfs_stat_fallback(c, proc_zone_canon(canon, host),
+                                 (gf & G_AT_SYMLINK_NOFOLLOW) != 0,
+                                 r < 0 ? -1 : 0, &ps)) {
+            statx_from_stat(buf, &ps);
+            r = 0;
         }
         path_unpin(&pin);
     }

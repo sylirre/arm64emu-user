@@ -226,6 +226,16 @@ unfiltered:
   `A64_PROCFS_FORCE_OLD` hides exactly those from an ordinary host's /proc so
   the append paths are reachable off the device.
 
+* **`stat` and `access` of the synthesized `/proc` files** are denied as well:
+  SELinux grants an app neither getattr nor read on `version`, `stat`,
+  `loadavg` and the rest, so a guest that `cat`s one — served from the
+  emulator's own view — still got `Permission denied` from `stat`, `ls -l`
+  and `test -r`, which were handed to the host. The host's refusal is now
+  answered from the same view with a procfs file's attributes (regular, size
+  0, root's 0444 — see [syscalls.md](syscalls.md)).
+  `A64_PROCSYNTH_FORCE_STAT_DENY` makes any host refuse them, and
+  `tests/fixtures/procsynth_stat.c` runs over it.
+
 * **`/proc/version` and `/proc/uptime`** are denied to an app outright, which
   is why both are synthesized. Where there is no anonymous backing to
   synthesize into (`A64_PROCSYNTH_FORCE_FAIL`), they are the two views that

@@ -626,6 +626,18 @@ void ptimers_fork_clear(void);
  * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
 
+/* The host's answer to a stat-like call (stat, statx, access, statfs) on a
+ * resolved path, judged against the synthesized /proc files. `canon` is the
+ * path as procfs_open takes it (NULL for anything outside /proc); `host_rc` is
+ * the host call's result with errno as it left it. When canon names a
+ * synthesized file and the host refused it -- EACCES/EPERM, as Android's
+ * policy does for the very files the open is served -- fills *st with the
+ * attributes of the kernel's own file and returns 1, and the caller treats the
+ * call as having succeeded; otherwise returns 0 with errno unchanged and the
+ * host's answer stands. */
+int procfs_stat_fallback(CPU *c, const char *canon, int nofollow, int host_rc,
+                         struct stat *st);
+
 /* Every synthesized file is a descriptor the emulator tracks by number, with
  * the access mode the guest opened it in: the backing memfd is O_RDWR
  * whatever the guest asked, so the mode is enforced here, not by the host --

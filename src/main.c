@@ -326,6 +326,11 @@ static void help(void) {
                         "memfd_create nor a writable directory is served by): "
                         "the per-process files are denied, never served from "
                         "the host's own /proc."},
+        {"A64_PROCSYNTH_FORCE_STAT_DENY", "Make the host refuse stat, statx, "
+                        "access and statfs of every synthesized /proc file "
+                        "(EACCES, as Android's SELinux policy does for the "
+                        "files whose open the emulator serves): the guest is "
+                        "then answered from the synthesized view instead."},
         {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
         {"A64_PROCTAB_FORCE_FILE", "Skip the diskless guest-PID registry "
                         "broker for the named-file tier (the tier a host with "
