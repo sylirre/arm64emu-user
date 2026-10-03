@@ -475,6 +475,23 @@ done
 # itself, rather than decide here that a run is impossible.
 [ -n "$A64_SCRATCH" ] || A64_SCRATCH=/tmp
 
+# ---- does this host give the ORACLE a real hardlink? -------------------------
+# Android denies link(2) to an app outright, which is the whole reason
+# --link2symlink exists. The emulator has a scheme for it and the oracle has
+# none, so a differential test that makes a real hardlink dies on the oracle
+# side with "link: Permission denied" while the emulator side prints every row
+# -- a difference in what the two worlds can DO, not in what they answer about
+# one question. A test that makes one says NEEDS-HOST-LINK and is skipped by
+# name where this is 0. Probed in the scratch directory, which is where those
+# tests work; a probe that cannot even make its first file does not gate
+# anything, the same rule the syscall probes follow.
+A64_HOST_HARDLINK=1
+_hl="$A64_SCRATCH/.a64hl.$$"
+if : > "$_hl" 2>/dev/null; then
+    ln "$_hl" "$_hl.l" 2>/dev/null || A64_HOST_HARDLINK=0
+fi
+rm -f "$_hl" "$_hl.l"
+
 # ---- link libraries the guest compiler actually has --------------------------
 # -lm -lpthread are right for glibc and for a cross sysroot, and wrong for
 # Bionic, where both live in libc and the standalone archives may not exist at

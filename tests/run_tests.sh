@@ -215,6 +215,12 @@ for cfile in tests/c/*.c; do
     for ni in $need_ioctl; do
         a64_oracle_ioctl_ok "$ni" || denied="$denied $ni"
     done
+    # And a real hardlink, which Android refuses an app (hostenv.sh): the
+    # emulator has a scheme for link(2) and the oracle has none, so there the
+    # oracle dies where the emulator answers.
+    if [ "$A64_HOST_HARDLINK" = 0 ] && grep -qm1 'NEEDS-HOST-LINK' "$cfile"; then
+        denied="$denied link(2)"
+    fi
     if [ -n "$denied" ]; then
         skip=$((skip+1)); echo "SKIP c/${base} (host denies:$denied)"; continue
     fi
@@ -312,6 +318,13 @@ if [ "$ORACLE_KIND" = recorded ]; then
     l2s_skip="same-host-only; the recorded oracle ran elsewhere"
 elif [ ! -w "$A64_SCRATCH" ]; then
     l2s_skip="no writable scratch directory on this host"
+elif [ "$A64_HOST_HARDLINK" = 0 ]; then
+    # The oracle makes real hardlinks; Android refuses an app link(2)
+    # altogether, which is what --link2symlink is for. The emulated scheme has
+    # nothing to be compared against there: the oracle dies with "link:
+    # Permission denied" where the emulator prints every row. Measured on the
+    # arm64 rig, which is also the host the /tmp gate used to stop by accident.
+    l2s_skip="the host refuses link(2), so the oracle has no real hardlink to compare with"
 fi
 if [ -x tests/c/l2s_rename_static.bin ] && [ -n "$l2s_skip" ]; then
     skip=$((skip+1)); echo "SKIP c/l2s_rename(--link2symlink) ($l2s_skip)"

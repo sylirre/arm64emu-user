@@ -501,9 +501,21 @@ Otherwise the two sides work in different filesystems, which is the one thing
 those rows must not compare. They still skip on a replay host, because what
 they ask about *is* the host filesystem (`st_nlink`, `RENAME_EXCHANGE`,
 xattrs, inotify) and every one carries `SAME-HOST-ONLY`; the gate used to be
-"is `/tmp` writable", which named the wrong reason there and also kept them
-from running on a device that has an oracle of its own. With a live oracle on
-the phone (`qemu-aarch64` is in Termux) all three now run for real.
+"is `/tmp` writable", which named the wrong reason there.
+
+It was hiding a better one, which the device gave up when those rows were run
+there by hand against its own `qemu-aarch64`: **Android refuses an app
+`link(2)` outright** — the whole reason `--link2symlink` exists. The emulator
+has a scheme for it and the oracle has none, so the oracle side dies with
+`link: Permission denied` while the emulator side prints every row. The two
+worlds differ there in what they can *do*, not in what they answer about one
+question, so no oracle on that host can referee these three. `hostenv.sh`
+tries a real hardlink in the scratch directory once (`A64_HOST_HARDLINK`), the
+`--link2symlink` block names that refusal where it is what stops the rows, and
+the three sources carry a `NEEDS-HOST-LINK` marker so the C loop's own rows
+skip with `host denies: link(2)`, beside the `NEEDS-HOST-READ` and
+`NEEDS-HOST-IOCTL` facts it asks for in the same place. They are the only
+three tests that make a real hardlink.
 
 A binary the pack shipped counts as missing once it stops matching the
 checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That

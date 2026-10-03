@@ -2,7 +2,8 @@
  * or /tmp) and leans on that filesystem's behavior (xattrs, inotify); a replay
  * host (Android: f2fs, old kernel) legitimately answers differently. Which
  * directory is not the reason -- the caller hands both worlds the same one --
- * the filesystem under it is. */
+ * the filesystem under it is.
+ * NEEDS-HOST-LINK */
 /* -link2symlink: every OTHER call that is told not to follow the last name.
  *
  * The scheme makes each name of a hardlink group a symlink to a hidden

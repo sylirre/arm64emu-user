@@ -2,7 +2,8 @@
  * or /tmp) and leans on that filesystem's behavior; a replay host (Android:
  * f2fs, old kernel) legitimately answers differently. Which directory is not
  * the reason -- the caller hands both worlds the same one -- the filesystem
- * under it is. */
+ * under it is.
+ * NEEDS-HOST-LINK */
 /* -link2symlink: renaming an emulated hardlink out of its directory.
  *
  * The scheme points every "hardlink" name at a hidden backing file through a

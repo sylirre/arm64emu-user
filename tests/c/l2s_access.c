@@ -2,7 +2,8 @@
  * or /tmp) and asks that filesystem about them; a replay host (Android: f2fs,
  * old kernel) legitimately answers differently. Which directory is not the
  * reason -- the caller hands both worlds the same one -- the filesystem under
- * it is. */
+ * it is.
+ * NEEDS-HOST-LINK */
 /* NEEDS-ORACLE: faccessat2 */
 /* -link2symlink: what access(2) says about an emulated hardlink.
  *
