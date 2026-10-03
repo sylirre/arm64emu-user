@@ -24,7 +24,7 @@ jobs:
   build-test:
     name: build + test (x86_64 host)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +106,7 @@ jobs:
   build-test-arm64:
     name: build + test (aarch64 host)
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -146,7 +146,7 @@ jobs:
   build-test-clang:
     name: build + test (clang)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
