@@ -11,7 +11,8 @@
  * error". Self-checking: qemu-user parses the line itself, differently. The
  * expected output is what this program prints built for the host and run on
  * a real kernel; the interpreter every script names is this binary, which
- * reports how it was invoked. */
+ * reports how it was invoked.
+ * WANTS-SCRATCH: a directory to write the scripts in */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +23,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static char self[4096], dir[] = "/tmp/shebangXXXXXX";
+static char self[4096], dir[256];
 
 /* Interpreter mode: print argv, with this binary's path and the scratch
  * directory folded to fixed tokens. */
@@ -32,9 +33,18 @@ static int as_interp(int argc, char **argv) {
         const char *a = argv[i];
         const char *d = getenv("SHEBANG_DIR");
         if (!strcmp(a, self)) printf(" [<self>]");
-        else if (d && !strncmp(a, d, strlen(d)) && strlen(a) > 60)
-            printf(" [<dir>/<long>/%s]", strrchr(a, '/') + 1);
-        else if (d && !strncmp(a, d, strlen(d))) printf(" [<dir>%s]", a + strlen(d));
+        else if (d && !strncmp(a, d, strlen(d))) {
+            /* What is left after the directory names either a script in it
+             * ("/s1") or the interpreter made under the long subdirectory
+             * ("/ddd...d/i"). Told apart by that second slash rather than by
+             * how long the whole path is: the directory comes from the host
+             * ($TMPDIR, which is 34 characters on Android and 4 here), so a
+             * length threshold folded the ordinary scripts as the long one on
+             * a host whose scratch simply sits deeper. */
+            const char *rest = a + strlen(d), *slash = strchr(rest + 1, '/');
+            if (slash) printf(" [<dir>/<long>/%s]", slash + 1);
+            else printf(" [<dir>%s]", rest);
+        }
         else if (strlen(a) > 40)   /* an argument cut at the buffer's end: 255
                                     * bytes less "#!", the name and one blank */
             printf(" [cut %s]", strlen(a) == 252 - strlen(self) ? "ok" : "bad");
@@ -71,7 +81,16 @@ int main(int argc, char **argv) {
         return as_interp(argc, argv);
     }
     if (!realpath("/proc/self/exe", self)) { printf("SKIP: no /proc/self/exe\n"); return 0; }
-    if (!mkdtemp(dir)) { printf("SKIP: no /tmp\n"); return 0; }
+    /* Any writable directory: the scripts below are this fixture's own, and
+     * what it prints folds their paths to <dir> tokens. The harness hands the
+     * directory in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) -- Android
+     * has no /tmp. The long-name rows further down stay exact either way:
+     * they size their subdirectory from strlen(dir) so the interpreter path
+     * is 253 bytes whatever the base is. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    snprintf(dir, sizeof dir, "%s/shebangXXXXXX", tmp);
+    if (!mkdtemp(dir)) { printf("SKIP: no writable scratch directory\n"); return 0; }
     setenv("SHEBANG_CHILD", self, 1);
     setenv("SHEBANG_DIR", dir, 1);
     char line[1024];
@@ -138,7 +157,7 @@ int main(int argc, char **argv) {
             rmdir(sub);
         }
     }
-    for (int i = 1; i <= 19; i++) { char p[64]; snprintf(p, sizeof p, "%s/s%d", dir, i); unlink(p); }
+    for (int i = 1; i <= 19; i++) { char p[320]; snprintf(p, sizeof p, "%s/s%d", dir, i); unlink(p); }
     rmdir(dir);
     printf("done\n");
     return 0;

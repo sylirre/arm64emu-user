@@ -465,6 +465,46 @@ has both a `/tmp` and a `/` the app may open.
   ids to prove the watchdog answers `SIGSETXID` — has nothing to check, and
   carries a `NEEDS-HOST-SYSCALL: set-ids` marker.
 
+### Scratch files: `$TMPDIR` first, `/tmp` after it
+
+Seven rows of that run skipped rather than failed, for the same reason as the
+three above: they build their files in a `/tmp` Android does not have. A host
+that keeps its scratch somewhere else says so in `$TMPDIR` — Termux sets it to
+`$PREFIX/tmp` — so `hostenv.sh` asks that first and falls back to `/tmp`
+(`A64_SCRATCH`), and `check_fixture` hands the answer to any fixture whose
+header carries a `WANTS-SCRATCH` marker as the guest's `TMPDIR`. It has to be
+handed in: the emulator gives the guest a clean environment, so a fixture
+cannot read the host's own variable (`-E` is how anything gets in). Only to
+the fixtures that ask, though — every expectation in the suite was recorded in
+that clean environment, and one variable more is one condition more
+(`fixtures/execnullv` prints the size of its own `envp`).
+
+Four self-checking fixtures — `readlinksz`, `shebang`, `sarestart`,
+`forkfds` — take it and run on the device now. Nothing compares their paths
+against another host's, so any writable directory does; what the change
+needed was care with the *lengths*, since a device's scratch path is 34
+characters where the development box's is 4:
+
+* `sarestart` binds one of its names into a `sockaddr_un`, which holds 108
+  bytes, so its base is bounded and a `$TMPDIR` too deep to bind under falls
+  back to `/tmp` rather than binding a truncated name.
+* `shebang` folds the scratch directory out of what it prints, and used to
+  decide which fold to use from the *length* of the path — with the scratch
+  directory 50 bytes deep, every ordinary script folded as the deliberately
+  long one and all ten rows differed. It now tells them apart by structure
+  (one more slash), which is what the two cases actually differ in.
+
+The three `--link2symlink` rows (`c/l2s_rename`, `c/l2s_access`,
+`c/l2s_nofollow`) are differential, so **both** worlds have to be handed the
+same directory — the oracle inherits it, the emulator is given it with `-E`.
+Otherwise the two sides work in different filesystems, which is the one thing
+those rows must not compare. They still skip on a replay host, because what
+they ask about *is* the host filesystem (`st_nlink`, `RENAME_EXCHANGE`,
+xattrs, inotify) and every one carries `SAME-HOST-ONLY`; the gate used to be
+"is `/tmp` writable", which named the wrong reason there and also kept them
+from running on a device that has an oracle of its own. With a live oracle on
+the phone (`qemu-aarch64` is in Termux) all three now run for real.
+
 A binary the pack shipped counts as missing once it stops matching the
 checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That
 only happens on a device that also has a working toolchain — an aarch64

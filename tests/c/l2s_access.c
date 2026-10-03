@@ -1,6 +1,8 @@
-/* SAME-HOST-ONLY: builds fixtures in the host /tmp and asks that filesystem
- * about them; a replay host (Android: no /tmp, f2fs, old kernel) legitimately
- * answers differently. */
+/* SAME-HOST-ONLY: builds fixtures in the host's scratch directory ($TMPDIR,
+ * or /tmp) and asks that filesystem about them; a replay host (Android: f2fs,
+ * old kernel) legitimately answers differently. Which directory is not the
+ * reason -- the caller hands both worlds the same one -- the filesystem under
+ * it is. */
 /* NEEDS-ORACLE: faccessat2 */
 /* -link2symlink: what access(2) says about an emulated hardlink.
  *
@@ -52,7 +54,17 @@
 #define AT_SYMLINK_NOFOLLOW 0x100
 #endif
 
-static char dir[] = "/tmp/l2saXXXXXX";
+static char dir[64];
+
+/* Where the group below is built. $TMPDIR when the caller handed one in --
+ * both worlds are given the same one, since what this asks about is the
+ * filesystem under it -- and /tmp otherwise, which is also the fallback for a
+ * name too long to fit, i.e. what every host with a /tmp did before. */
+static void scratch_template(char *out, size_t n, const char *tag) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp || (size_t)snprintf(out, n, "%s/%sXXXXXX", tmp, tag) >= n)
+        snprintf(out, n, "/tmp/%sXXXXXX", tag);
+}
 
 static void path_of(char *out, size_t n, const char *name) {
     snprintf(out, n, "%s/%s", dir, name);
@@ -114,6 +126,7 @@ static void drop(const char *name) {
 }
 
 int main(void) {
+    scratch_template(dir, sizeof dir, "l2sa");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
 
     /* Three modes that separate the triads, and one that grants everything.

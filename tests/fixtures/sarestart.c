@@ -15,7 +15,8 @@
  *
  * Every row arms a timer that lands while the call is blocked, and a helper
  * that unblocks the call a little later: a restarted call returns the
- * helper's outcome ("done"), a reported one returns EINTR (errno 4). */
+ * helper's outcome ("done"), a reported one returns EINTR (errno 4).
+ * WANTS-SCRATCH: a directory for the fifo, socket and lock file */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -44,7 +45,12 @@ static void on_alrm(int s) { (void)s; alarms++; }
 static void nap(void) { usleep(HELPER_US); }
 
 static int pipefd[2], spair[2], lsock, lockfd, lockfd2, fword, piword, sync_pipe[2];
-static char dir[] = "/tmp/sarestXXXXXX", fifo[64], sockpath[80], lockpath[80];
+/* The scratch directory, and the three names made under it. One of them is
+ * bound into a sockaddr_un, whose sun_path holds 108 bytes, so the base is
+ * BOUNDED here rather than silently shortened: a $TMPDIR too deep to bind
+ * under falls back to /tmp instead of binding a truncated name. ($TMPDIR is
+ * 34 characters on Android and the template below adds 13.) */
+static char dir[64], fifo[80], sockpath[80], lockpath[80];
 
 /* ---- the helpers: one wake-up each, after the nap ---- */
 static void *h_feed_pipe(void *a) { (void)a; nap(); if (write(pipefd[1], "x", 1) != 1) abort(); return NULL; }
@@ -172,7 +178,14 @@ static void run(const char *what, int restart, void *(*helper)(void *), long (*c
 }
 
 int main(void) {
-    if (!mkdtemp(dir)) { printf("SKIP: no /tmp\n"); return 0; }
+    /* Any writable directory: every name below is this fixture's own. The
+     * harness hands it in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) --
+     * Android has no /tmp, and all 39 rows used to opt out there. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp ||
+        snprintf(dir, sizeof dir, "%s/sarestXXXXXX", tmp) >= (int)sizeof dir)
+        snprintf(dir, sizeof dir, "/tmp/sarestXXXXXX");   /* too deep to bind */
+    if (!mkdtemp(dir)) { printf("SKIP: no writable scratch directory\n"); return 0; }
     snprintf(fifo, sizeof fifo, "%s/fifo", dir);
     snprintf(sockpath, sizeof sockpath, "%s/sock", dir);
     snprintf(lockpath, sizeof lockpath, "%s/lock", dir);

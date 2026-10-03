@@ -1,6 +1,8 @@
-/* SAME-HOST-ONLY: builds fixtures in the host /tmp and leans on that
- * filesystem's behavior; a replay host (Android: no /tmp, f2fs, old kernel)
- * legitimately answers differently. */
+/* SAME-HOST-ONLY: builds fixtures in the host's scratch directory ($TMPDIR,
+ * or /tmp) and leans on that filesystem's behavior; a replay host (Android:
+ * f2fs, old kernel) legitimately answers differently. Which directory is not
+ * the reason -- the caller hands both worlds the same one -- the filesystem
+ * under it is. */
 /* -link2symlink: renaming an emulated hardlink out of its directory.
  *
  * The scheme points every "hardlink" name at a hidden backing file through a
@@ -86,12 +88,23 @@ static int dir_reclaimable(const char *d) { return rmdir(d) == 0; }
 
 static int exchange_cases(void);
 
+/* Where a group is built. $TMPDIR when the caller handed one in -- both worlds
+ * are given the same one, since what these cases ask about is the filesystem
+ * under it -- and /tmp otherwise, which is also the fallback for a name too
+ * long to fit: what every host with a /tmp did before. */
+static void scratch_template(char *out, size_t n, const char *tag) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp || (size_t)snprintf(out, n, "%s/%sXXXXXX", tmp, tag) >= n)
+        snprintf(out, n, "/tmp/%sXXXXXX", tag);
+}
+
 int main(int argc, char **argv) {
     /* "exchange" selects the RENAME_EXCHANGE cases; see exchange_cases. */
     if (argc > 1 && !strcmp(argv[1], "exchange")) return exchange_cases();
-    char base[] = "/tmp/l2sXXXXXX";
+    char base[64];
+    scratch_template(base, sizeof base, "l2s");
     if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
-    char a[64], b[64], p[128], q[128], r[128];
+    char a[80], b[80], p[128], q[128], r[128];
     snprintf(a, sizeof a, "%s/a", base);
     snprintf(b, sizeof b, "%s/b", base);
 
@@ -178,11 +191,12 @@ int main(int argc, char **argv) {
  * against the host /tmp (tmpfs, which supports the flag) and the emulator
  * against the rootfs /tmp, which on a stacked filesystem such as ecryptfs
  * answers EINVAL. The caller runs this mode only where both sides see the same
- * /tmp. */
+ * directory, which it hands them as TMPDIR. */
 static int exchange_cases(void) {
-    char base[] = "/tmp/l2sxXXXXXX";
+    char base[64];
+    scratch_template(base, sizeof base, "l2sx");
     if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
-    char a[64], b[64], p[128], q[128], q2[128], r[128];
+    char a[80], b[80], p[128], q[128], q2[128], r[128];
     snprintf(a, sizeof a, "%s/a", base);
     snprintf(b, sizeof b, "%s/b", base);
     snprintf(p, sizeof p, "%s/f", a);

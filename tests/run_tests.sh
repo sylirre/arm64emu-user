@@ -294,17 +294,34 @@ rm -f /tmp/t.bin
 # loop puts qemu on the host /tmp (tmpfs, which supports RENAME_EXCHANGE) and
 # the emulator on the rootfs /tmp, which on a stacked filesystem like ecryptfs
 # answers EINVAL — a difference in the filesystem, not in the emulator. Both
-# sides here see the same /tmp.
-if [ -x tests/c/l2s_rename_static.bin ] && [ ! -w /tmp ]; then
-    # Both worlds work in the same host /tmp here; Android has none.
-    skip=$((skip+1)); echo "SKIP c/l2s_rename(--link2symlink) (no writable /tmp on this host)"
+# sides here see the same directory, which is why the mode can run at all.
+#
+# Why the three --link2symlink rows below may not run here, if they may not.
+# Both worlds are handed the same scratch directory ($A64_SCRATCH: $TMPDIR
+# first, then /tmp) -- the oracle inherits it, the emulator is given it with
+# -E, since it hands the guest a clean environment -- so the only thing that
+# stops them is a host whose answers cannot be compared with the recording's
+# at all. That is what the SAME-HOST-ONLY marker in each source says: these
+# ask the host FILESYSTEM about st_nlink, RENAME_EXCHANGE, xattrs and inotify,
+# and a recorded oracle's answers came from another one. The gate used to be
+# "is /tmp writable", which named the wrong reason on a host that simply keeps
+# its scratch somewhere else (Android), and kept the rows from running there
+# even with an oracle of its own.
+l2s_skip=
+if [ "$ORACLE_KIND" = recorded ]; then
+    l2s_skip="same-host-only; the recorded oracle ran elsewhere"
+elif [ ! -w "$A64_SCRATCH" ]; then
+    l2s_skip="no writable scratch directory on this host"
+fi
+if [ -x tests/c/l2s_rename_static.bin ] && [ -n "$l2s_skip" ]; then
+    skip=$((skip+1)); echo "SKIP c/l2s_rename(--link2symlink) ($l2s_skip)"
 elif [ -x tests/c/l2s_rename_static.bin ]; then
     for mode in "" exchange; do
         label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
         rec_have tests/c/l2s_rename_static.bin $mode || {
             skip=$((skip+1)); echo "SKIP $label (not in the test pack)"; continue; }
-        out_q=$(oracle_run tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
-        out_e=$(timeout -k 5 60 "$EMU" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
+        out_q=$(TMPDIR="$A64_SCRATCH" oracle_run tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
+        out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$A64_SCRATCH" --link2symlink / tests/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS $label"
         else
@@ -335,18 +352,17 @@ fi
 for l2snf in l2s_access l2s_nofollow; do
     L2SBIN="tests/c/${l2snf}_static.bin"
     [ -x "$L2SBIN" ] || continue
-    if [ ! -w /tmp ]; then
-        # Both worlds work in the same host /tmp here; Android has none.
+    if [ -n "$l2s_skip" ]; then
         skip=$((skip+1))
-        echo "SKIP c/${l2snf}(--link2symlink) (no writable /tmp on this host)"
+        echo "SKIP c/${l2snf}(--link2symlink) ($l2s_skip)"
         continue
     fi
     rec_have "$L2SBIN" || {
         skip=$((skip+1))
         echo "SKIP c/${l2snf}(--link2symlink) (not in the test pack)"; continue; }
     case $l2snf in l2s_access) NEEDS_ORACLE=faccessat2 ;; *) NEEDS_ORACLE= ;; esac
-    out_q=$(oracle_run "$L2SBIN" 2>/dev/null); rc_q=$?
-    out_e=$(timeout -k 5 60 "$EMU" --link2symlink / "$L2SBIN" 2>/dev/null); rc_e=$?
+    out_q=$(TMPDIR="$A64_SCRATCH" oracle_run "$L2SBIN" 2>/dev/null); rc_q=$?
+    out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$A64_SCRATCH" --link2symlink / "$L2SBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${l2snf}(--link2symlink)"
     else
@@ -2553,14 +2569,25 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     "$AGCC" -static -O2 -o "tests/fixtures/$name.bin" "tests/fixtures/$name.c" 2>/dev/null || {
         skip_build "fixtures/$name"; return; }
     local got
-    got=$("$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
+    # A fixture that makes files of its own says so with a WANTS-SCRATCH
+    # marker and is handed a directory as the guest's TMPDIR (hostenv.sh
+    # A64_SCRATCH: $TMPDIR first, then /tmp). It has to be handed in -- the
+    # emulator gives the guest a clean environment, so a fixture cannot read
+    # the host's own -- and only to the fixtures that ask for it: every
+    # expectation here was recorded in that clean environment, and one
+    # variable more is one condition more (fixtures/execnullv prints the size
+    # of its own envp, and nothing says the next fixture will not).
+    local -a sc=()
+    grep -qm1 'WANTS-SCRATCH' "tests/fixtures/$name.c" &&
+        sc=(-E "TMPDIR=$A64_SCRATCH")
+    got=$("$EMU" "${sc[@]}" / "tests/fixtures/$name.bin" 2>/dev/null)
     fixture_verdict "$name" "$expect" "$got"
     # The fallback tiers the same expectations have to survive: what the guest
     # reads must not depend on which tier the host let the emulator use. Each
     # is an environment (unquoted on purpose -- a tier may need more than one
     # variable) and the label the row is reported under.
     while [ $# -ge 2 ]; do
-        got=$(env $1 "$EMU" / "tests/fixtures/$name.bin" 2>/dev/null)
+        got=$(env $1 "$EMU" "${sc[@]}" / "tests/fixtures/$name.bin" 2>/dev/null)
         fixture_verdict "$name ($2)" "$expect" "$got"
         shift 2
     done

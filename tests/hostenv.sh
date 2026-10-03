@@ -456,13 +456,24 @@ fi
 # not the shared /tmp spelling the recorded answers are keyed by: nothing
 # compares its paths against another environment's. Hardcoding /tmp made those
 # fail outright on Android, which has none -- bindrace reported "setup failed"
-# on a device where the emulator was fine. They take this directory instead.
-A64_SCRATCH=/tmp
-if [ "$A64_HOST_TMP" = 0 ]; then
-    for _d in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
-        [ -n "$_d" ] && [ -w "$_d" ] && { A64_SCRATCH="$_d"; break; }
-    done
-fi
+# on a device where the emulator was fine. They take this directory instead:
+# bindrace as an argument, and a fixture that carries a WANTS-SCRATCH marker
+# as the guest's TMPDIR, which check_fixture hands it (the emulator gives the
+# guest a clean environment, so a fixture cannot read the host's own).
+#
+# $TMPDIR comes FIRST here: it is the host's own answer to "where does scratch
+# go", a host that sets it means it, and on Android it is the only answer there
+# is. /tmp follows for every host that has one, so nothing moves on the
+# development box, where TMPDIR is usually unset. (A64_DYN_ARGV0 above keeps
+# the opposite order on purpose: the recorded answers are KEYED by that path,
+# so it may not follow a variable that differs per host.)
+A64_SCRATCH=
+for _d in "${TMPDIR:-}" /tmp "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
+    [ -n "$_d" ] && [ -d "$_d" ] && [ -w "$_d" ] && { A64_SCRATCH="$_d"; break; }
+done
+# Nothing writable at all: name /tmp and let each fixture report the failure
+# itself, rather than decide here that a run is impossible.
+[ -n "$A64_SCRATCH" ] || A64_SCRATCH=/tmp
 
 # ---- link libraries the guest compiler actually has --------------------------
 # -lm -lpthread are right for glibc and for a cross sysroot, and wrong for

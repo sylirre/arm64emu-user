@@ -10,7 +10,8 @@
  * stray. Self-checking: qemu-user has no pins and nothing to leak; the
  * numbers are what a kernel guarantees, zero. Each row forks under a
  * different kind of sibling activity and counts, in the child, the
- * descriptors that are not the ones this program opened itself. */
+ * descriptors that are not the ones this program opened itself.
+ * WANTS-SCRATCH: a directory for the fifo */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
@@ -26,7 +27,7 @@
 #include <unistd.h>
 
 static volatile int stop;
-static char fifo[64];
+static char fifo[320];
 static void statfs_probe(void);
 
 /* What a child may hold: stdio and the descriptors listed here. */
@@ -94,8 +95,15 @@ static void *sem_waiter(void *a) {    /* parked in the IPC broker, socket held *
 }
 
 int main(void) {
-    char dir[] = "/tmp/forkfdsXXXXXX";
-    if (!mkdtemp(dir)) { printf("SKIP: no /tmp\n"); return 0; }
+    /* Any writable directory: the fifo below is this fixture's own and no
+     * path of it is compared against another host's. The harness hands the
+     * directory in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) -- Android
+     * has no /tmp, and this fixture used to opt out there rather than run. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s/forkfdsXXXXXX", tmp);
+    if (!mkdtemp(dir)) { printf("SKIP: no writable scratch directory\n"); return 0; }
     snprintf(fifo, sizeof fifo, "%s/fifo", dir);
     mkfifo(fifo, 0600);
     /* A descriptor of our own, to show the count is of strangers only. */

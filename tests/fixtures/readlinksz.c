@@ -5,7 +5,8 @@
  * for nothing -- and the guest died of its own stack protector. Self-
  * checking because qemu-user answers EFAULT for the negative rows (its
  * user-memory lock fails on the enormous length); the values are a real
- * kernel's. */
+ * kernel's.
+ * WANTS-SCRATCH: a directory to make the symlink in */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -21,12 +22,18 @@ static long rl(int dfd, const char *path, char *buf, long bufsiz) {
 }
 
 int main(void) {
-    char dir[] = "/tmp/rlszXXXXXX";
-    if (!mkdtemp(dir)) { printf("SKIP: no /tmp\n"); return 0; }
-    char link[64];
+    /* Anywhere writable will do -- nothing here compares a path against
+     * another host's. The harness hands the directory in as the guest's
+     * TMPDIR (hostenv.sh A64_SCRATCH), which is the only one Android has. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s/rlszXXXXXX", tmp);
+    if (!mkdtemp(dir)) { printf("SKIP: no writable scratch directory\n"); return 0; }
+    char link[320];
     snprintf(link, sizeof link, "%s/l", dir);
     if (symlink("/target/of/link", link) < 0) { printf("symlink failed\n"); return 1; }
-    char nolink[64];
+    char nolink[320];
     snprintf(nolink, sizeof nolink, "%s/nolink", dir);
 
     /* A buffer the guard bytes around would catch an overrun of. */
