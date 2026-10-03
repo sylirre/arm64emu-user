@@ -38,6 +38,12 @@ static const char *e(int rc) {
     }
 }
 
+/* The directory every call below aims at, and the source of the bind rows:
+ * under /tmp where the host has one, under the working directory otherwise.
+ * Android has no /tmp, and without the target the rows past it reported the
+ * ENOENT of a directory that was never created rather than what they ask. */
+static char base[1024], dir[1100], nope[1130], file[1130];
+
 int main(void) {
     /* An unmapped page, and a string that runs off the end of a mapped one. */
     char *bad = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -50,47 +56,54 @@ int main(void) {
     memset(toolong, 'x', 4096);          /* 4096 chars + NUL: PATH_MAX, too long */
 
     int root = geteuid() == 0;
-    mkdir("/tmp/mountargs", 0755);
+    strcpy(base, "/tmp");
+    if (mkdir("/tmp/mountargs", 0755) != 0 && errno != EEXIST &&
+        !getcwd(base, sizeof base))
+        return 1;
+    snprintf(dir, sizeof dir, "%s/mountargs", base);
+    mkdir(dir, 0755);                    /* already made, in the /tmp case */
+    snprintf(nope, sizeof nope, "%s/nope", dir);
+    snprintf(file, sizeof file, "%s/file", dir);
     /* The argument errors, in the kernel's order, ahead of everything: a bad
      * type before a bad source, both before the options, all before the
      * target and before privilege. */
-    printf("type_bad=%s\n",     e(mount(NULL, "/tmp/mountargs", unmapped, MS_PRIVATE, NULL)));
-    printf("type_long=%s\n",    e(mount(unmapped, "/tmp/mountargs", toolong, MS_PRIVATE, unmapped)));
-    printf("source_bad=%s\n",   e(mount(unmapped, "/tmp/mountargs", NULL, MS_PRIVATE, unmapped)));
-    printf("source_long=%s\n",  e(mount(toolong, "/tmp/mountargs", NULL, MS_PRIVATE, unmapped)));
-    printf("data_bad=%s\n",     e(mount(NULL, "/tmp/mountargs", NULL, MS_PRIVATE, unmapped)));
-    printf("data_bad_bind=%s\n", e(mount("/tmp", "/tmp/mountargs", NULL, MS_BIND, unmapped)));
-    printf("data_bad_tmpfs=%s\n", e(mount("none", "/tmp/mountargs", "tmpfs", 0, unmapped)));
+    printf("type_bad=%s\n",     e(mount(NULL, dir, unmapped, MS_PRIVATE, NULL)));
+    printf("type_long=%s\n",    e(mount(unmapped, dir, toolong, MS_PRIVATE, unmapped)));
+    printf("source_bad=%s\n",   e(mount(unmapped, dir, NULL, MS_PRIVATE, unmapped)));
+    printf("source_long=%s\n",  e(mount(toolong, dir, NULL, MS_PRIVATE, unmapped)));
+    printf("data_bad=%s\n",     e(mount(NULL, dir, NULL, MS_PRIVATE, unmapped)));
+    printf("data_bad_bind=%s\n", e(mount(base, dir, NULL, MS_BIND, unmapped)));
+    printf("data_bad_tmpfs=%s\n", e(mount("none", dir, "tmpfs", 0, unmapped)));
     printf("target_bad=%s\n",   e(mount(NULL, unmapped, NULL, MS_PRIVATE, NULL)));
-    printf("target_missing=%s\n", e(mount(NULL, "/tmp/mountargs/nope", NULL, MS_PRIVATE, NULL)));
-    printf("target_missing_bind=%s\n", e(mount("/tmp", "/tmp/mountargs/nope", NULL, MS_BIND, NULL)));
-    printf("nouser=%s\n",       e(mount(NULL, "/tmp/mountargs", NULL, MS_PRIVATE | (1UL << 31), NULL)));
-    printf("private=%s\n",      e(mount(NULL, "/tmp/mountargs", NULL, MS_REC | MS_PRIVATE, NULL)));
-    if (!root) { rmdir("/tmp/mountargs"); printf("done\n"); return 0; }
+    printf("target_missing=%s\n", e(mount(NULL, nope, NULL, MS_PRIVATE, NULL)));
+    printf("target_missing_bind=%s\n", e(mount(base, nope, NULL, MS_BIND, NULL)));
+    printf("nouser=%s\n",       e(mount(NULL, dir, NULL, MS_PRIVATE | (1UL << 31), NULL)));
+    printf("private=%s\n",      e(mount(NULL, dir, NULL, MS_REC | MS_PRIVATE, NULL)));
+    if (!root) { rmdir(dir); printf("done\n"); return 0; }
 
     /* The options page is read as far as it goes: a mode= that ends at the
      * edge of the readable memory, with no NUL in sight, still applies; and
      * one that sits past the 256 bytes the emulator used to read applies too. */
-    printf("bind_nosrc=%s\n",   e(mount(NULL, "/tmp/mountargs", NULL, MS_BIND, NULL)));
-    printf("bind_emptysrc=%s\n", e(mount("", "/tmp/mountargs", NULL, MS_BIND, NULL)));
-    printf("tmpfs_notype=%s\n", e(mount("none", "/tmp/mountargs", NULL, 0, NULL)));
+    printf("bind_nosrc=%s\n",   e(mount(NULL, dir, NULL, MS_BIND, NULL)));
+    printf("bind_emptysrc=%s\n", e(mount("", dir, NULL, MS_BIND, NULL)));
+    printf("tmpfs_notype=%s\n", e(mount("none", dir, NULL, 0, NULL)));
     struct stat st;
-    printf("tmpfs_edge=%s\n",   e(mount("none", "/tmp/mountargs", "tmpfs", 0, edge)));
-    printf("edge_mode=%o\n", stat("/tmp/mountargs", &st) == 0 ? (unsigned)(st.st_mode & 07777) : 0);
-    printf("umount=%s\n",       e(umount("/tmp/mountargs")));
+    printf("tmpfs_edge=%s\n",   e(mount("none", dir, "tmpfs", 0, edge)));
+    printf("edge_mode=%o\n", stat(dir, &st) == 0 ? (unsigned)(st.st_mode & 07777) : 0);
+    printf("umount=%s\n",       e(umount(dir)));
     static char late[4096];
     memset(late, 'a', 300); late[300] = ','; strcpy(late + 301, "mode=0700");
-    printf("tmpfs_late=%s\n",   e(mount("none", "/tmp/mountargs", "tmpfs", 0, late)));
-    printf("late_mode=%o\n", stat("/tmp/mountargs", &st) == 0 ? (unsigned)(st.st_mode & 07777) : 0);
-    printf("umount=%s\n",       e(umount("/tmp/mountargs")));
+    printf("tmpfs_late=%s\n",   e(mount("none", dir, "tmpfs", 0, late)));
+    printf("late_mode=%o\n", stat(dir, &st) == 0 ? (unsigned)(st.st_mode & 07777) : 0);
+    printf("umount=%s\n",       e(umount(dir)));
     /* A page-long option string with no NUL: the page's last byte is one. */
     memset(late, 'b', 4096);
-    printf("tmpfs_page=%s\n",   e(mount("none", "/tmp/mountargs", "tmpfs", 0, late)));
-    printf("umount=%s\n",       e(umount("/tmp/mountargs")));
-    { int f = open("/tmp/mountargs/file", O_WRONLY | O_CREAT, 0644); if (f >= 0) close(f); }
-    printf("tmpfs_on_file=%s\n", e(mount("none", "/tmp/mountargs/file", "tmpfs", 0, NULL)));
-    unlink("/tmp/mountargs/file");
-    rmdir("/tmp/mountargs");
+    printf("tmpfs_page=%s\n",   e(mount("none", dir, "tmpfs", 0, late)));
+    printf("umount=%s\n",       e(umount(dir)));
+    { int f = open(file, O_WRONLY | O_CREAT, 0644); if (f >= 0) close(f); }
+    printf("tmpfs_on_file=%s\n", e(mount("none", file, "tmpfs", 0, NULL)));
+    unlink(file);
+    rmdir(dir);
     printf("done\n");
     return 0;
 }

@@ -31,6 +31,23 @@
 
 static long m(void *a, size_t l, int adv) { return madvise(a, l, adv) < 0 ? -errno : 0; }
 
+/* An unlinked file to map: under /tmp where the host has one, under the
+ * working directory otherwise. Android has none, and the whole file half of
+ * this fixture -- EACCES for a private or read-only mapping, the punch a
+ * writable shared one makes in the file itself, the pages past its end --
+ * used to opt out there rather than run. */
+static int scratch(const char *tag) {
+    char t[256];
+    int fd;
+    snprintf(t, sizeof t, "/tmp/madvrm%sXXXXXX", tag);
+    if ((fd = mkstemp(t)) < 0) {
+        snprintf(t, sizeof t, "./madvrm%sXXXXXX", tag);
+        if ((fd = mkstemp(t)) < 0) return -1;
+    }
+    unlink(t);
+    return fd;
+}
+
 int main(void) {
     size_t pg = 4096;
     long r;
@@ -57,10 +74,8 @@ int main(void) {
 
     /* Files: a private mapping and a read-only shared one are EACCES, a
      * writable shared one punches the file itself. */
-    char tmpl[] = "/tmp/madvrmXXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) { printf("SKIP: no /tmp\n"); return 0; }
-    unlink(tmpl);
+    int fd = scratch("a");
+    if (fd < 0) { printf("SKIP: no writable directory\n"); return 0; }
     char buf[4096]; memset(buf, 'f', sizeof buf);
     for (int i = 0; i < 4; i++) if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) return 1;
     char *fpriv = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
@@ -105,10 +120,8 @@ int main(void) {
      * punch, and a success -- the file is one page, the mapping eight. (On a
      * 16 KB host the first lies in the host page holding end-of-file, the
      * second in one wholly past it, which the host will not let anyone touch.) */
-    char tmpe[] = "/tmp/madvreXXXXXX";
-    int efd = mkstemp(tmpe);
+    int efd = scratch("e");
     if (efd < 0) return 1;
-    unlink(tmpe);
     if (write(efd, buf, sizeof buf) != (ssize_t)sizeof buf) return 1;
     char *pe = mmap(NULL, 8 * pg, PROT_READ | PROT_WRITE, MAP_SHARED, efd, 0);
     if (pe == MAP_FAILED) return 1;

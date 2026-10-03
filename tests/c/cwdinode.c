@@ -19,7 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static char base[256];
+static char base[4160];
 
 /* Have another process do it. */
 static void other(void (*fn)(void)) {
@@ -28,13 +28,13 @@ static void other(void (*fn)(void)) {
     int st; waitpid(k, &st, 0);
 }
 static void do_rename(void) {
-    char a[512], b[512];
+    char a[4192], b[4192];
     snprintf(a, sizeof a, "%s/one", base);
     snprintf(b, sizeof b, "%s/two", base);
     rename(a, b);
 }
 static void do_remove(void) {
-    char p[512];
+    char p[4192];
     snprintf(p, sizeof p, "%s/two/x", base); unlink(p);
     snprintf(p, sizeof p, "%s/two", base); rmdir(p);
     /* ...and a new directory at the old name, holding a file of the same name. */
@@ -49,14 +49,19 @@ static const char *tail(const char *cwd) {   /* the last component, or "?" */
 }
 
 int main(void) {
-    const char *tmp = "/tmp";
-    { int probe = open("/tmp/.cwdi_probe", O_CREAT | O_WRONLY, 0600);
-      if (probe < 0) tmp = "."; else { close(probe); unlink("/tmp/.cwdi_probe"); } }
     char start[4096];
     if (!getcwd(start, sizeof start)) return 1;
+    /* The temp tree must be named ABSOLUTELY: this test chdirs into it and
+     * then has another process rename and remove it by name, and a relative
+     * base stops resolving the moment the cwd moves -- which quietly turned
+     * every row after the first into a no-op on a host with no /tmp (Android),
+     * the rename never happening and nothing it reports being under test. */
+    const char *tmp = "/tmp";
+    { int probe = open("/tmp/.cwdi_probe", O_CREAT | O_WRONLY, 0600);
+      if (probe < 0) tmp = start; else { close(probe); unlink("/tmp/.cwdi_probe"); } }
     snprintf(base, sizeof base, "%s/ci_cwdi.XXXXXX", tmp);
     if (!mkdtemp(base)) { printf("mkdtemp errno=%d\n", errno); return 0; }
-    char p[512];
+    char p[4192];
     snprintf(p, sizeof p, "%s/one", base); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/one/x", base);
     int fd = open(p, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { if (write(fd, "old", 3) != 3) return 1; close(fd); }

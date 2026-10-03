@@ -602,7 +602,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   holds pending signals in queues of its own, or a host
 #                   without that file, cannot say.
 #
-# And one names what the host lets the emulator do at all:
+# And two name what the host lets the emulator do at all:
 #
 #   pidfd           pidfd_open works: a kernel since 5.3, and no sandbox that
 #                   refuses it -- the Android app sandbox's seccomp filter
@@ -610,6 +610,29 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   probes run too (A64_EMU_WRAP). Where it is refused the
 #                   emulator answers the guest's pidfd_open ENOSYS, and a test
 #                   of what a pidfd does has nothing to compare.
+#
+#   set-ids         setgid/setuid reach the kernel at all. Android's app
+#                   seccomp filter traps both (host syscalls 144 and 146 on
+#                   arm64), which the emulator turns back into ENOSYS -- so a
+#                   guest there cannot change its ids whatever the emulator
+#                   does, and a test of a process doing so has nothing to
+#                   check. Asked of the ids the caller already has, which a
+#                   kernel always grants.
+#
+# One more names a rule the host kernel follows rather than a call it has:
+#
+#   write-faultin-partial
+#                   generic_perform_write copies the readable PART of a source
+#                   buffer whose tail is a hole, which is a kernel since 5.16
+#                   (the fault_in_iov_iter_readable rework); before it, a
+#                   write whose range is not readable in full is refused once
+#                   the copy reaches a page boundary -- so the same write
+#                   returns 4095 on a 5.15 host and 4096 on a 6.x one, and a
+#                   writev of a readable prefix plus a hole is EFAULT there
+#                   and a short write here. The emulator hands the host the
+#                   guest's own pages and the host kernel decides, so this is
+#                   not a tier it can implement: the rows that measure it take
+#                   the answer the probe measured (rwfault, iovroom).
 #
 # A test that needs one says so with a marker line
 #
@@ -918,6 +941,56 @@ int main(void) {
 }
 EOF
         ;;
+    set-ids) cat <<'EOF'
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    /* The ids this process already has: a kernel grants that to anyone, so a
+     * refusal is the sandbox's and not the credentials'. Raw syscalls, since
+     * a libc setgid may carry its own cross-thread protocol. */
+    if (syscall(SYS_setgid, getgid())) return 1;
+    return syscall(SYS_setuid, getuid()) != 0;
+}
+EOF
+        ;;
+    write-faultin-partial) cat <<'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    long pg = sysconf(_SC_PAGESIZE);
+    char *p = mmap(0, 3 * pg, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 1;
+    if (munmap(p + pg, 2 * pg)) return 1;       /* one page, then a hole */
+    memset(p, 'w', (size_t)pg);
+    /* Any writable file: the rule is generic_perform_write's, not the
+     * filesystem's. A memfd where there is one, and a kernel too old for
+     * memfd_create is certainly too old for the rework -- but measure it
+     * rather than concluding that from the missing call. */
+    int fd = (int)syscall(SYS_memfd_create, "faultin", 0u);
+    if (fd < 0) {
+        const char *dirs[] = { getenv("TMPDIR"), "/tmp", "." };
+        for (unsigned i = 0; i < sizeof dirs / sizeof *dirs && fd < 0; i++) {
+            char t[4096];
+            if (!dirs[i] || !*dirs[i]) continue;
+            snprintf(t, sizeof t, "%s/a64fi.XXXXXX", dirs[i]);
+            if ((fd = mkstemp(t)) >= 0) unlink(t);
+        }
+    }
+    if (fd < 0) return 1;
+    /* A page's worth from an offset of one: the copy reaches the destination's
+     * first page boundary with the source's last byte still readable. A kernel
+     * since 5.16 goes on and writes it; before it the whole second copy is
+     * refused and the write stops one byte short. */
+    return pwrite(fd, p, (size_t)(2 * pg), 1) != pg;
+}
+EOF
+        ;;
     thread-sigpnd) cat <<'EOF'
 #define _GNU_SOURCE
 #include <signal.h>
@@ -1002,8 +1075,13 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
                    -o "$_t/probe" 2>/dev/null; then
                 # Under the sandbox the emulator runs in, if the run puts it
                 # in one (make test-seccomp): what that refuses, the emulator
-                # cannot do either.
-                ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1 || _c=no
+                # cannot do either. In a subshell of its own because a probe a
+                # seccomp filter KILLS rather than refuses -- Android traps
+                # setgid with SECCOMP_RET_TRAP, and SIGSYS is fatal -- makes
+                # the running shell announce the signal on its own stderr, and
+                # that answer is an expected one, not a fault to report.
+                ( ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1 ) 2>/dev/null ||
+                    _c=no
             fi   # cannot build the probe: do not gate on an unasked question
             rm -rf "$_t"
         fi

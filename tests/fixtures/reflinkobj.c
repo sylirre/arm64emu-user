@@ -88,6 +88,21 @@ int main(void) {
         printf("setup: %s\n", strerror(errno));
         return 1;
     }
+    /* Does this host let these ioctls reach the kernel at all? A kernel never
+     * answers EACCES to either of them -- the whole sequence below is EXDEV,
+     * EBADF, EOPNOTSUPP and EFAULT -- while Android's SELinux policy refuses
+     * an ioctl outside the whitelist for the file's type with exactly that,
+     * for a memfd and for a /proc file alike. The rows the emulator decides
+     * for itself would still hold; every one it forwards reads back the
+     * refusal, including the two re-open rows, whose descriptors come from the
+     * same denied policy. Nothing here is the emulator's answer then, so the
+     * fixture says so instead of reporting a kernel that was never asked.
+     * Probed on a /proc file, which is a passthrough in both memfd tiers. */
+    errno = 0;
+    if (ioctl(comm, FICLONE, comm) < 0 && errno == EACCES) {
+        printf("SKIP: the host refuses the reflink ioctls on its own files (EACCES)\n");
+        return 0;
+    }
     if (write(m1, "aaaa", 4) != 4 || write(m2, "bbbb", 4) != 4) return 1;
     char link[64];
     snprintf(link, sizeof link, "/proc/self/fd/%d", m2);

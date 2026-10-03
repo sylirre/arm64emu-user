@@ -112,8 +112,10 @@ int main(void) {
     /* getdents64's count is the other way round: an unsigned int in the
      * kernel's own prototype, so the high half is not part of it. 2^32 + 5
      * is a count of 5, too small for a record (EINVAL); 2^32 + 4096 is an
-     * ordinary 4096. */
-    int dfd = open("/", O_RDONLY | O_DIRECTORY);
+     * ordinary 4096. The cwd, not "/": any directory asks the same question,
+     * and an Android app may not open the root at all -- both rows then read
+     * back the EBADF of an fd that was never opened. */
+    int dfd = open(".", O_RDONLY | O_DIRECTORY);
     errno = 0;
     r = syscall(SYS_getdents64, dfd, page, (1ULL << 32) + 5);
     int small = r < 0 && errno == EINVAL;

@@ -45,8 +45,12 @@
 static int E(long r) { return r < 0 ? errno : 0; }
 
 int main(void) {
+    /* The emulator used to answer this one itself, and answered it empty. The
+     * kernel never does: "(none)" where no NIS domain was set, the domain
+     * where one was -- and an Android host sets "localdomain", so what is
+     * checked is that a name came back at all, not which. */
     struct utsname u; uname(&u);
-    printf("domainname=[%s]\n", u.domainname);
+    printf("domainname_set=%d\n", u.domainname[0] != 0);
 
     int fd = open("/dev/null", O_RDONLY);
     int fl = fcntl(fd, F_GETFL);
@@ -54,8 +58,13 @@ int main(void) {
     close(fd);
 
     /* getdents64 into a buffer whose tail is unmapped: 32 bytes mapped before
-     * the hole take one short record; the rest wait at the position. */
-    fd = open("/", O_RDONLY | O_DIRECTORY);
+     * the hole take one short record; the rest wait at the position. The cwd
+     * stands in for "/" here and below: the questions are the same of any
+     * directory, while the root is one an Android app may not open (the three
+     * rows then read an EBADF back off an fd that was never opened) and one
+     * that lives on a read-only filesystem there (EROFS for the fchownat a
+     * writable directory answers). */
+    fd = open(".", O_RDONLY | O_DIRECTORY);
     char *m = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     munmap(m + 4096, 4096);
     errno = 0; long r = syscall(SYS_getdents64, fd, m + 4096 - 32, 8192);
@@ -68,13 +77,13 @@ int main(void) {
     close(fd);
 
     unsigned char sx[256];
-    errno = 0; r = syscall(SYS_statx, AT_FDCWD, "/", 0x8000, 0x7ff, sx); printf("statx_badflag: %d\n", E(r));
-    errno = 0; r = syscall(SYS_statx, AT_FDCWD, "/", AT_STATX_SYNC_TYPE, 0x7ff, sx); printf("statx_synctype_both: %d\n", E(r));
-    errno = 0; r = syscall(SYS_statx, AT_FDCWD, "/", 0, 0x80000000u, sx); printf("statx_reserved_mask: %d\n", E(r));
+    errno = 0; r = syscall(SYS_statx, AT_FDCWD, ".", 0x8000, 0x7ff, sx); printf("statx_badflag: %d\n", E(r));
+    errno = 0; r = syscall(SYS_statx, AT_FDCWD, ".", AT_STATX_SYNC_TYPE, 0x7ff, sx); printf("statx_synctype_both: %d\n", E(r));
+    errno = 0; r = syscall(SYS_statx, AT_FDCWD, ".", 0, 0x80000000u, sx); printf("statx_reserved_mask: %d\n", E(r));
     errno = 0; r = syscall(SYS_statx, AT_FDCWD, "/nonexistent", 0x8000, 0x7ff, sx); printf("statx_badflag_noent: %d\n", E(r));
-    errno = 0; r = syscall(SYS_statx, AT_FDCWD, "/", 0, 0x7ff, sx); printf("statx_ok: %d\n", E(r));
+    errno = 0; r = syscall(SYS_statx, AT_FDCWD, ".", 0, 0x7ff, sx); printf("statx_ok: %d\n", E(r));
     errno = 0; r = syscall(SYS_fchownat, AT_FDCWD, "/nonexistent", -1, -1, 0x8000); printf("fchownat_badflag: %d\n", E(r));
-    errno = 0; r = syscall(SYS_fchownat, AT_FDCWD, "/", -1, -1, AT_SYMLINK_NOFOLLOW); printf("fchownat_ok: %d\n", E(r));
+    errno = 0; r = syscall(SYS_fchownat, AT_FDCWD, ".", -1, -1, AT_SYMLINK_NOFOLLOW); printf("fchownat_ok: %d\n", E(r));
 
     struct ifreq ifr; memset(&ifr, 0, sizeof ifr); strcpy(ifr.ifr_name, "lo");
     int nf = open("/dev/null", O_RDONLY);

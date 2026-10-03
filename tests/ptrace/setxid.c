@@ -8,6 +8,11 @@
  * busybox, which drops its ids as it starts, hung there. It showed once the
  * tracer itself ran a watchdog -- it had traced something before -- and the
  * tracee was forked from it.
+ *
+ * A host that will not let a process change its ids at all -- Android's app
+ * seccomp filter traps setgid and setuid, which the emulator turns back into
+ * ENOSYS -- has no answer to give the guest here, whatever the watchdog does:
+ * NEEDS-HOST-SYSCALL: set-ids
  */
 #define _GNU_SOURCE
 #include <errno.h>

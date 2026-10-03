@@ -349,7 +349,7 @@ in, syscall and filesystem vintages), the proot-driven Alpine shell
 comparison, and anything whose binary or recording is missing from the
 pack — each named in the output.
 
-Six rows came out of the device runs themselves. One turned out to be a real
+Six rows came out of the first device runs. One turned out to be a real
 gap in the emulator (`c/memfd_seals`, below); of the rest, three are host
 answers a recording made elsewhere cannot referee, and two were tests that
 hardcoded a `/tmp` the device has none of:
@@ -390,6 +390,72 @@ hardcoded a `/tmp` the device has none of:
   the devices. The seccomp row re-runs `c/statx`, which is `SAME-HOST-ONLY`
   for the same reason, so it skips with that named; the keyring leg beside it
   needs no oracle and still runs.
+
+A second round, on the arm64 rig (kernel 5.15, SELinux `untrusted_app`)
+replaying a pack recorded on a 6.17 box, reported fourteen more rows — and
+again not one of them was the emulator's. They came down to seven facts about
+the *replaying* host, each of which the suite now asks rather than assumes.
+The giveaway on two of them was that the `(static)` row failed while the
+`(dyn)` row passed: a dynamic row runs against the packed glibc rootfs, which
+has both a `/tmp` and a `/` the app may open.
+
+* **An Android app may not `open("/")`.** The root is labelled `rootfs` and
+  `untrusted_app` has no read on it, so the fd is `-1` and whatever the row
+  does next reports the `EBADF` of a descriptor that was never opened:
+  `c/mprotectprot`'s `MAP_GROWSDOWN` of a directory (`EBADF` for the kernel's
+  `ENODEV`), `hugecount`'s `getdents64` count-truncation rows, and three rows
+  of `smallabi`. All of them now open the **working directory**: every one of
+  those questions is the same of any directory, and the root was never the
+  point. `smallabi`'s `statx`/`fchownat` rows moved with them — the root is
+  also a read-only filesystem there, which answered `EROFS` to a `fchownat`
+  any writable directory grants.
+* **There is no `/tmp`.** Three tests built their fixtures in one.
+  `fixtures/madvremove` opted out with its `SKIP:` line *after* four rows had
+  already printed, which is a failure and not a skip (only a lone line counts);
+  `fixtures/mountargs` never created its target, so every row below it reported
+  the `ENOENT` of a directory that was not there rather than the argument error
+  it asks about; and `c/cwdinode` fell back to a **relative** base, which stops
+  resolving the moment the test chdirs into it — the rename and the removal it
+  has another process perform both missed, and every row after the first was
+  quietly testing nothing on any host without a `/tmp`. All three probe for a
+  writable directory and fall back to the working one, `c/cwdinode` by
+  absolute path.
+* **The host's NIS domain name is its own.** `uname` reports `localdomain`
+  there and `(none)` on the recording box. `smallabi` checks that a name came
+  back at all, which is the invariant it was written for (the emulator used to
+  answer this one itself, and answered it empty).
+* **A host kernel older than 5.16 refuses a partly-readable write whole.**
+  Before the `fault_in_iov_iter_readable` rework, `generic_perform_write`
+  gives up on the entire copy once any of the range faults, where 5.16 and
+  later copy the readable part: the same `pwrite` from an offset of one
+  returns 4095 on the rig and 4096 on a 6.x box, and a `writev` of a readable
+  prefix plus a hole is `EFAULT` there and a short write here. The emulator
+  hands the host the guest's own pages and the host kernel decides, so this is
+  not a tier it could implement — both numbers were reproduced by a native
+  probe on each host. `fixtures/rwfault` and `fixtures/iovroom` take the
+  answer a host probe measures (`hostenv.sh`, `write-faultin-partial`), which
+  keeps both rows exact on either vintage.
+* **`/proc/locks` is denied to an app.** The emulator's is the host's file,
+  filtered to what a guest may see (`sys_procfs.c` `put_locks`), so there is
+  nothing for `fixtures/lockspid` to count. Those rows say `n/a` where the
+  file cannot be opened — the harness asks the host the same question — and
+  the `F_GETLK` rows beside them, which the emulator answers from the call
+  itself, go on being checked. Reporting `0` instead would have passed the two
+  rows that *expect* a lock to be invisible for entirely the wrong reason.
+* **Android refuses the reflink ioctls on its own files.** `FICLONE` and
+  `FICLONERANGE` are outside the whitelist for both a memfd's type and a
+  `/proc` file's, so they come back `EACCES` — an answer no kernel gives
+  (`do_clone_file_range` has only `EXDEV`, `EBADF`, `EOPNOTSUPP`, `EFAULT`).
+  Every row `fixtures/reflinkobj` *forwards* reads that refusal back, the
+  re-open rows included, while the rows the emulator decides for itself hold
+  unchanged. One control ioctl at the top now answers whether the host takes
+  these at all, and the fixture prints its `SKIP:` line when it does not.
+* **`setgid` and `setuid` are trapped by the app seccomp filter** (host
+  syscalls 144 and 146 on arm64 — the emulator's SIGSYS net turns them back
+  into `ENOSYS`, and says so on stderr). A guest there cannot change its ids
+  whatever the emulator does, so `ptrace/setxid` — whose tracee drops its own
+  ids to prove the watchdog answers `SIGSETXID` — has nothing to check, and
+  carries a `NEEDS-HOST-SYSCALL: set-ids` marker.
 
 A binary the pack shipped counts as missing once it stops matching the
 checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That

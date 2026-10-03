@@ -103,7 +103,10 @@ int main(void) {
            mm(PROT_READ, MAP_SHARED | MAP_ANONYMOUS | MAP_GROWSDOWN, -1));
     int fd = open("/proc/self/exe", O_RDONLY);
     printf("map growsdown file %ld\n", mm(PROT_READ, MAP_PRIVATE | MAP_GROWSDOWN, fd));
-    int dfd = open("/", O_RDONLY | O_DIRECTORY);
+    /* The cwd, not "/": any directory answers the same ENODEV, and an Android
+     * app may not open the root at all (EBADF here instead, on that host
+     * alone). */
+    int dfd = open(".", O_RDONLY | O_DIRECTORY);
     printf("map growsdown directory %ld\n", mm(PROT_READ, MAP_PRIVATE | MAP_GROWSDOWN, dfd));
     int pp[2];
     if (pipe(pp)) return 1;

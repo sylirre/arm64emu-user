@@ -14,9 +14,10 @@
  * child's OFD lock (-1), a guest request queued behind a guest lock (shown,
  * with its pid), and -- with a file a host process holds locked named on the
  * command line, plus that process's pid -- the host's lock (l_pid 0, absent
- * from /proc/locks, its guest waiter absent with it). Self-checking: qemu-user
- * forwards the raw answer, and the host block is what the kernel prints for a
- * caller in a child pid namespace. Run as
+ * from /proc/locks, its guest waiter absent with it) -- the /proc/locks rows
+ * "n/a" on a host that denies the file (see locks_visible). Self-checking:
+ * qemu-user forwards the raw answer, and the host block is what the kernel
+ * prints for a caller in a child pid namespace. Run as
  *   arm64chroot / tests/fixtures/lockspid.bin [<host-locked file> <host pid>] */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -33,6 +34,22 @@
 #define F_OFD_GETLK 36
 #define F_OFD_SETLK 37
 #endif
+
+/* Whether the guest can read /proc/locks at all. The emulator synthesizes the
+ * file from the host's own (sys_procfs.c put_locks), so a host that denies it
+ * -- Android does, to an app -- leaves the guest nothing to read and every row
+ * counting lines of it nothing to count. Those say "n/a" there rather than the
+ * 0 of a file that was never opened, which would have passed the two rows that
+ * expect a lock to be INVISIBLE for entirely the wrong reason; the harness
+ * asks the host the same question to know which to expect. The F_GETLK rows
+ * are unaffected -- the emulator answers those from the call itself. */
+static int locks_visible(void) {
+    int fd = open("/proc/locks", O_RDONLY);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+static const char *lk(int v) { return locks_visible() ? (v ? "1" : "0") : "n/a"; }
 
 /* /proc/locks, fully. */
 static char locks[1 << 16];
@@ -72,6 +89,7 @@ static int locks_count(int pid, int arrow) {
     return hits;
 }
 static int poll_locks(int pid, int arrow, int want) {   /* up to 5 s */
+    if (!locks_visible()) return !want;   /* nothing is ever there to wait for */
     for (int i = 0; i < 500; i++) {
         locks_read();
         if ((locks_count(pid, arrow) > 0) == want) return 1;
@@ -141,13 +159,14 @@ int main(int argc, char **argv) {
     query("posix_getlk", a, F_GETLK);
     query("posix_ofd_getlk", a2, F_OFD_GETLK);
     locks_read();
-    printf("posix_in_locks=%d\n", locks_count((int)k1, 0) > 0);
+    printf("posix_in_locks=%s\n", lk(locks_count((int)k1, 0) > 0));
     /* A guest request queued behind it: shown, and named. */
     int rdy2;
     pid_t k2 = holder(a2, F_SETLKW, &rdy2);
-    printf("waiter_in_locks=%d\n", poll_locks((int)k2, 1, 1));
+    printf("waiter_in_locks=%s\n", lk(poll_locks((int)k2, 1, 1)));
     release(k1, rdy);                           /* k2 now holds it */
-    printf("waiter_became_holder=%d\n", poll_locks((int)k2, 0, 1) && poll_locks((int)k2, 1, 0));
+    printf("waiter_became_holder=%s\n",
+           lk(poll_locks((int)k2, 0, 1) && poll_locks((int)k2, 1, 0)));
     release(k2, rdy2);
     /* A guest child's OFD lock: -1 for an owner, both forms. */
     pid_t k3 = holder(b, F_OFD_SETLK, &rdy);
@@ -157,7 +176,7 @@ int main(int argc, char **argv) {
     int b2 = open(lb, O_RDWR);
     query("ofd_ofd_getlk", b2 >= 0 ? b2 : b, F_OFD_GETLK);
     locks_read();
-    printf("ofd_in_locks=%d\n", locks_count(-1, 0) > 0);
+    printf("ofd_in_locks=%s\n", lk(locks_count(-1, 0) > 0));
     release(k3, rdy);
 
     if (argc >= 3) {
@@ -168,12 +187,13 @@ int main(int argc, char **argv) {
         query("host_getlk", h, F_GETLK);
         query("host_ofd_getlk", h, F_OFD_GETLK);
         locks_read();
-        printf("host_in_locks=%d\n", locks_count(hpid, 0) > 0);
+        printf("host_in_locks=%s\n", lk(locks_count(hpid, 0) > 0));
         /* A guest request queued behind the host's lock goes unseen with it. */
         pid_t k4 = holder(h, F_SETLKW, &rdy);
         usleep(300000);
         locks_read();
-        printf("host_waiter_in_locks=%d\n", locks_count((int)k4, 1) > 0 || locks_count((int)k4, 0) > 0);
+        printf("host_waiter_in_locks=%s\n",
+               lk(locks_count((int)k4, 1) > 0 || locks_count((int)k4, 0) > 0));
         kill(k4, SIGKILL);
         release(k4, rdy);
     }

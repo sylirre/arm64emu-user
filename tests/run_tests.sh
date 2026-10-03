@@ -1953,6 +1953,18 @@ if [ ! -x tests/fixtures/iovroom.bin ] && [ -n "$AGCC" ]; then
         tests/fixtures/iovroom.c $A64_TESTLIBS 2>/dev/null || true
 fi
 if [ -x tests/fixtures/iovroom.bin ]; then
+    # The one row the host kernel's own vintage decides: a write whose first
+    # segment is readable and whose second is a hole. A kernel since 5.16
+    # copies the readable prefix and reports it; before that rework the whole
+    # copy is refused once any of the range faults, with the file untouched
+    # (hostenv.sh, write-faultin-partial). The emulator hands the host the
+    # guest's own pages either way, so the answer is the host's and not a tier
+    # it could implement -- it is measured, not assumed.
+    if a64_emu_syscall_ok write-faultin-partial; then
+        fw="file-write         4 0 left=4"
+    else
+        fw="file-write         -1 14 left=0"
+    fi
     expect="none-addressable   -1 14 left=11
 none-1gb           -1 14 left=11
 file-read          4 0 left=7 got='hell'
@@ -1960,7 +1972,7 @@ file-read-1gb      8 0 left=3 got='hello wo'
 file-read-2gb      8 0 left=3 got='hello wo'
 file-read-sum      8 0 left=3 got='hello wo'
 neg-len            -1 22 left=11
-file-write         4 0 left=4
+$fw
 pipe-read          -1 14 left=11
 pipe-write         -1 14 left=0
 stream-read        -1 14 left=11
@@ -2661,7 +2673,14 @@ check_fixture xferfault $'ctrl_huge=ENOBUFS flat=1\nctrl_unmapped=ENOBUFS\nrecv_
 # pipe or socket, EFAULT for any buffer with nothing mapped -- and is now
 # answered by the host kernel, handed a fault in the same place (sys.h).
 # Gated like xferfault: qemu-user drops the fault, or refuses the call first.
-check_fixture rwfault $'stream_read_one=EFAULT left=8192\nstream_read_two=4096 left=4096\nstream_read_part=EFAULT left=100\nstream_readv_two=4096 left=4096\nstream_readv_none=EFAULT left=10\nstream_write=EFAULT sent=0\nstream_sendmsg=EFAULT sent=0\nstream_read_eof=0\nstream_send_big=n some=1 arrived_all=1\ndgram_read=EFAULT left=0\ndgram_write=EFAULT sent=0\ndgram_sendto=EFAULT sent=0\npipe_read_part=EFAULT left=100\npipe_write_part=EFAULT sent=0\npipe_write_merge=EFAULT sent=10\npipe_read_empty=EAGAIN\npipe_read_eof=0\npipe_write_noreader=EPIPE\neventfd_read_part=EFAULT then=EAGAIN\neventfd_readv_none=EFAULT then=EAGAIN\neventfd_write_part=EFAULT then=EAGAIN\ninotify_read_part=EFAULT left=32\ninotify_read_short=EFAULT left=0\nsignalfd_read_part=128 left=128\nsignalfd_read_none=EFAULT left=128\nfile_read_eof=0\nfile_pread_eof=0\nfile_write_none=EFAULT\nfile_write_part=4096\nfile_pwrite_part=4096\nfile_pread_part=4096\nnull_write_none=10\nnull_write_part=8192\nnull_read_none=0\nnull_writev_none=10\ndone'
+# One row is the host kernel's own vintage rather than its answer to any of
+# that: a pwrite from an offset of one, whose copy reaches the destination's
+# first page boundary with the source's last readable byte still to go. A
+# kernel since 5.16 writes it (4096); before the fault-in rework the second
+# copy is refused whole and the write stops one byte short (hostenv.sh,
+# write-faultin-partial). Measured, since nothing the emulator does decides it.
+if a64_emu_syscall_ok write-faultin-partial; then fpw=4096; else fpw=4095; fi
+check_fixture rwfault $'stream_read_one=EFAULT left=8192\nstream_read_two=4096 left=4096\nstream_read_part=EFAULT left=100\nstream_readv_two=4096 left=4096\nstream_readv_none=EFAULT left=10\nstream_write=EFAULT sent=0\nstream_sendmsg=EFAULT sent=0\nstream_read_eof=0\nstream_send_big=n some=1 arrived_all=1\ndgram_read=EFAULT left=0\ndgram_write=EFAULT sent=0\ndgram_sendto=EFAULT sent=0\npipe_read_part=EFAULT left=100\npipe_write_part=EFAULT sent=0\npipe_write_merge=EFAULT sent=10\npipe_read_empty=EAGAIN\npipe_read_eof=0\npipe_write_noreader=EPIPE\neventfd_read_part=EFAULT then=EAGAIN\neventfd_readv_none=EFAULT then=EAGAIN\neventfd_write_part=EFAULT then=EAGAIN\ninotify_read_part=EFAULT left=32\ninotify_read_short=EFAULT left=0\nsignalfd_read_part=128 left=128\nsignalfd_read_none=EFAULT left=128\nfile_read_eof=0\nfile_pread_eof=0\nfile_write_none=EFAULT\nfile_write_part=4096\nfile_pwrite_part='"$fpw"$'\nfile_pread_part=4096\nnull_write_none=10\nnull_write_part=8192\nnull_read_none=0\nnull_writev_none=10\ndone'
 # FIEMAP's answers through a one-run array (lent) and one across a seam
 # (staged): the extents, the slots it did not fill left alone, and the header
 # written back on an error too -- EBADR's fm_flags name the refused flag, where
@@ -3312,7 +3331,7 @@ check_fixture altstackflags $'sigaltstack_badflag: 22\nsigaltstack_small: 12\nsi
 # F_GETFL's O_LARGEFILE, getdents64 into a half-mapped buffer, statx /
 # fchownat flag refusals, the SIOCGIF* ioctls on a non-socket and on a bad
 # pointer, a seccomp shift by X >= 32. Self-checking: qemu differs on most.
-check_fixture smallabi $'domainname=[(none)]\ngetfl_largefile=1\ngetdents_short: r=one errno=0\ngetdents_unmapped: r=-1 errno=14 pos_kept=1\ngetdents_rest: r=some errno=0\nstatx_badflag: 22\nstatx_synctype_both: 22\nstatx_reserved_mask: 22\nstatx_badflag_noent: 22\nstatx_ok: 0\nfchownat_badflag: 22\nfchownat_ok: 0\nifflags_devnull: 25\nifconf_devnull_fault: 25\nifname_devnull_null: 25\nifflags_sock: r=0 errno=0 up=1\nifflags_fault: 14\nifflags_null: 14\nifconf_fault: 14\nifname_fault: 14\nifflags_badfd: 9\nseccomp_shift_x: exited=1 code=0\ndone'
+check_fixture smallabi $'domainname_set=1\ngetfl_largefile=1\ngetdents_short: r=one errno=0\ngetdents_unmapped: r=-1 errno=14 pos_kept=1\ngetdents_rest: r=some errno=0\nstatx_badflag: 22\nstatx_synctype_both: 22\nstatx_reserved_mask: 22\nstatx_badflag_noent: 22\nstatx_ok: 0\nfchownat_badflag: 22\nfchownat_ok: 0\nifflags_devnull: 25\nifconf_devnull_fault: 25\nifname_devnull_null: 25\nifflags_sock: r=0 errno=0 up=1\nifflags_fault: 14\nifflags_null: 14\nifconf_fault: 14\nifname_fault: 14\nifflags_badfd: 9\nseccomp_shift_x: exited=1 code=0\ndone'
 
 # POSIX timers past any small table: 300 created with deletions in between,
 # and a signalling one from the far end delivering its own sigval and id. The
@@ -3392,7 +3411,14 @@ fi
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/lockspid.bin \
             tests/fixtures/lockspid.c 2>/dev/null; then
-        exp_g=$'posix_getlk=WRLCK pid=guest\nposix_ofd_getlk=WRLCK pid=guest\nposix_in_locks=1\nwaiter_in_locks=1\nwaiter_became_holder=1\nofd_getlk=WRLCK pid=-1\nofd_ofd_getlk=WRLCK pid=-1\nofd_in_locks=1'
+        # The emulator's /proc/locks is the host's, filtered (sys_procfs.c), so
+        # a host that denies the file to its own user -- Android does -- leaves
+        # the guest nothing to read: those rows say "n/a" and the F_GETLK ones,
+        # which the emulator answers from the call itself, go on being checked.
+        # Asked of this host directly, as the NEEDS-HOST-READ marker does in
+        # the C loop, since the emulator runs as the same user.
+        if head -c1 /proc/locks >/dev/null 2>&1; then lkY=1 lkN=0; else lkY=n/a lkN=n/a; fi
+        exp_g=$'posix_getlk=WRLCK pid=guest\nposix_ofd_getlk=WRLCK pid=guest\nposix_in_locks='"$lkY"$'\nwaiter_in_locks='"$lkY"$'\nwaiter_became_holder='"$lkY"$'\nofd_getlk=WRLCK pid=-1\nofd_ofd_getlk=WRLCK pid=-1\nofd_in_locks='"$lkY"
         if [ -n "$HCC" ] && "$HCC" -O2 -o tests/hostlock.bin tests/hostlock.c 2>/dev/null; then
             lockf=$(mktemp); ready=$(mktemp)
             ./tests/hostlock.bin "$lockf" > "$ready" & hl=$!
@@ -3401,7 +3427,7 @@ if [ -n "$AGCC" ]; then
             kill "$hl" 2>/dev/null; wait "$hl" 2>/dev/null
             rm -f "$lockf" "$ready" tests/hostlock.bin
             fixture_verdict "lockspid (host holder)" \
-                "$exp_g"$'\nhost_getlk=WRLCK pid=0\nhost_ofd_getlk=WRLCK pid=0\nhost_in_locks=0\nhost_waiter_in_locks=0\ndone' "$got"
+                "$exp_g"$'\nhost_getlk=WRLCK pid=0\nhost_ofd_getlk=WRLCK pid=0\nhost_in_locks='"$lkN"$'\nhost_waiter_in_locks='"$lkN"$'\ndone' "$got"
         else
             got=$(timeout -k 5 60 "$EMU" / tests/fixtures/lockspid.bin 2>/dev/null)
             fixture_verdict "lockspid" "$exp_g"$'\ndone' "$got"
