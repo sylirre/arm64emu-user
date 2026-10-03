@@ -275,6 +275,14 @@ Reading the diagnostics on-device:
 | `host syscall N blocked by seccomp filter, returning ENOSYS` | a handler forwarded a blocked syscall; the net absorbed it, but please report it (with N) — it should be on the never-forward list |
 | process dies with `Bad system call` (SIGSYS, exit 159) | the net failed or was bypassed — definitely report it |
 
+That last line is about the emulator and its guest. `Bad system call` named on a
+`tests/hostenv.sh` line during a test run is a different thing and not a
+report: the harness measures whether this host lets a process change its ids
+at all (the `set-ids` probe) by calling `setgid`, which the app filter traps on
+purpose, and the probe's death *is* the answer. The run keeps that to itself —
+if a probe's signal ever reaches the suite's own output again, the shape that
+suppresses it is in `a64_emu_syscall_ok`.
+
 ## The no-device regression gate: `make test-seccomp`
 
 ```sh

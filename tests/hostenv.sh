@@ -1079,9 +1079,17 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
                 # seccomp filter KILLS rather than refuses -- Android traps
                 # setgid with SECCOMP_RET_TRAP, and SIGSYS is fatal -- makes
                 # the running shell announce the signal on its own stderr, and
-                # that answer is an expected one, not a fault to report.
-                ( ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1 ) 2>/dev/null ||
-                    _c=no
+                # that answer is an expected one, not a fault to report. The
+                # `exit` after it is what makes the redirection work: a
+                # subshell whose last command is a simple one does not run it
+                # in a child, it EXECS it in place of itself (bash and dash
+                # alike), so the process the signal kills is the subshell and
+                # the shell that announces the death is the PARENT -- whose
+                # stderr is the suite's own. With something left to do
+                # afterwards the subshell has to fork, and then it is the one
+                # that reports, into the /dev/null it was given.
+                ( ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1
+                  exit $? ) 2>/dev/null || _c=no
             fi   # cannot build the probe: do not gate on an unasked question
             rm -rf "$_t"
         fi
