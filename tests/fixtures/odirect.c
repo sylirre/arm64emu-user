@@ -12,15 +12,23 @@
  * (sys_file.c, xfer_scratch, has how the host is asked which it is).
  *
  * Which filesystem does which depends on the host: ext4, xfs, f2fs, exfat
- * and a block device do direct I/O (a misaligned buffer is EINVAL), btrfs
- * and tmpfs fall back (anything goes). run_tests.sh hands over the
- * directories it can write to after the mode -- "direct", or "fallback" --
- * and the first of that kind is used; with none, the fixture skips. The
- * third mode, "aligned", is "direct" without the stack's hole, for an
- * emulator whose own host cannot grow a stack from a system call at all
- * (qemu-user: tests/hostenv.sh, growsdown-copy), which it would be asking.
- * Self-checking: every line was taken from a native kernel running this
- * program built for the host, on exfat and on tmpfs. */
+ * and a block device do direct I/O (a length that is not whole blocks is
+ * EINVAL), btrfs and tmpfs fall back (anything goes). A misaligned buffer
+ * does not tell them apart: iomap's direct I/O (ext4, xfs) judges it by what
+ * the device can DMA to, four bytes for an NVMe or SCSI disk of an x86 host.
+ * And the ones that do it differ past a GUP that fails: exfat's (the old
+ * blockdev_direct_IO) refuses a write from the hole, and finishes a readv
+ * that ran short with a copy that grows the stack; ext4's redoes a direct
+ * write that moved nothing as a buffered one, which grows it, and fails the
+ * whole readv. run_tests.sh hands over the directories it can write to after
+ * the mode -- "direct", or "fallback" -- and the first of that kind is used
+ * (named on stderr); with none, the fixture skips. The third mode,
+ * "aligned", is "direct" without the stack's hole, for an emulator whose own
+ * host cannot grow a stack from a system call at all (qemu-user:
+ * tests/hostenv.sh, growsdown-copy), which it would be asking.
+ * Self-checking: run_tests.sh holds the emulator to this same program built
+ * for the host and run natively over the same directories, and without a
+ * host compiler to the lines a native kernel gave on exfat and on tmpfs. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -42,6 +50,8 @@ static char *grows_at(unsigned long at, unsigned long n) {
     munmap((void *)(at - 64 * 1024 * 1024UL), 64 * 1024 * 1024UL + n * PG);
     void *p = mmap((void *)at, n * PG, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_FIXED_NOREPLACE, -1, 0);
+    /* A kernel older than 4.17 takes the flag for a hint. */
+    if (p != MAP_FAILED && p != (void *)at) { munmap(p, n * PG); p = MAP_FAILED; }
     return p == MAP_FAILED ? NULL : p;
 }
 static unsigned long vma_start(unsigned long a) {
@@ -62,8 +72,8 @@ static const char *res(long r) {
     return b;
 }
 
-/* A file of 256 KiB in `dir`, and whether O_DIRECT there refuses a buffer
- * that is not block-aligned: 1 yes, 0 no, -1 no O_DIRECT or no file. */
+/* A file of 256 KiB in `dir`, and whether O_DIRECT there refuses a length
+ * that is not whole blocks: 1 yes, 0 no, -1 no O_DIRECT or no file. */
 static int real_dio(const char *dir) {
     snprintf(path, sizeof path, "%s/odirect.%d", dir, (int)getpid());
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -74,7 +84,7 @@ static int real_dio(const char *dir) {
     if (!ok) { unlink(path); return -1; }
     int dfd = open(path, O_RDONLY | O_DIRECT);
     if (dfd < 0) { unlink(path); return -1; }
-    long r = pread(dfd, buf + 8, PG, 0);
+    long r = pread(dfd, buf, 100, 0);
     int e = errno;
     close(dfd);
     return r < 0 && e == EINVAL;   /* the caller unlinks a file it does not use */
@@ -132,6 +142,7 @@ int main(int argc, char **argv) {
                direct ? "does direct I/O" : "takes O_DIRECT through its page cache");
         return 0;
     }
+    fprintf(stderr, "odirect: %s\n", argv[i]);
     if (!direct) {
         holes();
         unlink(path);

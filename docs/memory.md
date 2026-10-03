@@ -531,15 +531,20 @@ over each run the host got as far as (`XferHole`, `sys_file.c`) — handing a
 read's bytes over, and leaving it be for a write to `/dev/null` or
 `/dev/zero`. An `O_DIRECT` transfer is the GUP exception: a filesystem that
 really does direct I/O pins the pages, which grows no stack — `EFAULT` — while
-one that falls back to the page cache (btrfs, tmpfs) copies, and grows it; and
-a direct read that comes up short falls back to a copy for the rest, which a
-readv that runs from a stack into its hole does. Which of those a descriptor
-does is the host's to know, so the host is asked by the deed itself: the run
+one that falls back to the page cache (btrfs, tmpfs) copies, and grows it. And
+the ones that pin differ in what they do once the pin fails: exfat's and
+vfat's direct I/O (the old `blockdev_direct_IO`) refuses a write from the hole
+but finishes a read that came up short with a copy, which a readv that runs
+from a stack into its hole does; ext4's redoes a direct write that moved
+nothing through the page cache, which grows the stack, and fails such a readv
+whole; xfs's does neither. Which of those a descriptor does is the host's to
+know, so the host is asked by the deed itself: the run
 goes to it as the hole under a `MAP_GROWSDOWN` mapping of its own
 (`xfer_scratch`: an inaccessible floor that keeps no guard gap, the run's pages
 free, one page on top), which its kernel grows or refuses exactly as the
 guest's would grow the stack, and the stack grows if the scratch did
-(`tests/fixtures/odirect.c`, on a filesystem of each kind).
+(`tests/fixtures/odirect.c`, on a filesystem of each kind, held to the same
+program built for the host and run natively over the same directory).
 
 **The backing has to be there to grow into.** A region's host backing is one
 contiguous run (`Region.host`), so a stack is made by `guest_map_stack` with

@@ -309,10 +309,13 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   bytes lie into theirs (`xfer_stage`): an `O_DIRECT` descriptor on a
   filesystem that really does direct I/O — ext4, xfs, f2fs, exfat, a block
   device; not btrfs or tmpfs, which fall back to the page cache — refuses a
-  buffer that is not aligned to its logical block, and a bounce at malloc's
-  sixteen bytes made every `O_DIRECT` transfer of 64 KiB or less `EINVAL`
-  there however the guest had aligned it (`tests/fixtures/odirect.c`, which
-  the suite runs on the first directory it finds that does it). What is
+  buffer that is not aligned to its logical block (exfat's, vfat's) or to
+  what its disk can DMA to (ext4's and xfs's: as little as four bytes on an
+  NVMe or SCSI disk of an x86 host), and a bounce at malloc's sixteen bytes
+  made every `O_DIRECT` transfer of 64 KiB or less `EINVAL` there however
+  the guest had aligned it (`tests/fixtures/odirect.c`, which the suite runs
+  on the first directory it finds that does it, against the same program
+  built for the host). What is
   still staged is capped at `XFER_STAGE_MAX` (2 MiB) a call:
   - a guest segment the host can only reach as several runs (a buffer
     straddling two separate mappings — a glibc heap buffer across two `brk`

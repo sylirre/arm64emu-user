@@ -268,8 +268,11 @@ static int xfer_split_ok(int fd, int *cache) {
  * And not for GUP, which has grown no stack since 6.1.37: a filesystem that
  * really does direct I/O pins an O_DIRECT transfer's pages by it, and a run
  * in a stack's hole is EFAULT there, while one that falls back to the page
- * cache (btrfs, tmpfs) copies, and grows the stack. Which one a descriptor
- * does is the host's to know, so the host is asked by the same deed: an
+ * cache (btrfs, tmpfs) copies, and grows the stack -- as do some that pin,
+ * for what the pin left: ext4 redoes a direct write that moved nothing
+ * through the page cache, exfat the rest of a direct read that came up
+ * short. Which one a descriptor does is the host's to know, so the host is
+ * asked by the same deed: an
  * O_DIRECT transfer's run goes to it as the hole under a growsdown mapping
  * of its own (xfer_scratch), which its kernel grows or not exactly as the
  * guest's would grow the stack, and the guest's stack grows if the
@@ -428,8 +431,9 @@ static int xfer_hole_run(GuestXfer *x, u64 va, size_t len, int cap) {
  * lie into theirs. An O_DIRECT descriptor on a filesystem that really does
  * direct I/O -- ext4, xfs, f2fs, exfat, a block device; not btrfs or tmpfs,
  * which fall back to the page cache -- refuses with EINVAL a buffer, or an
- * iovec, that is not aligned to its logical block, and malloc's sixteen
- * bytes are not that: every O_DIRECT transfer of 64 KiB or less, the ones
+ * iovec, that is not aligned to its logical block (exfat's direct I/O) or to
+ * what its disk can DMA to (ext4's, xfs's), and malloc's sixteen bytes are
+ * not the former: every O_DIRECT transfer of 64 KiB or less, the ones
  * staged rather than lent (sys.h), was refused there however the guest had
  * aligned it. A vector whose segments are each aligned to a block of up to a
  * page and as long as whole blocks stays aligned laid out end to end from

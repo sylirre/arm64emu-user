@@ -2805,7 +2805,52 @@ check_fixture growsnomove $'thread grows it: 1, start moved: 1\nthe other thread
 # The hole rows ask the emulator's own host to grow a stack from a system
 # call, which qemu-user cannot do (hostenv.sh, growsdown-copy): there the
 # direct-I/O rows run without them, and the rest is skipped by name.
-# Self-checking: the blocks are the kernel's, on exfat and on tmpfs. ----
+# What the rows say is the host filesystem's own -- exfat refuses a write
+# from the hole that ext4 redoes buffered and grows into, ext4 fails a readv
+# into the hole that exfat finishes with a copy, and a misaligned buffer is
+# EINVAL or not by the disk's DMA alignment -- so the oracle is this same
+# program built for the host and run natively over the same directories,
+# whose filesystem the label names. Without a host compiler: the blocks a
+# native kernel gave on exfat and on tmpfs. ----
+dio_case() {   # dio_case <mode> <label> <expected without a host compiler>
+    local mode="$1" label="$2" exp="$3" dir eng got
+    if [ -n "$dio_host" ]; then
+        local err
+        err=$(mktemp)
+        exp=$(timeout -k 5 60 ./"$dio_host" "$mode" "${dio_dirs[@]}" 2>"$err")
+        dir=$(sed -n 's/^odirect: //p' "$err")
+        rm -f "$err"
+        [ -n "$dir" ] && label="$label on $(stat -f -c %T "$dir" 2>/dev/null)"
+        # A native run that stopped short, or could not place its stack (a
+        # kernel older than 4.17 takes MAP_FIXED_NOREPLACE for a hint), has
+        # nothing to hold the emulator to.
+        local why=
+        case "$exp" in
+        "SKIP: "*) ;;
+        *"setup failed"*) why="setup failed" ;;
+        *done) ;;
+        *) why="${exp##*$'\n'}"; why="${why:-no output}" ;;
+        esac
+        if [ -n "$why" ]; then
+            for eng in "" "--jit"; do
+                skip=$((skip+1))
+                echo "SKIP fixture: $label${eng:+ (jit)} (the host's own run did not finish: $why)"
+            done
+            return
+        fi
+    fi
+    for eng in "" "--jit"; do
+        got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/odirect.bin "$mode" "${dio_dirs[@]}" 2>/dev/null)
+        # fixture_verdict takes a lone SKIP line for the fixture opting out;
+        # here it is the guest finding no directory of a kind the host found.
+        if [ -n "$dio_host" ] && [ "${exp#SKIP: }" = "$exp" ] && [ "${got#SKIP: }" != "$got" ]; then
+            fail=$((fail+1))
+            echo "FAIL fixture: $label${eng:+ (jit)} (the host found a directory: guest says ${got#SKIP: })"
+            continue
+        fi
+        fixture_verdict "$label${eng:+ (jit)}" "$exp" "$got"
+    done
+}
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/odirect.bin tests/fixtures/odirect.c 2>/dev/null; then
         dio_dirs=("$PWD" "${TMPDIR:-/tmp}" /var/tmp "$HOME")
@@ -2820,21 +2865,21 @@ if [ -n "$AGCC" ]; then
         expect=$'aligned read 4096: 4096\naligned read 8192: 8192\naligned read 32768: 32768\naligned read 65536: 65536\naligned read 131072: 131072\naligned write 4096: 4096\naligned write 8192: 8192\naligned write 32768: 32768\naligned write 65536: 65536\naligned write 131072: 131072\naligned readv 1+2 pages: 12288\naligned writev 1+2 pages: 12288\nmisaligned read: EINVAL\nmisaligned length: EINVAL\nO_DIRECT read into a stack\'s hole: EFAULT, start moved: 0\nO_DIRECT read from the hole into the stack: EFAULT, start moved: 0\nO_DIRECT write from a stack\'s hole: EFAULT, start moved: 0\nO_DIRECT readv, the stack then the hole: 24576, start moved: 1\nthe same read without O_DIRECT: 8192, start moved: 1\ndone'
         expect_fb=$'O_DIRECT read into a stack\'s hole: 8192, start moved: 1\nO_DIRECT read from the hole into the stack: 16384, start moved: 1\nO_DIRECT write from a stack\'s hole: 8192, start moved: 1\nO_DIRECT readv, the stack then the hole: 24576, start moved: 1\nthe same read without O_DIRECT: 8192, start moved: 1\ndone'
         expect_al="${expect%%$'\n'O_DIRECT read into*}"$'\ndone'
-        dio_holes=1
-        a64_emu_syscall_ok growsdown-copy || dio_holes=0
-        for eng in "" "--jit"; do
-            if [ "$dio_holes" = 1 ]; then
-                got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/odirect.bin direct "${dio_dirs[@]}" 2>/dev/null)
-                fixture_verdict "odirect${eng:+ (jit)}" "$expect" "$got"
-                got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/odirect.bin fallback "${dio_dirs[@]}" 2>/dev/null)
-                fixture_verdict "odirect fallback${eng:+ (jit)}" "$expect_fb" "$got"
-            else
-                got=$(timeout -k 5 60 "$EMU" $eng / tests/fixtures/odirect.bin aligned "${dio_dirs[@]}" 2>/dev/null)
-                fixture_verdict "odirect, aligned only${eng:+ (jit)}" "$expect_al" "$got"
+        dio_host=
+        if [ -n "$HCC" ] && "$HCC" -O2 -o tests/odirect_host.bin tests/fixtures/odirect.c 2>/dev/null; then
+            dio_host=tests/odirect_host.bin
+        fi
+        if a64_emu_syscall_ok growsdown-copy; then
+            dio_case direct "odirect" "$expect"
+            dio_case fallback "odirect fallback" "$expect_fb"
+        else
+            dio_case aligned "odirect, aligned only" "$expect_al"
+            for eng in "" "--jit"; do
                 skip=$((skip+1))
                 echo "SKIP fixture: odirect, stack holes${eng:+ (jit)} (the emulator's host cannot: growsdown-copy)"
-            fi
-        done
+            done
+        fi
+        rm -f tests/odirect_host.bin
         fx_rm tests/fixtures/odirect.bin
     else
         skip_build "fixtures/odirect"
