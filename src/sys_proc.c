@@ -1540,7 +1540,16 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
     int nap_ms = 10;
     for (;;) {
         struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
-        int any = 0;
+        /* A child forked and not yet entered is one all the same: the
+         * kernel's wait finds it the moment fork returns. Counted before the
+         * table is looked at: a child enters itself (CK_LIVE) before it drops
+         * the count, so one entering while the table is looked at is in the
+         * one or the other -- counted after, it could be in neither, and the
+         * wait ECHILD with that child alive. */
+        int any = t &&
+            (((opts & (G_WALL | G_WCLONE)) && __atomic_load_n(&t->nborn, __ATOMIC_ACQUIRE)) ||
+             ((opts & G_WALL || !(opts & G_WCLONE)) &&
+              __atomic_load_n(&t->nordborn, __ATOMIC_ACQUIRE)));
         for (int i = 0; t && i < CK_MAX; i++) {
             struct CloneKid *k = &t->e[i];
             if (__atomic_load_n(&k->state, __ATOMIC_ACQUIRE) != CK_LIVE) continue;
@@ -1577,13 +1586,6 @@ static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
                 else clonekid_reaped(m, x, 0, 0, 0);
             }
         }
-        /* A child forked and not yet entered is one all the same: the
-         * kernel's wait finds it the moment fork returns. */
-        if (!any && t &&
-            (((opts & (G_WALL | G_WCLONE)) && __atomic_load_n(&t->nborn, __ATOMIC_ACQUIRE)) ||
-             ((opts & G_WALL || !(opts & G_WCLONE)) &&
-              __atomic_load_n(&t->nordborn, __ATOMIC_ACQUIRE))))
-            any = 1;
         if (!any) { errno = ECHILD; return -1; }
         memset(si, 0, sizeof *si);
         if (opts & G_WNOHANG) return 0;
