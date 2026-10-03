@@ -479,7 +479,8 @@ void nlr_note_gvec(CPU *c, int fd, const GIovec *seg, int nseg)
 
     if (!c->m->fake_netns || !c->m->nlr_fds_count)   /* as nlr_note_request */
         return;
-    nlr_note_request(c->m, fd, &hdr, gvec_head(c, seg, nseg, &hdr, sizeof(hdr)));
+    size_t got = gvec_head(c, seg, nseg, &hdr, sizeof(hdr));
+    nlr_note_request(c->m, fd, &hdr, got);
 }
 
 void nlr_fix_gvec(CPU *c, int fd, const GIovec *seg, int nseg, size_t len,

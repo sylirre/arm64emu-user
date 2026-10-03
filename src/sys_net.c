@@ -31,6 +31,9 @@
 #ifndef SO_ATTACH_REUSEPORT_CBPF   /* pre-4.5 host kernel headers */
 #define SO_ATTACH_REUSEPORT_CBPF 51
 #endif
+#ifndef MSG_ZEROCOPY               /* Bionic's <sys/socket.h> has no spelling */
+#define MSG_ZEROCOPY 0x4000000
+#endif
 
 #include "sys.h"
 #include "sys_netlink.h"
