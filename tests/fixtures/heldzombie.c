@@ -218,7 +218,10 @@ static void ignoring(void) {
 /* A child followed by its parent's tracer (PTRACE_O_TRACEFORK, strace -f):
  * the parent `m`, traced by `r`, forks `c`, which `r` traces from its first
  * instruction; `r` sees c's exit without taking it (WNOWAIT), and reaps it
- * 400 ms later. m reports what its waits for c said, by a pipe. */
+ * 400 ms later. m reports what its waits for c said, by a pipe. c dies only
+ * once m is past its fork: a kernel may report c's stop and c's exit to r
+ * before m's PTRACE_EVENT_FORK stop (c is the newer tracee), and r would
+ * then hold c's death and reap it while m was still in that stop. */
 static void followed(void) {
     printf("a followed fork's child:\n");
     int rep[2], go[2];
@@ -229,8 +232,12 @@ static void followed(void) {
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
         char g;
         if (read(go[0], &g, 1) != 1) _exit(9);
+        int past[2];
+        if (pipe(past)) _exit(9);
         pid_t c = fork();
-        if (c == 0) _exit(6);
+        if (c == 0) _exit(read(past[0], &g, 1) == 1 ? 6 : 9);
+        if (write(past[1], "p", 1) != 1) _exit(9);
+        close(past[0]); close(past[1]);
         nap(200);
         int st = 0;
         char line[160];
