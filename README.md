@@ -64,7 +64,9 @@ arm64chroot [options] <rootfs> <program> [args...]
                           interpreter elsewhere)
       --no-predecode      Disable the decoded-instruction cache (diagnostic; slower)
   -l, --link2symlink      Emulate hardlinks with tracked symlinks where the host
-                          forbids link() (Android/SELinux -> EXDEV)
+                          forbids link() (Android/SELinux -> EXDEV); also reads
+                          and keeps the hardlink groups a rootfs installed
+                          through proot (proot-distro) holds
       --shared-proc       Key the shared guest-PID registry by rootfs so `ps`/`top`
                           see guest processes across emulator invocations
       --no-dev            Disable the built-in /dev device-node passthrough; /dev

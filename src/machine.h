@@ -1222,6 +1222,28 @@ void fdheld_fork_child(void);
 void fdheld_exec_clear(void);       /* past de_thread: nobody else's entries */
 extern __thread int g_fdwin_depth;  /* windows this thread is inside */
 
+/* The emulated-hardlink scheme (--link2symlink) is compiled where the host
+ * needs it -- Android, which refuses link(2) -- or with -DA64_LINK2SYMLINK for
+ * testing. Both sys_file.c (the scheme) and path.c (the walker's half of
+ * reading a proot-made group) ask. */
+#if defined(__ANDROID__) || defined(A64_LINK2SYMLINK)
+#define L2S_ENABLED 1
+#endif
+
+#ifdef L2S_ENABLED
+/* path.c: the guest path a link2symlink symlink TARGET names, when the target
+ * is the form proot writes -- an absolute HOST path, into the l2s directory
+ * under the rootfs, ending in a ".l2s." / ".proot.l2s." name. proot records
+ * the rootfs's own host path in every link it makes, and resolves it by
+ * stripping that prefix; a guest walk that re-rooted such a target would
+ * apply the prefix a second time and miss. Returns a pointer into `tgt` (the
+ * path below the rootfs, or `tgt` itself where the rootfs is "/"), or NULL
+ * when `tgt` is not that form -- which is every ordinary symlink, so nothing
+ * else's target is ever reinterpreted. The result still goes through the
+ * resolver like any guest path: this removes a prefix, nothing more. */
+const char *l2s_unhost(const struct Machine *m, const char *tgt);
+#endif
+
 /* -link2symlink (sys_file.c): if `p` names one of the emulated-hardlink
  * scheme's members, rewrite the pin to name the group's backing file instead,
  * so a caller that told the host not to follow the final component still

@@ -535,6 +535,18 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *delete
     return 1;
 }
 
+#ifdef L2S_ENABLED
+const char *l2s_unhost(const struct Machine *m, const char *tgt) {
+    if (tgt[0] != '/') return NULL;
+    const char *base = strrchr(tgt, '/') + 1;
+    if (strncmp(base, ".l2s.", 5) && strncmp(base, ".proot.l2s.", 11)) return NULL;
+    size_t rl = strlen(m->rootfs);
+    if (!rl) return tgt;                  /* the rootfs is "/": a guest path already */
+    if (strncmp(tgt, m->rootfs, rl) || tgt[rl] != '/') return NULL;   /* a whole component */
+    return tgt + rl;
+}
+#endif
+
 /* Strip the rootfs prefix from a host path in place, yielding the guest path.
  * Anonymous targets (pipe:[..]) and passthrough paths (/dev, /proc) don't
  * carry the prefix and pass through unchanged. */
@@ -1875,6 +1887,20 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
                 strcpy(tgt, gview);
                 tn = (ssize_t)strlen(tgt);
             }
+#ifdef L2S_ENABLED
+            else if (m->link2symlink) {
+                /* A link proot's link2symlink made: an absolute HOST path into
+                 * the l2s directory, which re-rooting would prefix a second
+                 * time. Only that form is touched (l2s_unhost), and what
+                 * remains is walked like any guest path -- under the same
+                 * containment, whatever the text said. */
+                const char *gp = l2s_unhost(m, tgt);
+                if (gp && gp != tgt) {
+                    memmove(tgt, gp, strlen(gp) + 1);
+                    tn = (ssize_t)strlen(tgt);
+                }
+            }
+#endif
         }
         if (++nlinks > 40) return -ELOOP;
         /* Splice: target replaces the component; unprocessed remainder is

@@ -297,6 +297,18 @@ mkdir -p ~/debian && tar -xf debian-rootfs-arm64.tar.xz -C ~/debian
 Android forbids `link()`) are what package managers need; see the top-level
 README for details.
 
+A rootfs that **proot-distro** installed works with `--link2symlink` as it is
+(`./arm64chroot --link2symlink ~/…/proot-distro/containers/ubuntu/rootfs …`).
+proot keeps each group of hard links as symlinks holding the rootfs's *host*
+path, into `<rootfs>/.l2s`; the emulator follows them, shows every name as the
+regular file a hard link is, and keeps proot's own link counts as names come
+and go, so the rootfs can be used from either. Before that, the 26.04 rootfs's
+`coreutils` — one binary and 100-odd links to it, all of this kind — answered
+`No such file or directory` for `ls`, `tty` and the rest. See
+`docs/syscalls.md` ("proot's own groups") for what it does and does not do. A
+rootfs *moved* since proot made it (its recorded host path no longer names it)
+is not followed, as with proot.
+
 Reading the diagnostics on-device:
 
 | You see | It means |
@@ -546,6 +558,16 @@ the three sources carry a `NEEDS-HOST-LINK` marker so the C loop's own rows
 skip with `host denies: link(2)`, beside the `NEEDS-HOST-READ` and
 `NEEDS-HOST-IOCTL` facts it asks for in the same place. They are the only
 three tests that make a real hardlink.
+
+The proot-group rows (`tests/l2s_proot.sh`, sourced by `run_tests.sh`) need no
+oracle: the same guest program is run over real hardlinks on a real kernel once
+(`tests/fixtures/l2s_proot.expect`) and over a layout the harness lays down by
+hand exactly as a device's proot wrote it, and the two must print the same
+bytes; the hostile layouts judge against what an ordinary symlink answers and
+the canary files they leave outside the rootfs. They run wherever the scheme is
+compiled in — the android-sim build (which `make test-android-sim` tells with
+`A64_L2S_BUILD=1`) or an Android host — and are skipped under any other
+emulator, where those layouts are plain symlinks and there is nothing to ask.
 
 A binary the pack shipped counts as missing once it stops matching the
 checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That

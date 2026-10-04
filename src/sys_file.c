@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
@@ -866,8 +867,7 @@ static u64 sigfd_read_guest(CPU *c, int fd, const GIovec *seg, int nseg, size_t 
  * where __ANDROID__ is auto-defined) or with -DA64_LINK2SYMLINK for testing;
  * gated at run time by m->link2symlink (the -link2symlink option).
  * ------------------------------------------------------------------------- */
-#if defined(__ANDROID__) || defined(A64_LINK2SYMLINK)
-#define L2S_ENABLED 1
+#ifdef L2S_ENABLED      /* machine.h: Android, or -DA64_LINK2SYMLINK */
 
 #define L2S_PREFIX     ".l2s."
 #define L2S_PREFIX_LEN 5
@@ -1033,7 +1033,14 @@ static int l2s_materialize(struct Machine *m, int sdfd, const char *sname,
     /* Both descriptors are ours for the length of the copy: one window over
      * all of it (machine.h, "the emulator's own descriptors"). */
     fdwin_enter();
-    int in = openat(sdfd, sname, O_RDONLY | O_CLOEXEC);  /* follows /proc/self/fd/N */
+    /* A bare name under a pinned directory is rootfs content, and a symlink
+     * there would be followed by the HOST -- against the host's root, not the
+     * guest's: `link("sym", "new")` with sym -> /etc/hostname copied the host's
+     * file into the rootfs, a read of anything the emulator's user can read.
+     * Only the absolute host path of a /proc fd link (sdfd == AT_FDCWD: the
+     * O_TMPFILE a guest is publishing) is followed, because following that
+     * magic link is the whole point. */
+    int in = openat(sdfd, sname, O_RDONLY | O_CLOEXEC | (sdfd == AT_FDCWD ? 0 : O_NOFOLLOW));
     if (in < 0) { int e = errno; fdwin_leave(); L2SLOG("materialize open('%s'): %s\n", sname, strerror(e)); return -e; }
     struct stat sst;
     if (fstat(in, &sst) < 0) { int e = errno; close(in); fdwin_leave(); return -e; }
@@ -1116,6 +1123,18 @@ static int l2s_link(struct Machine *m, const PathPin *src, const PathPin *dst) {
         if (fstatat(src->dfd, src->name, &sst, AT_SYMLINK_NOFOLLOW) < 0) {
             L2SLOG("lstat('%s'): %s\n", src->host, strerror(errno));
             return -errno;
+        }
+        if (src->pinned && S_ISLNK(sst.st_mode)) {
+            /* link(2) of a symlink makes a second name for the SYMLINK, never
+             * for what it points at. A second symlink with the same text is
+             * that, and is the only thing that cannot be followed anywhere:
+             * the copy of the target this used to make was read by the host,
+             * resolving the guest's text against the host's root. */
+            char lt[PATH_MAX];
+            ssize_t ln = readlinkat(src->dfd, src->name, lt, sizeof lt - 1);
+            if (ln < 0) return -errno;
+            lt[ln] = '\0';
+            return symlinkat(lt, dst->dfd, dst->name) < 0 ? -errno : 0;
         }
         if (!S_ISREG(sst.st_mode)) {
             /* Not a named regular file (e.g. /proc/self/fd/N naming an O_TMPFILE):
@@ -1286,10 +1305,16 @@ static int l2s_stat(const PathPin *p, struct stat *out) {
     unsigned long count;
     int r = l2s_target(p, data, &count);
     if (r != 1) return r;
-    if (fstatat(p->dfd, data, out, 0) < 0) return -errno;
+    /* The backing is a regular file the scheme moved there. A symlink under
+     * that name is the guest's own doing, and following it asks the HOST: it
+     * would hand back the size and mode of any file the emulator can see. */
+    if (fstatat(p->dfd, data, out, AT_SYMLINK_NOFOLLOW) < 0) return -errno;
+    if (!S_ISREG(out->st_mode)) return 0;
     out->st_nlink = count ? count : 1;
     return 1;
 }
+
+static int pr_is_data(const char *name, unsigned long *count);   /* proot's, below */
 
 /* fstat-by-fd: if the fd names a data backing file, correct st_nlink in place.
  * The one place here with no pin to work from -- an fd carries no path -- so
@@ -1304,6 +1329,23 @@ static void l2s_fix_fd(int fd, struct stat *st) {
     if (n < 0) return;
     path[n] = '\0';
     unsigned long long ino;
+    unsigned long pc;
+    if (pr_is_data(l2s_basename(path), &pc)) {      /* proot's: the count is in the name */
+        /* ... when the indirection of that name is beside it, as a symlink: the
+         * path is the kernel's own spelling of the open file, and what is asked
+         * of it is one lstat that can only change a number the guest reads. */
+        const char *bn = l2s_basename(path);
+        size_t il = strlen(bn) - 5, dl = (size_t)(bn - path);
+        char ipath[PATH_MAX];
+        struct stat is;
+        if (S_ISREG(st->st_mode) && dl + il + 1 <= sizeof ipath) {
+            memcpy(ipath, path, dl);
+            memcpy(ipath + dl, bn, il);
+            ipath[dl + il] = '\0';
+            if (lstat(ipath, &is) == 0 && S_ISLNK(is.st_mode)) st->st_nlink = pc ? pc : 1;
+        }
+        return;
+    }
     if (!l2s_parse_data(l2s_basename(path), &ino)) return;
     const char *slash = strrchr(path, '/');
     if (!slash) return;
@@ -1321,6 +1363,498 @@ static void l2s_fix_fd(int fd, struct stat *st) {
         close(dfd);
     }
     fdwin_leave();
+}
+/* ---------------------------------------------------------------------------
+ * proot's link2symlink: reading and keeping a group proot made.
+ *
+ * A rootfs installed through proot (proot-distro's) carries its hardlinks as
+ * proot's scheme wrote them, which is not the one above:
+ *
+ *   member     any name of the group: a symlink holding an absolute HOST path,
+ *              <rootfs>/<l2s dir>/.l2s.<name><NNNN>          (the indirection)
+ *   indirection a symlink in the l2s directory, holding the host path of
+ *              <rootfs>/<l2s dir>/.l2s.<name><NNNN>.<CCCC>   (the data file)
+ *   data       the real file, in the l2s directory. CCCC is the live link count:
+ *              a name added or removed renames it, and the indirection is
+ *              re-pointed -- which is why members name the indirection, whose
+ *              name does not change.
+ *
+ * Because the members name an absolute path the groups span directories, which
+ * the scheme above cannot do; and because the walker (path.c, l2s_unhost) now
+ * follows them, exec, open and stat work. What is left is what a hardlink is
+ * to the guest: ONE regular file with st_nlink names. Presented that way
+ * here, and kept that way as names come and go, with proot's own bookkeeping,
+ * so a rootfs can move between proot and the emulator.
+ *
+ * WHAT MAKES THIS SAFE. The symlinks it reads are the guest's: any guest, or
+ * any image the rootfs was unpacked from, can write any text into one. So:
+ *
+ *  - No target is ever opened as a path string. The member's text is stripped
+ *    of the rootfs prefix (l2s_unhost -- only for a host path into a ".l2s."
+ *    name, so no other symlink is reinterpreted) and the REST is resolved by
+ *    the containment resolver like any guest path, which pins the directory:
+ *    ".." and symlinks in it cannot leave the rootfs or a bind, whatever the
+ *    text says. Everything after is a bare name under that pinned descriptor
+ *    -- the same discipline as the PathPin the guest's own syscalls run on.
+ *  - A group is recognised only if the whole chain checks out: the member
+ *    names a ".l2s.<name><NNNN>" symlink; THAT names ".l2s.<name><NNNN>.<CCCC>"
+ *    in the SAME directory (compared as text, and then read from the one
+ *    pinned descriptor, so a path the resolver walked twice cannot differ);
+ *    and that is a regular file. Anything else is an ordinary symlink and
+ *    behaves as one.
+ *  - Every name the bookkeeping creates, renames or removes is a bare
+ *    basename built from the validated indirection name, under the pinned
+ *    directory: never "." or "..", never a '/'.
+ *  - A write the guest could not make is not made on its behalf: the count
+ *    lives in the l2s directory, which can sit on a read-only bind while the
+ *    names do not. A new name is then EROFS (as a link onto a read-only mount
+ *    is); a removed name still succeeds and its count is left alone (a leak,
+ *    never a write through a :ro mount -- host_ro, as every other writer).
+ *  - The count only ever errs high: a name is added after the count is raised
+ *    and removed before it is lowered, and the last reference is deleted only
+ *    after the count is read afresh -- so a crash or a race leaks a file,
+ *    where the other order would lose one.
+ * ------------------------------------------------------------------------- */
+#define PR_NAME_MAX 200     /* longest indirection basename: the data suffix and
+                             * the temporary's stay inside NAME_MAX */
+#define PR_MAX_COUNT 9999   /* four digits */
+
+static const char *const pr_prefix[] = { ".l2s.", ".proot.l2s." };
+
+static size_t pr_prefix_len(const char *name) {
+    for (size_t i = 0; i < sizeof pr_prefix / sizeof pr_prefix[0]; i++) {
+        size_t n = strlen(pr_prefix[i]);
+        if (!strncmp(name, pr_prefix[i], n)) return n;
+    }
+    return 0;
+}
+
+static int pr_four_digits(const char *s) {
+    for (int i = 0; i < 4; i++)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
+
+/* An indirection's basename: "<prefix><name><NNNN>", a name of at least one
+ * character. */
+static int pr_is_ind(const char *name) {
+    size_t pl = pr_prefix_len(name), n = strlen(name);
+    if (!pl || n > PR_NAME_MAX || n < pl + 1 + 4) return 0;
+    return pr_four_digits(name + n - 4);
+}
+
+/* A data file's basename: an indirection's, ".", and the live count. */
+static int pr_is_data(const char *name, unsigned long *count) {
+    size_t n = strlen(name);
+    if (n < 5 + 1 || n - 5 > PR_NAME_MAX || name[n - 5] != '.' || !pr_four_digits(name + n - 4))
+        return 0;
+    char ind[PR_NAME_MAX + 1];
+    memcpy(ind, name, n - 5);
+    ind[n - 5] = '\0';
+    if (!pr_is_ind(ind)) return 0;
+    if (count) *count = strtoul(name + n - 4, NULL, 10);
+    return 1;
+}
+
+/* Is `dn` exactly "<ind>.<NNNN>"? Fills *count (a zero count reads as one). */
+static int pr_data_of(const char *dn, const char *ind, unsigned long *count) {
+    size_t il = strlen(ind);
+    if (strncmp(dn, ind, il) || dn[il] != '.' || !pr_four_digits(dn + il + 1) || dn[il + 5])
+        return 0;
+    *count = strtoul(dn + il + 1, NULL, 10);
+    if (!*count) *count = 1;
+    return 1;
+}
+
+typedef struct PrGroup_ {
+    PathPin ipin;                  /* the indirection, pinned -- owned when the
+                                    * group was reached by a member; ipin.dfd is
+                                    * then the group's directory */
+    int  dfd;                      /* the group's directory (ipin's, or the
+                                    * caller's pin's when reached by the data
+                                    * file: borrowed, never closed here) */
+    char ref[PATH_MAX];            /* a host path inside it, for the :ro test */
+    char t1[PATH_MAX];             /* the text a member carries (the indirection's host path) */
+    char t2dir[PATH_MAX];          /* the indirection's own target, up to and including its last '/' */
+    char ind[PR_NAME_MAX + 1];     /* indirection basename */
+    char data[PR_NAME_MAX + 6];    /* data basename, as of the last look */
+    unsigned long count;           /* its live count */
+} PrGroup;
+
+static void pr_init(PrGroup *g) {
+    g->ipin.dfd = AT_FDCWD;        /* path_unpin on it is a no-op */
+    g->ipin.pinned = 0;
+    g->dfd = -1;
+}
+
+static void pr_release(PrGroup *g) {
+    path_unpin(&g->ipin);
+}
+
+/* The errors that mean "this is not a group" rather than "this host cannot
+ * answer": anything else (a descriptor limit, no memory) is the caller's. */
+static int pr_benign(int e) {
+    return e == -ENOENT || e == -ENOTDIR || e == -ELOOP || e == -EACCES ||
+           e == -EPERM || e == -ENAMETOOLONG || e == -EINVAL || e == -EISDIR;
+}
+
+static int pr_settle(struct PrGroup_ *g);   /* below: makes a cut chain whole */
+
+/* Wait out another process's rename: a yield or three, then short sleeps. */
+static void pr_backoff(int attempt) {
+    if (attempt < 4) { sched_yield(); return; }
+    struct timespec ts = { 0, 100 * 1000 };
+    nanosleep(&ts, NULL);
+}
+
+#define PR_LOOKS_READERS 3      /* a stat looks again this many times */
+#define PR_LOOKS_LINK    64     /* a call that changes the group waits ~6 ms ... */
+#define PR_REPAIR        0x100  /* ... and then makes a cut chain whole (it writes) */
+
+/* If the pinned name `p` is a MEMBER of a proot group, fill *g (holding the
+ * indirection's pin; pr_release it). Returns 1 (ours), 0 (not a group, nothing
+ * held), -EAGAIN (shaped like one, but the data file the indirection names is
+ * not there -- after `looks` more looks: another process is between the two
+ * renames of a count change, or the group is broken), or -errno for an error
+ * that is not "not ours".
+ *
+ * The distinction matters: a caller that is about to ADD a name must never
+ * take "cannot tell" for "not a group". It used to, and a link made while
+ * another process was re-counting fell through to the generic path, which made
+ * a name nothing counted -- and the unlink of it later took a count nobody had
+ * raised, until the data was deleted from under the names that were left. */
+static int pr_resolve_member(struct Machine *m, const PathPin *p, PrGroup *g, int looks) {
+    int repair = looks & PR_REPAIR, repaired = 0;
+    looks &= ~PR_REPAIR;
+    pr_init(g);
+    if (!p->pinned) return 0;
+    struct stat st;
+    if (fstatat(p->dfd, p->name, &st, AT_SYMLINK_NOFOLLOW) < 0) return pr_benign(-errno) ? 0 : -errno;
+    if (!S_ISLNK(st.st_mode)) return 0;
+    ssize_t n = readlinkat(p->dfd, p->name, g->t1, sizeof g->t1 - 1);
+    if (n < 0) return pr_benign(-errno) ? 0 : -errno;
+    g->t1[n] = '\0';
+    const char *gp = l2s_unhost(m, g->t1);          /* the guest path, or not our form */
+    if (!gp) return 0;
+    const char *slash = strrchr(gp, '/');
+    if (!slash || !pr_is_ind(slash + 1)) return 0;
+    strcpy(g->ind, slash + 1);                      /* <= PR_NAME_MAX, pr_is_ind said */
+
+    int r = path_resolve_pin(m, G_AT_FDCWD, gp, PATH_NOFOLLOW_LAST, &g->ipin, NULL);
+    if (r < 0) { pr_release(g); return pr_benign(r) ? 0 : r; }
+    /* The name the resolver pinned is the one the text named -- everything the
+     * bookkeeping renames below is built from `ind`. */
+    if (!g->ipin.pinned || strcmp(g->ipin.name, g->ind)) { pr_release(g); return 0; }
+    /* From here every look is at a bare name under the pinned directory. */
+    if (fstatat(g->ipin.dfd, g->ipin.name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISLNK(st.st_mode)) {
+        pr_release(g);
+        return 0;
+    }
+    char t2[PATH_MAX];
+    const char *gp2, *slash2;
+    size_t dl = (size_t)(slash - gp);
+    /* A name added to or taken from the group renames the data file and then
+     * re-points the indirection, so for the length of two renames another
+     * process can find the indirection naming a file that is no longer there.
+     * That is not a broken group: look again, a few times, before saying so. */
+    for (int attempt = 0; ; attempt++) {
+        n = readlinkat(g->ipin.dfd, g->ipin.name, t2, sizeof t2 - 1);
+        if (n < 0) { pr_release(g); return 0; }
+        t2[n] = '\0';
+        gp2 = l2s_unhost(m, t2);
+        slash2 = gp2 ? strrchr(gp2, '/') : NULL;
+        if (!slash2 || (size_t)(slash2 - gp2) != dl || strncmp(gp, gp2, dl) ||
+            !pr_data_of(slash2 + 1, g->ind, &g->count)) {
+            pr_release(g);                          /* not the data file beside it */
+            return 0;
+        }
+        strcpy(g->data, slash2 + 1);
+        if (fstatat(g->ipin.dfd, g->data, &st, AT_SYMLINK_NOFOLLOW) == 0) break;
+        if (errno != ENOENT) { pr_release(g); return 0; }
+        if (attempt >= looks) {
+            /* Not another process's two renames, then: a process was killed
+             * between them, or a re-point landed out of order. A call that is
+             * about to change the group makes the chain whole -- once, and
+             * where the directory may be written. */
+            if (repair && !repaired && !host_ro(m, g->ipin.host)) {
+                const char *tsl = strrchr(t2, '/');          /* there is one: gp2 came from it */
+                size_t tll = (size_t)(tsl - t2) + 1;
+                memcpy(g->t2dir, t2, tll);
+                g->t2dir[tll] = '\0';
+                g->dfd = g->ipin.dfd;
+                repaired = 1;
+                if (pr_settle(g) == 0) continue;
+            }
+            pr_release(g);
+            return -EAGAIN;
+        }
+        pr_backoff(attempt);
+    }
+    if (!S_ISREG(st.st_mode)) { pr_release(g); return 0; }
+    const char *ts = strrchr(t2, '/');              /* there is one: gp2 came from it */
+    size_t tl = (size_t)(ts - t2) + 1;
+    memcpy(g->t2dir, t2, tl);
+    g->t2dir[tl] = '\0';
+    g->dfd = g->ipin.dfd;
+    snprintf(g->ref, sizeof g->ref, "%s", g->ipin.host);
+    return 1;
+}
+
+/* The same, reached by the DATA file: a walk that followed a member (link(2)
+ * with AT_SYMLINK_FOLLOW) ends there. Nothing is held: the group lives in the
+ * directory the caller's pin already holds. */
+static int pr_resolve_data(const PathPin *p, PrGroup *g) {
+    pr_init(g);
+    unsigned long cnt;
+    if (!p->pinned || !pr_is_data(p->name, &cnt)) return 0;
+    struct stat st;
+    if (fstatat(p->dfd, p->name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISREG(st.st_mode)) return 0;
+    size_t il = strlen(p->name) - 5;
+    memcpy(g->ind, p->name, il);
+    g->ind[il] = '\0';
+    char t2[PATH_MAX];
+    if (fstatat(p->dfd, g->ind, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISLNK(st.st_mode)) return 0;
+    ssize_t n = readlinkat(p->dfd, g->ind, t2, sizeof t2 - 1);
+    if (n < 0) return 0;
+    t2[n] = '\0';
+    const char *ts = strrchr(t2, '/');
+    if (t2[0] != '/' || !ts || strcmp(ts + 1, p->name)) return 0;   /* beside it, naming it */
+    size_t tl = (size_t)(ts - t2) + 1;
+    if (tl + il + 1 > sizeof g->t1) return 0;
+    memcpy(g->t2dir, t2, tl);
+    g->t2dir[tl] = '\0';
+    memcpy(g->t1, t2, tl);                          /* the indirection's host path:  */
+    memcpy(g->t1 + tl, g->ind, il + 1);             /* the directory, and its name    */
+    strcpy(g->data, p->name);
+    g->count = cnt ? cnt : 1;
+    g->dfd = p->dfd;
+    snprintf(g->ref, sizeof g->ref, "%s", p->host);
+    return 1;
+}
+
+/* A member, presented as what a hardlink is: the data file. The caller's pin
+ * is replaced by one on the data file -- the group's directory descriptor
+ * handed over, so nothing is opened twice and nothing leaks -- which is what
+ * every call that was told not to follow the last name needs (l2s_deref_pin).
+ * `host` becomes the data file's path, so the :ro test judges the mount the
+ * data is on: writing the data is what the call will do. 1 when replaced. */
+static int pr_deref_pin(struct Machine *m, PathPin *p) {
+    PrGroup g;
+    if (pr_resolve_member(m, p, &g, PR_LOOKS_READERS) != 1) return 0;
+    const char *sl = strrchr(g.ipin.host, '/');
+    size_t dl = sl ? (size_t)(sl - g.ipin.host) + 1 : 0;
+    if (!sl || dl + strlen(g.data) + 1 > sizeof p->host) { pr_release(&g); return 0; }
+    char host[PATH_MAX];
+    memcpy(host, g.ipin.host, dl);
+    strcpy(host + dl, g.data);
+    path_unpin(p);
+    memcpy(p->host, host, dl + strlen(g.data) + 1);
+    p->dfd = g.ipin.dfd;
+    p->lowfd = g.ipin.lowfd;
+    p->pinned = 1;
+    strcpy(p->base, g.data);
+    p->name = p->base;
+    g.ipin.dfd = AT_FDCWD;         /* given away */
+    pr_release(&g);
+    return 1;
+}
+
+/* st_nlink of a data file a stat reached, from the count in its name -- if it
+ * IS one: the indirection of that name must be there beside it, as a symlink.
+ * A file that merely looks like a data file (a guest made it, or an image
+ * did) is one link. */
+static void pr_fix_nlink(const PathPin *p, struct stat *st) {
+    unsigned long c;
+    if (!p->pinned || !S_ISREG(st->st_mode) || !pr_is_data(p->name, &c)) return;
+    char ind[PR_NAME_MAX + 1];
+    size_t il = strlen(p->name) - 5;
+    memcpy(ind, p->name, il);
+    ind[il] = '\0';
+    struct stat is;
+    if (fstatat(p->dfd, ind, &is, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(is.st_mode))
+        st->st_nlink = c ? c : 1;
+}
+
+/* Re-read the group's current data name and count from its indirection: the
+ * count is a file's NAME, and another process may have renamed it. 0 or -errno
+ * (the chain is gone). */
+static int pr_refresh(PrGroup *g) {
+    char t2[PATH_MAX];
+    ssize_t n = readlinkat(g->dfd, g->ind, t2, sizeof t2 - 1);
+    if (n < 0) return -errno;
+    t2[n] = '\0';
+    const char *ts = strrchr(t2, '/');
+    unsigned long c;
+    if (!ts || !pr_data_of(ts + 1, g->ind, &c)) return -EINVAL;
+    struct stat st;
+    if (fstatat(g->dfd, ts + 1, &st, AT_SYMLINK_NOFOLLOW) < 0) return -errno;
+    strcpy(g->data, ts + 1);
+    g->count = c;
+    return 0;
+}
+
+static unsigned pr_tmp_seq;
+
+/* Make a symlink, under a name of its own, to the data file `dname` -- the
+ * indirection as it will be once it is renamed over the old one. */
+static int pr_tmp_make(PrGroup *g, const char *dname, char *tmp, size_t tmpsz) {
+    char target[PATH_MAX];
+    if ((size_t)snprintf(target, sizeof target, "%s%s", g->t2dir, dname) >= sizeof target)
+        return -ENAMETOOLONG;
+    snprintf(tmp, tmpsz, "%s.t%ld.%u", g->ind, (long)syscall(SYS_gettid),
+             __atomic_fetch_add(&pr_tmp_seq, 1, __ATOMIC_RELAXED));
+    unlinkat(g->dfd, tmp, 0);     /* one of ours left by a process whose id was reused */
+    if (symlinkat(target, g->dfd, tmp) < 0) return -errno;
+    return 0;
+}
+
+/* The one data file of the group in its directory, by scanning for
+ * "<ind>.<NNNN>": the data file is only ever RENAMED, so there is one. Used
+ * when the indirection does not name it -- two processes changing the count
+ * at once can leave the indirection on whichever re-pointed last, and a
+ * process killed between the two renames leaves it on a name that is gone.
+ * 0 (*name filled), -ENOENT (there is none: the group is gone), or -EIO
+ * (more than one: not guessed at). */
+static int pr_find_data(PrGroup *g, char *name, size_t namesz) {
+    fdwin_enter();   /* the scan's own descriptor (machine.h) */
+    int d2 = openat(g->dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *d = d2 >= 0 ? fdopendir(d2) : NULL;
+    if (!d) {
+        int e = errno;
+        if (d2 >= 0) close(d2);
+        fdwin_leave();
+        return -e;
+    }
+    struct dirent *de;
+    int found = 0;
+    unsigned long c;
+    while ((de = readdir(d)) != NULL) {
+        struct stat st;
+        if (!pr_data_of(de->d_name, g->ind, &c)) continue;
+        if (fstatat(g->dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISREG(st.st_mode)) continue;
+        if (found++) break;
+        if (strlen(de->d_name) >= namesz) { found = 0; break; }   /* cannot happen: it is "<ind>.NNNN" */
+        strcpy(name, de->d_name);
+    }
+    closedir(d);
+    fdwin_leave();
+    return found == 1 ? 0 : found ? -EIO : -ENOENT;
+}
+
+/* Leave the indirection naming the data file that is there. The rename of the
+ * data file is exact -- every change is a rename from the CURRENT name -- but
+ * the re-point that follows is a separate step, and another process's can
+ * land after ours with a name that was current a moment ago. Each adjuster
+ * ends here, so whichever finishes last leaves the chain whole. 0, or -errno
+ * when the group is gone. */
+static int pr_settle(struct PrGroup_ *g) {
+    for (int i = 0; i < 8; i++) {
+        int rf = pr_refresh(g);
+        if (rf == 0) return 0;
+        if (rf != -ENOENT && rf != -EINVAL) return rf;
+        char name[PR_NAME_MAX + 6], tmp[PR_NAME_MAX + 48];
+        int r = pr_find_data(g, name, sizeof name);
+        if (r < 0) return r;
+        if ((r = pr_tmp_make(g, name, tmp, sizeof tmp)) < 0) return r;
+        if (renameat(g->dfd, tmp, g->dfd, g->ind) < 0) {
+            int e = errno;
+            unlinkat(g->dfd, tmp, 0);
+            return -e;
+        }
+    }
+    return -EAGAIN;
+}
+
+/* Add (+1) or drop (-1) one name from the group's count -- proot's own steps:
+ * rename the data file to its new count and re-point the indirection. The new
+ * indirection is made under a temporary name and renamed over the old, so a
+ * reader never finds the chain cut at the indirection (it can between the two
+ * renames, as with proot). 0 or -errno; dropping the last name removes the
+ * data and the indirection, and a vanished group is nothing to drop.
+ *
+ * The count is exact and the indirection is made whole: see pr_settle. */
+static int pr_adjust(struct Machine *m, PrGroup *g, int delta) {
+    if (host_ro(m, g->ref)) return -EROFS;
+    for (int attempt = 0; attempt < PR_LOOKS_LINK; attempt++) {
+        int rf = pr_refresh(g);       /* the count as it is NOW, not as it was read */
+        if (rf == -ENOENT || rf == -EINVAL) {
+            /* The chain is cut. Another process may be between its two
+             * renames: give it a moment. Past that it is not -- a process was
+             * killed there, or a re-point landed out of order -- and it is
+             * made whole here. */
+            if (attempt >= 4 && pr_settle(g) == 0) continue;
+            if (attempt < PR_LOOKS_LINK - 1) { pr_backoff(attempt); continue; }
+        }
+        if (rf < 0) return delta < 0 ? 0 : rf;
+        unsigned long nc;
+        if (delta < 0) {
+            if (g->count <= 1) {      /* the last name went */
+                unlinkat(g->dfd, g->data, 0);
+                unlinkat(g->dfd, g->ind, 0);
+                return 0;
+            }
+            nc = g->count - 1;
+        } else {
+            if (g->count >= PR_MAX_COUNT) return -EMLINK;
+            nc = g->count + 1;
+        }
+        char ndata[PR_NAME_MAX + 6], tmp[PR_NAME_MAX + 48];
+        snprintf(ndata, sizeof ndata, "%s.%04u", g->ind, (unsigned)(nc % 10000));
+        int r = pr_tmp_make(g, ndata, tmp, sizeof tmp);
+        if (r < 0) return r;
+        if (renameat(g->dfd, g->data, g->dfd, ndata) < 0) {
+            int e = errno;
+            unlinkat(g->dfd, tmp, 0);
+            if (e == ENOENT) { pr_backoff(attempt); continue; }   /* someone moved the count: look again */
+            return -e;
+        }
+        if (renameat(g->dfd, tmp, g->dfd, g->ind) < 0) {
+            int e = errno;
+            renameat(g->dfd, ndata, g->dfd, g->data);   /* put the count back */
+            unlinkat(g->dfd, tmp, 0);
+            return -e;
+        }
+        g->count = nc;
+        strcpy(g->data, ndata);
+        pr_settle(g);                 /* a re-point of another's may have landed after ours */
+        return 0;
+    }
+    return -EAGAIN;
+}
+
+/* link(src, dst) when `src` is a member of a proot group (or the data file a
+ * following walk reached): a new member with the same text, after the count
+ * has been raised -- so a failure leaves a count too high, never too low. 1
+ * when it handled the call (*err = 0 or -errno), 0 when `src` is not one. */
+static int pr_link(struct Machine *m, const PathPin *src, const PathPin *dst, int *err) {
+    PrGroup g;
+    int isl = pr_resolve_member(m, src, &g, PR_LOOKS_LINK | PR_REPAIR);
+    if (isl == 0) isl = pr_resolve_data(src, &g);
+    if (isl == 0) return 0;
+    if (isl < 0) { *err = isl == -EAGAIN ? -ENOENT : isl; return 1; }   /* never "not a group" */
+    int rc;
+    struct stat dst_st;
+    if (!dst->pinned) {
+        rc = -EXDEV;                 /* a name in a zone (/proc, /dev) holds no link */
+    } else if (fstatat(dst->dfd, dst->name, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
+        rc = -EEXIST;                /* link(2): the new name must not exist */
+    } else if ((rc = pr_adjust(m, &g, +1)) == 0) {
+        if (symlinkat(g.t1, dst->dfd, dst->name) < 0) {
+            rc = -errno;
+            pr_adjust(m, &g, -1);    /* the name was never made */
+        }
+    }
+    pr_release(&g);
+    *err = rc;
+    return 1;
+}
+
+/* A name of a proot group is going away: drop its count. Best effort by
+ * design -- the name's own removal is the call's result and must stand, and a
+ * count left high is a file left behind, where a failed removal would be a
+ * lie to the guest. */
+static void pr_drop(struct Machine *m, PrGroup *g) {
+    pr_adjust(m, g, -1);
 }
 #endif /* L2S_ENABLED */
 
@@ -1351,7 +1885,9 @@ int l2s_deref_pin(struct Machine *m, PathPin *p) {
 #ifdef L2S_ENABLED
     if (!m->link2symlink || !p->pinned) return 0;
     char data[L2S_NAME_MAX];
-    if (l2s_resolve(p, data, NULL) != 1) return 0;
+    int own = l2s_resolve(p, data, NULL);
+    if (own < 0) return 0;
+    if (own == 0) return pr_deref_pin(m, p);     /* proot's scheme, or no group at all */
     size_t n = strlen(data);
     if (n >= sizeof p->base) return 0;
     memcpy(p->base, data, n + 1);
@@ -1984,6 +2520,9 @@ SYSDEF(newfstatat) {
             int h = l2s_stat(&pin, &st);   /* present an l2s symlink as backing */
             if (h == 1) { path_unpin(&pin); goto out; }
             if (h < 0) { path_unpin(&pin); return (u64)(s64)h; }
+            /* A name of a proot group is the data file to a lstat as it is to
+             * a stat (which the walk already followed to it). */
+            if (gf & G_AT_SYMLINK_NOFOLLOW) pr_deref_pin(c->m, &pin);
         }
 #endif
         /* Pinned: the walk already followed the final component, so nothing
@@ -1992,6 +2531,9 @@ SYSDEF(newfstatat) {
          * magic link must report the link. */
         int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
         r = fstatat(pin.dfd, pin.name, &st, hf);
+#ifdef L2S_ENABLED
+        if (r == 0 && c->m->link2symlink) pr_fix_nlink(&pin, &st);   /* proot: count in the name */
+#endif
         /* The path spelling of one of our own fds must agree with the fd's own
          * stat: a memfd whose mode the registry holds reads the same either
          * way. (The host answers this stat even where it refuses the open.) */
@@ -2188,6 +2730,14 @@ SYSDEF(readlinkat) {
                 path_unpin(&pin);
                 return (u64)(s64)-EINVAL;   /* a regular file to the guest, not a link */
             }
+            PrGroup pg;
+            int prm = pr_resolve_member(c->m, &pin, &pg, PR_LOOKS_READERS);
+            if (prm == 1) {                 /* a name of a proot group: the same */
+                pr_release(&pg);
+                path_unpin(&pin);
+                return (u64)(s64)-EINVAL;
+            }
+            if (prm < 0 && prm != -EAGAIN) { path_unpin(&pin); return (u64)(s64)prm; }
         }
 #endif
         /* readlinkat never follows the final component, so the pin alone is
@@ -2205,6 +2755,20 @@ SYSDEF(readlinkat) {
             path_strip_rootfs(c->m, buf);
             rn = (ssize_t)strlen(buf);
         }
+#ifdef L2S_ENABLED
+        /* proot's own bookkeeping links (the indirection a member names) are
+         * visible in the l2s directory and carry the rootfs's HOST path; the
+         * guest is told the path it can use, as it is for every other link
+         * that names the rootfs. */
+        if (c->m->link2symlink && buf[0] == '/') {
+            buf[rn] = 0;
+            const char *gp = l2s_unhost(c->m, buf);
+            if (gp && gp != buf) {
+                memmove(buf, gp, strlen(gp) + 1);
+                rn = (ssize_t)strlen(buf);
+            }
+        }
+#endif
     }
     /* Report the target in the guest's own view: a link that resolves to a
      * guest path (a magic self-link, or a /proc/self/fd entry mapped back
@@ -3825,9 +4389,14 @@ SYSDEF(unlinkat) {
     int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
 #ifdef L2S_ENABLED
     char backing[L2S_NAME_MAX]; unsigned long count; int isl = 0;
+    PrGroup pg; int prm = 0;
     if (c->m->link2symlink && !flags) {
         isl = l2s_resolve(&pin, backing, &count);
         if (isl < 0) isl = 0;   /* probe error: fall through to a plain unlink */
+        if (isl == 0) {         /* not the emulator's own scheme: proot's? */
+            prm = pr_resolve_member(c->m, &pin, &pg, PR_LOOKS_LINK | PR_REPAIR);   /* it mutates: be patient */
+            if (prm < 0) prm = 0;      /* still cannot tell: the name goes, its count is left (high, never low) */
+        }
     }
 #endif
     int ur = unlinkat(pin.dfd, pin.name, flags);   /* never follows a symlink */
@@ -3836,6 +4405,10 @@ SYSDEF(unlinkat) {
     /* The group bookkeeping lives in the same pinned directory, so it has to
      * happen before the pin is dropped. */
     if (ur == 0 && isl == 1) l2s_decref(pin.dfd, backing, count);
+    if (prm == 1) {
+        if (ur == 0) pr_drop(c->m, &pg);           /* after the name is gone, never before */
+        pr_release(&pg);
+    }
 #endif
     path_unpin(&pin);
     return ur < 0 ? e : 0;
@@ -3867,10 +4440,37 @@ SYSDEF(renameat) {
         }
     }
 #endif
+#ifdef L2S_ENABLED
+    /* The destination may be a name of a proot group, and replacing it takes
+     * that name away. And if the SOURCE is a name of the same group, the two
+     * are hardlinks of one file, which rename(2) leaves exactly as they are
+     * (and reports success): done here, since renaming one symlink over the
+     * other would take a name away the guest was promised stays. */
+    PrGroup pgd; int prd = 0;
+    if (c->m->link2symlink && strcmp(h1, h2) != 0 && isl != 1) {
+        prd = pr_resolve_member(c->m, &p2, &pgd, PR_LOOKS_LINK | PR_REPAIR);
+        if (prd < 0) prd = 0;
+        if (prd == 1) {
+            PrGroup pgs;
+            int prs = pr_resolve_member(c->m, &p1, &pgs, PR_LOOKS_LINK | PR_REPAIR);
+            int same = prs == 1 && l2s_same_dir(pgs.dfd, pgd.dfd) && !strcmp(pgs.ind, pgd.ind);
+            if (prs == 1) pr_release(&pgs);
+            if (same) {
+                pr_release(&pgd);
+                path_unpin(&p1); path_unpin(&p2);
+                return 0;
+            }
+        }
+    }
+#endif
     int rr = renameat(p1.dfd, p1.name, p2.dfd, p2.name);   /* follows neither end */
     u64 e = rr < 0 ? host_err() : 0;
 #ifdef L2S_ENABLED
     if (rr == 0 && isl == 1) l2s_decref(p2.dfd, backing, count);
+    if (prd == 1) {
+        if (rr == 0) pr_drop(c->m, &pgd);           /* the replaced name's reference */
+        pr_release(&pgd);
+    }
 #endif
     path_unpin(&p1); path_unpin(&p2);
     return rr < 0 ? e : 0;
@@ -3998,6 +4598,20 @@ SYSDEF(linkat) {
      * is the race. Unpinned it still carries the guest's flag, which is what
      * lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) materialize. */
     int hflags = (!p1.pinned && (gf & G_AT_SYMLINK_FOLLOW)) ? AT_SYMLINK_FOLLOW : 0;
+#ifdef L2S_ENABLED
+    /* A name of a proot group is a symlink to the host, so a host link(2) of it
+     * makes a second name for the SYMLINK -- or, where the host refuses links,
+     * a copy -- and in neither case the count (a name added that is not
+     * counted is one the last unlink deletes the data from under). It is
+     * asked first, whatever the host would say. */
+    if (c->m->link2symlink) {
+        int perr = 0;
+        if (pr_link(c->m, &p1, &p2, &perr)) {
+            path_unpin(&p1); path_unpin(&p2);
+            return perr < 0 ? (u64)(s64)perr : 0;
+        }
+    }
+#endif
 #if defined(L2S_ENABLED) && defined(A64_L2S_FORCE)
     /* Test hook: exercise the l2s path even where the host allows hardlinks. */
     if (c->m->link2symlink) {
@@ -4519,16 +5133,32 @@ SYSDEF(statx) {
         int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
 #ifdef L2S_ENABLED
         char l2sb[L2S_NAME_MAX]; unsigned long l2sc;
+        /* As newfstatat: a lstat of a name of a proot group asks about the data. */
+        if (c->m->link2symlink && (gf & G_AT_SYMLINK_NOFOLLOW) &&
+            l2s_resolve(&pin, l2sb, NULL) == 0)
+            pr_deref_pin(c->m, &pin);
         if (c->m->link2symlink && l2s_target(&pin, l2sb, &l2sc) == 1) {
             /* Present the backing file (regular) with the group's link count.
              * It lives in the pinned directory, beside the name asked about. */
-            r = host_statx(pin.dfd, l2sb, 0, (unsigned)a3, buf);
+            r = host_statx(pin.dfd, l2sb, AT_SYMLINK_NOFOLLOW, (unsigned)a3, buf);
             if (r < 0 && errno == ENOSYS) {
                 struct stat st;
-                r = fstatat(pin.dfd, l2sb, &st, 0);
+                r = fstatat(pin.dfd, l2sb, &st, AT_SYMLINK_NOFOLLOW);
                 if (r == 0) statx_from_stat(buf, &st);
             }
-            if (r == 0) { u32 nl = l2sc ? (u32)l2sc : 1; memcpy(buf + 16, &nl, 4); }
+            u16 bmode = 0;
+            memcpy(&bmode, buf + 28, 2);                /* stx_mode */
+            if (r == 0 && !S_ISREG(bmode)) {            /* not the scheme's file: as l2s_stat */
+                r = host_statx(pin.dfd, pin.name, hf, (unsigned)a3, buf);
+                if (r < 0 && errno == ENOSYS) {
+                    struct stat st;
+                    r = fstatat(pin.dfd, pin.name, &st, hf);
+                    if (r == 0) statx_from_stat(buf, &st);
+                }
+            } else if (r == 0) {
+                u32 nl = l2sc ? (u32)l2sc : 1;
+                memcpy(buf + 16, &nl, 4);
+            }
         } else
 #endif
         {
@@ -4538,6 +5168,20 @@ SYSDEF(statx) {
                 r = fstatat(pin.dfd, pin.name, &st, hf);
                 if (r == 0) statx_from_stat(buf, &st);
             }
+#ifdef L2S_ENABLED
+            if (r == 0 && c->m->link2symlink) {   /* proot: the count is in the name */
+                struct stat fake = { 0 };
+                u16 mode;
+                memcpy(&mode, buf + 28, 2);       /* stx_mode */
+                fake.st_mode = mode;
+                fake.st_nlink = 0;
+                pr_fix_nlink(&pin, &fake);
+                if (fake.st_nlink) {
+                    u32 nl = (u32)fake.st_nlink;
+                    memcpy(buf + 16, &nl, 4);     /* stx_nlink */
+                }
+            }
+#endif
             if (r == 0) mfd_statx_fixup(c->m, proc_own_fd_path(host), buf);
         }
         /* As newfstatat: a synthesized /proc file the host refuses is still

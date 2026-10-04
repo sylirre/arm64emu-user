@@ -1,0 +1,74 @@
+== what a name is
+lstat g/a: reg nlink=3 size=6 mode=644
+lstat g/b: reg nlink=3 size=6 mode=644
+lstat h/c: reg nlink=3 size=6 mode=644
+lstat g/plain: reg nlink=1 size=6 mode=644
+same g/a g/b: 1
+same g/a h/c: 1
+same g/a g/plain: 0
+stat g/a: nlink=3 size=6
+cat g/a: hello|
+cat h/c: hello|
+readlink g/a: -1 errno=22
+open O_NOFOLLOW g/a: ok
+fstat that fd: nlink=3
+fstat opened g/a: nlink=3
+== link
+link g/a g/d: 0 errno=0
+lstat g/d: reg nlink=4 size=6 mode=644
+lstat g/a: reg nlink=4 size=6 mode=644
+cat g/d: hello|
+link g/a g/d again: -1 errno=17
+linkat FOLLOW g/a g/e: 0 errno=0
+lstat g/e: reg nlink=5 size=6 mode=644
+lstat h/c: reg nlink=5 size=6 mode=644
+link h/c h/c3 (another directory's name): 0 errno=0
+lstat h/c3: reg nlink=6 size=6 mode=644
+lstat g/a: reg nlink=6 size=6 mode=644
+== unlink
+unlink g/e: 0 errno=0
+unlink g/d: 0 errno=0
+unlink h/c3: 0 errno=0
+lstat g/a: reg nlink=3 size=6 mode=644
+unlink g/nope: -1 errno=2
+== rename
+rename h/c h/c2: 0 errno=0
+lstat h/c: errno=2
+lstat h/c2: reg nlink=3 size=6 mode=644
+rename g/a g/b (two names of one file): 0 errno=0
+lstat g/a: reg nlink=3 size=6 mode=644
+lstat g/b: reg nlink=3 size=6 mode=644
+rename g/plain g/b (over a name of the group): 0 errno=0
+cat g/b: plain|
+lstat g/a: reg nlink=2 size=6 mode=644
+lstat h/c2: reg nlink=2 size=6 mode=644
+rename h/p2 h/c2 (over another): 0 errno=0
+cat h/c2: p2|
+lstat g/a: reg nlink=1 size=6 mode=644
+rename x1 g/x1new (across directories): 0 errno=0
+lstat g/x1new: reg nlink=2 size=3 mode=644
+lstat x2: reg nlink=2 size=3 mode=644
+same g/x1new x2: 1
+rename g/a x2 (a name of one group over a name of another): 0 errno=0
+lstat x2: reg nlink=1 size=6 mode=644
+lstat g/x1new: reg nlink=1 size=3 mode=644
+cat x2: hello|
+cat g/x1new: xx|
+== the calls told not to follow
+utimensat x2 NOFOLLOW: 0 errno=0
+mtime x2: 1000000000
+fchownat x2 NOFOLLOW: 0 errno=0
+faccessat x2 NOFOLLOW: 0 errno=0
+== exec
+exec-child ok
+execve bin2/t2: exit 0
+exec-child ok
+execveat NOFOLLOW bin2/t2: exit 0
+== the ends
+link x2 g/z: 0 errno=0
+lstat g/z: reg nlink=2 size=6 mode=644
+lstat x2: reg nlink=2 size=6 mode=644
+same g/z x2: 1
+unlink g/x1new (the last name of its group): 0 errno=0
+lstat g/z: reg nlink=2 size=6 mode=644
+done

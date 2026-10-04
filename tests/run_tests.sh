@@ -385,6 +385,14 @@ for l2snf in l2s_access l2s_nofollow; do
     NEEDS_ORACLE=
 done
 
+# ---- -link2symlink: groups proot made (and the hostile layouts around them) ----
+# The emulated-hardlink scheme reads, presents and keeps a rootfs installed
+# through proot (proot-distro's). tests/l2s_proot.sh says what is asked and why;
+# it runs only where the scheme is compiled in (the android-sim build, which
+# the Makefile tells, or an Android host).
+. tests/l2s_proot.sh
+l2s_proot_suite
+
 # ---- System V shm: file-backed fallback tier ----
 # The shm tests already ran memfd-backed vs the qemu oracle in the C loop above.
 # Re-run them with A64_SHM_FORCE_FILE=1 so the broker backs each segment with a

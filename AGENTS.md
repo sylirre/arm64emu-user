@@ -160,7 +160,7 @@ uses an instruction outside ARMv8.0-A.
 
 Specialized tests focused at Android OS compatibility:
 
-* `make test-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here).
+* `make test-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here). It also runs the proot-group rows (`tests/l2s_proot.sh`: a rootfs installed through proot — proot-distro's — read, presented and kept by `--link2symlink`, and the hostile layouts around it; `A64_L2S_BUILD=1` tells the harness the scheme is in).
 * `make test-seccomp`: suite with the emulator under an Android-Oreo SECCOMP_RET_TRAP filter (no device).
 
 **Important**: do not run any of tests above in parallel with each other.

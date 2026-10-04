@@ -656,6 +656,89 @@ not deref: each keeps its own bookkeeping over the group. `open` looks the group
 up only after the host has already answered `ELOOP`, so the ordinary path pays
 nothing.
 
+**proot's own groups.** A rootfs installed through proot (proot-distro's) holds
+its hardlinks in proot's scheme, not the one above, and the emulator reads and
+keeps those too (`sys_file.c`, "proot's link2symlink"; `l2s_unhost` in
+`path.c`). Every name of a group is a symlink holding an absolute **host** path
+to an *indirection* symlink in the l2s directory
+(`<rootfs>/.l2s/.l2s.<name>0001`), which names the *data file* beside it
+(`….l2s.<name>0001.<CCCC>`), whose last four digits are the live link count: a
+name added or removed renames the data file and re-points the indirection,
+which is why members name the indirection. Because the names hold an absolute
+path, a group spans directories. proot resolves such a target by stripping the
+rootfs prefix; a guest walk that re-rooted it would apply the prefix twice, so
+the walker strips it — only from a host path into a `.l2s.` / `.proot.l2s.`
+name (`l2s_unhost`), never from an ordinary symlink. What is left is walked as
+any guest path, under the same containment. Exec, open and stat then work, and
+each name is *presented* as what a hardlink is:
+
+* `lstat`/`statx` (no-follow) ask the data file, so a name is one regular file
+  with the group's `st_nlink` and inode; `fstat` of an open one takes the
+  count from the name. `readlink` of a name is `EINVAL` (and of the visible
+  indirection, which carries the rootfs's host path, tells the guest the path
+  it can use); the no-follow calls (`open` `O_NOFOLLOW`, `utimensat`,
+  `fchownat`, `faccessat2`, `l*xattr`, `execveat`, inotify) go through
+  `l2s_deref_pin`, which for these groups *hands the caller's pin the
+  directory descriptor of the data file* — the group's directory is not the
+  name's, which is the difference from the scheme above.
+* `link` adds a name with the same text *after* raising the count (and with
+  `AT_SYMLINK_FOLLOW`, which reaches the data file, too); `unlink` removes the
+  name and *then* lowers it; `rename` over a name of a group lowers that group,
+  and `rename` of one name of a file onto another name of the *same* file does
+  nothing, as on a kernel. The last name removed deletes the data file and the
+  indirection. A new name of a group is `EMLINK` at 9999.
+
+How it is kept safe. The symlinks it reads are the guest's to write, so none
+of their text is ever opened as a path: the member's text, stripped, is
+resolved by the containment resolver, which pins the directory, and everything
+after is a bare name under that descriptor. A group is recognised only when the
+whole chain checks out — the member names a `.l2s.<name><NNNN>` symlink, *that*
+names `….<CCCC>` in the same directory (compared as text, and then read from the
+one pinned descriptor), and *that* is a regular file; anything else is an
+ordinary symlink and behaves as one. Every name the bookkeeping makes, renames
+or removes is a bare basename built from the validated indirection name. A
+write the guest could not make is not made for it: the count lives in the l2s
+directory, which can sit on a read-only bind while the names do not — a new
+name is then `EROFS`, and a removed name still succeeds with its count left
+alone (`host_ro`, as every other writer). The count errs high, never low (a
+name is added after the count is raised and removed before it is lowered), so a
+crash leaks a file where the other order would lose one.
+
+Two processes changing one group at once are the hard case, because a change
+is two renames. The count itself stays exact — every change is a rename from
+the *current* name of the data file, so exactly one of two racing renames wins
+and the other looks again — but the re-point that follows is a separate step,
+and one that lands late leaves the indirection on a name that is gone. Each
+change therefore ends by making the chain whole (`pr_settle`: it finds the one
+data file in the directory and re-points to it), so whichever finishes last
+leaves it consistent, and a call that is about to *change* the group does the
+same for a chain a killed process left cut. A reader that finds the chain cut
+looks a few times and then sees an ordinary symlink; a call that adds a name
+waits (and never takes "cannot tell" for "not a group" — it used to, and the
+name it made was one nothing counted). `tests/l2s_proot.sh` stresses this with
+six processes on one group.
+
+Known limits, all shared with proot: a name added or removed *while* another
+process opens a different name of the same group can make that open fail with
+`ENOENT` for the length of the two renames; `getdents` reports a name as a
+symlink (`DT_LNK`) though `lstat` says it is a regular file; a group's count
+is a number in a file name, so a name made by anything that does not keep it
+(a host tool copying the symlink) is one the count does not know, and a group
+whose names outnumber its count loses the data when the count reaches zero.
+New groups are still made in the emulator's own scheme; only a proot group is
+extended.
+
+Reading proot's groups surfaced two containment holes in the scheme above, now
+closed (tests: `l2s_proot` rows, which fail on the earlier emulator):
+`link(2)` of a symlink made a *copy of its target* with an `openat` the host
+resolved against **its** root — a symlink to `/etc/hostname` gave the guest the
+host's file — and moving a member whose backing name was a symlink did the
+same through `l2s_materialize`, while `l2s_stat` followed it for its size and
+mode. `link` of a symlink now makes a second symlink with the same text, a
+backing file is opened `O_NOFOLLOW` (only the absolute `/proc/self/fd/N` of an
+`O_TMPFILE` being published is followed, since following that is the point),
+and a backing that is not a regular file is not the scheme's.
+
 Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `truncate` and `statfs` pin the final component itself and reach it through
 `/proc/self/fd/<fd>` — `fstatfs` directly where the kernel allows it on an

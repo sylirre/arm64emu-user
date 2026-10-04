@@ -243,7 +243,9 @@ static void help(void) {
         {"    --no-predecode", "Disable the decoded-instruction cache "
                         "(diagnostic, slower)."},
         {"-l, --link2symlink", "Emulate hardlinks with tracked symlinks where "
-                        "the host forbids link() (Android OS)."},
+                        "the host forbids link() (Android OS); also reads and "
+                        "keeps the hardlink groups a rootfs installed through "
+                        "proot (proot-distro) holds."},
         {"    --shared-proc", "Share synthesized /proc view between multiple "
                         "emulator sessions within same rootfs."},
         {"    --no-dev", "Disable the synthesized /dev."},

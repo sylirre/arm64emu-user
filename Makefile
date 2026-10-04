@@ -233,7 +233,7 @@ test-jit: arm64chroot
 # fallback and the Bionic keyring gate, then require the differential suite
 # to still match the oracle.
 test-android-sim: arm64chroot_asim
-	bash tests/run_tests.sh ./arm64chroot_asim
+	A64_L2S_BUILD=1 bash tests/run_tests.sh ./arm64chroot_asim
 
 # Android-seccomp regression gate: the ENTIRE differential suite with the
 # emulator under a SECCOMP_RET_TRAP filter for the full Oreo-blocked set
