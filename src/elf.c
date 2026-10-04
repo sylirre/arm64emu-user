@@ -409,10 +409,10 @@ int exec_arg_room(struct Machine *m, u64 argc, u64 envc, u64 *room) {
     return 0;
 }
 
-int exec_arg_limit(struct Machine *m, const char *canon,
+int exec_arg_limit(struct Machine *m, const char *execfn,
                    char **argv, char **envp) {
     u64 argc = 0, envc = 0;
-    u64 bytes = strlen(canon) + 1;
+    u64 bytes = strlen(execfn) + 1;
     u64 room;
 
     while (argv[argc]) bytes += strlen(argv[argc]) + 1, argc++;
@@ -422,17 +422,18 @@ int exec_arg_limit(struct Machine *m, const char *canon,
 }
 
 /* Load the image on `fd` (canonical guest path `canon`, used for the region
- * names, AT_EXECFN and comm) and, when it names one, the interpreter on
- * `interp_fd`. Both descriptors stay the caller's. */
+ * names and the exe path; `execfn`, the path execve was given, for AT_EXECFN
+ * and comm) and, when it names one, the interpreter on `interp_fd`. Both
+ * descriptors stay the caller's. */
 int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
-             char **argv, char **envp) {
+             const char *execfn, char **argv, char **envp) {
     int r;
 
     /* Ahead of everything else, and ahead of any mapping: the initial exec
      * arrives here without passing through do_execve, and an image whose
      * arguments cannot fit must not be half-built before that is noticed.
      * (An execve has been refused this already, on the same list.) */
-    r = exec_arg_limit(m, canon, argv, envp);
+    r = exec_arg_limit(m, execfn, argv, envp);
     if (r < 0) return r;
 
     LoadInfo exe = {0}, interp = {0};
@@ -471,7 +472,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     int argc = 0, envc = 0;
     while (argv[argc]) argc++;
     while (envp[envc]) envc++;
-    size_t strtab = strlen(canon) + 1;
+    size_t strtab = strlen(execfn) + 1;
     for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
 
@@ -531,7 +532,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     envpp[envc] = 0;
     m->as.env_end = str;
     u64 execfn_va = str;
-    copy_to_guest(&m->cpu, str, canon, strlen(canon) + 1);
+    copy_to_guest(&m->cpu, str, execfn, strlen(execfn) + 1);
 
     /* AT_RANDOM is where a guest libc gets its stack canary and pointer guard
      * from, so these sixteen bytes have to be unpredictable: a fixed pattern
@@ -698,9 +699,12 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     /* Present the guest program's name as this process's comm, so
      * /proc/<pid>/comm, status Name: and stat field 2 — which pass through to
      * the host — are right for every guest process, and host-side ps shows
-     * guest names. prctl(PR_SET_NAME) is on the Android 8 seccomp allow-list. */
-    const char *base = strrchr(canon, '/');
-    prctl(PR_SET_NAME, base && base[1] ? base + 1 : canon);
+     * guest names. A kernel takes it from the last component of the path the
+     * exec was GIVEN (begin_new_exec: kbasename(bprm->filename)), so a program
+     * run through a symlink is named for the symlink, and a script for the
+     * script. prctl(PR_SET_NAME) is on the Android 8 seccomp allow-list. */
+    const char *base = strrchr(execfn, '/');
+    prctl(PR_SET_NAME, base && base[1] ? base + 1 : execfn);
 
     /* rt_sigreturn trampoline page: `mov x8, #139; svc #0`. arm64 has no
      * sa_restorer; the kernel points lr at the vDSO sigtramp — we host it on a

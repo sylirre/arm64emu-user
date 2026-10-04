@@ -17,7 +17,8 @@
  * same bytes. The expected output in run_tests.sh is the "real" run's, taken
  * on a real kernel. What a hardlink owes the guest:
  *   - lstat of every name: a regular file, the group's st_nlink, one inode;
- *   - readlink: EINVAL (nothing is a link); open(O_NOFOLLOW) opens it;
+ *   - readlink: EINVAL (nothing is a link); open(O_NOFOLLOW) opens it; and the
+ *     directory's own d_type says regular file, which is what find -type f goes by;
  *   - link(2) -- with AT_SYMLINK_FOLLOW too, which reaches the data file --
  *     adds a name and a count; EEXIST for a name that is there;
  *   - unlink and rename take a name away (a rename over a name of the group
@@ -25,7 +26,7 @@
  *     same file does nothing at all;
  *   - the calls told not to follow the last name -- utimensat, fchownat,
  *     execveat -- act on the file;
- *   - exec runs it.
+ *   - exec runs it, and the program's /proc/self/exe is the name it was run by.
  * and the layout's directories are what the names are spread over: a group
  * spans two directories, which the emulator's own scheme cannot do.
  *
@@ -35,6 +36,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -89,6 +91,18 @@ static void cat(const char *rel) {
     if (fd >= 0) close(fd);
 }
 
+/* What the directory itself calls an entry (d_type): find -type f and ls -F go by it. */
+static void dtype(const char *dir, const char *name) {
+    DIR *d = opendir(P(dir));
+    struct dirent *e;
+    const char *t = "missing";
+    while (d && (e = readdir(d)))
+        if (!strcmp(e->d_name, name))
+            t = e->d_type == DT_REG ? "reg" : e->d_type == DT_LNK ? "lnk" : e->d_type == DT_DIR ? "dir" : "other";
+    if (d) closedir(d);
+    printf("dtype %s/%s: %s\n", dir, name, t);
+}
+
 static void rc(const char *what, int r) {
     printf("%s: %d errno=%d\n", what, r, r < 0 ? errno : 0);
 }
@@ -136,7 +150,18 @@ static void rm_real(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "--child")) { puts("exec-child ok"); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "--child")) {
+        /* What a program run through a hardlink sees of itself: the hardlink's name
+         * (a kernel's /proc/self/exe is the name the file was reached by), never
+         * the hidden file holding the data. uutils' coreutils refuses to run
+         * unless this is the utility it was asked to be. */
+        char exe[PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        exe[n < 0 ? 0 : n] = 0;
+        const char *b = strrchr(exe, '/');
+        printf("exec-child ok exe=%s\n", b ? b + 1 : exe);
+        return 0;
+    }
     int real = argc > 1 && !strcmp(argv[1], "real");
     if (real) build_real(); else base[0] = 0;
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
@@ -157,6 +182,9 @@ int main(int argc, char **argv) {
         if (fd >= 0 && fstat(fd, &st) == 0) printf("fstat opened g/a: nlink=%lu\n", (unsigned long)st.st_nlink);
         if (fd >= 0) close(fd);
     }
+
+    puts("== what the directory says");
+    dtype("g", "a"); dtype("g", "b"); dtype("g", "plain"); dtype("h", "c");
 
     puts("== link");
     rc("link g/a g/d", link(P("g/a"), P("g/d")));

@@ -13,6 +13,11 @@ readlink g/a: -1 errno=22
 open O_NOFOLLOW g/a: ok
 fstat that fd: nlink=3
 fstat opened g/a: nlink=3
+== what the directory says
+dtype g/a: reg
+dtype g/b: reg
+dtype g/plain: reg
+dtype h/c: reg
 == link
 link g/a g/d: 0 errno=0
 lstat g/d: reg nlink=4 size=6 mode=644
@@ -60,9 +65,9 @@ mtime x2: 1000000000
 fchownat x2 NOFOLLOW: 0 errno=0
 faccessat x2 NOFOLLOW: 0 errno=0
 == exec
-exec-child ok
+exec-child ok exe=t2
 execve bin2/t2: exit 0
-exec-child ok
+exec-child ok exe=t2
 execveat NOFOLLOW bin2/t2: exit 0
 == the ends
 link x2 g/z: 0 errno=0

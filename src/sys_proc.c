@@ -2438,9 +2438,9 @@ static int strvec_fill(CPU *c, u64 va, u64 n, char **v) {
  * full budget -- roughly two budgets of strings staged before the pair was
  * measured, with a heap chunk per string on top.
  *
- * `canon` is the filename measured ahead of the strings, as exec_arg_limit
+ * `execfn` is the filename measured ahead of the strings, as exec_arg_limit
  * measures it. */
-static int exec_vecs_import(CPU *c, const char *canon, u64 av, u64 ev,
+static int exec_vecs_import(CPU *c, const char *execfn, u64 av, u64 ev,
                             char ***argv, char ***envp) {
     u64 argc, envc, room, abytes, ebytes;
     int r;
@@ -2450,7 +2450,7 @@ static int exec_vecs_import(CPU *c, const char *canon, u64 av, u64 ev,
         (r = strvec_count(c, ev, &envc)) < 0 ||
         (r = exec_arg_room(c->m, argc, envc, &room)) < 0)
         return r;
-    u64 used = strlen(canon) + 1;           /* copy_string_kernel(filename) */
+    u64 used = strlen(execfn) + 1;          /* copy_string_kernel(filename) */
     if (used > room) return -E2BIG;
     char **a = strvec_new(argc, 0), **e = strvec_new(envc, 0);
     if (!a || !e) { r = -ENOMEM; goto fail; }
@@ -2483,7 +2483,7 @@ fail:
  * import's E2BIG, like its EFAULT, belongs to the caller of execve(2): this
  * runs where a kernel's count() does, with the image already open. Returns 0
  * or -errno, and leaves both NULL on failure. */
-static int exec_vecs_take(CPU *c, const char *canon, ExecVec av, ExecVec ev,
+static int exec_vecs_take(CPU *c, const char *execfn, ExecVec av, ExecVec ev,
                           char ***argv, char ***envp) {
     if (av.vec) {                      /* the initial exec: already host-side */
         u64 argc = 0, envc = 0;
@@ -2497,7 +2497,7 @@ static int exec_vecs_take(CPU *c, const char *canon, ExecVec av, ExecVec ev,
             return -ENOMEM;
         }
     } else {
-        int r = exec_vecs_import(c, canon, av.va, ev.va, argv, envp);
+        int r = exec_vecs_import(c, execfn, av.va, ev.va, argv, envp);
         if (r < 0) return r;
     }
     /* An empty argv becomes a single empty string, as do_execveat_common has
@@ -3302,7 +3302,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * that is not there or EACCES for one that may not be run, and the
          * EFAULT of an argv the guest cannot back did the same. */
         if (!argv) {
-            r = exec_vecs_take(c, canon, argv_in, envp_in, &argv, &envp);
+            r = exec_vecs_take(c, gpath, argv_in, envp_in, &argv, &envp);
             if (r < 0) { exec_close_image(imgfd); return (u64)(s64)r; }
         }
         /* ...and measured, which is bprm_stack_limits' place in that same
@@ -3310,7 +3310,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * at all, and ahead of the ENOENT of a #! interpreter that is not
          * there. Measured again on each turn of the loop, since the shebang
          * rewrite below adds to the list. */
-        r = exec_arg_limit(m, canon, argv, envp);
+        r = exec_arg_limit(m, gpath, argv, envp);
         if (r < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
         /* The kernel's binprm buffer: BINPRM_BUF_SIZE bytes, zero-padded
          * when the file is shorter, and never NUL-terminated by itself. */
@@ -3378,10 +3378,10 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
              * interpreter's name on the stack -- against the budget sized from
              * the original argv -- and the interpreter is opened only after
              * that. So a list the rewrite pushed over is E2BIG, and not the
-             * ENOENT of an interpreter that is not there. `canon` is still the
+             * ENOENT of an interpreter that is not there. `gpath` is still the
              * script's, which is the execfn a kernel measures here too: the
              * rewrite changes bprm->interp, never bprm->filename. */
-            r = exec_arg_limit(m, canon, argv, envp);
+            r = exec_arg_limit(m, gpath, argv, envp);
             if (r < 0) { exec_close_image(imgfd); free_execvecs(argv, envp); return (u64)(s64)r; }
             snprintf(pathbuf, sizeof pathbuf, "%s", interp);
             exec_close_image(imgfd);
@@ -3504,7 +3504,19 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     g_tls.tagged_addr_ctrl = 0;   /* flush_tagged_addr_state: execve clears it */
     sig_reset_for_exec(m);   /* handlers -> default, host catchers removed */
 
-    int r = load_elf(m, imgfd, ifd, canon, argv, envp);
+    /* The path the image is SHOWN under -- /proc/self/exe, the mapping names --
+     * is where a kernel's walk ended, which for a hardlink is the hardlink's
+     * own name. A name of the emulated-hardlink scheme is a symlink to the
+     * host, so the walk above followed it to the hidden backing file; a second
+     * walk that stops at the member gives the name it was reached by. uutils'
+     * coreutils needs it: every applet is a hardlink of one binary, and it
+     * refuses to run unless the last component of /proc/self/exe is the
+     * utility it was asked to be. Display only: the image was opened above. */
+    char shown[PATH_MAX], shown_host[PATH_MAX];
+    if (!m->link2symlink ||
+        path_resolve(m, G_AT_FDCWD, pathbuf, PATH_STOP_AT_L2S, shown_host, shown) < 0)
+        snprintf(shown, sizeof shown, "%s", canon);
+    int r = load_elf(m, imgfd, ifd, shown, gpath, argv, envp);
     exec_close_image(imgfd);
     if (ifd >= 0) exec_close_image(ifd);
     free_execvecs(argv, envp);

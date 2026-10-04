@@ -304,7 +304,10 @@ path, into `<rootfs>/.l2s`; the emulator follows them, shows every name as the
 regular file a hard link is, and keeps proot's own link counts as names come
 and go, so the rootfs can be used from either. Before that, the 26.04 rootfs's
 `coreutils` — one binary and 100-odd links to it, all of this kind — answered
-`No such file or directory` for `ls`, `tty` and the rest. See
+`No such file or directory` for `ls`, `tty` and the rest; and once those were
+followed, refused to run (uutils checks that `/proc/self/exe` ends in the
+applet's name, and that `AT_EXECFN` is the path it was given — both of which a
+kernel reports and the emulator did not). See
 `docs/syscalls.md` ("proot's own groups") for what it does and does not do. A
 rootfs *moved* since proot made it (its recorded host path no longer names it)
 is not followed, as with proot.

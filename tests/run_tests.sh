@@ -842,8 +842,14 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     # ...and is absent from the /proc listing.
     check_procview "listing hides pid1" "no-pid1" "$ALPINE" /bin/busybox sh -c \
         'ls /proc | grep -qx 1 && echo has-pid1 || echo no-pid1'
-    # self and guest children stay fully accessible.
-    check_procview "self comm works" "busybox" "$ALPINE" /bin/busybox sh -c \
+    # self and guest children stay fully accessible. `cat` is a symlink to
+    # busybox, and a kernel names the process for the path exec was GIVEN
+    # (begin_new_exec: kbasename(bprm->filename)), not the file it led to: this
+    # prints "cat" on a real kernel (checked with a host busybox and a symlink
+    # named cat), where the emulator used to print "busybox" for the resolved
+    # path. tests/fixtures/execfn.c asks the same of symlinks, relative paths
+    # and scripts.
+    check_procview "self comm works" "cat" "$ALPINE" /bin/busybox sh -c \
         'cat /proc/self/comm'
     check_procview "guest child visible" "ok" "$ALPINE" /bin/busybox sh -c \
         'sleep 55 & p=$!; sleep 0.3; test -r /proc/$p/comm && echo ok || echo missing; kill $p'
@@ -2794,6 +2800,13 @@ check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 
 # to a new session.
 check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nslave_foreign=-1 errno=25\nslave_ctl=0 own=1\nslave_fault=-1 errno=14\nmaster_ctl=0 own=1\nmaster_parent=0 kid=1\nmaster_gone=-1 errno=25\npipe=-1 errno=25\nnull=-1 errno=25\nclosed=-1 errno=9\ndone' \
     "A64_TIOCGSID_FORCE_DENY=1" "denied tier"
+# AT_EXECFN and comm: the path execve was GIVEN, not the one it resolved to.
+# Through a symlink, a relative path or a script a kernel keeps the name as
+# written; the emulator reported the resolved file's, and uutils' coreutils
+# (which dispatches on basename(AT_EXECFN) vs argv[0]) answered "Security
+# violation" for every name of its multicall binary. Self-checking, over real
+# execs of a copy of the program; the expected output is a real kernel's.
+check_fixture execfn $'== a symlink: the name given, not the program it leads to\nsymlink: argv0=/lnk execfn=/lnk comm=lnk exe=prog\nsymlink argv0 differs: argv0=sh execfn=/lnk comm=lnk exe=prog\na chain of symlinks: argv0=/lnk2 execfn=/lnk2 comm=lnk2 exe=prog\n== relative, from the directory\nrelative symlink: argv0=./lnk execfn=./lnk comm=lnk exe=prog\nbare relative: argv0=lnk execfn=lnk comm=lnk exe=prog\n== a script: the script\'s own path\nscript: argv0=/prog execfn=/script comm=script exe=prog\n== the program itself\ndirect: argv0=/prog execfn=/prog comm=prog exe=prog\ndone'
 # MSG_ZEROCOPY: the socket keeps referencing what it was handed after the call
 # returns, so it is always handed the guest's own pages -- a bounce buffer was
 # freed and reused while the kernel could still transmit from it. One

@@ -674,7 +674,9 @@ each name is *presented* as what a hardlink is:
 
 * `lstat`/`statx` (no-follow) ask the data file, so a name is one regular file
   with the group's `st_nlink` and inode; `fstat` of an open one takes the
-  count from the name. `readlink` of a name is `EINVAL` (and of the visible
+  count from the name, and `getdents` reports the entry as `DT_REG` (a symlink
+  whose text is a group's: `find -type f` and `ls -F` go by `d_type`, and
+  agree with `lstat`). `readlink` of a name is `EINVAL` (and of the visible
   indirection, which carries the rootfs's host path, tells the guest the path
   it can use); the no-follow calls (`open` `O_NOFOLLOW`, `utimensat`,
   `fchownat`, `faccessat2`, `l*xattr`, `execveat`, inotify) go through
@@ -718,10 +720,18 @@ waits (and never takes "cannot tell" for "not a group" — it used to, and the
 name it made was one nothing counted). `tests/l2s_proot.sh` stresses this with
 six processes on one group.
 
+A program run through a name sees the name, as it does through a hardlink:
+`/proc/self/exe` (and the mapping names) is where a kernel's walk ends, which
+for a hardlink is the hardlink's own name, so the exec makes a second walk
+that stops at a group member (`PATH_STOP_AT_L2S`, in `path.c`; display only,
+the image was opened through the first). rust-coreutils (Ubuntu 26.04) is a
+binary hardlinked once per applet, and refuses to run — "Security violation:
+Requested utility `ls` does not match executable name" — unless the last
+component of `/proc/self/exe` is the applet it was asked to be.
+
 Known limits, all shared with proot: a name added or removed *while* another
 process opens a different name of the same group can make that open fail with
-`ENOENT` for the length of the two renames; `getdents` reports a name as a
-symlink (`DT_LNK`) though `lstat` says it is a regular file; a group's count
+`ENOENT` for the length of the two renames; a group's count
 is a number in a file name, so a name made by anything that does not keep it
 (a host tool copying the symlink) is one the count does not know, and a group
 whose names outnumber its count loses the data when the count reaches zero.
@@ -2327,6 +2337,20 @@ is a call a kernel accepts, and dereferencing it unconditionally answered
 entitled to an `argv[0]`, and a program that starts reading at `argv[1]` would
 otherwise walk straight into `envp`. The shebang rewrite below relies on there
 being one too, since it replaces `argv[0]` with the script path.
+
+The **filename** an exec carries is the one it was GIVEN. A kernel keeps
+`bprm->filename` as the caller wrote it — a relative path stays relative, a
+symlink is not followed for it, a script's is the script's — and makes it
+`AT_EXECFN`, the process's `comm` (`kbasename` of it) and a string the argument
+budget measures. `do_execve` hands `load_elf` that string (`execfn`) beside the
+canonical path (`canon`), which is for `/proc/self/exe` and the mapping names;
+it used to hand all of it the canonical one, so a program run through a symlink
+was told its target's name. That matters to anything that dispatches on it:
+uutils' coreutils takes its utility from `argv[0]` only when
+`basename(AT_EXECFN) == basename(argv[0])`, and otherwise from `AT_EXECFN`, so
+every name of its multicall binary (Ubuntu 26.04's `/usr/bin/ls`, a symlink to a
+hardlink of `coreutils`) answered "Security violation: Requested utility …"
+(`tests/fixtures/execfn.c`).
 
 The **argument budget** is measured there too, and for the same reason. A
 kernel sizes it in `bprm_stack_limits`, before it reaches a binary handler at

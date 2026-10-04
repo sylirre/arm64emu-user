@@ -1632,6 +1632,24 @@ static int pr_resolve_data(const PathPin *p, PrGroup *g) {
     return 1;
 }
 
+/* Is the directory entry `name` of the directory open on `dirfd` a symlink that
+ * is a name of a link2symlink group -- proot's (an absolute host path into an
+ * ".l2s.<name>NNNN" indirection) or the emulator's own (a bare ".l2s.<ino>")?
+ * Only the text of the link is looked at: this decides what getdents calls the
+ * entry (a hardlink is a regular file, so find -type f must see it), where
+ * lstat, which does the whole check, decides what it is. */
+static int l2s_dirent_member(struct Machine *m, int dirfd, const char *name) {
+    char tgt[PATH_MAX];
+    ssize_t n = readlinkat(dirfd, name, tgt, sizeof tgt - 1);
+    if (n <= 0) return 0;
+    tgt[n] = '\0';
+    unsigned long long ino;
+    if (!strchr(tgt, '/')) return l2s_parse_data(tgt, &ino);
+    const char *gp = l2s_unhost(m, tgt);
+    const char *sl = gp ? strrchr(gp, '/') : NULL;
+    return sl && pr_is_ind(sl + 1);
+}
+
 /* A member, presented as what a hardlink is: the data file. The caller's pin
  * is replaced by one on the data file -- the group's directory descriptor
  * handed over, so nothing is opened twice and nothing leaks -- which is what
@@ -3003,6 +3021,15 @@ SYSDEF(getdents64) {
                 int keep = 1;
 #ifdef L2S_ENABLED
                 if (l2s && l2s_hidden(nm)) keep = 0;
+#endif
+#ifdef L2S_ENABLED
+                /* A name of a link2symlink group is a symlink to the host and
+                 * the one regular file a hardlink is to the guest: lstat says
+                 * so, and the type the directory reports must agree, or find
+                 * -type f, ls -F and every tool that trusts d_type pass them by. */
+                if (keep && l2s && buf[o + 18] == 10 /*DT_LNK*/ &&
+                    l2s_dirent_member(c->m, (int)a0, nm))
+                    buf[o + 18] = 8;                              /* DT_REG */
 #endif
                 if (keep && is_proc && !proc_keep_name(nm)) keep = 0;
                 if (keep && nforeign) {

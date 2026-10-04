@@ -1074,17 +1074,21 @@ void emu_fork_check(const char *site);
 /* elf.c: load the image on `fd` (and, when it names one, the interpreter on
  * `interp_fd`, or -1 to open it by path) into the address space and prepare
  * the initial stack. `canon` is the image's canonical guest path, for the
- * region names, AT_EXECFN and comm. The descriptors stay the caller's.
- * Returns 0 or -errno. */
+ * region names and /proc/self/exe. `execfn` is the path execve was GIVEN --
+ * a kernel's bprm->filename, which it does not resolve: AT_EXECFN, the name
+ * the process takes as its comm (the last component of it) and what the
+ * argument budget measures. Through a symlink, a relative path or a script
+ * it is not `canon`: a multicall binary (uutils' coreutils) dispatches on
+ * the difference. The descriptors stay the caller's. Returns 0 or -errno. */
 int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
-             char **argv, char **envp);
+             const char *execfn, char **argv, char **envp);
 /* The AT_HWCAP / AT_HWCAP2 words this emulator advertises (elf.c). */
 void elf_hwcaps(u64 *hwcap, u64 *hwcap2);
 /* Does this argument list fit the budget a new image gets for argv+envp
  * (bprm_stack_limits: a share of RLIMIT_STACK, minus the pointer table)?
  * 0 or -E2BIG. Asked by execve while it can still refuse; load_elf asks it
  * again for the initial exec, which has no such caller (elf.c). */
-int exec_arg_limit(struct Machine *m, const char *canon,
+int exec_arg_limit(struct Machine *m, const char *execfn,
                    char **argv, char **envp);
 /* What of that budget the strings of an argc + envc entry list may spend,
  * once the pointer table is set aside: 0 with *room set, or -E2BIG when the
@@ -1111,6 +1115,15 @@ void exec_close_image(int fd);
  * path. Returns 0 or -errno. */
 #define PATH_NOFOLLOW_LAST 1
 #define PATH_CREATING      2
+/* PATH_STOP_AT_L2S: end the walk AT a name of the emulated-hardlink scheme
+ * (--link2symlink; a symlink to the host that is a regular file to the guest)
+ * instead of following it, as a kernel's walk ends at a hardlink's own
+ * dentry. What the walk reports is then the name the file was reached by --
+ * what /proc/self/exe shows for it -- where a followed member would report
+ * the hidden backing file. Only the exec's display path asks (do_execve): a
+ * multicall binary made of hardlinks (uutils' coreutils) checks that the last
+ * component of /proc/self/exe is the utility it was run as. */
+#define PATH_STOP_AT_L2S   4
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out);
 
