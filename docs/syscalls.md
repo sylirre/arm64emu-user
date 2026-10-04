@@ -105,7 +105,29 @@ is not the oracle for most, so the expected block is a native run's):
   (newer glibc's `tcgetattr`) got `unhandled ioctl 0x802c542a` and an `ENOTTY`
   for a terminal that was there. The table zeroes the bounce buffer first and
   copies exactly 44 bytes back, so nothing past the struct is written
-  (`tests/fixtures/termios2.c`).
+  (`tests/fixtures/termios2.c`). They are answered by `tty_termios2`
+  (`sys_file.c`), which asks the host first and falls back to the classic
+  `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` when the host refuses with `EACCES` or
+  `ENOTTY`: Android's SELinux policy whitelists the ioctls an app may issue on
+  its pty and `TCGETS2` is not on the list, so every termios2 command —
+  on a terminal and on a pipe alike — was `EACCES`, and a glibc since 2.42,
+  whose `tcgetattr` (hence `isatty`) is built on them, took its terminal for
+  none: bash (Ubuntu 26.04) ran non-interactively on a terminal and printed no
+  prompt (Ubuntu 24.04's glibc 2.39 asks `TCGETS` and was never affected). The
+  classic struct is the first 36 bytes; the two rates it lacks are read from
+  `c_cflag` — a `Bnnn` constant in `CBAUD` (output) and `CIBAUD` (input, 0 =
+  as the output) — or, for `BOTHER` ("the number is in `c_ospeed`/`c_ispeed`"),
+  from a per-terminal record of the last numbers set (a few slots, lock-free so
+  no lock crosses a `fork`; a master and its slave are one terminal, found by
+  `TIOCGPTN`), while the `BOTHER` marker itself rides in the host's own
+  termios. The record is per host process (an `exec` keeps it, a `fork`'s
+  child starts with a copy), so a `BOTHER` set by some other process is not
+  known here and reads as 38400. The first refusal
+  that the classic command then proves to be about termios2 is remembered, so
+  the policy is not asked (and does not log a denial) on every call; the
+  classic command answers `ENOTTY` itself for a descriptor that is no terminal.
+  `A64_TERMIOS2_FORCE_DENY` forces the tier on any host, and the suite runs
+  `termios2` over it (`(denied tier)`), a rate set through the master included.
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert

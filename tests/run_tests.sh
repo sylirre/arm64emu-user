@@ -2766,8 +2766,13 @@ check_fixture fiemapio $'one_run=0 mapped=1 last=1 untouched=1\none_run_badr=53 
 # pipe is ENOTTY. They were not whitelisted: "unhandled ioctl 0x802c542a" and an
 # ENOTTY on a terminal that is there. Self-checking: qemu-user has no TCGETS2
 # (hence NEEDS-HOST-SYSCALL: tcgets2, for the ARM32 tier); steps aside where the
-# host refuses the ioctl on a pty or has none.
-check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 readback=1\nsetsw2=0 errno=0 readback=1\nsetsf2=0 errno=0 readback=1\nget2_fault=-1 errno=14\nset2_fault=-1 errno=14\npipe=-1 errno=25\ndone'
+# host has none. A host that refuses them (Android's SELinux policy answers
+# EACCES to every termios2 command, so a glibc 2.42+ guest's isatty() was false
+# and bash printed no prompt) is served from TCGETS/TCSETS: the denied tier runs
+# the same answers over that, a BOTHER rate and a rate set through the pty's
+# master included.
+check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 readback=1\nsetsw2=0 errno=0 readback=1\nsetsf2=0 errno=0 readback=1\nmaster_set2=0 errno=0 readback=1\nmaster_get2=0 speed=1\nget2_fault=-1 errno=14\nset2_fault=-1 errno=14\npipe=-1 errno=25\ndone' \
+    "A64_TERMIOS2_FORCE_DENY=1" "denied tier"
 # MSG_ZEROCOPY: the socket keeps referencing what it was handed after the call
 # returns, so it is always handed the guest's own pages -- a bounce buffer was
 # freed and reused while the kernel could still transmit from it. One

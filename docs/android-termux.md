@@ -193,6 +193,16 @@ unfiltered:
   and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
   without `--fake-id`, requiring identical output.
 
+* **The termios2 ioctls** are denied on a terminal: `TCGETS2`, `TCSETS2`,
+  `TCSETSW2` and `TCSETSF2` answer `EACCES` (the classic `TCGETS`/`TCSETS*`
+  and `TIOCGWINSZ` are allowed). A glibc since 2.42 — Ubuntu 26.04 — builds
+  `tcgetattr`, and so `isatty`, on `TCGETS2`, so a guest took its terminal for
+  none: an interactive bash printed no prompt and readline could not set the
+  terminal. They are answered from the classic commands instead (the speeds are
+  the `c_cflag` rate, or a per-terminal record of an arbitrary one), and the
+  first refusal is remembered so the policy is not asked again. See
+  `docs/syscalls.md`; `A64_TERMIOS2_FORCE_DENY` forces the tier anywhere.
+
 * **Changing the mode of a memfd** is denied too, by the same policy: an app
   has no `setattr` on one, so `fchmod(memfd, ...)` is EACCES whether it is
   reached by descriptor or through `/proc/self/fd/N` (an ordinary file in the

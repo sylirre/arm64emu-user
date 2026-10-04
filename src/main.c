@@ -376,6 +376,11 @@ static void help(void) {
         {"A64_MEMFD_CHMOD_FORCE_DENY", "Refuse every mode change on a memfd, "
                         "as Android's policy does, so the guest-set mode is "
                         "held in the broker registry instead of by the host."},
+        {"A64_TERMIOS2_FORCE_DENY", "Refuse the termios2 ioctls (TCGETS2, "
+                        "TCSETS2, ...) with EACCES, as Android's policy does, "
+                        "so they are served from TCGETS/TCSETS -- without "
+                        "which a glibc 2.42+ guest's isatty() is false and "
+                        "an interactive bash prints no prompt."},
         {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "

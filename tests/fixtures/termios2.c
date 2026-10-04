@@ -17,13 +17,20 @@
  * an unmapped buffer is EFAULT both ways, and a descriptor that is no tty is
  * ENOTTY.
  *
+ * The master's termios is the slave's, so a rate set through one end is read
+ * back through the other and through the same end (the emulator keeps a
+ * BOTHER rate per terminal when the host cannot, and has to know the two ends
+ * for one).
+ *
  * qemu-user has no TCGETS2 in its ioctl table and answers ENOTTY, so it cannot
  * be the oracle (the C tests are) and it cannot host the emulator either:
  * NEEDS-HOST-SYSCALL: tcgets2
  * A host that has a kernel but refuses the ioctl on a pty -- an SELinux policy
- * that whitelists a slave's ioctls -- steps aside with a lone SKIP line. The
- * expected output is what this program prints built for the host and run on a
- * real kernel. */
+ * that whitelists a slave's ioctls, Android's -- is served from TCGETS/TCSETS
+ * by the emulator itself (A64_TERMIOS2_FORCE_DENY runs that tier anywhere), and
+ * the answers above are the same; a host this program reaches by itself and
+ * which still refuses steps aside with a lone SKIP line. The expected output is
+ * what this program prints built for the host and run on a real kernel. */
 #define _XOPEN_SOURCE 600
 #include <errno.h>
 #include <fcntl.h>
@@ -64,8 +71,8 @@ static int tail_ok(const struct guarded *g) {
     return 1;
 }
 
-/* One setter, then the read-back that must be what it was given. */
-static void set_and_check(const char *name, unsigned long cmd, int s, struct guarded *g,
+/* One setter on `s`, then the read-back, through `rd`, that must be what it was given. */
+static void set_and_check(const char *name, unsigned long cmd, int s, int rd, struct guarded *g,
                           unsigned speed, unsigned vmin, unsigned vtime) {
     g->t.c_cflag = (g->t.c_cflag & ~T_CBAUD) | T_BOTHER;
     g->t.c_ispeed = speed;                  /* the kernel makes the input rate follow */
@@ -77,7 +84,7 @@ static void set_and_check(const char *name, unsigned long cmd, int s, struct gua
     int e = r < 0 ? errno : 0;
     struct guarded b;
     poison(&b);
-    int r2 = ioctl(s, T_GETS2, &b.t);
+    int r2 = ioctl(rd, T_GETS2, &b.t);
     int same = r2 == 0 && tail_ok(&b) &&
                b.t.c_ospeed == speed &&
                b.t.c_cc[6] == vmin && b.t.c_cc[5] == vtime &&
@@ -109,9 +116,17 @@ int main(void) {
     printf("get2=%d errno=%d whole=%d tail=%d prefix=%d\n", r, e, whole, tail_ok(&g), prefix);
     if (r < 0) return 0;
 
-    set_and_check("set2", T_SETS2, s, &g, 123456, 7, 3);
-    set_and_check("setsw2", T_SETSW2, s, &g, 230400, 5, 2);
-    set_and_check("setsf2", T_SETSF2, s, &g, 345678, 9, 4);
+    set_and_check("set2", T_SETS2, s, s, &g, 123456, 7, 3);
+    set_and_check("setsw2", T_SETSW2, s, s, &g, 230400, 5, 2);
+    set_and_check("setsf2", T_SETSF2, s, s, &g, 345678, 9, 4);
+
+    /* A pty's master and slave are one termios: set through the master, read
+     * through the slave and through the master itself. */
+    set_and_check("master_set2", T_SETS2, m, s, &g, 56789, 6, 1);
+    struct guarded mb;
+    poison(&mb);
+    r = ioctl(m, T_GETS2, &mb.t);
+    printf("master_get2=%d speed=%d\n", r, r == 0 && mb.t.c_ospeed == 56789 && tail_ok(&mb));
 
     errno = 0;
     r = ioctl(s, T_GETS2, (void *)0);

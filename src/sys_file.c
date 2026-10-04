@@ -2653,16 +2653,11 @@ SYSDEF(fremovexattr) { /* (fd, name) */
  * all four hosts, so a size-tagged bounce is enough. */
 typedef struct { u32 cmd; u16 size; u8 dir; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
 #define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
-#define IOC_TERMIOS2_SZ 44  /* kernel struct termios2: that + c_ispeed + c_ospeed (2 u32) */
 static const IoctlEnt ioctl_tab[] = {
     { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1 },
     { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2 },
     { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2 },
     { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2 },
-    { 0x802c542a /*TCGETS2*/,  IOC_TERMIOS2_SZ, 1 },  /* termios + arbitrary baud rates; glibc's tcgetattr/cfsetspeed */
-    { 0x402c542b /*TCSETS2*/,  IOC_TERMIOS2_SZ, 2 },
-    { 0x402c542c /*TCSETSW2*/, IOC_TERMIOS2_SZ, 2 },
-    { 0x402c542d /*TCSETSF2*/, IOC_TERMIOS2_SZ, 2 },
     { 0x5409 /*TCSBRK*/,     0, 0 },
     { 0x540A /*TCXONC*/,     0, 0 },
     { 0x540B /*TCFLSH*/,     0, 0 },
@@ -2689,6 +2684,155 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
     { 0x4b33 /*KDGKBTYPE*/,   1, 1 },   /* char keyboard type, out; ENOTTY off a real VT */
 };
+
+/* ---- termios2: TCGETS2 / TCSETS2 / TCSETSW2 / TCSETSF2 ----
+ *
+ * 44 bytes: the 36-byte termios plus c_ispeed and c_ospeed (2 u32), the same
+ * on every host. A glibc since 2.42 implements tcgetattr/tcsetattr -- and so
+ * isatty -- on these, which is how a guest learns whether it has a terminal.
+ *
+ * Android's SELinux policy whitelists the ioctls an app may issue on its pty
+ * and TCGETS2 is not among them: the host answers EACCES, on a terminal and on
+ * a pipe alike. isatty(0) was then false for the guest, so bash (Ubuntu 26.04,
+ * glibc 2.43) ran non-interactively on a terminal and printed no prompt, and
+ * readline's tcsetattr would have been refused the same way. A host kernel
+ * that predates the commands (ENOTTY on a tty) is in the same position.
+ *
+ * Both are served from the classic commands, which every host answers: the
+ * termios is the first 36 bytes either way, and what the classic struct leaves
+ * out are the rates, which c_cflag already holds -- as a Bnnn constant in
+ * CBAUD (output) and CIBAUD (input; 0 = "as the output"), or BOTHER, "the
+ * number is in c_ospeed / c_ispeed". A Bnnn is read back from the constant;
+ * a BOTHER number cannot be held by a termios that has no field for it, so
+ * the emulator keeps the last one set per terminal (tc_shadow below) while
+ * c_cflag keeps the BOTHER marker in the host's own termios, where every
+ * reader sees it. The kernel's own termios2 reads the speeds back from the tty
+ * the same way for a tty that is not a serial port: they are only ever what
+ * was last set.
+ *
+ * Tried on the host first, so a host that does implement termios2 serves them
+ * itself; the first refusal that the classic command then proves to be about
+ * termios2 (it worked on the same descriptor) is remembered, and the
+ * remaining calls go straight to the fallback instead of being denied -- and
+ * logged by the policy -- every time. A64_TERMIOS2_FORCE_DENY forces the tier
+ * on any host. */
+#define TC_GETS    0x5401u
+#define TC_SETS    0x5402u
+#define TC_GETS2   0x802c542au
+#define TC_SETS2   0x402c542bu
+#define TC_SETSW2  0x402c542cu
+#define TC_SETSF2  0x402c542du
+#define TC_CBAUD   0x100fu     /* c_cflag's output-rate field */
+#define TC_BOTHER  0x1000u     /* ... holding "the rate is in c_ospeed" */
+#define TC_IBSHIFT 16          /* the input-rate field is CBAUD << this */
+#define IOC_TERMIOS2_SZ 44     /* kernel struct termios2: termios + c_ispeed + c_ospeed */
+
+/* The rate each Bnnn names: B0..B38400 are 0..15, B57600..B4000000 0x1001..0x100f. */
+static const u32 tc_rate_lo[16] = { 0, 50, 75, 110, 134, 150, 200, 300, 600, 1200,
+                                    1800, 2400, 4800, 9600, 19200, 38400 };
+static const u32 tc_rate_hi[15] = { 57600, 115200, 230400, 460800, 500000, 576000,
+                                    921600, 1000000, 1152000, 1500000, 2000000,
+                                    2500000, 3000000, 3500000, 4000000 };
+
+/* A rate field's number; `held` is the one kept for BOTHER. */
+static u32 tc_rate(u32 field, u32 held) {
+    if (field == TC_BOTHER) return held;
+    return (field & TC_BOTHER) ? tc_rate_hi[(field & 0xf) - 1] : tc_rate_lo[field];
+}
+
+/* The BOTHER numbers last set, per terminal: a few slots, replaced round
+ * robin. Lock-free on purpose (a lock held across fork() would be inherited
+ * held by the child): `speeds` is written before `key`, and a reader that
+ * lands between two writers of the same terminal gets one of the two pairs. */
+typedef struct { u64 key, speeds; } TcShadow;
+static TcShadow tc_shadow[8];
+static unsigned tc_shadow_next;
+
+/* Which terminal a descriptor is: the slave's device number, which the master
+ * ptmx's termios is too (it talks to its slave's). Bit 63 keeps it nonzero. */
+static u64 tc_key(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) return 1;
+    dev_t rd = st.st_rdev;
+    int n;
+    if (major(rd) == 5 && minor(rd) == 2 && ioctl(fd, 0x80045430 /*TIOCGPTN*/, &n) == 0 && n >= 0)
+        rd = makedev(136 + n / 256, n % 256);       /* UNIX98_PTY_SLAVE_MAJOR */
+    return (u64)rd | (1ull << 63);
+}
+
+static int tc_shadow_get(u64 key, u32 *ispeed, u32 *ospeed) {
+    for (unsigned i = 0; i < sizeof tc_shadow / sizeof tc_shadow[0]; i++) {
+        if (__atomic_load_n(&tc_shadow[i].key, __ATOMIC_ACQUIRE) != key) continue;
+        u64 v = __atomic_load_n(&tc_shadow[i].speeds, __ATOMIC_RELAXED);
+        *ispeed = (u32)(v >> 32);
+        *ospeed = (u32)v;
+        return 1;
+    }
+    return 0;
+}
+
+static void tc_shadow_put(u64 key, u32 ispeed, u32 ospeed) {
+    unsigned n = sizeof tc_shadow / sizeof tc_shadow[0], slot = n;
+    for (unsigned i = 0; i < n; i++)
+        if (__atomic_load_n(&tc_shadow[i].key, __ATOMIC_RELAXED) == key) { slot = i; break; }
+    if (slot == n) slot = __atomic_fetch_add(&tc_shadow_next, 1, __ATOMIC_RELAXED) % n;
+    __atomic_store_n(&tc_shadow[slot].speeds, (u64)ispeed << 32 | ospeed, __ATOMIC_RELAXED);
+    __atomic_store_n(&tc_shadow[slot].key, key, __ATOMIC_RELEASE);
+}
+
+/* Whether to skip the host's termios2 and go straight to the classic commands:
+ * forced by the knob, or set once the host refused a termios2 command that the
+ * classic one answering for it was not refused (so the refusal was about
+ * termios2). -1 = the knob is not read yet, 0 = ask the host. */
+static int tc2_host_lacks = -1;
+
+/* The host's own answer, or a refusal when the tier is forced. */
+static int tc2_host(int fd, u32 cmd, void *buf) {
+    if (PROBE_ONCE(tc2_host_lacks, getenv("A64_TERMIOS2_FORCE_DENY") != NULL) > 0) {
+        errno = EACCES;
+        return -1;
+    }
+    return ioctl(fd, cmd, buf);
+}
+
+static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
+    u8 buf[IOC_TERMIOS2_SZ];
+    int set = cmd != TC_GETS2;
+    /* Zeroed first, as in the table path below: only what is written is copied out. */
+    memset(buf, 0, sizeof buf);
+    if (set && copy_from_guest(c, buf, gp, sizeof buf) < 0) return (u64)(s64)-EFAULT;
+    if (tc2_host(fd, cmd, buf) < 0) {
+        if (errno != EACCES && errno != ENOTTY) return host_err();
+        /* Not served by the host: the classic command answers for it (and
+         * says ENOTTY itself where the descriptor is no terminal). */
+        u32 cflag, ispeed = 0, ospeed = 0;
+        u64 key = 0;
+        if (!set) {
+            if (ioctl(fd, TC_GETS, buf) < 0) return host_err();
+            memcpy(&cflag, buf + 8, 4);
+            u32 ib = (cflag >> TC_IBSHIFT) & TC_CBAUD, ob = cflag & TC_CBAUD;
+            u32 hi = 38400, ho = 38400;        /* a BOTHER nobody told us the number of */
+            if ((ob == TC_BOTHER || ib == TC_BOTHER) && (key = tc_key(fd)))
+                tc_shadow_get(key, &hi, &ho);
+            ospeed = tc_rate(ob, ho);
+            ispeed = ib ? tc_rate(ib, hi) : ospeed;
+            memcpy(buf + 36, &ispeed, 4);
+            memcpy(buf + 40, &ospeed, 4);
+        } else {
+            memcpy(&cflag, buf + 8, 4);
+            memcpy(&ispeed, buf + 36, 4);
+            memcpy(&ospeed, buf + 40, 4);
+            u32 hcmd = TC_SETS + (cmd - TC_SETS2);          /* TCSETS, TCSETSW, TCSETSF */
+            if (ioctl(fd, hcmd, buf) < 0) return host_err();
+            if (((cflag & TC_CBAUD) == TC_BOTHER ||
+                 ((cflag >> TC_IBSHIFT) & TC_CBAUD) == TC_BOTHER) && (key = tc_key(fd)))
+                tc_shadow_put(key, ispeed, ospeed);
+        }
+        __atomic_store_n(&tc2_host_lacks, 1, __ATOMIC_RELAXED);
+    }
+    if (!set && copy_to_guest(c, gp, buf, sizeof buf) < 0) return (u64)(s64)-EFAULT;
+    return 0;
+}
 
 /* The fs reflink ioctls -- FICLONE, FICLONERANGE -- clone the SOURCE fd's
  * blocks into the DESTINATION (the ioctl's own fd). The emulator's objects
@@ -2890,6 +3034,8 @@ SYSDEF(ioctl) {
             return ret;
         }
     }
+    if (cmd == TC_GETS2 || cmd == TC_SETS2 || cmd == TC_SETSW2 || cmd == TC_SETSF2)
+        return tty_termios2(c, (int)a0, cmd, a2);
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)
         if (ioctl_tab[i].cmd == cmd) { e = &ioctl_tab[i]; break; }
