@@ -2678,7 +2678,6 @@ static const IoctlEnt ioctl_tab[] = {
     { 0x5422 /*TIOCNOTTY*/,  0, 0 },
     { 0x5451 /*FIOCLEX*/,    0, 0 },
     { 0x5450 /*FIONCLEX*/,   0, 0 },
-    { 0x5429 /*TIOCGSID*/,   4, 1 },
     { 0x80045430 /*TIOCGPTN*/, 4, 1 },
     { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
     { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
@@ -2748,6 +2747,9 @@ typedef struct { u64 key, speeds; } TcShadow;
 static TcShadow tc_shadow[8];
 static unsigned tc_shadow_next;
 
+/* /dev/ptmx, whichever devpts mounts it: a pty's master end. */
+static int tc_is_ptmx(dev_t rd) { return major(rd) == 5 && minor(rd) == 2; }
+
 /* Which terminal a descriptor is: the slave's device number, which the master
  * ptmx's termios is too (it talks to its slave's). Bit 63 keeps it nonzero. */
 static u64 tc_key(int fd) {
@@ -2755,7 +2757,7 @@ static u64 tc_key(int fd) {
     if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) return 1;
     dev_t rd = st.st_rdev;
     int n;
-    if (major(rd) == 5 && minor(rd) == 2 && ioctl(fd, 0x80045430 /*TIOCGPTN*/, &n) == 0 && n >= 0)
+    if (tc_is_ptmx(rd) && ioctl(fd, 0x80045430 /*TIOCGPTN*/, &n) == 0 && n >= 0)
         rd = makedev(136 + n / 256, n % 256);       /* UNIX98_PTY_SLAVE_MAJOR */
     return (u64)rd | (1ull << 63);
 }
@@ -2831,6 +2833,55 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
         __atomic_store_n(&tc2_host_lacks, 1, __ATOMIC_RELAXED);
     }
     if (!set && copy_to_guest(c, gp, buf, sizeof buf) < 0) return (u64)(s64)-EFAULT;
+    return 0;
+}
+
+/* ---- TIOCGSID: the session a terminal belongs to ----
+ *
+ * tcgetsid(3), which login, script and agetty ask. Android's SELinux policy
+ * whitelists a pty's ioctls and TIOCGSID is not on the list: EACCES, where a
+ * kernel answers the session, or ENOTTY for a descriptor that is no terminal
+ * of the caller's (the policy answers a pipe EACCES too). The host is asked
+ * first; on that refusal it is served from the commands that are allowed --
+ * TCGETS to know a terminal from a pipe (ENOTTY, as a kernel says), TIOCGPGRP
+ * for the kernel's own reach check (a slave answers only the process whose
+ * controlling terminal it is, a master always: ENOTTY otherwise) -- and the
+ * session is then worked out the way the kernel holds it:
+ *   - a slave the caller controls belongs to the caller's session: getsid(0).
+ *     A terminal is a session's only while it is that session's controlling
+ *     terminal, and a process controls it only from inside that session;
+ *   - a master answers for its slave, the session of its foreground group (a
+ *     slave nobody controls has no group, and no session: ENOTTY).
+ * The ids are the host's, as getsid(2) and TIOCGPGRP report them. As with
+ * termios2 above, the first refusal that the allowed commands prove to be
+ * about TIOCGSID is remembered, and A64_TIOCGSID_FORCE_DENY forces the tier
+ * on any host. */
+#define TC_GPGRP 0x540fu
+#define TC_GSID  0x5429u
+
+static int tsid_host_lacks = -1;      /* as tc2_host_lacks: -1 = knob unread, 1 = skip the host */
+
+static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
+    s32 sid = 0;
+    int ok = 0;
+    if (!PROBE_ONCE(tsid_host_lacks, getenv("A64_TIOCGSID_FORCE_DENY") != NULL)) {
+        if (ioctl(fd, TC_GSID, &sid) == 0) ok = 1;
+        else if (errno != EACCES) return host_err();
+    }
+    if (!ok) {
+        u8 probe[IOC_TERMIOS_SZ];
+        s32 pg = 0;
+        struct stat st;
+        if (ioctl(fd, TC_GETS, probe) < 0) return host_err();    /* no terminal */
+        if (ioctl(fd, TC_GPGRP, &pg) < 0) return host_err();     /* not the caller's */
+        if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && tc_is_ptmx(st.st_rdev)) {
+            if (pg <= 0 || (sid = sig_pgrp_session(pg)) < 0) return (u64)(s64)-ENOTTY;
+        } else {
+            sid = (s32)getsid(0);
+        }
+        __atomic_store_n(&tsid_host_lacks, 1, __ATOMIC_RELAXED);
+    }
+    if (copy_to_guest(c, gp, &sid, sizeof sid) < 0) return (u64)(s64)-EFAULT;
     return 0;
 }
 
@@ -3036,6 +3087,7 @@ SYSDEF(ioctl) {
     }
     if (cmd == TC_GETS2 || cmd == TC_SETS2 || cmd == TC_SETSW2 || cmd == TC_SETSF2)
         return tty_termios2(c, (int)a0, cmd, a2);
+    if (cmd == TC_GSID) return tty_tiocgsid(c, (int)a0, a2);
     const IoctlEnt *e = NULL;
     for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)
         if (ioctl_tab[i].cmd == cmd) { e = &ioctl_tab[i]; break; }

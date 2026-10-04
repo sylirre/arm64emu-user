@@ -2283,6 +2283,33 @@ static int pgrp_orphaned(void) {
     return orphaned;
 }
 
+/* The session of process group `pg`, or -1 if no process of it can be found.
+ * getsid(pg) answers while the group's leader is there -- as a zombie too --
+ * but a group outlives its leader, and then one of its members' /proc stat
+ * says (a member the host's /proc will not show cannot be found). */
+int sig_pgrp_session(int pg) {
+    if (pg <= 0) return -1;
+    pid_t s = getsid((pid_t)pg);
+    if (s >= 0) return (int)s;
+    if (errno != ESRCH) return -1;
+    int found = -1;
+    fdwin_enter();   /* descriptors of our own, briefly (machine.h) */
+    DIR *d = opendir("/proc");
+    if (!d) { fdwin_leave(); return -1; }
+    struct dirent *de;
+    while (found < 0 && (de = readdir(d))) {
+        char *end, st;
+        long pid = strtol(de->d_name, &end, 10);
+        int pp, pgr, se;
+        if (*end || pid <= 0) continue;
+        if (proc_stat_ids((int)pid, &st, &pp, &pgr, &se) && pgr == pg && st != 'X')
+            found = se;
+    }
+    closedir(d);
+    fdwin_leave();
+    return found;
+}
+
 /* ---- SIGSYS safety net ----
  *
  * Android 8+ filters every app process with a seccomp whitelist whose action

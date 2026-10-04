@@ -203,6 +203,16 @@ unfiltered:
   first refusal is remembered so the policy is not asked again. See
   `docs/syscalls.md`; `A64_TERMIOS2_FORCE_DENY` forces the tier anywhere.
 
+* **`TIOCGSID`** (`tcgetsid(3)`) is denied on a pty slave and on a pipe, and
+  allowed on the ptmx master: `EACCES` where a kernel answers the session or
+  `ENOTTY`. It is answered from `TCGETS`, `TIOCGPGRP` and `getsid`, as above
+  (`A64_TIOCGSID_FORCE_DENY`). What the policy did with the tty ioctls
+  probed on a device: on a pty slave `TCGETS`, `TIOCGPGRP` and `TIOCGWINSZ`
+  were answered and `TCGETS2` and `TIOCGSID` refused; on a pipe `TCGETS` got
+  the kernel's `ENOTTY` while `TCGETS2`, `TIOCGPGRP` and `TIOCGSID` got
+  `EACCES`. A guest's `TIOCGPGRP` on a pipe is still forwarded as that
+  `EACCES`.
+
 * **Changing the mode of a memfd** is denied too, by the same policy: an app
   has no `setattr` on one, so `fchmod(memfd, ...)` is EACCES whether it is
   reached by descriptor or through `/proc/self/fd/N` (an ordinary file in the

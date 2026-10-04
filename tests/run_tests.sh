@@ -2775,6 +2775,17 @@ check_fixture fiemapio $'one_run=0 mapped=1 last=1 untouched=1\none_run_badr=53 
 # master included.
 check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 readback=1\nsetsw2=0 errno=0 readback=1\nsetsf2=0 errno=0 readback=1\nmaster_set2=0 errno=0 readback=1\nmaster_get2=0 speed=1\nget2_fault=-1 errno=14\nset2_fault=-1 errno=14\npipe=-1 errno=25\ndone' \
     "A64_TERMIOS2_FORCE_DENY=1" "denied tier"
+# TIOCGSID (tcgetsid): the session of a terminal over a real pty -- ENOTTY with
+# no session, a child that setsid()s and takes the pty reads its own pid from
+# the slave and from the master, the parent reads it from the master and is
+# ENOTTY of the slave it does not control, the leader's exit takes the session
+# away, a pipe and /dev/null are ENOTTY, EFAULT on a null buffer. Android's
+# policy answers EACCES to it on a slave and a pipe; the denied tier serves it
+# from TCGETS/TIOCGPGRP/getsid and must say the same. Self-checking (expected
+# output taken from a real kernel); steps aside where the pty cannot be handed
+# to a new session.
+check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nslave_foreign=-1 errno=25\nslave_ctl=0 own=1\nslave_fault=-1 errno=14\nmaster_ctl=0 own=1\nmaster_parent=0 kid=1\nmaster_gone=-1 errno=25\npipe=-1 errno=25\nnull=-1 errno=25\nclosed=-1 errno=9\ndone' \
+    "A64_TIOCGSID_FORCE_DENY=1" "denied tier"
 # MSG_ZEROCOPY: the socket keeps referencing what it was handed after the call
 # returns, so it is always handed the guest's own pages -- a bounce buffer was
 # freed and reused while the kernel could still transmit from it. One

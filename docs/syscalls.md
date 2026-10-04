@@ -128,6 +128,22 @@ is not the oracle for most, so the expected block is a native run's):
   classic command answers `ENOTTY` itself for a descriptor that is no terminal.
   `A64_TERMIOS2_FORCE_DENY` forces the tier on any host, and the suite runs
   `termios2` over it (`(denied tier)`), a rate set through the master included.
+- `TIOCGSID` (`tcgetsid(3)`; `tty_tiocgsid`, `sys_file.c`) is served the same
+  way, for the same reason: Android's SELinux policy answers `EACCES` to it on
+  a pty slave and on a pipe (the ptmx master it allows), where a kernel gives
+  the session, or `ENOTTY` for a descriptor that is no terminal, for a slave
+  the caller does not control and for a master whose slave has no session.
+  After the host's refusal, `TCGETS` tells a terminal from a pipe (`ENOTTY`),
+  and `TIOCGPGRP` is the kernel's own reach check for the slave (it answers
+  only the process whose controlling terminal it is). The session is then the
+  caller's, `getsid(0)`, for a slave — a terminal is a session's only while it
+  is that session's controlling terminal, and a process controls it only from
+  inside that session — and for a master the session of the slave's foreground
+  group (`sig_pgrp_session`: `getsid` of the group while its leader is there,
+  a member's `/proc` stat after — a group outlives its leader), `ENOTTY` when
+  the slave has no group. The ids are the host's, as `getsid(2)` and
+  `TIOCGPGRP` report them. `A64_TIOCGSID_FORCE_DENY` forces the tier on any
+  host and the suite runs `tests/fixtures/tiocgsid.c` over it.
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert

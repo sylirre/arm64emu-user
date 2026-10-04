@@ -781,6 +781,7 @@ int  sig_chld_reap_emulated(void);
  * the ENOSYS the SIGSYS net answers IS the guest's answer (the pidfd calls,
  * which the Android app filter blocks): no notice when it is trapped. */
 void sig_sigsys_expected(int host_nr);
+int  sig_pgrp_session(int pg);   /* session of a process group, -1 if none is found */
 
 /* sys_time.c: capture-time SI_TIMER fixup. A host POSIX-timer signal carries
  * only the emulator's timer-slot index in its sigval (a 64-bit guest sigval

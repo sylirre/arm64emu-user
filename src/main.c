@@ -381,6 +381,9 @@ static void help(void) {
                         "so they are served from TCGETS/TCSETS -- without "
                         "which a glibc 2.42+ guest's isatty() is false and "
                         "an interactive bash prints no prompt."},
+        {"A64_TIOCGSID_FORCE_DENY", "Refuse TIOCGSID (tcgetsid) with EACCES, "
+                        "as Android's policy does on a pty slave and a pipe, "
+                        "so it is served from TCGETS, TIOCGPGRP and getsid."},
         {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "
