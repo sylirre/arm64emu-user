@@ -56,7 +56,7 @@ segment it cannot lock, caps POSIX timers at 32, mistakes `SO_GET_FILTER` for
 an int option, refuses the subreaper/THP prctls, installs every SCM_RIGHTS
 descriptor into a short control buffer, ignores `MADV_REMOVE`, grows no stack
 from a system call's copy, hands an `F_SETSIG` signal no descriptor, aborts on
-a select past descriptor 1023, and cannot start where `vm.mmap_min_addr` reads
+a select past descriptor 1023, answers ENOTTY for `TCGETS2` on a tty, and cannot start where `vm.mmap_min_addr` reads
 0 (the full list is in tests/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
 test or a fixture alike) and skip there, naming what is missing; they run in
 full on real armv7 silicon.

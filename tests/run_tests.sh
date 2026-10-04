@@ -2759,6 +2759,15 @@ check_fixture rwfault $'stream_read_one=EFAULT left=8192\nstream_read_two=4096 l
 # the guest used to read back the flags it had asked for. Steps aside where no
 # candidate directory has an extent map (tmpfs has none).
 check_fixture fiemapio $'one_run=0 mapped=1 last=1 untouched=1\none_run_badr=53 flags=0x40000000\nstraddle=0 mapped=1 last=1 untouched=1\nstraddle_badr=53 flags=0x40000000\ndone'
+# The termios2 ioctls (TCGETS2/TCSETS2/TCSETSW2/TCSETSF2) over a real pty: the
+# 44-byte struct comes back whole and no further, agrees with TCGETS on the
+# first 36 bytes, each setter carries all of it in (c_ospeed too -- a copy that
+# stopped at 36 reads back rate 0), an unmapped buffer is EFAULT both ways and a
+# pipe is ENOTTY. They were not whitelisted: "unhandled ioctl 0x802c542a" and an
+# ENOTTY on a terminal that is there. Self-checking: qemu-user has no TCGETS2
+# (hence NEEDS-HOST-SYSCALL: tcgets2, for the ARM32 tier); steps aside where the
+# host refuses the ioctl on a pty or has none.
+check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 readback=1\nsetsw2=0 errno=0 readback=1\nsetsf2=0 errno=0 readback=1\nget2_fault=-1 errno=14\nset2_fault=-1 errno=14\npipe=-1 errno=25\ndone'
 # MSG_ZEROCOPY: the socket keeps referencing what it was handed after the call
 # returns, so it is always handed the guest's own pages -- a bounce buffer was
 # freed and reused while the kernel could still transmit from it. One

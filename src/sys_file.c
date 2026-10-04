@@ -2653,11 +2653,16 @@ SYSDEF(fremovexattr) { /* (fd, name) */
  * all four hosts, so a size-tagged bounce is enough. */
 typedef struct { u32 cmd; u16 size; u8 dir; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
 #define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
+#define IOC_TERMIOS2_SZ 44  /* kernel struct termios2: that + c_ispeed + c_ospeed (2 u32) */
 static const IoctlEnt ioctl_tab[] = {
     { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1 },
     { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2 },
     { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2 },
     { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2 },
+    { 0x802c542a /*TCGETS2*/,  IOC_TERMIOS2_SZ, 1 },  /* termios + arbitrary baud rates; glibc's tcgetattr/cfsetspeed */
+    { 0x402c542b /*TCSETS2*/,  IOC_TERMIOS2_SZ, 2 },
+    { 0x402c542c /*TCSETSW2*/, IOC_TERMIOS2_SZ, 2 },
+    { 0x402c542d /*TCSETSF2*/, IOC_TERMIOS2_SZ, 2 },
     { 0x5409 /*TCSBRK*/,     0, 0 },
     { 0x540A /*TCXONC*/,     0, 0 },
     { 0x540B /*TCFLSH*/,     0, 0 },
@@ -2908,7 +2913,7 @@ SYSDEF(ioctl) {
      * 0x54xx tty block) encodes no size at all, so nothing even checks. Copying
      * an unfilled tail back would hand the guest whatever was on the emulator's
      * stack, the same disclosure shape as the SIMD-pair bug. Cold path; the
-     * largest entry is a 36-byte termios. */
+     * largest entry is a 44-byte termios2. */
     memset(buf, 0, e->size);
     if (e->dir & 2)
         if (copy_from_guest(c, buf, a2, e->size) < 0) return (u64)(s64)-EFAULT;

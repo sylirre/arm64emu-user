@@ -736,13 +736,14 @@ reproducible in a few lines that never touch the emulator:
 | a system call's copy into the hole beneath a `MAP_GROWSDOWN` mapping | `EFAULT`: its own page table has no such page | grows the mapping |
 | an `F_SETSIG` real-time signal of an `O_ASYNC` descriptor | lays it out as a sigqueue's: no `si_fd` | `si_band` and `si_fd` |
 | `pselect6` with a bitmap naming a descriptor past 1023 | `FD_ISSET` on its own `fd_set` on the way back: a fortified build aborts | answers for it |
+| `TCGETS2` on a terminal | `ENOTTY`: no entry in its ioctl table | the 44-byte `struct termios2` |
 | starting a program where `vm.mmap_min_addr` reads 0 (a sandbox's bind mount) | "Unable to find a guest_base": it reserves its guest's space from address 0 | starts it |
 
 `tests/c/mremapsem.c`, `tests/fixtures/mremapdup.c` (the guest's own
 `mremap(old_size=0)`, which the emulator serves by duplicating the host
 mapping the same way), `tests/fixtures/dontunmap.c` (whose shared rows are
 served the same way), `tests/c/socktimeo.c`, `tests/ptrace/wait_rusage.c`,
-`timers_many`, `sockfilter_get`, `prctlset`, `scmfit`, `madvremove`, `sigpoll`, `pselectwide` and the
+`timers_many`, `sockfilter_get`, `prctlset`, `scmfit`, `madvremove`, `sigpoll`, `pselectwide`, `termios2` and the
 real-socket tier of `netns_ack` (its bad-tail send) declare what they need with a `NEEDS-HOST-SYSCALL:` marker; `personality`'s
 `mmap_min_addr` 0 row starts a program built the way the emulator is in its
 sandbox first, and skips where even that cannot start; and `odirect`'s

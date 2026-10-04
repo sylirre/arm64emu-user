@@ -547,7 +547,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
 # (docs/jit.md), and qemu-user is an interposer with defects of its own.
-# Fifteen of them stop correct tests dead, each reproducible in a few lines that
+# Sixteen of them stop correct tests dead, each reproducible in a few lines that
 # never touch the emulator:
 #
 #   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
@@ -609,6 +609,11 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   descriptors past FD_SETSIZE, which the kernel answers for;
 #                   qemu-user copies the sets back through FD_ISSET on an
 #                   fd_set of its own, which a fortified build aborts on.
+#   tcgets2         TCGETS2 on a terminal, the termios read that carries the
+#                   line's rates in a 44-byte struct termios2; qemu-user's
+#                   ioctl table has no entry for it and answers ENOTTY for a
+#                   tty that is there. (A policy that refuses the ioctl on a
+#                   pty is a different answer, EACCES, and not asked here.)
 #
 # One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -954,6 +959,24 @@ int main(void) {
     wide[3000 / bits] |= 1UL << (3000 % bits);
     long r = syscall(SYS_pselect6, 3001, wide, (void *)0, (void *)0, (void *)0, (void *)0);
     return !(r == 1 && ((wide[3000 / bits] >> (3000 % bits)) & 1));
+}
+EOF
+        ;;
+    tcgets2) cat <<'EOF'
+#define _XOPEN_SOURCE 600
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+    unsigned char t[64];
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0 || grantpt(m) || unlockpt(m)) return 0;   /* no pty: nothing to ask */
+    char *n = ptsname(m);
+    int s = n ? open(n, O_RDWR | O_NOCTTY) : -1;
+    if (s < 0) return 0;
+    return ioctl(s, 0x802c542aUL, t) < 0 && errno == ENOTTY;
 }
 EOF
         ;;

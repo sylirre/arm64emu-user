@@ -98,6 +98,14 @@ is not the oracle for most, so the expected block is a native run's):
   `ENOTTY` — and a pointer they cannot copy through (null included) is
   `EFAULT`; they used to be answered on any descriptor, and a fault fell into
   the generic table's `ENOTTY`.
+- The termios2 ioctls — `TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2` — are in
+  the `ioctl` table beside `TCGETS`/`TCSETS*`, as the 44-byte `struct termios2`
+  (the 36-byte termios plus `c_ispeed`/`c_ospeed`, the same layout on every
+  host). They were missing — a guest whose libc reads a terminal with them
+  (newer glibc's `tcgetattr`) got `unhandled ioctl 0x802c542a` and an `ENOTTY`
+  for a terminal that was there. The table zeroes the bounce buffer first and
+  copies exactly 44 bytes back, so nothing past the struct is written
+  (`tests/fixtures/termios2.c`).
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert
