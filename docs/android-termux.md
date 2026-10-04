@@ -213,6 +213,18 @@ unfiltered:
   `EACCES`. A guest's `TIOCGPGRP` on a pipe is still forwarded as that
   `EACCES`.
 
+* **`stat` of a device node an app may still name.** `/dev/full` (and
+  `/dev/kmsg`, ...) answers `stat`, `lstat` and `fstat` of an `O_PATH` fd
+  `EACCES`, while `access(F_OK)` and `open(O_PATH)` work — policy denies
+  `getattr`, not the lookup. `mount(2)` only needs the lookup, so the
+  emulator's existence check of a mount operand is an `O_PATH` open
+  (`pin_isdir`, `sys_file.c`) and not a `stat`; with a `stat` there,
+  `bwrap --dev /dev` died on the first node it binds (`Can't bind mount
+  /dev/full on full: Permission denied`), Ubuntu's bubblewrap 0.9 included.
+  The node is then bound into the sandbox's `/dev`, and an `ls -l` of it
+  there is refused for the same reason it is outside — the policy's, not the
+  emulator's.
+
 * **Changing the mode of a memfd** is denied too, by the same policy: an app
   has no `setattr` on one, so `fchmod(memfd, ...)` is EACCES whether it is
   reached by descriptor or through `/proc/self/fd/N` (an ordinary file in the

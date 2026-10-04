@@ -976,7 +976,47 @@ as `fchdir` does. The bind then records that *host path* as its source, never
 the link's spelling, which means another object once the descriptor is closed
 or reused. An unlinked target is `ENOENT`, an anonymous one (`pipe:[N]`) is
 left to fail as it always did, and `UMOUNT_NOFOLLOW` names the link itself.
-`tests/fixtures/sandbox_probe.c` pins it (`pivot_fd`, `fdlink`).
+Whether an operand exists (and is a directory, where it must be) is asked with
+an `O_PATH` open, `O_DIRECTORY` for the directory test, and not a `stat`: a
+kernel's mount lookup does no getattr, and Android's policy denies one on
+nodes an app can still name (`/dev/full`). `tests/fixtures/sandbox_probe.c`
+pins it (`pivot_fd`, `fdlink`).
+
+**The name a descriptor was opened under.** A descriptor is a host object and
+the host knows it by one path; the guest reached it by a guest path, and with
+mounts the two stop mapping back one-to-one. `--bind / /` binds the old root
+onto the new one, so one host directory is both `/oldroot` and `/newroot`, and
+a node in the `/dev` or `/proc` zone — host `/dev/null` — is also
+`/oldroot/dev/null` and `/newroot/dev/null`. The reverse map can only pick the
+topmost mount: the wrong one for a descriptor opened through `/oldroot`, and
+for a zone node none that names the mount at all. bubblewrap 0.10+ cannot live
+with that. It opens every source and destination through an `O_PATH` fd, reads
+`/proc/self/fd/N` back and dies (`Can't open source /dev/null: Not a
+directory`) unless the answer starts with `/oldroot/` or `/newroot/` — its
+fallback for a kernel without `openat2`, which is what a guest is told — and
+then resolves further names against those fds.
+
+A kernel's descriptor carries its mount; ours cannot, so `openat` remembers the
+canonical guest path it opened (`fdname_note`, `path.c`), by number, in a
+256-slot table of per-slot seqlocks. `dup`, `dup3`, `F_DUPFD` and `close` keep it
+through `fd_track_dup` / `fd_track_close` like the other classes tracked by
+number. It is a hint and not an authority: `fdname_get` hands it out only while
+the mount table, as it is now, still maps that name to the very host path the
+descriptor has (its `/proc/self/fd` link) — which also retires it, with no
+bookkeeping of its own, for a number that was closed and reused, a directory
+renamed or a mount since removed. Nothing is remembered while no mount exists
+(the usual case; the reverse map is exact then), and a number past the table
+has none. It answers the questions about what a descriptor is *called*: the
+base an `*at` call resolves a relative path against (`dirfd_guest_path`), what
+`readlink("/proc/self/fd/N")` returns, and a descriptor given as a mount
+operand (`path_fd_link_target`). `fchdir` is the one reader that skips it
+(`dirfd_mount_path`): a root fd kept across `pivot_root(".", ".")` must name the
+mount *now* covering its directory — the old root, stacked on the new one and
+about to be detached — which is what makes the cwd it sets the right thing for
+`umount2(".")`. With this, `bwrap --unshare-all --bind / / --proc /proc --dev
+/dev CMD` runs with Alpine's bubblewrap 0.12 as it does with 0.9, and so do
+`--tmpfs`, `--ro-bind` and a further `--bind` after a whole-root one.
+`tests/fixtures/sandbox_probe.c` pins it (`fdname_*`).
 
 The bind table is **process-shared** — a `MAP_SHARED` region created before the
 first fork (`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by
@@ -993,7 +1033,8 @@ what makes `pivot_root`'s idiom below work. The model has no real mounts, so two
 bind mountpoint is not protected from `rmdir`, and reverse mapping (`getcwd`,
 `/proc/self/fd/N`) of a source that shares a host inode with another path prefers
 the bind view — an inherent limit of prefix-based reverse mapping, already true
-of CLI binds.
+of CLI binds, and softened for descriptors by *the name a descriptor was opened
+under* (below).
 
 **`chroot(2)`** (`sys_chroot`) re-roots the guest into a subtree. It stores the
 resolved, canonical, namespace-absolute target in `m->chroot_base`, and

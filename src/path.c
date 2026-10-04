@@ -87,11 +87,140 @@ int host_fd_guest_path(struct Machine *m, const char *hostpath, char *out,
     return 0;
 }
 
-/* Canonical guest path of an open guest dirfd (guest fd == host fd): read the
- * host /proc/self/fd link, then map it via host_fd_guest_path. Exported for
- * getdents64 (sys_file.c), which uses it to know which guest directory a
+/* ---- the name an open descriptor was opened under -----------------------
+ *
+ * A descriptor is a host object, and the host knows it by ONE path. The guest
+ * reached it by a guest path, and the two stop mapping back one-to-one as soon
+ * as there are mounts: a directory that is both /oldroot and /newroot
+ * (bubblewrap's `--bind / /` binds the old root onto the new one), or a node
+ * in the /dev or /proc zone, whose host path /dev/null is also
+ * /oldroot/dev/null and /newroot/dev/null. host_fd_guest_path has to pick, and
+ * picks the topmost mount -- the wrong one for a descriptor opened through
+ * /oldroot, and for a zone node none that names the mount at all. A kernel's
+ * descriptor carries its mount; ours cannot, so the name it was opened under
+ * is remembered here, by number, like the other classes tracked by number
+ * (sys.h, fd_track_dup / fd_track_close). bubblewrap >= 0.10 needs it: it opens
+ * every source and destination through an O_PATH fd, reads
+ * /proc/self/fd/N back and refuses anything that does not start with
+ * /oldroot/ or /newroot/ (its fallback for a kernel without openat2, which is
+ * what a guest is told), and builds each mount from those spellings.
+ *
+ * It is a HINT, never an authority. It is used only when the mount table, as
+ * it is NOW, still maps the remembered name to the very host path the
+ * descriptor has -- which also drops it, with no bookkeeping of its own, for a
+ * number that was closed and reused, a directory renamed, a mount since
+ * removed. Nothing is remembered while no mount exists (the usual case: the
+ * reverse map is exact then), and a number past the table has none.
+ *
+ * Lock-free, one writer per number at a time (a number is written by whoever
+ * just opened, duplicated or closed it, and close drops the name BEFORE the
+ * host closes the number, so a racing open that gets it back writes after);
+ * each slot is a seqlock, odd while a writer is inside. A fork child that
+ * inherits a slot mid-write finds it odd forever and simply has no name for
+ * that number; the next writer sets the odd bit itself and recovers it. */
+#define FDNAME_N 256
+static struct FdName {
+    unsigned seq;
+    char canon[PATH_MAX];       /* "" = none */
+} g_fdname[FDNAME_N];
+static int g_fdname_any;         /* some slot was ever written */
+
+static void fdname_set(int fd, const char *canon) {   /* NULL clears */
+    struct FdName *e = &g_fdname[fd];
+    unsigned s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED) | 1;
+    __atomic_store_n(&e->seq, s, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    if (canon) strcpy(e->canon, canon); else e->canon[0] = 0;
+    __atomic_store_n(&e->seq, s + 1, __ATOMIC_RELEASE);
+}
+
+/* One consistent read of a slot into `out` (>= PATH_MAX); 1 if it holds a name. */
+static int fdname_read(int fd, char *out) {
+    const struct FdName *e = &g_fdname[fd];
+    for (int tries = 0; tries < 64; tries++) {
+        unsigned s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+        if (s1 & 1) continue;                          /* a writer is inside */
+        size_t n = strnlen(e->canon, PATH_MAX - 1);
+        memcpy(out, e->canon, n);
+        out[n] = 0;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1) continue;
+        return n > 0;
+    }
+    return 0;
+}
+
+/* `fd` was just opened as guest path `canon` (namespace-absolute); NULL, or no
+ * mount to be ambiguous about, forgets whatever the number had. */
+void fdname_note(int fd, const char *canon) {
+    if (fd < 0 || fd >= FDNAME_N) return;
+    if (!canon || !canon[0] || strlen(canon) >= PATH_MAX || bind_count() == 0) {
+        fdname_drop(fd);
+        return;
+    }
+    g_fdname_any = 1;
+    fdname_set(fd, canon);
+}
+
+void fdname_drop(int fd) {
+    if (!g_fdname_any || fd < 0 || fd >= FDNAME_N) return;
+    const struct FdName *e = &g_fdname[fd];
+    if (!e->canon[0] && !(__atomic_load_n(&e->seq, __ATOMIC_RELAXED) & 1))
+        return;                                        /* nothing to forget */
+    fdname_set(fd, NULL);
+}
+
+/* newfd is a second name for oldfd's description (dup, F_DUPFD, dup3): it was
+ * opened under the same path. */
+void fdname_dup(int oldfd, int newfd) {
+    if (!g_fdname_any || newfd < 0 || newfd >= FDNAME_N) return;
+    char name[PATH_MAX];
+    if (oldfd >= 0 && oldfd < FDNAME_N && fdname_read(oldfd, name))
+        fdname_set(newfd, name);
+    else
+        fdname_drop(newfd);
+}
+
+static int canon_to_host(struct Machine *m, const char *canon, char *host_out,
+                         size_t *rootlen, int *plain);
+
+/* The remembered name for `fd`, when it still holds: `host_target` is the
+ * descriptor's own host path (its /proc/self/fd link), and the name stands only
+ * if the mount table maps it to exactly that. 1 and `canon_out` (>= PATH_MAX),
+ * or 0 and the caller falls back to the reverse map. */
+int fdname_get(struct Machine *m, int fd, const char *host_target, char *canon_out) {
+    if (!g_fdname_any || fd < 0 || fd >= FDNAME_N) return 0;
+    char name[PATH_MAX], host[PATH_MAX];
+    if (!fdname_read(fd, name)) return 0;
+    if (canon_to_host(m, name, host, NULL, NULL) != 0 || strcmp(host, host_target))
+        return 0;
+    strcpy(canon_out, name);
+    return 1;
+}
+
+/* Canonical guest path of an open guest dirfd (guest fd == host fd): the name
+ * it was opened under when that is remembered and still true (fdname_get), else
+ * the host /proc/self/fd link mapped via host_fd_guest_path. What an *at call
+ * resolves a relative path against, and what /proc/self/fd/N reads back as.
+ * getdents64 (sys_file.c) maps the link itself, to know which guest directory a
  * listing fd names so it can splice in virtual bind mount points. */
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out) {
+    char link[64], buf[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
+    ssize_t n = readlink(link, buf, sizeof buf - 1);
+    if (n < 0) return -EBADF;
+    buf[n] = 0;
+    if (fdname_get(m, dirfd, buf, out)) return 0;
+    return host_fd_guest_path(m, buf, out, NULL);
+}
+
+/* The same, for a descriptor that has to name the mount NOW covering its
+ * directory rather than the one it was opened through: fchdir's. A root fd
+ * kept across pivot_root(".", ".") is the old root, stacked on the new one and
+ * about to be detached with umount2("."), and the reverse map's topmost-wins
+ * is what makes the cwd it sets name the stacked mount; the name the fd was
+ * opened under ("/") would name the sandbox's own tmpfs instead. */
+int dirfd_mount_path(struct Machine *m, int dirfd, char *out) {
     char link[64], buf[PATH_MAX];
     snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
     ssize_t n = readlink(link, buf, sizeof buf - 1);
@@ -398,8 +527,9 @@ int proc_fd_link_path(const char *host) {
  * a link to a path (anything else, or an anonymous target such as pipe:[N],
  * which the caller refuses as it always did), 1 when it was: `canon_out`
  * (PATH_MAX) then holds the target's namespace-absolute guest path -- the same
- * bind-reverse / rootfs-strip an fd's cwd or fchdir goes through -- and
- * `host_out` (PATH_MAX, optional) its host path. -ENOENT when the object has
+ * name the descriptor was opened under (fdname_get) when it is remembered, else
+ * the bind-reverse / rootfs-strip an fd's cwd goes through -- and `host_out`
+ * (PATH_MAX, optional) its host path. -ENOENT when the object has
  * been unlinked, the kernel's answer for a mount on a removed directory. */
 int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
                         char *host_out) {
@@ -411,6 +541,11 @@ int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
     static const char gone[] = " (deleted)";
     if ((size_t)n > sizeof gone - 1 && !strcmp(tgt + n - (sizeof gone - 1), gone))
         return -ENOENT;
+    int own = proc_own_fd_path(host);
+    if (own >= 0 && fdname_get(m, own, tgt, canon_out)) {   /* opened as this path */
+        if (host_out) strcpy(host_out, tgt);
+        return 1;
+    }
     int r = host_fd_guest_path(m, tgt, canon_out, NULL);
     if (r < 0) return r;
     if (host_out) strcpy(host_out, tgt);

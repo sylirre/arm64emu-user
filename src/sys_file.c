@@ -2180,6 +2180,11 @@ SYSDEF(openat) {
     if (fd >= 0 && !fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
     if (fd >= 0) {
         mfd_track_close(fd);   /* fresh number: drop any stale class */
+        /* ...and remember the guest path it was opened under, which the host
+         * path cannot tell once there are mounts (path.c). Not for a reopen of
+         * an fd link: that spelling names no place, and the object under it is
+         * whatever the link pointed at. */
+        fdname_note(fd, snap_tiered || proc_fd_link_path(host) ? NULL : canon);
         /* A path re-open of a tier memfd (through a /proc fd link -- this
          * process's own, or another's /proc/<pid>/fd/N) hands back a new fd
          * to the sealed inode; the host would let write(2) through where a
@@ -2223,6 +2228,7 @@ int fd_track_dup(struct Machine *m, int oldfd, int newfd) {
         return r;
     }
     mfd_track_dup(oldfd, newfd);
+    fdname_dup(oldfd, newfd);   /* opened under the same path (path.c) */
     return 0;
 }
 
@@ -2231,6 +2237,7 @@ void fd_track_close(struct Machine *m, int fd) {
     procfs_unmark_fd(m, fd);
     sigfd_unmark_fd(m, fd);
     mfd_track_close(fd);
+    fdname_drop(fd);
 }
 
 SYSDEF(close) {
@@ -2770,7 +2777,17 @@ SYSDEF(readlinkat) {
             buf[rn] = 0;
             if (mfd_link_rewrite(c, host, buf))   /* tier memfd: no host leak */
                 rn = (ssize_t)strlen(buf);
-            path_strip_rootfs(c->m, buf);
+            /* One of our own descriptors reads back as the path it was opened
+             * under, when that is remembered and still true: a node on the
+             * /dev or /proc zone, or a directory that is both /oldroot and
+             * /newroot, has one host path and the reverse map cannot say
+             * which (path.c, fdname_get). */
+            char opened[PATH_MAX];
+            int own = proc_own_fd_path(host);
+            if (own >= 0 && fdname_get(c->m, own, buf, opened))
+                strcpy(buf, opened);
+            else
+                path_strip_rootfs(c->m, buf);
             rn = (ssize_t)strlen(buf);
         }
 #ifdef L2S_ENABLED
@@ -4062,7 +4079,10 @@ SYSDEF(fchdir) {
      * through a mount -- an emulated tmpfs, or the root a pivot_root moved --
      * has a host path outside the rootfs entirely, and used to land the guest
      * on "/". bubblewrap fchdir()s a root fd it kept across its pivot_root, so
-     * it noticed immediately. */
+     * it noticed immediately. That fd must name the mount NOW covering the
+     * directory (the old root, stacked on the new one), not the path it was
+     * opened under, so this is the one reader that skips the remembered name
+     * (dirfd_mount_path). */
     task_lock();   /* the move and the published copy, one step (chdir) */
     if (fchdir((int)(s32)a0) < 0) {
         u64 e = host_err();
@@ -4070,7 +4090,7 @@ SYSDEF(fchdir) {
         return e;
     }
     char guest[PATH_MAX];
-    if (dirfd_guest_path(c->m, (int)(s32)a0, guest) == 0)
+    if (dirfd_mount_path(c->m, (int)(s32)a0, guest) == 0)
         cwd_publish_locked(c->m, guest);   /* keep /proc/<pid>/cwd live */
     cwd_current_locked(c->m, guest, NULL);   /* ...and the kernel's word on it */
     task_unlock();
@@ -4132,10 +4152,21 @@ SYSDEF(chroot) {
  * walk resolved, not about whatever the name means by the time the host looks.
  * 0, or -errno. */
 static int pin_isdir(PathPin *p, int want_dir) {
-    struct stat st;
-    int r = fstatat(p->dfd, p->name, &st, p->pinned ? AT_SYMLINK_NOFOLLOW : 0);
-    if (r < 0) return -errno;
-    return (want_dir && !S_ISDIR(st.st_mode)) ? -ENOTDIR : 0;
+    /* An O_PATH open is the lookup and nothing more, which is all a mount
+     * operand gets from a kernel: no getattr. A stat is more than that, and an
+     * Android app is refused it on nodes it can still name -- /dev/full answers
+     * stat EACCES, access and O_PATH fine -- which is what bubblewrap --dev
+     * binds. O_DIRECTORY makes the same open the directory test (ENOTDIR for
+     * anything else, a final symlink the pin did not follow included). The
+     * descriptor is ours for an instant, hence the window (machine.h). */
+    fdwin_enter();
+    int fd = openat(p->dfd, p->name,
+                    O_PATH | O_CLOEXEC | (p->pinned ? O_NOFOLLOW : 0) |
+                    (want_dir ? O_DIRECTORY : 0));
+    int e = errno;
+    if (fd >= 0) close(fd);
+    fdwin_leave();
+    return fd < 0 ? -e : 0;
 }
 
 /* mount(2)'s user-memory arguments, imported the way sys_mount imports them

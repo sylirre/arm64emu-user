@@ -2,7 +2,8 @@
  * mounts, a faked user namespace's id maps, a private mount namespace, and
  * pivot_root -- including the stack-then-detach idiom bubblewrap uses to
  * uncover its new root, in the /proc/self/fd/N spelling its 0.10+ builds
- * every mount from as well, and the EEXIST-before-EROFS order of a create on
+ * every mount from as well, a descriptor reading back as the path it was opened
+ * under, and the EEXIST-before-EROFS order of a create on
  * a read-only mount that its mount-point mkdir()s rest on. Self-checking: qemu-user hands all of these to the real
  * kernel, which refuses them without privilege, so it cannot be the oracle.
  * Runs under --fake-id against the writable alpine rootfs and prints a fixed
@@ -45,6 +46,16 @@ static const char *slurp(const char *p, char *buf, size_t n) {
     if (r < 0) r = 0;
     buf[r] = 0;
     while (r > 0 && buf[r - 1] == '\n') buf[--r] = 0;
+    return buf;
+}
+
+/* Where /proc/self/fd/N points, as the guest reads it. */
+static const char *fdlink(int fd, char *buf, size_t n) {
+    char l[64];
+    snprintf(l, sizeof l, "/proc/self/fd/%d", fd);
+    ssize_t r = readlink(l, buf, n - 1);
+    if (r < 0) return "-";
+    buf[r] = 0;
     return buf;
 }
 
@@ -314,6 +325,61 @@ int main(void) {
     st = 0;
     waitpid(kid, &st, 0);
     printf("fdlink=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+
+    /* ---- a descriptor reads back as the path it was opened under. After
+     * bubblewrap's `--bind / /` the old root is bound onto the new one, so the
+     * same host directory is both /oldroot and /newroot, and a node in the
+     * /dev zone is also /oldroot/dev/null: the host knows each by ONE path and
+     * the reverse map can only pick the topmost mount. bubblewrap >= 0.10
+     * opens every source and destination through an O_PATH fd, reads
+     * /proc/self/fd/N back and refuses what does not start with /oldroot/ or
+     * /newroot/, then resolves further names against those fds. A name that
+     * reaches the overlay on /newroot through the /oldroot fd is the same
+     * mistake in another form (rel). The tokens are the readbacks themselves. */
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        char s[64], d[64], b1[128], b2[128];
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        if (mkdir("/fn", 0755) != 0 && errno != EEXIST) _exit(3);
+        if (mount("tmpfs", "/fn", "tmpfs", 0, NULL) != 0) _exit(4);
+        if (mkdir("/fn/newroot", 0755) != 0) _exit(5);
+        if (mkdir("/fn/oldroot", 0755) != 0) _exit(6);
+        if (mkdir("/fn/proc", 0755) != 0) _exit(7);
+        if (pivot_root("/fn", "/fn/oldroot") != 0) _exit(8);
+        if (chdir("/") != 0) _exit(9);
+        if (mount("/oldroot/proc", "/proc", NULL, MS_BIND | MS_REC, NULL) != 0) _exit(10);
+        int oldfd = open("/oldroot", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        int newfd = open("/newroot", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (oldfd < 0 || newfd < 0) _exit(11);
+        snprintf(s, sizeof s, "/proc/self/fd/%d", oldfd);
+        snprintf(d, sizeof d, "/proc/self/fd/%d", newfd);
+        if (mount(s, d, NULL, MS_BIND | MS_REC, NULL) != 0) _exit(12);
+        /* The overlay: /newroot/tmp is empty, /oldroot/tmp still holds this
+         * very binary. */
+        if (mount("tmpfs", "/newroot/tmp", "tmpfs", 0, NULL) != 0) _exit(13);
+        printf("fdname_old=%s\n", fdlink(oldfd, b1, sizeof b1));
+        printf("fdname_new=%s\n", fdlink(newfd, b1, sizeof b1));
+        int zfd = openat(oldfd, "dev/null", O_PATH);
+        printf("fdname_zone=%s\n", zfd < 0 ? "-" : fdlink(zfd, b1, sizeof b1));
+        printf("fdname_rel=%d,%d\n",
+               faccessat(oldfd, "tmp/sandbox_probe.bin", F_OK, 0) == 0,
+               access("/newroot/tmp/sandbox_probe.bin", F_OK) == 0);
+        int dfd = dup(oldfd);
+        printf("fdname_dup=%s\n", fdlink(dfd, b1, sizeof b1));
+        /* The number is reused for something else: no stale name. */
+        close(dfd);
+        int rfd = open("/newroot/etc", O_PATH | O_DIRECTORY);
+        printf("fdname_reuse=%s %s\n", fdlink(rfd, b1, sizeof b1),
+               fdlink(oldfd, b2, sizeof b2));
+        /* A mount point is named by the fd it was made from. */
+        int tfd = openat(newfd, "tmp", O_PATH | O_DIRECTORY);
+        printf("fdname_mnt=%s\n", fdlink(tfd, b1, sizeof b1));
+        fflush(stdout);
+        _exit(0);
+    }
+    st = 0;
+    waitpid(kid, &st, 0);
 
     /* ---- creating on a read-only mount: the kernel looks the name up before
      * it gives up on the mount, so a name that is there is EEXIST and only a

@@ -1324,6 +1324,20 @@ void path_strip_rootfs(const struct Machine *m, char *path);
  * bind-reverse / rootfs-strip). Writes to `out` (>= PATH_MAX) and returns 0, or
  * a negative errno. Used by getdents64 to identify the directory being listed. */
 int dirfd_guest_path(struct Machine *m, int dirfd, char *out);
+/* The same for a descriptor that must name the mount now covering its
+ * directory, not the one it was opened through (fchdir -- path.c). */
+int dirfd_mount_path(struct Machine *m, int dirfd, char *out);
+/* The guest path a descriptor was opened under, remembered by number for the
+ * cases the host path cannot tell (path.c, "the name an open descriptor was
+ * opened under"). note: just opened as `canon` (NULL forgets); dup: newfd is
+ * a second name for oldfd; drop: the number is closed or replaced; get: the
+ * remembered name when the mount table still maps it to `host_target`, the
+ * descriptor's own host path -- 1 and canon_out (>= PATH_MAX), else 0. The
+ * first three are fd_track_dup / fd_track_close's business (sys_file.c). */
+void fdname_note(int fd, const char *canon);
+void fdname_dup(int oldfd, int newfd);
+void fdname_drop(int fd);
+int  fdname_get(struct Machine *m, int fd, const char *host_target, char *canon_out);
 /* The guest's cwd as the kernel has it -- the host cwd, mapped to the guest
  * view -- refreshing m->cwd; *deleted says the directory has been unlinked
  * (path.c, "the working directory is the host's"). The _locked form is for a

@@ -377,7 +377,11 @@ int a64_mfdfile(int cloexec);
  * not grow to hold the name -- in which case the caller must not hand newfd
  * to the guest, since it would be one of the untracked names above.
  * fd_track_close: fd no longer names what it did (close, dup3's replacement,
- * execve's close-on-exec walk). */
+ * execve's close-on-exec walk).
+ *
+ * Both also carry the guest path a descriptor was opened under (path.c,
+ * fdname_*): not a class of fd -- it changes what a descriptor is CALLED,
+ * never what it does -- but it is keyed by number and goes the same routes. */
 int  fd_track_dup(struct Machine *m, int oldfd, int newfd);
 void fd_track_close(struct Machine *m, int fd);
 
