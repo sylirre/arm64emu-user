@@ -1257,6 +1257,12 @@ const char *proc_other_tail(const char *canon, s32 *pid);
  * denies the path re-open (Android refuses it for memfds). */
 int proc_own_fd_path(const char *host);
 int proc_fd_link_path(const char *host);   /* any process's /proc/.../fd/N */
+/* A mount-family operand that is a /proc fd link: the object the descriptor
+ * holds, as a namespace-absolute guest path (canon_out) and a host path
+ * (host_out, optional); both >= PATH_MAX. 0: not such a link, 1: followed,
+ * -errno: the object is gone. See path.c. */
+int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
+                        char *host_out);
 /* Test knob (A64_OWNFD_FORCE_DENY): behave as a host that refuses the path
  * spelling of one of our own fds, the way Android's policy does for a memfd. */
 int proc_own_fd_denied(const char *host);

@@ -775,6 +775,15 @@ guest could still *obtain* a writable descriptor, or a writable alias, under a
   the open: the host is never handed `O_CREAT` under a `:ro` bind, so a name
   that has gone missing answers `ENOENT`, reported as the `EROFS` of the
   create.
+- **A create on a name that exists** (`mkdir`, `mknod`, `symlink`, and the new
+  name of a `link`) is `EEXIST`, not `EROFS`: `filename_create` looks the name
+  up before it gives up on the mount ("don't fail immediately if it's r/o, at
+  least try to report other errors"), and only a free name is refused for the
+  mount. Callers lean on it — bubblewrap `mkdir()`s every mount point and
+  tolerates `EEXIST`, so `bwrap --ro-bind / / --tmpfs /tmp` died of an `EROFS`
+  on a `/tmp` that was there. `ro_create_err` (`sys_file.c`) is the one place
+  that asks; `rename` and `unlink` stay `EROFS` first, as in the kernel
+  (`mnt_want_write` precedes their lookup).
 - **Locks.** A `--bind` is the *invoker's* mount, and the guest — fake-root at
   most — used to be able to `mount -o remount,rw` or `umount` it. The kernel
   locks a mount inherited from a more privileged namespace: `MNT_LOCKED`
@@ -840,6 +849,25 @@ could not read, and nothing read them for any other flavor
 (`tests/fixtures/mountargs.c`). `MS_BIND` with no source, or an empty one, is
 `EINVAL` (`do_loopback`); a new filesystem with no type is `EINVAL`
 (`do_new_mount`) and one on a file is `ENOTDIR` (`graft_tree`).
+
+**Operands that are descriptor links.** bubblewrap 0.10+ builds every mount from
+`O_PATH` descriptors — `mount("/proc/self/fd/S", "/proc/self/fd/T", MS_BIND)` —
+and the kernel's walk follows each magic link to the object the descriptor
+holds. The resolver cannot do that for the callers that need a *name*: it
+leaves a final component in the passthrough `/proc` zone alone so that the
+host reopens the fd (`O_TMPFILE` publishing, anonymous targets), which makes
+the canonical path the literal spelling — a bind at
+`/tmp/proc/self/fd/4` that nothing would ever look up, and a sandbox whose
+root stayed empty (`bwrap: execvp /bin/true: No such file or directory`). The
+mount family therefore resolves its operands through `mnt_operand`
+(`sys_file.c`: `mount`'s source and target, `umount2`, `chroot`, `pivot_root`'s
+pair), which follows such a link with `path_fd_link_target` (`path.c`): the
+descriptor's host target mapped back through the bind table and rootfs prefix,
+as `fchdir` does. The bind then records that *host path* as its source, never
+the link's spelling, which means another object once the descriptor is closed
+or reused. An unlinked target is `ENOENT`, an anonymous one (`pipe:[N]`) is
+left to fail as it always did, and `UMOUNT_NOFOLLOW` names the link itself.
+`tests/fixtures/sandbox_probe.c` pins it (`pivot_fd`, `fdlink`).
 
 The bind table is **process-shared** — a `MAP_SHARED` region created before the
 first fork (`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by

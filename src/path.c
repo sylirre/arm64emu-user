@@ -380,6 +380,43 @@ int proc_fd_link_path(const char *host) {
     return p && p[4] >= '0' && p[4] <= '9';
 }
 
+/* Follow a /proc fd link the way the kernel's path walk does when the link is
+ * the last thing a mount-family call names. nd_jump_link puts the walk on the
+ * very object the descriptor holds, so mount("/proc/self/fd/5",
+ * "/proc/self/fd/4", MS_BIND) is "bind what fd 5 is at what fd 4 is" -- the
+ * spelling bubblewrap >= 0.10 builds every one of its mounts from, to keep a
+ * rename from steering them.
+ *
+ * The resolver cannot do this for its callers: it leaves a final component in
+ * the passthrough /proc zone alone so that the HOST reopens the fd (O_TMPFILE
+ * publishing, anonymous targets), which is right for open() and wrong for
+ * anything that needs the NAME of the thing -- its canon is the literal
+ * "/tmp/proc/self/fd/4", a mount point nobody will ever look up, and the bind
+ * it made was never the one the guest asked for.
+ *
+ * `host` is the resolver's host path for the operand. Returns 0 when it is not
+ * a link to a path (anything else, or an anonymous target such as pipe:[N],
+ * which the caller refuses as it always did), 1 when it was: `canon_out`
+ * (PATH_MAX) then holds the target's namespace-absolute guest path -- the same
+ * bind-reverse / rootfs-strip an fd's cwd or fchdir goes through -- and
+ * `host_out` (PATH_MAX, optional) its host path. -ENOENT when the object has
+ * been unlinked, the kernel's answer for a mount on a removed directory. */
+int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
+                        char *host_out) {
+    if (!proc_fd_link_path(host)) return 0;
+    char tgt[PATH_MAX];
+    ssize_t n = readlink(host, tgt, sizeof tgt - 1);
+    if (n <= 0 || tgt[0] != '/') return 0;
+    tgt[n] = 0;
+    static const char gone[] = " (deleted)";
+    if ((size_t)n > sizeof gone - 1 && !strcmp(tgt + n - (sizeof gone - 1), gone))
+        return -ENOENT;
+    int r = host_fd_guest_path(m, tgt, canon_out, NULL);
+    if (r < 0) return r;
+    if (host_out) strcpy(host_out, tgt);
+    return 1;
+}
+
 /* Test knob for the tier above. Every caller that can serve a request from the
  * descriptor tries the path first, and on an ordinary Linux host the path form
  * always works -- so those fallbacks have coverage on a device and nowhere

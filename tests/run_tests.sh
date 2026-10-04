@@ -1489,19 +1489,21 @@ fi
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom
-# included). Self-checking: qemu hands all of these to the real kernel, which
-# refuses them unprivileged, so it cannot be the oracle. The umap_* block is
-# nonetheless exactly what a real kernel prints -- it runs before the process
-# has unshared anything, where an unprivileged parent may map its own euid into
-# a child's namespace for real. Gated on --fake-id, like the mount and chroot
-# emulation itself. ----
+# included, in both its path and its /proc/self/fd/N spelling; the mount-family
+# operands that follow an fd link; and the EEXIST-before-EROFS order of a create
+# on a read-only mount). Self-checking: qemu hands all of these to the real
+# kernel, which refuses them unprivileged, so it cannot be the oracle. The
+# umap_* block is nonetheless exactly what a real kernel prints -- it runs
+# before the process has unshared anything, where an unprivileged parent may
+# map its own euid into a child's namespace for real. Gated on --fake-id, like
+# the mount and chroot emulation itself. ----
 if [ -n "$AGCC" ] && [ -x "$ALPINE/bin/busybox" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/sandbox_probe.bin \
             tests/fixtures/sandbox_probe.c 2>/dev/null &&
        cp tests/fixtures/sandbox_probe.bin "$ALPINE/tmp/sandbox_probe.bin"; then
         rm -rf "$ALPINE/sbx" "$ALPINE/sbx2" "$ALPINE/pr"
         got=$("$EMU" --fake-id "$ALPINE" /tmp/sandbox_probe.bin 2>/dev/null)
-        expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\numap_sg=4\numap_empty=[]\numap_gid=8\numap_sg_late=1\numap_uid=8\numap_junk=1\numap_back=         0       1000          1\numap_child_uid=         0       1000          1\numap_child_gid=         0       1000          1\numap_child_sg=deny\numap_child_twice=1\numap_inherit=         0       1000          1\numap_status=0\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\nouter_root=1'
+        expect=$'tmpfs=0\nempty=0\ninner=sandbox\numount=0\nrestored=outer gone=1\numap_sg=4\numap_empty=[]\numap_gid=8\numap_sg_late=1\numap_uid=8\numap_junk=1\numap_back=         0       1000          1\numap_child_uid=         0       1000          1\numap_child_gid=         0       1000          1\numap_child_sg=deny\numap_child_twice=1\numap_inherit=         0       1000          1\numap_status=0\nunshare_user=0\nsetgroups=1 deny\nuid_map=1\nreadback=         0       1000          1\ntwice=1\nbadmap=1\nns_child=0 leaked=0\npivot=0\npivot_fd=0\nfdlink=31\nro_mkdir=17,30\nro_mknod=17,30\nro_symlink=17,30\nro_link=17,30\nouter_root=1'
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS sandbox: mount/userns/pivot_root"
         else
             fail=$((fail+1)); echo "FAIL sandbox: mount/userns/pivot_root"

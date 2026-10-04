@@ -1,7 +1,9 @@
 /* The syscall surface a sandbox helper (bubblewrap, flatpak) needs: tmpfs
  * mounts, a faked user namespace's id maps, a private mount namespace, and
  * pivot_root -- including the stack-then-detach idiom bubblewrap uses to
- * uncover its new root. Self-checking: qemu-user hands all of these to the real
+ * uncover its new root, in the /proc/self/fd/N spelling its 0.10+ builds
+ * every mount from as well, and the EEXIST-before-EROFS order of a create on
+ * a read-only mount that its mount-point mkdir()s rest on. Self-checking: qemu-user hands all of these to the real
  * kernel, which refuses them without privilege, so it cannot be the oracle.
  * Runs under --fake-id against the writable alpine rootfs and prints a fixed
  * token block the harness diffs.
@@ -231,6 +233,116 @@ int main(void) {
     st = 0;
     waitpid(kid, &st, 0);
     printf("pivot=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+
+    /* ---- the same idiom spelled with descriptors, the way bubblewrap >= 0.10
+     * builds every mount: O_PATH fds for both ends, then
+     * mount("/proc/self/fd/S", "/proc/self/fd/T", MS_BIND). The kernel's walk
+     * follows each magic link to the object the descriptor holds; taking the
+     * literal spelling as the mount point bound the old root at a path nobody
+     * would ever look up, and the sandbox came up empty (execvp: ENOENT). A
+     * /proc is bound in first, as bubblewrap does, because the spelling needs
+     * one inside the new root. ---- */
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        char s[64], d[64];
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        if (mkdir("/pf", 0755) != 0 && errno != EEXIST) _exit(3);
+        if (mount("tmpfs", "/pf", "tmpfs", 0, NULL) != 0) _exit(4);
+        if (mkdir("/pf/newroot", 0755) != 0) _exit(5);
+        if (mkdir("/pf/oldroot", 0755) != 0) _exit(6);
+        if (mkdir("/pf/proc", 0755) != 0) _exit(7);
+        if (pivot_root("/pf", "/pf/oldroot") != 0) _exit(8);
+        if (chdir("/") != 0) _exit(9);
+        if (mount("/oldroot/proc", "/proc", NULL, MS_BIND | MS_REC, NULL) != 0) _exit(10);
+        int src = open("/oldroot", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        int dst = open("/newroot", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (src < 0 || dst < 0) _exit(11);
+        snprintf(s, sizeof s, "/proc/self/fd/%d", src);
+        snprintf(d, sizeof d, "/proc/self/fd/%d", dst);
+        if (mount(s, d, NULL, MS_BIND | MS_REC, NULL) != 0) _exit(12);
+        close(src); close(dst);
+        if (access("/newroot/bin/busybox", F_OK) != 0) _exit(13);   /* mounted where the fd is */
+        if (umount2("/oldroot", MNT_DETACH) != 0) _exit(14);
+        int oldrootfd = open("/", O_RDONLY | O_DIRECTORY);
+        if (oldrootfd < 0) _exit(15);
+        if (chdir("/newroot") != 0) _exit(16);
+        if (pivot_root(".", ".") != 0) _exit(17);
+        if (fchdir(oldrootfd) != 0) _exit(18);
+        if (umount2(".", MNT_DETACH) != 0) _exit(19);
+        close(oldrootfd);
+        if (chdir("/") != 0) _exit(20);
+        if (access("/bin/busybox", F_OK) != 0) _exit(21);   /* the sandbox is the root */
+        if (access("/newroot", F_OK) == 0) _exit(22);
+        _exit(0);
+    }
+    st = 0;
+    waitpid(kid, &st, 0);
+    printf("pivot_fd=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+
+    /* ---- every operand of the mount family follows an fd link alike: the
+     * target of a bind, its source, umount2, chroot, and pivot_root's pair.
+     * The tokens are booleans; the object each lands on is a directory with a
+     * marker file, so a call that acted on the link's own spelling shows. ---- */
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        char a[64], b[64];
+        int fa, fb, rc = 0;
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mkdir("/fl", 0755);
+        if (mount("tmpfs", "/fl", "tmpfs", 0, NULL) != 0) _exit(3);
+        mkdir("/fl/a", 0755); mkdir("/fl/b", 0755); mkdir("/fl/c", 0755);
+        mkfile("/fl/a/marker", "A");
+        fa = open("/fl/a", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        fb = open("/fl/b", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (fa < 0 || fb < 0) _exit(4);
+        snprintf(a, sizeof a, "/proc/self/fd/%d", fa);
+        snprintf(b, sizeof b, "/proc/self/fd/%d", fb);
+        /* path source, fd target */
+        if (mount("/fl/a", b, NULL, MS_BIND, NULL) == 0 && access("/fl/b/marker", F_OK) == 0) rc |= 1;
+        /* fd source, path target */
+        if (mount(a, "/fl/c", NULL, MS_BIND, NULL) == 0 && access("/fl/c/marker", F_OK) == 0) rc |= 2;
+        /* umount2 through the link takes the mount off the directory */
+        if (umount2(b, MNT_DETACH) == 0 && access("/fl/b/marker", F_OK) != 0) rc |= 4;
+        /* UMOUNT_NOFOLLOW names the link itself: not a mount point */
+        if (umount2(a, UMOUNT_NOFOLLOW) != 0) rc |= 8;
+        /* chroot through the link lands in the directory it names */
+        if (chroot(a) == 0 && access("/marker", F_OK) == 0) rc |= 16;
+        _exit(rc);
+    }
+    st = 0;
+    waitpid(kid, &st, 0);
+    printf("fdlink=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+
+    /* ---- creating on a read-only mount: the kernel looks the name up before
+     * it gives up on the mount, so a name that is there is EEXIST and only a
+     * free one is EROFS. bubblewrap mkdir()s every mount point and tolerates
+     * EEXIST, so --ro-bind / / --tmpfs /tmp rested on this. ---- */
+    fflush(stdout);
+    kid = fork();
+    if (kid == 0) {
+        int rc = 0;
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mkdir("/rod", 0755);
+        if (mount("tmpfs", "/rod", "tmpfs", 0, NULL) != 0) _exit(3);
+        mkdir("/rod/dir", 0755); mkfile("/rod/file", "x");
+        if (symlink("file", "/rod/sym") != 0) _exit(4);
+        if (mount("/rod", "/rod", NULL, MS_BIND, NULL) != 0) _exit(5);
+        if (mount(NULL, "/rod", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) _exit(6);
+        printf("ro_mkdir=%d,%d\n", mkdir("/rod/dir", 0755) < 0 ? errno : 0,
+               mkdir("/rod/new", 0755) < 0 ? errno : 0);
+        printf("ro_mknod=%d,%d\n", mknod("/rod/file", S_IFIFO | 0600, 0) < 0 ? errno : 0,
+               mknod("/rod/newfifo", S_IFIFO | 0600, 0) < 0 ? errno : 0);
+        printf("ro_symlink=%d,%d\n", symlink("t", "/rod/sym") < 0 ? errno : 0,
+               symlink("t", "/rod/newsym") < 0 ? errno : 0);
+        printf("ro_link=%d,%d\n", link("/rod/file", "/rod/dir") < 0 ? errno : 0,
+               link("/rod/file", "/rod/newlink") < 0 ? errno : 0);
+        fflush(stdout);
+        _exit(rc);
+    }
+    st = 0;
+    waitpid(kid, &st, 0);
 
     /* The outer process never left its own root. */
     printf("outer_root=%d\n", access("/bin/busybox", F_OK) == 0);

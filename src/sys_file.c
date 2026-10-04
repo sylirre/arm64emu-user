@@ -3434,6 +3434,32 @@ SYSDEF(fchdir) {
     return 0;
 }
 
+/* An operand of the mount family (chroot, mount, umount2, pivot_root): the
+ * resolver's answer for it and, when that is a /proc fd link, the object the
+ * descriptor holds -- the kernel's walk ends there too, so the call acts on the
+ * directory the fd is open on and not on the link's own spelling
+ * (path_fd_link_target says why the resolver cannot do it). `canon` becomes
+ * that object's guest path; `real` (optional, PATH_MAX) receives the host path
+ * a bind has to record -- the link's target, never "/proc/self/fd/N", which
+ * means a different object the moment the descriptor is closed or reused.
+ * `follow` is 0 where the call forbids following a final link
+ * (UMOUNT_NOFOLLOW). On failure the pin is already released. */
+static int mnt_operand_follow(struct Machine *m, PathPin *pin, int follow,
+                              char *canon, char *real) {
+    if (real) strcpy(real, pin->host);
+    if (!follow) return 0;
+    int f = path_fd_link_target(m, pin->host, canon, real);
+    if (f < 0) { path_unpin(pin); return f; }
+    return 0;
+}
+
+static int mnt_operand(CPU *c, u64 va, unsigned rflags, PathPin *pin,
+                       char *canon, char *real) {
+    int r = resolve_pin(c, G_AT_FDCWD, va, rflags, pin, canon);
+    if (r < 0) return r;
+    return mnt_operand_follow(c->m, pin, !(rflags & PATH_NOFOLLOW_LAST), canon, real);
+}
+
 /* chroot(path=a0): re-root the guest at `path`. path_resolve resolves it in the
  * current namespace (honoring any existing chroot, so nesting composes) to a
  * canonical namespace-absolute path stored in m->chroot_base; subsequent
@@ -3445,7 +3471,7 @@ SYSDEF(chroot) {
     if (!fake_root(m)) return (u64)(s64)-EPERM;
     PathPin pin;
     char canon[PATH_MAX];
-    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
+    int r = mnt_operand(c, a0, 0, &pin, canon, NULL);
     if (r < 0) return (u64)(s64)r;
     struct stat st;
     int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
@@ -3521,7 +3547,7 @@ SYSDEF(mount) {
      * the thing the walk found. */
     char tcanon[PATH_MAX];
     PathPin tp;
-    r = resolve_pin(c, G_AT_FDCWD, a1, 0, &tp, tcanon);
+    r = mnt_operand(c, a1, 0, &tp, tcanon, NULL);
     if (r < 0) return (u64)(s64)r;
     r = pin_isdir(&tp, 1);
     path_unpin(&tp);
@@ -3545,8 +3571,9 @@ SYSDEF(mount) {
         if (!source[0]) return (u64)(s64)-EINVAL;      /* do_loopback: no source */
         r = path_resolve_pin(m, G_AT_FDCWD, source, 0, &sp, scanon);   /* source */
         if (r < 0) return (u64)(s64)r;
+        r = mnt_operand_follow(m, &sp, 1, scanon, shost);   /* an fd's link: its object */
+        if (r < 0) return (u64)(s64)r;
         r = pin_isdir(&sp, 0);                                   /* must exist */
-        strcpy(shost, sp.host);
         path_unpin(&sp);
         if (r < 0) return (u64)(s64)r;
         /* The source is a GUEST path, so only its host-owned prefix may ever be
@@ -3640,12 +3667,12 @@ SYSDEF(pivot_root) {
     if (!fake_root(m)) return (u64)(s64)-EPERM;
     char ncanon[PATH_MAX], ocanon[PATH_MAX];
     PathPin np, op;
-    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &np, ncanon);
+    int r = mnt_operand(c, a0, 0, &np, ncanon, NULL);
     if (r < 0) return (u64)(s64)r;
     r = pin_isdir(&np, 1);
     path_unpin(&np);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_pin(c, G_AT_FDCWD, a1, 0, &op, ocanon);
+    r = mnt_operand(c, a1, 0, &op, ocanon, NULL);
     if (r < 0) return (u64)(s64)r;
     r = pin_isdir(&op, 1);
     path_unpin(&op);
@@ -3682,7 +3709,7 @@ SYSDEF(umount2) {
     unsigned rf = (gf & G_UMOUNT_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     char canon[PATH_MAX];
     PathPin pin;
-    int r = resolve_pin(c, G_AT_FDCWD, a0, rf, &pin, canon);
+    int r = mnt_operand(c, a0, rf, &pin, canon, NULL);
     if (r < 0) return (u64)(s64)r;
     r = pin_isdir(&pin, 0);   /* the target must exist (the resolver is lexical) */
     path_unpin(&pin);
@@ -3694,11 +3721,24 @@ SYSDEF(umount2) {
     return (u64)(s64)bind_remove(m, canon);
 }
 
+/* What a create (mkdir, mknod, symlink, link) is told on a read-only mount.
+ * The kernel's filename_create looks the name up BEFORE it gives up on the
+ * mount -- "don't fail immediately if it's r/o, at least try to report other
+ * errors" -- so a name that is already there is EEXIST and only a free one is
+ * EROFS. Callers lean on the difference: bubblewrap mkdir()s every mount point
+ * and tolerates EEXIST, so --ro-bind / / --tmpfs /tmp died of the EROFS on a
+ * /tmp that was there. Takes the pin of the new name; returns -errno. */
+static u64 ro_create_err(const PathPin *pin) {
+    struct stat st;
+    return fstatat(pin->dfd, pin->name, &st, AT_SYMLINK_NOFOLLOW) == 0
+               ? (u64)(s64)-EEXIST : (u64)(s64)-EROFS;
+}
+
 SYSDEF(mknodat) {
     PathPin pin;
     int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    if (host_ro(c->m, pin.host)) { u64 e = ro_create_err(&pin); path_unpin(&pin); return e; }
     /* Pass the guest-supplied dev straight to the raw host syscall: it is
      * already in the kernel's major:minor encoding, and glibc's mknod()
      * wrapper would re-encode it. Unprivileged callers (this emulator) can
@@ -3716,7 +3756,7 @@ SYSDEF(mkdirat) {
     PathPin pin;
     int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+    u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
             : mkdirat(pin.dfd, pin.name, (mode_t)a2) < 0 ? host_err() : 0;
     path_unpin(&pin);
     return ret;
@@ -3856,7 +3896,7 @@ SYSDEF(symlinkat) {
     int r = resolve_pin(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     /* The link *content* is stored as the guest wrote it. */
-    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+    u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
             : symlinkat(target, pin.dfd, pin.name) < 0 ? host_err() : 0;
     path_unpin(&pin);
     return ret;
@@ -3879,8 +3919,9 @@ SYSDEF(linkat) {
     if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
     const char *h2 = p2.host;
     if (host_ro(c->m, h2)) {                          /* new name on a :ro bind */
+        u64 e = ro_create_err(&p2);
         path_unpin(&p1); path_unpin(&p2);
-        return (u64)(s64)-EROFS;
+        return e;
     }
     /* A hard link is a second name for the INODE, and do_linkat refuses one
      * that would cross mounts (old_path.mnt != new_path.mnt is EXDEV, after
